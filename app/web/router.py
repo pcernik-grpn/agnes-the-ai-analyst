@@ -939,9 +939,9 @@ async def login_page(request: Request):
                 conn.close()
         # Fall through to the normal login form so the missing-seed error is visible.
 
-    next_path = request.query_params.get("next", "")
-    if not next_path.startswith("/") or next_path.startswith("//"):
-        next_path = ""
+    from app.auth._common import safe_next_path
+
+    next_path = safe_next_path(request.query_params.get("next", ""), default="")
 
     from app.auth.provider_registry import provider_allowed
 
@@ -1068,9 +1068,9 @@ async def login_password_page(request: Request):
 
     if not provider_allowed("password"):
         raise HTTPException(status_code=404, detail="Not Found")
-    next_path = request.query_params.get("next", "")
-    if not next_path.startswith("/") or next_path.startswith("//"):
-        next_path = ""
+    from app.auth._common import safe_next_path
+
+    next_path = safe_next_path(request.query_params.get("next", ""), default="")
     google_ok = False
     try:
         from app.auth.providers.google import is_available as google_available

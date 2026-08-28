@@ -335,6 +335,9 @@ async def verify_magic_link(
     user = _consume_token(body.email, body.token)
     role_label = _role_label(user, conn)
     jwt_token = create_access_token(user["id"], user["email"])
+    from app.auth.login_audit import audit_login_success
+
+    audit_login_success(user["id"], provider="email", request=request)
     return {"access_token": jwt_token, "token_type": "bearer", "email": user["email"], "role": role_label}
 
 
@@ -358,6 +361,9 @@ async def verify_magic_link_get(
     """
     user = _consume_token(email, token)
     jwt_token = create_access_token(user["id"], user["email"])
+    from app.auth.login_audit import audit_login_success
+
+    audit_login_success(user["id"], provider="email", request=request)
     # Secure whenever served over HTTPS (proxy-aware via request scheme +
     # resolved public origin), not only when DOMAIN is set — see
     # app.auth.public_url.cookie_secure.

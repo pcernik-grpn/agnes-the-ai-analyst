@@ -31,7 +31,62 @@ from src.audit_helpers import (
     AUDIT_SOURCE_CASE_SQL,
     RESULT_CLASS_CASE_SQL,
     SCHEDULER_ACTION_SQL,
+    UNIFIED_TRAILS,
 )
+
+# ---------------------------------------------------------------------------
+# Unified Activity Center timeline (E3 slice 2) — Postgres mirror of
+# ``src/repositories/audit.py``'s ``_UNIFIED_UNION_SQL``. Same four branches,
+# same canonical column set + literal ``trail``; the only dialect deltas are
+# ``jsonb_build_object`` in place of DuckDB's ``json_object`` and explicit
+# ``NULL::type`` casts in place of ``CAST(NULL AS type)``. Keep both in
+# lockstep — ``tests/db_pg/test_audit_contract.py`` fails on any drift.
+#
+# ``chat_messages`` is NEVER part of this union (privacy decision) — there is
+# no branch for it below, on either backend.
+_UNIFIED_UNION_SQL = """
+    SELECT id, timestamp, user_id, action, resource, params, result, duration_ms,
+           params_before, client_ip, client_kind, correlation_id, 'audit' AS trail
+    FROM audit_log
+
+    UNION ALL
+
+    SELECT id, synced_at AS timestamp, NULL::text AS user_id,
+           'sync.table' AS action, 'table:' || table_id AS resource,
+           jsonb_build_object('rows', rows, 'error', error) AS params,
+           status AS result, duration_ms,
+           NULL::jsonb AS params_before, NULL::text AS client_ip,
+           'scheduler' AS client_kind, NULL::text AS correlation_id,
+           'sync' AS trail
+    FROM sync_history
+
+    UNION ALL
+
+    SELECT id, created_at AS timestamp, user_id,
+           'llm.call' AS action,
+           CASE WHEN agent_id IS NOT NULL THEN 'agent:' || agent_id ELSE NULL END AS resource,
+           jsonb_build_object('model', model, 'session_id', session_id,
+                              'input_tokens', input_tokens, 'output_tokens', output_tokens,
+                              'cache_read_tokens', cache_read_tokens,
+                              'cache_creation_tokens', cache_creation_tokens) AS params,
+           NULL::text AS result, NULL::integer AS duration_ms,
+           NULL::jsonb AS params_before, NULL::text AS client_ip,
+           'agent' AS client_kind, NULL::text AS correlation_id,
+           'llm' AS trail
+    FROM llm_usage
+
+    UNION ALL
+
+    SELECT id, created_at AS timestamp, NULL::text AS user_id,
+           'agent.spawn.scope' AS action,
+           'agent:' || agent_id AS resource,
+           jsonb_build_object('session_id', session_id, 'effective_scope', effective_scope) AS params,
+           NULL::text AS result, NULL::integer AS duration_ms,
+           NULL::jsonb AS params_before, NULL::text AS client_ip,
+           'agent' AS client_kind, NULL::text AS correlation_id,
+           'agent_scope' AS trail
+    FROM agent_scope_snapshots
+"""
 
 
 class AuditPgRepository:
@@ -239,6 +294,81 @@ class AuditPgRepository:
         return rows, next_cursor
 
     # -----------------------------------------------------------------
+    # read — unified Activity Center timeline (E3 slice 2)
+    # -----------------------------------------------------------------
+    def query_unified(
+        self,
+        *,
+        trail: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        user_id: Optional[str] = None,
+        action: Optional[str] = None,
+        action_prefix: Optional[str] = None,
+        action_in: Optional[List[str]] = None,
+        resource: Optional[str] = None,
+        resource_prefix: Optional[str] = None,
+        result_pattern: Optional[str] = None,
+        result_class: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        q: Optional[str] = None,
+        source: Optional[str] = None,
+        include_self_reads: bool = True,
+        cursor: Optional[Tuple[datetime, str]] = None,
+        limit: int = 100,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[datetime, str]]]:
+        """Mirror of ``AuditRepository.query_unified`` — same filter surface,
+        same cursor/ordering contract, over the Postgres ``_UNIFIED_UNION_SQL``.
+        See the DuckDB sibling's docstring for the full trail mapping."""
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
+        where, params = self._filters_where(
+            since=since,
+            until=until,
+            user_id=user_id,
+            action=action,
+            action_prefix=action_prefix,
+            action_in=action_in,
+            resource=resource,
+            resource_prefix=resource_prefix,
+            result_pattern=result_pattern,
+            result_class=result_class,
+            correlation_id=correlation_id,
+            q=q,
+            source=source,
+            include_self_reads=include_self_reads,
+        )
+        if trail is not None:
+            where.append("trail = :trail")
+            params["trail"] = trail
+        if cursor is not None:
+            ts, cid = cursor
+            where.append("(timestamp, id) < (:cursor_ts, :cursor_id)")
+            params["cursor_ts"] = ts
+            params["cursor_id"] = cid
+
+        sql = f"SELECT *, {AUDIT_SOURCE_CASE_SQL} AS source FROM ({_UNIFIED_UNION_SQL}) unified"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT :limit_plus_one"
+        params["limit_plus_one"] = limit + 1
+
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.text(sql), params)
+            rows = [dict(r._mapping) for r in result]
+
+        if not rows:
+            return [], None
+
+        next_cursor: Optional[Tuple[datetime, str]] = None
+        if len(rows) > limit:
+            last_shown = rows[limit - 1]
+            next_cursor = (last_shown["timestamp"], last_shown["id"])
+            rows = rows[:limit]
+        return rows, next_cursor
+
+    # -----------------------------------------------------------------
     # helpers
     # -----------------------------------------------------------------
     def query_actions(
@@ -329,11 +459,20 @@ class AuditPgRepository:
         *,
         since: datetime,
         limit: int = 50,
+        trail: Optional[str] = None,
         **filters: Any,
     ) -> "dict[str, list[dict]]":
         """Mirror of the DuckDB sibling: filter-aware facet buckets
-        (users/actions/results/result_classes/resources/sources)."""
+        (users/actions/results/result_classes/resources/sources) over the
+        unified timeline (audit_log + sync_history + llm_usage +
+        agent_scope_snapshots). ``trail`` narrows to one physical trail."""
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
         where, params = self._filters_where(since=since, **filters)
+        if trail is not None:
+            where.append("trail = :trail")
+            params["trail"] = trail
         w = ("WHERE " + " AND ".join(where)) if where else ""
         out: dict = {}
         with self._engine.connect() as conn:
@@ -342,7 +481,7 @@ class AuditPgRepository:
                 clause = w + (f" AND {extra}" if (w and extra) else (f"WHERE {extra}" if extra else ""))
                 return conn.execute(
                     sa.text(
-                        f"SELECT {select}, COUNT(*) AS n FROM audit_log {clause} "
+                        f"SELECT {select}, COUNT(*) AS n FROM ({_UNIFIED_UNION_SQL}) unified {clause} "
                         f"GROUP BY {group} ORDER BY n DESC LIMIT :facet_limit"
                     ),
                     {**params, "facet_limit": limit},
@@ -411,13 +550,21 @@ class AuditPgRepository:
             ).first()
         return int(row[0] or 0) if row else 0
 
-    def kpis(self, *, since: datetime, **filters: Any) -> "dict[str, Any]":
+    def kpis(self, *, since: datetime, trail: Optional[str] = None, **filters: Any) -> "dict[str, Any]":
         """Mirror of the DuckDB sibling — same filter kwargs, same output
-        keys. ``p95`` uses Postgres' exact ``percentile_cont`` (DuckDB uses
-        ``approx_quantile``; results may differ within tolerance).
-        ``active_users`` counts people (source ∉ scheduler/system);
-        ``errors`` counts ``result_class = 'error'``."""
+        keys, over the unified timeline (audit_log + sync_history +
+        llm_usage + agent_scope_snapshots). ``trail`` narrows to one
+        physical trail. ``p95`` uses Postgres' exact ``percentile_cont``
+        (DuckDB uses ``approx_quantile``; results may differ within
+        tolerance). ``active_users`` counts people (source ∉
+        scheduler/system); ``errors`` counts ``result_class = 'error'``."""
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
         where, params = self._filters_where(since=since, **filters)
+        if trail is not None:
+            where.append("trail = :trail")
+            params["trail"] = trail
         w = ("WHERE " + " AND ".join(where)) if where else ""
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -433,7 +580,7 @@ class AuditPgRepository:
                       CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS INTEGER) AS p95,
                       COUNT(duration_ms) AS measured,
                       COUNT(*) AS total
-                    FROM audit_log {w}
+                    FROM ({_UNIFIED_UNION_SQL}) unified {w}
                     """
                 ),
                 params,

@@ -17,6 +17,48 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
 
 ### Changed
+- **A question about a figure on a dashboard now starts from the data app.** The workspace prompt tells Agnes to find the app the user means
+  (`agnes app list`, `agnes app show <slug>`) and read its description for
+  context before hunting for a definition — both are registry-only reads, so a
+  sleeping app is not woken. When the description doesn't cover the figure,
+  Agnes falls back to `agnes catalog --metrics` as before, but now flags in the
+  answer that it cannot see how the report builds the figure and that the
+  metric it picked is a best match for the label rather than the app's own
+  definition.
+- **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
+  now enforced, not just a label.** The credential a running data app calls
+  Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
+  claim that no code path read — so it was functionally a full-privilege PAT
+  for the app's owner, usable against the whole REST API by anything running
+  in the container, including an externally-cloned, less-trusted repo. Two
+  concrete consequences: `/api/admin/*` was reachable whenever the app owner
+  was an Admin, and `POST /cli/auth/rescope-surface` — admin-gated, but it
+  *requires* a PAT and mints a fresh 90-day `surface='all'` one — let a token
+  that is itself minted **without expiry** launder itself into a further
+  durable credential. (The `require_session_token` minting routes —
+  `/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token` — were
+  already closed to it: that guard rejects any PAT-typed credential
+  regardless of scope.) `app/auth/pat_resolver.py` now admits the scope only
+  on a fail-closed allowlist of the surface a hosted app actually uses:
+  `/api/query` (not `/api/query/hybrid`), `/api/data/…`, the `/api/catalog`
+  read routes, `/api/metrics`, `/api/glossary`, the read-only
+  `/api/semantic-models` members (not `/apply`), and the `/api/v2` catalog,
+  schema, sample and scan routes the `agnes` CLI calls from inside an app.
+  Entries are exact paths plus narrow subtrees rather than one per router,
+  because a per-router prefix silently admits every route that router later
+  grows; `tests/…::test_the_admitted_route_set_is_pinned` walks the real
+  route table so a new route under an allowed path can never be admitted
+  without a deliberate decision. The two sibling scopes (`data-app-git:`,
+  `data-app-preview:`) keep their per-surface booleans and are unaffected.
+  **Upgrade note:** an app calling anything outside that list now gets a 401
+  where it previously succeeded — including MCP-over-HTTP, which passes no
+  request path and is therefore fail-closed. Each refusal logs a warning
+  naming the scope and the refused path, because this failure is otherwise
+  invisible from the outside (the container stays healthy and the app
+  renders; only its API calls fail). Unchanged: within the allowed surface an
+  app still reads with the **owner's** grants, evaluated live — sharing an
+  app remains an act of publication.
+- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 - **The chat Files drawer got a layout fix and a visual pass.** The file
   list now flexes across the panel's full remaining height (a fixed `46vh`
   box left most of the drawer an empty framed rectangle), rows are
@@ -30,6 +72,78 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **A completed sign-in is now recorded in `audit_log`, for every provider.**
+  `login_failed` was the only authentication event the trail carried: the
+  Google, Microsoft, email magic-link and Keboola providers wrote nothing at
+  all on their success paths, and the password provider audited only its
+  failures — so an instance whose people sign in through OAuth could not answer
+  "who signed in, and when" from its own audit log. Both password routes (the
+  browser form and the JSON route used by the CLI/desktop client, distinguished
+  by `client_kind`) and all four OAuth/magic-link callbacks now write a
+  `login_success` row carrying the provider and the trusted client IP. Two
+  adjacent gaps in the same lifecycle close with it: consuming an invite
+  (`/auth/password/setup/confirm`) writes `account_activated` alongside the
+  sign-in it also performs, and the self-service `/auth/password/setup/request`
+  writes `setup_link_requested` — whose anti-enumeration response is identical
+  whether or not the address matched, making the audit row the only place the
+  real outcome is visible. Completing a password reset
+  (`/auth/password/reset/confirm`) and the JSON `/auth/password/setup` sibling
+  both finish a sign-in too — one sets the cookie, the other hands back a
+  bearer token — and both wrote nothing; they record it now, the JSON one as
+  `client_kind="cli"` with `account_activated` beside it, matching its web
+  sibling. Two guards keep this from rotting: one walks `app/auth/providers/`
+  by source rather than a hand-maintained list, so the next provider to mint a
+  session cookie cannot ship without recording it, and a second checks
+  per-FUNCTION — the module-level walk is satisfied the moment a file audits
+  anywhere, which is exactly why those two routes were missed. Separately, the user-management
+  audit helper in `app/api/users.py` swallowed every write failure with a bare
+  `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
+  which keeps the same never-block-the-request policy but leaves a line in the
+  application log when a row is dropped.
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
+- A data source whose name is not a valid SQL identifier (e.g. a hyphenated
+  name) was silently skipped during rebuild and the rebuild still reported
+  success — the caller had no way to tell the source was rejected from
+  "source has zero tables". A single-source `rebuild_source()` call now
+  raises a typed error naming the identifier rule instead of returning an
+  empty list; a full multi-source rebuild still skips the bad directory and
+  rebuilds every other valid source, but now attributes the skip
+  (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
+  operator alert now surfaces too.
+
+- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  **Not fully closed:** a third copy of the same rule lives in the password
+  provider's web-form POST handler, which is the terminal consumer of the form
+  `/login/password` renders — so signing in *with a password* still lands on the
+  home route rather than back in the app. OAuth (Google, Microsoft, Keboola) and
+  magic-link all route through `safe_next_path` and do return you to the app.
+  The underlying fault is that this one rule had four implementations; three of
+  them still exist.
 
 ### Removed
 
