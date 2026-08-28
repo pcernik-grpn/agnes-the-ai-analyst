@@ -112,6 +112,88 @@ def test_list_tables_closes_session_on_failure(configured, monkeypatch):
     conn.close.assert_called_once()
 
 
+# ---- probe_connection: the connectivity check behind "Test" ---------------
+
+
+@pytest.fixture
+def configured_for_row(monkeypatch):
+    """`probe_connection` resolves settings FROM A ROW, so its seam takes the
+    connection argument the picker's zero-arg `configured` fixture does not."""
+    monkeypatch.setattr(discovery, "resolve_snowflake_settings", lambda connection=None: SF_SETTINGS.copy())
+    return SF_SETTINGS
+
+
+def test_probe_returns_the_coordinates_it_reached(configured_for_row, fake_conn, monkeypatch):
+    """A green check that does not say WHICH account answered cannot rule out
+    the one failure worth ruling out."""
+    _patch_session(monkeypatch, fake_conn)
+
+    assert discovery.probe_connection({"id": "conn-1"}) == {
+        "account": "acct-123",
+        "database": "PROD",
+        "warehouse": "WH",
+    }
+
+
+def test_probe_passes_the_row_through_to_resolution(fake_conn, monkeypatch):
+    """Testing a connection must report on THAT connection, not on whichever
+    row happens to be this type's default."""
+    seen = {}
+
+    def _resolve(connection=None):
+        seen["connection"] = connection
+        return SF_SETTINGS.copy()
+
+    monkeypatch.setattr(discovery, "resolve_snowflake_settings", _resolve)
+    _patch_session(monkeypatch, fake_conn)
+
+    discovery.probe_connection({"id": "conn-1"})
+
+    assert seen["connection"] == {"id": "conn-1"}
+
+
+def test_probe_reads_schemata_not_tables(configured_for_row, fake_conn, monkeypatch):
+    """`information_schema.tables` can be millions of rows on a real account;
+    `schemata` is tens and proves the same three things (driver loaded,
+    credential authenticated, warehouse ran a query)."""
+    _patch_session(monkeypatch, fake_conn)
+
+    discovery.probe_connection({"id": "conn-1"})
+
+    sql = " ".join(str(c) for c in fake_conn.execute.call_args_list)
+    assert "information_schema.schemata" in sql
+
+
+def test_probe_returns_none_when_not_configured(monkeypatch):
+    """Same "nothing to talk to" answer `list_tables` gives — the caller turns
+    it into a setup hint, not a driver error."""
+    monkeypatch.setattr(discovery, "resolve_snowflake_settings", lambda connection=None: None)
+
+    assert discovery.probe_connection({"id": "conn-1"}) is None
+
+
+def test_probe_refuses_a_host_outside_the_allowlist(configured_for_row, fake_conn, monkeypatch):
+    """Same egress gate every other Snowflake path applies — this one ships
+    the same credential."""
+    _patch_session(monkeypatch, fake_conn)
+    monkeypatch.setattr(discovery, "is_attach_host_allowed", lambda url: False)
+
+    with pytest.raises(ValueError, match="ALLOWLIST"):
+        discovery.probe_connection({"id": "conn-1"})
+
+
+def test_probe_closes_the_session_on_failure(configured_for_row, monkeypatch):
+    """A failed probe must not leak the DuckDB handle (and with it the
+    attached Snowflake session)."""
+    conn = MagicMock()
+    conn.execute.side_effect = RuntimeError("boom")
+    _patch_session(monkeypatch, conn)
+
+    with pytest.raises(RuntimeError):
+        discovery.probe_connection({"id": "conn-1"})
+    conn.close.assert_called_once()
+
+
 # ---- the endpoint the picker calls ----------------------------------------
 
 _LISTING = {

@@ -1122,6 +1122,13 @@ Tables in `table_registry` can be pinned to a specific connection via `connectio
 `GET …/{connection_id}/tables` lists the project's buckets with nested tables (admin-UI
 discovery helper for the /admin/data-sources add-project wizard, #755).
 
+`POST …/{connection_id}/test` branches on the row's `source_type`: `keboola` verifies
+the storage token against the stack, `snowflake` opens a session against the account
+and reads one row of metadata, and every other type answers
+`{"ok": false, "status": "unsupported", "detail": "connection test is not implemented
+for <type> yet"}`. Failure is HTTP 200 with `ok: false` throughout; only an unknown
+connection is a status code (404).
+
 - /api/admin/source-connections
 - /api/admin/source-connections/{connection_id}
 - /api/admin/source-connections/{connection_id}/secret

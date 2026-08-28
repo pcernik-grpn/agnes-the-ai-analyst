@@ -1837,31 +1837,106 @@ async def disable_chat_tools(
     _remove_chat_tools(connection_id)
 
 
+async def _test_snowflake_connection(connection_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Connectivity check for a ``source_type='snowflake'`` row.
+
+    Opens a session against the account this connection names and reads one
+    row of metadata (``connectors.snowflake.discovery.probe_connection``) —
+    the connector's own credential resolution, attach URL and
+    host-allowlist gate, no new credential path. Blocking DuckDB + ADBC
+    driver work, so it runs off the event loop exactly as the table picker
+    does.
+
+    Same answer shape as the Keboola branch (``{ok, project_name}`` /
+    ``{ok, error}``). ``project_name`` carries ``<account>/<database>``:
+    a green check that does not say WHICH account answered cannot rule out
+    the one failure worth ruling out.
+    """
+    from connectors.snowflake import discovery
+
+    try:
+        probe = await run_in_threadpool(discovery.probe_connection, row)
+    except ValueError as exc:
+        # The host-allowlist refusal — an operator misconfiguration whose
+        # message already names the env var to fix, so it passes through.
+        logger.info("connection test for %s (snowflake): refused — %s", connection_id, exc)
+        return {"ok": False, "error": str(exc)[:300]}
+    except Exception as exc:  # noqa: BLE001 — reported, never raised
+        # The full driver text (SQLSTATE, Snowflake error code, request id)
+        # is what an operator needs and goes to the log; the caller gets the
+        # classified one-sentence version, same split the browse endpoint
+        # makes (`app/api/admin_source_discovery.py`).
+        from app.api.admin_source_discovery import _classify_snowflake_error
+
+        logger.warning("connection test for %s (snowflake): failed — %s", connection_id, exc)
+        return {"ok": False, "error": _classify_snowflake_error(exc)}
+
+    if probe is None:
+        logger.info("connection test for %s (snowflake): not configured", connection_id)
+        return {
+            "ok": False,
+            "error": (
+                "no credential available for this connection (vault empty, no allowlisted "
+                "secret-ref env var) — store one via PUT .../secret, or complete "
+                "config.account/user/database/warehouse"
+            ),
+        }
+
+    logger.info("connection test for %s (snowflake): ok", connection_id)
+    return {"ok": True, "project_name": f"{probe['account']}/{probe['database']}"}
+
+
 @router.post("/{connection_id}/test")
 async def test_connection(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
-    """Verify connectivity for the connection.
+    """Verify connectivity for the connection — per source type.
 
-    Resolves the stack URL and token from the connection row (token_env →
-    environment lookup, or vault secret), then calls
-    ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.
+    - ``keboola``: resolves the stack URL and token from the row (token_env
+      → environment lookup, or vault secret) and calls
+      ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.
+    - ``snowflake``: opens a session against the account and reads one row
+      of metadata (:func:`_test_snowflake_connection`).
+    - anything else: ``{ok: false, status: "unsupported", detail: "…"}``
+      naming the type. This branch exists because the handler used to be
+      Keboola-shaped for EVERY row — it demanded a ``stack_url`` a Snowflake
+      or Databricks connection does not have, so "Test" on one of those
+      failed with a message about a field that source type has no concept
+      of, for a connection that may be perfectly healthy. An honest "not
+      implemented for this type yet" is a better answer than a confident
+      wrong one.
 
     Returns ``{ok: true, project_name: "…"}`` on success or
-    ``{ok: false, error: "…"}`` on failure.
+    ``{ok: false, error: "…"}`` on failure. Failure is HTTP 200 throughout —
+    only an unknown connection is a status code (404) — so the unsupported
+    answer keeps that convention rather than minting a new one for its own
+    callers to special-case.
 
-    It used to probe ``/v2/storage?exclude=components``, which measured
-    verified live (2026-08-10): that endpoint is the unauthenticated stack
-    index — it answers **200 with no token at all** and carries no ``owner``
-    block. So "Test" reported OK for any token, including a garbage one, and
-    the ``project_name`` it returned was always the empty string. Verifying
-    the token is the only probe that answers the question the button asks,
-    and it is what makes the project identity below readable at all.
+    The Keboola probe used to be ``/v2/storage?exclude=components``, which
+    measured verified live (2026-08-10): that endpoint is the
+    unauthenticated stack index — it answers **200 with no token at all**
+    and carries no ``owner`` block. So "Test" reported OK for any token,
+    including a garbage one, and the ``project_name`` it returned was always
+    the empty string. Verifying the token is the only probe that answers the
+    question the button asks, and it is what makes the project identity
+    below readable at all.
     """
     row = source_connections_repo().get(connection_id)
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
+
+    source_type = (row.get("source_type") or "").strip().lower()
+    if source_type == "snowflake":
+        return await _test_snowflake_connection(connection_id, row)
+    if source_type != "keboola":
+        named = source_type or "unknown"
+        logger.info("connection test for %s: unsupported source_type %s", connection_id, named)
+        return {
+            "ok": False,
+            "status": "unsupported",
+            "detail": f"connection test is not implemented for {named} yet",
+        }
 
     config = row.get("config") or {}
     try:

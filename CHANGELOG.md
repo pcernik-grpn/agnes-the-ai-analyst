@@ -772,6 +772,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   invisible to the old page's coverage engine entirely.
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 ### Fixed
+- **Testing a non-Keboola data connection no longer fails with a Keboola error.**
+  `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
+  /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and
+  called the Keboola token-verify endpoint for every connection, whatever its
+  source type — so testing a Snowflake connection reported a problem with a field
+  that source type has no concept of, for a connection that may be perfectly
+  healthy. A `snowflake` connection is now actually probed: a session against the
+  account it names, through the same credential resolution and remote-attach host
+  allowlist the extract build uses, reporting `<account>/<database>` on success.
+  Every other type (`databricks`, `bigquery`, …) gets an honest
+  `{"ok": false, "status": "unsupported", "detail": "connection test is not
+  implemented for <type> yet"}` instead of a misleading failure.
 - **Unregistering a table that belongs to a data package no longer fails with a
   server error.** `DELETE /api/admin/registry/{id}` (`agnes admin
   unregister-table`) hit the DuckDB foreign key from `data_package_tables` and
