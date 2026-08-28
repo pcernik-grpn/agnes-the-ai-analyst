@@ -11,46 +11,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
-- **Per-trail retention pruning (Track E3 Slice 1), opt-in and off by default.** Generalizes the existing `audit_log` retention pattern (B8) to the other unbounded audit/activity trails: `sync_history` (`retention.sync_history_days`), `llm_usage` (`retention.llm_usage_days`), and `agent_scope_snapshots` (`retention.agent_scope_snapshots_days`) each get a new `SyncStateRepository.prune_history_older_than`/`LlmUsageRepository.prune_older_than`/`AgentsRepository.prune_scope_snapshots_older_than` method (DuckDB + Postgres), dispatched by a generalized `src/audit_retention.py::run_retention_sweep` and run daily by a new `retention-prune` scheduler job (`POST /api/admin/run-retention-prune`). Every new window defaults to `0` = keep forever — nothing is pruned on a freshly-installed instance until an admin sets a window. `sync_state` (current per-table sync status) and the live `agents` table are never touched, only the trail tables themselves. `usage_events`'s pre-existing retention (`USAGE_EVENTS_RETENTION_DAYS` env var, `POST /api/admin/usage/prune`) now also honors an equivalent `retention.usage_events_days` config key (env var still wins when set); `chat_messages` and CLI session JSONLs remain out of scope. See `docs/observability.md`.
-- **Fact graph over Collections — read surface** (`facts.enabled`, off by default; Postgres-only). Typed subjects (facts/edges) extracted from Collections documents, each claim carrying its evidencing document, a verbatim quote and a date. `POST /api/facts/search` (typed subject search with attribute filters, projected per-caller from readable claims), `POST /api/facts/neighbors` (bounded graph traversal, depth ≤2, capped fanout/result, statement-timeout guarded — a node now carries the SAME projected shape `search` returns, aliases and per-caller-projected attrs and claim/quote counts included, and an edge carries its own projected attrs too, so walking the graph no longer needs a follow-up `search`/`claims` round trip per node just to learn its attributes; the projection runs once, after truncation, over the already-capped node/edge set), and `GET /api/facts/{subject_id}/claims` (the caller's readable evidence for one subject) — any authenticated caller, no admin gate; every bit of visibility enforcement lives server-side in the repository, never in a route dependency, so an agent's restricted scope or a group's collection grants are the only thing that decides what a caller sees. A subject under an admin `revealed` correction is served instance-wide without quotes; `restricted`/`wrong` withhold it everywhere; a nonexistent id and an unreadable one are indistinguishable (`404`, never `403`). A fact's visibility (search/neighbors/claims and the orphan sweep) now also counts a readable, non-withheld incident edge's claim as evidence of that fact's own existence — a node created only to anchor an evidenced edge (no evidence of its own, permitted by the producer wire contract) is no longer invisible or garbage-collected; its `attrs` and claim list still project from its own claims only. Honest scope: this is the READ surface only (build order steps 2+3) — the write surface and the CLI/MCP query surface ship alongside it (their own bullets below). DuckDB-backed instances answer a typed `501` (A3 PG-first ratchet). See `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
-- **`agnes facts search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/`fact_claims` (MCP foundation tools) — the query surface over the fact graph** (build order step 6). Facts have no local scope, so unlike `agnes query`'s local/server auto-routing there is no `--scope` flag — every CLI result labels its origin `[server]` on stderr with a hint explaining the deliberate deviation. The MCP tools call `src.repositories.facts_repo()` directly (never an HTTP self-call) with the caller's own resolved principal, so a scoped `AgentPrincipal` sees exactly its own narrowed subset rather than an owner's full authority. A `404` (never `403`) from `neighbors`/`claims` gets one honest hint covering all three indistinguishable causes — wrong id, no readable evidence, or the `facts` feature is off — never a probe that tells them apart.
-- **Fact graph over Collections — eval-critical UI surfaces** (behind the same `facts.enabled` flag, Postgres-only): the collection detail page grows a **Facts** section (fact count by type, a paged per-fact row list with display name/claim/quote counts, same-attribute-key conflicts rendered inline where the fact lives with both values and their evidencing documents' names/dates, and `possible_duplicate_of` review-item rows naming both subjects) — caller-scoped through `facts_repo().collection_facts_summary`, absent entirely (no error, no empty shell) when the flag is off, the backend is DuckDB, or the collection has zero facts. The Library collection card gains a caller-scoped "N files · M facts" count (omitted at zero). `/admin/access` collection rows carry a "⚠ nobody" badge when no group holds a grant on them ("indexed but invisible"). Web chat renders `fact_search`/`fact_neighbors`/`fact_claims` tool calls with a human head ("Searched the knowledge graph" / "Walked related facts" / "Read the evidence"), `fact_claims` results as a quote + document list (open-in-source link only when available, sanitized through the same markdown renderer as every other message body), and an end-of-turn "answered from N documents in M collections you can access" scope line. Connect wizard, source card and ontology builder remain out of scope for this round.
-- **Fact graph over Collections — write surface** (build order step 4, same `facts.enabled`/Postgres-only gate). `POST /api/facts/ingest` — scheduler token or admin PAT, no CLI/MCP by design (a producer contract, not an analyst command) — accepts the crawler's wire format verbatim: `documents[]` (`make_row` rows + `corpus_id`) upsert through the Collections source-anchor mapping; `doc_id` resolves via `corpus_file_sources`, refusing (`400`, itemized) an unresolved id when `documents` is omitted; a claim referencing a not-yet-`indexed` file is `deferred`, never rejected; every quote passes the verbatim gate (a substring of one chunk of the evidencing document's extracted text) before it's stored; `full_documents` replaces a document's whole claim set — every existing claim for it is deleted in one statement before any incoming claim is written, so a subject the re-extraction drops loses its stale claim; the batch as a whole is not one transaction, and does not need to be, because ingest is replayable by construction (union mode merges by `(subject, corpus_file_id, quote_hash)`, so replaying a batch is a true no-op and re-sending a batch that died halfway converges on the same state); unknown node/edge ids mint a new subject + alias, a type disagreement against an existing alias is rejected and itemized, `possible_duplicate_of` edges need no evidence and surface as review items; a same-date attribute conflict introduced by the batch is flagged as a review item, a different-date one silently succeeds (later wins); a functionally single-valued edge type (`facts.single_valued_edges`, default `owned_by`/`for_client`) with more than one distinct dst carrying a live claim — including a dst written by an earlier batch — becomes a `single_valued_conflict` review item too, never persisted and recomputed caller-scoped on the collection detail page the same way `possible_duplicate_of` rows are; batch caps (≤500 documents, ≤5000 claims/request, `413`) and a single document's evidence alone over the claim cap (`422`, never split). Response is the run report (`claims_written`/`claims_rejected`/`deferred`/`subjects_created`/`subjects_deleted`/`corrections_active`/`review_items`). Admin corrections — `PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}` (`wrong`/`restricted`/`revealed`, reasoned, audit-logged) and the producer export `GET /api/facts/corrections` — snapshot a subject's natural keys at write time so a `wrong` correction re-attaches even after its subject is deleted and later re-created under a new id. A post-ingest orphan sweep deletes and counts zero-claim subjects; the same sweep also runs after a file delete through the Collections API (`DELETE /api/collections/{id}/files/{file_id}`) and after a **content replace** — re-uploading a file with different bytes deletes that document's claims at replace time rather than leaving them to the producer's next extraction. A claim quotes a verbatim span of the bytes that are being replaced (and whose blob is unlinked in the same step), nothing in the read path filters on `claims.file_sha256`, and the claims read joins `corpus_files` for the document's *current* name and path — so the deferral window would serve a quote of deleted text under the new document's identity, and keep its subject alive in `search`/`neighbors`, for as long as the producer took to come back (forever, for a file replaced by hand). Fresh claims still arrive only on the next extraction, and replace-mode ingest is unchanged and still idempotent.
-- **`scripts/ontology/import_ontology.py` translates a producer's ontology.yaml into an Agnes semantic-model (Apache Ossie) document** — node types become datasets, edge types become relationships, guidance/rules with no Ossie field fold into `ai_context` verbatim, and every judgment call (a hierarchy inferred from a plain attribute, a wildcard-endpoint relationship) is named in a leftover report printed before writing or posting. Validates against the vendored Ossie schema before writing (`--out`) or importing through `POST /api/admin/semantic-models` (`--server`/`--token`); refuses loudly on a schema-invalid translation. Fact-graph build-order step 1.
-
-- **`scripts/eval/` — the fact-graph evaluation measurement harness, encoding eval workbook v0.2 exactly (EQ0/EQ3/EQ9).** `run_eval.py` drives an eval round from a YAML run-config against the frozen ten-prompt set (`tests/fixtures/eval/workbook_v0_2/`, sha256-pinned — the harness refuses to run on a locally-edited prompt) across five arms: A0 (bare Anthropic API) and A4 (Agnes, via a pluggable surface — `chat` implemented against the same one-shot endpoint `agnes agent ask` uses) run directly; A1/A2/A3 run in external product UIs this harness cannot drive headlessly, so `import-transcript` ingests an operator-pasted transcript into the same machine-readable record shape. `grade.py` produces blind grading sheets (arm identity hidden behind a nonce until scored), computes the composite (seven 0/1/2 dimensions, frozen weights, a governance-gate FAIL zeroing the question), and supports `--llm-assist` grading (always labeled, never a silent substitute for human grading). `decision.py` computes the five pre-registered decision thresholds with PASS/FAIL/incomplete verdicts. `metrics.py` computes EQ3 (precision/recall per fact type) and EQ9 (entity-resolution cluster purity, conflict rate, orphan rate) against the facts REST API's documented response shapes, against a planted ground-truth manifest (`tests/fixtures/eval/ground_truth.schema.json`); EQ3 matches each planted fact at most once, so a second extracted subject for the same planted fact scores as a false positive rather than a second true positive — otherwise duplicated entities, the failure EQ9 exists to measure, would have *raised* the precision the decision thresholds read. Fact-graph build-order step 5.
-
-- **Claude can run through Google Vertex AI — chat and server-side, keyless.**
-  Two new provider switches, both authenticated by Google Application Default
-  Credentials (no Anthropic key anywhere): `chat.llm.provider: vertex` (+
-  `chat.llm.vertex.project_id/region`) flips the chat sandbox CLI into Claude
-  Code's native Vertex gateway mode — requests still egress through the
-  loopback relay to the secret broker, which validates the path's
-  project/region by equality against instance config (a sandbox can never
-  redirect spend), signs upstream calls with a Google OAuth token, and keeps
-  model pinning, monthly token budgets, and the usage ledger working; the
-  kai-agent engine needs no change (the broker rewrites its first-party
-  Messages calls into the Vertex shape). `ai.provider: vertex` (+
-  `ai.vertex.project_id/region`) does the same for every server-side LLM
-  call-site — corporate memory, digests, guardrail reviews, usage-ask, vision
-  OCR, and chat auto-titles. Dated model ids interchange between the
-  first-party (`claude-…-YYYYMMDD`) and Vertex (`claude-…@YYYYMMDD`)
-  spellings everywhere they are compared. Boot refuses `vertex` combined with
-  `workload_identity` or `LLM_DISPATCHER_URL`, and refuses a `project_id` or
-  `region` outside the Google resource-id character set — both are
-  interpolated into the outbound Vertex URL (the region becomes part of the
-  hostname), so a crafted value would otherwise sign a request to a host that
-  is not Google's. The admin readiness page gains vertex rows plus a live
-  test-connection probe. See `docs/cloud-chat.md` → "LLM provider: Google
-  Vertex AI".
-
-- **Instances can opt into GCE deletion protection.** The `customer-instance`
-  module exposes `deletion_protection` on `prod_instance` and on each
-  `dev_instances[]` entry and passes it through to the `google_compute_instance`
-  resource, so a `terraform destroy` (or an accidental `-replace`) is refused by
-  the API until the flag is cleared. Defaults preserve today's behaviour — an
-  instance that does not set it is unprotected, exactly as before.
-
 - **Connecting an MCP source is a builder, and so is linking external apps.**
   Both were the least builder-shaped surfaces in the product, and both are now
   the two-pane shell the other four use — numbered sections with real
@@ -116,7 +76,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   things listed four of the six things you can add. They keep the menu's
   blast-radius grouping (an MCP source adds tool-calling reach to every agent
   granted it) and still open their existing pages.
-
 - **A plugin can now be composed from items already in the Library** — the
   builder's plugin type offers *Pick from the Library* beside *Upload a .zip*,
   and `POST /api/store/entities/from-components` assembles the bundle
@@ -143,7 +102,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   - Copy throughout the type now says the thing the builder never did: a skill
     saved to the Library **already installs on its own**, so a plugin is never
     a prerequisite for shipping one — only for shipping several at once.
-
 - **The builder's configuration sections are cards again.** They were flattened
   onto the panel with only a hairline between them, on the argument that six
   white cards inside a panel that is itself a surface is two levels of
@@ -153,7 +111,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   where one section ends and the next begins. Both builders share the rule, so
   `/agents` and `/skills` are fixed together, and the skills page's Type step
   follows — flat among cards is the same mistake inverted.
-
 - **The `/chat` landing page introduces itself in text instead of a banner.**
   The Knowledge Layer hero that led the page is retired: it asserted a category
   ("Agnes is your knowledge layer") rather than saying what Agnes answers,
@@ -165,7 +122,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ("See what Agnes knows", "Take Agnes to your own tools", "How Agnes
   works"), the middle one naming the direction the old CTA got backwards. Same
   page for admins and members.
-
 - **The chat landing page stops offering what it cannot do, and gives an admin
   one thing to do.** On an instance with no data reachable by the caller the
   page used to say "Ask Agnes anything", suggest four data starters ("Compare
@@ -187,7 +143,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   where you go instead of asking, so asking them to be scrolled past was
   backwards. The "no data is registered yet" notice bar is gone: the heading
   says it now.
-
 - **The `/agents` builder is now a conversation next to the configuration.**
   Opening an agent gives two panes: a **Create** conversation on the left that
   describes the agent in plain language, and the **Configuration** on the
@@ -204,7 +159,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   written, and `status` / the four `*_mode` columns are not writable from a
   conversation at all. With no AI credential configured the endpoint answers
   `503 builder_llm_unavailable` and the panel stays fully usable by hand.
-
 - **The builder's Preview is a live chat with the agent**, replacing the
   static mock card. It opens a real session bound to the draft agent's own
   slug (`POST /api/chat/sessions` with `agent_slug`) and streams the answer
@@ -214,16 +168,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   full chat* link to the same session for the full renderer. Engine failures
   are translated into what the reader can act on instead of surfacing the
   internal kind.
-- **Chat session files now work under the default `kai-agent` provider**
-  (#1611 follow-up). The Files listing/download/save-to-Library routes are
-  provider-aware: engine-backed sessions proxy the engine's sandbox file
-  browser (`GET /api/chat/{id}/sandbox/files` + the new
-  `…/sandbox/file/download`, session-JWT-authed; wire contract in
-  `docs/cloud-chat.md`) instead of walking the host session dir, which under
-  this provider holds only workspace-template symlinks — the pre-fix listing
-  showed hundreds of template files that were not session output. An engine
-  without those routes degrades to an honest "not exposed yet" notice; the
-  kai engine stub gained matching routes and a `deliverable` scenario.
+- **SharePoint file-source connect wizard** (spec §13.2), reached as a source *type* from `/admin/data-sources` "Add source" — no new nav item. `sharepoint` joins the `source_connections` registry (tenant/client id as fields, certificate via the connection's vault secret or a server env name, never echoed — only its origin and set-date, parsed from the repos' string stamp into the `datetime` the card renders). Its own admin API — `GET .../tree` (a live Microsoft Graph folder-tree browse, one level per call: sites → drives → root children, using the resolved certificate; a missing/unresolvable certificate answers a typed `409` rather than failing the browse), `GET/POST/DELETE .../scopes` (confirm a selected site/library/folder as a scope — `{source_scope_id, display_path, anonymize, collection_id}` stored in the connection's own config, no new table; confirming creates its collection, re-confirming the same `source_scope_id` reuses it; unselecting removes only the wizard's bookkeeping row, never the collection; `group_ids` is the complete SET of groups for that collection when the field is present — listed groups are granted and any other group's grant on it is revoked, because the share step pre-ticks the grants that exist and warns the moment the last one is unticked, so an additive-only handler would show the admin a revocation that never happened — while omitting the field touches no grant at all, which is what keeps a rename or an anonymize toggle from stripping access as a side effect), and `GET .../corpus-map` (the producer handoff: a flat `{source_scope_id: collection_id}` mapping `ship_to_agnes.py --corpus-map` reads until crawling moves inside Agnes). The wizard UI runs the three steps verbatim — connect (identity + certificate), scope (the folder tree, per-row anonymize column, a note that only the extracted markdown is stored, never the original file), share (a per-collection group-badge preview that warns on any collection leaving with no group — "indexed but invisible").
+- **Fact graph over Collections — ingest run reports + the file-source source card** (build order step 6, same `facts.enabled`/Postgres-only gate). Every `POST /api/facts/ingest` batch now also persists its run report to `facts_ingest_runs` (id, corpus ids touched, documents seen, claims written/rejected — count plus itemized detail, deferred, subjects created/deleted, review items, caller) — written AFTER the ingest transaction commits, log-and-continue on failure, so a report-write hiccup never rolls back or fails an ingest. `GET /api/facts/ingest-runs?limit=` (admin) lists them newest-first. On `/admin/data-sources`, a `sharepoint`-type connection now renders the shared `.ds-src` card with a file-source pipeline strip (crawl → extraction → facts → graph counts, plus a labeled-placeholder queue-cost estimate), a static schedule line ("external producer · hourly delta" — the crawl runs externally), a certificate row (vault/env origin and set-date, never the credential value), an identity-matching row (groups matched / collections with no group, fail-closed), and per-run error badges (rejected quotes / deferred / protocol errors) that open a drawer itemizing that category. A connection with no ingest history yet, or a DuckDB-backed instance, degrades gracefully rather than erroring; a "scope collections" heuristic (every collection this instance has ever ingested facts into) stands in until the connect wizard's own connection→collection scope mapping ships.
+- **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
 
 ### Changed
 - **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
@@ -234,7 +181,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   same principal holds it, but the registered path always leaves a row behind
   and this one leaves nothing, so the audit entry is the only trace it
   happened. Records the transport and the url/command, never the `env` dict.
-
 - **BREAKING: four admin surfaces are hidden by default — Studio, News, Knowledge
   digests, and Contribute a skill.** The admin sidebar drops all four rows (plus
   the Studio suggestions row, which reads the same flag its route always did),
@@ -255,140 +201,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   running digests keeps running them headlessly — and the news flag hides UI
   only, leaving `/api/admin/news/*` and any published version untouched, so
   turning it back on restores the surface with its content intact.
-
-- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
-- **Admin and workspace pages now use the plain page header.** 25 templates that
-  are lists, tables or editors switch from the bordered gradient hero panel to the
-  plain title + lede that `/library`, `/agents` and `/chats` already render, via the
-  existing `page_hero_plain` opt-in in `_page_hero.html` — no new CSS or components.
-  This closes the most visible reason admin read as an older product than the rest of
-  the app. The hero is kept on `mcp_connect` and `admin_session_detail`, which
-  introduce themselves rather than being workspace pages, and eyebrows are retained
-  everywhere: they carry the admin grouping (Agent Experience, Users & Access).
-- **BREAKING: Databricks Unity Catalog metric views now flow through the
-  semantic-source adapter contract, like Snowflake — no more direct
-  `metric_definitions` writer.** A new `databricks_semantic` adapter
-  (`connectors/databricks/semantic_ossie.py`) composes one Apache Ossie
-  document per metric view (measures → metrics, dimensions → dataset
-  fields, every expression tagged dialect `DATABRICKS`); a metric's
-  dialect expression is the full `SELECT MEASURE(...) FROM <metric view>`
-  statement (not the bare `expr` fragment, which is not runnable on its
-  own), and it projects into `metric_definitions` as a warehouse-only row
-  with a "run server-side" note — Task A's projector, now exercised by a
-  second connector. `POST /api/admin/run-databricks-semantic-layer-refresh`
-  keeps its path, scheduler cadence and single-flight guard, but now
-  registers the workspace as a `connection`-kind semantic source (fixed id
-  `databricks_default`) and syncs it via `src.semantic.transports.
-  import_source` — its response shape changed from the old counters
-  (`created_or_updated`/`pruned`/...) to the generic import report
-  (`models_written`/`models_pruned`/`projection`/...). Rows land stamped
-  `source='ossie_connection'` + `source_ref='databricks_default'` instead
-  of `source='databricks_semantic_layer'` + the workspace host; every
-  refresh reconciles any rows still carrying the old stamp (one-time,
-  idempotent — a no-op once they're gone), so an upgrading instance loses
-  nothing. This was the last connector writing `metric_definitions`
-  directly — every source (native, git, upload, Keboola, Snowflake,
-  Databricks) now goes through the same document → projector pipeline.
-- **Collections file upload now preserves a matched file's id on every
-  re-upload, instead of delete+insert.** `POST /api/collections/{id}/files`
-  gains optional positionally-paired form fields — `source_stable_ids` (+
-  `source_doc_ids`, `source_sha256s`, `document_dates`) — so a doc-sync
-  client can supply a producer's own stable id (e.g. a crawler's delta key)
-  alongside the existing `paths` field. A match is tried on
-  `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
-  as before; either way, the existing `corpus_files` row is now updated IN
-  PLACE — a content-unchanged match against an already-`indexed` row (a
-  rename/move) only refreshes filename/path and skips re-chunking entirely,
-  while a changed-content match purges chunks/derived tables and resets
-  `processing_status` on the SAME row. Content-unchanged against a row whose
-  ingest never completed (`rejected`, `needs_review`, or a parked `pending`)
-  counts as a **retry** instead: the row resets to `pending` and ingestion is
-  re-scheduled, so re-uploading the same bytes after fixing the cause works
-  without a separate `…/reingest` call — a row mid-ingest is left alone. A
-  manual `paths`-only re-upload of a file previously anchored by a stable id
-  now also preserves that row's id, so a hand upload can no longer orphan
-  anything referencing it. Two files sharing a non-blank `source_stable_id`
-  in one batch are rejected up front (`400
-  duplicate_source_stable_id_in_batch`), matching the existing
-  `duplicate_path_in_batch` guard — the second would otherwise overwrite the
-  first's row in place and silently drop its bytes — and a read-only
-  pre-flight resolves every file's target row before anything is stored, so
-  the two collisions that cross the stable-id/path boundary are refused
-  cleanly too: two files landing on the same existing row through different
-  anchors (`400 duplicate_target_row_in_batch`) and a stable-id match whose
-  `path` is already held by another row, which previously violated the
-  `(corpus_id, path)` unique index and surfaced as a `500` with earlier files
-  in the batch already written (`409 path_owned_by_another_file`). The old
-  blob is now unlinked whenever a matched row's `storage_path` moves rather
-  than only when its content changed — blob paths are `{sha256}{ext}` with
-  the extension taken from the filename, so an extension-only rename kept the
-  sha, allocated a new blob and orphaned the old one on disk. On a role-split
-  `api` replica a content-changed re-upload now rides ONE ordered
-  `collections-purge` job carrying `reingest_after_purge=True`, exactly as
-  `…/reingest` already did, instead of enqueueing a bare derived-table purge
-  while running the re-ingest in-process — because the row id (and therefore
-  the derived `table_id`) is now preserved, those two could land in either
-  order and the purge could delete the table the re-ingest had just rebuilt.
-  The stable-id mapping upsert also `COALESCE`s its optional columns, so a
-  rename-only re-sync carrying `source_stable_ids` without `source_doc_ids`
-  no longer resets a stored `source_doc_id` to NULL. The stable-id mapping
-  table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
-  instance returns `501`; omitting the field keeps today's flow unchanged.
-
-- **Session files are a side drawer that opens itself when a deliverable
-  lands.** The Files panel was a modal, which covered the very sentence
-  ("I saved it as …") the reader was checking the list against. It now docks
-  to the trailing edge with no backdrop, the conversation stays readable and
-  scrollable beside it, and where there is room (≥1100px) the composer makes
-  way instead of sitting underneath. The header button carries a count, and a
-  turn that writes a new file under `outputs/` opens the drawer on its own —
-  `outputs/` only, so the scratch files an agent touches mid-task do not
-  interrupt the read. The drawer learns which conversation it is looking at
-  when that conversation **opens**, so the first turn of a fresh chat is the
-  one that opens it (deriving the baseline from the first completed turn put
-  that turn's own deliverable into the baseline, and the commonest case —
-  ask, receive a document — never opened anything), and switching
-  conversations resets the count and reloads an open drawer instead of
-  leaving the previous chat's rows on screen with their old download links.
-- **Table registration: one shared form, two entry points (D4).** The
-  `/admin/tables` "+ Register new table" menu and the onboarding wizard's
-  step 3 now both open the SAME two-pane drawer (browse & multi-select →
-  configure & register) instead of four near-duplicate connector-specific
-  modals plus a separate onboarding auto-register-all. Every registration —
-  from either entry point, for all four connectors — POSTs through the
-  validated `POST /api/admin/register-table`, one row at a time; the
-  onboarding wizard no longer bypasses that validation via
-  `discover-and-register` (the sync-time drift-detection use of that helper
-  is unchanged). A "Select all" checkbox keeps the onboarding one-click
-  path fast — scoped to the rows the search filter leaves visible, and
-  switching connection or dataset clears the previous source's checkmarks,
-  so nothing can be registered that the operator cannot see. Reopening the
-  drawer starts from a clean Configure step rather than the previous
-  registration's description / folder / schedule / SQL / primary key /
-  server-only / Keboola filter. Also fixes Keboola's "Custom SQL" registration mode, which
-  422'd on every submit — a Keboola materialized row's `source_query` is a
-  Storage API JSON filter, not SQL; the mode is renamed "Filtered export"
-  and reuses the existing structured where_filters builder. Databricks has
-  no catalog-browse endpoint yet, so its tables are still added by name (in
-  the same multi-select flow) rather than browsed — tracked as a follow-up.
-
-- **The chat agent's file-handover rule now covers the case that actually
-  failed: a skill writing its output next to its own scaffolds.** The
-  sandbox-only `Files you produce` section already named `outputs/` as the
-  place to write a deliverable; what it did not say is that a skill whose
-  scaffolds live under `.claude/skills/<name>/` must still write its *output*
-  to `outputs/` — which is exactly what the repro did, producing a file no
-  surface could show. `outputs/` is the one location all three collectors
-  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
-  file browser lists the workspace tree while filtering dot-directories, and
-  the host walk lists the session dir. The section also now tells the agent
-  not to promise a download control it cannot see from inside the sandbox, and
-  keeps the chart/document split explicit. Sandbox surface only — on a laptop
-  workspace the filesystem IS the user's machine and naming the path is the
-  delivery. Mirrored across both prompt files
-  (`app/initial_workspace_default/CLAUDE.md` and
-  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
-
 - **The data-package drawer shows the package, not the warehouse.** Its tables
   field rendered the *entire* registry — ~500 rows in a project › bucket tree
   with tri-state boxes — and ticked the members somewhere inside it, so five
@@ -415,7 +227,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   empty composer and the typed prompt was gone. The failure path now puts the
   text back, so a chat backend that is down costs a retry rather than the
   message. Guarded by `tests/test_chat_failed_send_keeps_draft.py`.
-
 - **Clicking an agent card on `/agents` opens its builder, not a chat with it.**
   A ready agent's card used to start a conversation, which meant the one obvious
   gesture on the page whose whole subject is the *configuration* went somewhere
@@ -424,7 +235,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   footer action on every card (draft ones already had it). Nothing became
   unreachable: the composer's own agent picker still opens a session as any
   agent.
-
 - **Fixed: the empty-instance chat landing told the reader something untrue.**
   Its lede read "It knows nothing about your company yet, so it can answer
   nothing", and that second clause is false — with no data registered {brand}
@@ -440,7 +250,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ("Nothing is registered yet, so nobody can ask anything") and now reads "No
   data connected yet, so answers can't use your numbers". The guards assert the
   scoped claim and refuse either old form.
-
 - **The admin zero state greets the reader like every other chat landing.** It
   opened with an "{instance} · Admin" eyebrow where every other state opens with
   "Good morning, {name}" — two different openers for no benefit to the reader,
@@ -449,7 +258,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   branches, so the only thing that differs between them is the heading and lede
   that genuinely differ. The retired eyebrow's information is not lost: the
   deployment is identified by the rail's wordmark and the footer's build stamp.
-
 - **The chat empty state has a vertical rhythm you can read.** Its spacing was
   inverted: the gap between the composer block and the suggestions (18px) was
   *smaller* than the gaps inside the intro above it (25px, 28px), so eight
@@ -479,7 +287,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     on a shared line and the ringed card read as the heavier of the pair. The
     icon slot is the ring's exact size now (46px, was 40px), and the tools card
     carries a leading mark of its own.
-
 - **`/agents` opens with a "New agent" card instead of a button above the
   grid.** Making an agent lands in the same builder as opening one, so it is the
   same kind of act and belongs in the same row — in the position the eye reaches
@@ -490,7 +297,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   an instance whose every agent is still a draft does not lose it (an empty band
   renders nothing at all). The zero state keeps its own "Build an agent" panel —
   with no grid, there is no first cell for a card to be.
-
 - **The chat empty state is reordered, and the door-cards close the page.** The
   three cards between the heading and the input are now two, and they sit BELOW
   the composer and its suggested questions: greeting, heading, lede — then the
@@ -627,7 +433,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     "Continue setup" link took the PRIMARY fill on card hover, because the
     card-level rule outranked its own `background: none` by one class and painted
     the text link as a dark blue blob.
-
 - **The chat list has one view, and the rail's conversation zone has one door.**
   Three changes to the same surface, all rail-layout instances:
   - **`/chats` drops the list ⇄ grid switch.** A conversation is a title you
@@ -669,7 +474,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     is what left `/chats` unreachable on a first run last time. On an admin page
     the fold is not applied at all: the lists are not rendered there, so the row
     keeps its place at every width.
-
 - **The data-package builder is told what a table IS, not just what it is
   called.** A turn's candidate block carried `id`, `name` and 160 characters
   of description, so "the opportunity tables for sales" could only be
@@ -689,7 +493,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   per table against a list capped at 120, so schemas belong to a narrowing
   step over a shortlist. The wire contract, the propose-never-apply rule and
   `_sanitize_patch` as the trust boundary are unchanged.
-
 - **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
   It used to debounce-PATCH every keystroke, which meant there was never a
   moment at which the owner had *decided* the agent was right, and no honest
@@ -712,7 +515,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     answer as a configuration the server has; opening Preview performs the
     same write Save does, baseline included, rather than previewing a persona
     the agent does not have.
-
 - **`POST /api/agents/{agent_id}/builder/turn` accepts `apply` and `config`.**
   `apply=false` runs the turn and returns the sanitized patch **without**
   writing, which is what lets the page hold an unsaved working copy;
@@ -726,7 +528,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   applied row, so the enforced scope is re-derived at Save rather than at
   each turn — an unsaved patch grants nothing, so nothing is enforced later
   than it is shown.
-
 - **The `/agents` index separates ready agents from drafts, and a card's click
   follows its state.** Ready agents render in a titled band above Drafts.
   Clicking a ready card opens a conversation with that agent (what you came to
@@ -734,10 +535,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   draft opens the builder (what you came to *it* to do) and its footer keeps
   **Chat**. Neither route was lost in either state — marking an agent ready is
   not a one-way door out of the builder, and a draft is still talk-to-able.
-
 - **The builder's two panes are an even 50/50 split.** The configuration was
   previously capped at a third of the width, which left it a cramped sidebar
   while the conversation had room to spare.
+- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
+- **The chat Files drawer got a layout fix and a visual pass.** The file
+  list now flexes across the panel's full remaining height (a fixed `46vh`
+  box left most of the drawer an empty framed rectangle), rows are
+  self-bordered cards with an extension tile, a single-line ellipsized
+  `path · size` hint and compact icon actions (download / save-to-Library /
+  saved-check) instead of two text buttons squeezing the filename; Refresh
+  moved into the header as an icon matching the close button, and the
+  header neutralizes the page-level `header` tag styling that painted a
+  stray divider with a double gap under the title. Engine-backed listings
+  additionally sort `outputs/` deliverables first (they carry no mtime to
+  sort by).
 
 ### Fixed
 - **A failed builder Preview now says why, instead of pointing at the browser
@@ -756,7 +568,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `runner_not_ready` — the 30-second engine-start timeout, usually nobody's
   mistake on a cold instance — gets its own retryable sentence. The whole error
   frame is logged as well, so devtools keeps everything it had.
-
 - **All four conversational builders now say when they are talking to the
   scripted stand-in.** Every turn endpoint has always reported which engine
   answered it — that is the whole point of naming the engine — but only the
@@ -767,7 +578,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   builder gets it by using the shell rather than by remembering, and all four
   word it the same. Guarded by `tests/test_every_builder_names_its_engine.py`,
   which pins both halves — the render and the assignment — for each builder.
-
 - **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
   did not type, not just a `url`.** All three name what the instance dials or
   runs, and only `url` was guarded. `command` and `args` are the sharper pair:
@@ -780,7 +590,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   stays settable the ordinary way: the panel's own inputs. This sanitizer had
   no direct tests while its three siblings all did, which is how the gap
   survived; it has 18 now.
-
 - **Saving in the MCP-source builder is resumable instead of duplicating the
   source.** Save makes up to four calls — register the row, store the secret,
   then one grant per group — so a failure in a later step left a registered
@@ -789,7 +598,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   stored, grant failed" was a duplicate. Save now remembers the row it created
   and resumes from the step that failed, and says so ("The source is registered
   — press Save again to finish the rest").
-
 - **An already-granted group no longer fails a builder save.** Both the
   MCP-source and link-external-apps builders grant in a batch, and a duplicate
   grant answers `409` — which is the end state the save is asking for, not a
@@ -801,7 +609,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   failure names the app → group pairs that are still not granted instead of
   reporting "some grants failed". (The pre-builder `/admin/linked-apps` wizard
   already read 409 as done; the builder that replaced it had lost that.)
-
 - **The local-dev audience switch is admin-gated in code, not only in its
   comment.** Both the partial and `_chrome_ctx` stated the switch was
   LOCAL_DEV_MODE-and-admin, but `dev_preview_available` only ever checked dev
@@ -810,14 +617,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   but the claim now matches the check (`session.user.is_admin`, the same one
   the rail uses). The flag also had a dead first clause whose condition cannot
   be true without its second.
-
 - **Collapsing or expanding a section in the builder's Configuration panel no
   longer scrolls it back to the top.** The toggle rebuilt the whole panel,
   discarding its scroll position — so opening a section near the bottom
   scrolled away from the thing you had just opened. Every section's body is
   always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
   flips the class in place and re-renders nothing.
-
 - **The `/agents` builder's Configuration panel lists what the agent HAS, not
   everything it could have.** Data & resources and Capabilities used to render
   the caller's entire reachable pool — every data package, memory domain and
@@ -830,7 +635,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   things; the picker is the by-hand path. An attached id that has since left
   the caller's scope is still listed, marked *Unavailable*, rather than
   silently dropped — the panel must not disagree with the agent.
-
 - **The builder is full-bleed instead of a card inside the page column.** It
   broke out of the index shell's centred `--width-wide` container (via a
   `body.ag-building` class, cleared on the way back to the list, which is
@@ -839,7 +643,240 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   to 1200px lines. Each section's explanatory sentence moved from the header
   into the body, where it is read when you open the section to act rather than
   wrapping to four lines under all six collapsed titles.
+- A data source whose name is not a valid SQL identifier (e.g. a hyphenated
+  name) was silently skipped during rebuild and the rebuild still reported
+  success — the caller had no way to tell the source was rejected from
+  "source has zero tables". A single-source `rebuild_source()` call now
+  raises a typed error naming the identifier rule instead of returning an
+  empty list; a full multi-source rebuild still skips the bad directory and
+  rebuilds every other valid source, but now attributes the skip
+  (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
+  operator alert now surfaces too.
 
+### Removed
+
+### Internal
+- **Local-dev audience switch on the chat landing page.** Under
+  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
+  Admin | Admin, empty instance | Member" toggle for reviewing each landing
+  state without keeping a second account or mutating data — `?preview=member`
+  hides the admin notice, `?preview=empty` forces it on an instance that has
+  data. It fakes the render only: no repo read is bypassed, nothing is
+  written, and no authority or grant changes. Off the dev gate every value is
+  ignored outright and the toggle is not rendered, so it adds no surface to a
+  real deployment.
+
+## [0.91.0] - 2026-08-28
+
+### Added
+- **Per-trail retention pruning (Track E3 Slice 1), opt-in and off by default.** Generalizes the existing `audit_log` retention pattern (B8) to the other unbounded audit/activity trails: `sync_history` (`retention.sync_history_days`), `llm_usage` (`retention.llm_usage_days`), and `agent_scope_snapshots` (`retention.agent_scope_snapshots_days`) each get a new `SyncStateRepository.prune_history_older_than`/`LlmUsageRepository.prune_older_than`/`AgentsRepository.prune_scope_snapshots_older_than` method (DuckDB + Postgres), dispatched by a generalized `src/audit_retention.py::run_retention_sweep` and run daily by a new `retention-prune` scheduler job (`POST /api/admin/run-retention-prune`). Every new window defaults to `0` = keep forever — nothing is pruned on a freshly-installed instance until an admin sets a window. `sync_state` (current per-table sync status) and the live `agents` table are never touched, only the trail tables themselves. `usage_events`'s pre-existing retention (`USAGE_EVENTS_RETENTION_DAYS` env var, `POST /api/admin/usage/prune`) now also honors an equivalent `retention.usage_events_days` config key (env var still wins when set); `chat_messages` and CLI session JSONLs remain out of scope. See `docs/observability.md`.
+- **Fact graph over Collections — read surface** (`facts.enabled`, off by default; Postgres-only). Typed subjects (facts/edges) extracted from Collections documents, each claim carrying its evidencing document, a verbatim quote and a date. `POST /api/facts/search` (typed subject search with attribute filters, projected per-caller from readable claims), `POST /api/facts/neighbors` (bounded graph traversal, depth ≤2, capped fanout/result, statement-timeout guarded — a node now carries the SAME projected shape `search` returns, aliases and per-caller-projected attrs and claim/quote counts included, and an edge carries its own projected attrs too, so walking the graph no longer needs a follow-up `search`/`claims` round trip per node just to learn its attributes; the projection runs once, after truncation, over the already-capped node/edge set), and `GET /api/facts/{subject_id}/claims` (the caller's readable evidence for one subject) — any authenticated caller, no admin gate; every bit of visibility enforcement lives server-side in the repository, never in a route dependency, so an agent's restricted scope or a group's collection grants are the only thing that decides what a caller sees. A subject under an admin `revealed` correction is served instance-wide without quotes; `restricted`/`wrong` withhold it everywhere; a nonexistent id and an unreadable one are indistinguishable (`404`, never `403`). A fact's visibility (search/neighbors/claims and the orphan sweep) now also counts a readable, non-withheld incident edge's claim as evidence of that fact's own existence — a node created only to anchor an evidenced edge (no evidence of its own, permitted by the producer wire contract) is no longer invisible or garbage-collected; its `attrs` and claim list still project from its own claims only. Honest scope: this is the READ surface only (build order steps 2+3) — the write surface and the CLI/MCP query surface ship alongside it (their own bullets below). DuckDB-backed instances answer a typed `501` (A3 PG-first ratchet). See `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
+- **`agnes facts search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/`fact_claims` (MCP foundation tools) — the query surface over the fact graph** (build order step 6). Facts have no local scope, so unlike `agnes query`'s local/server auto-routing there is no `--scope` flag — every CLI result labels its origin `[server]` on stderr with a hint explaining the deliberate deviation. The MCP tools call `src.repositories.facts_repo()` directly (never an HTTP self-call) with the caller's own resolved principal, so a scoped `AgentPrincipal` sees exactly its own narrowed subset rather than an owner's full authority. A `404` (never `403`) from `neighbors`/`claims` gets one honest hint covering all three indistinguishable causes — wrong id, no readable evidence, or the `facts` feature is off — never a probe that tells them apart. Agent guidance closes the gap an eval run surfaced (facts-on never fabricated but stalled on an aggregation question by reaching for SQL instead of the readable graph, `docs/superpowers/runs/2026-08-28-run-p-planted.md`): the workspace CLAUDE.md gains a `facts.enabled`-gated "Facts — entity and relationship questions" section steering who/what/relationship/aggregation questions to `fact_search`/`fact_neighbors`/`fact_claims` before SQL or document search, with a fallback to Collections search when facts return nothing; the three MCP tools' wire descriptions now open with the same "use this first" framing so a model picking tools by description alone reaches for them.
+- **Fact graph over Collections — eval-critical UI surfaces** (behind the same `facts.enabled` flag, Postgres-only): the collection detail page grows a **Facts** section (fact count by type, a paged per-fact row list with display name/claim/quote counts, same-attribute-key conflicts rendered inline where the fact lives with both values and their evidencing documents' names/dates, and `possible_duplicate_of` review-item rows naming both subjects) — caller-scoped through `facts_repo().collection_facts_summary`, absent entirely (no error, no empty shell) when the flag is off, the backend is DuckDB, or the collection has zero facts. The Library collection card gains a caller-scoped "N files · M facts" count (omitted at zero). `/admin/access` collection rows carry a "⚠ nobody" badge when no group holds a grant on them ("indexed but invisible"). Web chat renders `fact_search`/`fact_neighbors`/`fact_claims` tool calls with a human head ("Searched the knowledge graph" / "Walked related facts" / "Read the evidence"), `fact_claims` results as a quote + document list (open-in-source link only when available, sanitized through the same markdown renderer as every other message body), and an end-of-turn "answered from N documents in M collections you can access" scope line. Connect wizard, source card and ontology builder remain out of scope for this round.
+- **Fact graph over Collections — write surface** (build order step 4, same `facts.enabled`/Postgres-only gate). `POST /api/facts/ingest` — scheduler token or admin PAT, no CLI/MCP by design (a producer contract, not an analyst command) — accepts the crawler's wire format verbatim: `documents[]` (`make_row` rows + `corpus_id`) upsert through the Collections source-anchor mapping; `doc_id` resolves via `corpus_file_sources`, refusing (`400`, itemized) an unresolved id when `documents` is omitted; a claim referencing a not-yet-`indexed` file is `deferred`, never rejected; every quote passes the verbatim gate (a substring of one chunk of the evidencing document's extracted text) before it's stored; `full_documents` replaces a document's whole claim set — every existing claim for it is deleted in one statement before any incoming claim is written, so a subject the re-extraction drops loses its stale claim; the batch as a whole is not one transaction, and does not need to be, because ingest is replayable by construction (union mode merges by `(subject, corpus_file_id, quote_hash)`, so replaying a batch is a true no-op and re-sending a batch that died halfway converges on the same state); unknown node/edge ids mint a new subject + alias, a type disagreement against an existing alias is rejected and itemized, `possible_duplicate_of` edges need no evidence and surface as review items; a same-date attribute conflict introduced by the batch is flagged as a review item, a different-date one silently succeeds (later wins); a functionally single-valued edge type (`facts.single_valued_edges`, default `owned_by`/`for_client`) with more than one distinct dst carrying a live claim — including a dst written by an earlier batch — becomes a `single_valued_conflict` review item too, never persisted and recomputed caller-scoped on the collection detail page the same way `possible_duplicate_of` rows are; batch caps (≤500 documents, ≤5000 claims/request, `413`) and a single document's evidence alone over the claim cap (`422`, never split). Response is the run report (`claims_written`/`claims_rejected`/`deferred`/`subjects_created`/`subjects_deleted`/`corrections_active`/`review_items`). Admin corrections — `PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}` (`wrong`/`restricted`/`revealed`, reasoned, audit-logged) and the producer export `GET /api/facts/corrections` — snapshot a subject's natural keys at write time so a `wrong` correction re-attaches even after its subject is deleted and later re-created under a new id. A post-ingest orphan sweep deletes and counts zero-claim subjects; the same sweep also runs after a file delete through the Collections API (`DELETE /api/collections/{id}/files/{file_id}`) and after a **content replace** — re-uploading a file with different bytes deletes that document's claims at replace time rather than leaving them to the producer's next extraction. A claim quotes a verbatim span of the bytes that are being replaced (and whose blob is unlinked in the same step), nothing in the read path filters on `claims.file_sha256`, and the claims read joins `corpus_files` for the document's *current* name and path — so the deferral window would serve a quote of deleted text under the new document's identity, and keep its subject alive in `search`/`neighbors`, for as long as the producer took to come back (forever, for a file replaced by hand). Fresh claims still arrive only on the next extraction, and replace-mode ingest is unchanged and still idempotent.
+- **`scripts/ontology/import_ontology.py` translates a producer's ontology.yaml into an Agnes semantic-model (Apache Ossie) document** — node types become datasets, edge types become relationships, guidance/rules with no Ossie field fold into `ai_context` verbatim, and every judgment call (a hierarchy inferred from a plain attribute, a wildcard-endpoint relationship) is named in a leftover report printed before writing or posting. Validates against the vendored Ossie schema before writing (`--out`) or importing through `POST /api/admin/semantic-models` (`--server`/`--token`); refuses loudly on a schema-invalid translation. Fact-graph build-order step 1.
+
+- **`scripts/eval/` — the fact-graph evaluation measurement harness, encoding eval workbook v0.2 exactly (EQ0/EQ3/EQ9).** `run_eval.py` drives an eval round from a YAML run-config against the frozen ten-prompt set (`tests/fixtures/eval/workbook_v0_2/`, sha256-pinned — the harness refuses to run on a locally-edited prompt) across five arms: A0 (bare Anthropic API) and A4 (Agnes, via a pluggable surface — `chat` implemented against the same one-shot endpoint `agnes agent ask` uses) run directly; A1/A2/A3 run in external product UIs this harness cannot drive headlessly, so `import-transcript` ingests an operator-pasted transcript into the same machine-readable record shape. `grade.py` produces blind grading sheets (arm identity hidden behind a nonce until scored), computes the composite (seven 0/1/2 dimensions, frozen weights, a governance-gate FAIL zeroing the question), and supports `--llm-assist` grading (always labeled, never a silent substitute for human grading). `decision.py` computes the five pre-registered decision thresholds with PASS/FAIL/incomplete verdicts. `metrics.py` computes EQ3 (precision/recall per fact type) and EQ9 (entity-resolution cluster purity, conflict rate, orphan rate) against the facts REST API's documented response shapes, against a planted ground-truth manifest (`tests/fixtures/eval/ground_truth.schema.json`); EQ3 matches each planted fact at most once, so a second extracted subject for the same planted fact scores as a false positive rather than a second true positive — otherwise duplicated entities, the failure EQ9 exists to measure, would have *raised* the precision the decision thresholds read. Fact-graph build-order step 5.
+
+- **Claude can run through Google Vertex AI — chat and server-side, keyless.**
+  Two new provider switches, both authenticated by Google Application Default
+  Credentials (no Anthropic key anywhere): `chat.llm.provider: vertex` (+
+  `chat.llm.vertex.project_id/region`) flips the chat sandbox CLI into Claude
+  Code's native Vertex gateway mode — requests still egress through the
+  loopback relay to the secret broker, which validates the path's
+  project/region by equality against instance config (a sandbox can never
+  redirect spend), signs upstream calls with a Google OAuth token, and keeps
+  model pinning, monthly token budgets, and the usage ledger working; the
+  kai-agent engine needs no change (the broker rewrites its first-party
+  Messages calls into the Vertex shape). `ai.provider: vertex` (+
+  `ai.vertex.project_id/region`) does the same for every server-side LLM
+  call-site — corporate memory, digests, guardrail reviews, usage-ask, vision
+  OCR, and chat auto-titles. Dated model ids interchange between the
+  first-party (`claude-…-YYYYMMDD`) and Vertex (`claude-…@YYYYMMDD`)
+  spellings everywhere they are compared. Boot refuses `vertex` combined with
+  `workload_identity` or `LLM_DISPATCHER_URL`, and refuses a `project_id` or
+  `region` outside the Google resource-id character set — both are
+  interpolated into the outbound Vertex URL (the region becomes part of the
+  hostname), so a crafted value would otherwise sign a request to a host that
+  is not Google's. The admin readiness page gains vertex rows plus a live
+  test-connection probe. See `docs/cloud-chat.md` → "LLM provider: Google
+  Vertex AI".
+
+- **Instances can opt into GCE deletion protection.** The `customer-instance`
+  module exposes `deletion_protection` on `prod_instance` and on each
+  `dev_instances[]` entry and passes it through to the `google_compute_instance`
+  resource, so a `terraform destroy` (or an accidental `-replace`) is refused by
+  the API until the flag is cleared. Defaults preserve today's behaviour — an
+  instance that does not set it is unprotected, exactly as before.
+
+- **Chat session files now work under the default `kai-agent` provider**
+  (#1611 follow-up). The Files listing/download/save-to-Library routes are
+  provider-aware: engine-backed sessions proxy the engine's sandbox file
+  browser (`GET /api/chat/{id}/sandbox/files` + the new
+  `…/sandbox/file/download`, session-JWT-authed; wire contract in
+  `docs/cloud-chat.md`) instead of walking the host session dir, which under
+  this provider holds only workspace-template symlinks — the pre-fix listing
+  showed hundreds of template files that were not session output. An engine
+  without those routes degrades to an honest "not exposed yet" notice; the
+  kai engine stub gained matching routes and a `deliverable` scenario.
+
+### Changed
+- **A generated file is handed over IN the conversation, as a chip on the
+  answer that produced it.** The turn that writes a deliverable now renders it
+  as a chip under that answer — a filename and a size at rest, with Download
+  and Save to Library appearing on hover or keyboard focus. The file is a
+  result of that turn, so it belongs beside the sentence naming it rather than
+  behind a panel thrown over the conversation, and a chip that says nothing
+  until you reach for it keeps a quiet turn quiet. The drawer stays reachable
+  from the header for everything a session has accumulated (older turns, after
+  a reload); it simply no longer opens itself — this **supersedes** the
+  self-opening drawer released in 0.91.0, so that entry describes the previous
+  behaviour, not the current one. Its rows also stop squeezing
+  the actions beside a wrapping path — in a 380px panel they now sit on their
+  own line under the name.
+- **Admin and workspace pages now use the plain page header.** 25 templates that
+  are lists, tables or editors switch from the bordered gradient hero panel to the
+  plain title + lede that `/library`, `/agents` and `/chats` already render, via the
+  existing `page_hero_plain` opt-in in `_page_hero.html` — no new CSS or components.
+  This closes the most visible reason admin read as an older product than the rest of
+  the app. The hero is kept on `mcp_connect` and `admin_session_detail`, which
+  introduce themselves rather than being workspace pages, and eyebrows are retained
+  everywhere: they carry the admin grouping (Agent Experience, Users & Access).
+- **BREAKING: Databricks Unity Catalog metric views now flow through the
+  semantic-source adapter contract, like Snowflake — no more direct
+  `metric_definitions` writer.** A new `databricks_semantic` adapter
+  (`connectors/databricks/semantic_ossie.py`) composes one Apache Ossie
+  document per metric view (measures → metrics, dimensions → dataset
+  fields, every expression tagged dialect `DATABRICKS`); a metric's
+  dialect expression is the full `SELECT MEASURE(...) FROM <metric view>`
+  statement (not the bare `expr` fragment, which is not runnable on its
+  own), and it projects into `metric_definitions` as a warehouse-only row
+  with a "run server-side" note — Task A's projector, now exercised by a
+  second connector. `POST /api/admin/run-databricks-semantic-layer-refresh`
+  keeps its path, scheduler cadence and single-flight guard, but now
+  registers the workspace as a `connection`-kind semantic source (fixed id
+  `databricks_default`) and syncs it via `src.semantic.transports.
+  import_source` — its response shape changed from the old counters
+  (`created_or_updated`/`pruned`/...) to the generic import report
+  (`models_written`/`models_pruned`/`projection`/...). Rows land stamped
+  `source='ossie_connection'` + `source_ref='databricks_default'` instead
+  of `source='databricks_semantic_layer'` + the workspace host; every
+  refresh reconciles any rows still carrying the old stamp (one-time,
+  idempotent — a no-op once they're gone), so an upgrading instance loses
+  nothing. This was the last connector writing `metric_definitions`
+  directly — every source (native, git, upload, Keboola, Snowflake,
+  Databricks) now goes through the same document → projector pipeline.
+- **Collections file upload now preserves a matched file's id on every
+  re-upload, instead of delete+insert.** `POST /api/collections/{id}/files`
+  gains optional positionally-paired form fields — `source_stable_ids` (+
+  `source_doc_ids`, `source_sha256s`, `document_dates`) — so a doc-sync
+  client can supply a producer's own stable id (e.g. a crawler's delta key)
+  alongside the existing `paths` field. A match is tried on
+  `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
+  as before; either way, the existing `corpus_files` row is now updated IN
+  PLACE — a content-unchanged match against an already-`indexed` row (a
+  rename/move) only refreshes filename/path and skips re-chunking entirely,
+  while a changed-content match purges chunks/derived tables and resets
+  `processing_status` on the SAME row. Content-unchanged against a row whose
+  ingest never completed (`rejected`, `needs_review`, or a parked `pending`)
+  counts as a **retry** instead: the row resets to `pending` and ingestion is
+  re-scheduled, so re-uploading the same bytes after fixing the cause works
+  without a separate `…/reingest` call — a row mid-ingest is left alone. A
+  manual `paths`-only re-upload of a file previously anchored by a stable id
+  now also preserves that row's id, so a hand upload can no longer orphan
+  anything referencing it. Two files sharing a non-blank `source_stable_id`
+  in one batch are rejected up front (`400
+  duplicate_source_stable_id_in_batch`), matching the existing
+  `duplicate_path_in_batch` guard — the second would otherwise overwrite the
+  first's row in place and silently drop its bytes — and a read-only
+  pre-flight resolves every file's target row before anything is stored, so
+  the two collisions that cross the stable-id/path boundary are refused
+  cleanly too: two files landing on the same existing row through different
+  anchors (`400 duplicate_target_row_in_batch`) and a stable-id match whose
+  `path` is already held by another row, which previously violated the
+  `(corpus_id, path)` unique index and surfaced as a `500` with earlier files
+  in the batch already written (`409 path_owned_by_another_file`). The old
+  blob is now unlinked whenever a matched row's `storage_path` moves rather
+  than only when its content changed — blob paths are `{sha256}{ext}` with
+  the extension taken from the filename, so an extension-only rename kept the
+  sha, allocated a new blob and orphaned the old one on disk. On a role-split
+  `api` replica a content-changed re-upload now rides ONE ordered
+  `collections-purge` job carrying `reingest_after_purge=True`, exactly as
+  `…/reingest` already did, instead of enqueueing a bare derived-table purge
+  while running the re-ingest in-process — because the row id (and therefore
+  the derived `table_id`) is now preserved, those two could land in either
+  order and the purge could delete the table the re-ingest had just rebuilt.
+  The stable-id mapping upsert also `COALESCE`s its optional columns, so a
+  rename-only re-sync carrying `source_stable_ids` without `source_doc_ids`
+  no longer resets a stored `source_doc_id` to NULL. The stable-id mapping
+  table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
+  instance returns `501`; omitting the field keeps today's flow unchanged.
+
+- **Session files are a side drawer that opens itself when a deliverable
+  lands.** The Files panel was a modal, which covered the very sentence
+  ("I saved it as …") the reader was checking the list against. It now docks
+  to the trailing edge with no backdrop, the conversation stays readable and
+  scrollable beside it, and where there is room (≥1100px) the composer makes
+  way instead of sitting underneath. The header button carries a count, and a
+  turn that writes a new file under `outputs/` opens the drawer on its own —
+  `outputs/` only, so the scratch files an agent touches mid-task do not
+  interrupt the read. The drawer learns which conversation it is looking at
+  when that conversation **opens**, so the first turn of a fresh chat is the
+  one that opens it (deriving the baseline from the first completed turn put
+  that turn's own deliverable into the baseline, and the commonest case —
+  ask, receive a document — never opened anything), and switching
+  conversations resets the count and reloads an open drawer instead of
+  leaving the previous chat's rows on screen with their old download links.
+- **Table registration: one shared form, two entry points (D4).** The
+  `/admin/tables` "+ Register new table" menu and the onboarding wizard's
+  step 3 now both open the SAME two-pane drawer (browse & multi-select →
+  configure & register) instead of four near-duplicate connector-specific
+  modals plus a separate onboarding auto-register-all. Every registration —
+  from either entry point, for all four connectors — POSTs through the
+  validated `POST /api/admin/register-table`, one row at a time; the
+  onboarding wizard no longer bypasses that validation via
+  `discover-and-register` (the sync-time drift-detection use of that helper
+  is unchanged). A "Select all" checkbox keeps the onboarding one-click
+  path fast — scoped to the rows the search filter leaves visible, and
+  switching connection or dataset clears the previous source's checkmarks,
+  so nothing can be registered that the operator cannot see. Reopening the
+  drawer starts from a clean Configure step rather than the previous
+  registration's description / folder / schedule / SQL / primary key /
+  server-only / Keboola filter. Also fixes Keboola's "Custom SQL" registration mode, which
+  422'd on every submit — a Keboola materialized row's `source_query` is a
+  Storage API JSON filter, not SQL; the mode is renamed "Filtered export"
+  and reuses the existing structured where_filters builder. Databricks has
+  no catalog-browse endpoint yet, so its tables are still added by name (in
+  the same multi-select flow) rather than browsed — tracked as a follow-up.
+
+- **The chat agent's file-handover rule now covers the case that actually
+  failed: a skill writing its output next to its own scaffolds.** The
+  sandbox-only `Files you produce` section already named `outputs/` as the
+  place to write a deliverable; what it did not say is that a skill whose
+  scaffolds live under `.claude/skills/<name>/` must still write its *output*
+  to `outputs/` — which is exactly what the repro did, producing a file no
+  surface could show. `outputs/` is the one location all three collectors
+  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
+  file browser lists the workspace tree while filtering dot-directories, and
+  the host walk lists the session dir. The section also now tells the agent
+  not to promise a download control it cannot see from inside the sandbox, and
+  keeps the chart/document split explicit. Sandbox surface only — on a laptop
+  workspace the filesystem IS the user's machine and naming the path is the
+  delivery. Mirrored across both prompt files
+  (`app/initial_workspace_default/CLAUDE.md` and
+  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
+
+### Fixed
+- **Session files: the workspace template no longer shows up as session
+  output on kai-agent instances.** The exclusion shipped for the host walk,
+  but a `chat.provider: kai-agent` session is listed by the ENGINE's own
+  sandbox browser — which filters dot-directories only, so `.claude` was
+  hidden while `scaffolds/` and `CLAUDE.md` came straight through. Live, that
+  meant a drawer full of `scaffolds/nodejs-dashboard/{package.json,index.html,
+  postcss.config.js,…}` with the user's actual document nowhere in it. The
+  engine walk now skips the same top-level template entries, derived from the
+  same `WORKSPACE_LINK_ENTRIES` source of truth as the host side, and no
+  longer even requests those subdirectories.
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
@@ -1068,15 +1105,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rejected with 400, same as any other unknown section.
 
 ### Internal
-- **Local-dev audience switch on the chat landing page.** Under
-  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
-  Admin | Admin, empty instance | Member" toggle for reviewing each landing
-  state without keeping a second account or mutating data — `?preview=member`
-  hides the admin notice, `?preview=empty` forces it on an instance that has
-  data. It fakes the render only: no repo read is bypassed, nothing is
-  written, and no authority or grant changes. Off the dev gate every value is
-  ignored outright and the toggle is not rendered, so it adds no surface to a
-  real deployment.
 
 - **`docs/llm-routing.md` scrubbed of customer-specific and stale planning
   content.** The provider-selection table and one config-example heading named

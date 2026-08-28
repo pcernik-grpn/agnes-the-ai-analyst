@@ -78,11 +78,37 @@ def _validate_snowflake(config: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _validate_sharepoint(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Mirrors ``connectors.sharepoint.settings.resolve_sharepoint_settings``'s
+    read set: ``tenant_id``/``client_id`` are plain identity fields typed in
+    the connect wizard's step 1 (never travel through a conversation). The
+    certificate itself is never here — it lives in the connection's vault
+    slot (``PUT .../secret``) or the deployment's ``cert_private_key_env``
+    (an admin-writable secret-ref NAME, not a value, so it passes through
+    unvalidated here — the shared allowlist guard runs at the admin-API layer,
+    same as Snowflake/Databricks's token-env fields).
+
+    ``scopes`` (the wizard's step-2/3 output — selected site/library rows,
+    each ``{source_scope_id, display_path, anonymize, collection_id}``) is
+    admin/server-written via the dedicated sharepoint scopes endpoints, not
+    typed by hand, so it also passes through unvalidated here rather than
+    duplicating that shape's ownership.
+    """
+    tenant_id = str(config.get("tenant_id") or "").strip()
+    if not tenant_id:
+        raise ValueError("sharepoint connection requires config.tenant_id")
+    client_id = str(config.get("client_id") or "").strip()
+    if not client_id:
+        raise ValueError("sharepoint connection requires config.client_id")
+    return {**config, "tenant_id": tenant_id, "client_id": client_id}
+
+
 _SPECS: Dict[str, ConnectionSpec] = {
     "keboola": ConnectionSpec("keboola", _validate_keboola),
     "bigquery": ConnectionSpec("bigquery", _validate_bigquery),
     "databricks": ConnectionSpec("databricks", _validate_databricks),
     "snowflake": ConnectionSpec("snowflake", _validate_snowflake),
+    "sharepoint": ConnectionSpec("sharepoint", _validate_sharepoint),
 }
 
 

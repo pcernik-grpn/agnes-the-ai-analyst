@@ -46,6 +46,8 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from app.chat.workdir import WORKSPACE_LINK_ENTRIES
+
 logger = logging.getLogger(__name__)
 
 #: Same posture as the provider's turn calls (kai_engine_provider.py): the
@@ -60,6 +62,21 @@ _MAX_DEPTH = 6
 
 #: Streamed download chunk size.
 _CHUNK_BYTES = 64 * 1024
+
+#: Top-level workspace-TEMPLATE entries, skipped exactly as the host walk skips
+#: them (``app/api/chat_session_files.py``). The engine serves this instance's
+#: own workspace tarball into its sandbox, so the template lands there too —
+#: and the engine's browser filters only DOT-directories, which hides
+#: ``.claude`` but not ``scaffolds/`` or ``CLAUDE.md``. Without this the walk
+#: reported the operator's bundled scaffold as files the conversation
+#: produced: observed on a live kai-agent instance as a listing of
+#: ``scaffolds/nodejs-dashboard/{package.json,index.html,postcss.config.js,…}``
+#: with the user's actual document nowhere in sight.
+#:
+#: Derived from the same source of truth as the host side rather than
+#: re-typed, so a new template entry cannot be filtered on one surface and
+#: leak on the other.
+_TEMPLATE_ENTRIES = frozenset(WORKSPACE_LINK_ENTRIES)
 
 
 class EngineFilesUnavailable(Exception):
@@ -148,6 +165,11 @@ async def fetch_engine_listing(
                     path = entry.get("path")
                     name = entry.get("name")
                     if not isinstance(path, str) or not isinstance(name, str):
+                        continue
+                    # Template, not session output — drop the whole tree at the
+                    # root (a directory the AGENT creates deeper keeps its name
+                    # whatever it is called).
+                    if depth == 0 and name in _TEMPLATE_ENTRIES:
                         continue
                     if kind == "dir":
                         if depth + 1 < _MAX_DEPTH:

@@ -924,6 +924,46 @@ _EXEMPT: dict[str, str] = {
         "keboola-only browse-and-register primitive with no analyst CLI/MCP analogue; "
         "`agnes admin register-table` already covers the actual registration step"
     ),
+    # SharePoint connect wizard (spec 2026-08-27 §13.2) — admin-only browse
+    # and scope-confirmation primitives feeding the wizard's step 2/3, with
+    # no analyst CLI/MCP analogue (the wizard itself is the only client; the
+    # eventual document surface is `agnes facts …`, already triple-surface
+    # in _COHORT above).
+    "/api/admin/sharepoint/connections/{connection_id}/tree": (
+        "live Graph folder-tree browse (sites -> drives -> root children, one level "
+        "per call) for the wizard's step-2 scope picker — admin-only, no analyst "
+        "CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/scopes": (
+        "confirm/list/unselect a scope (site/library/folder -> collection) for the "
+        "wizard's step 2/3 — admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": (
+        "producer handoff: the flat {source_scope_id: collection_id} mapping "
+        "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
+        "admin-only, no analyst CLI/MCP analogue"
+    ),
+    # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
+    # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
+    # ontology is consumed as a semantic model, which has its own surface.
+    "/api/admin/ontology/drafts": (
+        "ontology builder draft CRUD (create/list) — admin-only builder UI, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/ontology/drafts/{draft_id}": (
+        "ontology builder draft read/edit/discard — admin-only builder UI, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/ontology/drafts/{draft_id}/import": (
+        "translate a pasted/uploaded ontology into the unsaved draft — admin-only "
+        "builder action, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/ontology/drafts/{draft_id}/save": (
+        "materialize the frozen draft into a semantic model — admin-only builder "
+        "action; the semantic-model surface is where analysts consume it"
+    ),
+    "/api/admin/ontology/dry-run": (
+        "run the draft's types over one document via the server-side LLM — admin-only "
+        "builder preview, no analyst CLI/MCP analogue"
+    ),
     # Open semantic-layer contract (Task 10) — admin CRUD over the
     # semantic-model registry and its sync sources. The public,
     # resource-gated export endpoint carries the triple-surface contract in
@@ -1180,6 +1220,10 @@ _EXEMPT: dict[str, str] = {
     ),
     "/api/facts/corrections": (
         "producer corrections export (spec §7.4) — scheduler-token-or-admin, no analyst CLI/MCP analogue"
+    ),
+    "/api/facts/ingest-runs": (
+        "persisted ingest run reports (spec §7.2/§13.2) — admin-only, feeds the "
+        "/admin/data-sources source card, not an analyst query surface; no CLI/MCP analogue"
     ),
 }
 

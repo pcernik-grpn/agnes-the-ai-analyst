@@ -153,6 +153,69 @@ class TestSyncOrchestrator:
         tables = orch.rebuild_source("nonexistent")
         assert tables == []
 
+    def test_rebuild_source_invalid_name_raises(self, setup_env):
+        """A caller-supplied source_name that fails identifier validation
+        (e.g. hyphenated, as a producer appending a uuid4 would produce)
+        must fail loudly, not return an empty list indistinguishable from
+        "source has zero tables". Pre-fix this silently returned [] with
+        only a WARNING log — pure data loss for the single-source entry
+        point, since it names exactly one source."""
+        from src.orchestrator import InvalidSourceNameError, SyncOrchestrator
+
+        orch = SyncOrchestrator(analytics_db_path=setup_env["analytics_db"])
+        with pytest.raises(InvalidSourceNameError) as exc_info:
+            orch.rebuild_source("bad-name")
+
+        message = str(exc_info.value)
+        assert "bad-name" in message
+        assert "must match" in message
+
+    def test_rebuild_records_invalid_source_name_as_error(self, setup_env):
+        """A full rebuild() must attribute a skipped invalid-identifier
+        source directory as a failure the caller can inspect via
+        last_rebuild_errors — not just a log WARNING — while still
+        rebuilding every valid source in the same batch."""
+        from src.orchestrator import SyncOrchestrator
+
+        malicious_dir = setup_env["extracts_dir"] / "bad-name"
+        malicious_dir.mkdir()
+        (malicious_dir / "data").mkdir()
+        db_path = malicious_dir / "extract.duckdb"
+        conn = duckdb.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE _meta (
+            table_name VARCHAR, description VARCHAR, rows BIGINT,
+            size_bytes BIGINT, extracted_at TIMESTAMP,
+            query_mode VARCHAR DEFAULT 'local'
+        )"""
+        )
+        conn.execute('CREATE TABLE "orders" (id VARCHAR)')
+        conn.execute("INSERT INTO _meta VALUES ('orders', '', 0, 0, current_timestamp, 'local')")
+        conn.close()
+
+        _create_mock_extract(
+            setup_env["extracts_dir"],
+            "keboola",
+            [{"name": "orders", "data": [{"id": "1"}]}],
+        )
+
+        orch = SyncOrchestrator(analytics_db_path=setup_env["analytics_db"])
+        assert orch.last_rebuild_errors == {}
+        result = orch.rebuild()
+
+        # Still not exposed as a queryable source...
+        assert "bad-name" not in result
+        # ...but the rebuild must attribute the skip, not look clean.
+        assert "bad-name" in orch.last_rebuild_errors
+        assert "must match" in orch.last_rebuild_errors["bad-name"]
+        # A valid source in the same batch still rebuilds.
+        assert "keboola" in result
+
+        # Reset on the next call, not sticky forever.
+        result2 = orch.rebuild()
+        assert "bad-name" not in result2
+        assert "bad-name" in orch.last_rebuild_errors
+
     def test_rebuild_with_remote_tables(self, setup_env):
         from src.orchestrator import SyncOrchestrator
 

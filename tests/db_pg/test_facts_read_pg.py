@@ -1228,6 +1228,66 @@ def test_count_visible_facts_for_collection_zero_when_no_facts(pg_env, repo):
     assert repo.count_visible_facts_for_collection(_dict_user("zoe"), CORPUS_A) == 0
 
 
+# ---------------------------------------------------------------------------
+# count_visible_edges_for_collections — the edge analogue added for the
+# source card's pipeline-strip "edges" number (spec §13.2), added narrowly
+# alongside the existing fact counter above (there was no edge equivalent).
+# ---------------------------------------------------------------------------
+
+
+def test_count_visible_edges_for_collections_is_caller_scoped(pg_env, repo):
+    _seed_full_fixture()
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    src = repo.create_fact(type="engagement")
+    dst = repo.create_fact(type="person")
+    edge_id = repo.create_edge(src=src, type="owned_by", dst=dst)
+    repo.add_claim(edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Owned.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    users_repo().create(id="bob", email="bob@test.com", name="Bob")
+    _make_group_with_grant(pg_env, group_name="edge-group-alice", collection_id=CORPUS_A, member_user_id="alice")
+    _make_group_with_grant(pg_env, group_name="edge-group-bob", collection_id=CORPUS_B, member_user_id="bob")
+
+    alice_counts = repo.count_visible_edges_for_collections(_dict_user("alice"), [CORPUS_A, CORPUS_B])
+    bob_counts = repo.count_visible_edges_for_collections(_dict_user("bob"), [CORPUS_A, CORPUS_B])
+    assert alice_counts == {CORPUS_A: 1, CORPUS_B: 0}
+    assert bob_counts == {CORPUS_A: 0, CORPUS_B: 0}
+
+
+def test_count_visible_edges_for_collections_admin_sees_everything(pg_env, repo):
+    _seed_full_fixture()
+    src = repo.create_fact(type="engagement")
+    dst = repo.create_fact(type="person")
+    edge_id = repo.create_edge(src=src, type="owned_by", dst=dst)
+    repo.add_claim(edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Owned.")
+
+    from src.repositories import user_group_members_repo, user_groups_repo, users_repo
+
+    users_repo().create(id="admin1", email="admin1@test.com", name="Admin")
+    admin_gid = user_groups_repo().get_by_name("Admin")["id"]
+    user_group_members_repo().add_member("admin1", admin_gid, source="test-fixture")
+
+    counts = repo.count_visible_edges_for_collections(_dict_user("admin1"), [CORPUS_A])
+    assert counts == {CORPUS_A: 1}
+
+
+def test_count_visible_edges_for_collections_empty_input_returns_empty(pg_env, repo):
+    assert repo.count_visible_edges_for_collections(_dict_user("nobody"), []) == {}
+
+
+def test_count_visible_edges_for_collections_zero_when_no_edges(pg_env, repo):
+    _seed_full_fixture()
+    from src.repositories import users_repo
+
+    users_repo().create(id="zoe", email="zoe@test.com", name="Zoe")
+    _make_group_with_grant(pg_env, group_name="edge-group-zoe", collection_id=CORPUS_A, member_user_id="zoe")
+    assert repo.count_visible_edges_for_collections(_dict_user("zoe"), [CORPUS_A]) == {CORPUS_A: 0}
+
+
 def test_collection_facts_summary_type_counts_and_paged_facts(pg_env, repo):
     """type_counts + a paged fact row list (type, display name from natural
     key, claim_count, quote_count)."""
