@@ -5586,6 +5586,11 @@
             "title": "Id",
             "type": "string"
           },
+          "is_builtin": {
+            "default": false,
+            "title": "Is Builtin",
+            "type": "boolean"
+          },
           "last_commit_sha": {
             "anyOf": [
               {

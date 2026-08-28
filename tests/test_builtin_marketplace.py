@@ -224,3 +224,96 @@ def test_sync_marketplaces_skips_builtin(tmp_path, monkeypatch):
     assert "normal-mkt" in synced_ids
 
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# sync_one refuses is_builtin rows
+# ---------------------------------------------------------------------------
+
+
+def test_sync_one_refuses_builtin_and_leaves_content_intact(tmp_path, monkeypatch):
+    """`sync_one()` must refuse a built-in row before touching anything.
+
+    `sync_marketplaces()` filtered built-in rows out from the start, but the
+    per-row path (admin "Sync now" button, `agnes admin marketplace sync`) did
+    not. It handed the `builtin://` sentinel to `_sync_spec`, whose clone
+    branch **rmtree's the target directory first** — the baked tree has no
+    `.git`, so `is_git` is False — and only then ran a `git clone` that could
+    never succeed (`git: 'remote-builtin' is not a git command`). Net effect of
+    one click: the seeded content was deleted and the row stamped with a
+    `last_error` the nightly sync never clears.
+    """
+    import pytest
+
+    conn = _setup_duckdb_repos(tmp_path)
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
+
+    from app.utils import get_marketplaces_dir
+    from src.marketplace import (
+        BUILTIN_MARKETPLACE_SLUG,
+        MarketplaceNotSyncable,
+        seed_builtin_marketplace,
+        sync_one,
+    )
+
+    seed_builtin_marketplace()
+    baked = get_marketplaces_dir() / BUILTIN_MARKETPLACE_SLUG
+    assert baked.is_dir(), "precondition: seeding baked the bundled content"
+
+    def fail_if_called(spec):  # pragma: no cover - must never run
+        raise AssertionError(f"_sync_spec must not run for a built-in row: {spec['id']}")
+
+    monkeypatch.setattr("src.marketplace._sync_spec", fail_if_called)
+
+    with pytest.raises(MarketplaceNotSyncable):
+        sync_one(BUILTIN_MARKETPLACE_SLUG)
+
+    # Content survives — this is the destructive half of the bug.
+    assert baked.is_dir(), "refused sync must not delete the baked content"
+    from src.marketplace import PLUGIN_MANIFEST_REL
+
+    assert (baked / PLUGIN_MANIFEST_REL).is_file(), "manifest must survive a refused sync"
+
+    # And the row is untouched: no last_error to leave the marketplace
+    # permanently red in the admin table / "error" in marketplace health.
+    row = conn.execute(
+        "SELECT last_error, last_synced_at FROM marketplace_registry WHERE id = ?",
+        [BUILTIN_MARKETPLACE_SLUG],
+    ).fetchone()
+    assert row[0] is None, f"refused sync must not stamp last_error (got {row[0]!r})"
+    assert row[1] is None, "refused sync must not stamp last_synced_at"
+
+    conn.close()
+
+
+def test_sync_one_still_syncs_normal_rows(tmp_path, monkeypatch):
+    """The guard is scoped to is_builtin — admin-registered rows still sync."""
+    conn = _setup_duckdb_repos(tmp_path)
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
+
+    conn.execute(
+        "INSERT INTO marketplace_registry (id, name, url, is_builtin) "
+        "VALUES ('normal-mkt', 'Normal', 'https://example.test/normal.git', FALSE)"
+    )
+
+    called: list[str] = []
+
+    def fake_sync_spec(spec):
+        called.append(spec["id"])
+        return {"id": spec["id"], "name": spec["id"], "action": "clone", "commit": "a" * 40, "path": "/tmp/x"}
+
+    monkeypatch.setattr("src.marketplace._sync_spec", fake_sync_spec)
+    monkeypatch.setattr("src.marketplace._refresh_plugin_cache", lambda slug, commit_sha=None: 0)
+
+    from src.marketplace import sync_one
+
+    result = sync_one("normal-mkt")
+
+    assert called == ["normal-mkt"]
+    assert result["commit"] == "a" * 40
+
+    conn.close()

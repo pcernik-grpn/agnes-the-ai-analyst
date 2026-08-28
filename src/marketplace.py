@@ -52,6 +52,30 @@ class MarketplaceNotFound(Exception):
     """Raised when a marketplace id is not present in the registry."""
 
 
+class MarketplaceNotSyncable(Exception):
+    """Raised when a sync targets a row that has no git remote to sync from.
+
+    Built-in rows (``is_builtin=TRUE`` — ``agnes-builtin`` and the
+    contributed marketplace) carry a ``builtin://`` sentinel URL: their
+    content is baked from the wheel on boot or written locally, never
+    cloned. ``sync_marketplaces()`` filters them out via
+    ``list_non_builtin()``; this is the same refusal for the per-row path,
+    which is reachable from the admin "Sync now" button and
+    ``agnes admin marketplace sync <slug>``.
+
+    Not a RuntimeError/ValueError subclass on purpose: those two are what
+    ``sync_one()`` catches to stamp ``last_error`` on the registry row, and a
+    refusal must leave no trace on a row it never touched.
+    """
+
+    def __init__(self, marketplace_id: str):
+        self.marketplace_id = marketplace_id
+        super().__init__(
+            f"marketplace {marketplace_id!r} is built-in: its content ships with the "
+            "instance (or is written locally) and has no git remote to sync from"
+        )
+
+
 def is_valid_slug(slug: str) -> bool:
     return bool(_SLUG_RE.match(slug or ""))
 
@@ -807,6 +831,7 @@ def sync_one(marketplace_id: str) -> Dict[str, Any]:
 
     Raises:
         MarketplaceNotFound: if the id isn't registered.
+        MarketplaceNotSyncable: if the row is built-in (no git remote).
         RuntimeError: if the git operation failed (token-redacted).
     """
     from src.repositories import marketplace_registry_repo
@@ -817,6 +842,18 @@ def sync_one(marketplace_id: str) -> Dict[str, Any]:
     spec = repo.get(marketplace_id)
     if not spec:
         raise MarketplaceNotFound(marketplace_id)
+
+    # Built-in rows have a `builtin://` sentinel URL, so `_sync_spec` would
+    # hand it to git, which resolves the scheme to a `git-remote-builtin`
+    # helper that does not exist. That failure alone would be cosmetic — but
+    # the clone path rmtree's the target directory FIRST (the baked tree has
+    # no `.git`, so `is_git` is False), which destroys the seeded content
+    # before the doomed clone even runs. `agnes-builtin` survives to the next
+    # boot re-seed; the contributed marketplace, whose whole contract is
+    # durability across restarts and syncs, does not. Refuse before touching
+    # the filesystem or the registry row.
+    if spec.get("is_builtin"):
+        raise MarketplaceNotSyncable(marketplace_id)
 
     with _lock:
         try:
