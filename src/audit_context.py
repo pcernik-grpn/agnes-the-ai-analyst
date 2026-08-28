@@ -1,7 +1,7 @@
 """Request-scoped timing context for audit rows.
 
 An ASGI middleware (``app/middleware/audit_timing.py``) stamps the request
-start into a contextvar; ``audit_repo().log()`` (both backends) fills
+start into a contextvar; ``AuditRepository.log`` (both backends) fills
 ``duration_ms`` from it when the caller didn't pass one. One change covers
 every HTTP-triggered audit write — no per-endpoint instrumentation.
 
