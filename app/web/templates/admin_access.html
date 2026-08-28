@@ -1013,6 +1013,41 @@
      quieter than the group view's — it belongs to the rows above it rather
      than closing the whole list. */
   .ax-add--bb { margin-top: 4px; border-top: 0; font-size: 12px; padding: 6px 2px; }
+  /* ── Quiet the open group ────────────────────────────────────────────
+     It sat on a white card inside a grey page, so an opened group read as a
+     different surface from the list it belongs to — and five horizontal
+     rules stacked up inside it (identity, People, Access, column header,
+     the dashed Add) doing the work one does.
+
+     The rule kept: the column header's, because it separates labels from
+     data. Everything else is spacing and a small-caps label, which is
+     enough — the eye groups by proximity long before it needs a line. */
+  .ax-gs__body .ax-work,
+  .ax-gs__body .ax-gh { background: none; }
+  .ax-gs__body .ax-gh { border-bottom: 0; padding-bottom: 2px; }
+  .ax-gs__body .dsec,
+  .ax-gs__body .dsec-head { border: 0; background: none; }
+
+  /* The People / Access labels are section markers, not bars: no rule under
+     them, and no chevron competing with the group's own. */
+  .ax-gs__body #ax-sec-people > summary,
+  .ax-gs__body #ax-sec-access > summary { border: 0; }
+  .ax-gs__body #ax-sec-access > summary .dsec-chev,
+  .ax-gs__body #ax-sec-people > summary .dsec-chev { opacity: .35; }
+
+  /* Row hairlines lighten to the faintest token — at this density they are
+     alignment aids, not divisions. The last row needs none: the family below
+     (or the Add row) already ends it. */
+  .ax-r { border-bottom-color: var(--ds-border-light); }
+  .ax-fam .ax-r:last-child { border-bottom: 0; }
+
+  /* Add loses its dashed rule: it is the end of the list, and the list
+     already ended. */
+  .ax-add { border-top: 0; margin-top: 6px; }
+
+  /* The open group keeps ONE marker — a heavier top edge — so you can see
+     which row you are inside while scrolling its contents. */
+  .ax-gs[open] > .ax-gs__hd { background: none; }
 </style>
 {% endblock %}
 
@@ -1719,10 +1754,11 @@
     // much of everything grantable this group actually holds. The same two
     // numbers label the scope segments, so the control says what picking it
     // would show before you pick it.
-    const totalItems = (overview.resources || []).reduce(
-      (n, t) => n + (t.blocks || []).reduce((m, b) => m + (b.items || []).length, 0), 0);
     const held = grantsFor(selectedGroup).length;
-    setAccessHead(`${held} of ${totalItems} granted`);
+    // "7 of 25" counted the instance's whole grantable surface — a
+    // denominator this list stopped showing when it became the holding.
+    // What it holds is the number.
+    setAccessHead(`${held} granted`);
 
     const types = (overview.resources || []).slice().sort((a, b) => {
       const al = a.type_key === LEAD_TYPE ? 0 : 1;
@@ -1959,7 +1995,9 @@
     if (everyone) {
       memberIds = new Set();
       memberSource = new Map();
-      setPeopleHead(`${group.member_count ?? 0} accounts`, "Every account on this instance, automatically.");
+      const _n = group.member_count ?? 0;
+      setPeopleHead(`${_n} ${_n === 1 ? "account" : "accounts"}`,
+                    "Every account on this instance, automatically.");
       host.innerHTML = `
         <div class="ax-res__msg">Membership is automatic — every account on this instance
         is in this group by construction, so there is nothing to add or remove.
