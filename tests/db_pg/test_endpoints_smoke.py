@@ -2864,6 +2864,20 @@ KNOWN_UNTESTED = {
     # `proxy_app` docstring for why) and so never reaches `all_routes`
     # here at all. Behaviour covered in tests/test_data_apps_proxy.py.
     "GET /apps/{slug}",
+    # SharePoint connect wizard admin API (spec 2026-08-27 §13.2) — live
+    # Graph folder-tree browse + scope->collection confirmation. All state
+    # lives in `source_connections.config` (existing JSON column, both
+    # backends) plus ordinary `file_corpora`/`resource_grants` rows (existing
+    # tables) — no new schema surface to verify per-backend. Auth matrix,
+    # typed cert-missing/Graph-error responses (Graph mocked via
+    # httpx.MockTransport), scope->collection idempotency, the no-group
+    # warning, and the corpus-map producer handoff are all covered by
+    # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
+    "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
+    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
 }
 
 

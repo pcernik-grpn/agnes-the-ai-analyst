@@ -1739,6 +1739,38 @@
         "title": "ConfigureRequest",
         "type": "object"
       },
+      "ConfirmScopeBody": {
+        "properties": {
+          "anonymize": {
+            "default": false,
+            "title": "Anonymize",
+            "type": "boolean"
+          },
+          "display_path": {
+            "minLength": 1,
+            "title": "Display Path",
+            "type": "string"
+          },
+          "group_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Group Ids",
+            "type": "array"
+          },
+          "source_scope_id": {
+            "minLength": 1,
+            "title": "Source Scope Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_scope_id",
+          "display_path"
+        ],
+        "title": "ConfirmScopeBody",
+        "type": "object"
+      },
       "ConnectorMeta": {
         "description": "One connector tile's metadata as it appears in the manifest API\nresponse. Field names match the seed's frontmatter shape so the\ncontract documented in ``docs/seed-repo-contract.md`` lines up with\nthe JSON callers see.",
         "properties": {
@@ -27198,6 +27230,363 @@
         "summary": "Transcript",
         "tags": [
           "admin-sessions"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
+      "get": {
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
+        "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Corpus Map",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/scopes": {
+      "delete": {
+        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).",
+        "operationId": "remove_scope_api_admin_sharepoint_connections__connection_id__scopes_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_scope_id",
+            "required": true,
+            "schema": {
+              "title": "Source Scope Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Scope",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants.",
+        "operationId": "list_scopes_api_admin_sharepoint_connections__connection_id__scopes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scopes",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, if given, are applied as ordinary\n``resource_grants`` rows on the collection (step 3) \u2014 additive, never\nreplacing grants set elsewhere (e.g. the collection detail page,\n``/admin/access``).",
+        "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmScopeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Scope",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/tree": {
+      "get": {
+        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). Both -> the drive's root children. Exactly\n\"sites -> drives -> root children, one level per call\" (spec \u00a713.2) \u2014\nthere is no deeper recursive browse; a folder's own children are not\nfetched until the admin picks it.",
+        "operationId": "browse_tree_api_admin_sharepoint_connections__connection_id__tree_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "site_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Site Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "drive_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Drive Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Browse Tree",
+        "tags": [
+          "admin"
         ]
       }
     },

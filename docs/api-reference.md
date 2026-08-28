@@ -1142,6 +1142,45 @@ source lands with **no** `tool_grants`, so nothing is exposed until an admin
 grants the tools to a group. CLI: `agnes admin connection chat-tools [--disable]`.
 Deliberately not MCP-exposed (credential-provisioning exemption, `CONTRIBUTING.md`).
 
+### `/api/admin/sharepoint/connections/{connection_id}` — SharePoint connect wizard (spec 2026-08-27 §13.2)
+
+Admin-only surface behind the "connect → scope → share" file-source wizard on
+`/admin/data-sources`. The SharePoint connection itself is an ordinary
+`source_type=sharepoint` row through `/api/admin/source-connections` (tenant/
+client id, certificate via vault secret or `config.cert_private_key_env`);
+these three routes are the wizard's own steps 2/3.
+
+- /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/scopes
+- /api/admin/sharepoint/connections/{connection_id}/corpus-map
+
+`GET …/tree` browses the live Microsoft Graph folder tree one level per call
+(no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
+libraries; both → the drive's root children) using the connection's resolved
+certificate. A missing/unresolvable certificate is a typed `409
+sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
+rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+
+`GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
+site/library/folder, stored as `{source_scope_id, display_path, anonymize,
+collection_id}` inside the connection's own `config.scopes` (no new table).
+`POST` confirms a scope: creates its collection on first confirmation and
+reuses the same collection on every re-confirmation of the same
+`source_scope_id` (idempotent — a rename/move in the source updates
+`display_path` in place rather than forking a second collection), and
+optionally applies group grants (ordinary `resource_grants` rows on the
+collection — never duplicated onto the scope row itself). The response's
+`no_group_warning` flags a collection with no granted group ("indexed but
+invisible"). `DELETE` (`?source_scope_id=`) unselects a scope — an explicit
+exclusion — without touching its already-created collection.
+
+`GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
+collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
+crawling moves inside Agnes.
+
+Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
+document surface is `agnes facts …`.
+
 ### `/api/admin/contributed-skills` — Contributed skill management
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.

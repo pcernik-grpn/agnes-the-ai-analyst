@@ -845,6 +845,25 @@ _EXEMPT: dict[str, str] = {
         "keboola-only browse-and-register primitive with no analyst CLI/MCP analogue; "
         "`agnes admin register-table` already covers the actual registration step"
     ),
+    # SharePoint connect wizard (spec 2026-08-27 §13.2) — admin-only browse
+    # and scope-confirmation primitives feeding the wizard's step 2/3, with
+    # no analyst CLI/MCP analogue (the wizard itself is the only client; the
+    # eventual document surface is `agnes facts …`, already triple-surface
+    # in _COHORT above).
+    "/api/admin/sharepoint/connections/{connection_id}/tree": (
+        "live Graph folder-tree browse (sites -> drives -> root children, one level "
+        "per call) for the wizard's step-2 scope picker — admin-only, no analyst "
+        "CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/scopes": (
+        "confirm/list/unselect a scope (site/library/folder -> collection) for the "
+        "wizard's step 2/3 — admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": (
+        "producer handoff: the flat {source_scope_id: collection_id} mapping "
+        "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
+        "admin-only, no analyst CLI/MCP analogue"
+    ),
     # Open semantic-layer contract (Task 10) — admin CRUD over the
     # semantic-model registry and its sync sources. The public,
     # resource-gated export endpoint carries the triple-surface contract in
