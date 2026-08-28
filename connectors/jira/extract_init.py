@@ -51,18 +51,31 @@ def _view_sql(table_name: str, glob_path: str) -> str:
     )
 
 
-def _rebuild_view_and_stats(conn, table_name: str, table_dir: Path) -> tuple[int, int]:
+def _rebuild_view_and_stats(conn, table_name: str, table_dir: Path) -> tuple[int | None, int]:
     """Recreate a table's view and return its ``(rows, size_bytes)``.
 
     ``(0, 0)`` when the table has no parquet yet — DuckDB's glob fails on an empty
-    directory, so the view is left uncreated rather than pointing at nothing.
+    directory, so the view is left uncreated rather than pointing at nothing. This is
+    a genuinely empty table, not a failure.
 
-    A failure to build the view is warned about and reported as ``(0, 0)`` rather than
-    raised. That is deliberate, and it makes ``init_extract`` more forgiving than it
-    used to be: it previously created views outside its try, so one unreadable parquet
-    aborted the whole init. ``update_meta`` already swallowed the same failure, and it
-    runs after every webhook transform — so raising here would turn a single corrupt
-    partition into a failing ingest path. The table simply reports zero rows until the
+    ``(None, 0)`` when parquet files exist but the view build/count raised — #1364.
+    DuckDB's own exception already names the offending file (see the WARNING below);
+    the bug this closes was collapsing that into the SAME ``(0, 0)`` an honestly empty
+    table reports, making a corrupt table invisible on the one column an operator
+    would look at. ``None`` is a real "row count unavailable", never silently coerced
+    to ``0`` downstream — ``rows BIGINT`` in ``_meta`` is nullable, and
+    ``src.orchestrator._update_sync_state`` treats a NULL here as "could not count"
+    and flags it via the existing ``sync_state.status``/``error`` columns (the same
+    ones ``GET /api/admin/registry`` / ``agnes admin list-tables`` already surface as
+    ``last_sync_status``/``last_sync_error``) instead of publishing a plain, unflagged
+    zero.
+
+    A failure to build the view is warned about and NOT raised. That is deliberate,
+    and it makes ``init_extract`` more forgiving than it used to be: it previously
+    created views outside its try, so one unreadable parquet aborted the whole init.
+    ``update_meta`` already swallowed the same failure, and it runs after every
+    webhook transform — so raising here would turn a single corrupt partition into a
+    failing ingest path. The table simply reports an unavailable count until the
     parquet is readable again.
     """
     glob_path, files = _table_parquets(table_name, table_dir)
@@ -73,17 +86,25 @@ def _rebuild_view_and_stats(conn, table_name: str, table_dir: Path) -> tuple[int
         rows = conn.execute(f"SELECT count(*) FROM {quote_ident(table_name)}").fetchone()[0]
         return rows, sum(f.stat().st_size for f in files)
     except Exception as e:
-        logger.warning("Could not count rows for %s: %s", table_name, e)
-        return 0, 0
+        logger.warning(
+            "Could not count rows for %s: %s — reporting row count as unavailable, NOT as zero (see #1364).",
+            table_name,
+            e,
+        )
+        return None, 0
 
 
-def _upsert_meta(conn, table_name: str, rows: int, size_bytes: int, now: datetime) -> None:
+def _upsert_meta(conn, table_name: str, rows: int | None, size_bytes: int, now: datetime) -> None:
     """Write a table's catalog row, inserting it when it is not there yet.
 
     An UPDATE alone is not enough: on an instance whose extract.duckdb predates a
     table, `_meta` has no row for it and a bare UPDATE matches nothing, leaving the
     table absent from the catalog (and so unlisted for users) until someone happens
     to re-run ``init_extract``.
+
+    ``rows`` may be ``None`` (#1364) — "the extractor could not count this table's
+    rows this pass", distinct from a genuine ``0``. `_meta.rows` is nullable
+    specifically to carry that distinction through to `_update_sync_state`.
     """
     if conn.execute("SELECT count(*) FROM _meta WHERE table_name = ?", [table_name]).fetchone()[0]:
         conn.execute(

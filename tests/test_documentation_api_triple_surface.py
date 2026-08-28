@@ -994,6 +994,12 @@ _EXEMPT: dict[str, str] = {
         "seam) — admin/scheduler maintenance op, mirrors the run-blocked-purge "
         "/ run-reap-stuck-reviews exemptions; no analyst CLI/MCP analogue"
     ),
+    "/api/admin/run-retention-prune": (
+        "scheduler-driven per-trail retention pruning trigger (Track E3 Slice 1 "
+        "— sync_history / llm_usage / agent_scope_snapshots) — admin/scheduler "
+        "maintenance op, mirrors the run-audit-prune exemption; no analyst "
+        "CLI/MCP analogue"
+    ),
     "/api/chat/journey": (
         "chat-driven onboarding backend foundation — internal state read/write "
         "for the in-chat onboarding UI (a follow-up task), self-scoped to the "

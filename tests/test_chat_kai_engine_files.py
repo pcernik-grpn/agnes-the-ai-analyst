@@ -114,6 +114,38 @@ def test_listing_proxied_from_engine(data_dir: Path, monkeypatch: pytest.MonkeyP
     assert len(seen) == 2  # root + one subdirectory
 
 
+def test_listing_skips_the_workspace_template(data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict) -> None:
+    """The engine serves this instance's own workspace into its sandbox, and
+    its browser filters only DOT-directories — so `.claude` is hidden there
+    but `scaffolds/` and `CLAUDE.md` are not. Observed live: the drawer listed
+    `scaffolds/nodejs-dashboard/{package.json,index.html,…}` and the user's
+    actual document was nowhere in it.
+
+    The host walk already excluded these; the engine path did not, which is
+    why the fix for the host surface did not change what that instance showed.
+    A scaffolds/ subdirectory must not even be REQUESTED — walking it is what
+    produced the rows."""
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.params.get("path") or "")
+        if request.url.params.get("path") == "outputs":
+            return _entries({"name": "report.docx", "path": "outputs/report.docx", "type": "file", "size": 10})
+        if request.url.params.get("path") == "scaffolds":
+            raise AssertionError("walked into the template scaffold tree")
+        return _entries(
+            {"name": "outputs", "path": "outputs", "type": "dir"},
+            {"name": "scaffolds", "path": "scaffolds", "type": "dir"},
+            {"name": "CLAUDE.md", "path": "CLAUDE.md", "type": "file", "size": 25000},
+            {"name": "snapshots", "path": "snapshots", "type": "dir"},
+        )
+
+    client = _make_client(data_dir, monkeypatch, handler)
+    body = client.get(f"/api/chat/sessions/{CHAT_ID}/files").json()
+    assert [f["path"] for f in body["files"]] == ["outputs/report.docx"]
+    assert "scaffolds" not in requested and "snapshots" not in requested
+
+
 def test_listing_engine_404_degrades_to_unsupported(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
 ) -> None:

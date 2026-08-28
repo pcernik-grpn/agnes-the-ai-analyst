@@ -26322,6 +26322,60 @@
         ]
       }
     },
+    "/api/admin/run-retention-prune": {
+      "post": {
+        "description": "Trigger the opt-in retention sweep for ``sync_history``,\n``llm_usage``, and ``agent_scope_snapshots``.\n\nWraps :func:`src.audit_retention.run_retention_sweep`. The scheduler\nservice hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as\n``run-audit-prune``); admins can also run it on demand.\n\nEvery trail's window comes from ``retention.<trail>_days`` in\n``instance.yaml`` and defaults to 0 (keep forever) \u2014 nothing is pruned\nuntil an admin explicitly sets a window. ``audit_log`` has its own\nstandalone job (``run-audit-prune`` above, unchanged); ``usage_events``\nkeeps its own standalone job (``POST /api/admin/usage/prune``) \u2014 see\n``src/audit_retention.py``'s module docstring for why those two aren't\nfolded into this sweep.",
+        "operationId": "run_retention_prune_api_admin_run_retention_prune_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Retention Prune",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/run-session-collector": {
       "post": {
         "description": "Trigger the session-collector job from the scheduler.\n\nWalks /home/*/user/sessions/*.jsonl and copies new files into\n/data/user_sessions/<user>/. Idempotent \u2014 already-collected files\nare skipped.",
@@ -30342,7 +30396,7 @@
     },
     "/api/admin/telemetry/prune": {
       "post": {
-        "description": "Delete usage_events older than USAGE_EVENTS_RETENTION_DAYS.\n\nDefault retention: env var unset or ``0`` \u2192 no pruning (forever).\nDaily rollup tables untouched \u2014 they're tiny and lossy-by-design.",
+        "description": "Delete usage_events older than the configured retention window.\n\nWindow source: ``USAGE_EVENTS_RETENTION_DAYS`` env var (back-compat), or\n``retention.usage_events_days`` in instance.yaml (Track E3 Slice 1) \u2014\nsee ``app.instance_config.get_usage_events_retention_days``. Default\nretention: unset or ``0`` \u2192 no pruning (forever). Daily rollup tables\nuntouched \u2014 they're tiny and lossy-by-design.",
         "operationId": "prune_usage_api_admin_telemetry_prune_post",
         "parameters": [
           {
@@ -35650,6 +35704,7 @@
     },
     "/api/data-apps/{slug}/git-credential": {
       "post": {
+        "description": "Mint the app owner's 24-hour `data-app-git:<slug>` push credential.\n\nDeliberately gated by `get_current_user`, NOT `require_session_token`:\n`agnes app git-credential` authenticates with the PAT `agnes login` wrote\n(`cli/config.py::get_token`), and the same is true of this route's MCP\ntool over the PAT-authenticated SSE transport. Refusing a PAT here would\nbreak a shipped command while changing nothing an attacker can do \u2014 the\ngit surface admits a plain PAT for a push directly\n(`app/api/data_apps_git.py`: `allowed = is_owner or admin`, pinned by\n`tests/test_data_apps_git.py::test_push_allowed_for_owner`), so a PAT\nholder reaches the same repo one `git push` away with no mint call at all.\nThe mint is a convenience wrapper over authority the caller already holds,\nnot the gate that grants it.\n\nWhat the mint DID add was persistence: the credential is its own\n`personal_access_tokens` row, so revoking the PAT that produced it left it\npushing for the rest of its 24 hours. `revocable_credential_id` closes\nthat \u2014 when the caller holds a PAT, the successor is stamped with its id\nand dies with it.",
         "operationId": "mint_git_credential_api_data_apps__slug__git_credential_post",
         "parameters": [
           {

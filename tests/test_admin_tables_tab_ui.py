@@ -214,21 +214,30 @@ def test_admin_tables_no_connector_tab_nav(seeded_app):
 
 
 def test_admin_tables_renders_register_modals_in_dom(seeded_app):
-    """Register / edit modals stay in DOM after the tab nav drop — the
-    `+ Register new table ▾` dropdown items open them by id. Tests for
-    the modal's form fields live in test_admin_tables_ui_materialized."""
+    """D4 — one registration flow: the four connector-specific register
+    modals collapsed into ONE shared drawer (`#registerTableModal`,
+    `_register_table_form.html`), opened via `RegisterTableForm.open(...)`
+    from the `+ Register new table ▾` dropdown items. Edit modals are out
+    of scope for D4 and stay in DOM unchanged. Tests for the shared form's
+    fields live in test_admin_tables_ui_materialized /
+    test_register_table_form.py."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/admin/tables", headers=_auth(token))
     html = r.text
-    assert 'id="registerBqModal"' in html
+    assert 'id="registerBqModal"' not in html
+    assert 'id="registerKeboolaModal"' not in html
+    assert 'id="registerDatabricksModal"' not in html
+    assert 'id="registerSnowflakeModal"' not in html
     assert 'id="editBqModal"' in html
-    assert 'id="registerKeboolaModal"' in html
     assert 'id="editKeboolaModal"' in html
-    assert 'id="registerDatabricksModal"' in html
-    assert 'name="dbxAccessMode"' in html
-    assert 'id="registerDatabricksSubmitBtn"' in html
-    assert 'onclick="registerDatabricksTable()"' in html
+    assert 'id="registerTableModal"' in html
+    assert "openRegisterModal('bigquery')" in html
+    assert "openRegisterModal('keboola')" in html
+    assert "openRegisterModal('databricks')" in html
+    assert "openRegisterModal('snowflake')" in html
+    assert "RegisterTableForm.open({" in html
+    assert "js/register_table_form.js" in html
 
 
 def test_databricks_only_instance_keeps_the_full_register_menu_reachable(seeded_app, monkeypatch):
@@ -395,17 +404,18 @@ def test_admin_tables_shares_the_data_page_head(seeded_app):
 def test_register_opens_in_the_shared_drawer(seeded_app):
     """Registering a table is a SETUP flow, and setup flows in this product
     open from the right — the same `.ds-drawer` chrome Connect-source, the
-    Add-data wizard and the group editor use. Both register surfaces moved
-    off `.modal-overlay`; every field id is unchanged."""
+    Add-data wizard and the group editor use. D4 collapsed the two
+    connector-specific register drawers this test used to check into ONE
+    (`#registerTableModal`), generic across all four connectors."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     html = c.get("/admin/tables", headers=_auth(token)).text
-    for mid in ("registerBqModal", "registerKeboolaModal"):
-        assert f'class="ds-drawer ds-drawer--wide" id="{mid}"' in html, mid
-        assert f'<div class="modal-overlay" id="{mid}">' not in html, mid
+    assert 'class="ds-drawer ds-drawer--wide" id="registerTableModal"' in html
+    assert '<div class="modal-overlay" id="registerBqModal">' not in html
+    assert '<div class="modal-overlay" id="registerKeboolaModal">' not in html
     assert "css/drawer.css" in html
-    # The fields the flow is made of survived the chrome swap.
-    for field in ('id="kbViewName"', 'id="kbBucket"', 'id="bqDataset"', 'id="bqViewName"'):
+    # The single form's fields — generic ids, not per-connector clones.
+    for field in ('id="rtfViewName"', 'id="rtfCustomQuery"', 'id="rtfModeGroup"'):
         assert field in html, field
 
 
