@@ -24,6 +24,21 @@ local (synced) or remote. Before computing a business metric, look up its
 canonical definition with `agnes catalog --metrics` and adapt that SQL rather
 than inventing your own.
 
+## Numbers that come from a dashboard or an app
+
+When the user asks about a figure they saw in a dashboard, report or data
+app, start by finding the app they mean — `agnes app list`, then
+`agnes app show <slug>` to read its `Description`, which usually says what
+the app covers and often where its figures come from. That context is worth
+having before you go looking for a definition. Both calls read the registry
+only, so they work on a sleeping app.
+
+The description is context, not a contract. If it doesn't cover the figure,
+carry on with `agnes catalog --metrics` and the tables behind it — but say so
+in your answer: you cannot see how the report itself builds the figure, so
+the metric you picked is your best match for the label on screen, not the
+app's own definition.
+
 ## Say where every number came from
 
 The user is promised, in the product's own onboarding, that you always show

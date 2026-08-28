@@ -14,11 +14,11 @@ from argon2 import PasswordHasher
 from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db
 from app.auth.token_hash import hash_token
+from src.audit_helpers import log_safe
 from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
 from src.user_identity import normalize_email
 
 from src.repositories import (
-    audit_repo,
     user_group_members_repo,
     user_groups_repo,
     users_repo,
@@ -36,23 +36,25 @@ def _audit(
     ``conn`` is ignored — kept for backward-compat signature stability;
     the repo factory picks the right backend per AGNES_DB_URL.
     """
-    try:
-        safe_params = None
-        if params:
-            safe_params = {}
-            for k, v in params.items():
-                if isinstance(v, datetime):
-                    safe_params[k] = v.isoformat()
-                else:
-                    safe_params[k] = v
-        audit_repo().log(
-            user_id=actor_id,
-            action=action,
-            resource=f"user:{target_id}",
-            params=safe_params,
-        )
-    except Exception:
-        pass  # never block the endpoint on audit failure
+    safe_params = None
+    if params:
+        safe_params = {}
+        for k, v in params.items():
+            if isinstance(v, datetime):
+                safe_params[k] = v.isoformat()
+            else:
+                safe_params[k] = v
+    # `log_safe` keeps the "never block the endpoint on audit failure" policy
+    # while still writing a line to the application log. The bare `pass` this
+    # replaces meant a dropped user-management row left no trace anywhere —
+    # the trail could lose the record of who invited whom and nothing, not
+    # even the logs, would say so.
+    log_safe(
+        user_id=actor_id,
+        action=action,
+        resource=f"user:{target_id}",
+        params=safe_params,
+    )
 
 
 class CreateUserRequest(BaseModel):

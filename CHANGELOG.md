@@ -574,6 +574,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The builder's two panes are an even 50/50 split.** The configuration was
   previously capped at a third of the width, which left it a cramped sidebar
   while the conversation had room to spare.
+- **A question about a figure on a dashboard now starts from the data app.** The workspace prompt tells Agnes to find the app the user means
+  (`agnes app list`, `agnes app show <slug>`) and read its description for
+  context before hunting for a definition — both are registry-only reads, so a
+  sleeping app is not woken. When the description doesn't cover the figure,
+  Agnes falls back to `agnes catalog --metrics` as before, but now flags in the
+  answer that it cannot see how the report builds the figure and that the
+  metric it picked is a best match for the label rather than the app's own
+  definition.
 - **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
   now enforced, not just a label.** The credential a running data app calls
   Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
@@ -712,6 +720,34 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   to 1200px lines. Each section's explanatory sentence moved from the header
   into the body, where it is read when you open the section to act rather than
   wrapping to four lines under all six collapsed titles.
+- **A completed sign-in is now recorded in `audit_log`, for every provider.**
+  `login_failed` was the only authentication event the trail carried: the
+  Google, Microsoft, email magic-link and Keboola providers wrote nothing at
+  all on their success paths, and the password provider audited only its
+  failures — so an instance whose people sign in through OAuth could not answer
+  "who signed in, and when" from its own audit log. Both password routes (the
+  browser form and the JSON route used by the CLI/desktop client, distinguished
+  by `client_kind`) and all four OAuth/magic-link callbacks now write a
+  `login_success` row carrying the provider and the trusted client IP. Two
+  adjacent gaps in the same lifecycle close with it: consuming an invite
+  (`/auth/password/setup/confirm`) writes `account_activated` alongside the
+  sign-in it also performs, and the self-service `/auth/password/setup/request`
+  writes `setup_link_requested` — whose anti-enumeration response is identical
+  whether or not the address matched, making the audit row the only place the
+  real outcome is visible. Completing a password reset
+  (`/auth/password/reset/confirm`) and the JSON `/auth/password/setup` sibling
+  both finish a sign-in too — one sets the cookie, the other hands back a
+  bearer token — and both wrote nothing; they record it now, the JSON one as
+  `client_kind="cli"` with `account_activated` beside it, matching its web
+  sibling. Two guards keep this from rotting: one walks `app/auth/providers/`
+  by source rather than a hand-maintained list, so the next provider to mint a
+  session cookie cannot ship without recording it, and a second checks
+  per-FUNCTION — the module-level walk is satisfied the moment a file audits
+  anywhere, which is exactly why those two routes were missed. Separately, the user-management
+  audit helper in `app/api/users.py` swallowed every write failure with a bare
+  `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
+  which keeps the same never-block-the-request policy but leaves a line in the
+  application log when a row is dropped.
 - **The MCP OAuth callback now percent-encodes the client's `state`.** It was
   interpolated raw into the redirect back to the client, so an `&` or `=` inside
   an opaque `state` split into extra query parameters on the client's callback —
