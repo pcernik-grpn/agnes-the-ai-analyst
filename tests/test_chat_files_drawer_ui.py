@@ -478,3 +478,24 @@ def test_sandbox_prompt_no_longer_claims_files_cannot_reach_the_user():
     pick one."""
     template = _read(TEMPLATE)
     assert "any way to hand the user a file" not in template
+
+
+def test_a_long_filename_can_ellipsize_inside_its_chip():
+    """The chip is a flex container and its label sets ``text-overflow:
+    ellipsis``. A flex child defaults to ``min-width: auto`` — its content
+    width — so without an explicit ``min-width: 0`` the label refuses to
+    shrink and a long agent-chosen name overflows the chip instead of
+    truncating. Review finding on this PR; the chip's own ``max-width: 100%``
+    does not help, because the overflow happens inside it.
+    """
+    css = _read(Path("app/web/static/css/chat.css"))
+    chip = re.search(r"\.cloud-chat-file-chip \{([^}]*)\}", css)
+    assert chip and "flex" in chip.group(1), "premise: the chip is a flex container"
+
+    label = re.search(r"\.cloud-chat-file-chip-label \{([^}]*)\}", css)
+    assert label, "the chip label rule must exist"
+    block = label.group(1)
+    assert "text-overflow: ellipsis" in block, "premise: the label truncates rather than wraps"
+    assert re.search(r"min-width:\s*0", block), (
+        "a flex child needs min-width: 0 or the ellipsis never fires"
+    )

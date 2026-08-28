@@ -2782,6 +2782,9 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 .cloud-chat-file-chip-label {
   font-weight: var(--font-semibold);
   color: var(--ds-text-primary);
+  /* A flex child defaults to min-width: auto, which is its content width — the
+     ellipsis below would never fire on a long agent-chosen filename. */
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
