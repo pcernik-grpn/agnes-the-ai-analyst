@@ -359,6 +359,27 @@ class TestAddDataWizard:
         assert 'id="ds-new-master"' in body
         assert "owner" in body  # the copy says WHICH token this is
 
+    def test_the_semantic_opt_ins_link_the_source_to_the_connection(self, seeded_app):
+        """`config: {}` is what the created semantic source carries — the
+        adapters resolve their own credentials — but it must carry the
+        `connection_id` link, or the cross-domain coverage report credits the
+        source to nobody and scores a working semantic layer as missing
+        (src/semantic/coverage.py::_native_semantic_status)."""
+        body = self._page(seeded_app)
+        assert "async function _connectSemanticSource(adapter, label, connectionId)" in body
+        assert "connection_id: connectionId" in body
+        # Both opt-ins pass the row the wizard just saved.
+        assert '_connectSemanticSource("snowflake_semantic", "Snowflake semantics", _sfConnId)' in body
+        assert '_connectSemanticSource("databricks_metric_views", "Databricks semantics", _dbxConnId)' in body
+
+    def test_a_failed_databricks_semantic_optin_is_reported_not_swallowed(self, seeded_app):
+        """The Databricks branch closes the wizard and navigates away, so a
+        discarded failure left a checked box, no error and no semantic layer
+        indistinguishable from success. On failure it stays put and says so."""
+        body = self._page(seeded_app)
+        assert "Databricks connection saved." in body
+        assert "Continue to Tables" in body
+
     def test_bundle_and_share_write_through_the_canonical_apis(self, seeded_app):
         """The wizard must create real packages and real grants — the same
         rows /admin/data-packages and a group's Access tab edit — never a

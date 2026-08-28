@@ -11,11 +11,16 @@ providers below, wrapped, never rewritten.
 Two design rules worth stating, because both were deliberate:
 
 * **``not_applicable`` is not ``missing``.** A BigQuery connection has no
-  semantic-layer adapter in this build at all (three exist:
+  semantic-layer adapter in this build at all (three connector adapters
+  exist — Keboola, Snowflake, Databricks — plus ``native``:
   ``src/semantic/adapters/__init__.py``), so reporting it as "missing" —
   next to an action link into a create flow that does not exist for it —
   would invent work nobody can do. Only a source whose domain COULD be
-  filled reports ``missing``.
+  filled reports ``missing``. The inverse is the trap:
+  ``SEMANTIC_ADAPTER_BY_SOURCE_TYPE`` below is a hand-maintained mirror of
+  that registry, and a source type MISSING from it reports
+  ``not_applicable`` — "no adapter exists for this" — even when one does.
+  Register an adapter, add it here in the same change.
 * **A source's detail is as rich as its connector can compute, never as
   rich as its brand.** The Keboola rows carry a fat ``raw`` payload (token
   identity mismatches, metrics blocked by their own definition,

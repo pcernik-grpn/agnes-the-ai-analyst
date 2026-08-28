@@ -405,10 +405,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   terms, a skill, a specialized agent, and a knowledge base — not only
   Keboola projects, and not only sync-time binding. `not_applicable` marks a
   domain no adapter can fill yet (e.g. BigQuery has no semantic-layer adapter
-  in this build) and is never counted as missing work. Which skill / agent /
-  knowledge domain is *about* a given source is the one input the report
-  cannot derive on its own — record it with `agnes semantic-model coverage
-  tag|untag` (new `resource_source_tags` table). New: `GET /api/admin/
+  in this build) and is never counted as missing work — which makes the
+  source-type→adapter map behind it load-bearing, so all three connector
+  adapters are named in it (`databricks` was absent while
+  `databricks_metric_views` was registered and wired into the connect wizard,
+  so every Databricks connection reported `not_applicable`, the one status
+  telling an admin not to bother) and a new guard pins that map against the
+  adapter registry. Which skill / agent / knowledge domain is *about* a given
+  source is the one input the report cannot derive on its own — record it
+  with `agnes semantic-model coverage tag|untag` (new `resource_source_tags`
+  table). New: `GET /api/admin/
   semantic-model/coverage` (+ `POST`/`DELETE .../coverage/tags`), `agnes
   semantic-model coverage [show|tag|untag]`, MCP `semantic_model_coverage` /
   `semantic_model_coverage_tag` / `semantic_model_coverage_untag`. The
@@ -427,9 +433,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   only. The Snowflake and Databricks connect wizards on `/admin/data-sources`
   now offer an "Also sync semantic views" opt-in, mirroring Keboola's
   existing one: checked, it creates (or reuses) a `connection` source for
-  that connector's adapter (`snowflake_semantic` / `databricks_metric_views`)
-  and syncs it immediately. Non-fatal either way — skipped or failed, the new
-  page is where to set it up or retry.
+  that connector's adapter (`snowflake_semantic` / `databricks_metric_views`),
+  links it to the connection it was checked on (`config.connection_id`, which
+  is what the coverage report scores against — an unlinked source is credited
+  to no connection and a working semantic layer reads as missing), and syncs
+  it immediately. Non-fatal for the connection either way — skipped or
+  failed, the new page is where to set it up or retry — but the Databricks
+  branch, which closes the wizard and navigates away, now reports a failed
+  opt-in in place instead of discarding it, since a checked box with no error
+  and no semantic layer is indistinguishable from success.
+  `DatabricksMetricViewAdapter` takes only scope from its config
+  (`catalogs`/`catalog`, plus `connection_id` to pin which workspace — a
+  stale or wrong-typed id is refused by name rather than falling back to the
+  default connection) and resolves host/warehouse/token from the Databricks
+  connection like every other Databricks code path, as the Snowflake adapter
+  next door already did. It previously **required**
+  `config['host'/'warehouse_id'/'token']` and so could never sync from the
+  wizard's credential-free source at all — and a semantic source row is the
+  wrong place for a workspace token regardless, since
+  `GET /api/admin/semantic-sources` returns configs.
 
 - **Semantic-layer health: is what exists broken, stale, or inconsistent.**
   `GET /api/admin/semantic-layer/health` (`agnes semantic-model health`, MCP
@@ -655,22 +677,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
-
-- **Databricks "sync semantic views" wizard checkbox is now functional.**
-  `DatabricksMetricViewAdapter.extract` (`connectors/databricks/
-  semantic_ossie.py`) previously required `host`/`warehouse_id`/`token` in
-  the `semantic_sources` row's `config`, but the wizard checkbox (`app/web/
-  templates/admin_data_sources.html`) creates that row with `config={}` —
-  the same shape the Snowflake checkbox uses — so every wizard-triggered
-  Databricks sync failed silently. The adapter now falls back to
-  `connectors.databricks.semantic_layer.resolve_databricks_settings()` for
-  any field missing from `config`, the instance's own Databricks connection,
-  matching `SnowflakeSemanticAdapter.extract`'s existing "credentials never
-  live in a semantic source's config" contract. Also: `SEMANTIC_ADAPTER_BY_
-  SOURCE_TYPE` (`src/semantic/coverage.py`) was missing a `"databricks"`
-  entry despite the `databricks_metric_views` adapter being registered, so
-  every Databricks connection's cross-domain coverage report always showed
-  `not_applicable` ("no adapter") instead of a real semantic-coverage status.
 
 - **Keboola-imported column descriptions now actually surface somewhere.**
   `project_document`'s column leg (`src/semantic/projection.py`) wrote

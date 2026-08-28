@@ -144,107 +144,171 @@ class TestExtractDocuments:
         assert counters["metric_views_seen"] == 0
 
 
+_SETTINGS = {
+    "host": "https://dbc-test.cloud.databricks.com",
+    "warehouse_id": "wh-1",
+    "catalog": "main",
+    "catalogs": ["main"],
+    "token": "tok",
+}
+
+
+def _settings(monkeypatch, value=None):
+    """Point the adapter's credential resolution at fixed settings.
+
+    The adapter never reads credentials out of its own config (see the class
+    docstring), so every extract test has to say what the instance's
+    Databricks connection resolves to — including the tests that say it
+    resolves to nothing.
+    """
+    monkeypatch.setattr(
+        "connectors.databricks.semantic_layer.resolve_databricks_settings",
+        lambda connection=None: value,
+    )
+
+
 class TestAdapterExtract:
-    def test_extract_returns_documents_only_discarding_counters(self):
-        adapter = DatabricksMetricViewAdapter()
-        docs = adapter.extract(
-            {
-                "host": "https://dbc-test.cloud.databricks.com",
-                "warehouse_id": "wh-1",
-                "catalogs": ["main"],
-                "token": "tok",
-                "client": FakeStatementClient(),
-            }
-        )
-        assert len(docs) == 1
-        assert validate_document(docs[0]).ok
+    """The adapter's config carries SCOPE only.
 
-    def test_accepts_a_single_catalog_key(self):
-        adapter = DatabricksMetricViewAdapter()
-        docs = adapter.extract(
-            {
-                "host": "https://dbc-test.cloud.databricks.com",
-                "warehouse_id": "wh-1",
-                "catalog": "main",
-                "token": "tok",
-                "client": FakeStatementClient(),
-            }
-        )
-        assert len(docs) == 1
+    Regression boundary: the connect wizard's "Also sync semantic views"
+    opt-in creates this source with an empty config and syncs it immediately,
+    so an adapter that demanded `config['host'/'warehouse_id'/'token']` could
+    never succeed from that flow — it raised before issuing a statement, and
+    the wizard swallowed the failure as non-fatal. Credentials resolve from
+    the connection instead, the way the Snowflake adapter next door already
+    did.
+    """
 
-    def test_missing_connection_fields_raises(self):
-        import pytest
-
-        adapter = DatabricksMetricViewAdapter()
-        with pytest.raises(ValueError):
-            adapter.extract({"host": "h", "token": "t"})
-
-    def test_missing_catalogs_raises(self):
-        import pytest
-
-        adapter = DatabricksMetricViewAdapter()
-        with pytest.raises(ValueError):
-            adapter.extract({"host": "h", "warehouse_id": "w", "token": "t"})
-
-    def test_empty_config_falls_back_to_the_connection_settings(self, monkeypatch):
-        """The Databricks "sync semantic views" wizard checkbox creates the
-        ``semantic_sources`` row with ``config={}`` — same as the Snowflake
-        checkbox does for ``snowflake_semantic``. Snowflake's adapter never
-        needed credentials in config because it always resolves fresh from
-        ``resolve_snowflake_settings()``; this pins the Databricks adapter to
-        the same contract so the wizard checkbox is functional without the
-        admin re-pasting host/warehouse_id/token a second time.
-        """
-        monkeypatch.setattr(
-            "connectors.databricks.semantic_layer.resolve_databricks_settings",
-            lambda: {
-                "host": "https://dbc-test.cloud.databricks.com",
-                "warehouse_id": "wh-1",
-                "catalog": "main",
-                "catalogs": ["main"],
-                "token": "tok",
-            },
-        )
+    def test_an_empty_config_syncs_off_the_instance_connection(self, monkeypatch):
+        """The wizard's exact payload: `config: {}`, nothing else."""
+        _settings(monkeypatch, _SETTINGS)
         client = FakeStatementClient()
-        adapter = DatabricksMetricViewAdapter()
-        # `client` is still an explicit override (tests never hit the network);
-        # every credential/scope field is resolved from the connection.
-        docs = adapter.extract({"client": client})
+        monkeypatch.setattr(
+            "connectors.databricks.client.DatabricksStatementClient",
+            lambda **_kwargs: client,
+        )
+
+        docs = DatabricksMetricViewAdapter().extract({})
+
         assert len(docs) == 1
         assert validate_document(docs[0]).ok
 
-    def test_explicit_config_wins_over_the_connection_settings(self, monkeypatch):
-        """An explicit config value (e.g. a future non-wizard caller) is
-        never silently overridden by the connection's own settings."""
-        monkeypatch.setattr(
-            "connectors.databricks.semantic_layer.resolve_databricks_settings",
-            lambda: {
-                "host": "https://wrong.cloud.databricks.com",
-                "warehouse_id": "wrong-wh",
-                "catalog": "wrong",
-                "catalogs": ["wrong"],
-                "token": "wrong-tok",
-            },
-        )
+    def test_the_resolved_credentials_reach_the_statement_client(self, monkeypatch):
+        _settings(monkeypatch, _SETTINGS)
+        seen = {}
+
+        def _client(**kwargs):
+            seen.update(kwargs)
+            return FakeStatementClient()
+
+        monkeypatch.setattr("connectors.databricks.client.DatabricksStatementClient", _client)
+
+        DatabricksMetricViewAdapter().extract({})
+
+        assert seen == {
+            "host": _SETTINGS["host"],
+            "token": _SETTINGS["token"],
+            "warehouse_id": _SETTINGS["warehouse_id"],
+        }
+
+    def test_extract_returns_documents_only_discarding_counters(self, monkeypatch):
+        _settings(monkeypatch, _SETTINGS)
         adapter = DatabricksMetricViewAdapter()
-        docs = adapter.extract(
-            {
-                "host": "https://dbc-test.cloud.databricks.com",
-                "warehouse_id": "wh-1",
-                "catalogs": ["main"],
-                "token": "tok",
-                "client": FakeStatementClient(),
-            }
-        )
+        docs = adapter.extract({"catalogs": ["main"], "client": FakeStatementClient()})
+        assert len(docs) == 1
+        assert validate_document(docs[0]).ok
+
+    def test_accepts_a_single_catalog_key(self, monkeypatch):
+        _settings(monkeypatch, _SETTINGS)
+        adapter = DatabricksMetricViewAdapter()
+        docs = adapter.extract({"catalog": "main", "client": FakeStatementClient()})
         assert len(docs) == 1
 
-    def test_empty_config_with_no_connection_configured_raises(self, monkeypatch):
-        monkeypatch.setattr(
-            "connectors.databricks.semantic_layer.resolve_databricks_settings",
-            lambda: None,
+    def test_a_config_catalog_scope_narrows_the_connection_default(self, monkeypatch):
+        """Scope IS the adapter's config; it wins over the connection's own
+        catalog list, which is the whole point of having it."""
+        _settings(monkeypatch, {**_SETTINGS, "catalogs": ["main", "other"]})
+        client = FakeStatementClient()
+
+        DatabricksMetricViewAdapter().extract({"catalogs": ["other"], "client": client})
+
+        assert any("`other`.information_schema" in s for s in client.statements)
+        assert not any("`main`.information_schema" in s for s in client.statements)
+
+    def test_credentials_in_the_config_are_ignored_not_honored(self, monkeypatch):
+        """A semantic source row must never become a second place a workspace
+        token is stored — same rule as the Snowflake adapter."""
+        _settings(monkeypatch, _SETTINGS)
+        seen = {}
+
+        def _client(**kwargs):
+            seen.update(kwargs)
+            return FakeStatementClient()
+
+        monkeypatch.setattr("connectors.databricks.client.DatabricksStatementClient", _client)
+
+        DatabricksMetricViewAdapter().extract(
+            {"host": "https://evil.example.com", "token": "leaked", "warehouse_id": "wh-other"}
         )
+
+        assert seen["host"] == _SETTINGS["host"]
+        assert seen["token"] == _SETTINGS["token"]
+        assert seen["warehouse_id"] == _SETTINGS["warehouse_id"]
+
+    def test_unconfigured_databricks_raises(self, monkeypatch):
         import pytest
 
-        adapter = DatabricksMetricViewAdapter()
-        with pytest.raises(ValueError, match="host"):
-            adapter.extract({})
+        _settings(monkeypatch, None)
+        with pytest.raises(RuntimeError, match="not configured"):
+            DatabricksMetricViewAdapter().extract({})
+
+    def test_missing_catalogs_raises(self, monkeypatch):
+        import pytest
+
+        _settings(monkeypatch, {**_SETTINGS, "catalog": "", "catalogs": []})
+        with pytest.raises(ValueError, match="catalog"):
+            DatabricksMetricViewAdapter().extract({"client": FakeStatementClient()})
+
+    def test_a_pinned_connection_id_is_the_one_resolved(self, monkeypatch):
+        seen = {}
+
+        def _resolve_connection(source_type, connection_id):
+            seen["args"] = (source_type, connection_id)
+            return {"id": connection_id, "source_type": "databricks", "config": {}}
+
+        monkeypatch.setattr("src.connection_resolver.resolve_connection", _resolve_connection)
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda connection=None: {**_SETTINGS} if connection else None,
+        )
+
+        docs = DatabricksMetricViewAdapter().extract({"connection_id": "conn-dbx", "client": FakeStatementClient()})
+
+        assert seen["args"] == ("databricks", "conn-dbx")
+        assert len(docs) == 1
+
+    def test_a_pinned_connection_of_another_type_is_refused_by_name(self, monkeypatch):
+        """`resolve_connection` looks an explicit id up by id alone, so it will
+        happily hand back a Snowflake row. Reading its config would report
+        "Databricks is not configured" about a connection that exists."""
+        import pytest
+
+        monkeypatch.setattr(
+            "src.connection_resolver.resolve_connection",
+            lambda *_a, **_k: {"id": "conn-sf", "source_type": "snowflake", "config": {}},
+        )
+        _settings(monkeypatch, _SETTINGS)
+
+        with pytest.raises(RuntimeError, match="not a Databricks one"):
+            DatabricksMetricViewAdapter().extract({"connection_id": "conn-sf"})
+
+    def test_a_pinned_connection_that_is_gone_raises_instead_of_falling_back(self, monkeypatch):
+        """Falling through to the default connection would sync a DIFFERENT
+        workspace's metric views under this source's provenance, silently."""
+        import pytest
+
+        monkeypatch.setattr("src.connection_resolver.resolve_connection", lambda *_a, **_k: None)
+        _settings(monkeypatch, _SETTINGS)
+
+        with pytest.raises(RuntimeError, match="no longer exists"):
+            DatabricksMetricViewAdapter().extract({"connection_id": "conn-gone"})
