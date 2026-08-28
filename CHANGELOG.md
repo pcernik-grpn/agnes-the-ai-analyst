@@ -41,6 +41,245 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- The profiler worker subprocess crashed with `TypeError: Object of type
+  Decimal is not JSON serializable` when a profiled table had DECIMAL/NUMERIC
+  columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
+  stdout `json.dumps` now uses the same `default=str` handler as the
+  parent-side profile writer.
+- The group picker on `/admin/users/{id}` ("Add to group") showed only its
+  first option under themes that render the custom dropdown: the section
+  card's `overflow: hidden` clipped the popover at the card's bottom edge,
+  leaving every option past it invisible with no scroll or affordance. The
+  card's clip now yields while a dropdown menu inside it is open
+  (`section_card.css`), which fixes every ds-dropdown near the bottom of any
+  section card, not just this picker.
+- **MCP foundation-tool errors now carry the server's remedy, and the chat
+  approval card says what it is approving.** Every foundation tool used a bare
+  `raise_for_status()`, so a 4xx surfaced to the model as a generic
+  `Client error '400 Bad Request' for url …` while the response's `detail` —
+  the actionable part, e.g. `invalid_category` with the list of valid
+  categories — was discarded; the shared helper now appends it, letting the
+  model self-correct instead of dead-ending. The chat approval card now names
+  the tool being approved in its title (it previously said only "Approval
+  required", forcing the reader to infer the tool from a neighbouring card),
+  a no-args engine tool call no longer renders a code block containing just
+  `{}`, JSON args are pretty-printed, and while a call waits on the decision
+  its tool card reads "waiting for approval" instead of a contradictory
+  "running…".
+- **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
+  values.** Vertex validates the `anthropic-beta` header and refuses the whole
+  request on any value it does not recognize (the first-party API ignores
+  unknowns), and the kai-agent engine's SDK sends first-party betas like
+  `advisor-tool-2026-03-01` — so on `chat.llm.provider: vertex` every engine
+  chat turn died with `400 Unexpected value(s) … for the anthropic-beta
+  header`. The broker now filters the header in vertex mode to the values the
+  Vertex endpoint accepts (renaming where its spelling differs, e.g.
+  `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`), drops the
+  rest (logged; default-deny, so a future unknown beta degrades one optional
+  feature instead of 400-ing every turn), and omits the header entirely when
+  nothing survives.
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
+- **A failed builder Preview now says why, instead of pointing at the browser
+  console.** Reported from a deployed instance: the agent builder's Preview
+  answered "The preview could not answer. The details are in the browser
+  console." — useless to the author, to the person they reported it to, and to
+  the engineer after that. Reproducing it against the scripted engine showed
+  what the copy was discarding: an `engine_error` frame carrying
+  `engine refused the turn (500): {"detail":"… KAI_HOST_JWT_SECRET is unset …
+  Set the SAME value here and on the Agnes process …"}` — a complete diagnosis,
+  thrown away because `engine_error` matched none of the recognised patterns
+  and the fallback named devtools rather than the reason. The unrecognised case
+  now puts the engine's own words on screen (unwrapping the upstream's JSON
+  `detail`, keeping the prefix that says which step failed), `kind` is read as
+  well as `message` since several frames carry the useful half in the kind, and
+  `runner_not_ready` — the 30-second engine-start timeout, usually nobody's
+  mistake on a cold instance — gets its own retryable sentence. The whole error
+  frame is logged as well, so devtools keeps everything it had.
+- **All four conversational builders now say when they are talking to the
+  scripted stand-in.** Every turn endpoint has always reported which engine
+  answered it — that is the whole point of naming the engine — but only the
+  Library and MCP-source builders rendered it; the agents and data-package
+  builders took `engine` off the wire and dropped it, so on those two a stub
+  still passed for a real model. The notice moved into the shared shell
+  (`BuilderShell.engineNotice`), replacing two near-identical copies, so a
+  builder gets it by using the shell rather than by remembering, and all four
+  word it the same. Guarded by `tests/test_every_builder_names_its_engine.py`,
+  which pins both halves — the render and the assignment — for each builder.
+- **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
+  did not type, not just a `url`.** All three name what the instance dials or
+  runs, and only `url` was guarded. `command` and `args` are the sharper pair:
+  on `stdio` transport they are what reach `StdioServerParameters` and are
+  launched as a subprocess on the server, so a patched `command` chooses the
+  binary — and `args` alone is enough, since a benign `npx` or `node` the admin
+  typed will run whatever it is handed. All three are now accepted only when
+  they read exactly as the draft already holds them, so a patch echoing the
+  panel back is harmless and a patch inventing a target is a no-op. Every one
+  stays settable the ordinary way: the panel's own inputs. This sanitizer had
+  no direct tests while its three siblings all did, which is how the gap
+  survived; it has 18 now.
+- **Saving in the MCP-source builder is resumable instead of duplicating the
+  source.** Save makes up to four calls — register the row, store the secret,
+  then one grant per group — so a failure in a later step left a registered
+  source on screen with an error, and pressing Save again re-ran the whole
+  sequence and registered a SECOND source: the only recovery from "secret
+  stored, grant failed" was a duplicate. Save now remembers the row it created
+  and resumes from the step that failed, and says so ("The source is registered
+  — press Save again to finish the rest").
+- **An already-granted group no longer fails a builder save.** Both the
+  MCP-source and link-external-apps builders grant in a batch, and a duplicate
+  grant answers `409` — which is the end state the save is asking for, not a
+  failure. Counting it as one was not cosmetic in the linked-apps builder:
+  `Promise.all` rejects on the first failure, so a single already-granted pair
+  failed the whole save, and every retry then failed identically because the
+  pairs that had succeeded were 409s too — Save became permanently unreachable.
+  Grants are now settled independently, a 409 counts as done, and a partial
+  failure names the app → group pairs that are still not granted instead of
+  reporting "some grants failed". (The pre-builder `/admin/linked-apps` wizard
+  already read 409 as done; the builder that replaced it had lost that.)
+- **The local-dev audience switch is admin-gated in code, not only in its
+  comment.** Both the partial and `_chrome_ctx` stated the switch was
+  LOCAL_DEV_MODE-and-admin, but `dev_preview_available` only ever checked dev
+  mode, so a non-admin on a local instance got the switch. It changes what
+  renders and never any permission, so this was cosmetic rather than a leak —
+  but the claim now matches the check (`session.user.is_admin`, the same one
+  the rail uses). The flag also had a dead first clause whose condition cannot
+  be true without its second.
+- **Collapsing or expanding a section in the builder's Configuration panel no
+  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
+  discarding its scroll position — so opening a section near the bottom
+  scrolled away from the thing you had just opened. Every section's body is
+  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
+  flips the class in place and re-renders nothing.
+- **The `/agents` builder's Configuration panel lists what the agent HAS, not
+  everything it could have.** Data & resources and Capabilities used to render
+  the caller's entire reachable pool — every data package, memory domain and
+  marketplace plugin — as a list of toggles, which made the panel a form to
+  fill in and buried the two or three things actually attached among the
+  dozens that were not. Both sections now show only what is connected (each
+  row's action is *Remove*), with the full pool one click behind a **+** in
+  the section header that opens a searchable picker over the shared
+  `.modal-backdrop` modal. The conversation stays the primary way to attach
+  things; the picker is the by-hand path. An attached id that has since left
+  the caller's scope is still listed, marked *Unavailable*, rather than
+  silently dropped — the panel must not disagree with the agent.
+- **The builder is full-bleed instead of a card inside the page column.** It
+  broke out of the index shell's centred `--width-wide` container (via a
+  `body.ag-building` class, cleared on the way back to the list, which is
+  still a document and keeps its column), so both panes get the screen. The
+  conversation keeps a 780px measure inside its pane so prose does not stretch
+  to 1200px lines. Each section's explanatory sentence moved from the header
+  into the body, where it is read when you open the section to act rather than
+  wrapping to four lines under all six collapsed titles.
+- **A completed sign-in is now recorded in `audit_log`, for every provider.**
+  `login_failed` was the only authentication event the trail carried: the
+  Google, Microsoft, email magic-link and Keboola providers wrote nothing at
+  all on their success paths, and the password provider audited only its
+  failures — so an instance whose people sign in through OAuth could not answer
+  "who signed in, and when" from its own audit log. Both password routes (the
+  browser form and the JSON route used by the CLI/desktop client, distinguished
+  by `client_kind`) and all four OAuth/magic-link callbacks now write a
+  `login_success` row carrying the provider and the trusted client IP. Two
+  adjacent gaps in the same lifecycle close with it: consuming an invite
+  (`/auth/password/setup/confirm`) writes `account_activated` alongside the
+  sign-in it also performs, and the self-service `/auth/password/setup/request`
+  writes `setup_link_requested` — whose anti-enumeration response is identical
+  whether or not the address matched, making the audit row the only place the
+  real outcome is visible. Completing a password reset
+  (`/auth/password/reset/confirm`) and the JSON `/auth/password/setup` sibling
+  both finish a sign-in too — one sets the cookie, the other hands back a
+  bearer token — and both wrote nothing; they record it now, the JSON one as
+  `client_kind="cli"` with `account_activated` beside it, matching its web
+  sibling. Two guards keep this from rotting: one walks `app/auth/providers/`
+  by source rather than a hand-maintained list, so the next provider to mint a
+  session cookie cannot ship without recording it, and a second checks
+  per-FUNCTION — the module-level walk is satisfied the moment a file audits
+  anywhere, which is exactly why those two routes were missed. Separately, the user-management
+  audit helper in `app/api/users.py` swallowed every write failure with a bare
+  `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
+  which keeps the same never-block-the-request policy but leaves a line in the
+  application log when a row is dropped.
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
