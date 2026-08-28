@@ -1,0 +1,441 @@
+/* =====================================================================
+ * builder.css — the builder WORKSPACE: a conversation that writes a
+ * configuration, and the configuration itself.
+ *
+ * Extracted from agents.html so a second builder can host the same shell
+ * instead of copying 200 lines of it. Copying is how the two pages would
+ * drift back apart, which is the whole reason this file exists — see
+ * docs/superpowers/specs/2026-08-26-conversational-entity-builder-design.md.
+ *
+ * Load it from the page's own {% block head_extra %}, next to the page's
+ * remaining inline rules. It is NOT globally imported: only builder pages
+ * pay for it.
+ *
+ * Two deliberate choices worth knowing before you edit:
+ *
+ *   - The `ag-` prefix is historical, not a claim of ownership. Renaming it
+ *     to something neutral touches 586 occurrences across the page's inline
+ *     script and 89 assertions in tests, for a purely cosmetic gain, so it
+ *     was not done as part of the extraction. Read it as "Agnes builder".
+ *   - A few rules here style section BODIES only the agent builder has
+ *     (schedules, admin boundaries). They ride along rather than being
+ *     surgically separated: unused selectors cost a consumer nothing, and
+ *     an interleaved split is exactly the kind of edit that silently drops
+ *     a rule. Separate them when a second page says what it actually needs.
+ *
+ * Colours are `--ds-*` tokens throughout. Keep it that way — a raw hex or a
+ * legacy `var(--primary)` here is a design-system regression that the
+ * template-scoped guards in tests/test_design_system_contract.py cannot see
+ * from a .css file; tests/test_builder_css_tokens.py is what watches this
+ * file instead.
+ * ===================================================================== */
+
+/* Status pill — draft vs ready. */
+.ag-status { font-size: 12px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 2px 10px; flex-shrink: 0; white-space: nowrap; }
+.ag-status--draft { color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); }
+.ag-status--ready { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); border: 1px solid var(--ds-accent-success-line); }
+
+/* ── Builder ── */
+.ag-back { border: none; background: none; color: var(--ds-text-secondary); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; padding: 4px 8px 4px 0; flex-shrink: 0; }
+.ag-back:hover { color: var(--ds-primary); }
+/* One row: leave, identity, state, act. The builder is a workspace now, so
+   the header is chrome above it rather than a page title block. */
+.ag-build-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 2px 0 14px; }
+/* Full-bleed breakout for the builder. Scoped to the body class so the list
+   view — which IS a document — keeps the shared index column untouched. */
+body.ag-building .idx-band-inner { max-width: none; padding: 0; }
+/* Zero, not just the bottom. /agents HIDES this band outright while building,
+   so only its bottom padding ever showed. A builder page whose `page_head`
+   block is empty still RENDERS the band, and its 32px top padding pushed the
+   whole workspace down by exactly that much. */
+body.ag-building .idx-head { padding: 0; }
+/* The head is the only thing still wanting a gutter once the band loses its
+   padding; the work area below deliberately has none. */
+body.ag-building .ag-build-head { margin: 0; padding: 14px 28px; }
+/* A footer under a viewport-height workspace is dead scroll. */
+body.ag-building .idx > footer { display: none; }
+.ag-build-head h2 { font-size: 19px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* What the thing IS, beside the title rather than as a panel section. */
+.ag-build-badge { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.ag-build-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; margin-top: 4px; }
+/* Says why Save is lit. Quiet — it is a state, not a warning. */
+.ag-unsaved { font-size: 12.5px; color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border: 1px solid var(--ds-accent-warn-line); border-radius: var(--ds-radius-pill); padding: 2px 10px; white-space: nowrap; }
+/* Delete sits left of the status button — a real button so it reads as an
+   action next to "Mark ready", but danger-tinted only on hover/focus so it
+   never competes with the primary affordance. */
+.ag-build-actions .ag-del-btn:hover,
+.ag-build-actions .ag-del-btn:focus-visible { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
+
+/* Numbered collapsible sections. */
+/* Sections ARE cards, restored after a flat pass (cc2247518) that put them on
+   the panel separated only by hairlines. The argument for flattening was real —
+   two levels of container for one list, card edges competing with headings —
+   but the cost was worse: with only a hairline, a section's heading, labels,
+   hints and inputs all sit on one grey field, and the white input boxes become
+   the strongest edges on the panel. That puts the emphasis on the fields
+   instead of the structure, and nothing marks where one section ends and the
+   next begins. A card per section is what makes the column scannable. */
+.ag-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
+.ag-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; cursor: pointer; user-select: none; }
+/* Back to the sunken fill: on a white card the badge is the darker thing
+   again, which is what makes it read as a step marker rather than a hole. */
+.ag-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
+.ag-sec-head h3 { font-size: 15px; margin: 0; }
+.ag-sec-head h3 .ag-sec-note { font-weight: 400; color: var(--ds-text-muted); font-size: 13px; margin-left: 4px; }
+.ag-sec-sub { margin: 12px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--ds-text-secondary); }
+.ag-sec-grow { flex: 1; min-width: 0; }
+.ag-sec-sum { font-size: 12.5px; color: var(--ds-text-muted); white-space: nowrap; }
+.ag-sec-chev { color: var(--ds-text-muted); transition: transform var(--ds-motion-fast) var(--ds-ease-standard); }
+.ag-sec-chev svg { width: 16px; height: 16px; display: block; }
+.ag-sec.collapsed .ag-sec-chev { transform: rotate(-90deg); }
+/* The divider comes back with the card: inside a bounded card a rule between
+   the header and the body reads as internal structure, not as a heading cut
+   off from what it names — which is only how it read on the flat panel. */
+.ag-sec-body { padding: 4px 18px 18px; border-top: 1px solid var(--ds-border); }
+.ag-sec.collapsed .ag-sec-body { display: none; }
+.ag-sec.collapsed .ag-sec-head { padding-bottom: 14px; }
+
+/* Fields. */
+.ag-field { display: block; margin: 14px 0 0; }
+.ag-field > span { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--ds-text-primary); }
+.ag-field > span em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
+.ag-field input[type=text], .ag-field textarea { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); resize: vertical; }
+.ag-field input:focus, .ag-field textarea:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+.ag-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.ag-chip { font-size: 13px; font-weight: 500; padding: 5px 13px; border-radius: var(--ds-radius-pill); border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); cursor: pointer; font-family: inherit; }
+.ag-chip.on { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); font-weight: 600; }
+
+/* Ingredient rows (knowledge / capabilities / surfaces). */
+.ag-row { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--ds-border); }
+.ag-row:last-child { border-bottom: none; padding-bottom: 2px; }
+.ag-row-body { flex: 1; min-width: 0; }
+.ag-row-name { font-size: 14px; font-weight: 600; color: var(--ds-text-primary); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ag-row-desc { font-size: 12.5px; color: var(--ds-text-secondary); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ag-row-meta { font-size: 12px; color: var(--ds-text-muted); margin-left: 4px; }
+.ag-kind { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; border-radius: var(--ds-radius-pill); padding: 1px 8px; }
+.ag-kind--data { background: var(--ds-kind-data-soft); color: var(--ds-kind-data); }
+.ag-kind--memory { background: var(--ds-kind-memory-soft); color: var(--ds-kind-memory); }
+.ag-kind--plugin { background: var(--ds-kind-plugin-soft); color: var(--ds-kind-plugin); }
+.ag-kind--skill { background: var(--ds-kind-skill-soft); color: var(--ds-kind-skill); }
+.ag-kind--agent { background: var(--ds-kind-agent-soft); color: var(--ds-kind-agent); }
+.ag-kind--file { background: var(--ds-kind-library-soft); color: var(--ds-kind-library); }
+
+/* Ingredient toolbar — a search box over the (now workspace-wide) pool, so
+   data · memory · files and every available plugin/skill stay scannable. */
+.ag-toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0 4px; }
+.ag-search { flex: 1; min-width: 0; padding: 8px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 13.5px; background: var(--ds-surface); color: var(--ds-text-primary); }
+.ag-search:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+.ag-toolcount { font-size: 12.5px; color: var(--ds-text-muted); white-space: nowrap; flex-shrink: 0; }
+.ag-emptyrows { padding: 16px 2px; font-size: 13px; color: var(--ds-text-muted); }
+/* "Already in your stack" marker — the axis the caller cares about now that
+   the pool is everything available, not just the stack. */
+.ag-instack { font-size: 11px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 1px 8px; color: var(--ds-agnes); background: var(--ds-agnes-soft); border: 1px solid var(--ds-agnes-line); white-space: nowrap; }
+.ag-tglbtn { flex-shrink: 0; font: inherit; font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); cursor: pointer; }
+.ag-tglbtn.on { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+/* Remove is quiet until you reach for it: in the panel every row already
+   IS attached, so a row of loud buttons would be the noisiest thing in the
+   configuration while being the least likely thing anyone wants. */
+.ag-tglbtn--rm { border-color: transparent; color: var(--ds-text-muted); font-weight: 500; }
+.ag-row:hover .ag-tglbtn--rm { border-color: var(--ds-border); color: var(--ds-text-secondary); }
+.ag-tglbtn--rm:hover, .ag-tglbtn--rm:focus-visible { border-color: var(--ds-accent-danger-line); color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
+
+/* The header "+" — the by-hand path into a section's picker. */
+.ag-addbtn { flex-shrink: 0; width: 26px; height: 26px; border-radius: 8px; border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); font: inherit; font-size: 16px; line-height: 1; cursor: pointer; display: grid; place-items: center; }
+.ag-addbtn:hover, .ag-addbtn:focus-visible { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+/* The same action, spelled out, at the end of a list or in an empty slot. */
+.ag-addrow { margin-top: 12px; font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 9px; border: 1px dashed var(--ds-border); background: none; color: var(--ds-text-secondary); cursor: pointer; width: 100%; }
+.ag-addrow:hover, .ag-addrow:focus-visible { border-color: var(--ds-primary); color: var(--ds-primary); border-style: solid; background: var(--ds-primary-light); }
+/* The row is sometimes a link rather than a button — "+ Connect an MCP source"
+   from the linked-apps builder's zero state goes to another page. It has to
+   read as the same control, so it loses the underline and gets the same box. */
+a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-decoration: none; }
+/* Empty section: says what the conversation would do, offers the manual way. */
+.ag-slot { padding: 14px 0 2px; }
+.ag-slot-head { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--ds-text-primary); }
+.ag-slot-body { margin: 4px 0 0; font-size: 12.5px; color: var(--ds-text-secondary); line-height: 1.55; }
+
+/* Picker modal — the full pool, one click behind the "+". Widens and caps
+   the shared .modal-card so a long catalogue scrolls inside the card rather
+   than growing it past the viewport. */
+.ag-pick { max-width: 620px; display: flex; flex-direction: column; max-height: min(76vh, 720px); }
+.ag-pick-head { display: flex; align-items: flex-start; gap: 12px; }
+.ag-pick-head > div { flex: 1; min-width: 0; }
+.ag-pick-head p.sub { margin: 4px 0 0; }
+.ag-pick-x { flex-shrink: 0; border: none; background: none; font: inherit; font-size: 15px; color: var(--ds-text-muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+.ag-pick-x:hover, .ag-pick-x:focus-visible { color: var(--ds-text-primary); background: var(--ds-surface-sunken); }
+.ag-pick-rows { flex: 1; overflow-y: auto; min-height: 120px; }
+.ag-kind--unknown { color: var(--ds-text-muted); background: var(--ds-surface-sunken); }
+.ag-note { font-size: 12.5px; color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 9px; padding: 8px 12px; margin: 12px 0 0; }
+.ag-note a { color: var(--ds-primary); }
+/* Two tints on the neutral note, for the two things a builder has to say that
+   are not standing guidance: a step that failed, and a degraded engine. Both
+   stay the same box — a different SHAPE for an error would read as a different
+   kind of thing, and it is the same sentence slot. */
+/* The interview's progress line. Lived in skills.html's inline <style>, which
+   made it invisible on every other builder that rendered the same markup —
+   "0 of 4still to settle" with no gap and no box was exactly that. */
+.ag-prog {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 14px; padding: 8px 12px;
+  background: var(--ds-surface-sunken); border: 1px solid var(--ds-border);
+  border-radius: 9px; font-size: 12.5px; color: var(--ds-text-secondary);
+}
+.ag-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
+.ag-note--err { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
+.ag-note--warn { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); }
+
+/* Boundaries (read-only, admin-managed). */
+.ag-bnd { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
+.ag-bnd-row { display: flex; justify-content: space-between; gap: 12px; padding: 9px 13px; font-size: 13px; border-bottom: 1px solid var(--ds-border); }
+.ag-bnd-row:last-child { border-bottom: none; }
+.ag-bnd-k { color: var(--ds-text-secondary); }
+.ag-bnd-v { color: var(--ds-text-primary); font-weight: 550; text-align: right; }
+
+/* Schedules (unattended runs). Status chips ride the shared status accent
+   vocabulary; `backlogged` wears the WARN treatment deliberately — it means
+   the previous run is still sitting queued because no worker is claiming
+   agent_response jobs, which an owner must notice, not skim past. */
+.ag-sch-cadence { font-family: var(--ds-font-mono); font-size: 12px; color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 6px; padding: 1px 7px; white-space: nowrap; }
+.ag-sch-status { font-size: 11px; font-weight: 700; letter-spacing: 0.02em; border-radius: var(--ds-radius-pill); padding: 1px 8px; white-space: nowrap; }
+.ag-sch-status--enqueued { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); border: 1px solid var(--ds-accent-success-line); }
+.ag-sch-status--failed { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); }
+.ag-sch-status--backlogged { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border: 1px solid var(--ds-accent-warn-line); }
+.ag-row--sch-off .ag-row-name, .ag-row--sch-off .ag-row-desc, .ag-row--sch-off .ag-sch-last { opacity: 0.55; }
+.ag-sch-last { font-size: 12px; color: var(--ds-text-muted); margin-top: 3px; }
+.ag-sch-acts { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.ag-sch-form { margin-top: 14px; border-top: 1px dashed var(--ds-border); }
+.ag-sch-form h4 { font-size: 13.5px; margin: 14px 0 0; color: var(--ds-text-primary); }
+.ag-field select { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); }
+.ag-field select:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+.ag-hint { display: block; font-weight: 400; font-size: 12px; color: var(--ds-text-muted); margin-top: 5px; line-height: 1.5; }
+.ag-hint code { font-family: var(--ds-font-mono); font-size: 11.5px; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 5px; padding: 0 4px; }
+.ag-sch-en { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ds-text-primary); margin-top: 14px; cursor: pointer; }
+.ag-sch-err { margin-top: 12px; font-size: 13px; color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); border-radius: 9px; padding: 8px 12px; }
+.ag-sch-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+.ag-sch-fine { font-size: 12px; color: var(--ds-text-muted); margin: 0; }
+
+/* ── Builder workspace ──
+   Two panes: a conversation that writes the configuration (left) and the
+   configuration itself, editable by hand (right). The right pane is the
+   source of truth for what the agent IS; the left is one way to fill it in,
+   which is why the panel is never read-only while the assistant is talking.
+   Each pane scrolls independently so a long conversation never pushes the
+   fields off-screen. */
+/* The builder is a workspace, not a document, so it does not sit in a card
+   inside the index shell's centred column — a card-in-a-band spent ~500px
+   of a wide screen on gutters and chrome around the two things that
+   actually need the room. `body.ag-building` (set while the builder view is
+   up, cleared on the way back to the list) drops the shell's max-width and
+   padding so the panes run edge to edge; one hairline divides them and the
+   page border IS the window. Everything is undone on the list view, which
+   is a document and wants its column back. */
+.ag-work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); background: var(--ds-surface); border-top: 1px solid var(--ds-border); min-height: 520px; flex: 1 1 auto; }
+.ag-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.ag-pane--cfg { border-left: 1px solid var(--ds-border); background: var(--ds-surface-sunken); }
+/* Prose does not want the full width of a wide monitor even when the pane
+   has it: the conversation keeps a readable measure and centres, while the
+   pane around it still spans. */
+.ag-conv-in { flex: 1; display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 780px; margin: 0 auto; }
+.ag-comp-in { width: 100%; max-width: 780px; margin: 0 auto; }
+@media (max-width: 900px) {
+  /* Stacked, each pane its own scroll region rather than one long page —
+     the configuration must stay reachable while the conversation runs. */
+  .ag-work { grid-template-columns: 1fr; height: auto; }
+  .ag-pane { max-height: 70vh; }
+  .ag-pane--cfg { border-left: none; border-top: 1px solid var(--ds-border); }
+}
+
+/* Create | Preview switch. */
+.ag-tabs { display: flex; justify-content: center; padding: 14px 16px 10px; }
+.ag-tabs-in { display: inline-flex; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 10px; padding: 3px; gap: 3px; }
+.ag-tab { border: none; background: none; font-family: inherit; font-size: 13.5px; font-weight: 600; color: var(--ds-text-secondary); padding: 6px 20px; border-radius: 8px; cursor: pointer; }
+.ag-tab[aria-selected="true"] { background: var(--ds-surface); color: var(--ds-text-primary); box-shadow: var(--ds-shadow-sm); }
+
+/* Conversation. */
+.ag-conv { flex: 1; overflow-y: auto; padding: 8px 22px 4px; display: flex; flex-direction: column; gap: 16px; }
+.ag-msg { display: flex; gap: 12px; font-size: 14.5px; line-height: 1.6; }
+.ag-msg-dot { width: 20px; height: 20px; border-radius: 6px; background: var(--ds-agnes); flex-shrink: 0; margin-top: 2px; }
+/* Assistant and owner turns are told apart by alignment + surface, never by
+   colour alone. `white-space: pre-wrap` and text-only insertion: replies are
+   rendered as plain text (the assistant is instructed to write prose, and
+   this page has no sanitizer — see the security playbook on innerHTML). */
+.ag-msg-text { min-width: 0; white-space: pre-wrap; color: var(--ds-text-primary); }
+.ag-msg--me { justify-content: flex-end; }
+.ag-msg--me .ag-msg-text { background: var(--ds-primary-light); border: 1px solid var(--ds-primary-line, var(--ds-border)); border-radius: 12px 12px 4px 12px; padding: 9px 13px; max-width: 80%; }
+.ag-msg--busy .ag-msg-text { color: var(--ds-text-muted); font-style: italic; }
+.ag-conv-empty { margin: auto; text-align: center; color: var(--ds-text-muted); font-size: 14px; display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 20px; }
+.ag-conv-empty svg { width: 26px; height: 26px; opacity: 0.55; }
+.ag-conv-empty-ring { width: 62px; height: 62px; border-radius: 50%; border: 1px solid var(--ds-border); display: grid; place-items: center; }
+.ag-conv-err { font-size: 13px; color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); border-radius: 9px; padding: 9px 12px; }
+
+/* Composer + starter chips. */
+.ag-comp { padding: 10px 22px 20px; }
+.ag-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+/* Suggested prompts under the composer. Deliberately the SAME chip as the
+   chat landing screen's "Suggested for you" row (.rdb-action in
+   chat_dashboard.css): both are "things you could say next" sitting under a
+   composer, and shipping two different chips for one idea is how a product
+   stops reading as one system. Copied rather than shared because the two
+   sheets have no common ancestor to hang it on — if a third surface grows
+   one, that is the moment to lift it.
+
+   Softened border and translucent fill so the row stays quiet under the
+   composer, which is the loud element; 11px rather than a pill because these
+   carry a sentence, and a full pill on a long label reads as a tag.
+
+   Scoped to .ag-chips: the bare .ag-chip above is the agent builder's TONE
+   selector, a segmented choice where the pill is right. */
+.ag-chips .ag-chip {
+  border: 1px solid color-mix(in srgb, var(--ds-border) 70%, transparent);
+  background: color-mix(in srgb, var(--ds-surface) 60%, transparent);
+  color: var(--ds-text-secondary);
+  border-radius: 11px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--ds-motion-fast) var(--ds-ease-standard),
+              border-color var(--ds-motion-fast) var(--ds-ease-standard);
+}
+.ag-chips .ag-chip:hover {
+  border-color: var(--ds-primary);
+  background: color-mix(in srgb, var(--ds-primary) 6%, var(--ds-surface));
+  color: var(--ds-text-primary);
+}
+.ag-chips .ag-chip:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+.ag-chip { border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); border-radius: var(--ds-radius-pill); padding: 6px 14px; font-size: 13px; font-family: inherit; cursor: pointer; }
+.ag-chip:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
+.ag-comp-box { display: flex; align-items: flex-end; gap: 8px; border: 1.5px solid var(--ds-primary); border-radius: 12px; background: var(--ds-surface); padding: 7px 7px 7px 14px; }
+.ag-comp-box:focus-within { box-shadow: 0 0 0 3px var(--ds-primary-light); }
+.ag-comp-box textarea { flex: 1; border: none; background: none; resize: none; font-family: inherit; font-size: 14.5px; color: var(--ds-text-primary); padding: 6px 0; max-height: 140px; }
+.ag-comp-box textarea:focus { outline: none; }
+.ag-send { border: none; background: var(--ds-primary); color: var(--ds-text-inverse); font-family: inherit; font-size: 13.5px; font-weight: 600; border-radius: 9px; padding: 8px 16px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
+.ag-send[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+/* Configuration pane. */
+.ag-cfg-head { display: flex; align-items: baseline; justify-content: center; gap: 12px; padding: 18px 16px 16px; border-bottom: 1px solid var(--ds-border); }
+.ag-cfg-head h3 { font-size: 15.5px; margin: 0; color: var(--ds-text-primary); }
+.ag-cfg-head p { font-size: 13px; margin: 0; color: var(--ds-text-muted); }
+.ag-cfg-body { flex: 1; overflow-y: auto; padding: 22px; }
+.ag-cfg-ava { display: flex; justify-content: center; margin-bottom: 22px; }
+.ag-cfg-ava span { width: 74px; height: 74px; border-radius: 50%; border: 1.5px dashed var(--ds-border); display: grid; place-items: center; color: var(--ds-text-muted); }
+.ag-cfg-ava svg { width: 26px; height: 26px; }
+/* A field the assistant just wrote, flagged for one beat so the owner can
+   see WHAT the conversation changed rather than re-reading the whole form. */
+.ag-touched { animation: ag-touch 1.6s var(--ds-ease-standard); }
+@keyframes ag-touch { 0%, 55% { border-color: var(--ds-agnes); box-shadow: 0 0 0 3px var(--ds-agnes-soft); } 100% { border-color: var(--ds-border); box-shadow: none; } }
+
+/* Live preview — a real session with the agent, not a mock of one. */
+.ag-live-note { font-size: 12px; color: var(--ds-text-muted); text-align: center; padding: 0 22px 10px; }
+.ag-live-note a { color: var(--ds-primary); font-weight: 600; text-decoration: none; }
+.ag-live-note a:hover { text-decoration: underline; }
+
+/* ── The drawer, grown into a workspace ──
+   The data-package builder is the same drawer /admin/tables opens from a chip
+   input; from the Library's "+ New" it grows to host these two panes instead.
+   One implementation, two sizes — see package_drawer.js.
+
+   The panel is wider than --wide and the body stops scrolling: the workspace
+   owns the height and each pane scrolls inside it, exactly as on the builder
+   pages. Without this the whole drawer scrolls and the conversation's
+   composer walks off the bottom. */
+.ds-drawer--builder .ds-drawer__panel { width: min(1360px, 100vw); }
+.ds-drawer--builder .ds-drawer__body { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.ds-drawer--builder .ag-work { flex: 1; height: auto; min-height: 0; }
+/* The moved-in form is the configuration pane's content; it keeps the
+   drawer's own field styling and only needs the gutter back. */
+.ds-drawer--builder .ds-drawer__pane { padding: 18px 22px; }
+.pdw-conv { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+@media (max-width: 900px) {
+  .ds-drawer--builder .ds-drawer__body { overflow-y: auto; }
+  .ds-drawer--builder .ag-work { height: auto; }
+}
+
+/* ...and stands back down when it is not the builder.
+   `enterBuilderLayout` restructures the drawer ONCE and leaves the scaffold
+   in place (it now holds the moved-in form), so a later compact open — the
+   chip-input path on /admin/tables — would otherwise inherit a two-column
+   grid squeezed into 600px with a stale conversation beside it. The class is
+   the switch; without it the workspace is a plain block and the form is the
+   only thing in it. */
+.ds-drawer:not(.ds-drawer--builder) .ag-work {
+  display: block; height: auto; min-height: 0; border-top: none; background: none;
+}
+.ds-drawer:not(.ds-drawer--builder) .ag-pane { display: block; }
+.ds-drawer:not(.ds-drawer--builder) .pdw-conv,
+.ds-drawer:not(.ds-drawer--builder) .ag-cfg-head { display: none; }
+.ds-drawer:not(.ds-drawer--builder) .ag-pane--cfg { border-left: none; background: none; }
+.ds-drawer:not(.ds-drawer--builder) .ds-drawer__pane { padding: 0; }
+
+/* ── Filling the window, without guessing at the chrome ──
+   `.ag-work` used to be `height: calc(100vh - 150px)`, where 150px was the
+   height of ONE page's header. On the other builder the header is 70px, so
+   the workspace stopped 80px short and left a band of dead white under it.
+
+   A number tuned to one page's chrome is wrong on every other page and wrong
+   again the moment either header rewraps. So the whole column flexes instead:
+   the shell is pinned to the viewport and the workspace takes whatever the
+   header leaves, whatever that turns out to be. */
+body.ag-building .idx { height: 100vh; min-height: 0; overflow: hidden; }
+body.ag-building .idx-band { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+body.ag-building .idx-band-inner { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+/* The chain that makes the workspace fill the viewport ends here, at the
+   page's own mount. It used to name the two mounts that existed by ID, which
+   meant a new builder page silently got no flex column: its panes never became
+   scroll containers, and the composer fell off the bottom of the page. That is
+   not a bug a third builder should have to rediscover, so the hook is a class
+   every builder mount carries. The two IDs stay as an alias — they are in
+   markup and in assertions, and dropping them buys nothing. */
+body.ag-building .ag-builder-mount,
+body.ag-building #ag-builder-view,
+body.ag-building #sk-builder-view { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+@media (max-width: 900px) {
+  /* Stacked, so the page scrolls again and pinning it would trap the panes. */
+  body.ag-building .idx { height: auto; overflow: visible; }
+}
+
+/* In builder mode the drawer wears the shell's header instead of its own.
+   The title bar and the footer button row are the COMPACT drawer's pattern:
+   a workspace whose primary action sits in a footer under a scrolling form
+   reads as a dialog, and the action leaves the screen as soon as the form is
+   long enough to scroll. Hidden rather than not-built, because the compact
+   drawer still needs both and there is only one DOM. */
+.ds-drawer--builder .ds-drawer__head,
+.ds-drawer--builder .ds-drawer__foot { display: none; }
+.ds-drawer--builder .ag-build-head { padding: 14px 22px; border-bottom: 1px solid var(--ds-border); }
+/* ...and the shell head is chrome, so it must not scroll with the panes. */
+.ds-drawer--builder .ds-drawer__panel > .ag-build-head { flex: 0 0 auto; }
+
+/* ...and the shell header is builder-only, for the same reason the drawer's
+   own header is compact-only. Both exist in the DOM once the drawer has been
+   opened as a builder; the class decides which one is showing. */
+.ds-drawer:not(.ds-drawer--builder) .ag-build-head { display: none; }
+
+/* ── The package builder as a PAGE ──
+   Same component, no overlay. `is-page` undoes the drawer's fixed-position
+   scaffolding so the panel is just content in the page's own column, and the
+   `body.ag-building` rules above then treat it exactly like the other two
+   builders: full-bleed, pinned to the viewport, two panes filling what the
+   header leaves. */
+.ds-drawer.is-page {
+  position: static; inset: auto; background: none;
+  display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
+  /* An overlay needs to sit above everything (drawer.css: 1200). A PAGE does
+     not, and must not: the app rail is a fixed element at z-index 40, so a
+     page-mounted drawer keeping 1200 paints OVER the sidebar wherever the two
+     meet. `position: static` is not enough to neutralise it — this is a flex
+     item, and z-index applies to flex items whether or not they are
+     positioned. */
+  z-index: auto;
+}
+.ds-drawer.is-page .ds-drawer__backdrop { display: none; }
+.ds-drawer.is-page .ds-drawer__panel {
+  position: static; width: auto; max-width: none; box-shadow: none;
+  border-left: none; transform: none; display: flex; flex-direction: column;
+  min-height: 0; flex: 1 1 auto; background: none;
+}
+body.ag-building #pkg-builder-view { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }

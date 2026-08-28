@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 # Reused rather than re-implemented: the queue-backed reader is the exact
 # StreamReader shim ChatManager's pump expects, and its readline() buffering is
 # subtle enough that a second copy would drift.
-from app.chat.provider import SANDBOX_WORKDIR, _StreamReaderAdapter
+from app.chat.provider import SANDBOX_WORKDIR, SandboxCapacityError, _StreamReaderAdapter
 
 # Module-level so unit tests can ``patch("app.chat.docker_provider.SandboxRunnerClient")``.
 from app.chat.config import sandbox_can_reach_directly
@@ -530,7 +530,14 @@ class DockerSandboxProvider:
                 if row.get("name") != name and row.get("status") != "stopped"
             ]
             if len(existing) >= self._max_total_sandboxes:
-                raise RuntimeError(
+                # Typed: ChatManager answers this by freeing the
+                # least-recently-paused sandbox and retrying, rather than
+                # failing the user's attach. Paused sandboxes count here (a
+                # paused container still holds its memory), so without that
+                # reclaim a handful of parked conversations would hold the
+                # whole host hostage until `paused_ttl_seconds` — 7 days by
+                # default — finally expired them.
+                raise SandboxCapacityError(
                     f"docker_max_total_sandboxes reached ({len(existing)}/{self._max_total_sandboxes}) "
                     "— refusing to spawn chat sandbox",
                 )

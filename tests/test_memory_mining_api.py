@@ -1,5 +1,17 @@
 """API tests for the privacy-gated memory-mining flow (v78)."""
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def studio_on(monkeypatch):
+    """Mining writes its output into the Studio's suggestion queue, and this
+    module reads it back through `GET /api/admin/authoring-suggestions` — which
+    403s while Studio is off, the default since the admin cleanup. The 403 body
+    is a dict where a list was expected, so the failure surfaced as a TypeError
+    rather than as the gate it is."""
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}

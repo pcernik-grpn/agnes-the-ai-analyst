@@ -1311,6 +1311,72 @@
         "title": "BootstrapRequest",
         "type": "object"
       },
+      "BuilderMessage": {
+        "description": "One turn of the transcript, as the page replays it.",
+        "properties": {
+          "role": {
+            "maxLength": 16,
+            "title": "Role",
+            "type": "string"
+          },
+          "text": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "BuilderMessage",
+        "type": "object"
+      },
+      "BuilderTurnRequest": {
+        "properties": {
+          "apply": {
+            "default": true,
+            "title": "Apply",
+            "type": "boolean"
+          },
+          "config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          },
+          "plugin_candidates": {
+            "items": {
+              "$ref": "#/components/schemas/PluginCandidate"
+            },
+            "title": "Plugin Candidates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "BuilderTurnRequest",
+        "type": "object"
+      },
       "BulkUpdateRequest": {
         "description": "Apply ``updates`` to every id in ``item_ids``. Issue #62.",
         "properties": {
@@ -2528,6 +2594,73 @@
         "title": "CreateDraftRequest",
         "type": "object"
       },
+      "CreateFromComponentsBody": {
+        "description": "JSON contract for composing a plugin out of Library entities.\n\nDeliberately the same metadata fields as ``CreateFromMarkdownBody`` \u2014 the\nbuilder posts one shape or the other depending on which source the author\npicked, and both delegate to ``create_entity`` so quota, guardrails, LLM\nreview, naming and versioning apply identically.",
+        "properties": {
+          "access": {
+            "default": "everyone",
+            "enum": [
+              "private",
+              "everyone"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "components": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "publisher_kind": {
+            "default": "user",
+            "enum": [
+              "user",
+              "organization"
+            ],
+            "title": "Publisher Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateFromComponentsBody",
+        "type": "object"
+      },
       "CreateFromMarkdownBody": {
         "description": "JSON contract for markdown-first publishing (studio Skill Builder /\nAgent Builder).",
         "properties": {
@@ -3207,6 +3340,16 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "preview_skill": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviewSkill"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "profile": {
             "anyOf": [
@@ -3904,6 +4047,37 @@
         "title": "EnqueueJobRequest",
         "type": "object"
       },
+      "EntityDraft": {
+        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "category": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "EntityDraft",
+        "type": "object"
+      },
       "EntityRating": {
         "description": "#398: per-user thumbs up/down tally for a store entity.\n\n``up`` / ``down`` are global counts; ``my_vote`` is the caller's own\nvote (``1`` up, ``-1`` down, ``0`` = not voted).",
         "properties": {
@@ -3924,6 +4098,43 @@
           }
         },
         "title": "EntityRating",
+        "type": "object"
+      },
+      "EntityTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EntityDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 16,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "message"
+        ],
+        "title": "EntityTurnRequest",
         "type": "object"
       },
       "FactsCorrectionRequest": {
@@ -5714,6 +5925,79 @@
         "title": "MaterializeRequest",
         "type": "object"
       },
+      "McpDraft": {
+        "description": "The panel as it stands. Untrusted; used only to build the prompt.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "auth_decided": {
+            "default": false,
+            "title": "Auth Decided",
+            "type": "boolean"
+          },
+          "auth_method": {
+            "default": "",
+            "maxLength": 32,
+            "title": "Auth Method",
+            "type": "string"
+          },
+          "auth_secret_env": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Auth Secret Env",
+            "type": "string"
+          },
+          "command": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Command",
+            "type": "string"
+          },
+          "introspected": {
+            "default": false,
+            "title": "Introspected",
+            "type": "boolean"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "scope": {
+            "default": "shared",
+            "maxLength": 16,
+            "title": "Scope",
+            "type": "string"
+          },
+          "tool_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tool Names",
+            "type": "array"
+          },
+          "transport": {
+            "default": "http",
+            "maxLength": 16,
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "default": "",
+            "maxLength": 2048,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "title": "McpDraft",
+        "type": "object"
+      },
       "McpEntry": {
         "properties": {
           "description": {
@@ -5747,6 +6031,35 @@
           "name"
         ],
         "title": "McpEntry",
+        "type": "object"
+      },
+      "McpTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "title": "McpTurnRequest",
         "type": "object"
       },
       "MemberResponse": {
@@ -6364,6 +6677,70 @@
         "title": "OwnerOption",
         "type": "object"
       },
+      "PackageDraft": {
+        "description": "The drawer's unsaved state. Used only to build the prompt.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "tables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tables",
+            "type": "array"
+          }
+        },
+        "title": "PackageDraft",
+        "type": "object"
+      },
+      "PackageTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PackageDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "PackageTurnRequest",
+        "type": "object"
+      },
       "PassthroughToolDTO": {
         "description": "Slimmed-down tool_registry row for the stdio client's tool list.",
         "properties": {
@@ -6589,6 +6966,33 @@
           "pinned"
         ],
         "title": "PinSessionBody",
+        "type": "object"
+      },
+      "PluginCandidate": {
+        "description": "A capability the page is offering in its picker.\n\nSent by the client because the marketplace ids the picker uses are\nassembled there (curated \u222a store, with their display prefixes); the\nserver validates the model's choices against this same list. Safe as a\ncandidate set for the reason in the module docstring: a declared scope id\ngrants nothing on its own.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 400,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 200,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PluginCandidate",
         "type": "object"
       },
       "PluginDetailResponse": {
@@ -7158,6 +7562,25 @@
         "title": "PolicyPreviewRequest",
         "type": "object"
       },
+      "PreviewAgentRequest": {
+        "description": "The draft template to try out. Body only \u2014 a template carries no data\naccess of its own, and the preview must not invent any.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "PreviewAgentRequest",
+        "type": "object"
+      },
       "PreviewComponent": {
         "properties": {
           "description": {
@@ -7231,6 +7654,92 @@
           "message"
         ],
         "title": "PreviewFieldIssue",
+        "type": "object"
+      },
+      "PreviewIntrospectRequest": {
+        "description": "A connection the admin has typed but not yet registered.",
+        "properties": {
+          "args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Args"
+          },
+          "auth_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Method"
+          },
+          "auth_secret_env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Secret Env"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env"
+          },
+          "transport": {
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "transport"
+        ],
+        "title": "PreviewIntrospectRequest",
         "type": "object"
       },
       "PreviewRequest": {
@@ -7308,6 +7817,25 @@
           "type"
         ],
         "title": "PreviewResponse",
+        "type": "object"
+      },
+      "PreviewSkill": {
+        "description": "A draft skill to make invokable for one session. Both fields are\nuntrusted; see the note on CreateSessionBody.preview_skill.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "PreviewSkill",
         "type": "object"
       },
       "ProjectionMapRequest": {
@@ -11801,7 +12329,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.90.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -12806,6 +13334,56 @@
         ]
       }
     },
+    "/admin/data-packages/new": {
+      "get": {
+        "description": "Author a data package, in the same builder shell /agents and /skills use.\n\nA PAGE, not the drawer. The drawer is right where it is used \u2014 mid-sentence\non /admin/tables, assigning a table to a package that does not exist yet \u2014\nbecause it opens over the lens you are standing on and gives it back. A\nworkspace is the opposite: it is where you have gone to do the thing, and\nit should look like the other two places you go to do the thing.\n\nThe FORM is still the drawer component's; this route only gives it a page\nto render into (`mount`), so there is one implementation of a package's\nfields and grants rather than two that drift.",
+        "operationId": "admin_package_builder_admin_data_packages_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Package Builder",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/data-packages/{package_id}": {
       "get": {
         "description": "ONE package, end to end \u2014 what is in it, who can use it, who has it.\n\nThe package is the unit an analyst actually receives, and until this page\nexisted it was the one object in the Data section with no home: its\ncomposition was edited inside the package-grouped layout on /admin/tables,\nits sharing on /admin/data-packages, and the card's own drilldown left the\nadmin area entirely for the analyst-facing /catalog/p/<slug>. Three places,\nnone of them about the package.\n\nEverything here rides EXISTING repositories and endpoints \u2014 the page adds\nno repo method, so there is no DuckDB\u2194Postgres parity sibling to write\n(CLAUDE.md). Composition writes through ``/api/admin/data-packages/{id}\n/tables``; sharing writes the same ``/api/admin/grants`` rows a group's\nAccess tab does, so the two ends of one relationship can never disagree.\n\nThe delivery read-out is the part the product could not draw anywhere:\na grant is a PERMISSION, and the data only lands once `agnes pull` runs.\n``users.last_pull_at`` (stamped by app/api/sync.py on every human pull) is\nwhat turns \"shared with 14 people\" into \"11 of them actually have it\".",
@@ -13324,6 +13902,56 @@
         ]
       }
     },
+    "/admin/linked-apps/new": {
+      "get": {
+        "description": "Publish externally-hosted apps into the Library, in the builder shell.\n\n/admin/linked-apps stays as the wizard for now; this is the path the\nLibrary's \"+ Add\" reaches. What it fixes is the two things that made the\nwizard an operator-hostile surface: step 1 asked which MCP source to read\napps from, with a dead end under it (\"Not registered yet? Register one\nfirst, then come back\"), and step 2 asked for a projection map \u2014 which\nresponse field is the app's name, which is its URL.\n\nA projection map is an integration author's artifact. The adapter already\nfalls back to alias guesses (src/data_apps/keboola_adapter.py), so the\nmapping is an escape hatch shown only when a row came back that the aliases\ncould not read, and the source and its lister tool are detected rather than\nchosen.",
+        "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Linked Apps Builder",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/marketplaces": {
       "get": {
         "description": "Admin page for marketplace git repositories (register / sync / delete).",
@@ -13419,6 +14047,56 @@
           }
         },
         "summary": "Admin Mcp Sources Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/mcp-sources/new": {
+      "get": {
+        "description": "Connect a tool server, in the same builder shell the other four use.\n\n/admin/mcp-sources stays the LIST. What moved here is the create path,\nwhich was the least builder-shaped surface in the product: a modal with\neleven fields, then a second page to introspect, curate the tools and grant\nthem \u2014 an order the admin was expected to know, with no way to find out\nwhether the server was even reachable until step three.\n\nIt suits the shell better than it looks. The procedure is fixed, so the\nconversation sequences work and reports what the server said rather than\ninventing anything; the exact values still arrive by paste, into fields,\nbecause a URL and an env var name are values from another system.",
+        "operationId": "admin_mcp_builder_admin_mcp_sources_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Mcp Builder",
         "tags": [
           "web"
         ]
@@ -14838,7 +15516,7 @@
     },
     "/agents": {
       "get": {
-        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nWork-in-progress surface (rail item carries a WIP badge). The builder's\ningredient lists are REAL and RBAC-scoped: knowledge sources are the data\npackages + memory domains resolved from the caller's stack (same\n``StackResolver`` reads as /stack), and capabilities hydrate client-side\nfrom ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).\nAgent definitions themselves persist in the browser for now \u2014 a server\nregistry is the next iteration, so the page states that plainly rather\nthan pretending drafts are shared.",
+        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artefact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
         "operationId": "agents_page_agents_get",
         "parameters": [
           {
@@ -15086,6 +15764,24 @@
                 }
               ],
               "title": "Source"
+            }
+          },
+          {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+              "title": "Trail"
             }
           },
           {
@@ -16916,6 +17612,70 @@
         "summary": "Create Data Package",
         "tags": [
           "data-packages"
+        ]
+      }
+    },
+    "/api/admin/data-packages/builder/turn": {
+      "post": {
+        "description": "Run one turn of the data-package builder. Proposes; never writes.\n\nReturns ``{reply, patch, suggestions}``. Nothing here creates a package\nor writes a grant \u2014 see the module docstring for why that is a rule\nrather than a default.",
+        "operationId": "package_builder_turn_api_admin_data_packages_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Package Builder Turn",
+        "tags": [
+          "admin"
         ]
       }
     },
@@ -19796,6 +20556,134 @@
           }
         },
         "summary": "Create Mcp Source",
+        "tags": [
+          "admin-mcp"
+        ]
+      }
+    },
+    "/api/admin/mcp-sources/builder/turn": {
+      "post": {
+        "description": "Run one turn of the MCP builder. Proposes into the panel; writes nothing.\n\nRegistering the source, storing its secret and granting its tools are all\nthe admin's own button presses, made against a panel they can read.",
+        "operationId": "mcp_builder_turn_api_admin_mcp_sources_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mcp Builder Turn",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/mcp-sources/preview-introspect": {
+      "post": {
+        "description": "Dial a connection the admin has typed and list its tools. Writes nothing.\n\nThe builder needs to show what a server exposes BEFORE the admin presses\nSave \u2014 you cannot sensibly choose which tools to grant, or name the source,\nwithout seeing them. The alternative was registering a disabled row first\nand introspecting that, which puts a source in the list that the admin\nnever agreed to create.\n\nSame shape as ``POST /entities/preview``: the values that would be saved\ngo in, a verdict comes back, and the temp state is gone before the response\nis. It builds a row-shaped dict and runs the SAME guard and the SAME\nintrospection the registered path does \u2014 a probe dials with a credential\nattached, so it takes the configuration-time url check whether or not a row\nexists yet.\n\nThe secret is NOT in this payload and never should be: ``auth_secret_env``\nnames an environment variable, and the credential resolves out of the vault\nexactly as it does for a registered source. A connection whose secret is not\nstored yet fails here with the reason, which is the truthful answer \u2014 store\nit, then check.\n\nAudited like its registered sibling above, and for the same reason rather\nthan for symmetry: writing nothing is what would make this endpoint the\nexception. It dials a network endpoint with a credential attached, or \u2014 on\n``stdio`` \u2014 launches a subprocess with a command the caller supplied. That\nis the same authority the registered path has, held by the same principal,\nbut the registered path always leaves a row behind and this one leaves\nnothing, so the audit entry is the only trace that it happened.",
+        "operationId": "preview_introspect_mcp_source_api_admin_mcp_sources_preview_introspect_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewIntrospectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Introspect Mcp Source",
         "tags": [
           "admin-mcp"
         ]
@@ -22967,7 +23855,7 @@
     },
     "/api/admin/observability/facets": {
       "get": {
-        "description": "Return the distinct facet values present in `audit_log` for the\nselected window, each with a count \u2014 under the SAME filters the\ntimeline uses, so dropdown counts always describe rows the table can\nactually show. `include_self_reads` defaults to False: the Activity\nCenter's own `activity.read` audit rows are hidden unless asked for.\n\nCounts are capped at 50 per facet (largest first). 50 is comfortable in\na dropdown; tighter windows usually have <20 anyway.",
+        "description": "Return the distinct facet values present across the unified timeline\n(audit_log + sync_history + llm_usage + agent_scope_snapshots) for the\nselected window, each with a count \u2014 under the SAME filters the\ntimeline uses, so dropdown counts always describe rows the table can\nactually show. `include_self_reads` defaults to False: the Activity\nCenter's own `activity.read` audit rows are hidden unless asked for.\n\nCounts are capped at 50 per facet (largest first). 50 is comfortable in\na dropdown; tighter windows usually have <20 anyway.",
         "operationId": "facets_api_admin_observability_facets_get",
         "parameters": [
           {
@@ -23095,6 +23983,24 @@
             }
           },
           {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+              "title": "Trail"
+            }
+          },
+          {
             "in": "query",
             "name": "include_self_reads",
             "required": false,
@@ -23155,7 +24061,7 @@
     },
     "/api/admin/observability/kpis": {
       "get": {
-        "description": "KPIs for the top-bar cards \u2014 same filter surface as the timeline, so\nthe cards and the table can never tell different stories. `active_users`\ncounts people (scheduler/system actors excluded); `errors` counts\nresult_class='error'; `duration_coverage` says what fraction of rows\ncarry a measured duration (feeds the p95 card's honesty sub-label).",
+        "description": "KPIs for the top-bar cards \u2014 same filter surface as the (unified)\ntimeline, so the cards and the table can never tell different stories.\n`active_users` counts people (scheduler/system actors excluded);\n`errors` counts result_class='error'; `duration_coverage` says what\nfraction of rows carry a measured duration (feeds the p95 card's\nhonesty sub-label).",
         "operationId": "kpis_api_admin_observability_kpis_get",
         "parameters": [
           {
@@ -23280,6 +24186,24 @@
                 }
               ],
               "title": "Source"
+            }
+          },
+          {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+              "title": "Trail"
             }
           },
           {
@@ -32012,6 +32936,79 @@
         "summary": "Admin Preview Workspace Template",
         "tags": [
           "claude_md"
+        ]
+      }
+    },
+    "/api/agents/{agent_id}/builder/turn": {
+      "post": {
+        "description": "Run one builder turn against an agent the caller owns.",
+        "operationId": "builder_turn_api_agents__agent_id__builder_turn_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuilderTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Builder Turn",
+        "tags": [
+          "agents"
         ]
       }
     },
@@ -46509,6 +47506,134 @@
         ]
       }
     },
+    "/api/store/entities/builder/preview-agent": {
+      "post": {
+        "description": "Point the caller's scratch agent at this draft template and return its\nslug, so the page can open a normal chat session against it.\n\nAn agent template IS a system prompt, so previewing one means running an\nagent with that prompt. That needs a row, because a session runs as an\nagent id \u2014 hence a scratch agent rather than some parallel un-agent path\nthat would drift from how templates actually behave once installed.\n\nDeliberately inherits NOTHING from the author's own agents: default\nscope modes, no knowledge, no plugins. A template carries no data access,\nso a preview that quietly ran with the author's would flatter it \u2014\nsomeone would install a template that worked in the preview and does\nnothing for them.",
+        "operationId": "preview_agent_api_store_entities_builder_preview_agent_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Agent",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/builder/turn": {
+      "post": {
+        "description": "Run one builder turn for a Library entity draft.\n\nReturns ``{reply, patch, suggestions}``. Writes nothing: the draft is the\ncaller's, and only *Save to Library* creates anything.",
+        "operationId": "entity_builder_turn_api_store_entities_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EntityTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Entity Builder Turn",
+        "tags": [
+          "store"
+        ]
+      }
+    },
     "/api/store/entities/dryrun": {
       "post": {
         "description": "Run the full guardrail pipeline against a candidate bundle WITHOUT\npersisting anything.\n\nSame multipart payload as ``POST /entities`` (``file``, ``type``,\n``description``). The submitter sees exactly what would block the\nreal upload \u2014 inline checks plus the LLM verdict \u2014 and can iterate\nbefore spending an LLM token budget / admin-queue slot on a real\nsubmission (#317).\n\nNO DB writes: no ``store_entities``, no ``store_submissions``, no\n``audit_log``. The bundle bytes are extracted to a scratch dir,\nbaked into a throwaway plugin tree, checked, and wiped in ``finally``\nexactly like :func:`preview_entity`.\n\nPer-submitter dry-run quota + identical-bundle verdict caching are\ndeferred (tracked on #317) \u2014 the auth gate plus HTTP-level rate\nlimiting bound abuse until they land.\n\n``lint_only=true`` returns ``inline`` + ``lint`` and SKIPS the LLM\nsecurity review entirely (no ``verdict``, and ``would_publish`` is not\nmeaningful). The advisory-lint panels use it so previewing findings never\nbills a security-review round-trip the caller would discard.",
@@ -46570,6 +47695,70 @@
           }
         },
         "summary": "Dryrun Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/from-components": {
+      "post": {
+        "description": "Compose a plugin from Library entities the caller can already see.\n\nMerges each selected entity's baked subtree into one plugin tree, zips it\nin memory, and delegates to ``create_entity`` \u2014 so a composite is\nindistinguishable downstream from an uploaded ``.zip`` of the same bytes,\nand pays the same guardrail review.\n\n``dry_run=True`` returns a ``PreviewResponse`` (the shape the ``.zip``\nCheck path returns) and writes nothing.",
+        "operationId": "create_entity_from_components_api_store_entities_from_components_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFromComponentsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Entity From Components",
         "tags": [
           "store"
         ]

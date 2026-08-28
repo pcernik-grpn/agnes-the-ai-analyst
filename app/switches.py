@@ -107,11 +107,79 @@ SWITCHES: tuple[Switch, ...] = (
         config_keys=("studio", "enabled"),
         env_var="AGNES_STUDIO_ENABLED",
         kind="bool",
-        default=True,
+        default=False,
         effect="live",
         category="product",
         editable=True,
-        description="Authoring Studio surface (/admin/studio*). Grandfathered on by default.",
+        description=(
+            "Authoring Studio surface: /admin/studio, its per-domain builders, the "
+            "/admin/studio/suggestions moderation queue, their nav + command-palette "
+            "entries, and the public suggestion API. OFF by default since the admin "
+            "cleanup — the Studio's authoring jobs are done by the Library builders "
+            "(/library '+ New') now, so a second authoring surface offered two ways to "
+            "do one thing. The pages are intact, not deleted: set "
+            "AGNES_STUDIO_ENABLED=1 (or `studio.enabled: true`) to bring the whole "
+            "surface back."
+        ),
+    ),
+    # The three surfaces retired alongside Studio in the same admin cleanup.
+    # All under `features` rather than a section each: they are UI-visibility
+    # switches with no other configuration of their own, and a top-level yaml
+    # section holding exactly one boolean is a section nobody can guess the
+    # name of. Every one of them hides UI ONLY — the /api/admin/news/*,
+    # /api/admin/knowledge-digests/* and marketplace-publish APIs behind them
+    # keep serving, so the CLI and the digest scheduler job are unaffected.
+    Switch(
+        name="news",
+        config_keys=("features", "news_enabled"),
+        env_var="AGNES_NEWS_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "In-product news: the /admin/news editor, the /news reader, the /home "
+            '"What\'s new" strip, and their nav + command-palette entries. Off by '
+            "default since the admin cleanup. Hides UI only — /api/admin/news/* keeps "
+            "serving, and a published version is preserved, so turning this back on "
+            "restores the surface with its content intact."
+        ),
+    ),
+    Switch(
+        name="knowledge_digests",
+        config_keys=("features", "knowledge_digests_enabled"),
+        env_var="AGNES_KNOWLEDGE_DIGESTS_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Maintained knowledge digests admin page (/admin/knowledge-digests) and its "
+            "nav entry. Off by default since the admin cleanup. Hides that PAGE only: "
+            "/api/admin/knowledge-digests/*, `agnes admin digest`, the digest scheduler "
+            "job and `agnes pull`'s digest delivery all keep working, so an instance "
+            "already running digests keeps running them headlessly."
+        ),
+    ),
+    Switch(
+        name="contribute_skill",
+        config_keys=("features", "contribute_skill_enabled"),
+        env_var="AGNES_CONTRIBUTE_SKILL_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The paste-a-SKILL.md publish page (/admin/contribute-skill) and its nav "
+            'entry — the landing target for an external "Load skill to Agnes" button. '
+            "Off by default since the admin cleanup: the Library's skill builder "
+            "(/library '+ New') is the supported path, and this page duplicated it with "
+            "a worse flow. Its POST handlers are gated with the page, so a stale "
+            "external button gets a redirect home rather than a silent publish."
+        ),
     ),
     Switch(
         name="guardrails",

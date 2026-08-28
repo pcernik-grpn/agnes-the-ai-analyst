@@ -652,9 +652,9 @@ variable "home_route" {
 }
 
 variable "studio_enabled" {
-  description = "Expose the authoring Studio (/admin/studio). First-boot seed only (D1, 2026-08): `false` is written into instance.yaml's `studio.enabled` the FIRST time a VM in this instance boots (never on a later apply/recreate) — the admin UI (`/admin/server-config`) owns it from day 2 onward. `true` (default) seeds nothing, matching the app's own default."
+  description = "Expose the authoring Studio (/admin/studio, its per-domain builders and the suggestions moderation queue). First-boot seed only (D1, 2026-08): `true` is written into instance.yaml's `studio.enabled` the FIRST time a VM in this instance boots (never on a later apply/recreate) — the admin UI (`/admin/server-config`) owns it from day 2 onward. `false` (default) seeds nothing, matching the app's own default, which is now OFF: the admin cleanup retired the Studio in favour of the Library builders (/library, '+ New'). Set true only for an instance that wants the second authoring surface back."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "enable_watchdog" {

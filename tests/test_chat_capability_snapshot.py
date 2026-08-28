@@ -112,3 +112,45 @@ def test_snapshot_resolves_accessible_tables_once(seeded_app, monkeypatch):
         conn.close()
 
     assert calls["n"] == 1
+
+
+def test_the_snapshot_carries_is_admin(seeded_app):
+    """The dashboard's admin starters hang off this one key.
+
+    ``buildSuggestedActions`` in ``chat_dashboard.js`` picks ``ADMIN_TASKS`` /
+    ``ADMIN_ZERO_TASKS`` from ``_capabilities.is_admin``, and the snapshot
+    embedded in ``chat.html`` is the only thing that sets it. Drop the key and
+    nothing errors — ``!!undefined`` is false, so every admin quietly falls
+    through to the member starters and is offered "ask for access" on an
+    instance they administer. Raised as a question by a review bot on PR #1679;
+    the key was there, the guard was not.
+    """
+    from app.web import router
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    try:
+        admin = router._chat_capability_snapshot(conn, {"id": "admin1"})
+        analyst = router._chat_capability_snapshot(conn, {"id": "analyst1"})
+    finally:
+        conn.close()
+
+    assert admin["is_admin"] is True
+    assert analyst["is_admin"] is False
+
+
+def test_the_zero_data_override_keeps_is_admin(seeded_app):
+    """The chat route rewrites the snapshot when the caller has no tables
+    (``tables_total``/``tables_by_source`` forced to empty). That rewrite is a
+    spread, so it must not drop the key the zero-data starters need — which is
+    precisely the state ``ADMIN_ZERO_TASKS`` exists for.
+    """
+    import inspect
+
+    from app.web import router
+
+    src = inspect.getsource(router)
+    assert '{**ctx["chat_capabilities"], "tables_total": 0, "tables_by_source": {}}' in src, (
+        "the zero-data override must spread the snapshot, not rebuild it — "
+        "rebuilding drops is_admin and sends admins the member starters"
+    )

@@ -101,6 +101,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "store_rate",
     "store_status",
     "store_publish_markdown",
+    "store_compose_plugin",
     # Full agent/skill lifecycle parity (REST × CLI × MCP): discover, inspect,
     # install/remove, edit, delete — an agent can manage its own store
     # entities and stack without leaving the chat. Binary paths (ZIP upload,
@@ -148,6 +149,11 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "admin_jobs_list",
     "admin_job_get",
     "admin_job_enqueue",
+    # Unified Activity Center timeline (E3 slice 2) — audit_log +
+    # sync_history + llm_usage + agent_scope_snapshots (never chat_messages,
+    # privacy decision). Triple-surface with GET /api/admin/activity +
+    # `agnes admin activity`.
+    "activity",
     # DuckLake analytics-backend migration (wave-2G Task 6), triple-surface
     # with /api/admin/analytics/migrate + `agnes admin analytics migrate`.
     "admin_analytics_migrate",
@@ -1296,6 +1302,48 @@ def register_foundation_tools(
             r.raise_for_status()
             return r.json()
 
+    @tool(read_only=False)
+    async def store_compose_plugin(
+        name: str,
+        components: list[str],
+        description: str | None = None,
+        category: str | None = None,
+    ) -> dict:
+        """Bundle skills and agent templates you already have into one plugin.
+
+        Every store entity is already served as a plugin in its own right, so
+        this is not how a single skill is published — it is how several are
+        handed over in ONE install. The server merges each component's bundle
+        into one tree and runs it through the same guardrail + review pipeline
+        as a ZIP upload. Mirrors ``POST /api/store/entities/from-components``
+        and ``agnes store compose``.
+
+        Args:
+            name:        Name for the plugin — lowercase letters, digits, dashes.
+            components:  Store entity ids to bundle (skills and agent templates
+                         only; find them with ``marketplace_search``). A plugin
+                         cannot contain another plugin.
+            description: What the plugin adds and who should install it.
+            category:    Optional store category (case-insensitive).
+
+        Returns the created entity — ``{"id", "name", "invocation_name",
+        "version", "visibility_status", …}``.
+        """
+        payload: dict = {"name": name, "components": list(components)}
+        if description:
+            payload["description"] = description
+        if category:
+            payload["category"] = category
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/store/entities/from-components",
+                json=payload,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
     @tool(read_only=True)
     async def marketplace_search(
         query: str = "",
@@ -2096,6 +2144,65 @@ def register_foundation_tools(
             body["idempotency_key"] = idempotency_key
         async with httpx.AsyncClient() as c:
             r = await c.post(f"{base_url}/api/jobs", json=body, headers=headers_fn(), timeout=30)
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=True)
+    async def activity(
+        since_minutes: int = 1440,
+        limit: int = 50,
+        action_prefix: str = "",
+        user_id: str = "",
+        resource_prefix: str = "",
+        result_class: str = "",
+        source: str = "",
+        trail: str = "",
+        q: str = "",
+    ) -> dict:
+        """Tail the unified Activity Center timeline (admin only).
+
+        One chronological feed folding in ``audit_log`` (admin/API actions),
+        ``sync_history`` (table syncs), ``llm_usage`` (per-call agent token
+        accounting), and ``agent_scope_snapshots`` (agent-runtime effective
+        scope at spawn). ``chat_messages`` is never included — privacy
+        decision, no admin viewer for chat transcripts by design.
+
+        Args:
+            since_minutes: How far back to look (default 1440 = 24h, max 43200 = 30d).
+            limit:         Max rows to return, newest first (default 50, max 200).
+            action_prefix: Filter by action prefix, e.g. "sync." or "llm.".
+            user_id:       Filter by exact user_id.
+            resource_prefix: Filter by resource prefix, e.g. "table:" or "agent:".
+            result_class:  "success" | "error" | "denied" | "none" | "other".
+            source:        Row origin: "web" | "cli" | "scheduler" | "system" |
+                            "agent" | "other".
+            trail:         Narrow to one physical trail: "audit" | "sync" |
+                            "llm" | "agent_scope". Empty (default) returns the
+                            unified timeline across all four.
+            q:             Free-text search over the row's params JSON.
+
+        Returns ``{"rows": [{"timestamp", "trail", "source", "action",
+        "resource", "user_id", "user_email", "result", "params", ...}, ...],
+        "next_cursor"}``. Mirrors ``GET /api/admin/activity`` and
+        ``agnes admin activity``. Requires an admin PAT.
+        """
+        params: dict[str, Any] = {"since_minutes": since_minutes, "limit": limit}
+        if action_prefix:
+            params["action_prefix"] = action_prefix
+        if user_id:
+            params["user_id"] = user_id
+        if resource_prefix:
+            params["resource_prefix"] = resource_prefix
+        if result_class:
+            params["result_class"] = result_class
+        if source:
+            params["source"] = source
+        if trail:
+            params["trail"] = trail
+        if q:
+            params["q"] = q
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
             r.raise_for_status()
             return r.json()
 
