@@ -800,10 +800,39 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rebuilds every other valid source, but now attributes the skip
   (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
   operator alert now surfaces too.
+- **A full chat host no longer locks every other user out for a week.** Paused
+  sandboxes count against `chat.docker_max_total_sandboxes` (a paused container
+  still holds its memory) but survive until `chat.paused_ttl_seconds` — 7 days
+  by default — so on an instance with a small cap a handful of parked
+  conversations filled the host and every subsequent attach failed with
+  `docker_max_total_sandboxes reached`, with no path back short of an operator
+  deleting containers by hand. The docker provider now raises a typed
+  `SandboxCapacityError`, and ChatManager answers it by destroying the
+  least-recently-paused sandbox (the paused-TTL sweep's own teardown, triggered
+  by pressure instead of by the clock — the evicted transcript is untouched and
+  respawns on its owner's next message) and retrying, up to three reclaims per
+  spawn. A session this process is actively serving is never evicted — and
+  neither is one being brought back: `_resume_live` holds a per-session lock
+  across `provider.resume()` + runner install while the session is still
+  PAUSED with a stale `sandbox_paused_at`, so both the reclaim and the
+  long-standing paused-TTL sweep now take that same lock, which closes a
+  window where either could have destroyed the sandbox of a conversation a
+  user was actively resuming. Any other spawn failure still propagates
+  untouched.
+
+- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  **Not fully closed:** a third copy of the same rule lives in the password
+  provider's web-form POST handler, which is the terminal consumer of the form
+  `/login/password` renders — so signing in *with a password* still lands on the
+  home route rather than back in the app. OAuth (Google, Microsoft, Keboola) and
+  magic-link all route through `safe_next_path` and do return you to the app.
+  The underlying fault is that this one rule had four implementations; three of
+  them still exist.
 
 ### Removed
 
 ### Internal
+- **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
 - **Local-dev audience switch on the chat landing page.** Under
   `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
   Admin | Admin, empty instance | Member" toggle for reviewing each landing

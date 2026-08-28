@@ -111,3 +111,42 @@ def test_data_app_origin_refused_when_feature_disabled(monkeypatch):
 )
 def test_lookalikes_refused(apps_on, hostile):
     assert safe_next_path(hostile, default=D) == D
+
+
+# --- the base itself has to be a plausible app origin ----------------------
+# `subdomain_base` is operator config, not user input — but it is a single
+# unvalidated string, and a wrong one silently turns this narrow exception into
+# a general open redirect. Nothing else surfaces the mistake: a single-label
+# base makes `session_cookie_domain()` return None (no cookie breakage), and
+# `DataAppSubdomainMiddleware` still refuses to route the deployment's own
+# multi-label host (no routing breakage). The instance looks healthy while
+# login redirects anywhere.
+#
+# The documented shape is `apps.<agnes-host>`, and an agnes host is itself at
+# least two labels — so requiring three is the documented minimum, not an
+# arbitrary bar. Rejecting narrows: an under-specified base falls back to
+# same-origin-paths-only, never wider.
+
+
+@pytest.mark.parametrize(
+    "bad_base",
+    [
+        "com",           # a bare TLD: every https://<anything>.com/ would pass
+        "run.app",       # a public suffix: every tenant of that platform
+        "example",       # single label
+        "",              # unset
+    ],
+)
+def test_implausible_base_is_refused(monkeypatch, bad_base):
+    monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "true")
+    monkeypatch.setenv("AGNES_DATA_APPS_SUBDOMAIN_BASE", bad_base)
+    victim = f"https://evil.{bad_base}/phish" if bad_base else "https://evil.example/phish"
+    assert safe_next_path(victim, default=D) == D
+
+
+@pytest.mark.parametrize("good_base", ["apps.example.com", "apps.agnes.example.com"])
+def test_plausible_base_still_works(monkeypatch, good_base):
+    monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "true")
+    monkeypatch.setenv("AGNES_DATA_APPS_SUBDOMAIN_BASE", good_base)
+    url = f"https://s.{good_base}/"
+    assert safe_next_path(url, default=D) == url
