@@ -2439,8 +2439,47 @@
   function renderPick() {
     const host = el("ax-pick");
     if (!PICK || !resourceFilter) { host.innerHTML = ""; return; }
-    host.innerHTML = `<span>Granting access to <code>${esc(PICK.id)}</code> — pick the group that should get it
-      on the left, then tick it on the right.</span>
+
+    /* A TABLE arriving from /admin/tables is the one case where the obvious
+       answer is the wrong one. A per-table grant no longer surfaces the
+       table in an analyst's manifest — the package grant does — so pointing
+       the admin at a table row would hand them a lever that is not
+       connected. The honest answer is which packages carry it, and who
+       those reach. */
+    if (PICK.type === "table") {
+      const pkgType = (overview.resources || []).find((t) => t.type_key === "data_package");
+      const pkgs = [];
+      for (const b of (pkgType ? pkgType.blocks || [] : [])) {
+        for (const i of (b.items || [])) {
+          if ((i.contains || []).includes(PICK.id)) pkgs.push(i);
+        }
+      }
+      if (!pkgs.length) {
+        host.innerHTML = `<span><code>${esc(PICK.id)}</code> is in no data package, so no analyst
+          receives it. A table reaches people by being in a package —
+          <a href="/admin/data-packages">put it in one</a>, then grant that.</span>
+          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button>`;
+        return;
+      }
+      const held = (pkg) => (overview.grants || [])
+        .filter((g) => g.resource_type === "data_package" && g.resource_id === pkg.resource_id)
+        .map((g) => (overview.groups || []).find((x) => x.id === g.group_id))
+        .filter(Boolean);
+      const lines = pkgs.map((pkg) => {
+        const gs = held(pkg);
+        return `<b>${esc(pkg.name)}</b> — ${gs.length
+          ? `granted to ${gs.map((g) => esc(titleOf(g))).join(", ")}`
+          : `<i>granted to nobody</i>`}`;
+      }).join("; ");
+      host.innerHTML = `<span><code>${esc(PICK.id)}</code> reaches people through
+        ${pkgs.length === 1 ? "one package" : `${pkgs.length} packages`}: ${lines}.
+        Grant the package, not the table.</span>
+        <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button>`;
+      return;
+    }
+
+    host.innerHTML = `<span>Granting access to <code>${esc(PICK.id)}</code> — open the group that should
+      get it, then tick it.</span>
       <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button>`;
   }
 

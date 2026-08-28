@@ -156,3 +156,47 @@ class TestGrantsCarryTheirWriter:
         assert all("assigned_by" in g for g in grants)
         mine = [g for g in grants if g["resource_type"] == "chat"]
         assert mine and mine[0]["assigned_by"], "the writer was not recorded"
+
+
+class TestPackagesSayWhichTablesTheyCarry:
+    """`/admin/tables` asks `/admin/access` "who can see this table".
+
+    A per-table grant no longer surfaces a table in an analyst's manifest —
+    the package grant does — so the honest answer names the packages that
+    carry it, and the groups those are granted to. The page can only give
+    that answer if the projection says what a package contains.
+    """
+
+    def test_package_items_carry_their_table_ids(self, seeded_app):
+        from app.resource_types import _data_package_blocks
+        from src.repositories import data_packages_repo, table_registry_repo
+
+        table_registry_repo().register(
+            id="tbl_orders", name="orders", source_type="local", bucket="in.c-crm",
+            source_table="orders",
+        )
+        repo = data_packages_repo()
+        pkg_id = repo.create(
+            name="Revenue Core", description="revenue", created_by="admin@test.com",
+            slug="revenue-core", icon=None, color=None,
+        )
+        repo.add_table(pkg_id, "tbl_orders", added_by="admin@test.com")
+
+        blocks = _data_package_blocks()
+        items = [i for b in blocks for i in b["items"] if i["resource_id"] == pkg_id]
+        assert items, "the package is not in the projection"
+        assert items[0]["contains"] == ["tbl_orders"]
+
+    def test_a_package_with_no_tables_says_so_with_an_empty_list(self, seeded_app):
+        """Not a missing key — the page distinguishes "carries nothing" from
+        "we did not look"."""
+        from app.resource_types import _data_package_blocks
+        from src.repositories import data_packages_repo
+
+        pkg_id = data_packages_repo().create(
+            name="Empty", description="", created_by="admin@test.com",
+            slug="empty", icon=None, color=None,
+        )
+        blocks = _data_package_blocks()
+        items = [i for b in blocks for i in b["items"] if i["resource_id"] == pkg_id]
+        assert items and items[0]["contains"] == []

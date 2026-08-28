@@ -287,9 +287,17 @@ def _data_package_blocks() -> List[Block]:
     """
     from src.repositories import data_packages_repo
 
-    rows = data_packages_repo().list(limit=_GRANT_PROJECTION_LIMIT)  # all live rows; see _GRANT_PROJECTION_LIMIT
+    repo = data_packages_repo()
+    rows = repo.list(limit=_GRANT_PROJECTION_LIMIT)  # all live rows; see _GRANT_PROJECTION_LIMIT
     if not rows:
         return []
+    # Which tables each package carries. `/admin/access` needs it to answer
+    # the question `/admin/tables` sends it — "who can see THIS table" — now
+    # that a table reaches a person by being in a package rather than by a
+    # grant of its own. One query per package, bounded by the same
+    # projection limit as the packages themselves; both backends implement
+    # `list_tables` and the pair is contract-tested.
+    contains = {r["id"]: [t["id"] for t in repo.list_tables(r["id"])] for r in rows}
     return [
         {
             "id": "data_packages",
@@ -303,6 +311,7 @@ def _data_package_blocks() -> List[Block]:
                     "icon": r.get("icon"),
                     "color": r.get("color"),
                     "slug": r.get("slug"),
+                    "contains": contains.get(r["id"], []),
                 }
                 for r in rows
             ],
