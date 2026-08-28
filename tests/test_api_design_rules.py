@@ -120,6 +120,14 @@ _VERB_PATH_ALLOWLIST = frozenset(
         "/api/admin/mcp-sources/{source_id}/oauth/register",
         "/api/admin/metadata/{table_id}/push",
         "/api/admin/metrics/import",
+        # Ontology builder draft state machine (spec §13.2): the draft is
+        # filled by two RPC actions with no idiomatic REST noun — `import`
+        # translates a pasted/uploaded ontology into the unsaved draft (mirrors
+        # the allowlisted `/api/admin/metrics/import` upstream), `save`
+        # materializes the frozen draft into a semantic model. Both act on the
+        # draft, not on a fresh sub-resource.
+        "/api/admin/ontology/drafts/{draft_id}/import",
+        "/api/admin/ontology/drafts/{draft_id}/save",
         # Profile refresh — triggers async re-profiling of table metadata
         "/api/catalog/profile/{table_name}/refresh",
         # BQ metadata cache refresh — on-demand operator trigger for a single registry row

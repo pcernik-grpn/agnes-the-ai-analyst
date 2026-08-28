@@ -446,6 +446,9 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
         except HTTPException:
             continue
         files.append(SessionFileEntry(**entry))
+    # Engine listings carry no mtime to sort by, but the deliverables-first
+    # promise holds: outputs/ ahead of everything, then stable by path.
+    files.sort(key=lambda f: (not f.path.startswith(_OUTPUTS_PREFIX), f.path))
     return SessionFilesResponse(files=files, truncated=truncated, source="engine", supported=True)
 
 

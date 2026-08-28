@@ -1739,6 +1739,45 @@
         "title": "ConfigureRequest",
         "type": "object"
       },
+      "ConfirmScopeBody": {
+        "properties": {
+          "anonymize": {
+            "default": false,
+            "title": "Anonymize",
+            "type": "boolean"
+          },
+          "display_path": {
+            "minLength": 1,
+            "title": "Display Path",
+            "type": "string"
+          },
+          "group_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Ids"
+          },
+          "source_scope_id": {
+            "minLength": 1,
+            "title": "Source Scope Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_scope_id",
+          "display_path"
+        ],
+        "title": "ConfirmScopeBody",
+        "type": "object"
+      },
       "ConnectorMeta": {
         "description": "One connector tile's metadata as it appears in the manifest API\nresponse. Field names match the seed's frontmatter shape so the\ncontract documented in ``docs/seed-repo-contract.md`` lines up with\nthe JSON callers see.",
         "properties": {
@@ -6195,6 +6234,111 @@
           }
         },
         "title": "OnboardedRequest",
+        "type": "object"
+      },
+      "OntologyDraftCreate": {
+        "properties": {
+          "name": {
+            "default": "Untitled ontology",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "OntologyDraftCreate",
+        "type": "object"
+      },
+      "OntologyDraftUpdate": {
+        "properties": {
+          "document_sample": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Sample"
+          },
+          "edge_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Types"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "node_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Types"
+          }
+        },
+        "title": "OntologyDraftUpdate",
+        "type": "object"
+      },
+      "OntologyDryRunRequest": {
+        "properties": {
+          "collection_id": {
+            "title": "Collection Id",
+            "type": "string"
+          },
+          "edge_types": {
+            "additionalProperties": true,
+            "title": "Edge Types",
+            "type": "object"
+          },
+          "file_id": {
+            "title": "File Id",
+            "type": "string"
+          },
+          "node_types": {
+            "additionalProperties": true,
+            "title": "Node Types",
+            "type": "object"
+          }
+        },
+        "required": [
+          "collection_id",
+          "file_id"
+        ],
+        "title": "OntologyDryRunRequest",
+        "type": "object"
+      },
+      "OntologyImportRequest": {
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "OntologyImportRequest",
         "type": "object"
       },
       "OwnerOption": {
@@ -13443,6 +13587,56 @@
           }
         },
         "summary": "Admin News Editor",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/ontology": {
+      "get": {
+        "description": "Ontology builder (fact-graph-over-Collections \u00a713.2) \u2014 a semantic\nmodel authored through the shared builder shell: Create | Preview left,\nnumbered sections right, the right panel the source of truth, Save the\nonly write. Zero new navigation (spec \u00a713.2) \u2014 the only entry point is\nthe link on ``/admin/semantic-layer``; this route carries no admin-nav\nentry of its own.\n\nWhen the ``facts`` flag is off, or the active backend is DuckDB (drafts\nare PG-only, A3 ratchet \u2014 the builder cannot persist a draft without\nPostgres), renders an explanatory empty state instead of 404ing, same\nposture as ``/apps`` when ``data_apps`` is disabled.",
+        "operationId": "admin_ontology_page_admin_ontology_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Ontology Page",
         "tags": [
           "web"
         ]
@@ -23320,6 +23514,508 @@
         ]
       }
     },
+    "/api/admin/ontology/drafts": {
+      "get": {
+        "operationId": "list_drafts_api_admin_ontology_drafts_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Drafts",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "post": {
+        "operationId": "create_draft_api_admin_ontology_drafts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDraftCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}": {
+      "delete": {
+        "operationId": "delete_draft_api_admin_ontology_drafts__draft_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Draft",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "get": {
+        "operationId": "get_draft_api_admin_ontology_drafts__draft_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Draft",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "put": {
+        "description": "Section edits land here. Whatever the client sends \u2014 a paste import,\na conversation proposal, a manual attribute tweak \u2014 this is the ONLY\nthing that happens: the draft row changes. Nothing here ever reaches\n``semantic_models``.",
+        "operationId": "update_draft_api_admin_ontology_drafts__draft_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDraftUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}/import": {
+      "post": {
+        "description": "Paste-a-finished-ontology / file upload (spec \u00a713.2 \"source\" section).\n\nRuns the SAME translator Save uses, but only to render the leftover\nreport and fill the draft's node/edge types \u2014 it never validates\nagainst the Ossie schema here and never touches ``semantic_models``.\n\"Import fills the draft. It is not a save, and it is not an\nendorsement\" (``.claude/skills/ontology-building/SKILL.md``).",
+        "operationId": "import_ontology_text_api_admin_ontology_drafts__draft_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Ontology Text",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}/save": {
+      "post": {
+        "description": "The one write. Translate -> validate -> POST through the exact path\n``import_ontology.py --server`` uses (in-process, not a self-HTTP-call).",
+        "operationId": "save_draft_api_admin_ontology_drafts__draft_id__save_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/dry-run": {
+      "post": {
+        "description": "One document, the draft's current types, no persistence \u2014 the\nsample-driven test the ontology-building skill calls \"the valuable half\"\nof authoring: what got captured, and what didn't.",
+        "operationId": "ontology_dry_run_api_admin_ontology_dry_run_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDryRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ontology Dry Run",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
     "/api/admin/prompts/iwt-files": {
       "get": {
         "description": "Repo-root-relative bindable file list from the synced IWT clone, for the\nbind-git picker (#622 Slice 3). Returns ``files == []`` (200, not 404) when\nIWT is unconfigured \u2014 the UI disables git mode in that case. Every path\nreturned is a valid ``bind-git`` input (load-bearing invariant). One\nendpoint for both cards: the file set is the same repo; the front-end\npre-selects ``suggested[kind]`` per card.\n\nAdmin-web-only (no analyst CLI/MCP analogue) \u2192 EXEMPT in the triple-surface\ngate, alongside the other ``/api/admin/prompts/*`` routes.",
@@ -27252,6 +27948,363 @@
         "summary": "Transcript",
         "tags": [
           "admin-sessions"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
+      "get": {
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
+        "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Corpus Map",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/scopes": {
+      "delete": {
+        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).",
+        "operationId": "remove_scope_api_admin_sharepoint_connections__connection_id__scopes_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_scope_id",
+            "required": true,
+            "schema": {
+              "title": "Source Scope Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Scope",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants.",
+        "operationId": "list_scopes_api_admin_sharepoint_connections__connection_id__scopes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scopes",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, **if the field is present**, is the complete\nset of groups for this collection (step 3): listed groups are granted,\nand any other group's grant on this collection is revoked. The wizard's\ncheckboxes are pre-checked from the grants that exist and its row warns\nthe moment the last one is unticked, so the screen already promises that\nunticking removes access \u2014 making the handler additive-only meant the\nadmin was shown a revocation that never happened. Omitting the field\ntouches no grant at all, which is what keeps a rename or an anonymize\ntoggle from stripping access as a side effect.",
+        "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmScopeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Scope",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/tree": {
+      "get": {
+        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). Both -> the drive's root children. Exactly\n\"sites -> drives -> root children, one level per call\" (spec \u00a713.2) \u2014\nthere is no deeper recursive browse; a folder's own children are not\nfetched until the admin picks it.",
+        "operationId": "browse_tree_api_admin_sharepoint_connections__connection_id__tree_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "site_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Site Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "drive_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Drive Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Browse Tree",
+        "tags": [
+          "admin"
         ]
       }
     },
@@ -35543,7 +36596,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -35604,6 +36657,76 @@
           }
         },
         "summary": "Facts Ingest",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/ingest-runs": {
+      "get": {
+        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.",
+        "operationId": "list_ingest_runs_api_facts_ingest_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Ingest Runs Api Facts Ingest Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Ingest Runs",
         "tags": [
           "facts"
         ]
