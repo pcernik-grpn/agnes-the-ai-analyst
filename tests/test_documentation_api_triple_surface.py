@@ -626,6 +626,18 @@ _LIBRARY_SHARING_REASON = (
     "so a second CLI/MCP vocabulary for it would duplicate the admin one."
 )
 
+_SHARE_REQUESTS_ADMIN_REASON = (
+    "Track C6 agent-sharing approval queue — web-only, same reasoning as "
+    "_LIBRARY_SHARING_REASON above: the underlying write is the exact same "
+    "`resource_grants` row the admin `agnes admin grant …` CLI already "
+    "mints, so approve/reject here only decides a QUEUED instance of that "
+    "same grant. The queue itself has no analyst-facing use — it exists "
+    "purely so an admin can review a non-admin owner's agent-share request, "
+    "a decision made from the admin moderation hub (`/admin/store`), never "
+    "scripted. No CLI/MCP vocabulary is warranted for either the list or "
+    "the approve/reject verbs."
+)
+
 _DATA_APPS_PREVIEW_GRANT_REASON = (
     "preview-grant mints the in-chat iframe cookie for the web chat surface; chat-only, no CLI/MCP analogue (spec §7)"
 )
@@ -795,6 +807,9 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
+    "/api/admin/share-requests": _SHARE_REQUESTS_ADMIN_REASON,
+    "/api/admin/share-requests/{request_id}/approve": _SHARE_REQUESTS_ADMIN_REASON,
+    "/api/admin/share-requests/{request_id}/reject": _SHARE_REQUESTS_ADMIN_REASON,
     "/api/me/elevation": (
         "admin elevation consent gate — sets the browser-session cookie the "
         "elevation middleware reads; structurally a web-browser surface (the "

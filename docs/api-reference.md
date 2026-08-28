@@ -1519,8 +1519,45 @@ Shareable resource types are `collection` and `agent` — skills are excluded
 because an approved store entity is already readable by every authenticated
 user.
 
+**Track C6 — agent-sharing needs admin approval (PG-only).** A user may build
+agents freely, but when a NON-ADMIN actor shares an `agent` with a group it has
+not already reached, the grant is not written immediately: it is queued in
+`share_requests` and `PUT /api/sharing/agent/{id}` answers `202` (not `200`),
+with `pending_group_ids` naming what's awaiting a decision. An admin actor
+(regardless of who owns the agent) and any un-share (revoking a group) both
+stay instant and answer `200`, matching every other resource type. `GET
+/api/sharing/agent/{id}` always echoes the current `pending_group_ids` so a
+page reload still shows "pending approval". This gate requires a Postgres
+app-state backend (A3 ratchet) — see `/api/admin/share-requests` below; a
+DuckDB-backed instance answers `501 requires_postgres_backend` only for the
+narrow non-admin+new-group case, never for the admin or un-share paths.
+
 - /api/sharing/groups
 - /api/sharing/{resource_type}/{resource_id}
+
+### `/api/admin/share-requests` — Agent-sharing approval queue (Track C6, PG-only)
+
+Every route requires admin. `GET` lists queued requests, optionally filtered by
+comma-separated `status` (`pending`/`approved`/`rejected`; omitted returns every
+decision, newest first — the queue doubles as its own audit trail). Each row
+carries resolved display fields (`resource_name`, `requested_group_name`,
+`requested_by_email`) alongside the raw ids. `POST .../{id}/approve` writes the
+grant via the same `resource_grants_repo().ensure_grant` the admin-curated
+`/admin/access` layer uses — an approved share reaches the grantee through the
+identical mechanism the shared-agent runtime already honors — and marks the
+request `approved` with `decided_by`/`decided_at`. `POST .../{id}/reject`
+leaves no grant. Both decision routes are a clean `404` on an unknown id OR a
+request that was already decided (an atomic `WHERE status = 'pending'` guard —
+a double-click can never double-write the grant or flip an already-decided
+verdict). Every decision writes an `audit_log` row (`share_request.approved` /
+`share_request.rejected`). PG-only (A3 ratchet): on a DuckDB-backed instance
+every route here answers `501 requires_postgres_backend`. Web-only by design —
+see the triple-surface ratchet's `_SHARE_REQUESTS_ADMIN_REASON` for why no
+CLI/MCP vocabulary was added.
+
+- /api/admin/share-requests
+- /api/admin/share-requests/{request_id}/approve
+- /api/admin/share-requests/{request_id}/reject
 
 ### `/api/collections` — File collections (bring-your-files)
 

@@ -37,6 +37,8 @@
     color: var(--ds-text-secondary);
     text-transform: capitalize;
   }
+  .mod-share-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+  .mod-share-err { color: var(--ds-accent-danger-ink); font-size: var(--text-13); margin-top: var(--space-2); }
 </style>
 {% endblock %}
 
@@ -52,6 +54,46 @@
     Register marketplace repos, sync them, and mark plugins system / disabled.
   {% endcall %}
 </div>
+
+<h2 class="mod-section-title">Pending agent shares</h2>
+
+{% if not agent_share_requests_enabled %}
+  <div class="empty-state">
+    The agent-sharing approval queue requires a Postgres app-state backend.
+    Not available on this instance.
+  </div>
+{% elif pending_share_requests %}
+  <table class="ds-table" id="mod-share-requests-table">
+    <thead>
+      <tr>
+        <th>Agent</th>
+        <th>Requested by</th>
+        <th>Share with</th>
+        <th>Requested</th>
+        <th class="num">Decision</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for sr in pending_share_requests %}
+      <tr data-share-request-id="{{ sr.id }}">
+        <td>{{ sr.resource_name }}</td>
+        <td class="mod-owner">{{ sr.requested_by_email }}</td>
+        <td>{{ sr.requested_group_name }}</td>
+        <td class="mod-owner">{{ sr.created_at }}</td>
+        <td class="num">
+          <div class="mod-share-actions">
+            <button type="button" class="btn btn-secondary btn-sm" data-share-request-action="approve">Approve</button>
+            <button type="button" class="btn btn-danger btn-sm" data-share-request-action="reject">Reject</button>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="mod-share-err" id="mod-share-requests-err" hidden></div>
+{% else %}
+  <div class="empty-state">No agent shares waiting on approval.</div>
+{% endif %}
 
 <h2 class="mod-section-title">Verification requests</h2>
 
@@ -93,5 +135,43 @@
 {% else %}
   <div class="empty-state">No verification requests waiting.</div>
 {% endif %}
+
+<script>
+(function () {
+  var table = document.getElementById('mod-share-requests-table');
+  if (!table) return;
+  var errEl = document.getElementById('mod-share-requests-err');
+
+  table.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('[data-share-request-action]');
+    if (!btn) return;
+    var row = btn.closest('tr[data-share-request-id]');
+    var id = row && row.dataset.shareRequestId;
+    if (!id) return;
+    var action = btn.dataset.shareRequestAction; // 'approve' | 'reject'
+
+    errEl.hidden = true;
+    row.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+
+    fetch('/api/admin/share-requests/' + encodeURIComponent(id) + '/' + action, {
+      method: 'POST',
+      credentials: 'same-origin',
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function () {
+      row.remove();
+      if (window.appToast) {
+        window.appToast({ kind: 'success', msg: action === 'approve' ? 'Share approved' : 'Share rejected' });
+      }
+      if (!table.querySelector('tbody tr')) window.location.reload();
+    }).catch(function (e) {
+      errEl.textContent = 'Could not ' + action + ' this share: ' + (e && e.message ? e.message : e);
+      errEl.hidden = false;
+      row.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+    });
+  });
+})();
+</script>
 
 {% endblock %}

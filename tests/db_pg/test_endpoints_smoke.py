@@ -2903,6 +2903,14 @@ KNOWN_UNTESTED = {
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
+    # Agent-sharing approval queue (Track C6, PG-only). Covered end to end
+    # (queue/approve/reject, C2.3 runtime honoring an approved grant, admin
+    # RBAC, moderation-hub UI wiring, DuckDB typed-501 fail-clean) by
+    # tests/db_pg/test_agent_share_approval_pg.py + the repo-level tests in
+    # tests/db_pg/test_share_requests_pg.py; not duplicated here.
+    "GET /api/admin/share-requests",
+    "POST /api/admin/share-requests/{request_id}/approve",
+    "POST /api/admin/share-requests/{request_id}/reject",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
     # Data-package builder page — the same HTML surface, hosting the drawer

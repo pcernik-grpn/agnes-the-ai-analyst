@@ -9184,6 +9184,13 @@
             "title": "Group Ids",
             "type": "array"
           },
+          "pending_group_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pending Group Ids",
+            "type": "array"
+          },
           "resource_id": {
             "title": "Resource Id",
             "type": "string"
@@ -28929,6 +28936,220 @@
         ]
       }
     },
+    "/api/admin/share-requests": {
+      "get": {
+        "description": "Comma-separated ``status`` (``pending``/``approved``/``rejected``),\ne.g. ``?status=pending``. Omitted returns every decision, newest first \u2014\nthe queue is also the audit trail of past approve/reject calls.",
+        "operationId": "list_share_requests_api_admin_share_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "skip",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Skip",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Share Requests",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
+    "/api/admin/share-requests/{request_id}/approve": {
+      "post": {
+        "operationId": "approve_share_request_api_admin_share_requests__request_id__approve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve Share Request",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
+    "/api/admin/share-requests/{request_id}/reject": {
+      "post": {
+        "operationId": "reject_share_request_api_admin_share_requests__request_id__reject_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reject Share Request",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/certificate": {
       "get": {
         "description": "Read-only certificate metadata for the connection's already-stored\nPEM \u2014 thumbprint (the ``x5t`` value the client actually presents, plus\nthe conventional uppercase-hex fingerprint), subject/issuer, validity\nwindow, and a derived ``ok``/``expiring_soon``/``expired`` status. Two\nreal failure modes this closes: a registered certificate that does not\nmatch what the connection actually presents (opaque provider auth\nerror), and a certificate expiring silently (crawl/sync fails with no\nwarning).\n\nNever the private key \u2014 only :func:`connectors.sharepoint.graph_client.\ncertificate_metadata`'s CERTIFICATE-block parse reaches the response.\nNo certificate configured, or a certificate that fails to resolve or\nparse, is a typed absence (``certificate: null`` plus ``reason``) \u2014\nnever a 500.",
@@ -47061,7 +47282,7 @@
         ]
       },
       "put": {
-        "description": "Set which groups a Library item is shared with (idempotent).\n\n``group_ids: []`` makes the item private again. Grants to groups outside\nthe caller's shareable set are preserved \u2014 see ``set_shares``.",
+        "description": "Set which groups a Library item is shared with (idempotent).\n\n``group_ids: []`` makes the item private again. Grants to groups outside\nthe caller's shareable set are preserved \u2014 see ``set_shares``.\n\nTrack C6: for an approval-gated type (``agent``) shared by a non-admin\nactor, a newly-requested group is queued instead of granted \u2014 this is\nNOT an error, so the status is ``202`` (queued) rather than ``200``,\nand ``pending_group_ids`` names what's awaiting an admin decision.",
         "operationId": "put_share_state_api_sharing__resource_type___resource_id__put",
         "parameters": [
           {

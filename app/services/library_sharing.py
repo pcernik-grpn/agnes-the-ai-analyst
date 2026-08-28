@@ -233,6 +233,37 @@ def visibility_for(resource_type: str, resource_id: str) -> str:
     return "shared"
 
 
+#: Resource types whose sharing widens through an admin approval queue
+#: instead of an immediate grant, when the ACTOR (not the resource owner) is
+#: not an admin (Track C6 — "a user can build their own agents freely, but
+#: SHARING an agent needs ADMIN APPROVAL"). Un-sharing (revoking a group) is
+#: never gated — it only narrows reach, so it stays instant regardless of
+#: actor. Admin actors always take the immediate `ensure_grant` path below,
+#: matching the rest of this module's "admins pass for everything" posture.
+_APPROVAL_GATED_TYPES: frozenset[str] = frozenset({ResourceType.AGENT.value})
+
+
+def pending_share_group_ids(resource_type: str, resource_id: str) -> Set[str]:
+    """Group ids with an outstanding (undecided) share request on this
+    resource — the queued counterpart to :func:`current_share_group_ids`.
+
+    Best-effort: on a DuckDB-backed instance the PG-only ``share_requests``
+    table doesn't exist (the whole approval queue is a PG-only feature, see
+    ``src/repositories/share_requests_pg.py``), so this degrades to "no
+    pending state visible" rather than surfacing a 501 on what is otherwise
+    a plain read of sharing state.
+    """
+    if resource_type not in _APPROVAL_GATED_TYPES:
+        return set()
+    try:
+        from src.repositories import share_requests_repo
+
+        rows = share_requests_repo().list_pending_for_resource(resource_type, resource_id)
+    except Exception:
+        return set()
+    return {r["requested_group_id"] for r in rows}
+
+
 def set_shares(
     *,
     resource_type: str,
@@ -247,9 +278,20 @@ def set_shares(
     set*. Grants to groups outside that set (e.g. one an admin made) are left
     alone — an owner can neither revoke nor forge them.
 
-    Returns ``{visibility, group_ids, added, removed}``. Raises ``ValueError``
-    with a stable machine token when a requested group isn't shareable by this
-    caller.
+    For an approval-gated type (``agent``) shared by a non-admin actor, a
+    newly-requested group is NOT granted immediately — it is queued as a
+    ``share_requests`` row for an admin to approve/reject (Track C6). An
+    admin actor (regardless of whose agent it is) always takes the
+    immediate path, matching every other "admins pass" rule in this module.
+    Un-sharing (``to_remove``) is never gated.
+
+    Returns ``{visibility, group_ids, added, removed, pending_group_ids,
+    queued_group_ids}``. ``pending_group_ids`` is every outstanding
+    request on the resource (including ones queued by an earlier call);
+    ``queued_group_ids`` is only the groups THIS call just queued — the
+    signal the endpoint uses to answer 202 instead of 200. Raises
+    ``ValueError`` with a stable machine token when a requested group isn't
+    shareable by this caller.
     """
     from src.repositories import resource_grants_repo
 
@@ -266,6 +308,22 @@ def set_shares(
     to_add = requested - existing
     to_remove = (existing & allowed) - requested
 
+    gate_approval = resource_type in _APPROVAL_GATED_TYPES and not is_admin
+    queued: Set[str] = set()
+    if gate_approval and to_add:
+        from src.repositories import share_requests_repo
+
+        sr_repo = share_requests_repo()
+        for gid in sorted(to_add):
+            sr_repo.create(
+                resource_type=resource_type,
+                resource_id=resource_id,
+                requested_group_id=gid,
+                requested_by=actor_id,
+            )
+        queued = set(to_add)
+        to_add = set()  # nothing granted yet — queued for admin decision
+
     for gid in sorted(to_add):
         grants_repo.ensure_grant(gid, resource_type, resource_id, assigned_by=actor_id)
     for gid in sorted(to_remove):
@@ -278,4 +336,6 @@ def set_shares(
         "group_ids": sorted(current_share_group_ids(resource_type, resource_id)),
         "added": sorted(to_add),
         "removed": sorted(to_remove),
+        "pending_group_ids": sorted(pending_share_group_ids(resource_type, resource_id)),
+        "queued_group_ids": sorted(queued),
     }

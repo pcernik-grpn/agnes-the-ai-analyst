@@ -77,6 +77,7 @@ from src.models.rbac import (
 )
 from src.models.recipes import Recipe
 from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
+from src.models.share_requests import ShareRequest
 from src.models.sso import SsoConfig, UserExternalIdentity
 from src.models.store import (
     MarketplacePlugin,
@@ -170,6 +171,7 @@ __all__ = [
     "ScriptRegistry",
     "SemanticModel",
     "SemanticSource",
+    "ShareRequest",
     "SessionProcessorState",
     "SetupToken",
     "SourceConnection",
