@@ -792,9 +792,8 @@ def register_foundation_tools(
         who/what/which-entity or aggregation questions ("who worked on
         what", "which clients per industry", "who owns X") — BEFORE any SQL
         or document search; each result is pre-filtered server-side to
-        evidence you can read, so a hit here answers the relationship
-        directly instead of you reconstructing it from a table join or a
-        keyword search.
+        evidence you can read, so a hit answers the relationship directly,
+        no table join or keyword search needed.
 
         Facts have no local scope — this always runs server-side, filtered
         entirely to evidence YOU can read (design doc §5): a subject
