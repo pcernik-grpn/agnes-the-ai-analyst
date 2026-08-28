@@ -21,7 +21,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   confusion (an in-chat agent concluding its auth was broken and recommending
   `agnes pull`): (1) the secret broker now replays **read-only (GET/HEAD)
   admin routes** under the session user's own identity — `agnes admin
-  list-users` / `list-tables` work for an actual admin in chat, while the
+  list-users` / `list-tables` work for an actual admin in chat (main-scoped
+  CLI tickets only — the MCP leg keeps the full refusal), while the
   route's live `require_admin` still refuses non-admins and agent principals,
   and admin **mutations** stay interactive-only (403
   `admin_mutations_require_interactive_auth`); switchable via the new live

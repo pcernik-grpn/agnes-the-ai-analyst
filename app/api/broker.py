@@ -21,7 +21,9 @@ CLI cannot be replayed against the other's route. Admin-*mutation* paths
 the broker only ever re-authenticates the interactive-parity flows (catalog
 reads, queries, MCP tool calls), never privileged admin writes, regardless of
 the resolved identity's own grants. Read-only (``GET``/``HEAD``) admin routes
-ARE replayed (switchable via ``chat.broker_admin_reads``, default on): the
+ARE replayed for ``main``-scoped tickets only (the CLI's leg — the MCP
+subprocess's narrower ticket keeps the full refusal), switchable via
+``chat.broker_admin_reads`` (default on): the
 replay runs under the ticket's resolved identity and the route's own
 ``require_admin`` still decides live — a non-admin caller (or an
 ``AgentPrincipal``, which ``require_admin`` hard-denies) gets the route's own
@@ -416,9 +418,14 @@ async def _replay(request: Request, row: Dict[str, Any], body: Dict[str, Any]) -
     # under the resolved identity and the route's own `require_admin` decides
     # live — so `agnes admin list-users`/`list-tables` work for an actual
     # admin in chat, while a non-admin or an AgentPrincipal still gets 403
-    # from the route itself, and mutations stay interactive-only.
+    # from the route itself, and mutations stay interactive-only. The
+    # allowance is scoped to the MAIN ticket (the CLI's leg): the MCP
+    # subprocess has no admin commands, so its narrower ticket keeps the
+    # pre-existing full refusal — least privilege over symmetry (Devin
+    # review on this PR).
     is_admin_route = match_path.startswith(_ADMIN_PATH_PREFIX) or _route_requires_admin(request.app, method, match_path)
-    if is_admin_route and not (method in _ADMIN_READ_METHODS and _broker_admin_reads_enabled()):
+    admin_read_allowed = method in _ADMIN_READ_METHODS and row.get("scope") == "main" and _broker_admin_reads_enabled()
+    if is_admin_route and not admin_read_allowed:
         try:
             audit_repo().log(
                 action="broker_admin_route_rejected",

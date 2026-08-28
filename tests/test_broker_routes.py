@@ -280,6 +280,37 @@ def test_admin_read_route_still_requires_admin_downstream(broker_app, e2e_env):
     assert r.json().get("detail") == "Admin access required"
 
 
+def test_admin_read_not_available_to_mcp_scope(broker_app, e2e_env):
+    """The read allowance is main-scope only: an mcp-scoped ticket replaying
+    an admin GET through /api/broker/agnes-mcp gets the broker's own refusal
+    even for an admin identity — the MCP subprocess has no admin commands, so
+    its narrower ticket keeps the pre-existing full refusal (Devin review)."""
+    from src.db import SYSTEM_ADMIN_GROUP
+    from src.repositories.user_group_members import UserGroupMembersRepository
+
+    conn = get_system_db()
+    UserRepository(conn).create(id="broker_admin_mcp1", email="broker_admin_mcp@test.com", name="Broker Admin")
+    admin_row = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]).fetchone()
+    assert admin_row is not None
+    UserGroupMembersRepository(conn).add_member("broker_admin_mcp1", admin_row[0], source="system_seed")
+    conn.close()
+    session = chat_session_repo().create_session(user_email="broker_admin_mcp@test.com", surface=Surface.WEB)
+    tok = ticket_repo().mint(session.id, "mcp")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/agnes-mcp",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"method": "GET", "path": "/api/users", "body": None},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 403, r.text
+    assert r.json().get("detail") == "admin_mutations_require_interactive_auth"
+
+
 def test_admin_read_switch_off_refuses_even_get(broker_app, e2e_env, monkeypatch):
     """`chat.broker_admin_reads` off (env kill-switch) restores the old
     behavior: even a read-only admin GET from an actual admin is refused by
