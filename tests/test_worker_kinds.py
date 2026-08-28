@@ -27,6 +27,7 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -569,10 +570,12 @@ class TestCorpusExtractionHandler:
         with pytest.raises(RuntimeError, match="certificate not configured"):
             handler({"connection_id": "conn1"})
 
-    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material"):
+    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material", config=None):
         monkeypatch.setattr(
             "src.repositories.source_connections_repo",
-            lambda: _FakeSourceConnectionsRepo(row={"id": "conn1", "source_type": "sharepoint", "config": {}}),
+            lambda: _FakeSourceConnectionsRepo(
+                row={"id": "conn1", "source_type": "sharepoint", "config": config if config is not None else {}}
+            ),
         )
         from connectors.sharepoint.settings import SharePointSettings
 
@@ -762,6 +765,143 @@ class TestCorpusExtractionHandler:
 
         with pytest.raises(RuntimeError, match="exited 3"):
             handler({"connection_id": "conn1"})
+
+    # -- anonymize-in-front handoff (spec §9/§9.2) --------------------------
+
+    _ANON_CONFIG = {
+        "scopes": [
+            {
+                "source_scope_id": "scope-anon-1",
+                "display_path": "Contracts",
+                "anonymize": True,
+                "collection_id": "col_anon_1",
+            },
+            {
+                "source_scope_id": "scope-plain-1",
+                "display_path": "Public docs",
+                "anonymize": False,
+                "collection_id": "col_plain_1",
+            },
+        ]
+    }
+
+    def _fake_run_capturing(self, monkeypatch, calls):
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+
+    def test_anonymize_marked_scopes_land_in_child_env_as_json(self, monkeypatch):
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "instance-hmac-secret")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert len(calls) == 1
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"]) == {"scope-anon-1": "col_anon_1"}
+        assert env["AGNES_ANONYMIZATION_HMAC_KEY"] == "instance-hmac-secret"
+        # Never on argv.
+        argv_joined = " ".join(calls[0]["argv"])
+        assert "instance-hmac-secret" not in argv_joined
+        assert "col_anon_1" not in argv_joined
+
+    def test_no_anonymize_scopes_omits_both_vars(self, monkeypatch):
+        """No scope marked anonymize -> neither the scopes map NOR the HMAC
+        key is resolved or forwarded, even if a key happens to be set in the
+        environment — an instance that never anonymizes should never touch
+        the key."""
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unused-secret")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        plain_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-plain-1",
+                    "display_path": "Public docs",
+                    "anonymize": False,
+                    "collection_id": "col_plain_1",
+                }
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=plain_config)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert "AGNES_EXTRACTION_ANONYMIZE_SCOPES" not in env
+        assert "AGNES_ANONYMIZATION_HMAC_KEY" not in env
+
+    def test_no_scopes_at_all_omits_both_vars(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert "AGNES_EXTRACTION_ANONYMIZE_SCOPES" not in env
+        assert "AGNES_ANONYMIZATION_HMAC_KEY" not in env
+
+    def test_anonymize_scope_without_a_resolvable_key_raises(self, monkeypatch):
+        """An anonymize-marked scope with no HMAC key configured must fail
+        the job clean rather than silently run the producer without a
+        per-instance key."""
+        monkeypatch.delenv("AGNES_ANONYMIZATION_HMAC_KEY", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="AGNES_ANONYMIZATION_HMAC_KEY"):
+            handler({"connection_id": "conn1"})
+        # Never invoked the producer at all — the key resolution failure
+        # happens before subprocess.run.
+        assert calls == []
+
+    def test_anonymize_key_env_name_must_be_allowlisted(self, monkeypatch):
+        monkeypatch.setenv("SOME_UNRELATED_SECRET", "leaked-if-not-gated")
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value(
+                {
+                    "extraction": {
+                        "enabled": True,
+                        "producer": {"command": "python -m fake_producer"},
+                        "timeout_s": 60,
+                        "anonymization": {"hmac_key_env": "SOME_UNRELATED_SECRET"},
+                    }
+                }
+            ),
+        )
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="not an allowed credential"):
+            handler({"connection_id": "conn1"})
+        assert calls == []
 
 
 class TestJiraWebhookEnqueues:

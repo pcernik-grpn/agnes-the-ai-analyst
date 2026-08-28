@@ -1199,6 +1199,86 @@ def _extraction_producer_env() -> dict[str, str]:
     return {name: os.environ[name] for name in names if name in os.environ}
 
 
+class AnonymizationKeyError(RuntimeError):
+    """At least one selected scope is ``anonymize=true`` but no per-instance
+    HMAC key resolves (design spec §9.2's pseudonym scheme —
+    ``PERSON_<hmac(key, ...)>`` etc., never a fixed marker). Raised rather
+    than silently omitting the key: a producer falling back to a shared or
+    absent key defeats the "tokens never correlate across tenants"
+    guarantee the key exists for, so the job fails clean instead of running
+    with a weaker guarantee than the wizard promised."""
+
+
+_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT = "AGNES_ANONYMIZATION_HMAC_KEY"
+
+
+def _anonymize_marked_scope_map(connection: dict) -> dict[str, str]:
+    """``{source_scope_id: collection_id}`` for exactly the scopes THIS
+    connection's wizard marked ``anonymize=true`` (spec §9's
+    anonymize-in-front pipeline: source -> crawl -> convert -> anonymize ->
+    Agnes) — the producer handoff for which scopes it must run through the
+    anonymizer before uploading.
+
+    Reads the connection row's own ``config.scopes`` directly (the shape
+    ``app/api/admin_sharepoint.py`` writes and reads:
+    ``{source_scope_id, display_path, anonymize, collection_id}``) rather
+    than importing that admin router — this worker handler must not gain a
+    dependency on the admin API surface. ``GET .../corpus-map`` stays the
+    flat ``{source_scope_id: collection_id}`` producers already consume;
+    this is the SAME mapping, narrowed to anonymize-marked rows, used only
+    internally to build the child env below.
+    """
+    scopes = (connection.get("config") or {}).get("scopes")
+    if not isinstance(scopes, list):
+        return {}
+    out: dict[str, str] = {}
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        if scope.get("anonymize") and scope.get("source_scope_id") and scope.get("collection_id"):
+            out[str(scope["source_scope_id"])] = str(scope["collection_id"])
+    return out
+
+
+def _resolve_anonymization_key() -> str:
+    """Resolve this instance's per-instance anonymization HMAC key (spec
+    §9.2), the SAME pattern ``connectors.sharepoint.settings`` uses for the
+    SharePoint certificate: an admin-configurable env var NAME
+    (``extraction.anonymization.hmac_key_env``, default
+    ``AGNES_ANONYMIZATION_HMAC_KEY``), checked against the shared token-env
+    allowlist (:func:`src.orchestrator_security.is_token_env_allowed`)
+    BEFORE the value is read. That allowlist gate matters here for the same
+    reason it matters for the certificate: the env var NAME is
+    admin-writable config, so without it an admin could point
+    ``hmac_key_env`` at an unrelated instance secret (``ANTHROPIC_API_KEY``,
+    ``JWT_SECRET_KEY``, ...) and have it forwarded to the external producer
+    as if it were the anonymization key. Raises
+    :class:`AnonymizationKeyError` (never returns a fallback/empty key) when
+    the name is disallowed or unset — see that class's docstring for why.
+    """
+    from app.instance_config import get_value
+    from src.orchestrator_security import is_token_env_allowed
+
+    env_name = str(get_value("extraction", "anonymization", "hmac_key_env", default="") or "").strip()
+    env_name = env_name or _ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
+
+    if not is_token_env_allowed(env_name):
+        raise AnonymizationKeyError(
+            f"extraction.anonymization.hmac_key_env={env_name!r} is not an allowed credential "
+            "variable. Add it to AGNES_REMOTE_ATTACH_TOKEN_ENVS if the deployment really uses "
+            "that name for the anonymization key, or use the default AGNES_ANONYMIZATION_HMAC_KEY."
+        )
+
+    value = os.environ.get(env_name)
+    if not value:
+        raise AnonymizationKeyError(
+            f"{env_name} is not set on the server, so the per-instance anonymization key cannot "
+            "be resolved. At least one selected scope is marked anonymize=true — set "
+            f"{env_name} (see docs/anonymization.md) or unmark the scope in the connect wizard."
+        )
+    return value
+
+
 def _run_corpus_extraction(payload: dict) -> dict:
     """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
     §7.5 / §16 step 7). See the module docstring's entry for the wider
@@ -1225,20 +1305,35 @@ def _run_corpus_extraction(payload: dict) -> dict:
         collection the producer should write into. Passed through to the
         producer verbatim; this handler does not interpret it.
 
+    Anonymize-in-front handoff (spec §9/§9.2): this connection's own
+    ``config.scopes`` rows carry a per-scope ``anonymize`` flag (the connect
+    wizard's step-2 column, ``app/api/admin_sharepoint.py``) — the ONLY
+    place that flag is real is here. When at least one confirmed scope is
+    ``anonymize=true``, the child env additionally carries
+    ``AGNES_EXTRACTION_ANONYMIZE_SCOPES`` (a JSON object,
+    ``{source_scope_id: collection_id}``, covering ONLY the anonymize-marked
+    scopes — see :func:`_anonymize_marked_scope_map`) and
+    ``AGNES_ANONYMIZATION_HMAC_KEY`` (the per-instance pseudonym key, see
+    :func:`_resolve_anonymization_key`). Neither var is set when no scope is
+    anonymize-marked — an instance that never anonymizes never resolves or
+    forwards a key it does not need.
+
     Security (playbook F7): every secret this handler resolves —
-    tenant id, client id, certificate private key — reaches the producer
-    ONLY via the child process's environment, never on argv (readable via
-    `ps`/`/proc/<pid>/cmdline`) and never logged. That child env is NOT
+    tenant id, client id, certificate private key, and (when needed) the
+    anonymization HMAC key — reaches the producer ONLY via the child
+    process's environment, never on argv (readable via `ps`/
+    `/proc/<pid>/cmdline`) and never logged. That child env is NOT
     `{**os.environ}` — `extraction.producer` names an EXTERNAL,
     admin-configurable binary, so it starts from a curated non-secret
     allowlist (`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`) plus any operator-
     opted-in `extraction.producer.env_passthrough`, then adds only the
-    three named credentials + the corpus id. No other instance secret
-    (vault key, LLM API key, DB DSN, ...) is ever forwarded, no matter what
-    happens to be sitting in this process's own environment. The
-    producer's own stdout/stderr are logged at DEBUG only, and only on
-    failure, in case a misbehaving producer echoes something it shouldn't
-    at INFO-visible levels.
+    three named credentials + the corpus id + (conditionally) the two
+    anonymization vars above. No other instance secret (vault key, LLM API
+    key, DB DSN, ...) is ever forwarded, no matter what happens to be
+    sitting in this process's own environment. The producer's own
+    stdout/stderr are logged at DEBUG only, and only on failure, in case a
+    misbehaving producer echoes something it shouldn't at INFO-visible
+    levels.
 
     No-op guard: raises (so the job fails cleanly, not with a confusing
     subprocess error) when ``extraction.enabled`` is false or no producer
@@ -1297,6 +1392,16 @@ def _run_corpus_extraction(payload: dict) -> dict:
     }
     if corpus_id:
         child_env["AGNES_EXTRACTION_CORPUS_ID"] = str(corpus_id)
+
+    # Anonymize-in-front handoff (spec §9/§9.2): which of THIS connection's
+    # scopes the producer must run through the anonymizer before uploading,
+    # plus the per-instance pseudonym key — env only (never argv), and only
+    # added when at least one scope actually needs it, so an instance that
+    # never anonymizes never resolves/forwards the key at all.
+    anonymize_scopes = _anonymize_marked_scope_map(connection)
+    if anonymize_scopes:
+        child_env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"] = json.dumps(anonymize_scopes, sort_keys=True)
+        child_env["AGNES_ANONYMIZATION_HMAC_KEY"] = _resolve_anonymization_key()
 
     timeout_s = _extraction_timeout_seconds()
 

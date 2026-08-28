@@ -1602,6 +1602,126 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         )
         assert "Nothing in this category" in result["innerHTML"]
 
+    # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
+
+    def test_facts_html_has_no_anonymization_row_when_nothing_requested(self):
+        """No scope has ever been marked anonymize — the row must not
+        appear at all, not render as empty/zero."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        assert "Anonymization" not in result["html"]
+
+    def test_facts_html_renders_requested_but_not_declared_as_warn(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["anonymization"] = {"requested": ["col_a"], "declared": [], "pending": ["col_a"]}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "anonymization requested 1" in html
+        # Never claims "anonymized" for a scope nothing has declared yet.
+        assert "anonymized 1" not in html
+        assert "badge-warn" in html
+
+    def test_facts_html_renders_declared_as_ok(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["anonymization"] = {"requested": ["col_a"], "declared": ["col_a"], "pending": []}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "anonymized 1" in html
+        assert "anonymization requested" not in html
+        assert "badge-env" in html
+
+    def test_facts_html_renders_both_declared_and_pending_together(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["anonymization"] = {"requested": ["col_a", "col_b"], "declared": ["col_a"], "pending": ["col_b"]}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "anonymized 1" in html
+        assert "anonymization requested 1" in html
+
+
+class TestSharePointWizardShareBadgeRendering:
+    """`spRenderShare` (the connect wizard's step-3 share preview, spec
+    §13.2) executed for real via `node` — the badge this task exists to
+    fix: `anonymize=true` alone must never render "anonymized"; that word
+    is earned only once the scope row's server-computed
+    `anonymization_declared` is also true. Same node-harness pattern as
+    `TestSharePointSourceCardRendering`."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, items: list) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig) for sig in ("function spEsc(s) {", "function spRenderShare(items) {")
+        )
+        script = f"""
+{fns}
+
+const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
+const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
+let spPendingGroups = {{}};
+let spGroups = [];
+const items = {json.dumps(items)};
+
+spRenderShare(items);
+console.log(_host.innerHTML);
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout
+
+    def _row(self, **overrides) -> dict:
+        row = {
+            "source_scope_id": "scope-1",
+            "display_path": "Contracts",
+            "anonymize": False,
+            "anonymization_declared": False,
+            "collection_id": "col_a",
+            "collection": {"id": "col_a", "slug": "contracts", "name": "Contracts"},
+            "group_ids": ["g1"],
+        }
+        row.update(overrides)
+        return row
+
+    def test_not_anonymize_marked_shows_no_badge(self):
+        html = self._run([self._row(anonymize=False)])
+        assert "sp-badge--anon" not in html
+
+    def test_requested_but_not_declared_shows_requested_warn_badge(self):
+        html = self._run([self._row(anonymize=True, anonymization_declared=False)])
+        assert "anonymization requested" in html
+        assert ">anonymized<" not in html
+        assert 'sp-badge--anon"' in html
+        assert "sp-badge--anon-declared" not in html
+
+    def test_declared_shows_anonymized_ok_badge(self):
+        html = self._run([self._row(anonymize=True, anonymization_declared=True)])
+        assert ">anonymized<" in html
+        assert "anonymization requested" not in html
+        assert "sp-badge--anon-declared" in html
+
+    def test_declared_true_but_anonymize_false_shows_no_badge(self):
+        """A defensive edge case: the server never produces this
+        combination (declared implies anonymize was true when the run
+        landed), but the client must not invent a claim from a stale
+        `anonymization_declared` alone."""
+        html = self._run([self._row(anonymize=False, anonymization_declared=True)])
+        assert "sp-badge--anon" not in html
+
 
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
     """`_registerErrorText` output goes to `textContent`, so it must not be

@@ -255,6 +255,104 @@ class TestScopeConfirmationIdempotency:
         assert r1.json()["collection_id"] != r2.json()["collection_id"]
 
 
+class TestAnonymizationDeclaredField:
+    """The wizard's honest badge state (spec §9.2/§13.2): `anonymize` is the
+    admin's checkbox (a wish); `anonymization_declared` is whether the LAST
+    persisted ingest run actually declared this collection anonymized. The
+    two must never collapse into one boolean — a badge reading "anonymized"
+    from the checkbox alone is exactly the bug this field exists to fix."""
+
+    def test_requested_but_not_yet_declared_by_default(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:anon", "display_path": "Contracts", "anonymize": True},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        assert confirmed.json()["anonymize"] is True
+        assert confirmed.json()["anonymization_declared"] is False
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.json()["items"][0]["anonymization_declared"] is False
+
+    def test_declared_once_the_latest_run_reports_the_collection(self, seeded_app, monkeypatch):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn-2")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:anon2", "display_path": "Contracts", "anonymize": True},
+            headers=_auth(token),
+        )
+        collection_id = confirmed.json()["collection_id"]
+
+        class _FakeRunsRepo:
+            def list_recent(self, limit=1):
+                return [{"anonymization": {"declared": True, "scopes": {collection_id: {"docs_anonymized": 3}}}}]
+
+        monkeypatch.setattr("src.repositories.facts_ingest_runs_repo", lambda: _FakeRunsRepo())
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        row = listed.json()["items"][0]
+        assert row["anonymize"] is True
+        assert row["anonymization_declared"] is True
+
+    def test_non_anonymize_scope_never_reads_declared_true(self, seeded_app, monkeypatch):
+        """A collection appearing in a run's declared set does not flip
+        `anonymization_declared` for a scope that was never marked
+        `anonymize` — the field means "requested AND declared", never
+        "declared alone"."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn-3")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:plain", "display_path": "Public", "anonymize": False},
+            headers=_auth(token),
+        )
+        collection_id = confirmed.json()["collection_id"]
+
+        class _FakeRunsRepo:
+            def list_recent(self, limit=1):
+                return [{"anonymization": {"declared": True, "scopes": {collection_id: {"docs_anonymized": 3}}}}]
+
+        monkeypatch.setattr("src.repositories.facts_ingest_runs_repo", lambda: _FakeRunsRepo())
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        row = listed.json()["items"][0]
+        assert row["anonymize"] is False
+        assert row["anonymization_declared"] is False
+
+    def test_run_report_lookup_failure_degrades_to_not_declared(self, seeded_app, monkeypatch):
+        """`facts_ingest_runs_repo()` raising (PG-only repo on a
+        DuckDB-backed instance, per the A3 ratchet) must never 500 the
+        wizard's scope listing — it degrades to "nothing declared yet"."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn-4")
+
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:anon4", "display_path": "Contracts", "anonymize": True},
+            headers=_auth(token),
+        )
+
+        def _boom():
+            raise RuntimeError("requires_postgres_backend")
+
+        monkeypatch.setattr("src.repositories.facts_ingest_runs_repo", _boom)
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.status_code == 200
+        assert listed.json()["items"][0]["anonymization_declared"] is False
+
+
 class TestScopeRemoval:
     def test_removing_a_scope_drops_the_row_not_the_collection(self, seeded_app):
         c = seeded_app["client"]

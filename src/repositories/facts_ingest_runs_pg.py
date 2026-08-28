@@ -25,15 +25,29 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 
+_LIST_JSON_FIELDS = ("corpus_ids", "claims_rejected", "deferred", "review_items")
+
+
 def _decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(row)
-    for key in ("corpus_ids", "claims_rejected", "deferred", "review_items"):
+    for key in _LIST_JSON_FIELDS:
         value = row.get(key)
         if isinstance(value, str):
             try:
                 row[key] = json.loads(value)
             except (ValueError, TypeError):
                 row[key] = []
+    # `anonymization` is a dict, not a list — decoded separately so a bad
+    # payload falls back to `{}` (never `[]`, which every OTHER field above
+    # correctly falls back to).
+    anonymization = row.get("anonymization")
+    if isinstance(anonymization, str):
+        try:
+            row["anonymization"] = json.loads(anonymization)
+        except (ValueError, TypeError):
+            row["anonymization"] = {}
+    elif anonymization is None:
+        row["anonymization"] = {}
     if row.get("created_at") is not None:
         row["created_at"] = row["created_at"].isoformat()
     return row
@@ -55,6 +69,7 @@ class FactsIngestRunsPgRepository:
         subjects_created: int,
         subjects_deleted: int,
         review_items: List[Dict[str, Any]],
+        anonymization: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Persist one ingest batch's run report. Returns the generated id.
 
@@ -63,6 +78,12 @@ class FactsIngestRunsPgRepository:
         connection, and its own failure domain (see the module docstring
         and ``app/api/facts.py::facts_ingest``): a report-write failure must
         never look like an ingest failure to the caller.
+
+        ``anonymization`` (spec §9.2) is the producer's OPTIONAL declaration
+        that (some of) this batch went through the anonymize-in-front
+        pipeline before ingestion — ``None`` (the default, a producer that
+        never anonymizes) stores ``{}``, never ``NULL``, so every reader can
+        treat the column as always-present.
         """
         run_id = "ir_" + secrets.token_hex(8)
         with self._engine.begin() as conn:
@@ -71,10 +92,10 @@ class FactsIngestRunsPgRepository:
                     "INSERT INTO facts_ingest_runs "
                     "(id, corpus_ids, caller, documents_seen, claims_written, "
                     " claims_rejected_count, claims_rejected, deferred, "
-                    " subjects_created, subjects_deleted, review_items) "
+                    " subjects_created, subjects_deleted, review_items, anonymization) "
                     "VALUES (:id, :corpus_ids, :caller, :documents_seen, :claims_written, "
                     "        :claims_rejected_count, :claims_rejected, :deferred, "
-                    "        :subjects_created, :subjects_deleted, :review_items)"
+                    "        :subjects_created, :subjects_deleted, :review_items, :anonymization)"
                 ),
                 {
                     "id": run_id,
@@ -88,6 +109,7 @@ class FactsIngestRunsPgRepository:
                     "subjects_created": subjects_created,
                     "subjects_deleted": subjects_deleted,
                     "review_items": json.dumps(review_items),
+                    "anonymization": json.dumps(anonymization or {}),
                 },
             )
         return run_id

@@ -64,6 +64,15 @@ _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
         # is_token_env_allowed() for the same reason the Snowflake names above
         # do: the variable name lives in admin-writable connection config.
         "SHAREPOINT_CERT_PRIVATE_KEY",
+        # Per-instance HMAC key for the anonymize-in-front pipeline's
+        # pseudonym scheme (design spec §9.2 — PERSON_<hmac(key, ...)> etc.,
+        # never a fixed marker). Resolved by name through
+        # ``app.worker.kinds._resolve_anonymization_key`` (config
+        # ``extraction.anonymization.hmac_key_env``, admin-writable, hence
+        # the same allowlist gate as the SharePoint certificate above) and
+        # forwarded to the EXTERNAL producer subprocess — never used inside
+        # this process for anything else.
+        "AGNES_ANONYMIZATION_HMAC_KEY",
     }
 )
 

@@ -7706,6 +7706,32 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
     cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
 
+    # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
+    # own confirmed scopes marked anonymize=true, read straight off `conn` —
+    # the SAME config `app/api/admin_sharepoint.py` writes) vs "declared"
+    # (the LATEST persisted run report's `anonymization.scopes` — the
+    # producer's own claim). Never collapse the two: a collection can be
+    # requested with nothing declared yet (badge: "anonymization
+    # requested", warn), or declared (badge: "anonymized", ok). A
+    # collection declared but never requested is surfaced too — an operator
+    # misconfiguration worth seeing, not hiding.
+    requested_ids = {
+        s.get("collection_id")
+        for s in (conn.get("config") or {}).get("scopes") or []
+        if isinstance(s, dict) and s.get("anonymize") and s.get("collection_id")
+    }
+    declared_ids: set[str] = set()
+    if last_run is not None:
+        anon = last_run.get("anonymization") or {}
+        run_scopes = anon.get("scopes")
+        if isinstance(run_scopes, dict):
+            declared_ids = set(run_scopes.keys())
+    cell["anonymization"] = {
+        "requested": sorted(requested_ids),
+        "declared": sorted(requested_ids & declared_ids),
+        "pending": sorted(requested_ids - declared_ids),
+    }
+
     return cell
 
 
