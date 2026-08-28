@@ -713,6 +713,53 @@ class TestColumnBinding:
 
         assert repo.get("shop_orders", "amount") is None, "deleting the model must not orphan its column_metadata row"
 
+    def test_manual_dataset_source_is_never_resolved(self, system_db):
+        """Regression (Devin, PR #1673): a manual dataset's `source` is
+        ALREADY an Agnes table id by convention, so it must land under that
+        literal string, not whatever `resolve_dataset_table` maps it to.
+        `table_registry.id` is derived from `name` (e.g. `request.name
+        .strip().lower().replace(" ", "_")` in `app/api/admin.py`), so a
+        table registered with a display name containing spaces/uppercase
+        has `id != name` — before this guard, a manual dataset whose
+        `source` matched that NAME would silently resolve onto the
+        DIFFERENT `id`, orphaning any pre-existing column row under the
+        raw name key."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="orders_table",
+                name="Orders Table",
+                source_type="local",
+                query_mode="local",
+            )
+        finally:
+            conn.close()
+
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "Orders Table",
+                            "fields": [{"name": "amount"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        project_document(doc, source="manual", source_ref=None)
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("Orders Table", "amount") is not None, "must land under the raw dataset source, unresolved"
+        assert repo.get("orders_table", "amount") is None, "must NOT resolve onto table_registry's derived id"
+
 
 class TestDuplicateModelName:
     """A document with NO stable model identifier falls back to the model

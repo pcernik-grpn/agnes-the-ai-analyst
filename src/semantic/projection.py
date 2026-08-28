@@ -257,6 +257,43 @@ def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str
     return row["id"] if row else None
 
 
+def _column_table_id(dataset: dict, source: str) -> str:
+    """The ``column_metadata`` table-id key one dataset's fields write
+    under — :func:`resolve_dataset_table`'s result, falling back to the raw
+    ``dataset.source``/``.name`` on a miss, EXCEPT for ``source == 'manual'``
+    (never resolved).
+
+    A manual dataset's ``source`` is already an Agnes table id by
+    convention (see :data:`_MANUAL_DOCUMENT_SOURCE`'s note near the top of
+    this module) — running it through resolution anyway can silently shift
+    the key it lands under (``table_registry.id`` is derived from ``name``,
+    e.g. ``request.name.strip().lower().replace(" ", "_")`` in
+    ``app/api/admin.py``, so the two diverge whenever a table's display name
+    has spaces/uppercase) or, on a literal-match miss, match an unrelated
+    table via the generic multi-segment fallback that manual documents never
+    went through before this helper existed — orphaning existing rows under
+    the old raw key either way. The three callers that key ``column_
+    metadata`` (the write leg of :func:`project_document`, :func:`prune_model`,
+    :func:`_sibling_column_claims`) must all agree on this key, so they share
+    this one function rather than repeating the ``source``-gated ternary.
+
+    TODO(perf, Devin PR #1673): each call rebuilds `resolve_dataset_table`'s
+    whole table-registry lookup from scratch (`list_by_source()` for
+    Keboola, `_generic_table_lookup()` otherwise) — this function is called
+    once per dataset, so one `project_document`/`prune_model` call over N
+    models × M datasets does O(N*M) full registry scans instead of the ONE
+    the metric leg's `_table_binder()` gets away with by building its lookup
+    once and reusing it. Not a correctness bug (registries are small; a
+    routine sync stays well within one request), but the fix is to build the
+    lookup(s) once per outer call and thread them through here, in
+    `prune_model`, and in `_sibling_column_claims`, mirroring `_table_binder`.
+    """
+    raw_table_id = dataset.get("source") or dataset.get("name") or ""
+    if source == _MANUAL_DOCUMENT_SOURCE:
+        return raw_table_id
+    return resolve_dataset_table(dataset, source) or raw_table_id
+
+
 def _table_binder():
     """Return ``resolve(table_id) -> view_name | None`` over every registered
     table this instance knows how to bind against, or ``None`` when nothing
@@ -727,18 +764,10 @@ def project_document(
             report.metrics_written += 1
 
         for dataset in model.get("datasets") or []:
-            # Resolved through the same `resolve_dataset_table` chain the
-            # metric leg's table binder above already uses, so `column_
-            # metadata` is keyed under the same `table_registry.id` every
-            # other reader of it (the schema API, the profiler, the admin
-            # metadata API) already expects — previously this stayed under
-            # the RAW dataset id (e.g. a Keboola tableId like
-            # `in.c-shop.orders`), which nothing else ever reads, making an
-            # imported column description a silent no-op. Falls back to the
-            # raw id when resolution misses (table not registered yet),
-            # preserving the prior behavior for that case.
-            raw_table_id = dataset.get("source") or dataset.get("name") or ""
-            table_id = resolve_dataset_table(dataset, source) or raw_table_id
+            # `_column_table_id` keys this the same way `prune_model` and
+            # `_sibling_column_claims` do — see its docstring for why
+            # `source == 'manual'` is never resolved.
+            table_id = _column_table_id(dataset, source)
             field_names = written_columns_by_table.setdefault(table_id, set())
             for column in dataset.get("fields") or []:
                 column_name = column.get("name")
@@ -891,7 +920,7 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
         report.glossary_pruned += _prune_glossary(source, source_ref, set(), scope_prefixes={prefix})
 
         written_by_table = {
-            (resolve_dataset_table(dataset, source) or dataset.get("source") or dataset.get("name") or ""): set()
+            _column_table_id(dataset, source): set()
             for dataset in model.get("datasets") or []
             if isinstance(dataset, dict)
         }
@@ -960,7 +989,7 @@ def _sibling_column_claims(
             for dataset in model.get("datasets") or []:
                 if not isinstance(dataset, dict):
                     continue
-                table_id = resolve_dataset_table(dataset, source) or dataset.get("source") or dataset.get("name") or ""
+                table_id = _column_table_id(dataset, source)
                 names = claims.setdefault(table_id, set())
                 for column in dataset.get("fields") or []:
                     if isinstance(column, dict) and column.get("name"):
