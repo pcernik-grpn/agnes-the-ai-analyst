@@ -29,6 +29,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
