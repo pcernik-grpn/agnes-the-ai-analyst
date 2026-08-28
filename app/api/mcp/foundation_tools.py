@@ -787,7 +787,13 @@ def register_foundation_tools(
         filters: dict[str, Any] | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict:
-        """Search typed subjects (facts) extracted from Collections documents, by type and attribute filters.
+        """Search typed facts extracted from documents — entities (people,
+        clients, organizations) and their attributes. Use this FIRST for
+        who/what/which-entity or aggregation questions ("who worked on
+        what", "which clients per industry", "who owns X") — BEFORE any SQL
+        or document search; each result is pre-filtered server-side to
+        evidence you can read, so a hit answers the relationship directly,
+        no table join or keyword search needed.
 
         Facts have no local scope — this always runs server-side, filtered
         entirely to evidence YOU can read (design doc §5): a subject
@@ -829,7 +835,12 @@ def register_foundation_tools(
         fanout: Annotated[int, Field(ge=1, le=100)] = 100,
         limit: Annotated[int, Field(ge=1, le=500)] = 500,
     ) -> dict:
-        """Bounded graph traversal from one fact or edge (depth <= 2, design doc §12).
+        """Traverse relationships between facts — use for connection/chain
+        questions ("how are X and Y connected", "who does X report to",
+        "which team owns this client") once you have a starting
+        `subject_id` from `fact_search`; prefer this over inferring
+        structure from a SQL join or a document search. Depth <= 2, capped
+        fanout (design doc §12).
 
         Re-checks visibility at EVERY hop — an edge into a subject whose
         claims you cannot read is dropped silently, never revealed as
@@ -871,7 +882,11 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def fact_claims(subject_id: str) -> dict:
-        """Your readable evidence for one fact or edge — quote, document, date.
+        """Your readable evidence for one fact or edge — the exact quote,
+        source document and date backing a result from `fact_search` or
+        `fact_neighbors`. Call this before reporting a fact in your answer:
+        a fact you cannot cite this way is not one you should state as
+        given.
 
         Mirrors `GET /api/facts/{subject_id}/claims` and `agnes facts claims`.
 

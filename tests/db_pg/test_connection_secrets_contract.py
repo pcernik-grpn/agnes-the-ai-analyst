@@ -69,6 +69,19 @@ def test_upsert_get_has_delete_roundtrip(repo):
     assert repo.has("c1") is False
 
 
+def test_updated_at_tracks_upsert_and_is_none_when_unset(repo):
+    """``updated_at`` is the set-date badge's data source (e.g. the SharePoint
+    wizard's certificate row) — it must never require a decrypt to read."""
+    assert repo.updated_at("c2") is None
+    repo.upsert("c2", "tok-1")
+    first = repo.updated_at("c2")
+    assert first is not None
+    repo.upsert("c2", "tok-2")  # rotate
+    assert repo.updated_at("c2") is not None
+    repo.delete("c2")
+    assert repo.updated_at("c2") is None
+
+
 def test_get_returns_none_on_decrypt_failure(repo, monkeypatch, caplog):
     """Vault key rotated → ``get()`` reads as absent (never raises) on either
     backend, and the WARNING names the column. Both repos read through
@@ -91,3 +104,22 @@ def test_get_returns_none_on_decrypt_failure(repo, monkeypatch, caplog):
     assert "connection_secrets.ciphertext[c-rot]" in caplog.text, (
         f"decrypt warning does not identify the column: {caplog.text!r}"
     )
+
+
+def test_updated_at_is_none_when_absent(repo):
+    """The source card's certificate row (spec §13.2) shows a vault-provided
+    credential's set-date without ever reading the value — ``updated_at()``
+    exists for exactly that (see ``connectors/sharepoint/settings.py``'s
+    ``credential_set_at``). No row yet -> ``None``, never an exception."""
+    assert repo.updated_at("c-never-set") is None
+
+
+def test_updated_at_round_trips_and_advances_on_rotate(repo):
+    repo.upsert("c1", "tok-secret-1")
+    first = repo.updated_at("c1")
+    assert first is not None
+
+    repo.upsert("c1", "tok-secret-2")
+    second = repo.updated_at("c1")
+    assert second is not None
+    assert second >= first

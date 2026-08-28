@@ -93,6 +93,41 @@ class TestCreateRejectsDisallowedConfigTokenEnv:
         assert resp.status_code == 400, resp.text
         assert "ANTHROPIC_API_KEY" in resp.text
 
+    def test_sharepoint_disallowed_cert_private_key_env_in_config_is_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sp-evil",
+                "source_type": "sharepoint",
+                "config": {
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
+                    "client_id": "app-client-id",
+                    "cert_private_key_env": "JWT_SECRET_KEY",
+                },
+            },
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "JWT_SECRET_KEY" in resp.text
+
+    def test_sharepoint_allowlisted_cert_private_key_env_in_config_is_accepted(self, seeded_app):
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sp-ok",
+                "source_type": "sharepoint",
+                "config": {
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
+                    "client_id": "app-client-id",
+                    "cert_private_key_env": "SHAREPOINT_CERT_PRIVATE_KEY",
+                },
+            },
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+
     def test_allowlisted_token_env_in_config_is_accepted(self, seeded_app):
         c = seeded_app["client"]
         resp = c.post(
