@@ -71,6 +71,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **MCP foundation-tool errors now carry the server's remedy, and the chat
+  approval card says what it is approving.** Every foundation tool used a bare
+  `raise_for_status()`, so a 4xx surfaced to the model as a generic
+  `Client error '400 Bad Request' for url …` while the response's `detail` —
+  the actionable part, e.g. `invalid_category` with the list of valid
+  categories — was discarded; the shared helper now appends it, letting the
+  model self-correct instead of dead-ending. The chat approval card now names
+  the tool being approved in its title (it previously said only "Approval
+  required", forcing the reader to infer the tool from a neighbouring card),
+  a no-args engine tool call no longer renders a code block containing just
+  `{}`, JSON args are pretty-printed, and while a call waits on the decision
+  its tool card reads "waiting for approval" instead of a contradictory
+  "running…".
 - **A completed sign-in is now recorded in `audit_log`, for every provider.**
   `login_failed` was the only authentication event the trail carried: the
   Google, Microsoft, email magic-link and Keboola providers wrote nothing at

@@ -649,6 +649,10 @@ class KaiEngineHandle:
         elif etype == "tool-approval-request":
             tool_call_id = str(event.get("toolCallId", ""))
             state.pending_approvals.add(tool_call_id)
+            # No-args tools send "" (not "{}"): the client only renders the
+            # command block when there is something to show. indent=2 keeps
+            # the block readable even after the 2000-char truncation.
+            args = state.tool_args.get(tool_call_id, {})
             self.stdout.feed_frame(
                 {
                     "type": "approval_request",
@@ -657,7 +661,7 @@ class KaiEngineHandle:
                     # hands it back verbatim.
                     "request_id": tool_call_id,
                     "tool": state.tool_names.get(tool_call_id, "tool"),
-                    "command": json.dumps(state.tool_args.get(tool_call_id, {}), ensure_ascii=False)[:2000],
+                    "command": json.dumps(args, ensure_ascii=False, indent=2)[:2000] if args else "",
                     "reason": "The engine requires approval before running this tool.",
                     "timeout_seconds": self._approval_timeout_seconds,
                 }

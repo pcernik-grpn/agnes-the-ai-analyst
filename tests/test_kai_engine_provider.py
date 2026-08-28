@@ -426,6 +426,50 @@ def test_approval_round_trip():
     asyncio.run(_run())
 
 
+def test_approval_card_empty_args_sends_no_command():
+    """A no-args tool call must not put an args preview on the approval card:
+    the client renders the command block whenever the string is non-empty, and
+    a literal "{}" is a code block saying nothing."""
+
+    async def _run():
+        engine = FakeEngine()
+        gate = asyncio.Event()
+        engine.turns = [
+            {
+                "pre": [
+                    {
+                        "type": "tool-input-available",
+                        "toolCallId": "call-10",
+                        "toolName": "github_get_me",
+                        "input": {},
+                    },
+                    {"type": "tool-approval-request", "toolCallId": "call-10"},
+                ],
+                "gate": gate,
+                "post": [
+                    {"type": "tool-output-error", "toolCallId": "call-10", "errorText": "denied"},
+                    {"type": "finish"},
+                ],
+            }
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "hi"})
+        while True:
+            frame = json.loads(await handle.stdout.readline())
+            if frame.get("type") == "approval_request":
+                break
+        assert frame["tool"] == "github_get_me"
+        assert frame["command"] == ""
+        gate.set()
+        frames = await _drain_until_done(handle)
+        await handle.kill()
+        # Engine-side resolution (the error output) retires the card.
+        assert any(f.get("type") == "approval_resolved" for f in frames)
+
+    asyncio.run(_run())
+
+
 def test_unanswered_approval_retired_at_turn_end():
     async def _run():
         engine = FakeEngine()
@@ -1011,7 +1055,9 @@ def test_the_agent_api_refuses_rather_than_running_the_wrong_persona():
     # Reach the provider defensively: a manager without `_provider` (any test
     # double, and the api-role thin producer) must not turn this guard into an
     # AttributeError 500 on a route that has nothing to do with the engine.
-    assert 'getattr(manager, "_provider", None)' in fn, "reading manager._provider directly 500s on a manager without one"
+    assert 'getattr(manager, "_provider", None)' in fn, (
+        "reading manager._provider directly 500s on a manager without one"
+    )
     assert "agent_sessions_unavailable_on_provider" in fn
     # Refused BEFORE the session is created, not after.
     assert fn.index("provides_own_credentials") < fn.index("manager.create_session")
