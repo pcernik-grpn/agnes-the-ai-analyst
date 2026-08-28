@@ -2909,8 +2909,7 @@ KNOWN_UNTESTED = {
     # tests/db_pg/test_agent_share_approval_pg.py + the repo-level tests in
     # tests/db_pg/test_share_requests_pg.py; not duplicated here.
     "GET /api/admin/share-requests",
-    "POST /api/admin/share-requests/{request_id}/approve",
-    "POST /api/admin/share-requests/{request_id}/reject",
+    "PATCH /api/admin/share-requests/{request_id}",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
     # Data-package builder page — the same HTML surface, hosting the drawer

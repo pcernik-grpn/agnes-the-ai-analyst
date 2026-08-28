@@ -808,8 +808,7 @@ _EXEMPT: dict[str, str] = {
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/admin/share-requests": _SHARE_REQUESTS_ADMIN_REASON,
-    "/api/admin/share-requests/{request_id}/approve": _SHARE_REQUESTS_ADMIN_REASON,
-    "/api/admin/share-requests/{request_id}/reject": _SHARE_REQUESTS_ADMIN_REASON,
+    "/api/admin/share-requests/{request_id}": _SHARE_REQUESTS_ADMIN_REASON,
     "/api/me/elevation": (
         "admin elevation consent gate — sets the browser-session cookie the "
         "elevation middleware reads; structurally a web-browser surface (the "

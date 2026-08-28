@@ -1,8 +1,14 @@
 """Admin API for the agent-sharing approval queue (Track C6).
 
-  GET  /api/admin/share-requests                 require_admin
-  POST /api/admin/share-requests/{id}/approve     require_admin
-  POST /api/admin/share-requests/{id}/reject      require_admin
+  GET   /api/admin/share-requests        require_admin
+  PATCH /api/admin/share-requests/{id}   require_admin  -- {"decision": "approve"|"reject"}
+
+The decision rides in the body rather than a verb path segment, mirroring
+the existing moderation precedent this router follows on purpose:
+``PATCH /api/v1/agents/{agent_id}/memories/{memory_id}`` with an ``action``
+field (``app/api/agents_admin.py``'s ``MemoryActionRequest`` /
+``_MEMORY_ACTIONS``) — see ``tests/test_api_design_rules.py::
+test_no_new_verbs_in_path``, which forbids a new verb-segment in a path.
 
 A non-admin owner's ``PUT /api/sharing/agent/{id}`` queues a
 ``share_requests`` row instead of writing the ``resource_grants`` row
@@ -26,6 +32,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from app.auth.access import require_admin
 from src.repositories import (
@@ -40,6 +47,17 @@ from src.repositories import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/share-requests", tags=["share-requests"])
+
+# Wire vocabulary mirrors MemoryActionRequest's "approve"/"archive" shape
+# (present-tense verb IN THE BODY, never in the path). Maps to the stored
+# `share_requests.status` values, which stay past-tense ("approved" /
+# "rejected") to read correctly as a noun-state once decided.
+_DECISIONS = frozenset({"approve", "reject"})
+_DECISION_TO_STATUS = {"approve": "approved", "reject": "rejected"}
+
+
+class ShareRequestDecisionRequest(BaseModel):
+    decision: str
 
 
 def _audit(actor_id: str, action: str, resource: str, params: Optional[dict] = None) -> None:
@@ -143,11 +161,15 @@ def _decide(request_id: str, *, decision: str, user: dict) -> Dict[str, Any]:
     return _serialize(row)
 
 
-@router.post("/{request_id}/approve")
-async def approve_share_request(request_id: str, user: dict = Depends(require_admin)):
-    return _decide(request_id, decision="approved", user=user)
-
-
-@router.post("/{request_id}/reject")
-async def reject_share_request(request_id: str, user: dict = Depends(require_admin)):
-    return _decide(request_id, decision="rejected", user=user)
+@router.patch("/{request_id}")
+async def decide_share_request(
+    request_id: str,
+    payload: ShareRequestDecisionRequest,
+    user: dict = Depends(require_admin),
+):
+    if payload.decision not in _DECISIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid_decision: must be one of {sorted(_DECISIONS)}, got {payload.decision!r}",
+        )
+    return _decide(request_id, decision=_DECISION_TO_STATUS[payload.decision], user=user)

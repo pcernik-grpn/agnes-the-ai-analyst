@@ -9175,6 +9175,19 @@
         "title": "SetupTokenItem",
         "type": "object"
       },
+      "ShareRequestDecisionRequest": {
+        "properties": {
+          "decision": {
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "ShareRequestDecisionRequest",
+        "type": "object"
+      },
       "ShareStateResponse": {
         "properties": {
           "group_ids": {
@@ -29026,9 +29039,9 @@
         ]
       }
     },
-    "/api/admin/share-requests/{request_id}/approve": {
-      "post": {
-        "operationId": "approve_share_request_api_admin_share_requests__request_id__approve_post",
+    "/api/admin/share-requests/{request_id}": {
+      "patch": {
+        "operationId": "decide_share_request_api_admin_share_requests__request_id__patch",
         "parameters": [
           {
             "in": "path",
@@ -29056,6 +29069,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRequestDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -29082,69 +29105,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Approve Share Request",
-        "tags": [
-          "share-requests"
-        ]
-      }
-    },
-    "/api/admin/share-requests/{request_id}/reject": {
-      "post": {
-        "operationId": "reject_share_request_api_admin_share_requests__request_id__reject_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "request_id",
-            "required": true,
-            "schema": {
-              "title": "Request Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Reject Share Request",
+        "summary": "Decide Share Request",
         "tags": [
           "share-requests"
         ]

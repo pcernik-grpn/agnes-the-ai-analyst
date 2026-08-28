@@ -153,9 +153,11 @@
     errEl.hidden = true;
     row.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
 
-    fetch('/api/admin/share-requests/' + encodeURIComponent(id) + '/' + action, {
-      method: 'POST',
+    fetch('/api/admin/share-requests/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
+      body: JSON.stringify({ decision: action }),
     }).then(function (r) {
       if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || ('HTTP ' + r.status)); });
       return r.json();

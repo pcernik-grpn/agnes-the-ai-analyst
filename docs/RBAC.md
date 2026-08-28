@@ -75,7 +75,7 @@ an agent freely, but sharing one is the one owner-writable grant that isn't
 instant: when a NON-ADMIN actor shares an `agent` with a group it hasn't
 already reached, the write lands in a `share_requests` queue instead of
 `resource_grants` directly, and an admin decides via
-`GET/POST /api/admin/share-requests*` (approve writes the exact same
+`GET /api/admin/share-requests` + `PATCH .../{id}` (approve writes the exact same
 `ensure_grant` an admin-curated `/admin/access` write would). An admin actor
 and any un-share both stay instant. This requires a Postgres app-state
 backend (A3 ratchet) — see `docs/api-reference.md` → `/api/admin/share-requests`.

@@ -134,7 +134,11 @@ def test_admin_approve_grants_access_and_marks_decided(tmp_path, monkeypatch, pg
         "id"
     ]
 
-    r = client.post(f"/api/admin/share-requests/{request_id}/approve", headers=_auth(admin_token))
+    r = client.patch(
+        f"/api/admin/share-requests/{request_id}",
+        json={"decision": "approve"},
+        headers=_auth(admin_token),
+    )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "approved"
@@ -153,7 +157,11 @@ def test_admin_approve_grants_access_and_marks_decided(tmp_path, monkeypatch, pg
 
     # Re-approving the same (now-decided) request is a clean 404, not a
     # double grant / double audit entry.
-    again = client.post(f"/api/admin/share-requests/{request_id}/approve", headers=_auth(admin_token))
+    again = client.patch(
+        f"/api/admin/share-requests/{request_id}",
+        json={"decision": "approve"},
+        headers=_auth(admin_token),
+    )
     assert again.status_code == 404
 
 
@@ -170,7 +178,11 @@ def test_admin_reject_leaves_no_grant(tmp_path, monkeypatch, pg_engine):
         "id"
     ]
 
-    r = client.post(f"/api/admin/share-requests/{request_id}/reject", headers=_auth(admin_token))
+    r = client.patch(
+        f"/api/admin/share-requests/{request_id}",
+        json={"decision": "reject"},
+        headers=_auth(admin_token),
+    )
     assert r.status_code == 200
     assert r.json()["status"] == "rejected"
 
@@ -180,6 +192,31 @@ def test_admin_reject_leaves_no_grant(tmp_path, monkeypatch, pg_engine):
 
     runtime = client.get(f"/api/v1/agents/{agent_id}", headers=_auth(env["grantee_token"]))
     assert runtime.status_code == 404
+
+
+def test_admin_decide_rejects_unknown_decision_value(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    env = _make_owner_and_group()
+    agent_id = _create_agent(client, env["owner_token"])
+    client.put(
+        f"/api/sharing/agent/{agent_id}",
+        json={"group_ids": [env["group_id"]]},
+        headers=_auth(env["owner_token"]),
+    )
+    request_id = client.get("/api/admin/share-requests?status=pending", headers=_auth(admin_token)).json()["data"][0][
+        "id"
+    ]
+
+    r = client.patch(
+        f"/api/admin/share-requests/{request_id}",
+        json={"decision": "maybe"},
+        headers=_auth(admin_token),
+    )
+    assert r.status_code == 400
+
+    # Still pending — the bad request never touched the row.
+    still_pending = client.get("/api/admin/share-requests?status=pending", headers=_auth(admin_token)).json()
+    assert still_pending["total"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +244,11 @@ def test_moderation_hub_lists_pending_share_and_approve_clears_it(tmp_path, monk
     request_id = client.get("/api/admin/share-requests?status=pending", headers=_auth(admin_token)).json()["data"][0][
         "id"
     ]
-    approved = client.post(f"/api/admin/share-requests/{request_id}/approve", headers=_auth(admin_token))
+    approved = client.patch(
+        f"/api/admin/share-requests/{request_id}",
+        json={"decision": "approve"},
+        headers=_auth(admin_token),
+    )
     assert approved.status_code == 200
 
     page_after = client.get("/admin/store", headers=_auth(admin_token))
@@ -307,11 +348,19 @@ def test_admin_endpoints_403_for_non_admin(tmp_path, monkeypatch, pg_engine):
 
     assert client.get("/api/admin/share-requests", headers=_auth(env["owner_token"])).status_code == 403
     assert (
-        client.post("/api/admin/share-requests/does-not-exist/approve", headers=_auth(env["owner_token"])).status_code
+        client.patch(
+            "/api/admin/share-requests/does-not-exist",
+            json={"decision": "approve"},
+            headers=_auth(env["owner_token"]),
+        ).status_code
         == 403
     )
     assert (
-        client.post("/api/admin/share-requests/does-not-exist/reject", headers=_auth(env["owner_token"])).status_code
+        client.patch(
+            "/api/admin/share-requests/does-not-exist",
+            json={"decision": "reject"},
+            headers=_auth(env["owner_token"]),
+        ).status_code
         == 403
     )
 
