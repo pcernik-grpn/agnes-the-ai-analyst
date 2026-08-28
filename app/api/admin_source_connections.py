@@ -326,6 +326,11 @@ def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
 _CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
     "snowflake": ("token_env", "private_key_env", "private_key_passphrase_env"),
     "databricks": ("token_env",),
+    # `connectors.sharepoint.settings.resolve_sharepoint_settings` falls back
+    # to this env var name when the connection has no vault secret of its
+    # own — same admin-writable secret-ref-NAME shape as Snowflake/Databricks
+    # above, and the same exfiltration risk without this guard.
+    "sharepoint": ("cert_private_key_env",),
 }
 
 

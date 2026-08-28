@@ -87,6 +87,17 @@ class TestCreateRejectsGarbage:
         assert resp.status_code == 400, resp.text
         assert "warehouse" in resp.json()["detail"]
 
+    def test_malformed_sharepoint_config_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={"name": "test-sp-no-client", "source_type": "sharepoint", "config": {"tenant_id": "t1"}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "client_id" in resp.json()["detail"]
+
 
 class TestCreateAcceptsEachValidSpec:
     def test_keboola(self, seeded_app):
@@ -147,6 +158,20 @@ class TestCreateAcceptsEachValidSpec:
         )
         assert resp.status_code == 201, resp.text
         assert resp.json()["config"]["auth_type"] == "password"  # normalized default
+
+    def test_sharepoint(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "valid-sharepoint",
+                "source_type": "sharepoint",
+                "config": {"tenant_id": "11111111-1111-1111-1111-111111111111", "client_id": "app-client-id"},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
 
     def test_empty_config_still_allowed_for_wizard_multi_step_create(self, seeded_app):
         """Not a regression on the documented `_validate_stack_url`

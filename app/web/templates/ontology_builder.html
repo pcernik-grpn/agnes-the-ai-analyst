@@ -1,0 +1,710 @@
+{% extends "base_admin_page.html" %}
+{# Ontology builder (fact-graph-over-Collections §13.2) -- the shared
+   builder shell: Create | Preview left, numbered sections right, the right
+   panel the source of truth, Save is the only write. Reached only from the
+   link on /admin/semantic-layer -- zero new navigation, no admin-nav entry
+   of its own (see app/web/router.py::admin_ontology_page).
+
+   The draft (name/node_types/edge_types/document_sample) is persisted
+   server-side via /api/admin/ontology/drafts/{id} (PG-only, A3 ratchet) so
+   a reload resumes work; every edit PUTs the draft and NOTHING else --
+   translate/validate/create-semantic-model happens exactly once, on Save
+   (POST .../drafts/{id}/save). Dry-run (section 5) sends the CURRENT
+   in-browser draft state inline rather than reading the persisted draft,
+   so it always reflects unsaved edits too. #}
+
+{% block title %}Ontology builder — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{% set page_hero_title = "Ontology builder" %}
+{% set page_hero_subtitle = "Author the entity and relationship types the fact graph extracts against. An attribute is free to add later; a new type means re-extracting the corpus." %}
+
+{% block head_extra %}
+<style>
+  /* Page chrome only -- every colour rides --ds-* tokens. */
+  .ont-empty { text-align: center; padding: 48px 20px; border: 1px dashed var(--ds-border); border-radius: 14px; color: var(--ds-text-secondary); font-size: 14px; }
+  .ont-empty a { color: var(--ds-primary); }
+
+  .ont-status { font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary); margin-right: 10px; }
+  .ont-status.ont-status--unsaved { color: var(--ds-accent-warn-ink); }
+  .ont-status.ont-status--saved { color: var(--ds-accent-success-ink); }
+
+  .ont-grid { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 22px; align-items: start; }
+  @media (max-width: 980px) { .ont-grid { grid-template-columns: 1fr; } }
+
+  .ont-left { position: sticky; top: 18px; }
+  .ont-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--ds-border); margin-bottom: 12px; }
+  .ont-tab { font: inherit; font-size: 13.5px; font-weight: 600; padding: 8px 14px; border: none; background: none; color: var(--ds-text-secondary); cursor: pointer; border-bottom: 2px solid transparent; }
+  .ont-tab.on { color: var(--ds-primary); border-bottom-color: var(--ds-primary); }
+  .ont-tabpanel { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 12px; padding: 14px; }
+  .ont-tabpanel textarea { width: 100%; min-height: 220px; font-family: var(--ds-font-mono); font-size: 12.5px; padding: 9px 11px; border: 1px solid var(--ds-border); border-radius: 8px; background: var(--ds-surface); color: var(--ds-text-primary); resize: vertical; }
+  .ont-tabpanel input[type=file] { margin-top: 8px; font-size: 12.5px; }
+  .ont-tabpanel label { display: block; font-size: 12.5px; font-weight: 600; color: var(--ds-text-primary); margin: 10px 0 4px; }
+  .ont-tabpanel label:first-child { margin-top: 0; }
+  .ont-preview-yaml { white-space: pre-wrap; word-break: break-word; font-family: var(--ds-font-mono); font-size: 11.5px; line-height: 1.55; color: var(--ds-text-primary); max-height: 460px; overflow: auto; margin: 0; }
+  .ont-report { margin-top: 10px; padding: 8px 10px; border-radius: 8px; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); font-size: 12px; white-space: pre-wrap; color: var(--ds-text-secondary); max-height: 220px; overflow: auto; }
+
+  /* Numbered sections, mirroring the /agents builder's accordion vocabulary. */
+  .ont-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
+  .ont-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
+  .ont-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
+  .ont-sec-head h3 { font-size: 15px; margin: 0; flex: 1; }
+  .ont-sec-sub { margin: 2px 18px 0; font-size: 12.5px; color: var(--ds-text-secondary); }
+  .ont-sec-body { padding: 10px 18px 18px; }
+
+  .ont-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--ds-border); flex-wrap: wrap; }
+  .ont-row:last-child { border-bottom: none; }
+  .ont-row input[type=text] { font: inherit; font-size: 13px; padding: 6px 9px; border: 1px solid var(--ds-border); border-radius: 7px; background: var(--ds-surface); color: var(--ds-text-primary); }
+  .ont-row .ont-name { width: 130px; flex-shrink: 0; }
+  .ont-row .ont-desc { flex: 1; min-width: 140px; }
+  .ont-row .ont-attrs { flex: 1; min-width: 160px; font-family: var(--ds-font-mono); font-size: 12px; }
+  .ont-row .ont-src, .ont-row .ont-dst { width: 110px; flex-shrink: 0; }
+  .ont-row-del { border: none; background: none; color: var(--ds-text-muted); cursor: pointer; font-size: 13px; padding: 4px 6px; border-radius: 7px; }
+  .ont-row-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
+  .ont-evreq { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ds-text-secondary); white-space: nowrap; }
+  .ont-add-btn { margin-top: 10px; font: inherit; font-size: 12.5px; font-weight: 600; padding: 6px 12px; border-radius: 8px; border: 1.5px dashed var(--ds-border); background: none; color: var(--ds-text-secondary); cursor: pointer; }
+  .ont-add-btn:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
+  .ont-hint { font-size: 11.5px; color: var(--ds-text-muted); margin: 4px 0 0; }
+
+  .ont-doc-picker { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .ont-doc-picker select { flex: 1; font: inherit; font-size: 13px; padding: 6px 9px; border: 1px solid var(--ds-border); border-radius: 7px; background: var(--ds-surface); color: var(--ds-text-primary); }
+  .ont-sample-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 12.5px; }
+  .ont-sample-list li { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--ds-border); }
+  .ont-sample-list li:last-child { border-bottom: none; }
+
+  .ont-dryrun-btn { font: inherit; font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-primary); cursor: pointer; }
+  .ont-dryrun-btn:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
+  .ont-dryrun-err { margin-top: 10px; font-size: 12.5px; color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); border-radius: 8px; padding: 8px 10px; }
+  .ont-dryrun-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 12px; }
+  @media (max-width: 700px) { .ont-dryrun-cols { grid-template-columns: 1fr; } }
+  .ont-dryrun-cols h4 { font-size: 12.5px; margin: 0 0 6px; color: var(--ds-text-secondary); text-transform: uppercase; letter-spacing: 0.03em; }
+  .ont-fact-row { font-size: 12.5px; padding: 6px 0; border-bottom: 1px solid var(--ds-border); }
+  .ont-fact-row:last-child { border-bottom: none; }
+  .ont-fact-type { font-weight: 600; color: var(--ds-text-primary); }
+  .ont-fact-quote { color: var(--ds-text-secondary); font-style: italic; margin-top: 2px; }
+  .ont-not-captured { background: var(--ds-accent-warn-bg); border: 1px solid var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink); }
+
+  .ont-freeze-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .ont-freeze-stat { border: 1px solid var(--ds-border); border-radius: 10px; padding: 10px 12px; }
+  .ont-freeze-stat b { display: block; font-size: 20px; color: var(--ds-text-primary); }
+  .ont-freeze-stat span { font-size: 11.5px; color: var(--ds-text-secondary); }
+  .ont-economics { font-size: 13px; color: var(--ds-text-primary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 9px; padding: 10px 12px; line-height: 1.6; }
+  .ont-economics code { font-family: var(--ds-font-mono); font-size: 12px; }
+
+  .ont-toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 16px; border-radius: 8px; font-size: 13px; font-weight: 500; box-shadow: var(--ds-shadow-md); z-index: 9999; display: none; }
+  .ont-toast.show { display: block; }
+  .ont-toast.ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border: 1px solid var(--ds-accent-success-line); }
+  .ont-toast.fail { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); border: 1px solid var(--ds-accent-danger-line); }
+</style>
+{% endblock %}
+
+{% block toolbar %}
+{% if facts_enabled and pg_backend %}
+<span class="ont-status" id="ont-status">loading…</span>
+<button type="button" class="btn btn-primary" id="ont-save-btn" disabled>Save</button>
+{% endif %}
+{% endblock %}
+
+{% block page %}
+{% if not facts_enabled %}
+<div class="ont-empty">
+  The ontology builder is part of the fact-graph feature, which is off on this instance
+  (<code>facts.enabled</code>). Ask an admin to enable it in <code>instance.yaml</code> or via
+  <code>AGNES_FACTS_ENABLED=1</code>.
+</div>
+{% elif not pg_backend %}
+<div class="ont-empty">
+  The ontology builder needs the Postgres app-state backend to save a working draft
+  (this instance is still on DuckDB). See <a href="/admin/database">Database</a> to migrate.
+</div>
+{% else %}
+<div id="ont-app">
+  <div class="ont-grid">
+    <div class="ont-left">
+      <div class="ont-tabs">
+        <button type="button" class="ont-tab on" data-tab="create">Create</button>
+        <button type="button" class="ont-tab" data-tab="preview">Preview</button>
+      </div>
+      <div class="ont-tabpanel" id="ont-tab-create">
+        <label for="ont-name-input">Ontology name</label>
+        <input type="text" id="ont-name-input" placeholder="e.g. cuesta_star">
+        <label for="ont-paste">Paste a finished ontology (YAML)</label>
+        <textarea id="ont-paste" placeholder="node_types:&#10;  client:&#10;    attrs:&#10;      name: {type: string, required: true}&#10;edge_types:&#10;  owned_by:&#10;    src: client&#10;    dst: sponsor"></textarea>
+        <input type="file" id="ont-file" accept=".yaml,.yml,text/yaml,text/plain">
+        <p class="ont-hint">Or upload a <code>.yaml</code> file — either way, "Import" fills the draft below; it is not applied until you press Save.</p>
+        <button type="button" class="ont-add-btn" id="ont-import-btn">Import into draft</button>
+        <div id="ont-report" class="ont-report" hidden></div>
+      </div>
+      <div class="ont-tabpanel" id="ont-tab-preview" hidden>
+        <p class="ont-hint" style="margin-bottom:8px;">What Save will translate, validate, and create — not yet applied.</p>
+        <pre class="ont-preview-yaml" id="ont-preview-yaml"></pre>
+      </div>
+    </div>
+
+    <div class="ont-right">
+      <div class="ont-sec">
+        <div class="ont-sec-head"><span class="ont-sec-no">1</span><h3>Source</h3></div>
+        <p class="ont-sec-sub">Import leftovers — anything the translator could not place structurally lands here, from the "Create" panel's Import.</p>
+        <div class="ont-sec-body"><div id="ont-source-report" class="ont-report">No import run yet.</div></div>
+      </div>
+
+      <div class="ont-sec">
+        <div class="ont-sec-head"><span class="ont-sec-no">2</span><h3>Entity types</h3></div>
+        <p class="ont-sec-sub">What the corpus talks about. Ask: is it asked about on its own?</p>
+        <div class="ont-sec-body">
+          <div id="ont-entity-rows"></div>
+          <button type="button" class="ont-add-btn" id="ont-add-entity">+ Add entity type</button>
+          <p class="ont-hint">Attrs: comma-separated <code>name:type</code> pairs, e.g. <code>name:string, revenue_usd:number</code>.</p>
+        </div>
+      </div>
+
+      <div class="ont-sec">
+        <div class="ont-sec-head"><span class="ont-sec-no">3</span><h3>Relationship types</h3></div>
+        <p class="ont-sec-sub">Keep them few and directional — a specific type is queryable, "related_to" is not.</p>
+        <div class="ont-sec-body">
+          <div id="ont-edge-rows"></div>
+          <button type="button" class="ont-add-btn" id="ont-add-edge">+ Add relationship type</button>
+        </div>
+      </div>
+
+      <div class="ont-sec">
+        <div class="ont-sec-head"><span class="ont-sec-no">4</span><h3>Document sample</h3></div>
+        <p class="ont-sec-sub">Five to ten real documents, chosen to be different from each other — never author from memory of what they "probably" contain.</p>
+        <div class="ont-sec-body">
+          <div class="ont-doc-picker">
+            <select id="ont-collection-select"><option value="">Loading collections…</option></select>
+            <select id="ont-file-select" disabled><option value="">Pick a collection first</option></select>
+            <button type="button" class="ont-add-btn" id="ont-add-doc" style="margin-top:0;">+ Add</button>
+          </div>
+          <ul class="ont-sample-list" id="ont-sample-list"></ul>
+        </div>
+      </div>
+
+      <div class="ont-sec">
+        <div class="ont-sec-head"><span class="ont-sec-no">5</span><h3>Dry-run output</h3></div>
+        <p class="ont-sec-sub">Run the current (possibly unsaved) types against ONE document from the sample above. The not-captured block is the valuable half.</p>
+        <div class="ont-sec-body">
+          <select id="ont-dryrun-doc-select"><option value="">Pick a document from the sample above</option></select>
+          <button type="button" class="ont-dryrun-btn" id="ont-dryrun-btn">Run dry-run</button>
+          <div id="ont-dryrun-err" class="ont-dryrun-err" hidden></div>
+          <div id="ont-dryrun-results" hidden>
+            <div class="ont-dryrun-cols">
+              <div>
+                <h4>Facts &amp; edges</h4>
+                <div id="ont-dryrun-facts"></div>
+              </div>
+              <div>
+                <h4>Not captured</h4>
+                <div id="ont-dryrun-not-captured"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="ont-sec">
+        <div class="ont-sec-head"><span class="ont-sec-no">6</span><h3>Freeze summary</h3></div>
+        <p class="ont-sec-sub">Before the first full run: every type appears in a real question, every type has a stated evidence source, the cost is known.</p>
+        <div class="ont-sec-body">
+          <div class="ont-freeze-grid">
+            <div class="ont-freeze-stat"><b id="ont-freeze-entities">0</b><span>entity types</span></div>
+            <div class="ont-freeze-stat"><b id="ont-freeze-edges">0</b><span>relationship types</span></div>
+            <div class="ont-freeze-stat"><b id="ont-freeze-docs">0</b><span>sample documents</span></div>
+            <div class="ont-freeze-stat"><b id="ont-freeze-collections">0</b><span>documents in scope</span></div>
+          </div>
+          <div class="ont-economics">
+            <div>Attribute = <b>free</b> — picked up on the next document processed, nothing is re-read.</div>
+            <div>New type = <b>re-extraction</b> over <span id="ont-freeze-n">0</span> document(s) in the sample's collections
+              ≈ <code id="ont-freeze-cost">$0.00</code>
+              <span class="ont-hint" style="display:inline;">(placeholder estimate — <code id="ont-freeze-rate">$0.05</code>/document, not tied to actual LLM pricing)</span>.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="ont-toast" id="ont-toast"></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if facts_enabled and pg_backend %}
+<script>
+(function () {
+  'use strict';
+
+  // Rough, clearly-labelled placeholder — see the freeze-summary hint. Not
+  // wired to any real LLM pricing table; the point is showing that a new
+  // type has a NUMBER attached, not that the number is precise (spec §11).
+  var COST_PER_DOCUMENT_USD = 0.05;
+  var DRAFT_ID_KEY = 'agnes_ontology_draft_id';
+
+  var draft = null;            // the server row, refreshed after every PUT
+  var saveTimer = null;
+  var collectionsCache = [];   // [{id, name, files: [...] | null}]
+  var lastDryRunDoc = null;    // {collection_id, file_id}
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function setStatus(text, cls) {
+    var el = document.getElementById('ont-status');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'ont-status' + (cls ? ' ont-status--' + cls : '');
+  }
+
+  function toast(msg, ok) {
+    var el = document.getElementById('ont-toast');
+    el.textContent = msg;
+    el.className = 'ont-toast show ' + (ok ? 'ok' : 'fail');
+    setTimeout(function () { el.className = 'ont-toast'; }, 4000);
+  }
+
+  // ---- draft load/create --------------------------------------------
+
+  function loadOrCreateDraft() {
+    var id = localStorage.getItem(DRAFT_ID_KEY);
+    if (!id) return createDraft();
+    return fetch('/api/admin/ontology/drafts/' + encodeURIComponent(id), { credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+      .catch(function () { return createDraft(); });
+  }
+
+  function createDraft() {
+    return fetch('/api/admin/ontology/drafts', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Untitled ontology' })
+    }).then(function (r) { return r.json(); })
+      .then(function (d) { localStorage.setItem(DRAFT_ID_KEY, d.id); return d; });
+  }
+
+  // ---- Save-only-write: every section edit PUTs the draft, nothing else --
+
+  function scheduleSave() {
+    setStatus('Unsaved section edits — press Save to publish', 'unsaved');
+    document.getElementById('ont-save-btn').disabled = false;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(putDraft, 500);
+  }
+
+  function putDraft() {
+    if (!draft) return Promise.resolve();
+    return fetch('/api/admin/ontology/drafts/' + encodeURIComponent(draft.id), {
+      method: 'PUT', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: draft.name, node_types: draft.node_types,
+        edge_types: draft.edge_types, document_sample: draft.document_sample
+      })
+    }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (updated) { if (updated) draft = updated; renderFreeze(); renderPreview(); });
+  }
+
+  function saveOntology() {
+    var btn = document.getElementById('ont-save-btn');
+    btn.disabled = true;
+    setStatus('Saving…');
+    putDraft().then(function () {
+      return fetch('/api/admin/ontology/drafts/' + encodeURIComponent(draft.id) + '/save', {
+        method: 'POST', credentials: 'same-origin'
+      });
+    }).then(function (r) {
+      return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+    }).then(function (res) {
+      if (!res.ok) {
+        var msg = (res.body && res.body.detail && (res.body.detail.message || res.body.detail)) || 'Save failed';
+        toast(String(msg), false);
+        setStatus('Save failed', 'unsaved');
+        btn.disabled = false;
+        return;
+      }
+      toast('Saved as semantic model "' + (res.body.model && res.body.model.slug) + '"', true);
+      setStatus('Saved', 'saved');
+    }).catch(function (e) {
+      toast('Save failed: ' + e, false);
+      setStatus('Save failed', 'unsaved');
+      btn.disabled = false;
+    });
+  }
+
+  // ---- Create tab: name + paste/upload import (fills draft, never applies) --
+
+  function wireCreateTab() {
+    document.getElementById('ont-name-input').addEventListener('change', function (e) {
+      draft.name = e.target.value || draft.name;
+      scheduleSave();
+    });
+    document.getElementById('ont-file').addEventListener('change', function (e) {
+      var f = e.target.files && e.target.files[0];
+      if (!f) return;
+      var reader = new FileReader();
+      reader.onload = function () { document.getElementById('ont-paste').value = reader.result; };
+      reader.readAsText(f);
+    });
+    document.getElementById('ont-import-btn').addEventListener('click', function () {
+      var text = document.getElementById('ont-paste').value;
+      if (!text.trim()) return;
+      fetch('/api/admin/ontology/drafts/' + encodeURIComponent(draft.id) + '/import', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text })
+      }).then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+        .then(function (res) {
+          if (!res.ok) {
+            var msg = (res.body.detail && res.body.detail.message) || 'Import failed';
+            document.getElementById('ont-report').hidden = false;
+            document.getElementById('ont-report').textContent = String(msg);
+            return;
+          }
+          draft = res.body.draft;
+          document.getElementById('ont-report').hidden = false;
+          document.getElementById('ont-report').textContent = res.body.report;
+          document.getElementById('ont-source-report').textContent = res.body.report;
+          renderAll();
+          setStatus('Imported — press Save to publish', 'unsaved');
+          document.getElementById('ont-save-btn').disabled = false;
+        }).catch(function (e) { toast('Import failed: ' + e, false); });
+    });
+
+    Array.prototype.forEach.call(document.querySelectorAll('.ont-tab'), function (btn) {
+      btn.addEventListener('click', function () {
+        Array.prototype.forEach.call(document.querySelectorAll('.ont-tab'), function (b) { b.classList.remove('on'); });
+        btn.classList.add('on');
+        var tab = btn.getAttribute('data-tab');
+        document.getElementById('ont-tab-create').hidden = tab !== 'create';
+        document.getElementById('ont-tab-preview').hidden = tab !== 'preview';
+        if (tab === 'preview') renderPreview();
+      });
+    });
+  }
+
+  function renderPreview() {
+    var el = document.getElementById('ont-preview-yaml');
+    if (!el || !draft) return;
+    el.textContent = JSON.stringify({ name: draft.name, node_types: draft.node_types, edge_types: draft.edge_types }, null, 2);
+  }
+
+  // ---- Section 2: entity types ---------------------------------------
+
+  function attrsToText(attrs) {
+    attrs = attrs || {};
+    return Object.keys(attrs).sort().map(function (k) {
+      var t = (attrs[k] && attrs[k].type) || 'string';
+      return k + ':' + t;
+    }).join(', ');
+  }
+
+  function textToAttrs(text) {
+    var out = {};
+    (text || '').split(',').forEach(function (part) {
+      part = part.trim();
+      if (!part) return;
+      var bits = part.split(':');
+      var name = bits[0].trim();
+      var type = (bits[1] || 'string').trim();
+      if (name) out[name] = { type: type };
+    });
+    return out;
+  }
+
+  function renderEntityRows() {
+    var host = document.getElementById('ont-entity-rows');
+    var names = Object.keys(draft.node_types || {}).sort();
+    host.innerHTML = names.map(function (name) {
+      var spec = draft.node_types[name] || {};
+      return '<div class="ont-row" data-name="' + esc(name) + '">' +
+        '<input type="text" class="ont-name" data-field="rename" value="' + esc(name) + '" placeholder="type name">' +
+        '<input type="text" class="ont-desc" data-field="description" value="' + esc(spec.description || '') + '" placeholder="description">' +
+        '<input type="text" class="ont-attrs" data-field="attrs" value="' + esc(attrsToText(spec.attrs)) + '" placeholder="name:string, ...">' +
+        '<button type="button" class="ont-row-del" data-action="del-entity">✕</button>' +
+        '</div>';
+    }).join('') || '<p class="ont-hint">No entity types yet.</p>';
+
+    Array.prototype.forEach.call(host.querySelectorAll('.ont-row'), function (row) {
+      var name = row.getAttribute('data-name');
+      row.querySelector('[data-field="rename"]').addEventListener('change', function (e) {
+        var newName = e.target.value.trim();
+        if (!newName || newName === name) return;
+        draft.node_types[newName] = draft.node_types[name];
+        delete draft.node_types[name];
+        renderEntityRows(); renderEdgeRows(); renderFreeze(); scheduleSave();
+      });
+      row.querySelector('[data-field="description"]').addEventListener('change', function (e) {
+        draft.node_types[name] = draft.node_types[name] || {};
+        draft.node_types[name].description = e.target.value;
+        scheduleSave();
+      });
+      row.querySelector('[data-field="attrs"]').addEventListener('change', function (e) {
+        draft.node_types[name] = draft.node_types[name] || {};
+        draft.node_types[name].attrs = textToAttrs(e.target.value);
+        scheduleSave();
+      });
+      row.querySelector('[data-action="del-entity"]').addEventListener('click', function () {
+        delete draft.node_types[name];
+        renderEntityRows(); renderFreeze(); scheduleSave();
+      });
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('ont-add-entity').addEventListener('click', function () {
+      var n = 1;
+      while (draft.node_types['new_type_' + n]) n++;
+      draft.node_types['new_type_' + n] = { attrs: {} };
+      renderEntityRows(); renderFreeze(); scheduleSave();
+    });
+  });
+
+  // ---- Section 3: relationship types ----------------------------------
+
+  function renderEdgeRows() {
+    var host = document.getElementById('ont-edge-rows');
+    var names = Object.keys(draft.edge_types || {}).sort();
+    host.innerHTML = names.map(function (name) {
+      var spec = draft.edge_types[name] || {};
+      var checked = spec.evidence_required === false ? '' : 'checked';
+      return '<div class="ont-row" data-name="' + esc(name) + '">' +
+        '<input type="text" class="ont-name" data-field="rename" value="' + esc(name) + '" placeholder="relationship name">' +
+        '<input type="text" class="ont-src" data-field="src" value="' + esc(spec.src || '') + '" placeholder="src type">' +
+        '<input type="text" class="ont-dst" data-field="dst" value="' + esc(spec.dst || '') + '" placeholder="dst type">' +
+        '<label class="ont-evreq"><input type="checkbox" data-field="evidence_required" ' + checked + '> evidence required</label>' +
+        '<button type="button" class="ont-row-del" data-action="del-edge">✕</button>' +
+        '</div>';
+    }).join('') || '<p class="ont-hint">No relationship types yet.</p>';
+
+    Array.prototype.forEach.call(host.querySelectorAll('.ont-row'), function (row) {
+      var name = row.getAttribute('data-name');
+      row.querySelector('[data-field="rename"]').addEventListener('change', function (e) {
+        var newName = e.target.value.trim();
+        if (!newName || newName === name) return;
+        draft.edge_types[newName] = draft.edge_types[name];
+        delete draft.edge_types[name];
+        renderEdgeRows(); renderFreeze(); scheduleSave();
+      });
+      row.querySelector('[data-field="src"]').addEventListener('change', function (e) {
+        draft.edge_types[name] = draft.edge_types[name] || {};
+        draft.edge_types[name].src = e.target.value;
+        scheduleSave();
+      });
+      row.querySelector('[data-field="dst"]').addEventListener('change', function (e) {
+        draft.edge_types[name] = draft.edge_types[name] || {};
+        draft.edge_types[name].dst = e.target.value;
+        scheduleSave();
+      });
+      row.querySelector('[data-field="evidence_required"]').addEventListener('change', function (e) {
+        draft.edge_types[name] = draft.edge_types[name] || {};
+        draft.edge_types[name].evidence_required = !!e.target.checked;
+        scheduleSave();
+      });
+      row.querySelector('[data-action="del-edge"]').addEventListener('click', function () {
+        delete draft.edge_types[name];
+        renderEdgeRows(); renderFreeze(); scheduleSave();
+      });
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('ont-add-edge').addEventListener('click', function () {
+      var n = 1;
+      while (draft.edge_types['new_relationship_' + n]) n++;
+      draft.edge_types['new_relationship_' + n] = { src: '', dst: '', evidence_required: true };
+      renderEdgeRows(); renderFreeze(); scheduleSave();
+    });
+  });
+
+  // ---- Section 4: document sample -------------------------------------
+
+  function loadCollections() {
+    return fetch('/api/collections', { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (rows) {
+        collectionsCache = (rows || []).map(function (c) { return { id: c.id, name: c.name, files: null }; });
+        var sel = document.getElementById('ont-collection-select');
+        sel.innerHTML = '<option value="">Pick a collection…</option>' +
+          collectionsCache.map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join('');
+      }).catch(function () {
+        document.getElementById('ont-collection-select').innerHTML = '<option value="">Could not load collections</option>';
+      });
+  }
+
+  function filesForCollection(id) {
+    var entry = collectionsCache.filter(function (c) { return c.id === id; })[0];
+    if (!entry) return Promise.resolve([]);
+    if (entry.files) return Promise.resolve(entry.files);
+    return fetch('/api/collections/' + encodeURIComponent(id) + '/files', { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (rows) { entry.files = rows || []; return entry.files; });
+  }
+
+  function wireDocumentSample() {
+    var collSel = document.getElementById('ont-collection-select');
+    var fileSel = document.getElementById('ont-file-select');
+    collSel.addEventListener('change', function () {
+      var id = collSel.value;
+      if (!id) { fileSel.disabled = true; fileSel.innerHTML = '<option value="">Pick a collection first</option>'; return; }
+      fileSel.disabled = true;
+      fileSel.innerHTML = '<option value="">Loading files…</option>';
+      filesForCollection(id).then(function (files) {
+        fileSel.disabled = false;
+        fileSel.innerHTML = files.map(function (f) {
+          return '<option value="' + esc(f.file_id) + '">' + esc(f.filename) + '</option>';
+        }).join('') || '<option value="">No files in this collection</option>';
+      });
+    });
+    document.getElementById('ont-add-doc').addEventListener('click', function () {
+      var cid = collSel.value, fid = fileSel.value;
+      if (!cid || !fid) return;
+      var collName = (collectionsCache.filter(function (c) { return c.id === cid; })[0] || {}).name || cid;
+      var fileName = fileSel.options[fileSel.selectedIndex].textContent;
+      var already = (draft.document_sample || []).some(function (d) { return d.collection_id === cid && d.file_id === fid; });
+      if (already) return;
+      draft.document_sample = (draft.document_sample || []).concat([{ collection_id: cid, file_id: fid, name: collName + ' / ' + fileName }]);
+      renderSampleList(); renderFreeze(); scheduleSave();
+    });
+  }
+
+  function renderSampleList() {
+    var host = document.getElementById('ont-sample-list');
+    var docs = draft.document_sample || [];
+    host.innerHTML = docs.map(function (d, i) {
+      return '<li><span>' + esc(d.name || (d.collection_id + '/' + d.file_id)) + '</span>' +
+        '<button type="button" class="ont-row-del" data-idx="' + i + '">✕</button></li>';
+    }).join('') || '<li><span class="ont-hint">No documents picked yet.</span></li>';
+    Array.prototype.forEach.call(host.querySelectorAll('[data-idx]'), function (btn) {
+      btn.addEventListener('click', function () {
+        var idx = parseInt(btn.getAttribute('data-idx'), 10);
+        draft.document_sample.splice(idx, 1);
+        renderSampleList(); renderDryRunDocOptions(); renderFreeze(); scheduleSave();
+      });
+    });
+    renderDryRunDocOptions();
+  }
+
+  function renderDryRunDocOptions() {
+    var sel = document.getElementById('ont-dryrun-doc-select');
+    var docs = draft.document_sample || [];
+    sel.innerHTML = '<option value="">Pick a document from the sample above</option>' +
+      docs.map(function (d, i) { return '<option value="' + i + '">' + esc(d.name || d.file_id) + '</option>'; }).join('');
+  }
+
+  // ---- Section 5: dry-run -----------------------------------------------
+
+  function wireDryRun() {
+    document.getElementById('ont-dryrun-btn').addEventListener('click', function () {
+      var sel = document.getElementById('ont-dryrun-doc-select');
+      var idx = sel.value;
+      var errEl = document.getElementById('ont-dryrun-err');
+      errEl.hidden = true;
+      if (idx === '') return;
+      var doc = (draft.document_sample || [])[parseInt(idx, 10)];
+      if (!doc) return;
+      lastDryRunDoc = doc;
+      var btn = document.getElementById('ont-dryrun-btn');
+      btn.disabled = true; btn.textContent = 'Running…';
+      fetch('/api/admin/ontology/dry-run', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          node_types: draft.node_types, edge_types: draft.edge_types,
+          collection_id: doc.collection_id, file_id: doc.file_id
+        })
+      }).then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+        .then(function (res) {
+          btn.disabled = false; btn.textContent = 'Run dry-run';
+          if (!res.ok) {
+            var msg = (res.body.detail && (res.body.detail.message || res.body.detail.error)) || 'Dry-run failed';
+            errEl.hidden = false; errEl.textContent = String(msg);
+            return;
+          }
+          renderDryRunResults(res.body);
+        }).catch(function (e) {
+          btn.disabled = false; btn.textContent = 'Run dry-run';
+          errEl.hidden = false; errEl.textContent = 'Dry-run failed: ' + e;
+        });
+    });
+  }
+
+  function renderDryRunResults(result) {
+    document.getElementById('ont-dryrun-results').hidden = false;
+    var facts = (result.facts || []).concat((result.edges || []).map(function (e) {
+      return { type: e.type, quote: e.quote, attrs: { src_type: e.src_type, dst_type: e.dst_type } };
+    }));
+    document.getElementById('ont-dryrun-facts').innerHTML = facts.map(function (f) {
+      return '<div class="ont-fact-row"><span class="ont-fact-type">' + esc(f.type) + '</span>' +
+        '<div class="ont-fact-quote">“' + esc(f.quote) + '”</div></div>';
+    }).join('') || '<p class="ont-hint">Nothing extracted.</p>';
+
+    var nc = result.not_captured || [];
+    document.getElementById('ont-dryrun-not-captured').innerHTML = nc.map(function (n) {
+      return '<div class="ont-fact-row ont-not-captured"><div>' + esc(n.sentence) + '</div>' +
+        (n.reason ? '<div class="ont-fact-quote">' + esc(n.reason) + '</div>' : '') + '</div>';
+    }).join('') || '<p class="ont-hint">Everything the model saw had a home in the ontology.</p>';
+  }
+
+  // ---- Section 6: freeze summary -----------------------------------------
+
+  function renderFreeze() {
+    if (!draft) return;
+    document.getElementById('ont-freeze-entities').textContent = Object.keys(draft.node_types || {}).length;
+    document.getElementById('ont-freeze-edges').textContent = Object.keys(draft.edge_types || {}).length;
+    var docs = draft.document_sample || [];
+    document.getElementById('ont-freeze-docs').textContent = docs.length;
+
+    var collIds = {};
+    docs.forEach(function (d) { collIds[d.collection_id] = true; });
+    var ids = Object.keys(collIds);
+    document.getElementById('ont-freeze-collections').textContent = '…';
+    document.getElementById('ont-freeze-rate').textContent = '$' + COST_PER_DOCUMENT_USD.toFixed(2);
+    if (!ids.length) {
+      document.getElementById('ont-freeze-collections').textContent = '0';
+      document.getElementById('ont-freeze-n').textContent = '0';
+      document.getElementById('ont-freeze-cost').textContent = '$0.00';
+      return;
+    }
+    Promise.all(ids.map(filesForCollection)).then(function (results) {
+      var n = results.reduce(function (sum, files) { return sum + files.length; }, 0);
+      document.getElementById('ont-freeze-collections').textContent = n;
+      document.getElementById('ont-freeze-n').textContent = n;
+      document.getElementById('ont-freeze-cost').textContent = '$' + (n * COST_PER_DOCUMENT_USD).toFixed(2);
+    });
+  }
+
+  // ---- boot ---------------------------------------------------------------
+
+  function renderAll() {
+    document.getElementById('ont-name-input').value = draft.name || '';
+    if (draft.leftover_report) {
+      document.getElementById('ont-source-report').textContent = draft.leftover_report;
+    }
+    renderEntityRows();
+    renderEdgeRows();
+    renderSampleList();
+    renderFreeze();
+    renderPreview();
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    wireCreateTab();
+    wireDocumentSample();
+    wireDryRun();
+    document.getElementById('ont-save-btn').addEventListener('click', saveOntology);
+
+    loadOrCreateDraft().then(function (d) {
+      draft = d;
+      draft.node_types = draft.node_types || {};
+      draft.edge_types = draft.edge_types || {};
+      draft.document_sample = draft.document_sample || [];
+      setStatus(draft.saved_model_slug ? 'Saved as "' + draft.saved_model_slug + '"' : 'Draft — not saved yet', draft.saved_model_slug ? 'saved' : 'unsaved');
+      renderAll();
+      loadCollections();
+    });
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}
