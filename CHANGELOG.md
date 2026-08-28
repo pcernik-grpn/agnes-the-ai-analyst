@@ -348,6 +348,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     answering three different questions; this one predicts what a live Keboola
     project *would* import, which is neither of the other two. All three helps
     now name their question and their endpoint.
+  - The health report's `orphaned_table_bindings` section (Block 5 of #1707)
+    is carried across with the command. `health` hardcodes one rendering block
+    per report key, so a key with no block is swallowed in silence — the
+    section is pinned by tests against the new path, and the deprecated alias
+    inherits it by delegating rather than by carrying a second copy.
   - **Every old invocation still works this release**, as a hidden alias that
     prints one line on stderr naming its new path and then delegates to the
     same function the new path runs — so a script keeps working, `--help`

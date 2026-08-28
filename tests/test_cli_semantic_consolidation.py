@@ -332,6 +332,90 @@ class TestAdminSemanticGroup:
         assert m.call_args.args[0] == "/api/admin/semantic-layer/health"
 
 
+def _health_body(**overrides) -> dict:
+    body = {
+        "sources": [],
+        "orphaned_models": [],
+        "orphaned_table_bindings": [],
+        "invalid_models": [],
+        "metrics_missing_description": [],
+        "duplicate_metric_names": [],
+        "metrics_missing_relationships": [],
+        "coverage_summary": {"missing_count": 0, "partial_count": 0},
+        "mutes": [],
+    }
+    body.update(overrides)
+    return body
+
+
+class TestHealthRendersEveryKeyItIsGiven:
+    """`health` hardcodes one section per health-report key, so a key with no
+    section is swallowed in silence.
+
+    That makes the renderer the thing a move can quietly break: these pin the
+    `orphaned_table_bindings` section (Block 5 of #1707, PR #1717) against the
+    NEW command, since the report is rendered by
+    `cli/commands/admin_semantic.py` now. `tests/test_cli_semantic_model_health.py`
+    covers the same section on the old path and patches
+    `cli.commands.semantic_model.api_get` — which no longer intercepts, because
+    the alias delegates into this module. Its patch target and invocation path
+    need updating when the two branches meet.
+    """
+
+    def test_a_clean_report_says_nothing_is_wrong(self):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, _health_body())):
+            result = runner.invoke(app, ["admin", "semantic", "health"])
+        assert result.exit_code == 0
+        assert "No sync failures, disconnected models, or invalid documents." in result.output
+
+    def test_an_orphaned_metric_binding_names_the_missing_table(self):
+        body = _health_body(
+            orphaned_table_bindings=[
+                {"binding": "metric", "metric_id": "met1", "name": "revenue", "missing_tables": ["orders_gone"]}
+            ]
+        )
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "semantic", "health"])
+        assert result.exit_code == 0
+        assert "revenue" in result.output
+        assert "orders_gone" in result.output
+        # A clean report's headline must not also print for a dirty one.
+        assert "No sync failures, disconnected models, or invalid documents." not in result.output
+
+    def test_orphaned_columns_are_reported_with_the_table_id_and_count(self):
+        body = _health_body(
+            orphaned_table_bindings=[{"binding": "column", "table_id": "orders_gone", "column_count": 12}]
+        )
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "semantic", "health"])
+        assert result.exit_code == 0
+        assert "orders_gone" in result.output
+        assert "12" in result.output
+
+    def test_json_passes_the_key_through_verbatim(self):
+        body = _health_body(
+            orphaned_table_bindings=[{"binding": "column", "table_id": "orders_gone", "column_count": 3}]
+        )
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "semantic", "health", "--json"])
+        assert result.exit_code == 0
+        assert "orphaned_table_bindings" in result.output
+        assert "orders_gone" in result.output
+
+    def test_the_deprecated_alias_renders_the_same_sections(self):
+        """The alias delegates into this module, so it inherits every section —
+        including any added after the move. This is the guard that would fail
+        if someone "resolved" the alias by re-copying an older renderer."""
+        body = _health_body(
+            orphaned_table_bindings=[{"binding": "column", "table_id": "orders_gone", "column_count": 7}]
+        )
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["semantic-model", "health"])
+        assert result.exit_code == 0
+        assert _DEPRECATED in result.output
+        assert "orders_gone" in result.output
+
+
 # ---------------------------------------------------------------------------
 # 5. Backward compatibility — every old path still works, and says so
 # ---------------------------------------------------------------------------
