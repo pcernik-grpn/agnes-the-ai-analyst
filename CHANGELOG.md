@@ -156,6 +156,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   conversations resets the count and reloads an open drawer instead of
   leaving the previous chat's rows on screen with their old download links.
 
+- **The chat agent's file-handover rule now covers the case that actually
+  failed: a skill writing its output next to its own scaffolds.** The
+  sandbox-only `Files you produce` section already named `outputs/` as the
+  place to write a deliverable; what it did not say is that a skill whose
+  scaffolds live under `.claude/skills/<name>/` must still write its *output*
+  to `outputs/` — which is exactly what the repro did, producing a file no
+  surface could show. `outputs/` is the one location all three collectors
+  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
+  file browser lists the workspace tree while filtering dot-directories, and
+  the host walk lists the session dir. The section also now tells the agent
+  not to promise a download control it cannot see from inside the sandbox, and
+  keeps the chart/document split explicit. Sandbox surface only — on a laptop
+  workspace the filesystem IS the user's machine and naming the path is the
+  delivery. Mirrored across both prompt files
+  (`app/initial_workspace_default/CLAUDE.md` and
+  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
+
 ### Fixed
 - **Dark theme: several light-hex backgrounds that never flipped now use
   `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
@@ -338,6 +355,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   light-theme blue under dark, measuring ~3.3:1 against the dark surface
   (below WCAG AA). Now aliased to `var(--ds-primary*)` like the rest of the
   family (#1625).
+- **A known-bad table no longer looks like a healthy, empty one.** A corrupt
+  parquet part is refused at hash time since #1559, but the refusal died in a
+  WARNING log line — `sync_state` (and so `GET /api/admin/registry` /
+  `agnes admin list-tables`) still reported `status: ok`, indistinguishable
+  from a genuinely empty or fully synced table. `_update_sync_state`
+  (`src/orchestrator.py`) now flags the row via the existing `sync_state`
+  `status`/`error` columns — the same mechanism already used for the
+  both-layouts collision (#1339) — naming the rejected part(s) whether the
+  table's manifest just got frozen at its last known-good state or nothing
+  was ever published for it. Separately, Jira's `extract_init.py` was
+  collapsing a failed view build into `rows=0`, identical to a real empty
+  table even though DuckDB's own exception names the offending file; it now
+  reports `rows=NULL` ("could not count") through `_meta`, which
+  `_update_sync_state` flags the same way instead of publishing a plain,
+  unflagged zero. No change to what is refused or served — refusal at hash
+  time (#1559) and quarantining a corrupt part at view build (deliberately
+  not pursued, per the issue's decision memo) are unaffected. (#1364)
 
 ### Removed
 
@@ -350,6 +384,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`docs/llm-routing.md` scrubbed of customer-specific and stale planning
+  content.** The provider-selection table and one config-example heading named
+  a specific company where every neighbouring entry is a neutral deployment
+  profile; both now read as profiles ("Single-vendor deployment"). The
+  "Files to Modify" plan table is gone — it described a two-repo OSS/private
+  split and listed `server/bin/collect-knowledge`, `server/deploy.sh`,
+  `requirements.txt` and `tests/test_corporate_memory.py`, none of which exist
+  in this repo — and the "Deployment" section it fed is rewritten to the
+  configuration-only steps that actually apply now that the connector ships
+  with the platform. Docs only; no behaviour change.
 - **`scripts/eval/corpus_gen.py` generates the planted proving-run corpus for
   the fact-graph spec's Run P (§15.5).** A deterministic (seeded), SharePoint-
   shaped filesystem corpus — ≥4 sites, 2-3 libraries each, mixed
