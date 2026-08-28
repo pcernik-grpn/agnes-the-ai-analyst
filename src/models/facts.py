@@ -168,5 +168,5 @@ class IngestRun(Base):
     #: The producer's OPTIONAL anonymization declaration for this batch
     #: (spec §9.2): ``{declared: bool, scopes: {corpus_id: {docs_anonymized,
     #: docs_skipped}}}``. Empty ``{}`` (never null) when the producer never
-    #: anonymizes — see ``migrations/versions/0079_facts_ingest_runs_anonymization.py``.
+    #: anonymizes — see ``migrations/versions/0079_ingest_runs_anonymize.py``.
     anonymization: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"), nullable=False)
