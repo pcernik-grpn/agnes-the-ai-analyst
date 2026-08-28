@@ -155,6 +155,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ask, receive a document — never opened anything), and switching
   conversations resets the count and reloads an open drawer instead of
   leaving the previous chat's rows on screen with their old download links.
+- **Table registration: one shared form, two entry points (D4).** The
+  `/admin/tables` "+ Register new table" menu and the onboarding wizard's
+  step 3 now both open the SAME two-pane drawer (browse & multi-select →
+  configure & register) instead of four near-duplicate connector-specific
+  modals plus a separate onboarding auto-register-all. Every registration —
+  from either entry point, for all four connectors — POSTs through the
+  validated `POST /api/admin/register-table`, one row at a time; the
+  onboarding wizard no longer bypasses that validation via
+  `discover-and-register` (the sync-time drift-detection use of that helper
+  is unchanged). A "Select all" checkbox keeps the onboarding one-click
+  path fast — scoped to the rows the search filter leaves visible, and
+  switching connection or dataset clears the previous source's checkmarks,
+  so nothing can be registered that the operator cannot see. Also fixes Keboola's "Custom SQL" registration mode, which
+  422'd on every submit — a Keboola materialized row's `source_query` is a
+  Storage API JSON filter, not SQL; the mode is renamed "Filtered export"
+  and reuses the existing structured where_filters builder. Databricks has
+  no catalog-browse endpoint yet, so its tables are still added by name (in
+  the same multi-select flow) rather than browsed — tracked as a follow-up.
 
 - **The chat agent's file-handover rule now covers the case that actually
   failed: a skill writing its output next to its own scaffolds.** The
