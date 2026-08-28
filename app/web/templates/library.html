@@ -569,24 +569,43 @@
 
      The bands keep the top of the viewport, which is what they had before and
      what makes a long list readable: you always know which kind you are in. */
-  .library-page .idx-head { padding-bottom: 0; border-bottom: 1px solid var(--ds-border-light); }
+  .library-page .idx-head { padding-bottom: 0; }
   .lib-head { margin: 4px 0 0; }
   /* Spacing rhythm through the header: 4 / 10 / 14 / 0. Every layer used to
      carry its own generous margin, and stacked they put the first row of the
      list a third of the way down the page. */
-  .lib-head__bar {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 16px; flex-wrap: wrap;
-  }
+  .lib-head__bar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   .lib-head__titles { min-width: 0; }
-  .lib-head__controls { flex: 1 1 420px; display: flex; justify-content: flex-end; min-width: 0; }
+  /* The controls left the title row for the browsing block above the list —
+     `.lib-head__controls` is kept as their class so the page-scoped `.fbar`
+     rules below still address exactly this toolbar and not /chats's. */
+  .lib-head__controls { display: flex; min-width: 0; }
   .lib-head__controls .fbar { width: 100%; }
+
+  /* ── The browsing block ──
+     One row of controls, then one line stating what they did, then the list.
+     The state line carries BOTH the count and the active-filter chips: they are
+     the same sentence ("2 of 6, because Access is Automatic or Optional"), and
+     splitting them put the number under the page title and the chips two bands
+     lower. */
+  .lib-browse { margin: 0 0 10px; }
+  .lib-browse__state {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+    min-height: 22px; margin-top: 10px;
+  }
+  .lib-browse__state .lib-count { font-size: 12.5px; color: var(--ds-text-muted); }
+  .lib-browse__state #lib-chips { margin: 0; }
+  /* A chip sits on the same baseline as the count beside it. */
+  .library-page .lib-browse__state .fbar-chip { height: 22px; }
   /* The tab strip closes the header, full width, so it reads as the divider
      between the page and its list rather than as another control. */
   /* The content switcher. Underlined rather than pilled, so it reads as a
      division of the page below it and not as another control in the row above;
      quieter than the title, louder than the utilities. */
-  .lib-head .lib-tabs { margin: 14px 0 0; border: 0; background: none; padding: 0; gap: 18px; }
+  .lib-head .lib-tabs {
+    margin: 14px 0 0; border: 0; background: none; padding: 0; gap: 18px;
+    box-shadow: inset 0 -1px 0 var(--ds-border-light);
+  }
   .lib-head .lib-tabs .fbar-seg__btn {
     border-radius: 0; border-bottom: 2px solid transparent; height: 32px;
     padding: 0 0 2px; font-size: 13.5px; gap: 7px;
@@ -672,7 +691,7 @@
   .library-page .fbar { gap: 6px; margin: 0; }
 
   /* Search stops growing: a fixed, modest field beside the title. */
-  .library-page .fbar__search { flex: 0 1 260px; }
+  .library-page .fbar__search { flex: 0 1 300px; }
   .library-page .fbar__search input {
     height: 32px; font-size: 13px; padding: 0 10px 0 30px;
     background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
@@ -706,8 +725,23 @@
   .library-page .fbar-toggle__n { font-weight: 600; }
   .library-page .fbar-filter__n { min-width: 16px; height: 16px; font-size: 10.5px; }
 
+  /* Sort. It renders only in GRID view (the table sorts from its column
+     headers), and it kept the shared 38px while everything around it had come
+     down to 32 — so switching view made the whole toolbar jump 4px.
+  Sort is the design system's `ds-dropdown` (the native <select> beside it is
+     the accessible source of truth and is visually hidden), so the height that
+     mattered is the BUTTON's, not the select's. `min-width: 180px` went too:
+     "Recently added" does not need a 180px slot in a row of content-sized
+     controls. */
+  .library-page .fbar-select .ds-dropdown-btn {
+    height: 32px; min-width: 0; font-size: 12.5px; padding: 0 8px 0 10px;
+    background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
+    border-color: transparent;
+  }
+  .library-page .fbar-select .ds-dropdown-btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
+
   /* View switcher: same weight as its neighbours, no box of its own. */
-  .library-page .fbar-view { border-color: transparent; border-radius: 8px; overflow: hidden; }
+  .library-page .fbar-view { border: 0; border-radius: 8px; overflow: hidden; }
   .library-page .fbar-view__btn { width: 30px; height: 32px; background: transparent; }
   .library-page .fbar-view__btn + .fbar-view__btn { border-left: 0; }
   .library-page .fbar-view__btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent); }
@@ -715,10 +749,11 @@
 
   /* A hairline before the primary, so "utilities … then the action" is legible
      without another border per control. */
-  .library-page .lib-new {
-    margin-left: 4px; padding-left: 10px;
-    border-left: 1px solid var(--ds-border-light);
-  }
+  /* The primary takes the right end of the row, on the same edge as the
+     table's own action column — so "the thing you do" and "the things you can
+     do to a row" line up instead of both floating mid-row. The hairline is
+     gone with it: the gap does that job now. */
+  .library-page .lib-new { margin-left: auto; }
   .library-page .lib-new__btn { height: 32px; font-size: 13px; }
 
   /* Chips: the detail behind the Filter badge, so they read as a caption on the
@@ -760,6 +795,26 @@
     border-color: color-mix(in srgb, var(--ds-primary) 30%, transparent);
   }
 
+  /* ══ Status is not a control ══════════════════════════════════════════
+     "Shared with you", "Required by your admin" and "Granted to your group"
+     all answer the same question — WHY you have this — and all three were
+     drawn as pills, in the same slot the row's actual buttons use. A reader
+     had no way to tell what they could press from what they were being told.
+     They read as text now, with their icon; only a control keeps a box. */
+  .library-page .lib-vis:not(.lib-vis--editable),
+  .library-page .lib-instack--fixed {
+    height: auto; padding: 0; border: 0; background: none;
+    color: var(--ds-text-muted); font-weight: 500; font-size: 11.5px;
+    letter-spacing: 0;
+  }
+  .library-page .lib-instack--fixed { gap: 5px; }
+
+  /* Visually hidden, still announced — same recipe ds_dropdown.css uses. */
+  .lib-sr {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+
   /* Column headers: a label for the column, not a heading in the list. */
   .library-page .lib-table thead th { font-size: 10.5px; letter-spacing: .07em; color: var(--ds-text-muted); }
 
@@ -769,7 +824,7 @@
      on a group band, so the two paddings read as a gap rather than as a break;
      18px total is the step the header rhythm already uses. */
   .library-page .idx-band { padding-top: 0; }
-  .library-page .idx-band-inner { padding-top: 18px; }
+  .library-page .idx-band-inner { padding-top: 16px; }
   .library-page .lib-list { margin-top: 0; }
 
   /* Below the shell's own breakpoint the rail becomes a top bar, and the
@@ -786,18 +841,11 @@
   /* Narrow viewports: the controls drop under the title rather than squeezing
      search to a slot too small to type in. */
   @media (max-width: 900px) {
-    .lib-head__bar { align-items: flex-start; }
-    .lib-head__controls { flex-basis: 100%; justify-content: flex-start; margin-top: 10px; }
     .library-page .fbar__search { flex: 1 1 180px; }
   }
 
   /* "+ Add" is content-sized like every other control in the row. */
   .lib-head__controls .lib-new { flex: 0 0 auto; }
-
-  /* Only the active tab's half of the menu is shown. Both are rendered, so
-     switching tabs is an attribute flip rather than a re-render. */
-  .lib-new__menu[data-tab="knowledge"] .lib-new__group[data-menu-tab="capabilities"],
-  .lib-new__menu[data-tab="capabilities"] .lib-new__group[data-menu-tab="knowledge"] { display: none; }
 
   /* Bounded by the room below the button (published on open, see
      `openNewMenu`) so the last entries are always reachable. */
@@ -1762,9 +1810,23 @@
     margin-top: 8px; overflow: visible;
     border-top: 0; border-top-left-radius: 0;
   }
+  /* ── The folder card's tint ──
+     `--ds-resource-collection-soft` is #fdece9 against a danger background of
+     #fee2e2 — a few degrees of hue apart, at similar saturation. That is fine
+     everywhere the token is used small: a 3px band rule, a 24px icon tile, a
+     text colour. As a full-width header fill on a card it stops reading as
+     "collection" and starts reading as "something is wrong with this one",
+     which is the one thing the card must not say at rest.
+     
+     The token is not the problem and is not touched — it is fleet-wide, and
+     the hue is deliberate (coral is one step from the file amber, because a
+     collection is a container of files). The APPLICATION is: diluted to a
+     wash at rest, it still names the kind without raising an alarm. The
+     emphatic state was never this colour anyway — a drop target tints
+     `--ds-primary-light`, which is why nothing about drag-and-drop weakens. */
   .lib-card--folder .fbar-card__head {
     position: relative; margin-top: 0;
-    background: var(--lib-kind-soft);
+    background: color-mix(in srgb, var(--lib-kind-soft) 45%, var(--ds-surface));
     border-top: 1px solid var(--ds-border);
     border-radius: 0 13px 0 0;
   }
@@ -1773,11 +1835,12 @@
      two shapes meet without a seam at any device pixel ratio. `left: -1px`
      parks its left border in the card's own border column, so the folder's
      leading edge is one unbroken line. */
+  /* The tab shares the head's wash so the two shapes stay one object. */
   .lib-card--folder .fbar-card__head::before {
     content: '';
     position: absolute; left: -1px; top: -9px;
     width: 38%; max-width: 132px; height: 10px;
-    background: var(--lib-kind-soft);
+    background: color-mix(in srgb, var(--lib-kind-soft) 45%, var(--ds-surface));
     border: 1px solid var(--ds-border); border-bottom: 0;
     border-radius: 7px 7px 0 0;
   }
@@ -1929,261 +1992,6 @@
       {# The count line, where a paragraph explaining what a library is used to
          sit. `#lib-item-count` is the element the filter engine rewrites, so it
          moved here whole rather than being duplicated. #}
-      <p class="lede">
-        <span class="lib-count" id="lib-item-count">{{ library_items|length }} item{{ '' if library_items|length == 1 else 's' }}</span>
-        {{ library_more_coming() }}
-      </p>
-    </div>
-    <div class="lib-head__controls">
-  <div class="fbar" role="group" aria-label="Search, filter and sort library">
-    {# The bar's own `role="search"` landmark. It sits inside a `group` rather
-       than fronting one, which is why the landmark rides this box: a search
-       field with no landmark of its own is unreachable by landmark navigation. #}
-    <div class="fbar__search" role="search">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
-      <input type="search" id="lib-search" placeholder="Search library…" autocomplete="off" aria-label="Search library">
-    </div>
-
-    {# Filter menu — CATEGORIES, each revealing its options in a secondary
-       popover on hover/focus (see .fbar-cat in filter_toolbar.css). Type is
-       absent by design: items are GROUPED by type into collapsible sections
-       below, so the grouping is the type navigation. Only controls that can
-       change the page render — no dead filters. #}
-    <div class="fbar-filter">
-      <button type="button" class="fbar-filter__btn" id="lib-filter-btn" aria-haspopup="true" aria-expanded="false">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
-        Filter
-        <span class="fbar-filter__n" hidden>0</span>
-      </button>
-      <div class="fbar-menu fbar-menu--cats" id="lib-filter-menu" role="menu" aria-label="Filter library" hidden>
-        {# "Not in stack yet" — the acquisition question ("what could I add?"),
-           demoted from the toolbar's retired "Available to add" segment to an
-           ordinary refinement: the Stack concept owns the bar, and every
-           acquirable row already advertises itself in All with an Add pill.
-           A TOGGLE facet (one condition, no submenu — the engine renders its
-           chip as the condition itself), slicing rows on
-           data-stack="available": strictly the rows an Add control can act
-           on, which the old scope's ownership blend never quite was. Rendered
-           only when something is actually addable — no dead filters. This is
-           also where the retired Catalog/Marketplace browse pages land:
-           their ?scope=available redirects arrive with this box checked. #}
-        {% if library_available_count %}
-        <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not in stack yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
-        {% endif %}
-        {% set _cats = [
-             ('requirement', 'Access', library_requirements),
-             ('tag', 'Tags', library_tags),
-             ('owner', 'Owner', library_owners),
-             ('origin', 'Source', library_origins),
-           ] %}
-        {% for facet_key, cat_label, options in _cats %}
-        {% if options %}
-        <div class="fbar-cat" data-cat="{{ facet_key }}">
-          <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
-            <span class="fbar-cat__label">{{ cat_label }}</span>
-            {# The count and the chevron travel together in a trailing group, so
-               the chevron is pinned to the far right whether or not the count is
-               showing. (A bare `margin-left: auto` on the chevron lost to the
-               sibling rule for the count — which matches even while the count is
-               `hidden` — and the chevron ended up hugging the label.) The chevron
-               points RIGHT, at the submenu's default side, and never turns. #}
-            <span class="fbar-cat__end">
-              <span class="fbar-cat__n" data-cat-count="{{ facet_key }}" hidden>0</span>
-              <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </span>
-          </button>
-          <div class="fbar-cat__pop" hidden>
-            {% for key, label, n in options %}
-            <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ facet_key }}" value="{{ key }}"><span class="fbar-menu__opt-text">{{ label }}</span><span class="fbar-menu__opt-n">{{ n }}</span></label>
-            {% endfor %}
-          </div>
-        </div>
-        {% endif %}
-        {% endfor %}
-        <div class="fbar-menu__foot">
-          <button type="button" data-fbar-clear>Clear</button>
-          <button type="button" data-fbar-done>Done</button>
-        </div>
-      </div>
-    </div>
-
-    {# "In stack only" — a binary condition, and the single most consequential
-       one on this page ("what can my default agent actually use?"), so it
-       rides the bar as a pressed-state BUTTON with its count — the design
-       system's own pattern for a refinement worth seeing at rest
-       (`.fbar-toggle` in filter_toolbar.css) — rather than as a scope
-       segment (tab-rank for a filter; tried after the fold, retired) or a
-       row one level deep in the Filter menu. filter_toolbar.js owns it as an
-       ordinary facet via `control` (see FilterToolbar.init below):
-       `data-facet-value` carries the value an in-menu checkbox would have
-       carried in `value=`, and the engine drives aria-pressed. Because the
-       button shows its own state, the engine leaves this facet out of the
-       Filter badge count and the chip row; "Clear all" still clears it and
-       syncs the button back. The count is the unfiltered in-Stack tally
-       (kept truthful by refreshStackCount); rendered only when flipping it
-       would change the list (`library_stack_toggle`), so it never sits
-       there as a no-op. The acquisition sibling ("Not in stack yet") stays
-       one level deep in the Filter menu — granted-but-not-added is a
-       shopping question, not this one. #}
-    {% if library_stack_toggle %}
-    <button type="button" class="fbar-toggle" id="lib-stack-toggle"
-            data-facet-value="in_stack" aria-pressed="false"
-            title="Only what's in your stack — the set your default agent can use">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 4.9-9 4.9-9-4.9L12 2Z"></path><path d="m3 11.9 9 4.9 9-4.9"></path><path d="m3 16.9 9 4.9 9-4.9"></path></svg>
-      In stack only<span class="fbar-toggle__n" data-stack-count>{{ library_in_stack_count }}</span>
-    </button>
-    {% endif %}
-
-    {# Sorting for GRID view. In table view the column headers own it (see the
-       <thead> below) and this control hides — two live readouts of one order
-       would be one too many. It must cover EVERY order a header can produce,
-       or switching to grid after sorting by one of the header-only columns
-       would leave the select showing nothing; hence the Owner and Sharing
-       pairs, which have no toolbar equivalent of their own. Recently added has
-       no column (it is the default order and the table shows no date), so this
-       is the only place it can be asked for. Hidden by the engine, not by a
-       Jinja condition: the view is a client-side, persisted choice, so the
-       server can't know which one to render. #}
-    <div class="fbar-select" id="lib-sortwrap" hidden>
-      <select id="lib-sort" aria-label="Sort library" class="ds-dropdown-native">
-        <option value="added_desc">Recently added</option>
-        <option value="added_asc">Oldest first</option>
-        <option value="name_asc">Name A–Z</option>
-        <option value="name_desc">Name Z–A</option>
-        <option value="owner_asc">Owner A–Z</option>
-        <option value="owner_desc">Owner Z–A</option>
-        <option value="sharing_asc">Sharing A–Z</option>
-        <option value="sharing_desc">Sharing Z–A</option>
-      </select>
-      {# Custom dropdown replacement (#1055) — same-container sibling of the
-         real select so the wrap's own `hidden` (grid-view-only) still governs
-         both, and paper-skin.css's `.fbar-select > .ds-dropdown` chevron-hiding
-         rule (a direct-child selector) applies. See _components.html's
-         `dropdown` macro for the pattern. #}
-      {{ ds.dropdown(
-        id='lib-sort-dd', target='lib-sort',
-        aria_label='Sort library', selected='added_desc',
-        options=[
-          {'value': 'added_desc', 'label': 'Recently added'},
-          {'value': 'added_asc', 'label': 'Oldest first'},
-          {'value': 'name_asc', 'label': 'Name A–Z'},
-          {'value': 'name_desc', 'label': 'Name Z–A'},
-          {'value': 'owner_asc', 'label': 'Owner A–Z'},
-          {'value': 'owner_desc', 'label': 'Owner Z–A'},
-          {'value': 'sharing_asc', 'label': 'Sharing A–Z'},
-          {'value': 'sharing_desc', 'label': 'Sharing Z–A'},
-        ],
-      ) }}
-    </div>
-
-    {# Table ⇄ grid toggle. Default is table; the choice persists in
-       localStorage. Same shared control as My Stack. #}
-    <div class="fbar-view" role="group" aria-label="View">
-      <button type="button" class="fbar-view__btn is-active" data-view="table" aria-label="Table view" aria-pressed="true" title="Table view">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"></path></svg>
-      </button>
-      <button type="button" class="fbar-view__btn" data-view="grid" aria-label="Grid view" aria-pressed="false" title="Grid view">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"></rect><rect x="13" y="4" width="7" height="7" rx="1.5"></rect><rect x="4" y="13" width="7" height="7" rx="1.5"></rect><rect x="13" y="13" width="7" height="7" rx="1.5"></rect></svg>
-      </button>
-    </div>
-
-    {# Every "add something" path lives behind ONE primary button + chevron, so
-       the page carries a single call to action however many kinds the Library
-       grows. Last in the row, and the only filled control in it: the one thing
-       here that changes the Library rather than the view of it. Click (not
-       hover) so it works on touch + keyboard.
-
-       All three authored kinds now go to the one builder at /skills, which
-       deep-links past its type picker via ?type=. Plugins used to fork off to
-       the /store/new upload wizard because a plugin is a zip bundle rather
-       than a markdown body; the builder absorbs that difference internally,
-       so the menu no longer has to. #}
-    <div class="lib-new">
-      <button type="button" class="cc-btn cc-btn--primary lib-new__btn" id="lib-new-btn"
-              aria-haspopup="true" aria-expanded="false">
-        <span>+ Add</span>
-        <svg class="lib-new__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </button>
-      {# The menu follows the TAB. "+ Add" used to offer one list wherever you
-         were, so a reader on Capabilities was offered a data package and a
-         reader on Knowledge was offered a plugin — and the list was long
-         enough that neither found their own half quickly. Each tab now shows
-         only what it can hold, and the blast-radius headings survive INSIDE
-         each half rather than being replaced by the split: the tab says which
-         part of the Library you are adding to, the heading still says how far
-         the thing you add will reach.
-
-         Both halves render; `data-tab` on the menu picks which is shown (see
-         `openNewMenu` and the tab handler), so switching tabs does not have to
-         re-fetch or re-render a menu. #}
-      <div class="lib-new__menu" id="lib-new-menu" role="menu" aria-label="Add to your library"
-           data-tab="{{ library_active_tab }}" hidden>
-
-        {# ── Knowledge: the sources what Agnes KNOWS comes from ── #}
-        <div class="lib-new__group" data-menu-tab="knowledge">
-          <div class="lib-new__cap">Create for the workspace</div>
-          {% if user.is_admin %}
-          {# A data package is the unit governed data reaches analysts through,
-             so authoring one is an instance decision. Opens the same shared
-             drawer /admin/data-packages does. #}
-          <button type="button" class="lib-new__item" role="menuitem" data-new-package>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/></svg>
-            <span>New data package<small>Governed tables analysts can query</small></span>
-          </button>
-          <a class="lib-new__item" href="/admin/data-sources" role="menuitem">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
-            <span>Connect a source<small>Warehouse, BigQuery, Databricks, files</small></span>
-          </a>
-          {# An app is a view onto the data rather than something an agent
-             calls, which is why it is added from this half. Opens the existing
-             three-step admin ingest. #}
-          <a class="lib-new__item" href="/admin/linked-apps/new" role="menuitem">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
-            <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
-          </a>
-          {% endif %}
-          <div class="lib-new__sep"></div>
-          <div class="lib-new__cap">Just for you</div>
-          <button type="button" class="lib-new__item" role="menuitem" data-new-upload>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 16V5M8 9l4-4 4 4" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
-            <span>Upload a file</span>
-          </button>
-        </div>
-
-        {# ── Capabilities: what changes what an agent can DO ── #}
-        <div class="lib-new__group" data-menu-tab="capabilities">
-          <div class="lib-new__cap">Create for the workspace</div>
-          <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>
-            <span>Build a skill</span>
-          </a>
-          <a class="lib-new__item" href="/skills?type=plugin" role="menuitem">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg>
-            <span>Build a plugin</span>
-          </a>
-          {# An agent TEMPLATE — a Library resource others build their own agent
-             from. The agents a user configures for themselves live on /agents
-             and are reached from the rail, never from this menu. #}
-          <a class="lib-new__item" href="/skills?type=agent" role="menuitem">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4M9 13h.01M15 13h.01" stroke-linecap="round"/></svg>
-            <span>Build an agent template</span>
-          </a>
-          {% if user.is_admin %}
-          {# Filed under Capabilities on the menu's own reading of it — "tools an
-             agent can call". The other reading is real and points the other way:
-             /admin/mcp-sources materializes discovered tools into the table
-             registry or exposes them as passthrough lookups, which is data. If
-             that reading wins later, this row moves and nothing else does. #}
-          <a class="lib-new__item" href="/admin/mcp-sources/new" role="menuitem">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v6M5.5 7.5l4 3M18.5 7.5l-4 3M12 21v-6" stroke-linecap="round"/><circle cx="12" cy="12" r="2.5"/></svg>
-            <span>Connect an MCP source<small>Tools an agent can call</small></span>
-          </a>
-          {% endif %}
-        </div>
-
-      </div>
-    </div>
-  </div>
     </div>
   </div>
   {# The connect invitation sits between the page title and the tabs — above the
@@ -2302,11 +2110,280 @@
     <div class="lib-drafts__rows" id="lib-drafts-rows"></div>
   </div>
 
-  {# Applied filters, stated above the list they narrow. NOT `--center`: that
-     modifier belonged to the dock's card, where the row was centred over a
-     centred bar; over a left-aligned list it left the chips floating in the
-     middle of the page with nothing to align to. #}
-  <div class="fbar-chips" id="lib-chips" hidden></div>
+
+  {# ── The browsing block ─────────────────────────────────────────────
+     Search, the filters, the view switch, "+ Add", the count and the active
+     filters are ONE job, so they are one block, and it sits directly on the
+     list it acts on. They used to be spread over three bands with the connect
+     banner and the tab strip in the gaps — you pressed Filter in the page
+     header and read what it did two bands lower, past a promo panel.
+
+     The tabs stay above, at the foot of the page header: they choose WHICH
+     list, and everything here narrows the one they chose. #}
+  <div class="lib-browse">
+      <div class="lib-head__controls">
+    <div class="fbar" role="group" aria-label="Search, filter and sort library">
+      {# The bar's own `role="search"` landmark. It sits inside a `group` rather
+         than fronting one, which is why the landmark rides this box: a search
+         field with no landmark of its own is unreachable by landmark navigation. #}
+      <div class="fbar__search" role="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+        <input type="search" id="lib-search" placeholder="Search library…" autocomplete="off" aria-label="Search library">
+      </div>
+  
+      {# Filter menu — CATEGORIES, each revealing its options in a secondary
+         popover on hover/focus (see .fbar-cat in filter_toolbar.css). Type is
+         absent by design: items are GROUPED by type into collapsible sections
+         below, so the grouping is the type navigation. Only controls that can
+         change the page render — no dead filters. #}
+      <div class="fbar-filter">
+        <button type="button" class="fbar-filter__btn" id="lib-filter-btn" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
+          Filter
+          <span class="fbar-filter__n" hidden>0</span>
+        </button>
+        <div class="fbar-menu fbar-menu--cats" id="lib-filter-menu" role="menu" aria-label="Filter library" hidden>
+          {# "Not in stack yet" — the acquisition question ("what could I add?"),
+             demoted from the toolbar's retired "Available to add" segment to an
+             ordinary refinement: the Stack concept owns the bar, and every
+             acquirable row already advertises itself in All with an Add pill.
+             A TOGGLE facet (one condition, no submenu — the engine renders its
+             chip as the condition itself), slicing rows on
+             data-stack="available": strictly the rows an Add control can act
+             on, which the old scope's ownership blend never quite was. Rendered
+             only when something is actually addable — no dead filters. This is
+             also where the retired Catalog/Marketplace browse pages land:
+             their ?scope=available redirects arrive with this box checked. #}
+          {% if library_available_count %}
+          <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not in stack yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
+          {% endif %}
+          {% set _cats = [
+               ('requirement', 'Access', library_requirements),
+               ('tag', 'Tags', library_tags),
+               ('owner', 'Owner', library_owners),
+               ('origin', 'Source', library_origins),
+             ] %}
+          {% for facet_key, cat_label, options in _cats %}
+          {% if options %}
+          <div class="fbar-cat" data-cat="{{ facet_key }}">
+            <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
+              <span class="fbar-cat__label">{{ cat_label }}</span>
+              {# The count and the chevron travel together in a trailing group, so
+                 the chevron is pinned to the far right whether or not the count is
+                 showing. (A bare `margin-left: auto` on the chevron lost to the
+                 sibling rule for the count — which matches even while the count is
+                 `hidden` — and the chevron ended up hugging the label.) The chevron
+                 points RIGHT, at the submenu's default side, and never turns. #}
+              <span class="fbar-cat__end">
+                <span class="fbar-cat__n" data-cat-count="{{ facet_key }}" hidden>0</span>
+                <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+            </button>
+            <div class="fbar-cat__pop" hidden>
+              {% for key, label, n in options %}
+              <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ facet_key }}" value="{{ key }}"><span class="fbar-menu__opt-text">{{ label }}</span><span class="fbar-menu__opt-n">{{ n }}</span></label>
+              {% endfor %}
+            </div>
+          </div>
+          {% endif %}
+          {% endfor %}
+          <div class="fbar-menu__foot">
+            <button type="button" data-fbar-clear>Clear</button>
+            <button type="button" data-fbar-done>Done</button>
+          </div>
+        </div>
+      </div>
+  
+      {# "In stack only" — a binary condition, and the single most consequential
+         one on this page ("what can my default agent actually use?"), so it
+         rides the bar as a pressed-state BUTTON with its count — the design
+         system's own pattern for a refinement worth seeing at rest
+         (`.fbar-toggle` in filter_toolbar.css) — rather than as a scope
+         segment (tab-rank for a filter; tried after the fold, retired) or a
+         row one level deep in the Filter menu. filter_toolbar.js owns it as an
+         ordinary facet via `control` (see FilterToolbar.init below):
+         `data-facet-value` carries the value an in-menu checkbox would have
+         carried in `value=`, and the engine drives aria-pressed. Because the
+         button shows its own state, the engine leaves this facet out of the
+         Filter badge count and the chip row; "Clear all" still clears it and
+         syncs the button back. The count is the unfiltered in-Stack tally
+         (kept truthful by refreshStackCount); rendered only when flipping it
+         would change the list (`library_stack_toggle`), so it never sits
+         there as a no-op. The acquisition sibling ("Not in stack yet") stays
+         one level deep in the Filter menu — granted-but-not-added is a
+         shopping question, not this one. #}
+      {% if library_stack_toggle %}
+      <button type="button" class="fbar-toggle" id="lib-stack-toggle"
+              data-facet-value="in_stack" aria-pressed="false"
+              title="Only what's in your stack — the set your default agent can use">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 4.9-9 4.9-9-4.9L12 2Z"></path><path d="m3 11.9 9 4.9 9-4.9"></path><path d="m3 16.9 9 4.9 9-4.9"></path></svg>
+        In stack only<span class="fbar-toggle__n" data-stack-count>{{ library_in_stack_count }}</span>
+      </button>
+      {% endif %}
+  
+      {# Sorting for GRID view. In table view the column headers own it (see the
+         <thead> below) and this control hides — two live readouts of one order
+         would be one too many. It must cover EVERY order a header can produce,
+         or switching to grid after sorting by one of the header-only columns
+         would leave the select showing nothing; hence the Owner and Sharing
+         pairs, which have no toolbar equivalent of their own. Recently added has
+         no column (it is the default order and the table shows no date), so this
+         is the only place it can be asked for. Hidden by the engine, not by a
+         Jinja condition: the view is a client-side, persisted choice, so the
+         server can't know which one to render. #}
+      <div class="fbar-select" id="lib-sortwrap" hidden>
+        <select id="lib-sort" aria-label="Sort library" class="ds-dropdown-native">
+          <option value="added_desc">Recently added</option>
+          <option value="added_asc">Oldest first</option>
+          <option value="name_asc">Name A–Z</option>
+          <option value="name_desc">Name Z–A</option>
+          <option value="owner_asc">Owner A–Z</option>
+          <option value="owner_desc">Owner Z–A</option>
+          <option value="sharing_asc">Sharing A–Z</option>
+          <option value="sharing_desc">Sharing Z–A</option>
+        </select>
+        {# Custom dropdown replacement (#1055) — same-container sibling of the
+           real select so the wrap's own `hidden` (grid-view-only) still governs
+           both, and paper-skin.css's `.fbar-select > .ds-dropdown` chevron-hiding
+           rule (a direct-child selector) applies. See _components.html's
+           `dropdown` macro for the pattern. #}
+        {{ ds.dropdown(
+          id='lib-sort-dd', target='lib-sort',
+          aria_label='Sort library', selected='added_desc',
+          options=[
+            {'value': 'added_desc', 'label': 'Recently added'},
+            {'value': 'added_asc', 'label': 'Oldest first'},
+            {'value': 'name_asc', 'label': 'Name A–Z'},
+            {'value': 'name_desc', 'label': 'Name Z–A'},
+            {'value': 'owner_asc', 'label': 'Owner A–Z'},
+            {'value': 'owner_desc', 'label': 'Owner Z–A'},
+            {'value': 'sharing_asc', 'label': 'Sharing A–Z'},
+            {'value': 'sharing_desc', 'label': 'Sharing Z–A'},
+          ],
+        ) }}
+      </div>
+  
+      {# Table ⇄ grid toggle. Default is table; the choice persists in
+         localStorage. Same shared control as My Stack. #}
+      <div class="fbar-view" role="group" aria-label="View">
+        <button type="button" class="fbar-view__btn is-active" data-view="table" aria-label="Table view" aria-pressed="true" title="Table view">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"></path></svg>
+        </button>
+        <button type="button" class="fbar-view__btn" data-view="grid" aria-label="Grid view" aria-pressed="false" title="Grid view">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"></rect><rect x="13" y="4" width="7" height="7" rx="1.5"></rect><rect x="4" y="13" width="7" height="7" rx="1.5"></rect><rect x="13" y="13" width="7" height="7" rx="1.5"></rect></svg>
+        </button>
+      </div>
+  
+      {# Every "add something" path lives behind ONE primary button + chevron, so
+         the page carries a single call to action however many kinds the Library
+         grows. Last in the row, and the only filled control in it: the one thing
+         here that changes the Library rather than the view of it. Click (not
+         hover) so it works on touch + keyboard.
+  
+         All three authored kinds now go to the one builder at /skills, which
+         deep-links past its type picker via ?type=. Plugins used to fork off to
+         the /store/new upload wizard because a plugin is a zip bundle rather
+         than a markdown body; the builder absorbs that difference internally,
+         so the menu no longer has to. #}
+      <div class="lib-new">
+        <button type="button" class="cc-btn cc-btn--primary lib-new__btn" id="lib-new-btn"
+                aria-haspopup="true" aria-expanded="false">
+          <span>+ Add</span>
+          <svg class="lib-new__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        {# The menu follows the TAB. "+ Add" used to offer one list wherever you
+           were, so a reader on Capabilities was offered a data package and a
+           reader on Knowledge was offered a plugin — and the list was long
+           enough that neither found their own half quickly. Each tab now shows
+           only what it can hold, and the blast-radius headings survive INSIDE
+           each half rather than being replaced by the split: the tab says which
+           part of the Library you are adding to, the heading still says how far
+           the thing you add will reach.
+  
+           Both halves render; `data-tab` on the menu picks which is shown (see
+           `openNewMenu` and the tab handler), so switching tabs does not have to
+           re-fetch or re-render a menu. #}
+        <div class="lib-new__menu" id="lib-new-menu" role="menu" aria-label="Add to your library"
+             data-tab="{{ library_active_tab }}" hidden>
+  
+          {# ── Knowledge: the sources what Agnes KNOWS comes from ── #}
+        {# ONE list, on both tabs. It was split by tab for a release, which meant
+           a reader on Knowledge was never offered "Build a skill" and had to know
+           to switch tabs before they could create one — a create menu is where you
+           go when you do NOT yet know where the thing belongs. The grouping that
+           survives is the original one, by blast radius: publishing a skill, a
+           plugin, an agent template or a data package reaches other people, while
+           an uploaded file is private until it is shared. #}
+        <div class="lib-new__group">
+            <div class="lib-new__cap">Create for the workspace</div>
+            {% if user.is_admin %}
+            {# A data package is the unit governed data reaches analysts through,
+               so authoring one is an instance decision. Opens the same shared
+               drawer /admin/data-packages does. #}
+            <button type="button" class="lib-new__item" role="menuitem" data-new-package>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/></svg>
+              <span>New data package<small>Governed tables analysts can query</small></span>
+            </button>
+            <a class="lib-new__item" href="/admin/data-sources" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
+              <span>Connect a source<small>Warehouse, BigQuery, Databricks, files</small></span>
+            </a>
+            {# An app is a view onto the data rather than something an agent
+               calls, which is why it is added from this half. Opens the existing
+               three-step admin ingest. #}
+            <a class="lib-new__item" href="/admin/linked-apps/new" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
+              <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
+            </a>
+            {% endif %}
+            <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>
+              <span>Build a skill</span>
+            </a>
+            <a class="lib-new__item" href="/skills?type=plugin" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg>
+              <span>Build a plugin</span>
+            </a>
+            {# An agent TEMPLATE — a Library resource others build their own agent
+               from. The agents a user configures for themselves live on /agents
+               and are reached from the rail, never from this menu. #}
+            <a class="lib-new__item" href="/skills?type=agent" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4M9 13h.01M15 13h.01" stroke-linecap="round"/></svg>
+              <span>Build an agent template</span>
+            </a>
+            {% if user.is_admin %}
+            {# Filed under Capabilities on the menu's own reading of it — "tools an
+               agent can call". The other reading is real and points the other way:
+               /admin/mcp-sources materializes discovered tools into the table
+               registry or exposes them as passthrough lookups, which is data. If
+               that reading wins later, this row moves and nothing else does. #}
+            <a class="lib-new__item" href="/admin/mcp-sources/new" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v6M5.5 7.5l4 3M18.5 7.5l-4 3M12 21v-6" stroke-linecap="round"/><circle cx="12" cy="12" r="2.5"/></svg>
+              <span>Connect an MCP source<small>Tools an agent can call</small></span>
+            </a>
+            {% endif %}
+            <div class="lib-new__sep"></div>
+            <div class="lib-new__cap">Just for you</div>
+            <button type="button" class="lib-new__item" role="menuitem" data-new-upload>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 16V5M8 9l4-4 4 4" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+              <span>Upload a file</span>
+            </button>
+        </div>
+  
+        </div>
+      </div>
+    </div>
+      </div>
+    <div class="lib-browse__state">
+            <span class="lib-count" id="lib-item-count">{{ library_items|length }} item{{ '' if library_items|length == 1 else 's' }}</span>
+            {{ library_more_coming() }}
+      {# Applied filters, stated above the list they narrow. NOT `--center`: that
+         modifier belonged to the dock's card, where the row was centred over a
+         centred bar; over a left-aligned list it left the chips floating in the
+         middle of the page with nothing to align to. #}
+      <div class="fbar-chips" id="lib-chips" hidden></div>
+    </div>
+  </div>
 
   {% if library_sections %}
   {# ── ONE united list, each group with its own sticky header ──
@@ -2398,7 +2475,12 @@
                 Sharing <span class="lib-sort__dir" aria-hidden="true"></span>
               </button>
             </th>
-            <th scope="col" class="lib-cell-actions">Actions</th>
+            {# No label. The column holds a control on some rows and a STATUS on
+               others ("Required by your admin" is the reason there is no
+               control), and "Actions" promised the first for both. A trailing
+               column whose content is self-describing does not need a word;
+               the header stays for the grid, screen readers get the name. #}
+            <th scope="col" class="lib-cell-actions"><span class="lib-sr">Access</span></th>
           </tr>
         </thead>
         <tbody>
@@ -3145,10 +3227,18 @@
       if (stackEl) {
         const locked = stackEl.classList.contains('lib-instack--locked');
         status.classList.add(locked ? 'fbar-card__status--locked' : 'fbar-card__status--in');
-        tip('In stack', stackEl.dataset.tip || stackEl.title || (locked
+        // The row's own words, not a second vocabulary: a granted package
+        // reads "Required by your admin" in the table, and a card that said
+        // "In stack" for the same item made the two views disagree about what
+        // the caller has. `textContent` of the pill's rest state is exactly
+        // what the row shows.
+        const rowLabel = (stackEl.querySelector('.lib-stackpill__rest') || stackEl).textContent.trim()
+          || 'In stack';
+        tip(rowLabel, stackEl.dataset.tip || stackEl.title || (locked
           ? 'In your stack — only an admin can remove it'
           : 'In your stack'));
-        status.innerHTML = (locked ? LOCK_SVG : CARD_CHECK_SVG) + '<span>In stack</span>';
+        status.innerHTML = (locked ? LOCK_SVG : CARD_CHECK_SVG) + '<span></span>';
+        status.querySelector('span').textContent = rowLabel;
         foot.appendChild(status);
       } else if (row.dataset.type !== 'data_app') {
         // Data apps have no stack membership AT ALL — "Not addable" would
@@ -3243,15 +3333,6 @@
     const activeTab = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
     if (activeTab) activeTab.click();
 
-    // "+ Add" offers what the CURRENT tab can hold. The engine owns the tab
-    // value, so this listens to the same buttons rather than keeping a second
-    // copy of which tab is on.
-    document.querySelectorAll('#lib-tabs .fbar-seg__btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const menu = document.getElementById('lib-new-menu');
-        if (menu) menu.dataset.tab = btn.getAttribute('data-own') || 'knowledge';
-      });
-    });
   }
 
   // ── Which emptiness ──────────────────────────────────────────────────

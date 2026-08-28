@@ -207,15 +207,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     plugin, agent template, MCP source). The blast-radius headings survive
     inside each half. The menu is bounded to the room below its button, so its
     last entries stay reachable.
-  - **One page header instead of four stacked bands.** Title, item count,
-    controls and tabs are a single band; the applied-filter chips moved down
-    beside the list they describe, left-aligned on the rows' own edge. The
-    Library used to spend its first screen not listing anything — title,
-    banner, tabs, toolbar, count row, five bands before row one. The group
-    bands keep the viewport top, which is the thing worth pinning on a long
-    list; the header itself does not pin, because a header carrying all of that
-    runs ~270px and leaves a band no room to travel in. The shared floating
-    dock (`.fbar-dock`) is untouched and still `/chats`'s.
+  - **One browsing block, sitting on the list.** Search, the filters, the view
+    switch, "+ Add", the item count and the active-filter chips are one job, so
+    they are one block directly above what they act on; the page header keeps
+    the title, the connect banner and the tabs. They used to be spread over
+    four bands — you pressed Filter in the page header and read what it did two
+    bands lower, past a promo panel, while the count sat in a third place. The
+    Library spent its first screen not listing anything. The group bands keep
+    the viewport top, which is the thing worth pinning on a long list; no header
+    pins, because one carrying all of that runs ~270px and leaves a band no room
+    to travel in. The shared floating dock (`.fbar-dock`) is untouched and still
+    `/chats`'s.
+  - **Status stopped looking like a control.** "Shared with you", "Required by
+    your admin" and "Granted to your group" all answer *why you have this* and
+    were drawn as pills in the same slot the row's buttons use, under a column
+    headed **Actions** — which is what "Required by your admin" is precisely
+    not. They read as text now; only a control keeps a box, and the trailing
+    column drops its misleading label (keeping an accessible name). Controls
+    themselves went quiet at rest: five 38px bordered boxes across the toolbar
+    gave nothing rank, so search is a field, Filter/stack/view are borderless
+    utilities that tint when on, and "+ Add" is the only filled control.
   - **Bands open on arrival**, and an empty tab says so in its own words rather
     than offering a "Clear filters" button for filters that are not applied.
 - **The chat sandbox now tells the agent the truth about its runtime, and

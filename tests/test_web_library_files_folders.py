@@ -212,7 +212,15 @@ def test_grid_view_keeps_the_sticky_header_and_veils_it(seeded_app):
     grid_on = ":has(> .fbar-grid:not([hidden]))"
     # ONE sticky rule, both views — grid never unpins the band.
     assert ".lib-band { position: sticky; top: 0;" in text
-    assert "position: static" not in css
+    # Nothing unpins the BAND. (The blanket ban this used to be also caught the
+    # narrow-viewport rule that unpins the column HEADER, which is a different
+    # element solving a different problem: below the shell's breakpoint the
+    # scrollport that header resolves against changes and it lands a band-height
+    # below where it belongs, covering the first row of its own group.)
+    for rule in css.split("}"):
+        if "position: static" in rule:
+            assert ".lib-band" not in rule, f"the band must never be unpinned: {rule.strip()}"
+            assert "thead th" in rule, f"unexpected `position: static`: {rule.strip()}"
     # Both gaps sit inside the grid, so the group's content box runs right up to
     # the next group's band and the handoff is exact.
     assert f".lib-group{grid_on} > .fbar-grid" in text

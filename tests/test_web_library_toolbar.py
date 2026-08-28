@@ -351,9 +351,15 @@ def test_sortable_columns_are_name_owner_and_sharing(seeded_app):
     keys = re.findall(r'data-sort-key="([^"]+)"', head)
     assert keys == ["name", "owner", "sharing"], f"sortable columns drifted: {keys}"
     assert ">Type<" not in head, "the Type column should be gone, not merely unsortable"
-    before, marker, _ = head.partition(">Actions<")
-    assert marker, "Actions header missing"
-    assert "lib-sort" not in before.rsplit("<th", 1)[-1], "Actions must not be sortable"
+    # The trailing column has no visible label. It holds a control on some rows
+    # and a STATUS on others ("Required by your admin" is the reason there is no
+    # control), and the word "Actions" promised the first for both. The header
+    # stays for the grid and for screen readers, unsortable as it always was.
+    before, marker, _ = head.partition('class="lib-cell-actions"')
+    assert marker, "trailing column header missing"
+    assert ">Actions<" not in head, "the trailing column must not claim to be actions"
+    assert '<span class="lib-sr">Access</span>' in head, "it still needs an accessible name"
+    assert "lib-sort" not in head.split(marker, 1)[1], "the trailing column must not be sortable"
 
 
 def test_every_sortable_column_opens_a_to_z(seeded_app):

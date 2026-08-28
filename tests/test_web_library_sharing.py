@@ -659,28 +659,33 @@ def test_library_add_actions_live_behind_one_menu(seeded_app):
 
 
 def test_search_and_new_ride_the_toolbar(seeded_app):
-    """Search and "+ Add" ride the page header — search first in the controls
-    row, "+ Add" last — and the header is STICKY.
+    """Search and "+ Add" ride the BROWSING BLOCK that sits on the list —
+    search first in the controls row, "+ Add" last — not the page header.
 
-    They were kept out of the header for years on one reasoning: a header
-    scrolls away, so the two most-reached-for controls would leave the viewport,
-    and a scroll-driven script had to ferry the real nodes into a floating dock
-    and back. That is a property of a header that scrolls, not of a header. The
-    header pins now, so the controls sit on the row they act on AND stay on
-    screen at every scroll position — which is what the dock was bought for.
+    Everything that narrows or adds to the list is one job, so it is one block,
+    directly above what it acts on: controls, then the line stating what they
+    did (the count and the active-filter chips), then the list. The two were
+    split across the page for a while — Filter in the page header, its chips two
+    bands lower, the count in a third place — which meant pressing a control and
+    reading its effect happened in different parts of the page.
     """
     # One item, so the type sections actually render — they are what bounds the
     # count row below (an empty Library renders no `data-lib-sec`).
     _create_collection(seeded_app, "Row Anchor", seeded_app["admin_token"])
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
 
-    # The header holds the title, the count line, the controls and the tabs —
-    # and no leftover action row for a script to observe.
-    head = text.split('class="lib-head"', 1)[1].split('<div class="lib-list">', 1)[0]
-    assert 'id="lib-search"' in head
-    assert 'id="lib-new-btn"' in head
+    # The page header holds the title, the banner and the tabs. The controls do
+    # not live there, and there is no leftover action row for a script to ferry.
+    head = text.split('class="lib-head"', 1)[1].split('class="lib-browse"', 1)[0]
     assert 'id="lib-tabs"' in head
+    assert 'id="lib-search"' not in head
+    assert 'id="lib-new-btn"' not in head
     assert 'class="lib-actions"' not in text
+
+    # The browsing block holds all of it, in order.
+    browse = text.split('class="lib-browse"', 1)[1].split('<div class="lib-list">', 1)[0]
+    for kept in ('id="lib-search"', 'id="lib-new-btn"', 'id="lib-item-count"', 'id="lib-chips"'):
+        assert kept in browse, kept
 
     # The controls row carries both, at its two ends, with the list controls
     # between them. Bounded by the dock's own closing markup rather than by the
@@ -711,23 +716,24 @@ def test_search_and_new_ride_the_toolbar(seeded_app):
     assert "fbar-chips--center" not in text
     assert 'class="fbar-chips" id="lib-chips"' in text
 
-    # The count line under the title carries the count alone — "+ Add" is up in
-    # the controls cluster beside it, not in the line that states the size.
-    row = text.split('class="lib-head__titles"', 1)[1].split('class="lib-head__controls"', 1)[0]
+    # The state line carries the count and the chips — not the controls.
+    row = text.split('class="lib-browse__state"', 1)[1].split('<div class="lib-list">', 1)[0]
     assert 'id="lib-item-count"' in row
+    assert 'id="lib-chips"' in row
     assert 'id="lib-new-btn"' not in row
 
-    # Page order: title+controls → tabs → chips → groups. The chips describe the
-    # LIST, so they left the header and sit beside what they narrowed.
+    # Page order: title → tabs → controls → count+chips → groups. Everything
+    # that acts on the list is contiguous and adjacent to it.
     assert text.index('class="lib-head__bar"') < text.index('id="lib-tabs"')
-    assert text.index('id="lib-tabs"') < text.index('id="lib-chips"')
+    assert text.index('id="lib-tabs"') < text.index('class="lib-browse"')
+    assert text.index('id="lib-filter-btn"') < text.index('id="lib-chips"')
     assert text.index('id="lib-chips"') < text.index('<div class="lib-list">')
     # The chips now FOLLOW the controls that produced them, because they moved
     # to the list they describe: inside the old dock they had to sit above the
     # bar (a card whose two rows read top-down); beside the list they read as
     # the list's current narrowing, which is what they are.
-    assert text.index('class="fbar" role="group"') < text.index('id="lib-tabs"')
-    assert text.index('id="lib-tabs"') < text.index("data-lib-sec=")
+    assert text.index('id="lib-tabs"') < text.index('class="fbar" role="group"')
+    assert text.index('class="lib-browse"') < text.index("data-lib-sec=")
 
 
 FILTER_TOOLBAR_CSS = Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "css" / "filter_toolbar.css"
@@ -773,11 +779,11 @@ def test_page_header_carries_the_controls_and_the_bands_own_the_top(seeded_app):
     _create_collection(seeded_app, "Dock Anchor", seeded_app["admin_token"])
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
 
-    # Title, controls and tabs are one band; the chips left it for the list.
+    # Page furniture, then the browsing block, then the list.
     head = text.split('class="lib-head"', 1)[1].split('<div class="lib-list">', 1)[0]
-    assert head.index('class="lib-head__titles"') < head.index('class="lib-head__controls"')
-    assert head.index('class="lib-head__controls"') < head.index('id="lib-tabs"')
-    assert head.index('id="lib-tabs"') < head.index('id="lib-chips"')
+    assert head.index('class="lib-head__titles"') < head.index('id="lib-tabs"')
+    assert head.index('id="lib-tabs"') < head.index('class="lib-browse"')
+    assert head.index('class="lib-browse"') < head.index('id="lib-chips"')
 
     # The HEADER does not pin — the group bands do. A pinned header of title +
     # count + banner + controls + tabs runs ~270px, a third of an 800px
@@ -820,13 +826,15 @@ def test_library_title_carries_no_setup_caveat(seeded_app):
     assert "lib-status" not in text
     # The title stands alone, directly ahead of the lede.
     assert "<h1>Library</h1>" in text
-    assert text.index("<h1>Library</h1>") < text.index('class="lede"')
+    # The title stands alone. The prose lede that used to follow it is gone —
+    # what it became is the count, and the count belongs on the list.
+    assert 'class="lede"' not in text
     # Where the note lives now: beside the item count, as list metadata. Not a
     # panel, not a row above the list, and not a pill on the h1 (the two bans
     # above still catch that).
     assert 'class="lib-count-note"' in text
     assert ">More coming soon<" in text
-    assert text.index('class="lede"') < text.index('class="lib-count-note"')
+    assert text.index('class="lib-browse__state"') < text.index('class="lib-count-note"')
     # It reads as GROWTH, not as a caveat: no warn vocabulary, no "incomplete",
     # and no cue to explain itself away. The Library is being filled, which is
     # good news — dressing good news in amber is what the old versions got wrong.
