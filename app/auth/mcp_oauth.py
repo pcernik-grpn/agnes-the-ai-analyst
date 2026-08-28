@@ -791,6 +791,11 @@ def _record_consent_outcome(pending: str, *, action: str, client_name: str) -> N
     code, so the marker is inert as a credential even if its key is guessed.
     The decision lives in ``state`` and the client's name in ``redirect_uri`` —
     both plain text columns — because this row is never used as a grant.
+
+    TODO: nothing sweeps ``oauth_auth_codes`` of rows past ``expires_at`` — this
+    marker leaks one row per completed consent, the same way an abandoned
+    pending row already does. Harmless at this volume, but a janitor for the
+    whole table is the real fix.
     """
     from src.repositories import oauth_clients_repo
 
