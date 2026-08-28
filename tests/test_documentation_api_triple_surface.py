@@ -930,8 +930,13 @@ _EXEMPT: dict[str, str] = {
     # eventual document surface is `agnes facts …`, already triple-surface
     # in _COHORT above).
     "/api/admin/sharepoint/connections/{connection_id}/tree": (
-        "live Graph folder-tree browse (sites -> drives -> root children, one level "
-        "per call) for the wizard's step-2 scope picker — admin-only, no analyst "
+        "live Graph folder-tree browse (sites -> drives -> root children -> "
+        "arbitrary-depth subfolder children, TCRD-240) for the wizard's step-2 "
+        "scope picker — admin-only, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/tree/search": (
+        "bounded BFS folder search (TCRD-240) over the same live tree — admin-only "
+        "display primitive feeding the wizard's step-2 search box, no analyst "
         "CLI/MCP analogue"
     ),
     "/api/admin/sharepoint/connections/{connection_id}/scopes": (

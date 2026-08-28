@@ -1169,16 +1169,34 @@ client id, certificate via vault secret or `config.cert_private_key_env`);
 these three routes are the wizard's own steps 2/3.
 
 - /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
-libraries; both → the drive's root children) using the connection's resolved
-certificate. A missing/unresolvable certificate is a typed `409
-sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
-rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+libraries; `drive_id` → the drive's root children; `drive_id` + `item_id` →
+that folder's own children, at any depth — TCRD-240) using the connection's
+resolved certificate. `item_id` is structurally validated before it ever
+reaches a Graph URL path segment, and is rejected (`422
+item_id_requires_drive_id`) without a `drive_id`. A missing/unresolvable
+certificate is a typed `409 sharepoint_cert_unresolved` (surface absence
+rather than fail the crawl); a rejected/failed Graph call is a typed `502
+sharepoint_graph_error`.
+
+`GET …/tree/search` (TCRD-240) is a bounded breadth-first folder search over
+the same live tree — Graph's own `/search` is known to silently under-return
+under app-only auth, so this module never calls it. Params: `q` (required,
+`min_length=2`), `mode` (`prefix` default, `contains`, or `glob` —
+`fnmatch` syntax, case/composition-insensitive; a malformed glob, defined as
+unbalanced `[`/`]`, is a typed `422 invalid_search_pattern`), an optional
+`drive_id` + `item_id` subtree root (neither given searches every drive of
+every reachable site; `item_id` without `drive_id` is `422`), and
+`max_depth`/`max_visited` (defaults `5`/`500`, CLAMPED to caps `10`/`2000`
+rather than rejected). Response: `{matches: [{item_id, drive_id,
+display_path}], visited, truncated}` — `truncated` is `true` whenever a cap
+is what stopped the walk, never a silently partial result.
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
