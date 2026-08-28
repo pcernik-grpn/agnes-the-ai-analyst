@@ -738,6 +738,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   while the conversation had room to spare.
 
 ### Fixed
+- **All four conversational builders now say when they are talking to the
+  scripted stand-in.** Every turn endpoint has always reported which engine
+  answered it — that is the whole point of naming the engine — but only the
+  Library and MCP-source builders rendered it; the agents and data-package
+  builders took `engine` off the wire and dropped it, so on those two a stub
+  still passed for a real model. The notice moved into the shared shell
+  (`BuilderShell.engineNotice`), replacing two near-identical copies, so a
+  builder gets it by using the shell rather than by remembering, and all four
+  word it the same. Guarded by `tests/test_every_builder_names_its_engine.py`,
+  which pins both halves — the render and the assignment — for each builder.
+
 - **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
   did not type, not just a `url`.** All three name what the instance dials or
   runs, and only `url` was guarded. `command` and `args` are the sharper pair:

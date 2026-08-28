@@ -1178,8 +1178,16 @@
     });
   }
 
+  /* Which engine answered the last turn, so the pane can say when it is the
+     scripted stand-in. The turn has always reported it (`engine`, see
+     app/api/builder_core.py) and this builder used to discard it — which
+     defeats the point of naming the engine at all: someone spends an afternoon
+     judging a string-slicer. `BuilderShell.engineNotice` renders it, so all
+     four builders word it identically. */
+  var convEngine = null;
+
   function createPaneHtml() {
-    return convHtml() +
+    return BuilderShell.engineNotice(convEngine) + convHtml() +
       composerHtml('create', convDraft, 'Tell me what this agent should do…', convBusy);
   }
 
@@ -1389,6 +1397,7 @@
       });
     }).then(function (body) {
       conv.push({ role: 'assistant', text: body.reply || '' });
+      convEngine = body.engine || null;
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
       var patch = body.patch || {};
       if (Object.keys(patch).length) {

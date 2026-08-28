@@ -478,18 +478,11 @@
       });
   }
 
-  function engineNoticeHtml() {
-    if (convEngine !== 'stub') return '';
-    return '<div class="ag-note ag-note--warn">Scripted stand-in — this instance has no AI credential ' +
-      'configured (or <code>AGNES_BUILDER_STUB</code> is set), so the replies are canned. ' +
-      'The panel and Save work normally.</div>';
-  }
-
   function leftHtml() {
     var rows = conv.length ? conv : (convBusy ? [] : [{ role: 'assistant', text:
       'Connecting a tool server takes four things: where it lives, how it authenticates, ' +
       'which of its tools to expose, and who may call them. Tell me what you are connecting.' }]);
-    return engineNoticeHtml() +
+    return window.BuilderShell.engineNotice(convEngine) +
       window.BuilderShell.conversation({
         id: 'mcp-conv', rows: rows, busy: convBusy,
         busyText: conv.length ? 'Thinking…' : 'Getting started…', err: convErr,

@@ -702,7 +702,7 @@
      The form is MOVED into the shell's configuration slot rather than
      re-authored, so every cached node in `els` and every handler bound to it
      keeps working untouched. */
-  var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [];
+  var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [], convEngine = null;
 
   function enterBuilderLayout() {
     if (!els || els.root.classList.contains('is-builder-built')) return;
@@ -756,6 +756,10 @@
   function renderConv() {
     if (!els || !els.convHost) return;
     els.convHost.innerHTML =
+      // The engine, named. Every turn reports it and this builder used to
+      // discard it — see BuilderShell.engineNotice for why that is worse than
+      // not having the badge at all.
+      BuilderShell.engineNotice(convEngine) +
       BuilderShell.conversation({
         id: 'pdw-conv-scroll',
         rows: [{ role: 'assistant', text: OPENING }].concat(conv),
@@ -796,6 +800,7 @@
       }),
     }).then(function (body) {
       conv = conv.concat([{ role: 'assistant', text: body.reply || '' }]);
+      convEngine = body.engine || null;
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
       applyPatch(body.patch || {});
     }).catch(function (err) {
@@ -857,7 +862,7 @@
     els.root.classList.toggle('ds-drawer--builder', st.builder);
     // Reset either way: a transcript from a previous open must not be sitting
     // there when the drawer is next used, in either size.
-    conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = [];
+    conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = []; convEngine = null;
     if (st.builder) {
       enterBuilderLayout();
       renderConv();

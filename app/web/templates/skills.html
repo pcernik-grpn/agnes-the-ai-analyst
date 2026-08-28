@@ -170,7 +170,6 @@
   /* The interview's progress line lives in builder.css now (.ag-prog) — it is
      the shell's, and keeping it here made it invisible on every other builder
      that rendered the same markup. */
-  .sk-note--engine { border-color: var(--ds-accent-warn-line); background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sk-build-kicker--agent { color: var(--ds-kind-agent); }
   .sk-build-head h2 { font-size: 24px; margin: 2px 0 0; word-break: break-word; }
   .sk-build-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex: 1 1 320px; flex-wrap: wrap; min-width: 0; margin-top: 4px; }
@@ -1308,10 +1307,10 @@
      one every turn would be noise, but leaving the scripted one unnamed is
      how someone spends an afternoon judging a string-slicer. */
   function engineNoticeHtml() {
-    if (convEngine !== 'stub') return '';
-    return '<div class="sk-note sk-note--engine">Scripted stand-in — this instance has no AI ' +
-      'credential configured (or <code>AGNES_BUILDER_STUB</code> is set), so the replies are ' +
-      'canned. The panel and Save work normally.</div>';
+    // Kept as a named function because three call sites read better for it;
+    // the notice itself is the shell's (BuilderShell.engineNotice), so all
+    // four builders say the same thing in the same words.
+    return BuilderShell.engineNotice(convEngine);
   }
 
   /* The interview's state, straight from the last turn. Computed server-side

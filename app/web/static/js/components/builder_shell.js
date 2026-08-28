@@ -245,8 +245,27 @@
     );
   }
 
+  /* The engine badge, in the shell rather than per page.
+
+     Every turn endpoint reports which engine answered it (`engine` in the
+     response — see app/api/builder_core.py), because a scripted stand-in that
+     looks identical to the real thing is a lie the product tells every day
+     someone runs it locally. Two of the four builders rendered that and two
+     dropped it on the floor, which is the same failure one tier up: the badge
+     existed and the instance still could not be trusted to say so. One
+     implementation, so a builder cannot forget. */
+  function engineNotice(engine) {
+    if (engine !== 'stub') return '';
+    return (
+      '<div class="ag-note ag-note--warn">Scripted stand-in — this instance has no AI ' +
+      'credential configured (or <code>AGNES_BUILDER_STUB</code> is set), so the replies are ' +
+      'canned. The panel and Save work normally.</div>'
+    );
+  }
+
   window.BuilderShell = {
     esc: esc,
+    engineNotice: engineNotice,
     section: section,
     toolbar: toolbar,
     message: message,
