@@ -8252,6 +8252,10 @@ async def admin_override_store_submission(
         },
         result="success",
     )
+
+    from app.api.store import _notify_submitter
+
+    _notify_submitter(sub, decision="overridden", note=body.reason)
     return {"ok": True, "submission_id": submission_id, "entity_id": entity_id}
 
 
@@ -8502,7 +8506,7 @@ async def admin_delete_store_submission(
     wrong call. The audit_log row preserves what was deleted in case
     triage needs the evidence trail later.
     """
-    from app.api.store import _entity_dir
+    from app.api.store import _entity_dir, _notify_submitter
 
     subs = store_submissions_repo()
     sub = subs.get(submission_id)
@@ -8527,6 +8531,8 @@ async def admin_delete_store_submission(
             "status": sub.get("status"),
         },
     )
+
+    _notify_submitter(sub, decision="deleted")
 
 
 # ---------------------------------------------------------------------------
