@@ -1687,16 +1687,29 @@ class TestBigQueryRebuildErrorPropagation:
 class TestKeboolaModalUsesDiscoveredTableId:
     """Review IMPORTANT 5: the JS that builds the Keboola register payload
     must derive `source_table` from the discovered table's storage ID
-    (`t.id`), NOT the human-friendly display name (`t.name`).
+    **minus the bucket prefix**, NOT from an operator-typed display name.
+
+    Those are two separate requirements and only the second one was ever
+    about `t.name`. Keboola's Storage API table object carries `id`
+    (`in.c-main.orders`, fully qualified), `name` (`orders`, the bare
+    in-bucket identifier) and `displayName` (the human-friendly one). The
+    registry keeps the bucket and the bare name in separate columns and the
+    export path composes `kbc.<bucket>.<source_table>`, so a full `t.id` in
+    `source_table` doubles the bucket prefix — the #755-era wizard bug
+    `connectors.keboola.storage_api.normalize_source_table` heals at use.
 
     C3: the legacy #registerModal that owned regTableName / regSourceTable
-    was removed. D4 replaced the Phase F #registerKeboolaModal (kbBucket /
-    kbSourceTable + `_buildKeboolaPayload`) with the shared drawer's
-    Keboola `discover()` (register_table_form.js), which keeps the same
-    separation: each browsed row's `sourceTable` comes from the bucket
-    listing's `t.id` (the Storage API identifier registration needs), and
-    the operator-visible name is independently editable in the Configure
-    step (`#rtfViewName`) — verified here by static asset inspection."""
+    was removed. D4 replaced the Phase F #registerKeboolaModal with the
+    shared drawer's Keboola `discover()` (register_table_form.js). The
+    legacy Discover button this replaced read `t.name || t.id` and stripped
+    a leading `<bucket>.`; the drawer does the same. The operator-visible
+    name stays independently editable in the Configure step
+    (`#rtfViewName`).
+
+    The behaviour itself is pinned by
+    `tests/test_register_table_form.py::test_keboola_connection_browse_registers_the_bare_table_name`,
+    which runs the shipped `discover()` under node. This one guards the
+    surrounding separation-of-fields contract."""
 
     def test_phase_f_modal_separates_storage_id_from_display_name(
         self,
@@ -1729,12 +1742,24 @@ class TestKeboolaModalUsesDiscoveredTableId:
             js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
             # The row built from a connection-scoped bucket listing
             # (GET /api/admin/source-connections/{id}/tables — the same
-            # endpoint the legacy modal's Discover button called) uses
-            # `t.id` (the Storage API identifier) for `sourceTable`, not a
-            # display-name field, for that endpoint's shape.
+            # endpoint the legacy modal's Discover button called) must not
+            # put the FULL Storage API id in `sourceTable`: that endpoint
+            # returns `{"id": "in.c-main.orders", "name": "orders"}` (see its
+            # own fixture in tests/test_admin_source_connections.py), and the
+            # export path prepends the bucket itself.
             kb_conn_start = js.index("if (ctx.connectionId) {")
             kb_conn_end = js.index("var discovered = await _apiGet", kb_conn_start)
-            assert "sourceTable: t.id," in js[kb_conn_start:kb_conn_end]
+            kb_conn = js[kb_conn_start:kb_conn_end]
+            assert "sourceTable: t.id," not in kb_conn, (
+                "the full Keboola table id doubles the bucket prefix once the export path "
+                "composes kbc.<bucket>.<source_table> — pass the bare in-bucket name"
+            )
+            # …and it must not be read from an operator-typed display-name
+            # input either, which is the separation this class exists for.
+            assert "rtfViewName" not in kb_conn, (
+                "the browsed row's storage identifier must come from the listing, never from "
+                "the operator-editable view-name field"
+            )
         finally:
             reset_cache()
 
