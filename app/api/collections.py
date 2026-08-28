@@ -659,10 +659,51 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
         logger.info("facts orphan sweep trigger=%s subjects_deleted=%d", trigger, deleted)
 
 
+def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
+    """Drop a file's claims when its CONTENT is replaced in place (spec §6,
+    "content changed"). Returns the number deleted (0 when facts is off).
+
+    Why at replace time and not "on the next extraction": a claim's ``quote``
+    is a verbatim span validated against THIS file's chunks at ingest (§8).
+    The moment ``corpus_files.sha256`` moves, the bytes that span was checked
+    against are gone — the old blob is refcount-deleted right below — so the
+    claim is not merely stale, it is unverifiable. Nothing in the read path
+    filters it: ``claims.file_sha256`` is written on every claim and compared
+    by no query, and ``facts_pg.claims()`` joins ``corpus_files`` for the
+    document's CURRENT name/path, so an old quote would be served under the
+    new document's identity while its subject stays alive in ``search`` /
+    ``neighbors``. Deferring to the producer's next replace-mode ingest also
+    assumes a producer exists — a file replaced by hand through the UI has
+    none, so "next ingest" can be never.
+
+    Before #1655 this happened for free: a content change deleted the
+    ``corpus_files`` row and the claims cascaded. Preserving the row id (the
+    point of §6) must not also preserve evidence for deleted text.
+
+    Same flag/backend tolerance as ``_sweep_facts_orphans_after_delete``:
+    a no-op with zero DB round trips when the ``facts`` flag is off, and a
+    DuckDB-backed instance can never have claims to begin with.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return 0
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        return facts_repo().delete_claims_for_file(file_id)
+    except RequiresPostgresBackend:
+        return 0
+    except Exception:
+        logger.warning("facts claim purge failed for replaced file %s", file_id, exc_info=True)
+        return 0
+
+
 def _purge_children_and_content(collection_id: str, row: dict) -> None:
     """Purge a matched row's zip-bundle children (fully — they are
-    regenerated on the next ingest) plus the row's OWN chunks and derived
-    tables, ahead of an in-place content update that reuses ``row``'s id.
+    regenerated on the next ingest) plus the row's OWN chunks, derived
+    tables and fact claims, ahead of an in-place content update that reuses
+    ``row``'s id.
 
     ``row`` itself, and its own blob, are left for the caller
     (``_upsert_corpus_file``): ``row`` still carries its OLD ``storage_path``
@@ -692,6 +733,24 @@ def _purge_children_and_content(collection_id: str, row: dict) -> None:
 
     _schedule_derived_purge(collection_id, row["id"])
     chunks_repo.delete_for_file(row["id"])
+
+    # Claims are derived from the content too, and the content is being
+    # replaced — see `_purge_facts_claims_for_replaced_file`. The children
+    # deleted above cascade THEIR claims away via the FK, so the orphan
+    # sweep below covers both paths; it runs as its own step outside the
+    # deleting work, exactly as `delete_file` does (spec §6). Once per
+    # REPLACED file (not per uploaded file), and skipped entirely with the
+    # facts flag off, which is the default.
+    purged = _purge_facts_claims_for_replaced_file(row["id"])
+    if purged or children:
+        _sweep_facts_orphans_after_delete(trigger=f"replace_file:{row['id']}")
+    if purged:
+        logger.info(
+            "facts claims purged on content replace collection=%s file_id=%s claims=%d",
+            collection_id,
+            row["id"],
+            purged,
+        )
 
 
 def _ingest_incomplete(row: dict) -> bool:

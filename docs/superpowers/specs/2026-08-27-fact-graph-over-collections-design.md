@@ -418,13 +418,15 @@ Lifecycle:
 |---|---|
 | re-sync, content unchanged | row kept, zero re-processing, claims untouched (test C3) |
 | rename / move | same `source_stable_id` → same row, path updated; claims untouched (C4). Note: the current crawler's ctag-skip leaves `path` stale on a pure rename — the port must refresh path/name on delta items even when content is unchanged |
-| content changed | same row, new sha; that document's claims **replaced** on next extraction (old quotes may no longer exist in the text) |
+| content changed | same row, new sha; that document's claims are **deleted at replace time**, then the orphan sweep below runs. Deferring the delete to the next extraction was considered and rejected (review, 2026-08-28): a claim's quote is a verbatim span validated against the OLD bytes (§8) and those bytes are gone once the sha moves — the blob is refcount-deleted — while nothing in the read path withholds it (`claims.file_sha256` is written by `add_claim` and compared by no query, and §4's claims read joins `corpus_files` for the document's CURRENT name/path). So the window would serve a quote of deleted text under the new document's identity, and keep its subject alive in search/neighbors, for as long as the producer takes to re-extract — which for a hand-replaced file is forever. Fresh claims still arrive only on the next extraction; replace-mode ingest's own `DELETE` simply finds nothing left, unchanged and idempotent |
 | deleted in source / moved out of crawl scope | row deleted → claims cascade → an EDGE left with zero claims of its own is deleted first; a FACT is deleted only once it has NEITHER an own claim NOR an incident edge still carrying any claim (rev 3.2, §0 — an edge anchors its endpoints); deletions are **counted in the run report**; their `corrections` rows survive (§3) |
 
 The orphan-subject sweep runs as its own step **after any batch of
 `corpus_files` deletions** — ingest-driven or UI-driven (an admin deleting a
-file from a collection cascades claims exactly the same way) — never inside
-the deleting transaction. Its counts land in the run report or, for UI
+file from a collection cascades claims exactly the same way) — and equally
+after a **content replace**, which deletes claims without deleting the row
+(and hard-deletes the row's zip-bundle children, whose claims cascade). Never
+inside the deleting transaction. Its counts land in the run report or, for UI
 deletions, on the source card, attributed to the operation that triggered
 them. Edges sweep first, so by the time the fact sweep runs every surviving
 edge already carries >=1 claim — a fact with a live incident edge survives

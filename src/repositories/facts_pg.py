@@ -269,6 +269,33 @@ class FactsPgRepository:
             )
         return claim_id if result.rowcount else None
 
+    def delete_claims_for_file(self, corpus_file_id: str) -> int:
+        """Delete every claim anchored to one ``corpus_files`` row; return the
+        count.
+
+        Used when the row's CONTENT is replaced in place (spec §6, "content
+        changed"). Since #1655 an upload matching an existing row updates it
+        in place instead of delete+insert, so the ``claims.corpus_file_id``
+        ``ON DELETE CASCADE`` that used to clear a replaced document's claims
+        no longer fires. Every claim carries a verbatim ``quote`` validated
+        against the file's chunks at ingest (§8); once ``corpus_files.sha256``
+        moves, those bytes are gone (the old blob is refcount-deleted) and the
+        quote is unverifiable by construction — so the claims are dropped at
+        replace time rather than served as current evidence until the
+        producer's next extraction, which may never come for a hand-replaced
+        file.
+
+        Deliberately claims-only: facts/edges left with no evidence are
+        removed by ``sweep_orphans`` as its own step afterwards (§6), exactly
+        like the delete-driven cascade path.
+        """
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                sa.text("DELETE FROM claims WHERE corpus_file_id = :file_id"),
+                {"file_id": corpus_file_id},
+            )
+        return int(result.rowcount or 0)
+
     def upsert_correction(
         self,
         *,
