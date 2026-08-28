@@ -201,6 +201,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **By bundle is grouped, not alphabetical.** A flat A–Z list interleaved a
+  plugin, a package, a memory domain and a collection — four different kinds
+  of decision — so the reader re-sorted them mentally on every pass. It now
+  carries the same two levels the group view does: **family** as a filled band
+  (Knowledge, Capabilities, Surfaces) and the **kind** as a quiet run inside it
+  with its own count, kinds in registry order and names alphabetical within a
+  kind. A row no longer repeats its family on the right, because the band it
+  sits under already says it.
+- **New group is the group list's first row.** It made a row of the list it
+  was sitting above, so it is a row of that list, on that list's geometry —
+  marker where each group's avatar sits, label where each group's name sits.
+  Bound by delegation rather than by id, since `#ax-groups` is rewritten on
+  every repaint and an element-bound listener would be lost the first time a
+  grant was written.
 - **Add / Share are the table's first row, not a link above it.** Outside the
   table they read as page furniture; inside, on the table's own grid, they
   read as something the table can do — the `+` in the Kind column where every

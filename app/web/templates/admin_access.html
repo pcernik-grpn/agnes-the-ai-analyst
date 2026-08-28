@@ -1738,6 +1738,40 @@
   /* One line: the hint gives way before the label does. */
   .ax-add__body { flex-wrap: nowrap; }
   .ax-add__label { white-space: nowrap; }
+  /* ── New group: the list's first row ──────────────────────────────────
+     It made a row of the list it sat above, so it is a row of that list, on
+     the same geometry: the marker where each group's avatar sits, the label
+     where each group's name sits. */
+  .ax-newrow {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    padding: 10px 12px 10px 10px; text-align: left;
+    background: none; border: 0; border-bottom: 1px solid var(--ds-border-light);
+    cursor: pointer; font: inherit;
+  }
+  .ax-newrow:hover { background: var(--ds-surface-dim); }
+  .ax-newrow:focus-visible { outline: var(--ds-focus-outline); outline-offset: -2px; }
+  .ax-newrow__plus {
+    flex: none; width: 22px; height: 22px; line-height: 20px; text-align: center;
+    margin-left: 22px;                 /* clears the caret column */
+    border: 1px dashed var(--ds-border); border-radius: 50%;
+    color: var(--ds-text-link); font-size: 14px;
+  }
+  .ax-newrow:hover .ax-newrow__plus { border-style: solid; border-color: var(--ds-text-link); }
+  .ax-newrow__label { font-size: 14px; font-weight: 600; color: var(--ds-text-link); }
+  .ax-newrow__hint { font-size: 12px; color: var(--ds-text-muted); }
+
+  /* ── A kind's run inside a family ─────────────────────────────────────
+     The family band is filled and repeats per family; a kind repeats inside
+     it, so it is the quieter of the two — a label and a count, no fill, or
+     the list gains a second stripe for every kind it holds. */
+  .ax-kindrun {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 10px 12px 4px 34px;
+    font-size: 10.5px; font-weight: 700; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+  }
+  .ax-kindrun__c { font-family: var(--ds-font-mono); font-size: 10px; font-weight: 400; }
+  .ax-fam .ax-kindrun:first-child { padding-top: 6px; }
 </style>
 {% endblock %}
 
@@ -1796,9 +1830,9 @@
         <button type="button" class="fbar-seg__btn" data-by="bundle">By bundle</button>
         <button type="button" class="fbar-seg__btn" data-by="person">By person</button>
       </span>
-      <button type="button" class="ax-gnew" id="ax-new-group">
-        <span class="ax-gnew__plus" aria-hidden="true">+</span> New group
-      </button>
+      {# "New group" is not toolbar furniture: it makes a row of the list
+         below, so it IS a row of that list — see `newGroupRow` in
+         renderGroups. #}
     </div>
 </div>
 
@@ -2352,9 +2386,19 @@
        change the membership of. The groups they actually work on come
        first; the two fixed ones sit at the foot, where a list you have read
        to the end ends. */
-    host.innerHTML = (custom.length && system.length)
+    /* The action that makes a group is the first row of the list of groups,
+       on that list's own geometry — the marker where each row's avatar sits,
+       the label where each row's name sits. Bound by delegation, not by id:
+       this markup is replaced on every repaint. */
+    const newGroupRow = `
+      <button type="button" class="ax-newrow" data-new-group>
+        <span class="ax-newrow__plus" aria-hidden="true">+</span>
+        <span class="ax-newrow__label">New group</span>
+        <span class="ax-newrow__hint">an audience to write grants against</span>
+      </button>`;
+    host.innerHTML = newGroupRow + ((custom.length && system.length)
       ? label("Groups") + custom.map(row).join("") + label("System") + system.map(row).join("")
-      : groups.map(row).join("");
+      : groups.map(row).join(""));
     homeWork(selectedGroup);
   }
 
@@ -3335,9 +3379,7 @@
               ? `<span class="ax-gs__desc">${esc(String(r.i.description).slice(0, 150))}</span>`
               : ""}
           </span>
-          <span class="ax-gs__counts">
-            <span class="ax-gs__cnt${nobody ? "" : " is-held"}">${esc(famName.get(r.t.family) || "")}</span>
-          </span>
+
         </summary>
         <div class="ax-gs__body">
           ${(() => {
@@ -3387,12 +3429,56 @@
         <div>${nobody.map(section).join("")}</div>
       </details>` : "";
 
-    host.innerHTML = (held.length
-      ? held.map(section).join("")
-      : `<div class="ax-empty">Nothing on this instance is granted to anyone yet.</div>`) + nobodyLine;
+    /* Grouped, not alphabetical. A flat A-Z list interleaves a plugin, a
+       package, a memory domain and a collection — four different kinds of
+       decision — so the reader sorts them mentally on every pass. The same
+       two levels the group view uses: FAMILY as a band, and the kind as a
+       quiet run inside it, so all the packages sit together under Knowledge
+       and all the plugins under Capabilities. */
+    const famOrder = (overview.families || []).map((f) => f.key);
+    const inFamily = new Map();
+    for (const r of held) {
+      const fam = r.t.family || "knowledge";
+      if (!inFamily.has(fam)) inFamily.set(fam, []);
+      inFamily.get(fam).push(r);
+    }
+    const painted = (overview.families || []).map((f) => {
+      const mine = inFamily.get(f.key) || [];
+      if (!mine.length) return "";
+      // Kinds in the registry's own order, names alphabetical inside a kind.
+      const kindRank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
+      mine.sort((a, b) => (kindRank.get(a.t.type_key) ?? 99) - (kindRank.get(b.t.type_key) ?? 99)
+        || byName(a, b));
+      let lastKind = null;
+      const body = mine.map((r) => {
+        const head = r.t.type_key !== lastKind
+          ? `<div class="ax-kindrun"><span class="ax-kindrun__n">${esc(r.t.type_display)}</span>
+               <span class="ax-kindrun__c">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span></div>`
+          : "";
+        lastKind = r.t.type_key;
+        return head + section(r);
+      }).join("");
+      return `
+      <div class="ax-fam">
+        <div class="ax-fam__hd">
+          <span class="ax-fam__nm">${esc(f.display_name)}</span>
+          ${f.blurb ? `<span class="ax-fam__sub">${esc(f.blurb)}</span>` : ""}
+          <span class="ax-fam__n">${mine.length}</span>
+        </div>
+        ${body}
+      </div>`;
+    }).join("");
+
+    host.innerHTML = (painted
+      || `<div class="ax-empty">Nothing on this instance is granted to anyone yet.</div>`) + nobodyLine;
   }
 
-  el("ax-new-group").addEventListener("click", () => openGroupDrawer(null));
+  //: Delegated: the row lives inside `#ax-groups`, which every repaint
+  //: rewrites, so a listener bound to the element would be lost on the first
+  //: grant written.
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("[data-new-group]")) openGroupDrawer(null);
+  });
 
   /* The group menu, delegated: every repaint replaces the rows, so binding
      to the buttons themselves would leave the listeners on detached nodes.
