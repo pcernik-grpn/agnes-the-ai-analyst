@@ -1498,6 +1498,8 @@ so comments and key order survive.
 - /api/admin/semantic-models/{model_id}
 - /api/admin/semantic-models/{model_id}/detach
 - /api/admin/semantic-models/{model_id}/reattach
+- /api/admin/semantic-models/{slug}/packages
+- /api/admin/semantic-models/{slug}/packages/{package_id}
 - /api/admin/semantic-sources
 - /api/admin/semantic-sources/{source_id}
 - /api/admin/semantic-sources/{source_id}/sync
@@ -1548,6 +1550,15 @@ CLI: `agnes admin semantic-model list/show/import/export/validate` (the
 last runs entirely offline — no server, no token) and `agnes admin
 semantic-source add/list/sync`. MCP: `semantic_model_search`,
 `semantic_model_get`.
+
+`POST /api/admin/semantic-models/{slug}/packages` (body `{"package_id":
+...}`) and `DELETE .../packages/{package_id}` link/unlink a model to/from a
+Data Package — the administrative counterpart to the visibility rule above.
+Both 404 if the model slug or the package id doesn't exist, are idempotent
+on a repeat call, and return the model's current `package_ids`. Not gated
+by the ownership rule (the junction is outside the document a re-sync would
+rewrite), so a source-owned model can be linked the same as a hand-authored
+one. CLI: `agnes admin semantic-model link-package/unlink-package`.
 
 `POST /api/semantic-models/apply` is the one non-admin-reachable write
 surface (chat-first authoring): any authenticated caller submits an Ossie

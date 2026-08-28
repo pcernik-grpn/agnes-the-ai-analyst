@@ -40,7 +40,14 @@ from app.auth.dependencies import _get_db, get_current_user
 from app.instance_config import get_studio_enabled
 from app.resource_types import ResourceType
 from src.audit_helpers import client_kind_from_user
-from src.repositories import RequiresPostgresBackend, audit_repo, semantic_model_repo, semantic_source_repo, use_pg
+from src.repositories import (
+    RequiresPostgresBackend,
+    audit_repo,
+    data_packages_repo,
+    semantic_model_repo,
+    semantic_source_repo,
+    use_pg,
+)
 from src.semantic.cache_render import DEFAULT_TTL_SECONDS
 from src.semantic.document_validation import validate_document
 from src.semantic.projection import project_document, prune_model
@@ -83,6 +90,10 @@ class SemanticModelApply(BaseModel):
 class SemanticModelUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+
+
+class SemanticModelPackageLink(BaseModel):
+    package_id: str
 
 
 class SemanticQueryValidate(BaseModel):
@@ -773,6 +784,59 @@ async def reattach_semantic_model(model_id: str, body: ReattachRequest, user: di
         params={"slug": row["slug"]},
     )
     return updated
+
+
+@router.post("/api/admin/semantic-models/{slug}/packages")
+async def link_semantic_model_package(
+    slug: str,
+    body: SemanticModelPackageLink,
+    user: dict = Depends(require_admin),
+):
+    """Link a semantic model to a Data Package, giving it that package's
+    visibility to non-admin readers (see the module docstring's "A model
+    with no linked package is reachable by admins only").
+
+    Not gated by the ownership rule: the link lives in the
+    ``data_package_semantic_models`` junction, not in the model's document
+    or its ``semantic_models`` row, so a source re-sync (which only rewrites
+    those) can never revert it — the exact concern the ownership rule
+    guards against does not apply here. An admin may link ANY model,
+    hand-authored or source-owned, the same way a direct ``semantic_model``
+    resource grant already applies regardless of a model's ``source``
+    (``_can_read_model`` above has no ownership check either).
+
+    Idempotent (``link_package`` itself is delete-then-insert). 404s if
+    ``slug`` or ``package_id`` doesn't resolve to an existing row.
+    """
+    repo = semantic_model_repo()
+    model = repo.get_by_slug(slug)
+    if model is None:
+        raise HTTPException(status_code=404, detail=f"Semantic model '{slug}' not found")
+    if not data_packages_repo().get(body.package_id):
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+    repo.link_package(body.package_id, model["id"])
+    return {"package_ids": repo.list_packages_for_model(model["id"])}
+
+
+@router.delete("/api/admin/semantic-models/{slug}/packages/{package_id}")
+async def unlink_semantic_model_package(
+    slug: str,
+    package_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Unlink a semantic model from a Data Package.
+
+    Idempotent on an already-unlinked pair or an unknown ``package_id`` —
+    the junction delete is a no-op either way, mirroring
+    ``remove_table_from_package``'s junction-row semantics
+    (``app/api/data_packages.py``). Only ``slug`` 404s.
+    """
+    repo = semantic_model_repo()
+    model = repo.get_by_slug(slug)
+    if model is None:
+        raise HTTPException(status_code=404, detail=f"Semantic model '{slug}' not found")
+    repo.unlink_package(package_id, model["id"])
+    return {"package_ids": repo.list_packages_for_model(model["id"])}
 
 
 @router.delete("/api/admin/semantic-models/{model_id:path}", status_code=204)

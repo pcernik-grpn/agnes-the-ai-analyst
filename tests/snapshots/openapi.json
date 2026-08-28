@@ -8473,6 +8473,19 @@
         "title": "SemanticModelCreate",
         "type": "object"
       },
+      "SemanticModelPackageLink": {
+        "properties": {
+          "package_id": {
+            "title": "Package Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "package_id"
+        ],
+        "title": "SemanticModelPackageLink",
+        "type": "object"
+      },
       "SemanticModelUpdate": {
         "properties": {
           "description": {
@@ -27931,6 +27944,151 @@
           }
         },
         "summary": "Reattach Semantic Model",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{slug}/packages": {
+      "post": {
+        "description": "Link a semantic model to a Data Package, giving it that package's\nvisibility to non-admin readers (see the module docstring's \"A model\nwith no linked package is reachable by admins only\").\n\nNot gated by the ownership rule: the link lives in the\n``data_package_semantic_models`` junction, not in the model's document\nor its ``semantic_models`` row, so a source re-sync (which only rewrites\nthose) can never revert it \u2014 the exact concern the ownership rule\nguards against does not apply here. An admin may link ANY model,\nhand-authored or source-owned, the same way a direct ``semantic_model``\nresource grant already applies regardless of a model's ``source``\n(``_can_read_model`` above has no ownership check either).\n\nIdempotent (``link_package`` itself is delete-then-insert). 404s if\n``slug`` or ``package_id`` doesn't resolve to an existing row.",
+        "operationId": "link_semantic_model_package_api_admin_semantic_models__slug__packages_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticModelPackageLink"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Semantic Model Package",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{slug}/packages/{package_id}": {
+      "delete": {
+        "description": "Unlink a semantic model from a Data Package.\n\nIdempotent on an already-unlinked pair or an unknown ``package_id`` \u2014\nthe junction delete is a no-op either way, mirroring\n``remove_table_from_package``'s junction-row semantics\n(``app/api/data_packages.py``). Only ``slug`` 404s.",
+        "operationId": "unlink_semantic_model_package_api_admin_semantic_models__slug__packages__package_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Semantic Model Package",
         "tags": [
           "semantic-models"
         ]

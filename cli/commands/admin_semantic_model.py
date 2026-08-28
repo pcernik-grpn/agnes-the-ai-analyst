@@ -4,10 +4,14 @@ models (open semantic-layer contract, Task 11).
 CLI counterpart to the ``/api/admin/semantic-models`` + public
 ``/api/semantic-models/*`` surface:
 
-  - ``list``     → ``GET /api/admin/semantic-models``
-  - ``show``     → ``GET /api/admin/semantic-models/{id}``
-  - ``import``   → ``POST /api/admin/semantic-models`` (reads a local file)
-  - ``export``   → ``GET /api/semantic-models/{slug}.yaml``
+  - ``list``           → ``GET /api/admin/semantic-models``
+  - ``show``           → ``GET /api/admin/semantic-models/{id}``
+  - ``import``         → ``POST /api/admin/semantic-models`` (reads a local file)
+  - ``export``         → ``GET /api/semantic-models/{slug}.yaml``
+  - ``detach``         → ``POST /api/admin/semantic-models/{id}/detach`` (PG-only, F3)
+  - ``reattach``       → ``POST /api/admin/semantic-models/{id}/reattach`` (PG-only, F3)
+  - ``link-package``   → ``POST /api/admin/semantic-models/{slug}/packages``
+  - ``unlink-package`` → ``DELETE /api/admin/semantic-models/{slug}/packages/{package_id}``
   - ``validate`` → local only, no server call, no token: schema-checks a
     file against the vendored Ossie spec (``src.semantic.document_validation``)
     so an author can fix a document before ever reaching an admin session.
@@ -21,7 +25,7 @@ from typing import Optional
 
 import typer
 
-from cli.client import api_get, api_post
+from cli.client import api_delete, api_get, api_post
 
 admin_semantic_model_app = typer.Typer(help="Admin: semantic-model CRUD (Ossie documents)")
 
@@ -199,6 +203,51 @@ def reattach_model(
     if resp.status_code != 200:
         _fail(resp)
     typer.echo(f"Re-attached {model_ref}")
+
+
+@admin_semantic_model_app.command("link-package")
+def link_package(
+    slug: str = typer.Argument(..., help="Model slug"),
+    package_id: str = typer.Argument(..., help="Data Package id"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Link a semantic model to a Data Package, granting it that package's
+    visibility for non-admin readers (export/search). Idempotent: linking
+    an already-linked pair is a no-op."""
+    resp = api_post(f"/api/admin/semantic-models/{slug}/packages", json={"package_id": package_id})
+    if resp.status_code == 404:
+        detail = (resp.json() or {}).get("detail")
+        if detail == "data_package_not_found":
+            typer.echo(f"Data package not found: {package_id}", err=True)
+            raise typer.Exit(1)
+        _not_found(slug)
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    typer.echo(f"Linked '{slug}' to package '{package_id}'. Packages: {', '.join(body.get('package_ids', [])) or '(none)'}")
+
+
+@admin_semantic_model_app.command("unlink-package")
+def unlink_package(
+    slug: str = typer.Argument(..., help="Model slug"),
+    package_id: str = typer.Argument(..., help="Data Package id"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Unlink a semantic model from a Data Package. Idempotent: unlinking a
+    pair that was never linked is a no-op."""
+    resp = api_delete(f"/api/admin/semantic-models/{slug}/packages/{package_id}")
+    if resp.status_code == 404:
+        _not_found(slug)
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    typer.echo(f"Unlinked '{slug}' from package '{package_id}'. Packages: {', '.join(body.get('package_ids', [])) or '(none)'}")
 
 
 @admin_semantic_model_app.command("validate")
