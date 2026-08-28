@@ -265,6 +265,12 @@ class TestMembersInContext:
         assert "data-invite-typed" in body
         # It says what inviting does, because it creates an account.
         assert "added to this group, and to Everyone" in body
+        # Nobody types the same text twice: the search query is carried into
+        # the field, completed with the instance's sign-in domain when there
+        # is exactly one, and Enter finishes the job from the search box.
+        assert "const seed = looksLikeEmail" in body
+        assert 'value="${esc(seed)}"' in body
+        assert "INVITE_DOMAINS" in body
         # The add-path race still routes to People.
         assert "invite them on People first" in body
 

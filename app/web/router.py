@@ -8467,6 +8467,14 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     which is how /admin/tables' "Manage access" arrives.
     """
     ctx = _build_context(request, user=user)
+    # Inviting from a group's People search completes an address rather than
+    # asking for one. The instance's configured sign-in domains are the only
+    # ones an invited account could ever authenticate with, so they are the
+    # candidates worth offering; with none configured the field takes a full
+    # address, as before.
+    from app.instance_config import get_allowed_domains
+
+    ctx["invite_domains"] = get_allowed_domains() or []
     return templates.TemplateResponse(request, "admin_access.html", ctx)
 
 

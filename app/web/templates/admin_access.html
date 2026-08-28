@@ -1608,6 +1608,11 @@
   // would read "grp_acme_finance@example.com" where the retired list read
   // "Finance". Same constant, same derivation, as that list used.
   const GOOGLE_GROUP_PREFIX = {{ config.AGNES_GOOGLE_GROUP_PREFIX | tojson }};
+  //: The instance's configured sign-in domains. An invited account can only
+  //: ever authenticate with one of these, so they are the candidates the
+  //: invite field completes with. Empty is normal (no domain configured) —
+  //: the field then takes a whole address.
+  const INVITE_DOMAINS = {{ invite_domains | default([]) | tojson }};
 
   let overview = null;   // {groups, grants, resources}
   let selectedGroup = null;
@@ -2514,7 +2519,30 @@
       if (e.key === "Enter") {
         const row = findRows()[findActive];
         const btn = row && row.querySelector("[data-addmember],[data-rmmember]");
-        if (btn) { e.preventDefault(); btn.click(); }
+        if (btn) { e.preventDefault(); btn.click(); return; }
+        /* Nothing matched, so Enter means the other half of the intent:
+           invite the person you were looking for. The address is already
+           carried into the field, so a complete one goes straight through
+           and a partial one just needs finishing — either way nobody types
+           the same text twice.
+
+           Focus is deliberately NOT moved while typing (that would fight the
+           search on every keystroke); it moves here, on Enter, because Enter
+           is the moment the admin says they are done searching. */
+        const one = popEl() && popEl().querySelector(".ax-invite");
+        if (!one) return;
+        e.preventDefault();
+        const go = one.querySelector("[data-invite]");
+        if (go) { go.click(); return; }
+        const field = one.querySelector(".ax-invite__mail");
+        if (!field) return;
+        const val = field.value.trim();
+        if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(val)) {
+          one.querySelector("[data-invite-typed]").click();
+        } else {
+          field.focus();
+          field.setSelectionRange(field.value.length, field.value.length);
+        }
       }
     });
     // Re-opening on focus rather than only on keystroke: someone who
@@ -2539,6 +2567,7 @@
     if (seq !== findSeq) return; // a later keystroke already answered
 
     if (!people.length) {
+      // (the seeded field is focused below, once it is in the DOM)
       /* No account matched — which used to end the job here and send the
          admin to People to start it again. "Add someone to this group" and
          "invite someone" are one intent, and the second half of it was a
@@ -2549,7 +2578,16 @@
          the whole task is one field whose result lands in the roster
          directly below. A modal earns its interruption when a task needs its
          own space; this does not. */
-      const looksLikeEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(q.trim());
+      const typed = q.trim();
+      const looksLikeEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(typed);
+      /* Never make them type it twice. The search text IS the start of the
+         address, so it is carried into the field — completed to a full
+         address when the instance has a sign-in domain (an invited account
+         could not authenticate with any other), and otherwise left as the
+         local part with the caret after it. */
+      const domain = (INVITE_DOMAINS && INVITE_DOMAINS.length === 1) ? INVITE_DOMAINS[0] : "";
+      const seed = looksLikeEmail ? typed
+        : (domain && typed && !typed.includes("@") ? `${typed}@${domain}` : typed);
       out.innerHTML = looksLikeEmail
         ? `<div class="ax-invite">
              <span class="ax-invite__msg">No account for <b>${esc(q)}</b> yet.</span>
@@ -2557,14 +2595,16 @@
                Invite and add to this group
              </button>
            </div>`
-        : `<div class="ax-invite">
+        : `<div class="ax-invite" data-invite-seeded>
              <span class="ax-invite__msg">No account matches “${esc(q)}”. Invite them:</span>
              <span class="ax-invite__form">
                <input type="email" class="ax-invite__mail" placeholder="name@company.com"
-                      aria-label="Email address to invite" value="">
+                      aria-label="Email address to invite" value="${esc(seed)}">
                <button type="button" class="btn btn--primary" data-invite-typed>Invite</button>
              </span>
-             <span class="ax-invite__note">They are added to this group, and to Everyone, as soon as the account exists.</span>
+             <span class="ax-invite__note">${domain
+               ? `Completed with <code>@${esc(domain)}</code>, this instance's sign-in domain. `
+               : ""}They are added to this group, and to Everyone, as soon as the account exists.</span>
            </div>`;
       openFind();
       return;
@@ -2598,6 +2638,16 @@
      are two facts — an account exists, and it is in this audience — and the
      second failing must not silently undo the first: the toast says which
      half landed. */
+  //: Enter in the invite field is the same act as pressing Invite beside it.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const field = e.target.closest && e.target.closest(".ax-invite__mail");
+    if (!field) return;
+    e.preventDefault();
+    const btn = field.closest(".ax-invite").querySelector("[data-invite-typed]");
+    if (btn) btn.click();
+  });
+
   async function inviteAndAdd(email) {
     const addr = String(email || "").trim();
     if (!addr) return;
