@@ -374,3 +374,56 @@ def test_duckdb_backend_answers_typed_501(tmp_path, monkeypatch, pg_engine):
     r = client.get("/api/admin/sso/config", headers=_h(admin_token))
     assert r.status_code == 501
     assert r.json()["error"] == "requires_postgres_backend"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/me/external-identity + profile line (PG side)
+# ---------------------------------------------------------------------------
+
+
+def test_me_external_identity_not_linked(sso_env):
+    client, admin_token, _ = sso_env
+    r = client.get("/api/me/external-identity", headers=_h(admin_token))
+    assert r.status_code == 200
+    assert r.json() == {"linked": False}
+
+
+def test_me_external_identity_linked_shape(sso_env):
+    client, _, analyst_token = sso_env
+    from src.repositories import user_external_identities_repo
+
+    user_external_identities_repo().link(
+        user_id="analyst1",
+        provider_type="entra_oidc",
+        tenant_id=TENANT_GUID,
+        subject="oid-analyst",
+        email_at_link="analyst@test.com",
+    )
+    r = client.get("/api/me/external-identity", headers=_h(analyst_token))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] is True
+    assert body["provider_type"] == "entra_oidc"
+    assert body["tenant_id"] == TENANT_GUID
+    assert body["subject"] == "oid-analyst"
+    assert body["linked_at"] is not None
+    assert body["last_login_at"] is None
+
+
+def test_profile_page_shows_linked_identity(sso_env):
+    client, _, analyst_token = sso_env
+    from src.repositories import user_external_identities_repo
+
+    client.cookies.set("access_token", analyst_token)
+    page = client.get("/me/profile").text
+    assert "Linked identity" in page
+
+    user_external_identities_repo().link(
+        user_id="analyst1",
+        provider_type="entra_oidc",
+        tenant_id=TENANT_GUID,
+        subject="oid-analyst",
+        email_at_link="analyst@test.com",
+    )
+    page = client.get("/me/profile").text
+    assert "oid-analyst" in page

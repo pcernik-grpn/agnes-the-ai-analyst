@@ -41301,6 +41301,60 @@
         ]
       }
     },
+    "/api/me/external-identity": {
+      "get": {
+        "description": "The calling user's linked external identity (design 2026-08-28).\n\nLive repo lookup, deliberately NOT a JWT claim: link state must stay\nrevocable (an admin unlink takes effect on the next call, not after a\n30-day stateless token expires). None of the returned fields is a\nsecret \u2014 the ``subject`` is the Entra directory object ID the admin\nidentities list shows too. Postgres-only feature: on a DuckDB-backed\ninstance the repo factory raises ``RequiresPostgresBackend`` and the\napp-wide handler answers the typed 501.",
+        "operationId": "get_external_identity_api_me_external_identity_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get External Identity",
+        "tags": [
+          "me"
+        ]
+      }
+    },
     "/api/me/home-stats": {
       "get": {
         "description": "Return the five counters rendered in the /home status frame for\nthe calling user, over a 24-hour or 7-day window.\n\nMissing rows (new user, no telemetry yet) surface as zeros / null\nrather than 404 \u2014 the frame still renders cleanly for first-day\nanalysts.",
@@ -53899,6 +53953,102 @@
           }
         },
         "summary": "Refresh Groups",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/callback": {
+      "get": {
+        "description": "Code exchange -> claims -> identity -> bind -> JWT cookie.\n\nThe test-mode leg (session marker) re-verifies the CURRENT session user\nis an admin, completes the exchange, and renders the result page \u2014\nwithout ``ensure_user``, without an identity row, without a cookie.",
+        "operationId": "sso_callback_auth_sso_callback_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/login": {
+      "get": {
+        "description": "Redirect to the configured tenant's Entra authorize endpoint.\n\n``?mode=test`` (admin-only, works pre-enable and outside the allowlist)\nstashes a session marker so the callback renders the side-effect-free\nresult page instead of signing anyone in.",
+        "operationId": "sso_login_auth_sso_login_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Login",
         "tags": [
           "auth"
         ]

@@ -635,6 +635,13 @@ _EXEMPT: dict[str, str] = {
         "re-opens first-login email attach for that user (an auth-trust "
         "mutation), and is admin recovery tooling, not analyst tooling"
     ),
+    "/api/me/external-identity": (
+        "the caller's own external-identity linkage — CLI-reachable via the "
+        "`agnes whoami` linked-identity line, deliberately never MCP-exposed "
+        "per the 'operator security-posture diagnostics' standing exemption "
+        "in CONTRIBUTING.md: it enumerates the caller's auth linkage (which "
+        "external principal can authenticate as them)"
+    ),
     "/api/admin/users/{user_id}/library-preview": (
         "feeds the Simulate lens's Library-shaped preview on /admin/access — "
         "a projection of another person's /library page, meaningful only "

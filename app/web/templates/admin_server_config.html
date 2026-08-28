@@ -471,6 +471,64 @@
     </div>
   </section>
 
+  <!-- External SSO sign-in — bespoke panel (runtime DB config, not part of
+       instance.yaml). Config from GET /api/admin/sso/config; the client
+       secret is write-only via PUT /api/admin/sso/client-secret. -->
+  <section class="cfg-section" id="sso-section">
+    <header>
+      <div>
+        <h3>External SSO sign-in</h3>
+        <div class="section-help">
+          Optional external identity login via a customer-owned Microsoft
+          Entra ID tenant (OIDC). Configured here at runtime — changes apply
+          on the next login attempt, no restart. The client secret is stored
+          encrypted in the server vault (requires <code>AGNES_VAULT_KEY</code>)
+          and is never shown back. The email-domain allowlist is
+          <strong>required</strong> and deliberately not inherited from
+          <code>auth.allowed_domain</code>: list only domains the external
+          tenant is entitled to assert identities for. Requires the Postgres
+          app-state backend. Setup checklist:
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/auth-sso-entra.md"
+             target="_blank" rel="noopener">docs/auth-sso-entra.md</a>.
+        </div>
+      </div>
+    </header>
+    <div class="section-body">
+      <div id="sso-status" class="cfg-loading">Loading…</div>
+      <div class="iw-form-field">
+        <label for="sso-tenant-id">Directory (tenant) ID</label>
+        <input type="text" id="sso-tenant-id" placeholder="GUID or verified domain (e.g. fabrikam.onmicrosoft.com)" autocomplete="off">
+      </div>
+      <div class="iw-form-field">
+        <label for="sso-client-id">Application (client) ID</label>
+        <input type="text" id="sso-client-id" autocomplete="off">
+      </div>
+      <div class="iw-form-field">
+        <label for="sso-display-name">Button label</label>
+        <input type="text" id="sso-display-name" placeholder='Shown on the login page as "Sign in with …"' autocomplete="off">
+      </div>
+      <div class="iw-form-field">
+        <label for="sso-domains">Allowed email domains (comma-separated)</label>
+        <input type="text" id="sso-domains" placeholder="fabrikam.com, partners.fabrikam.com" autocomplete="off">
+      </div>
+      <div class="iw-form-field">
+        <label for="sso-client-secret">Client secret</label>
+        <input type="password" id="sso-client-secret" placeholder="(leave blank to keep existing)" autocomplete="off">
+      </div>
+      <div class="iw-form-field">
+        <label><input type="checkbox" id="sso-enabled"> Enabled — offer the button on the login page</label>
+      </div>
+    </div>
+    <div class="section-actions">
+      <button type="button" class="btn btn-primary" id="sso-save-btn">Save SSO config</button>
+      <button type="button" class="btn btn-secondary" id="sso-test-btn">Test config</button>
+      <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test" target="_blank" rel="noopener">Test sign-in</a>
+      <button type="button" class="btn btn-secondary" id="sso-clear-secret-btn">Clear secret</button>
+      <button type="button" class="btn btn-secondary" id="sso-delete-btn">Delete config</button>
+      <span id="sso-test-result" hidden style="margin-left: 8px; font-size: 13px;"></span>
+    </div>
+  </section>
+
   <!-- Feature flags — read-only inventory (#1022). A flag is editable in
        the UI only if its config section is registered as editable (currently
        guardrails and library); all others must be set via their env var or
@@ -1169,6 +1227,7 @@ const SECTION_GROUPS = [
   { label: "Services",     sections: ["chat"], bespoke: [
     { id: "chat-section",          title: "Cloud chat" },
     { id: "slack-secrets-section", title: "Slack bot secrets" },
+    { id: "sso-section",           title: "External SSO sign-in" },
     { id: "feature-flags-section", title: "Feature flags" },
   ]},
   { label: "Danger zone",  sections: ["auth", "server"], isDanger: true },
@@ -2163,5 +2222,174 @@ async function slackSecretsSave(btn) {
 
 document.getElementById("slack-secrets-save-btn").addEventListener("click", (e) => slackSecretsSave(e.currentTarget));
 slackSecretsLoad();
+
+// ════════════════════════════════════════════════════════════════════════
+// External SSO sign-in — runtime DB config (design 2026-08-28). Status +
+// form from GET /api/admin/sso/config; the client secret is write-only
+// (PUT /api/admin/sso/client-secret) and never echoed back. Requires the
+// Postgres app-state backend — a DuckDB instance answers a typed 501.
+// ════════════════════════════════════════════════════════════════════════
+
+const SSO_API = "/api/admin/sso";
+
+function ssoBadge(ok, yes, no, badClass) {
+  return ok
+    ? '<span class="badge badge--success">' + escHtml(yes) + "</span>"
+    : '<span class="badge ' + (badClass || "badge--warn") + '">' + escHtml(no) + "</span>";
+}
+
+async function ssoLoad() {
+  const el = document.getElementById("sso-status");
+  if (!el) return;
+  try {
+    const r = await fetch(SSO_API + "/config", { credentials: "include" });
+    if (r.status === 501) {
+      el.className = "";
+      el.innerHTML = '<span class="badge badge--warn">Requires the Postgres app-state backend</span>';
+      document.querySelectorAll("#sso-section input, #sso-section button").forEach((n) => { n.disabled = true; });
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    el.className = "";
+    el.innerHTML = [
+      ssoBadge(s.configured, "configured", "not configured"),
+      ssoBadge(s.enabled, "enabled", "disabled"),
+      ssoBadge(s.has_client_secret, "secret stored", "secret missing"),
+      ssoBadge(s.vault_key_configured, "vault key OK", "AGNES_VAULT_KEY missing", "badge--danger"),
+    ].join(" ");
+    if (s.configured) {
+      document.getElementById("sso-tenant-id").value = s.tenant_id || "";
+      document.getElementById("sso-client-id").value = s.client_id || "";
+      document.getElementById("sso-display-name").value = s.display_name || "";
+      document.getElementById("sso-domains").value = (s.allowed_email_domains || []).join(", ");
+      document.getElementById("sso-enabled").checked = !!s.enabled;
+    }
+    document.getElementById("sso-test-signin-link").classList.toggle(
+      "btn-disabled", !(s.configured && s.has_client_secret)
+    );
+  } catch (e) {
+    el.className = "";
+    el.innerHTML = '<span class="badge badge--danger">Failed to load SSO config: ' + escHtml(e.message) + "</span>";
+  }
+}
+
+function ssoConfigBody(enabled) {
+  return {
+    tenant_id: document.getElementById("sso-tenant-id").value.trim(),
+    client_id: document.getElementById("sso-client-id").value.trim(),
+    display_name: document.getElementById("sso-display-name").value.trim(),
+    allowed_email_domains: document.getElementById("sso-domains").value
+      .split(",").map((d) => d.trim()).filter(Boolean),
+    enabled: enabled,
+  };
+}
+
+async function ssoPutConfig(enabled) {
+  const r = await fetch(SSO_API + "/config", {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(ssoConfigBody(enabled)),
+  });
+  if (!r.ok) {
+    const detail = (await r.json().catch(() => ({}))).detail;
+    throw new Error(detail || "HTTP " + r.status);
+  }
+}
+
+async function ssoPutSecret(value) {
+  const r = await fetch(SSO_API + "/client-secret", {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value }),
+  });
+  if (r.status === 409) {
+    throw new Error("AGNES_VAULT_KEY is not configured on the server — cannot store the client secret.");
+  }
+  if (!r.ok) {
+    const detail = (await r.json().catch(() => ({}))).detail;
+    throw new Error(detail || "HTTP " + r.status);
+  }
+}
+
+async function ssoSave(btn) {
+  const secretInput = document.getElementById("sso-client-secret");
+  const wantEnabled = document.getElementById("sso-enabled").checked;
+  const secret = secretInput.value.trim();
+  btn.disabled = true;
+  try {
+    // The secret column lives on the config row, and enabling requires a
+    // stored secret — so: ensure the row exists (disabled), store the
+    // secret, then apply the requested enable state.
+    await ssoPutConfig(false);
+    if (secret) {
+      await ssoPutSecret(secret);
+      secretInput.value = "";  // don't let the secret linger in the DOM
+    }
+    if (wantEnabled) {
+      await ssoPutConfig(true);
+    }
+    showBanner("SSO config saved.", "success");
+  } catch (e) {
+    showBanner("Failed to save SSO config: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    ssoLoad();
+  }
+}
+
+async function ssoTestConfig(btn) {
+  const out = document.getElementById("sso-test-result");
+  btn.disabled = true;
+  out.hidden = false;
+  out.textContent = "Testing…";
+  try {
+    const r = await fetch(SSO_API + "/test-config", { method: "POST", credentials: "include" });
+    if (!r.ok) {
+      const detail = (await r.json().catch(() => ({}))).detail;
+      throw new Error(detail || "HTTP " + r.status);
+    }
+    const s = await r.json();
+    out.innerHTML = s.ok
+      ? '<span class="badge badge--success">reachable</span> issuer: <code>' + escHtml(s.issuer || "?") + "</code>"
+      : '<span class="badge badge--danger">failed</span> ' + escHtml(s.error || "unknown error");
+  } catch (e) {
+    out.innerHTML = '<span class="badge badge--danger">failed</span> ' + escHtml(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function ssoDelete(btn, path, confirmText, doneText) {
+  if (!await confirmModal(confirmText)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(SSO_API + path, { method: "DELETE", credentials: "include" });
+    if (!r.ok) {
+      const detail = (await r.json().catch(() => ({}))).detail;
+      throw new Error(detail || "HTTP " + r.status);
+    }
+    showBanner(doneText, "success");
+  } catch (e) {
+    showBanner(e.message, "error");
+  } finally {
+    btn.disabled = false;
+    ssoLoad();
+  }
+}
+
+document.getElementById("sso-save-btn").addEventListener("click", (e) => ssoSave(e.currentTarget));
+document.getElementById("sso-test-btn").addEventListener("click", (e) => ssoTestConfig(e.currentTarget));
+document.getElementById("sso-clear-secret-btn").addEventListener("click", (e) =>
+  ssoDelete(e.currentTarget, "/client-secret",
+    "Clear the stored client secret? The SSO login button disappears until a new secret is stored.",
+    "Client secret cleared."));
+document.getElementById("sso-delete-btn").addEventListener("click", (e) =>
+  ssoDelete(e.currentTarget, "/config",
+    "Delete the SSO configuration? Linked identities are kept; the login button disappears.",
+    "SSO configuration deleted."));
+ssoLoad();
 </script>
 {% endblock %}

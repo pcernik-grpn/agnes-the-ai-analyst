@@ -8965,6 +8965,17 @@ async def profile_page(
     telegram_status = {"linked": bool(_tg_link)}
     desktop_status = {"linked": False}
 
+    # Linked external identity (design 2026-08-28) — PG-only feature; on a
+    # DuckDB-backed instance (or any read failure) the row simply reads as
+    # not-linked so the profile never 501s over one aside line.
+    external_identity = None
+    try:
+        from src.repositories import user_external_identities_repo
+
+        external_identity = user_external_identities_repo().get_by_user_id(user["id"])
+    except Exception:
+        external_identity = None
+
     ctx = _build_context(
         request,
         user=user,
@@ -8977,6 +8988,7 @@ async def profile_page(
         sync_summary=_last_sync_summary(user["id"]),
         telegram_status=telegram_status,
         desktop_status=desktop_status,
+        external_identity=external_identity,
         # Display-only — keep original case (no .lower()), unlike the
         # refetch-groups handler below which lowercases for set comparison.
         google_group_prefix=os.environ.get("AGNES_GOOGLE_GROUP_PREFIX", "").strip(),

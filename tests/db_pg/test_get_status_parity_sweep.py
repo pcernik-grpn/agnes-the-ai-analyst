@@ -83,6 +83,10 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
         "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
     ),
+    "GET /api/me/external-identity": (
+        "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
+        "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
+    ),
 }
 
 
