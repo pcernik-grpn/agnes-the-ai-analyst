@@ -324,7 +324,7 @@ def test_the_file_handover_wording_does_not_drift():
     independent files carry this sandbox prose with no shared source, so pin
     the bundled file equal to the template's ``is_sandbox=True`` render or an
     edit to one will silently leave the other behind."""
-    heading = "Handing over a file"
+    heading = "Files you produce"
     bundled = _section(_read(WORKSPACE_CLAUDE_MD), heading)
     server_default = _section(_rendered_server_default_claude_md(is_sandbox=True), heading)
     assert bundled == server_default, (
