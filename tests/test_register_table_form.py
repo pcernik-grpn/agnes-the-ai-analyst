@@ -409,3 +409,56 @@ def test_keboola_connection_browse_registers_the_bare_table_name():
     )
     assert row["bucket"] == "in.c-main"
     assert row["key"] == "in.c-main.orders", "the row key doubled the bucket prefix too"
+
+
+# ── 7: a second registration starts from a clean form ───────────────────
+
+
+def test_open_resets_every_configure_step_control():
+    """`close()` only drops the `is-open` class, so the drawer's DOM — and
+    every value typed into it — outlives the modal. Registering table B after
+    table A must not open on A's description, folder, schedule, project, SQL,
+    primary key, server-only checkbox or Keboola filter, because `submit()`
+    forwards whatever those fields hold.
+
+    Runs the shipped `_resetConfigureStep` against a stubbed document and
+    asserts on the resulting field values, so it fails if the helper stops
+    covering a control rather than merely if it stops being called."""
+    reset = _JS.read_text(encoding="utf-8")
+    body = reset[reset.index("  function _resetConfigureStep() {") : reset.index("  function close() {")]
+    script = """
+const fields = {};
+const TEXT = ['rtfViewName','rtfDescription','rtfFolder','rtfSyncSchedule','rtfProject',
+  'rtfCustomQuery','rtfPrimaryKey','rtfKbPartitionBy','rtfKbIncrementalWindowDays',
+  'rtfKbMaxHistoryDays','rtfKbInitialLoadChunkDays','rtfKbWhereFilters'];
+TEXT.forEach(function (id) { fields[id] = { value: 'stale', style: {display: 'block'} }; });
+fields['rtfServerOnly'] = { checked: true };
+fields['rtfKbStrategy'] = { selectedIndex: 2 };
+fields['rtfKbPartitionGranularity'] = { selectedIndex: 1 };
+const document = { getElementById(id) { return fields[id] || null; } };
+""" + body + """
+_resetConfigureStep();
+process.stdout.write(JSON.stringify({
+  values: TEXT.map(function (id) { return fields[id].value; }),
+  serverOnly: fields['rtfServerOnly'].checked,
+  strategy: fields['rtfKbStrategy'].selectedIndex,
+  granularity: fields['rtfKbPartitionGranularity'].selectedIndex,
+  filterHidden: fields['rtfKbWhereFilters'].style.display,
+}));
+"""
+    out = json.loads(_node_run(script))
+    assert out["values"] == [""] * 12, f"a text/number control kept its previous value: {out['values']}"
+    assert out["serverOnly"] is False, "server-only must not stay checked from the previous registration"
+    assert out["strategy"] == 0 and out["granularity"] == 0, "selects must fall back to their first option"
+    assert out["filterHidden"] == "none", "the raw where-filters textarea must be re-hidden too"
+
+
+def test_open_calls_the_configure_reset():
+    """The helper only matters if `open()` invokes it — and `open()` reaches
+    the DOM and the network, so pin the call site at the source level."""
+    js = _JS.read_text(encoding="utf-8")
+    body = js[js.index("  function open(opts) {") : js.index("  function close() {")]
+    assert "_resetConfigureStep();" in body, (
+        "open() must clear the Configure step — close() only removes a class, so the "
+        "previous registration's values survive in the DOM"
+    )
