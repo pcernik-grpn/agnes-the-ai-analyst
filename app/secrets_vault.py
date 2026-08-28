@@ -509,3 +509,14 @@ class ConnectionSecretsRepository:
     def has(self, connection_id: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM connection_secrets WHERE connection_id = ?", [connection_id]).fetchone()
         return row is not None
+
+    def updated_at(self, connection_id: str) -> Optional[str]:
+        """When this secret was last stored (upsert's ``current_timestamp``),
+        or ``None`` if no secret is stored. The value is never a secret — a
+        set-date badge (e.g. the SharePoint wizard's certificate row) can
+        show "set 2026-08-14" without ever reading ``get()``."""
+        row = self.conn.execute(
+            "SELECT updated_at FROM connection_secrets WHERE connection_id = ?",
+            [connection_id],
+        ).fetchone()
+        return str(row[0]) if row and row[0] is not None else None

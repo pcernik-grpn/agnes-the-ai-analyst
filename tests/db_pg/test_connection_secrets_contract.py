@@ -69,6 +69,19 @@ def test_upsert_get_has_delete_roundtrip(repo):
     assert repo.has("c1") is False
 
 
+def test_updated_at_tracks_upsert_and_is_none_when_unset(repo):
+    """``updated_at`` is the set-date badge's data source (e.g. the SharePoint
+    wizard's certificate row) — it must never require a decrypt to read."""
+    assert repo.updated_at("c2") is None
+    repo.upsert("c2", "tok-1")
+    first = repo.updated_at("c2")
+    assert first is not None
+    repo.upsert("c2", "tok-2")  # rotate
+    assert repo.updated_at("c2") is not None
+    repo.delete("c2")
+    assert repo.updated_at("c2") is None
+
+
 def test_get_returns_none_on_decrypt_failure(repo, monkeypatch, caplog):
     """Vault key rotated → ``get()`` reads as absent (never raises) on either
     backend, and the WARNING names the column. Both repos read through

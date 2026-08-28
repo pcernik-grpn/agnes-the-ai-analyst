@@ -59,6 +59,13 @@ class SharePointSettings:
 
     tenant_id: str
     client_id: str
+    #: The PEM material for Entra's certificate-credential flow: the
+    #: X.509 certificate followed by its private key, concatenated in one
+    #: PEM blob (what an admin generates for an app registration's
+    #: certificate credential, and what ``connectors.sharepoint.graph_client``
+    #: parses to sign a client assertion — the certificate for the JWT's
+    #: ``x5t`` thumbprint, the private key to sign it). This module treats it
+    #: as opaque secret material; it does not itself parse or validate the PEM.
     private_key: str
     #: ``"vault"`` (the admin's own key) or ``"env"`` (the deployment's).
     #: Surfaced on the connection page so an admin can see which certificate is
