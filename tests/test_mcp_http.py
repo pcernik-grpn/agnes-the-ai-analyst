@@ -390,6 +390,11 @@ class TestToolRegistration:
             "admin_jobs_list",
             "admin_job_get",
             "admin_job_enqueue",
+            # Unified Activity Center timeline (E3 slice 2) — audit_log +
+            # sync_history + llm_usage + agent_scope_snapshots (never
+            # chat_messages, privacy decision). Triple-surface with
+            # GET /api/admin/activity + `agnes admin activity`.
+            "activity",
             # DuckLake analytics-backend migration (wave-2G Task 6). Triple-
             # surface with POST /api/admin/analytics/migrate + `agnes admin
             # analytics migrate`.
@@ -1013,6 +1018,52 @@ class TestServerInfoTool:
 
         assert result["health"] == "unreachable"
         assert result["authenticated"] is True
+
+
+# ── activity tool (E3 slice 2 — unified Activity Center timeline) ───────────
+
+
+class TestActivityTool:
+    def test_calls_admin_activity_and_returns_json(self):
+        mod = _import_mod()
+        data = {"rows": [{"trail": "sync", "action": "sync.table"}], "next_cursor": None}
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp(data))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            result = _run(mod.activity())
+
+        assert result == data
+        called_url = get_mock.call_args.args[0]
+        assert called_url.endswith("/api/admin/activity")
+
+    def test_forwards_optional_filters_including_trail(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(mod.activity(trail="sync", source="scheduler", action_prefix="sync.", limit=10))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["trail"] == "sync"
+        assert params["source"] == "scheduler"
+        assert params["action_prefix"] == "sync."
+        assert params["limit"] == 10
+
+    def test_omits_unset_optional_filters(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(mod.activity())
+
+        params = get_mock.call_args.kwargs["params"]
+        assert set(params) == {"since_minutes", "limit"}
 
 
 # ── my_secret_test tool ──────────────────────────────────────────────────────

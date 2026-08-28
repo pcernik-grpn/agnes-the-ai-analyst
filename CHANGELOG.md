@@ -153,6 +153,40 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic-layer auto-draft sweep, Postgres app-state only (post-A3).** `POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every 55 minutes) drafts a semantic model for a bounded batch of tables with zero semantic-layer coverage via a headless `semantic-model-builder` chat session, authenticated as the non-admin `semantic-drafter` identity — every draft lands in the `authoring_suggestions` moderation queue exactly like a human-submitted proposal, never applied directly. Dedup bookkeeping (`table_registry.semantic_draft_pending_at`, PG-only per the A3 ratchet — no DuckDB migration step) is stamped before each session runs, so a concurrent sweep tick can never double-pick a table; the flag clears once an admin resolves the resulting suggestion, approve or reject alike. The resolve-hook clearing this flag runs on every semantic-layer suggestion's approve/reject regardless of backend — human-submitted or auto-drafted alike — but no-ops cleanly on the frozen DuckDB app-state backend, where there is no flag to clear. A session hitting the chat concurrency cap is counted and skipped, never a 500, and has its dedup flag cleared again on the way out — the cap is enforced before the session starts, so no suggestion would ever exist to clear it and the table would otherwise be excluded from every later sweep permanently. On an instance still running the frozen DuckDB app-state backend, the sweep endpoint itself fails clean with a typed `501`.
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 ### Changed
+- **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
+  now enforced, not just a label.** The credential a running data app calls
+  Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
+  claim that no code path read — so it was functionally a full-privilege PAT
+  for the app's owner, usable against the whole REST API by anything running
+  in the container, including an externally-cloned, less-trusted repo. Two
+  concrete consequences: `/api/admin/*` was reachable whenever the app owner
+  was an Admin, and `POST /cli/auth/rescope-surface` — admin-gated, but it
+  *requires* a PAT and mints a fresh 90-day `surface='all'` one — let a token
+  that is itself minted **without expiry** launder itself into a further
+  durable credential. (The `require_session_token` minting routes —
+  `/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token` — were
+  already closed to it: that guard rejects any PAT-typed credential
+  regardless of scope.) `app/auth/pat_resolver.py` now admits the scope only
+  on a fail-closed allowlist of the surface a hosted app actually uses:
+  `/api/query` (not `/api/query/hybrid`), `/api/data/…`, the `/api/catalog`
+  read routes, `/api/metrics`, `/api/glossary`, the read-only
+  `/api/semantic-models` members (not `/apply`), and the `/api/v2` catalog,
+  schema, sample and scan routes the `agnes` CLI calls from inside an app.
+  Entries are exact paths plus narrow subtrees rather than one per router,
+  because a per-router prefix silently admits every route that router later
+  grows; `tests/…::test_the_admitted_route_set_is_pinned` walks the real
+  route table so a new route under an allowed path can never be admitted
+  without a deliberate decision. The two sibling scopes (`data-app-git:`,
+  `data-app-preview:`) keep their per-surface booleans and are unaffected.
+  **Upgrade note:** an app calling anything outside that list now gets a 401
+  where it previously succeeded — including MCP-over-HTTP, which passes no
+  request path and is therefore fail-closed. Each refusal logs a warning
+  naming the scope and the refused path, because this failure is otherwise
+  invisible from the outside (the container stays healthy and the app
+  renders; only its API calls fail). Unchanged: within the allowed surface an
+  app still reads with the **owner's** grants, evaluated live — sharing an
+  app remains an act of publication.
+- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 - **The chat Files drawer got a layout fix and a visual pass.** The file
   list now flexes across the panel's full remaining height (a fixed `46vh`
   box left most of the drawer an empty framed rectangle), rows are
@@ -170,6 +204,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   invisible to the old page's coverage engine entirely.
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 ### Fixed
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
