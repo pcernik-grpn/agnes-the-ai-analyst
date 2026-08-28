@@ -624,7 +624,12 @@ class TestTheEndpointOnPostgres:
 
 
 class TestTheCli:
-    """``agnes semantic-model coverage …`` over the same endpoints.
+    """``agnes admin semantic coverage …`` over the same endpoints.
+
+    Under ``admin`` since #1707 Block 6 — the endpoints are all
+    ``require_admin``. The old ``agnes semantic-model coverage …`` spelling
+    still runs as a hidden deprecated alias (covered in
+    ``tests/test_cli_semantic_consolidation.py``).
 
     Lives here rather than in ``tests/test_cli_api_parity.py``: that harness
     snapshots the DuckDB system DB directly to diff API-vs-CLI state, and this
@@ -637,7 +642,7 @@ class TestTheCli:
         _connection("conn-a", source_type="bigquery", name="Warehouse")
         _table("orders", connection_id="conn-a")
 
-        result = cli_client_both["invoke"](["semantic-model", "coverage"])
+        result = cli_client_both["invoke"](["admin", "semantic", "coverage"])
         assert result.exit_code == 0, result.output
         # The grid …
         assert "SOURCE" in result.output
@@ -654,7 +659,7 @@ class TestTheCli:
 
         _connection("conn-a", source_type="bigquery", name="Warehouse")
 
-        result = cli_client_both["invoke"](["semantic-model", "coverage", "--json"])
+        result = cli_client_both["invoke"](["admin", "semantic", "coverage", "--json"])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)
         assert [s["source_id"] for s in payload["sources"]] == ["conn-a"]
@@ -665,7 +670,7 @@ class TestTheCli:
         _connection("conn-a", source_type="bigquery", name="Warehouse")
         _connection("conn-b", source_type="bigquery", name="Lakehouse")
 
-        result = cli_client_both["invoke"](["semantic-model", "coverage", "--source", "conn-b"])
+        result = cli_client_both["invoke"](["admin", "semantic", "coverage", "--source", "conn-b"])
         assert result.exit_code == 0, result.output
         assert "Lakehouse" in result.output
         assert "Warehouse" not in result.output
@@ -675,8 +680,8 @@ class TestTheCli:
             pytest.skip("PG-only surface")
         _connection("conn-a", source_type="bigquery", name="Warehouse")
 
-        bare = cli_client_both["invoke"](["semantic-model", "coverage", "--json"])
-        explicit = cli_client_both["invoke"](["semantic-model", "coverage", "show", "--json"])
+        bare = cli_client_both["invoke"](["admin", "semantic", "coverage", "--json"])
+        explicit = cli_client_both["invoke"](["admin", "semantic", "coverage", "show", "--json"])
         assert bare.exit_code == explicit.exit_code == 0
         assert bare.output == explicit.output
 
@@ -687,19 +692,19 @@ class TestTheCli:
 
         _connection("conn-a", source_type="bigquery", name="Warehouse")
 
-        tagged = cli_client_both["invoke"](["semantic-model", "coverage", "tag", "agent", "ag-1", "conn-a"])
+        tagged = cli_client_both["invoke"](["admin", "semantic", "coverage", "tag", "agent", "ag-1", "conn-a"])
         assert tagged.exit_code == 0, tagged.output
         assert "Tagged" in tagged.output
 
-        report = json.loads(cli_client_both["invoke"](["semantic-model", "coverage", "--json"]).output)
+        report = json.loads(cli_client_both["invoke"](["admin", "semantic", "coverage", "--json"]).output)
         agent_domain = report["sources"][0]["domains"]["agent"]
         assert agent_domain["status"] == "ok"
 
         tag_id = tagged.output.split("(tag ")[1].rstrip(")\n")
-        untagged = cli_client_both["invoke"](["semantic-model", "coverage", "untag", tag_id])
+        untagged = cli_client_both["invoke"](["admin", "semantic", "coverage", "untag", tag_id])
         assert untagged.exit_code == 0, untagged.output
 
-        report = json.loads(cli_client_both["invoke"](["semantic-model", "coverage", "--json"]).output)
+        report = json.loads(cli_client_both["invoke"](["admin", "semantic", "coverage", "--json"]).output)
         assert report["sources"][0]["domains"]["agent"]["status"] == "missing"
 
     def test_an_untaggable_type_is_refused_before_the_call(self, state_backend, cli_client_both):
@@ -707,7 +712,7 @@ class TestTheCli:
             pytest.skip("PG-only surface")
         _connection("conn-a", source_type="bigquery", name="Warehouse")
 
-        result = cli_client_both["invoke"](["semantic-model", "coverage", "tag", "table", "orders", "conn-a"])
+        result = cli_client_both["invoke"](["admin", "semantic", "coverage", "tag", "table", "orders", "conn-a"])
         assert result.exit_code == 1
         assert "marketplace_plugin" in result.output
 
@@ -718,9 +723,9 @@ class TestTheCli:
         _connection("conn-a", source_type="bigquery", name="Warehouse")
 
         assert (
-            cli_client_both["invoke"](["semantic-model", "coverage", "tag", "agent", "ag-1", "conn-a"]).exit_code == 0
+            cli_client_both["invoke"](["admin", "semantic", "coverage", "tag", "agent", "ag-1", "conn-a"]).exit_code == 0
         )
-        again = cli_client_both["invoke"](["semantic-model", "coverage", "tag", "agent", "ag-1", "conn-a"])
+        again = cli_client_both["invoke"](["admin", "semantic", "coverage", "tag", "agent", "ag-1", "conn-a"])
         assert again.exit_code == 1
         assert "Already tagged" in again.output
         assert "coverage --json" in again.output
@@ -728,7 +733,7 @@ class TestTheCli:
     def test_untagging_an_unknown_id_hints_the_next_step(self, state_backend, cli_client_both):
         if state_backend != "pg":
             pytest.skip("PG-only surface")
-        result = cli_client_both["invoke"](["semantic-model", "coverage", "untag", "rst_nope"])
+        result = cli_client_both["invoke"](["admin", "semantic", "coverage", "untag", "rst_nope"])
         assert result.exit_code == 1
         assert "coverage --json" in result.output
 
@@ -738,7 +743,7 @@ class TestTheCli:
         if state_backend != "duckdb":
             pytest.skip("this is the DuckDB half")
 
-        result = cli_client_both["invoke"](["semantic-model", "coverage"])
+        result = cli_client_both["invoke"](["admin", "semantic", "coverage"])
         assert result.exit_code == 1
         assert "Postgres" in result.output
         assert "docs/migrations.md" in result.output

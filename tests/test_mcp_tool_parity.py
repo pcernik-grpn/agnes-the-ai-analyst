@@ -170,6 +170,134 @@ def test_stdio_server_exposes_data_app_family():
     assert set(DATA_APP_TOOL_NAMES) <= _tool_names(stdio_server.mcp)
 
 
+# --- The stdio surface is closed (#1707 Block 6, decision 8) ---------------
+#
+# The stdio server is INTERNAL: the hosted chat sandbox spawns it per session
+# and `agnes global enable` wires it into Claude Code. It is not a supported
+# end-user surface and its tool set does not grow — anything agent-facing that
+# is not filesystem-bound belongs on the HTTP foundation surface, which every
+# transport (SSE, streamable, chat) already shares.
+#
+# This constant is the whole set, written out. A `<=` subset assertion (which
+# is all this file used to have for stdio) cannot notice a tool being ADDED,
+# and an intersection-based comparison cannot notice one being added to a
+# family that is absent from the other side — which is exactly how the
+# semantic-tool question below went unguarded.
+
+STDIO_TOOL_NAMES = frozenset(
+    {
+        # Catalog / data reads
+        "catalog",
+        "schema",
+        "describe",
+        "query",
+        "query_local",
+        "pull",
+        "server_info",
+        "tool_docs",
+        # Knowledge + collections
+        "knowledge_search",
+        "collections_list",
+        "collections_search",
+        "collections_reingest",
+        "collection_get",
+        "collection_file_read",
+        "chat_upload_file",
+        # Data apps: authoring, deploy, and the in-chat preview loop
+        "data_apps_list",
+        "data_app_get",
+        "data_app_create",
+        "data_app_create_draft",
+        "data_app_delete_draft",
+        "data_app_deploy",
+        "data_app_git_credential",
+        "data_app_logs",
+        "data_app_set_description",
+        "agnes_data_app_preview",
+        "agnes_data_app_refresh",
+        "agnes_data_app_close",
+        "agnes_data_app_credentials",
+    }
+)
+
+
+def test_stdio_tool_set_is_exactly_the_documented_set():
+    """Adding or removing an ``agnes mcp`` tool must be a conscious edit.
+
+    Passthrough tools registered dynamically at ``run()`` are deliberately not
+    in scope — this pins the STATIC set the module declares at import time.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from cli.mcp import server as stdio_server
+
+    actual = _tool_names(stdio_server.mcp)
+    assert actual == set(STDIO_TOOL_NAMES), (
+        "the stdio `agnes mcp` tool set changed. It is closed by design "
+        "(#1707 Block 6): put agent-facing tools on the HTTP foundation "
+        "surface (app/api/mcp/foundation_tools.py) instead. If a tool "
+        "genuinely needs a local process, add it to STDIO_TOOL_NAMES here in "
+        f"the same change. added={sorted(actual - set(STDIO_TOOL_NAMES))} "
+        f"removed={sorted(set(STDIO_TOOL_NAMES) - actual)}"
+    )
+
+
+"""Every semantic-layer tool, on the surface that is allowed to have them."""
+SEMANTIC_TOOL_NAMES = frozenset(
+    {
+        "semantic_model_search",
+        "semantic_model_get",
+        "apply_semantic_model",
+        "validate_semantic_query",
+        "get_semantic_context",
+        "get_semantic_schema",
+        "semantic_model_coverage",
+        "semantic_model_coverage_tag",
+        "semantic_model_coverage_untag",
+        "admin_semantic_coverage",
+        "admin_semantic_layer_coverage",
+        "semantic_layer_health",
+        "semantic_mutes_list",
+        "mute_semantic_check",
+        "unmute_semantic_check",
+        "flag_semantic_issue",
+        "semantic_feedback_list",
+        "semantic_feedback_resolve",
+    }
+)
+
+
+def test_the_whole_semantic_family_is_on_the_remote_foundation_surface():
+    """One definition, every HTTP transport — the point of foundation_tools."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    missing = sorted(SEMANTIC_TOOL_NAMES - set(FOUNDATION_TOOL_NAMES))
+    assert not missing, f"semantic tools missing from the foundation surface: {missing}"
+
+
+def test_semantic_tools_are_remote_only_by_design():
+    """No semantic tool may appear on the stdio server. Ever.
+
+    #1707 decision 8: the stdio server is the chat sandbox's internal tool
+    channel, retired as an end-user surface; no semantic tools will be added
+    to it. Every semantic read is RBAC-filtered server-side against the
+    caller's grants, so it has nothing to gain from a local process and one
+    thing to lose — a second, hand-maintained copy of a permission-sensitive
+    tool that no `foundation_tools` change would keep in step.
+
+    This replaces an intersection-based guard that looked like coverage and
+    verified nothing: the stdio and HTTP registries share no semantic tool, so
+    intersecting them produced an empty set to assert over.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from cli.mcp import server as stdio_server
+
+    leaked = sorted(SEMANTIC_TOOL_NAMES & _tool_names(stdio_server.mcp))
+    assert not leaked, (
+        f"semantic tools were added to the stdio `agnes mcp` server: {leaked}. "
+        "They belong on app/api/mcp/foundation_tools.py only (#1707 decision 8)."
+    )
+
+
 # --- Behaviour annotations (CON-1) ---------------------------------------
 #
 # Both the Anthropic and the OpenAI directory submissions check that every tool
@@ -290,6 +418,12 @@ def test_stdio_and_http_agree_on_shared_tool_behaviour():
     `stack_unsubscribe` from being destructive over HTTP and read-only over
     stdio — exactly the drift the name-parity guards above already prevent for
     the tool *list*.
+
+    Scope note: an intersection guard can only speak about tools that exist on
+    BOTH surfaces, which for the semantic family is none of them (they are
+    remote-only by design — see `test_semantic_tools_are_remote_only_by_design`
+    and the exact-set pin `test_stdio_tool_set_is_exactly_the_documented_set`,
+    which is what actually covers additions and removals).
     """
     pytest.importorskip("mcp", reason="mcp package not installed")
     from app.api import mcp_http

@@ -377,20 +377,25 @@ class TestTheEndpointsOnPostgres:
 
 
 class TestTheCli:
-    """`agnes semantic-model mute|unmute|mutes` — the same three verbs the API
+    """`agnes admin semantic mute|unmute|mutes` — the same three verbs the API
     and the MCP tools carry, so an admin working from a terminal is not the one
-    surface that has to open a browser to silence a known gap."""
+    surface that has to open a browser to silence a known gap.
+
+    Under `admin` since #1707 Block 6: every mute endpoint is `require_admin`,
+    which the old `agnes semantic-model …` home did not say. The old spelling
+    still runs as a hidden deprecated alias (covered in
+    `tests/test_cli_semantic_consolidation.py`)."""
 
     def test_mute_then_list_shows_who_and_why(self, state_backend, cli_client_both):
         if state_backend != "pg":
             pytest.skip("PG-only feature")
         invoke = cli_client_both["invoke"]
 
-        muted = invoke(["semantic-model", "mute", "domain:glossary", "--reason", "terminology review in flight"])
+        muted = invoke(["admin", "semantic", "mute", "domain:glossary", "--reason", "terminology review in flight"])
         assert muted.exit_code == 0, muted.output
         assert "Muted" in muted.output
 
-        listed = invoke(["semantic-model", "mutes"])
+        listed = invoke(["admin", "semantic", "mutes"])
         assert listed.exit_code == 0, listed.output
         assert "domain:glossary" in listed.output
         assert "admin@test.com" in listed.output
@@ -401,8 +406,8 @@ class TestTheCli:
             pytest.skip("PG-only feature")
         invoke = cli_client_both["invoke"]
 
-        invoke(["semantic-model", "mute", "domain:metrics"])
-        listed = invoke(["semantic-model", "mutes", "--json"])
+        invoke(["admin", "semantic", "mute", "domain:metrics"])
+        listed = invoke(["admin", "semantic", "mutes", "--json"])
         assert listed.exit_code == 0, listed.output
         items = json.loads(listed.output)["items"]
         assert [m["scope"] for m in items] == ["domain:metrics"]
@@ -412,20 +417,20 @@ class TestTheCli:
             pytest.skip("PG-only feature")
         invoke = cli_client_both["invoke"]
 
-        invoke(["semantic-model", "mute", "domain:metrics"])
-        mute_id = json.loads(invoke(["semantic-model", "mutes", "--json"]).output)["items"][0]["id"]
+        invoke(["admin", "semantic", "mute", "domain:metrics"])
+        mute_id = json.loads(invoke(["admin", "semantic", "mutes", "--json"]).output)["items"][0]["id"]
 
-        unmuted = invoke(["semantic-model", "unmute", mute_id])
+        unmuted = invoke(["admin", "semantic", "unmute", mute_id])
         assert unmuted.exit_code == 0, unmuted.output
 
-        after = json.loads(invoke(["semantic-model", "mutes", "--json"]).output)
+        after = json.loads(invoke(["admin", "semantic", "mutes", "--json"]).output)
         assert after["items"] == []
 
     def test_an_empty_list_says_so_instead_of_printing_nothing(self, state_backend, cli_client_both):
         if state_backend != "pg":
             pytest.skip("PG-only feature")
 
-        result = cli_client_both["invoke"](["semantic-model", "mutes"])
+        result = cli_client_both["invoke"](["admin", "semantic", "mutes"])
         assert result.exit_code == 0, result.output
         assert "No muted checks" in result.output
 
@@ -434,17 +439,17 @@ class TestTheCli:
             pytest.skip("PG-only feature")
         invoke = cli_client_both["invoke"]
 
-        result = invoke(["semantic-model", "mute", "domain:metrics", "--expires", _iso(timedelta(days=3))])
+        result = invoke(["admin", "semantic", "mute", "domain:metrics", "--expires", _iso(timedelta(days=3))])
         assert result.exit_code == 0, result.output
 
-        items = json.loads(invoke(["semantic-model", "mutes", "--json"]).output)["items"]
+        items = json.loads(invoke(["admin", "semantic", "mutes", "--json"]).output)["items"]
         assert items[0]["expires_at"] is not None
 
     def test_a_malformed_scope_names_the_three_forms(self, state_backend, cli_client_both):
         if state_backend != "pg":
             pytest.skip("PG-only feature")
 
-        result = cli_client_both["invoke"](["semantic-model", "mute", "everything"])
+        result = cli_client_both["invoke"](["admin", "semantic", "mute", "everything"])
         assert result.exit_code == 1
         assert "source:" in result.output and "domain:" in result.output
 
@@ -452,16 +457,16 @@ class TestTheCli:
         if state_backend != "pg":
             pytest.skip("PG-only feature")
 
-        result = cli_client_both["invoke"](["semantic-model", "unmute", "shm_nope"])
+        result = cli_client_both["invoke"](["admin", "semantic", "unmute", "shm_nope"])
         assert result.exit_code == 1
-        assert "semantic-model mutes" in result.output
+        assert "agnes admin semantic mutes" in result.output
 
     def test_muting_the_same_scope_twice_names_the_existing_mute(self, state_backend, cli_client_both):
         if state_backend != "pg":
             pytest.skip("PG-only feature")
         invoke = cli_client_both["invoke"]
 
-        invoke(["semantic-model", "mute", "domain:metrics", "--reason", "first"])
-        again = invoke(["semantic-model", "mute", "domain:metrics", "--reason", "second"])
+        invoke(["admin", "semantic", "mute", "domain:metrics", "--reason", "first"])
+        again = invoke(["admin", "semantic", "mute", "domain:metrics", "--reason", "second"])
         assert again.exit_code == 1
         assert "Already muted" in again.output
