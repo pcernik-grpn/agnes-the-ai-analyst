@@ -132,6 +132,96 @@ UNATTENDED = "unattended"
 #: next message is served.
 _WEDGE_DRAIN_SECONDS = 5.0
 
+# ── MCP tool approval routing ────────────────────────────────────────────
+#
+# The CLI namespaces every MCP tool as ``mcp__<server>__<tool>``. Whether a
+# call needs the user's confirmation is decided from the tool's OWN
+# behaviour annotation (``readOnlyHint``, set at the ``@tool(read_only=…)``
+# decoration in ``cli/mcp/server.py`` via ``src/mcp_tooling.py``), never
+# from its name: a name-shaped rule silently stops covering the next
+# mutating tool somebody adds. Anything not positively known to be
+# read-only — a tool added after this runner was built, a per-caller
+# passthrough tool (registered dynamically, carries no annotation at all),
+# or a tool from a workspace-configured MCP server — counts as mutating and
+# takes the approval round-trip.
+_MCP_TOOL_PREFIX = "mcp__"
+
+#: PreToolUse matcher covering every MCP tool from every connected server.
+#: Claude Code hook matchers are regexes (the SDK's own example is
+#: ``"Write|MultiEdit|Edit"``) and ``mcp__<server>__<tool>`` is the
+#: documented MCP form, so this is the narrowest pattern that cannot miss a
+#: server. Deliberately a SECOND matcher rather than one alternation with
+#: ``Bash``: Bash's coverage is load-bearing and stays on the exact,
+#: already-proven matcher.
+_MCP_TOOL_MATCHER = "mcp__.*"
+
+#: The name ``_agnes_mcp_servers()`` registers the Agnes stdio MCP server
+#: under. The allowlist below is keyed on (server, tool), so a workspace-
+#: configured MCP server — outside Agnes' control, and the agent can write
+#: the workspace's own MCP config — cannot borrow an Agnes read-only
+#: verdict by naming its write tool ``catalog``.
+_AGNES_MCP_SERVER_NAME = "agnes"
+
+#: Agnes stdio MCP tools annotated ``readOnlyHint=True``; they run without
+#: a confirmation. A copy, because this file is uploaded to the sandbox and
+#: executed STANDALONE (``python3 /work/runner.py``) — the same reason
+#: ``_SANDBOX_WHEEL_DIR`` and ``_CONTEXT_RESTORE_PATH`` are duplicated
+#: here. Importing ``cli.mcp.server`` from the hook would work only after
+#: the wheel install lands and would pull duckdb + FastMCP into the runner
+#: process on the tool-call hot path. Drift is guarded by
+#: ``tests/test_chat_approval_gate.py::test_read_only_allowlist_matches_the_stdio_mcp_server``
+#: — and drift fails SAFE either way round: an unlisted read-only tool
+#: costs a needless card, never an unasked mutation.
+_READ_ONLY_AGNES_MCP_TOOLS = frozenset(
+    {
+        "agnes_data_app_credentials",
+        "catalog",
+        "collection_file_read",
+        "collection_get",
+        "collections_list",
+        "collections_search",
+        "data_app_get",
+        "data_app_logs",
+        "data_apps_list",
+        "describe",
+        "knowledge_search",
+        "query",
+        "query_local",
+        "schema",
+        "server_info",
+        "tool_docs",
+    }
+)
+
+
+def _mcp_tool_is_read_only(tool_name: str) -> bool:
+    """True only for an Agnes MCP tool KNOWN to be read-only.
+
+    Everything else — another server's tool, an unknown Agnes tool, a
+    malformed name — is False, i.e. treated as mutating. Unknown must fail
+    closed here: the gate is the only thing standing between the model and
+    a write it decided to make on its own.
+    """
+    parts = tool_name.split("__", 2)
+    if len(parts) != 3 or parts[0] != "mcp":
+        return False
+    server, tool = parts[1], parts[2]
+    return server == _AGNES_MCP_SERVER_NAME and tool in _READ_ONLY_AGNES_MCP_TOOLS
+
+
+def _mcp_tool_display_name(tool_name: str) -> str:
+    """``mcp__agnes__catalog`` → ``catalog``, for the approval card.
+
+    Another server keeps its namespace (``othersrv.search``): the user is
+    deciding whether to let this call run, and "which server" is part of
+    that decision.
+    """
+    parts = tool_name.split("__", 2)
+    if len(parts) != 3 or parts[0] != "mcp":
+        return tool_name
+    server, tool = parts[1], parts[2]
+    return tool if server == _AGNES_MCP_SERVER_NAME else f"{server}.{tool}"
+
 
 class ApprovalGate:
     """In-process PreToolUse gate that makes the workspace hook's ``ask``
@@ -151,10 +241,16 @@ class ApprovalGate:
     were silently inert in cloud chat). An SDK-level PreToolUse hook runs
     in-process, so it CAN block the call while a human answers.
 
-    ``allow_session`` remembers the exact approved COMMAND and auto-allows
-    later asks for that identical command for this runner's lifetime (not
-    the hook's reason string, which is shared across a whole command
-    family and would over-approve).
+    MCP tools take the same round-trip, routed from their own behaviour
+    ANNOTATIONS rather than the file hook: ``readOnlyHint=True`` runs
+    unasked, everything else — including a tool nobody has classified —
+    asks (see ``_check_mcp_tool``). The file hook is not consulted for them;
+    the bundled one allows every non-Bash tool anyway.
+
+    ``allow_session`` remembers the exact approved COMMAND (for an MCP tool,
+    the tool plus its arguments) and auto-allows later asks for that
+    identical call for this runner's lifetime (not the hook's reason string,
+    which is shared across a whole command family and would over-approve).
 
     The gate is armed on EVERY surface. Whether anyone can actually answer
     a given request is not knowable here — it depends on which sinks are
@@ -259,10 +355,22 @@ class ApprovalGate:
 
     async def check(self, input_data: dict, tool_use_id, context) -> dict:
         """SDK PreToolUse callback body. Returns hookSpecificOutput."""
-        payload = {
-            "tool_name": input_data.get("tool_name"),
-            "tool_input": input_data.get("tool_input") or {},
-        }
+        tool_name = str(input_data.get("tool_name") or "")
+        tool_input = input_data.get("tool_input") or {}
+        if tool_name.startswith(_MCP_TOOL_PREFIX):
+            # MCP tools carry their own verdict in their annotations; the
+            # workspace file hook has no opinion on them (the bundled one
+            # allows every non-Bash tool) and running it per call would put
+            # a subprocess in front of every `catalog`.
+            return await self._check_mcp_tool(tool_name, tool_input)
+        if tool_name != "Bash":
+            # Same reach the gate has always had. The bundled workspace hook
+            # returns `allow` for every non-Bash tool, so nothing is lost,
+            # and gating every Read/Grep/Edit through a per-call file-hook
+            # subprocess would add real latency (scope note on #1145). The
+            # MCP matcher above is why this branch is now reachable at all.
+            return {}
+        payload = {"tool_name": tool_name, "tool_input": tool_input}
         verdict = await asyncio.to_thread(self.run_file_hook, payload)
         decision = (verdict or {}).get("permissionDecision")
         reason = (verdict or {}).get("permissionDecisionReason", "")
@@ -270,15 +378,74 @@ class ApprovalGate:
             return _hook_output("deny", reason or "Denied by workspace policy.")
         if decision != "ask":
             return {}
-        # "Allow for session" dedupes on the exact COMMAND, not the hook's
-        # reason string: the bundled hook emits one fixed reason for the whole
-        # `agnes admin grant|group|user` family, so a reason-keyed cache would
-        # let approving one `agnes admin grant …` silently pre-approve every
-        # `agnes admin user delete …` for the runner's life. Command-keyed
-        # keeps the "Allow for session" blast radius to the identical command
-        # (review finding on #1145).
-        command = str(payload["tool_input"].get("command", ""))
-        if command and command in self._session_approved:
+        command = str(tool_input.get("command", ""))
+        return await self._round_trip(
+            tool_name=tool_name,
+            command=command,
+            reason=reason,
+            # "Allow for session" dedupes on the exact COMMAND, not the
+            # hook's reason string: the bundled hook emits one fixed reason
+            # for the whole `agnes admin grant|group|user` family, so a
+            # reason-keyed cache would let approving one `agnes admin grant
+            # …` silently pre-approve every `agnes admin user delete …` for
+            # the runner's life. Command-keyed keeps the "Allow for session"
+            # blast radius to the identical command (review finding on
+            # #1145).
+            session_key=command,
+            advice="Ask the user to confirm and run the command themselves.",
+        )
+
+    async def _check_mcp_tool(self, tool_name: str, tool_input: dict) -> dict:
+        """Approval verdict for one ``mcp__<server>__<tool>`` call.
+
+        Read-only by its own annotation → no opinion, the call proceeds.
+        Anything else — including a tool nobody has classified — takes the
+        same round-trip an ask-flagged Bash command takes. Before this,
+        the gate matched `Bash` only, so every mutating MCP tool
+        (`data_app_delete_draft`, `data_app_deploy`, `pull`, …) ran without
+        the confirmation its own contract asks for.
+        """
+        if _mcp_tool_is_read_only(tool_name):
+            return {}
+        try:
+            arguments = json.dumps(tool_input, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            arguments = str(tool_input)
+        display = _mcp_tool_display_name(tool_name)
+        return await self._round_trip(
+            tool_name=tool_name,
+            # The card renders `command` verbatim and nothing else names the
+            # call, so it carries the tool AND its arguments: "delete a
+            # draft" is not a decision anyone can make without knowing which
+            # draft.
+            command=f"{display}({arguments})",
+            reason=(
+                f"The MCP tool {display!r} is not declared read-only, so it can change "
+                "state; confirm before it runs."
+            ),
+            # Keyed on tool + arguments, mirroring the Bash path's exact-
+            # command key: approving one delete must not pre-approve the
+            # next one with different arguments.
+            session_key=f"{tool_name} {arguments}",
+            advice="Ask the user to perform this action themselves, or to confirm it in a chat session.",
+        )
+
+    async def _round_trip(
+        self,
+        *,
+        tool_name: str,
+        command: str,
+        reason: str,
+        session_key: str,
+        advice: str,
+    ) -> dict:
+        """Emit an ``approval_request``, suspend on the user's decision.
+
+        Shared by the Bash (file-hook ``ask``) and MCP (non-read-only
+        annotation) paths so both get the same session cache, kill-switch
+        behaviour, cancellation handling and outcome messages.
+        """
+        if session_key and session_key in self._session_approved:
             return _hook_output("allow", "approved by user for this session")
         if not self._enabled:
             return _hook_output(
@@ -292,7 +459,7 @@ class ApprovalGate:
                     # kill-switch.
                     or "approvals are switched off for this deployment (AGNES_APPROVALS=off)."
                 )
-                + " Ask the user to confirm and run the command themselves.",
+                + f" {advice}",
             )
         self._counter += 1
         # Globally unique, not per-process: a respawned sandbox restarts the
@@ -306,7 +473,7 @@ class ApprovalGate:
             {
                 "type": "approval_request",
                 "request_id": request_id,
-                "tool": payload["tool_name"],
+                "tool": tool_name,
                 "command": command[:2000],
                 "reason": reason,
                 "timeout_seconds": int(self.timeout_seconds),
@@ -349,8 +516,8 @@ class ApprovalGate:
             }
         )
         if outcome in ("allow", "allow_session"):
-            if outcome == "allow_session" and command:
-                self._session_approved.add(command)
+            if outcome == "allow_session" and session_key:
+                self._session_approved.add(session_key)
             return _hook_output("allow", "approved by user")
         if outcome == "timeout":
             return _hook_output(
@@ -367,6 +534,60 @@ class ApprovalGate:
                 "session they can answer from.",
             )
         return _hook_output("deny", f"The user denied this action: {reason}")
+
+
+def _build_pretool_matchers(gate: "ApprovalGate", HookMatcher) -> list:
+    """Build the PreToolUse matchers that arm ``gate``.
+
+    TWO matchers, deliberately not one ``Bash|mcp__.*`` alternation:
+
+    - ``Bash`` — the exact matcher the gate has always used, carrying the
+      workspace file hook's ``ask``/``deny`` verdicts. Left untouched so
+      its coverage cannot regress on the MCP pattern.
+    - ``mcp__.*`` — every MCP tool, from every connected server. Without
+      it, mutating MCP tools (``data_app_delete_draft``, ``data_app_deploy``,
+      ``pull``, and anything a future connector adds) bypassed the
+      confirmation round-trip entirely, despite their own contracts asking
+      for one. The two patterns are disjoint, so one tool call never fires
+      the gate twice.
+
+    HookMatcher.timeout is newer than HookMatcher itself. The margin over
+    the gate's own await is what stops the CLI-side matcher timeout from
+    firing first; without it the CLI could time the hook out and treat it
+    as non-blocking, running the tool while a human is still being asked.
+
+    Two assumptions ride on that margin and cannot be checked from here
+    (they live in the CLI, not the SDK): that the value is in SECONDS, and
+    that the CLI treats a matcher timeout as non-blocking rather than as a
+    deny. If the unit were smaller the margin collapses and the CLI times
+    out first; if a timeout denies, the failure is safe (a refused command)
+    rather than an unasked one. Both were consistent with an empirical
+    ≥75s block during development. A test pins the field's existence,
+    which is what we can assert offline (review note on #1145).
+
+    So on an SDK without it we still REGISTER both matchers, with the gate
+    disabled. A disabled gate denies instantly instead of waiting, so there
+    is nothing for a CLI-side timeout to cut short — whereas skipping
+    registration would leave nothing to deny at all, and ask-flagged
+    commands (and now mutating MCP tools) would run unasked: the exact
+    behavior this gate exists to remove (review finding on #1145).
+    """
+
+    async def _gate_hook(input_data, tool_use_id, context):
+        return await gate.check(input_data, tool_use_id, context)
+
+    patterns = ("Bash", _MCP_TOOL_MATCHER)
+    try:
+        return [
+            HookMatcher(matcher=p, hooks=[_gate_hook], timeout=gate.timeout_seconds + 30) for p in patterns
+        ]
+    except TypeError:
+        gate.disable_unsupported(
+            "the installed claude-agent-sdk HookMatcher takes no `timeout`, so the gate "
+            "cannot block safely; ask-flagged commands and mutating MCP tools are DENIED "
+            "instead of confirmed — upgrade the SDK to restore approvals"
+        )
+        return [HookMatcher(matcher=p, hooks=[_gate_hook]) for p in patterns]
 
 
 #: Hard caps on a ``question_answer`` payload accepted from stdin. The
@@ -718,7 +939,10 @@ def _agnes_mcp_servers() -> dict:
     if session_id := os.environ.get("AGNES_SESSION_ID", "").strip():
         env["AGNES_SESSION_ID"] = session_id
     return {
-        "agnes": {
+        # The name here is the `<server>` half of every `mcp__<server>__<tool>`
+        # the approval gate sees, so it must stay the constant the read-only
+        # allowlist is keyed on.
+        _AGNES_MCP_SERVER_NAME: {
             "type": "stdio",
             "command": "agnes",
             "args": ["mcp"],
@@ -1084,58 +1308,16 @@ async def _real_agent_loop(
             # honest about that rather than calling it fail-closed. The
             # sandbox image's SDK is outside the wheel's pin (its
             # :latest tag is mutable), so log loudly enough for an operator
-            # to notice that ask-flagged commands are running unasked.
+            # to notice that ask-flagged commands and mutating MCP tools are
+            # running unasked.
             gate.disable_unsupported(
                 "the installed claude-agent-sdk cannot register a PreToolUse hook "
                 f"({'ClaudeAgentOptions has no `hooks` field' if not _hooks_supported else 'no HookMatcher'}); "
-                "APPROVALS ARE NOT ENFORCED in this session — upgrade the sandbox template's SDK"
+                "APPROVALS ARE NOT ENFORCED in this session (ask-flagged commands and mutating "
+                "MCP tools run unasked) — upgrade the sandbox template's SDK"
             )
         else:
-
-            async def _gate_hook(input_data, tool_use_id, context):
-                return await gate.check(input_data, tool_use_id, context)
-
-            # Matcher is Bash-only: the bundled workspace hook short-circuits
-            # to allow for every non-Bash tool, so no policy is lost today,
-            # and gating every Read/Write/Edit through a per-call file-hook
-            # subprocess would add real latency. Consequence documented in
-            # docs/cloud-chat.md: an operator override that adds `ask` rules
-            # for Write/Edit/WebFetch would need this widened to see them
-            # (review note on #1145).
-            #
-            # HookMatcher.timeout is newer than HookMatcher itself. The margin
-            # over the gate's own await is what stops the CLI-side matcher
-            # timeout from firing first; without it the CLI could time the
-            # hook out and treat it as non-blocking, running the tool while a
-            # human is still being asked.
-            #
-            # Two assumptions ride on that margin and cannot be checked from
-            # here (they live in the CLI, not the SDK): that the value is in
-            # SECONDS, and that the CLI treats a matcher timeout as
-            # non-blocking rather than as a deny. If the unit were smaller the
-            # margin collapses and the CLI times out first; if a timeout
-            # denies, the failure is safe (a refused command) rather than an
-            # unasked one. Both were consistent with an empirical ≥75s block
-            # during development. The test below pins the field's existence,
-            # which is what we can assert offline (review note on #1145).
-            #
-            # So on an SDK without it we still REGISTER the hook, with the
-            # gate disabled. A disabled gate denies instantly instead of
-            # waiting, so there is nothing for a CLI-side timeout to cut
-            # short — whereas skipping registration would leave nothing to
-            # deny at all, and ask-flagged commands would run unasked: the
-            # exact behavior this change exists to remove (review finding
-            # on #1145).
-            try:
-                _matcher = HookMatcher(matcher="Bash", hooks=[_gate_hook], timeout=gate.timeout_seconds + 30)
-            except TypeError:
-                gate.disable_unsupported(
-                    "the installed claude-agent-sdk HookMatcher takes no `timeout`, so the gate "
-                    "cannot block safely; ask-flagged commands are DENIED instead of confirmed — "
-                    "upgrade the SDK to restore approvals"
-                )
-                _matcher = HookMatcher(matcher="Bash", hooks=[_gate_hook])
-            options_kwargs["hooks"] = {"PreToolUse": [_matcher]}
+            options_kwargs["hooks"] = {"PreToolUse": _build_pretool_matchers(gate, HookMatcher)}
     # Question gate (SDK can_use_tool callback). The AskUserQuestion tool's
     # permission check is unconditionally "ask" — bypassPermissions does NOT
     # swallow it the way it swallows ordinary tools' prompts, so every
