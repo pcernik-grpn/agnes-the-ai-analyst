@@ -1863,6 +1863,20 @@
   .ax-kindrun[aria-expanded="false"] .fbar-group__caret { transform: rotate(-90deg); }
   @media (prefers-reduced-motion: reduce) { .ax-kindrun .fbar-group__caret { transition: none; } }
   .ax-kindrun__c { margin-left: 4px; }
+  /* The filter is a button with a menu and its choices restated as chips —
+     the Library's shape. A row of segments reads as tabs, and tabs say "this
+     is what the list is of"; a filter says "this is what I have hidden". */
+  .ax-filter { position: relative; flex: 0 0 auto; }
+  .ax-filter[hidden] { display: none; }
+  .ax-chips { margin: 10px 0 0; }
+  .ax-chips[hidden] { display: none; }
+  .ax-picker__filter { position: relative; flex: 0 0 auto; }
+  .ax-picker__chips { margin: 0 0 10px; }
+  .fbar-chips__clear {
+    background: none; border: 0; padding: 0 4px; cursor: pointer;
+    font: inherit; font-size: 12.5px; font-weight: 600; color: var(--ds-text-link);
+  }
+  .fbar-chip__val { font-weight: 600; }
 </style>
 {% endblock %}
 
@@ -1922,10 +1936,21 @@
         <input type="search" id="ax-group-find" placeholder="Search groups, bundles or people…" autocomplete="off" aria-label="Search groups, bundles or people">
       </div>
       {# The list's own filter. Search answers "where is X"; this answers
-         "show me only the packages" — the question you have when you are
-         auditing rather than looking something up, and until now the only
-         way to answer it was to scroll. #}
-      <span class="fbar-seg ax-kindfilter" id="ax-kindfilter" role="group" aria-label="Filter by kind"></span>
+         "show me only the packages" — the auditing question, which until now
+         could only be answered by scrolling.
+
+         A BUTTON with a menu, and the choice restated as a chip beneath —
+         the Library's own filter shape. A row of segments reads as tabs,
+         which say "this is what the list is of"; a filter says "this is what
+         I have hidden", and that difference has to survive being glanced at. #}
+      <div class="fbar-filter ax-filter">
+        <button type="button" class="fbar-filter__btn" id="ax-filter-btn" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
+          Filter
+          <span class="fbar-filter__n" id="ax-filter-n" hidden>0</span>
+        </button>
+        <div class="fbar-menu fbar-menu--cats" id="ax-filter-menu" role="menu" aria-label="Filter by kind" hidden></div>
+      </div>
       {# The audience that does not exist yet. "Grant this to the finance
          team" is one thought, and it used to break in half here: no Finance
          group meant leaving for the group list, creating it there, coming
@@ -1950,6 +1975,9 @@
      the query string; empty (and so `display:none`) otherwise. #}
   <div class="ax-pin" id="ax-pick" role="status"></div>
   <div class="ax-one">
+    {# The applied filters, restated under the bar — a filter you cannot see
+       is a filter you forget you set, and then the list is simply wrong. #}
+    <div class="fbar-chips ax-chips" id="ax-chips" hidden></div>
     <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
 
     {# ONE panel, three regions divided by hairlines. It was a single
@@ -3390,12 +3418,24 @@
      control never offers a kind that would empty the list. Hidden in the
      person view, which is not a list of things. */
   function paintKindFilter() {
-    const host = el("ax-kindfilter");
-    if (!host) return;
-    if (viewMode === "person") { host.hidden = true; return; }
+    const btn = el("ax-filter-btn");
+    const menu = el("ax-filter-menu");
+    const chips = el("ax-chips");
+    const nBadge = el("ax-filter-n");
+    if (!btn || !menu || !chips) return;
+
+    const wrap = btn.closest(".ax-filter");
+    if (viewMode === "person") {
+      if (wrap) wrap.hidden = true;
+      chips.hidden = true;
+      return;
+    }
+    if (wrap) wrap.hidden = false;
+
     /* Only the kinds the ACTIVE view can show. By bundle lists the kinds an
-       admin hands out as a unit, so offering it "Cloud chat" would be a chip
-       that empties the list — a filter has to describe the set it filters. */
+       admin hands out as a unit, so offering it "Cloud chat" would be an
+       option that empties the list — a filter has to describe the set it
+       filters. */
     const BUNDLE_LEAD = new Set(["data_package", "memory_domain", "semantic_model", "recipe",
                                  "marketplace_plugin", "store_entity", "data_app", "agent", "collection"]);
     const counts = new Map();
@@ -3405,14 +3445,29 @@
     }
     const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
     const label = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
-    host.innerHTML = [
-      `<button type="button" class="fbar-seg__btn${listKind ? "" : " is-active"}" data-list-kind="">All</button>`,
-      ...[...counts.keys()].sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99))
-        .map((k) => `<button type="button" class="fbar-seg__btn${listKind === k ? " is-active" : ""}"
-                        data-list-kind="${esc(k)}">${esc(label.get(k) || k)}
-                        <span class="fbar-seg__n">${counts.get(k)}</span></button>`),
-    ].join("");
-    host.hidden = !listKind && counts.size < 2;
+    const kinds = [...counts.keys()].sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99));
+
+    menu.innerHTML = kinds.map((k) => `
+      <label class="fbar-menu__opt">
+        <input type="checkbox" data-list-kind="${esc(k)}"${listKind === k ? " checked" : ""}>
+        <span class="fbar-menu__opt-text">${esc(label.get(k) || k)}</span>
+        <span class="fbar-menu__opt-n">${counts.get(k)}</span>
+      </label>`).join("");
+
+    nBadge.textContent = listKind ? "1" : "0";
+    nBadge.hidden = !listKind;
+    btn.classList.toggle("is-on", !!listKind);
+
+    chips.innerHTML = listKind ? `
+      <span class="fbar-chip">
+        <span class="fbar-chip__edit">
+          <span class="fbar-chip__label">Kind:</span>
+          <span class="fbar-chip__val">${esc(label.get(listKind) || listKind)}</span>
+        </span>
+        <button type="button" class="fbar-chip__x" data-chip-clear aria-label="Remove kind filter">×</button>
+      </span>
+      <button type="button" class="fbar-chips__clear" data-chip-clear>Clear all</button>` : "";
+    chips.hidden = !listKind;
   }
 
   function paintTabCounts() {
@@ -3811,11 +3866,37 @@
       return;
     }
 
-    const kindBtn = e.target.closest("[data-list-kind]");
-    if (kindBtn) {
-      listKind = kindBtn.dataset.listKind || "";
+    if (e.target.closest("#ax-filter-btn")) {
+      const menu = el("ax-filter-menu");
+      const btn = el("ax-filter-btn");
+      const show = menu.hidden;
+      menu.hidden = !show;
+      btn.setAttribute("aria-expanded", show ? "true" : "false");
+      return;
+    }
+    if (e.target.closest("[data-chip-clear]")) {
+      listKind = "";
       await repaint();
       return;
+    }
+    const kindBox = e.target.closest("[data-list-kind]");
+    if (kindBox) {
+      // One kind at a time: the chip says which, and a second chip for a
+      // second kind would need a menu that can express "or", which this
+      // question does not have.
+      listKind = kindBox.checked ? kindBox.dataset.listKind : "";
+      el("ax-filter-menu").hidden = true;
+      el("ax-filter-btn").setAttribute("aria-expanded", "false");
+      await repaint();
+      return;
+    }
+    // A click anywhere else closes the menu, as the Library's does.
+    if (!e.target.closest("#ax-filter-menu")) {
+      const menu = el("ax-filter-menu");
+      if (menu && !menu.hidden) {
+        menu.hidden = true;
+        el("ax-filter-btn").setAttribute("aria-expanded", "false");
+      }
     }
 
     const byBtn = e.target.closest("[data-by]");
@@ -4065,8 +4146,15 @@
       '      <div class="fbar__search ax-picker__find">' +
       '        <input type="search" data-pk="q" placeholder="Search everything grantable…" aria-label="Search what to add">' +
       '      </div>' +
-      '      <span class="fbar-seg ax-picker__kinds" data-pk="kinds" role="group" aria-label="Filter by kind"></span>' +
+      '      <div class="fbar-filter ax-picker__filter">' +
+      '        <button type="button" class="fbar-filter__btn" data-pk="filterbtn" aria-haspopup="true" aria-expanded="false">' +
+      '          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>' +
+      '          Filter<span class="fbar-filter__n" data-pk="filtern" hidden>0</span>' +
+      '        </button>' +
+      '        <div class="fbar-menu fbar-menu--cats" data-pk="kinds" role="menu" aria-label="Filter by kind" hidden></div>' +
+      '      </div>' +
       '    </div>' +
+      '    <div class="fbar-chips ax-picker__chips" data-pk="chips" hidden></div>' +
       '    <div class="ax-picker__list" data-pk="list"></div>' +
       '  </div>' +
       '  <div class="ds-drawer__foot">' +
@@ -4096,9 +4184,23 @@
         paintPicker();
         return;
       }
+      if (e.target.closest('[data-pk="filterbtn"]')) {
+        // `root`, not `els.root`: this listener is installed inside
+        // buildPicker, where the element map is still being assembled and is
+        // named `pickerEls`. Reading `els` here threw, so the button did
+        // nothing at all — silently, because the throw was inside a handler.
+        const menu = root.querySelector('[data-pk="kinds"]');
+        const show = menu.hidden;
+        menu.hidden = !show;
+        e.target.closest('[data-pk="filterbtn"]').setAttribute("aria-expanded", show ? "true" : "false");
+        return;
+      }
       const kindBtn = e.target.closest("[data-pk-kind]");
       if (kindBtn) {
-        pickerState.kind = kindBtn.dataset.pkKind || "";
+        const val = kindBtn.dataset.pkKind || "";
+        pickerState.kind = (kindBtn.type === "checkbox" && !kindBtn.checked) ? "" : val;
+        const menu = root.querySelector('[data-pk="kinds"]');
+        if (menu) menu.hidden = true;
         paintPicker();
         return;
       }
@@ -4203,22 +4305,36 @@
     }
     pickerState.kind = wasKind;
     const kindsEl = els.root.querySelector('[data-pk="kinds"]');
-    if (kindsEl) {
+    const chipsEl = els.root.querySelector('[data-pk="chips"]');
+    const nEl = els.root.querySelector('[data-pk="filtern"]');
+    const btnEl = els.root.querySelector('[data-pk="filterbtn"]');
+    if (kindsEl && chipsEl) {
       const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
       const label = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
-      kindsEl.innerHTML = [
-        `<button type="button" class="fbar-seg__btn${pickerState.kind ? "" : " is-active"}" data-pk-kind="">All</button>`,
-        ...[...kinds.keys()]
-          .sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99))
-          .map((k) => `<button type="button" class="fbar-seg__btn${pickerState.kind === k ? " is-active" : ""}"
-                          data-pk-kind="${esc(k)}">${esc(label.get(k) || k)}
-                          <span class="fbar-seg__n">${kinds.get(k)}</span></button>`),
-      ].join("");
-      /* Hidden only when there is nothing to choose between AND nothing is
-         chosen. Hiding it whenever one kind remains was a trap: picking a
-         kind leaves one kind in the set, so the control removed itself and
-         took the way back to All with it. */
-      kindsEl.hidden = !pickerState.kind && kinds.size < 2;
+      kindsEl.innerHTML = [...kinds.keys()]
+        .sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99))
+        .map((k) => `
+          <label class="fbar-menu__opt">
+            <input type="checkbox" data-pk-kind="${esc(k)}"${pickerState.kind === k ? " checked" : ""}>
+            <span class="fbar-menu__opt-text">${esc(label.get(k) || k)}</span>
+            <span class="fbar-menu__opt-n">${kinds.get(k)}</span>
+          </label>`).join("");
+      if (nEl) { nEl.textContent = pickerState.kind ? "1" : "0"; nEl.hidden = !pickerState.kind; }
+      if (btnEl) btnEl.classList.toggle("is-on", !!pickerState.kind);
+      chipsEl.innerHTML = pickerState.kind ? `
+        <span class="fbar-chip">
+          <span class="fbar-chip__edit">
+            <span class="fbar-chip__label">Kind:</span>
+            <span class="fbar-chip__val">${esc(label.get(pickerState.kind) || pickerState.kind)}</span>
+          </span>
+          <button type="button" class="fbar-chip__x" data-pk-kind="" aria-label="Remove kind filter">×</button>
+        </span>
+        <button type="button" class="fbar-chips__clear" data-pk-kind="">Clear all</button>` : "";
+      chipsEl.hidden = !pickerState.kind;
+      // The button is the control; it is never hidden, so the way back to
+      // "no filter" cannot disappear with the last unfiltered kind.
+      const wrap = btnEl && btnEl.closest(".fbar-filter");
+      if (wrap) wrap.hidden = !pickerState.kind && kinds.size < 2;
     }
 
     const n = pickerState.chosen.size;

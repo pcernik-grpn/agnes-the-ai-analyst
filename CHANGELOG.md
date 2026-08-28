@@ -201,6 +201,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The kind filter is a Filter button with applied chips, not a row of
+  segments.** A row of segments reads as tabs, and tabs say *this is what the
+  list is of*; a filter says *this is what I have hidden*, and that difference
+  has to survive a glance. It takes the Library's shape exactly — a `Filter`
+  button carrying a count badge, a checkbox menu of the kinds the active view
+  can show, and the choice restated beneath as `Kind: Data packages ×` with
+  `Clear all`. The same control serves the list and the Add / Share picker, so
+  filtering is one gesture wherever it appears.
 - **By group / By bundle / By person are tabs, and the lists get a filter.**
   They were a segmented control, which says "narrow what you are looking at";
   these change what the list is *of*, which is what a tab says. They use
