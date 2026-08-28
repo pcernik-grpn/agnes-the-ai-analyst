@@ -7783,6 +7783,32 @@ async def admin_semantic_layer_page(
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
 
 
+@router.get("/admin/ontology", response_class=HTMLResponse)
+async def admin_ontology_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Ontology builder (fact-graph-over-Collections §13.2) — a semantic
+    model authored through the shared builder shell: Create | Preview left,
+    numbered sections right, the right panel the source of truth, Save the
+    only write. Zero new navigation (spec §13.2) — the only entry point is
+    the link on ``/admin/semantic-layer``; this route carries no admin-nav
+    entry of its own.
+
+    When the ``facts`` flag is off, or the active backend is DuckDB (drafts
+    are PG-only, A3 ratchet — the builder cannot persist a draft without
+    Postgres), renders an explanatory empty state instead of 404ing, same
+    posture as ``/apps`` when ``data_apps`` is disabled.
+    """
+    from app.instance_config import feature_enabled
+    from src.repositories import use_pg
+
+    ctx = _build_context(request, user=user)
+    ctx["facts_enabled"] = feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+    ctx["pg_backend"] = use_pg()
+    return templates.TemplateResponse(request, "ontology_builder.html", ctx)
+
+
 @router.get("/admin/database", response_class=HTMLResponse)
 async def admin_database_page(
     request: Request,
