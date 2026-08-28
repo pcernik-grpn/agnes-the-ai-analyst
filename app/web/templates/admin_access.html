@@ -1431,6 +1431,44 @@
 
   /* Add row: the end of the list, at the list's own indent. */
   .ax-add { margin-top: 8px; padding: 9px 0; border-top: 1px solid var(--ds-border-light); }
+  /* ══ One list component, two subjects ══════════════════════════════════
+     By group and By bundle sat on the same page looking like two products:
+     a group was a collapsible row with counts on the right, a bundle was a
+     permanently-open block with a table beneath it. They share the row now,
+     so switching changes what the list is ABOUT, not what a list IS. ── */
+
+  /* A bundle's row: the kind chip takes the avatar's slot, and its family
+     takes the counts' slot. Same geometry, different subject. */
+  .ax-gs--bb > .ax-gs__hd .ax-r__kd { flex: none; }
+  .ax-gs--bb .ax-gs__cnt { min-width: 0; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; }
+  /* Granted to nobody is a state worth seeing from the closed row, so it is
+     said in the row's own meta rather than needing the row opened. */
+  .ax-gs--bb.is-nobody .ax-gs__reach { color: var(--ds-accent-warn-ink, #92590a); }
+
+  /* A bundle's rows name AUDIENCES, so the kind column has nothing to put in
+     it — the kind belongs to the bundle, and is in its row above. */
+  .ax-gs--bb .ax-colhd,
+  .ax-gs--bb .ax-r {
+    grid-template-columns: minmax(0, 1fr) 10rem 12rem 13rem;
+  }
+  @media (max-width: 900px) {
+    .ax-gs--bb .ax-colhd, .ax-gs--bb .ax-r { grid-template-columns: minmax(0, 1fr) 8rem 10.5rem; }
+  }
+  .ax-gs--bb .ax-r__d { margin-top: 0; }
+  .ax-bb__lede {
+    margin: 8px 0 2px; font-size: 12.5px; color: var(--ds-text-secondary);
+    max-width: 68ch; line-height: 1.5;
+  }
+
+  /* ── The add action, above the list in both views ──────────────────────
+     At the foot it cost a scroll through everything already there to reach
+     the control that adds one more — and the fuller the list, the further
+     the control retreated. */
+  .ax-add {
+    margin: 6px 0 2px; padding: 8px 0;
+    border-top: 0; border-bottom: 1px solid var(--ds-border-light);
+  }
+  .ax-gs--bb .ax-add { margin-top: 4px; }
 </style>
 {% endblock %}
 
@@ -2290,7 +2328,10 @@
       </div>`;
     }).join("");
 
-    // One way in, at the foot of the list it adds to.
+    /* Above the list, not after it. At the foot it cost a scroll through
+       everything the group already has to reach the thing that adds one
+       more — and the more a group holds, the further the control retreats,
+       which is exactly backwards. */
     const addRow = `
       <button type="button" class="ax-add" data-add-grant>
         <span class="ax-add__plus" aria-hidden="true">+</span>
@@ -2315,7 +2356,7 @@
 
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const painted = (colhd + sections + addRow) || (fq
+    const painted = (addRow + colhd + sections) || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
       : `<div class="dsec-empty"><strong>This group has nothing granted yet</strong>
@@ -2608,7 +2649,11 @@
           one.querySelector("[data-invite-typed]").click();
         } else {
           field.focus();
-          field.setSelectionRange(field.value.length, field.value.length);
+          /* `setSelectionRange` throws on `type="email"` — that input type
+             does not support selection at all. Putting the caret at the end
+             is the whole point (the query is already in the field), so the
+             type is text and the shape is validated on submit instead. */
+          try { field.setSelectionRange(field.value.length, field.value.length); } catch (err) { /* unsupported type */ }
         }
       }
     });
@@ -2665,7 +2710,7 @@
         : `<div class="ax-invite" data-invite-seeded>
              <span class="ax-invite__msg">No account matches “${esc(q)}”. Invite them:</span>
              <span class="ax-invite__form">
-               <input type="email" class="ax-invite__mail" placeholder="name@company.com"
+               <input type="text" inputmode="email" autocomplete="off" class="ax-invite__mail" placeholder="name@company.com"
                       aria-label="Email address to invite" value="${esc(seed)}">
                <button type="button" class="btn btn--primary" data-invite-typed>Invite</button>
              </span>
@@ -2961,49 +3006,71 @@
     const nobody = rows.filter((r) => !r.held.length).sort(byName);
     const held = rows.filter((r) => r.held.length).sort(byName);
 
+    //: One row shape across both views. The columns differ (a group's list
+    //: names things, a bundle's list names audiences) but the anatomy —
+    //: label, subject, control, consequence — does not.
     const groupRow = (r, grant) => {
       const g = groupsById.get(grant.group_id);
       if (!g) return "";
       const tier = grant.requirement === "required" ? "required" : "available";
+      const n = g.member_count ?? 0;
+      const who = whoGranted(grant);
+      const tiered = TIERED.has(r.t.type_key);
       return `
-      <tr data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}" class="is-granted">
-        <td class="ax-chk"><input type="checkbox" checked aria-label="Revoke from ${esc(titleOf(g))}"></td>
-        <td class="ax-name"><b>${esc(titleOf(g))}</b>
-          <span class="blk"> · ${esc(String(g.member_count ?? 0))} ${(g.member_count ?? 0) === 1 ? "person" : "people"}</span>
-          ${whoGranted(grant) ? `<br><span class="ax-by-who">granted by ${esc(whoGranted(grant))}</span>` : ""}</td>
-        <td class="ax-acc">${tierControl(tier, true)}</td>
-        <td class="ax-reads">${readsFor(r.t.type_key, tier)}</td>
-      </tr>`;
+      <div class="ax-r" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}">
+        <span class="ax-r__nm">${esc(titleOf(g))}</span>
+        <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${
+          who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
+        <span class="ax-r__ctl">${tiered
+          ? tierControl(tier, true)
+          : `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button></span>`}</span>
+        <span class="ax-r__rd">${readsLabelled(r.t.type_key, tier)}</span>
+      </div>`;
     };
 
+    /* A bundle is a row that opens to what it holds — the same anatomy as a
+       group, because it is the same question asked the other way round.
+       Both views were on one page looking like two products: a group was a
+       collapsible row with counts on the right, a bundle was a permanently
+       open block with a table under it. They share the row component now,
+       so the switch changes what the list is ABOUT, not what a list IS. */
     const section = (r) => {
       const reach = r.held.reduce((n, g) => n + (groupsById.get(g.group_id)?.member_count ?? 0), 0);
       const nobody = !r.held.length;
+      const meta = nobody
+        ? "granted to nobody"
+        : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`;
       return `
-      <section class="ax-bb${nobody ? " is-nobody" : ""}">
-        <div class="ax-bb__hd">
+      <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}">
+        <summary class="ax-gs__hd">
+          <span class="ax-gs__car" aria-hidden="true">›</span>
           <span class="ax-r__kd" data-kind="${esc(kindToken(r.t))}">${esc(kindWord(r.t))}</span>
-          <span class="ax-bb__nm">${esc(r.i.name || r.i.resource_id)}
-            ${r.i.description ? `<span class="ax-bb__sub">${esc(String(r.i.description).slice(0, 110))}</span>` : ""}
+          <span class="ax-gs__id">
+            <span class="ax-g__name">${esc(r.i.name || r.i.resource_id)}</span>
+            <span class="ax-gs__reach">${meta}</span>
           </span>
-          <span class="ax-bb__cnt">${nobody
-            ? `<b class="ax-bb__none">granted to nobody</b>`
-            : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"} · <b>${reach}</b> ${reach === 1 ? "person" : "people"}`}
-            <span class="ax-bb__fam">${esc(famName.get(r.t.family) || "")}</span></span>
+          <span class="ax-gs__counts">
+            <span class="ax-gs__cnt${nobody ? "" : " is-held"}">${esc(famName.get(r.t.family) || "")}</span>
+          </span>
+        </summary>
+        <div class="ax-gs__body">
+          ${r.i.description ? `<p class="ax-bb__lede">${esc(String(r.i.description).slice(0, 160))}</p>` : ""}
+          <button type="button" class="ax-add" data-share-bundle
+                  data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
+                  data-blabel="${esc(r.i.name || r.i.resource_id)}">
+            <span class="ax-add__plus" aria-hidden="true">+</span>
+            <span>${nobody ? "Share it with a group" : "Share with another group"}</span>
+            <span class="ax-add__hint">every group in the list below already has it</span>
+          </button>
+          ${nobody
+            ? `<div class="ax-empty">Authored, then never handed to anyone.</div>`
+            : `<div class="ax-colhd">
+                 <span>Group</span><span>Who that reaches</span>
+                 <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
+               </div>
+               ${r.held.map((grant) => groupRow(r, grant)).join("")}`}
         </div>
-        ${nobody
-          ? `<div class="ax-empty" style="padding-left:22px;">Authored, then never handed to anyone.</div>`
-          : `<table class="data-table data-table--compact">
-               <thead><tr><th class="ax-chk" aria-label="Granted"></th><th>Group</th><th class="ax-acc">Admin control</th><th class="ax-reads">What the person reads</th></tr></thead>
-               <tbody>${r.held.map((grant) => groupRow(r, grant)).join("")}</tbody>
-             </table>`}
-        <button type="button" class="ax-add ax-add--bb" data-share-bundle
-                data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
-                data-blabel="${esc(r.i.name || r.i.resource_id)}">
-          <span class="ax-add__plus" aria-hidden="true">+</span>
-          <span>${nobody ? "Share it with a group" : "Share with another group"}</span>
-        </button>
-      </section>`;
+      </details>`;
     };
 
     // "2 data packages, 4 agents" — counted by kind, because "9 things" is

@@ -201,6 +201,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **By group and By bundle are one list component.** They sat on the same
+  page looking like two products: a group was a collapsible row with counts
+  on the right, a bundle a permanently-open block with a table beneath it.
+  A bundle is now the same row — kind chip where the avatar sits, its family
+  where the counts sit — **collapsed on arrival**, opening to the groups that
+  hold it. Both views emit the same `.ax-r` row, so the switch changes what
+  the list is *about*, not what a list *is*. **The add action moved above the
+  list in both**: at the foot it cost a scroll through everything already
+  there to reach the control that adds one more, and the fuller the list the
+  further the control retreated. *Granted to nobody* is said in the closed
+  bundle row rather than only inside it.
 - **People and Access both start closed inside a group, and the expanded
   group is quieter.** Opening a group is a step toward an answer, not the
   answer, and unrolling the tallest thing on the page for someone who came to

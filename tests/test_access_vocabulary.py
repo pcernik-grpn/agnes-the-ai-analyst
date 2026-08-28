@@ -150,9 +150,17 @@ class TestRowsAndTheirHandlerAgree:
         assert 'closest("tr[data-rid]")' not in src
         assert 'closest("[data-rid]")' in src
 
-    def test_both_views_mark_their_rows_the_same_way(self):
-        """The grid rows and the bundle view's table rows both carry it, so
-        one handler serves both."""
+    def test_both_views_emit_the_same_row(self):
+        """Both views render the SAME row element now.
+
+        By group and By bundle sat on one page looking like two products —
+        one a collapsible row with counts, the other a permanently-open block
+        with a table under it. They share `.ax-r` and `.ax-gs`, so switching
+        changes what the list is about, not what a list is. The bundle view's
+        `<tr>`s are gone, which is also why the tag-specific handler could
+        never have been caught by using that view.
+        """
         src = self._source()
-        assert 'class="ax-r" data-type=' in src      # group view, a <div>
-        assert '<tr data-type=' in src               # bundle view, a <tr>
+        assert src.count('class="ax-r" data-type=') == 2   # one per view
+        assert "<tr data-type=" not in src
+        assert 'class="ax-gs ax-gs--bb' in src             # a bundle is a group-shaped row
