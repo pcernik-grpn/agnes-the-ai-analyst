@@ -240,8 +240,23 @@ def logout():
     typer.echo("Logged out.")
 
 
+def _fetch_external_identity():
+    """The caller's linked external identity from the server, or ``None``
+    when it cannot be answered (offline, DuckDB-backed instance's typed 501,
+    older server). whoami stays useful offline, so this is best-effort."""
+    try:
+        from cli.client import api_get
+
+        resp = api_get("/api/me/external-identity", timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
 @auth_app.command()
-def whoami():
+def whoami(as_json: bool = typer.Option(False, "--json", help="Machine-readable output")):
     """Show current user info."""
     token = get_token()
     if not token:
@@ -252,11 +267,33 @@ def whoami():
 
     try:
         payload = jwt.decode(token, options={"verify_signature": False})
-        typer.echo(f"Email: {payload.get('email', 'unknown')}")
-        typer.echo(f"Server: {get_server_url()}")
         from cli.token_status import format_status_line
 
+        identity = _fetch_external_identity()
+        if as_json:
+            import json as _json
+
+            typer.echo(
+                _json.dumps(
+                    {
+                        "email": payload.get("email"),
+                        "server": get_server_url(),
+                        "token": format_status_line(token),
+                        "external_identity": identity,
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
+            return
+        typer.echo(f"Email: {payload.get('email', 'unknown')}")
+        typer.echo(f"Server: {get_server_url()}")
         typer.echo(f"Token: {format_status_line(token)}")
+        if identity is not None:
+            if identity.get("linked"):
+                typer.echo(f"Linked identity: {identity['subject']} (Entra tenant {identity['tenant_id']})")
+            else:
+                typer.echo("Linked identity: none")
     except Exception:
         typer.echo("Invalid token. Run: agnes login")
         raise typer.Exit(1)
