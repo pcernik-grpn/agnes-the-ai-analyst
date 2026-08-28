@@ -51,7 +51,7 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        ``?confirm_connection_change=true`` to apply (RBAC
                                                        review second round, 2026-08-26; see
                                                        ``_guard_default_repoint``). Success (204) carries an
-                                                       ``X-Semantic-References-Count`` header — informational
+                                                       ``X-Agnes-Semantic-References`` header — informational
                                                        only, never blocks the delete (Block 5 of #1707).
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
@@ -1065,7 +1065,7 @@ async def delete_connection(
     2026-08-26; ``?confirm_connection_change=true`` to apply). See
     :func:`_guard_default_repoint`.
 
-    Success carries an ``X-Semantic-References-Count`` header — the number
+    Success carries an ``X-Agnes-Semantic-References`` header — the number
     of semantic sources/models tied to this connection (Block 5 of #1707).
     A header, not a body field: the response is ``204 No Content`` (pinned
     by ``test_delete_returns_204``), and this is informational only — it
@@ -1121,7 +1121,7 @@ async def delete_connection(
     # turn an otherwise-successful delete into a 500; the row is already
     # gone by this point, and there is nothing left to retry.
     try:
-        response.headers["X-Semantic-References-Count"] = str(_semantic_reference_count(connection_id))
+        response.headers["X-Agnes-Semantic-References"] = str(_semantic_reference_count(connection_id))
     except Exception:
         logger.warning(
             "could not compute semantic-reference count for deleted connection %s", connection_id, exc_info=True

@@ -538,7 +538,7 @@ class TestSourceConnectionsDelete:
 
         resp2 = c.delete(f"{BASE}/{conn_id}", headers=_auth(token))
         assert resp2.status_code == 204
-        assert resp2.headers.get("X-Semantic-References-Count") == "0"
+        assert resp2.headers.get("X-Agnes-Semantic-References") == "0"
 
     def test_delete_reports_a_semantic_source_and_the_model_it_fed(self, seeded_app):
         c = seeded_app["client"]
@@ -578,7 +578,38 @@ class TestSourceConnectionsDelete:
         resp2 = c.delete(f"{BASE}/{conn_id}", headers=_auth(token))
         assert resp2.status_code == 204
         # 1 semantic source + 1 model fed by it.
-        assert resp2.headers.get("X-Semantic-References-Count") == "2"
+        assert resp2.headers.get("X-Agnes-Semantic-References") == "2"
+
+    def test_delete_omits_header_when_semantic_reference_count_raises(self, seeded_app, monkeypatch):
+        """Fail-open (Block 5 of #1707): the row is already gone by the time
+        the header is computed, so a broken ``semantic_source_repo``/
+        ``semantic_model_repo`` read must not turn a successful delete into
+        a 500 — the delete still returns 204 with the header simply
+        omitted, matching the ``except Exception`` guard around the header
+        assignment."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "test-keboola-count-raises",
+                "source_type": "keboola",
+                "config": {"stack_url": "https://connection.example.com"},
+            },
+            headers=_auth(token),
+        )
+        conn_id = resp.json()["id"]
+
+        import src.repositories as repositories
+
+        def _boom():
+            raise RuntimeError("semantic repo unavailable")
+
+        monkeypatch.setattr(repositories, "semantic_source_repo", _boom)
+
+        resp2 = c.delete(f"{BASE}/{conn_id}", headers=_auth(token))
+        assert resp2.status_code == 204
+        assert "X-Agnes-Semantic-References" not in resp2.headers
 
     def test_delete_in_use_returns_409(self, seeded_app):
         c = seeded_app["client"]
