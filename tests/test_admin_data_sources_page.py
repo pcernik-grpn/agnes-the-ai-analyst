@@ -1454,6 +1454,65 @@ class TestSharePointSourceCard:
             assert cert["origin"] == "env"
             assert cert["env_name"] == "SHAREPOINT_CERT_PRIVATE_KEY"
             assert "-----BEGIN PRIVATE KEY-----" not in str(cert)
+            # No CERTIFICATE PEM block in this stored value -> a clean typed
+            # absence, not a missing key / a crash.
+            assert cert["metadata_reason"] == "no_certificate_configured"
+            assert "thumbprint_x5t" not in cert
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_certificate_metadata_flows_through_from_a_real_certificate(self, seeded_app, monkeypatch):
+        """The thumbprint/subject/expiry `certificate_metadata` derives are
+        merged into the same cell the settings-resolution fields already
+        populate — one certificate row, not two competing sources of truth."""
+        import datetime
+        import uuid
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agnes-test")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=90))
+            .sign(key, hashes.SHA256())
+        )
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode()
+        pem = cert_pem + key_pem
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1", "cert_private_key_env": "SHAREPOINT_CERT_PRIVATE_KEY"},
+        )
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", pem)
+        try:
+            inv = _source_inventory()
+            cert_cell = inv["pipelines"][conn_id]["file_source"]["certificate"]
+            assert cert_cell["origin"] == "env"  # settings-resolution field, unaffected
+            assert cert_cell["subject"] == "CN=agnes-test"
+            assert cert_cell["issuer"] == "CN=agnes-test"
+            assert cert_cell["status"] == "ok"
+            assert cert_cell["thumbprint_x5t"]
+            assert "-----BEGIN PRIVATE KEY-----" not in str(cert_cell)
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1721,6 +1780,120 @@ console.log(_host.innerHTML);
         `anonymization_declared` alone."""
         html = self._run([self._row(anonymize=False, anonymization_declared=True)])
         assert "sp-badge--anon" not in html
+
+
+class TestSharePointCertificateMetadataRendering:
+    """Certificate metadata rows (thumbprint, subject/issuer, expiry status)
+    on the file-source card — introduced alongside
+    `GET .../connections/{id}/certificate` (integration, #1704). Same
+    node-harness pattern; kept as its own class rather than folded back
+    into `TestSharePointSourceCardRendering` so a merge conflict here next
+    time is a smaller diff."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+    _FILE_SOURCE = TestSharePointSourceCardRendering._FILE_SOURCE
+    _run = TestSharePointSourceCardRendering._run
+
+    def test_certificate_metadata_renders_thumbprint_subject_and_ok_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "vault",
+            "env_name": None,
+            "set_at": "2026-08-20T12:00:00+00:00",
+            "error": None,
+            "thumbprint_x5t": "abcXYZ123-_",
+            "thumbprint_sha1_hex": "AB" * 20,
+            "subject": "CN=agnes-test",
+            "issuer": "CN=agnes-test",
+            "not_before": "2026-08-01T00:00:00+00:00",
+            "not_after": "2027-08-01T00:00:00+00:00",
+            "expires_in_days": 300,
+            "status": "ok",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "abcXYZ123-_" in html
+        assert "CN=agnes-test" in html
+        assert "badge-ok" in html
+        assert "300d left" in html
+
+    def test_certificate_metadata_expiring_soon_gets_the_warn_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "env",
+            "env_name": "SHAREPOINT_CERT_PRIVATE_KEY",
+            "set_at": None,
+            "error": None,
+            "thumbprint_x5t": "thumb-soon",
+            "thumbprint_sha1_hex": "CD" * 20,
+            "subject": "CN=agnes-test",
+            "issuer": "CN=agnes-test",
+            "not_before": "2026-01-01T00:00:00+00:00",
+            "not_after": "2026-09-05T00:00:00+00:00",
+            "expires_in_days": 8,
+            "status": "expiring_soon",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "badge-warn" in html
+        assert "8d left" in html
+
+    def test_certificate_metadata_expired_gets_the_danger_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "env",
+            "env_name": "SHAREPOINT_CERT_PRIVATE_KEY",
+            "set_at": None,
+            "error": None,
+            "thumbprint_x5t": "thumb-expired",
+            "thumbprint_sha1_hex": "EF" * 20,
+            "subject": "CN=agnes-test",
+            "issuer": "CN=agnes-test",
+            "not_before": "2025-01-01T00:00:00+00:00",
+            "not_after": "2025-06-01T00:00:00+00:00",
+            "expires_in_days": -80,
+            "status": "expired",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "badge-danger" in html
+        assert "expired 80d ago" in html
+
+    def test_no_certificate_configured_renders_a_clean_absence_not_a_blank_card(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "env",
+            "env_name": "SHAREPOINT_CERT_PRIVATE_KEY",
+            "set_at": None,
+            "error": None,
+            "metadata_reason": "no_certificate_configured",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "not configured" in html
+        assert "badge-ok" not in html and "badge-warn" not in html and "badge-danger" not in html
+
+    def test_unparseable_certificate_renders_unreadable_not_a_blank_card(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "vault",
+            "env_name": None,
+            "set_at": "2026-08-20T12:00:00+00:00",
+            "error": None,
+            "metadata_reason": "certificate_unparseable: bad PEM",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "unreadable" in html
+
+    def test_settings_resolution_error_does_not_duplicate_the_not_configured_row(self):
+        """`cert.error` (a settings-RESOLUTION failure) already renders "not
+        configured" via the existing Certificate row — the metadata rows must
+        not repeat that verdict a second time."""
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": None,
+            "env_name": None,
+            "set_at": None,
+            "error": "SharePoint connection is missing required field(s): tenant_id, client_id",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert html.count("Thumbprint") == 0
 
 
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
