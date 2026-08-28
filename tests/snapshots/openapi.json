@@ -55173,7 +55173,7 @@
     },
     "/auth/password/change": {
       "get": {
-        "description": "Self-serve change-password page, linked from the account menu.",
+        "description": "Self-serve change-password page, linked from the account menu.\n\nA forced-to-SSO account renders the same single-sign-on state a\nhash-less account gets, even when it still holds a hash \u2014 the password\ndoor is shut for it, so offering the change form would be a lie.",
         "operationId": "password_change_page_auth_password_change_get",
         "parameters": [
           {

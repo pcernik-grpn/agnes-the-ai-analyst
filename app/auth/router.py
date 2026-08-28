@@ -93,6 +93,15 @@ async def create_token(
     # Strip only — case is folded by the lookup (SQL). A pasted address
     # carries whitespace and must not be a hard auth failure.
     email = (body.email or "").strip()
+    from app.auth.providers.sso import sso_forced_for_email
+
+    if sso_forced_for_email(email):
+        # Forced to the sso door — the copy this endpoint already answers
+        # for accounts with no password hash.
+        raise HTTPException(
+            status_code=401,
+            detail="This account uses external authentication. Please log in via your configured provider.",
+        )
     canonical = repo.get_by_email_ci(email)
     if not canonical:
         raise HTTPException(status_code=401, detail="User not found")

@@ -125,10 +125,22 @@ them; the domain allowlist does. The authorize redirect forces
 session) gets the account picker instead of a silent SSO into a
 domain-allowlist refusal.
 
-**Both login doors stay open.** A user who links an external identity keeps
-every other way in (password, Google, magic link — whatever the instance
-offers). There is no SSO enforcement or lockout; the external IdP's
-MFA/conditional-access posture protects only the SSO door.
+**Allowlisted domains are forced to the SSO door.** While the config is
+enabled (and `sso` is offered under `auth.providers`), an address whose
+domain is in `allowed_email_domains` can sign in **only** through SSO: the
+password and magic-link doors refuse it — login, forgot-password, invite
+and magic-link legs alike, including redemption of links minted before the
+domain joined the allowlist. This is what makes the delegation real: when
+the customer tenant offboards someone, no previously set password or
+bookmarked link keeps their Agnes access alive. Browser forms redirect such
+addresses to `/auth/sso/login`; JSON credential endpoints answer their
+usual generic refusal (no domain oracle). Existing password hashes are left
+in place, just unusable — remove the domain from the allowlist (or disable
+SSO) and those doors open again; nothing is destroyed. The forcing covers
+the local credential doors (password, magic link, `/auth/token`); OAuth
+providers keep their own domain gates as before. The external IdP's
+MFA/conditional-access posture therefore protects the ONLY door these
+domains have.
 
 **Accepted risks (v1), documented rather than mitigated:** first-login email
 attach itself (same semantics as every Agnes provider); no session revocation
@@ -162,6 +174,12 @@ is the detective control.
   for an admin, or widen `auth.providers`. Break-glass with server access:
   the `AGNES_AUTH_PROVIDERS` env override (env wins over instance.yaml) plus
   the registry's password/email rescue.
+- **Domain forcing follows the live config** — it applies exactly while the
+  provider is enabled, complete and offered, with no persistent state of its
+  own. Each of the guarded operations above also lifts the forcing, which is
+  why a password holder inside a forced domain still satisfies the guard:
+  their password door is the one that reopens the moment the operation
+  lands.
 - **Deleting the config keeps the identity rows** — they are historically
   true links, inert unless the same tenant is configured again, purgeable
   per-user via `unlink`.
@@ -200,3 +218,8 @@ is the detective control.
   *Assignment required = Yes* on their Enterprise Application (see the
   checklist); Agnes's allowlist still refuses foreign domains, but the
   tenant-side gate should be closed too.
+- **A permitted-domain user reports password login / forgot-password
+  bouncing them to the SSO sign-in** → working as designed: their domain is
+  in `allowed_email_domains`, so the SSO door is the only one that opens
+  (see the trust model). If that user genuinely should not be federated,
+  their domain does not belong on the allowlist.
