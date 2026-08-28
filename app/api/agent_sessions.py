@@ -215,27 +215,14 @@ async def create_agent_session(
     manager = get_current_chat_manager()
     if manager is None:
         raise HTTPException(status_code=503, detail={"code": "chat_disabled"})
-    # An agent's persona and memory notebook are delivered by materializing
-    # them into the session workspace (`ChatManager.create_session` ->
-    # `agent_profile.materialize_memories`). A provider that brings its own
-    # runtime never reads that directory, so the agent's system prompt, tone,
-    # greeting and memories simply do not reach the turn — the caller would
-    # get the instance template persona under the agent's name, and a
-    # narrowed-scope agent would additionally 403 on every tool call.
-    # Refuse rather than answer wrongly: this endpoint's whole contract is
-    # "run as THIS agent".
-    if getattr(getattr(manager, "_provider", None), "provides_own_credentials", False) is True:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "agent_sessions_unavailable_on_provider",
-                "hint": (
-                    "This instance runs chat on an embedded turn engine that does not read the "
-                    "agent workspace, so an agent's persona and memories cannot be applied. Use "
-                    "the native chat provider to serve the agent API."
-                ),
-            },
-        )
+    # This endpoint's contract — "run as THIS agent" — holds on every
+    # provider: the native ones read the persona/memories the manager
+    # materializes into the session workspace, and the embedded kai-agent
+    # engine receives the same three artifacts in its workspace tarball
+    # (`app/api/kai.py::_agent_workspace_members`) with a scoped agent's tool
+    # authority enforced live at `/api/kai/mcp` (`_mint_mcp_access_token`).
+    # The 503 guard that used to refuse self-credentialed providers here
+    # predates both halves and must not come back — a static test pins that.
     try:
         session = await manager.create_session(
             user_email=user["email"],
