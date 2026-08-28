@@ -2245,7 +2245,7 @@ KNOWN_UNTESTED = {
     "GET /admin/chat",
     "GET /admin/chat/readiness",
     "GET /admin/chat/{chat_id}/debug",
-    "GET /admin/chat/{chat_id}/tail-ticket",
+    "POST /admin/chat/{chat_id}/tail-ticket",
     "GET /admin/corporate-memory",
     "GET /admin/database",
     "GET /admin/grants",
