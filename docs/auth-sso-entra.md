@@ -125,22 +125,25 @@ them; the domain allowlist does. The authorize redirect forces
 session) gets the account picker instead of a silent SSO into a
 domain-allowlist refusal.
 
-**Allowlisted domains are forced to the SSO door.** While the config is
-enabled (and `sso` is offered under `auth.providers`), an address whose
-domain is in `allowed_email_domains` can sign in **only** through SSO: the
-password and magic-link doors refuse it — login, forgot-password, invite
-and magic-link legs alike, including redemption of links minted before the
-domain joined the allowlist. This is what makes the delegation real: when
+**Allowlisted domains are forced off the local credential doors.** While
+the config is enabled (and `sso` is offered under `auth.providers`), the
+password and magic-link doors — login, `/auth/token`, forgot-password,
+invite and magic-link legs alike, including redemption of links minted
+before the domain joined the allowlist — refuse every address whose domain
+is in `allowed_email_domains`. This is what makes the delegation real: when
 the customer tenant offboards someone, no previously set password or
 bookmarked link keeps their Agnes access alive. Browser forms redirect such
 addresses to `/auth/sso/login`; JSON credential endpoints answer their
 usual generic refusal (no domain oracle). Existing password hashes are left
 in place, just unusable — remove the domain from the allowlist (or disable
-SSO) and those doors open again; nothing is destroyed. The forcing covers
-the local credential doors (password, magic link, `/auth/token`); OAuth
-providers keep their own domain gates as before. The external IdP's
-MFA/conditional-access posture therefore protects the ONLY door these
-domains have.
+SSO) and those doors open again; nothing is destroyed. The scope is the
+**local credential doors only**: the OAuth providers (google, microsoft,
+keboola) are separate doors with their own domain policies, unchanged by
+the forcing — if one of them is enabled and its policy admits an
+allowlisted domain, it remains a way in, so keep those policies from
+overlapping the SSO allowlist if the offboarding guarantee is to be
+complete. Within its scope the external IdP's MFA/conditional-access
+posture protects the only door these domains have.
 
 **Accepted risks (v1), documented rather than mitigated:** first-login email
 attach itself (same semantics as every Agnes provider); no session revocation

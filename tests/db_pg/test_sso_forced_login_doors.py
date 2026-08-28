@@ -141,6 +141,17 @@ def test_auth_token_still_works_outside_forced_domains(forced_env):
     assert r.json()["access_token"]
 
 
+def test_auth_token_unknown_forced_address_matches_unknown_elsewhere(forced_env):
+    """An address with NO account must answer identically inside and outside
+    the forced domains — the forcing refuses existing accounts, it must not
+    become a domain-membership oracle for arbitrary strings."""
+    client, _ = forced_env
+    inside = client.post("/auth/token", json={"email": f"ghost@{FORCED_DOMAIN}", "password": PASSWORD})
+    outside = client.post("/auth/token", json={"email": f"ghost@{OTHER_DOMAIN}", "password": PASSWORD})
+    assert inside.status_code == outside.status_code == 401
+    assert inside.json()["detail"] == outside.json()["detail"]
+
+
 def test_password_login_web_redirects_forced_domain_to_sso(forced_env):
     client, _ = forced_env
     r = client.post(
@@ -318,6 +329,23 @@ def test_setup_json_refuses_invite_for_forced_domain(forced_env):
     assert r.status_code == 400
     assert r.json()["detail"] == "Invalid setup token"
     assert _row("jit3").get("password_hash") is None
+
+
+def test_setup_json_unknown_forced_address_matches_unknown_elsewhere(forced_env):
+    """Same rule on the JSON setup leg: unknown addresses keep this
+    endpoint's pre-existing unknown-address response (404) on both sides of
+    the allowlist — no domain oracle for arbitrary strings."""
+    client, _ = forced_env
+    inside = client.post(
+        "/auth/password/setup",
+        json={"email": f"ghost@{FORCED_DOMAIN}", "token": "whatever", "password": "brand-new-password-1"},
+    )
+    outside = client.post(
+        "/auth/password/setup",
+        json={"email": f"ghost@{OTHER_DOMAIN}", "token": "whatever", "password": "brand-new-password-1"},
+    )
+    assert inside.status_code == outside.status_code == 404
+    assert inside.json()["detail"] == outside.json()["detail"] == "User not found"
 
 
 def test_setup_json_still_works_outside_forced_domains(forced_env):

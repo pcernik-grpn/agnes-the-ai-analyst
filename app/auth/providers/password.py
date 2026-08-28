@@ -470,7 +470,13 @@ async def password_setup(
     email = (request_body.email or "").strip()
     if sso_forced_for_email(email):
         # Forced to the sso door — a pre-minted invite must not redeem once
-        # the domain is in the allowlist. Same copy an unknown token gets.
+        # the domain is in the allowlist. The refusal mirrors this
+        # endpoint's existing response pair so an arbitrary string learns
+        # nothing about the allowlist: unknown addresses keep the same 404
+        # they get outside the forced domains, known ones get the same copy
+        # an unknown token gets.
+        if not repo.get_by_email_ci(email):
+            raise HTTPException(status_code=404, detail="User not found")
         raise HTTPException(status_code=400, detail="Invalid setup token")
     # The invitation is minted by user id, so it can sit on a case variant the
     # oldest-wins lookup does not return — resolve by the token it carries.
