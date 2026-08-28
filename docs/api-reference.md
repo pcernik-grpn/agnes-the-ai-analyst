@@ -1493,10 +1493,20 @@ unresolved ids itemized. Corrections management
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
 
+Every successful ingest batch also persists a copy of its run report to
+`facts_ingest_runs` — written AFTER the ingest transaction commits, so a
+report-write failure never rolls back or fails the ingest itself (see
+`app/api/facts.py::facts_ingest`). `GET /api/facts/ingest-runs?limit=`
+(admin, default `20`, max `200`) lists them newest-first: this is what the
+`/admin/data-sources` source card (spec §13.2) reads for its pipeline-strip
+counts and per-category error badges — an admin-only, UI-internal surface,
+not an analyst query (no CLI/MCP analogue).
+
 - /api/facts/search
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
+- /api/facts/ingest-runs
 - /api/facts/corrections
 - /api/facts/corrections/{subject_kind}/{subject_id}
 

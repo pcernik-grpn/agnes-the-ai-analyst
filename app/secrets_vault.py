@@ -511,10 +511,10 @@ class ConnectionSecretsRepository:
         return row is not None
 
     def updated_at(self, connection_id: str) -> Optional[str]:
-        """When this secret was last stored (upsert's ``current_timestamp``),
-        or ``None`` if no secret is stored. The value is never a secret — a
-        set-date badge (e.g. the SharePoint wizard's certificate row) can
-        show "set 2026-08-14" without ever reading ``get()``."""
+        """When this connection's vault secret was last set/rotated, or
+        ``None`` if no row exists. Never touches ``ciphertext`` — a set-date
+        badge (the SharePoint wizard's / source card's certificate row, spec
+        §13.2) can show "set 2026-08-14" without ever reading ``get()``."""
         row = self.conn.execute(
             "SELECT updated_at FROM connection_secrets WHERE connection_id = ?",
             [connection_id],

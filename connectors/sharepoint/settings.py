@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from src.orchestrator_security import is_token_env_allowed
@@ -74,6 +75,11 @@ class SharePointSettings:
     #: The env var consulted, or ``None`` when the key came from the vault.
     #: Kept for the same reason: the page shows the name, never the value.
     credential_env: Optional[str] = None
+    #: WHEN a vault-provided certificate was last set/rotated (``None`` for
+    #: an env-sourced one — an env var carries no timestamp of its own, and
+    #: none is invented). The source card's certificate row (spec §13.2)
+    #: shows this alongside ``credential_source``, never the value.
+    credential_set_at: Optional[datetime] = None
 
 
 def _vault_secret(connection_id: str) -> Optional[str]:
@@ -89,6 +95,25 @@ def _vault_secret(connection_id: str) -> Optional[str]:
         return connection_secrets_repo().get(connection_id) or None
     except Exception:  # pragma: no cover — no vault configured, or no such row
         logger.debug("sharepoint: no vault secret for connection %s", connection_id, exc_info=True)
+        return None
+
+
+def _vault_secret_updated_at(connection_id: str) -> Optional[datetime]:
+    """When ``_vault_secret``'s row was last set/rotated, or ``None``.
+
+    Deliberately a SEPARATE lookup rather than folding this into
+    ``_vault_secret`` — the plaintext getter's contract (a bare string or
+    ``None``) stays unchanged for every other caller, and this one never
+    touches ``ciphertext``. Same tolerant-of-no-vault posture: any failure
+    here degrades to "set-date unknown", never a resolution failure — the
+    card would rather show a blank set-date than hide a working credential.
+    """
+    try:
+        from src.repositories import connection_secrets_repo
+
+        return connection_secrets_repo().updated_at(connection_id)
+    except Exception:  # pragma: no cover — no vault configured, or no such row
+        logger.debug("sharepoint: no vault set-date for connection %s", connection_id, exc_info=True)
         return None
 
 
@@ -126,13 +151,15 @@ def resolve_sharepoint_settings(connection: Dict[str, Any]) -> SharePointSetting
     if missing:
         raise SharePointSettingsError("SharePoint connection is missing required field(s): " + ", ".join(missing))
 
-    vault_value = _vault_secret(connection.get("id") or "")
+    connection_id = connection.get("id") or ""
+    vault_value = _vault_secret(connection_id)
     if vault_value:
         return SharePointSettings(
             tenant_id=str(config["tenant_id"]).strip(),
             client_id=str(config["client_id"]).strip(),
             private_key=vault_value,
             credential_source="vault",
+            credential_set_at=_vault_secret_updated_at(connection_id),
         )
 
     env_name = str(config.get("cert_private_key_env") or "").strip() or SHAREPOINT_CERT_PRIVATE_KEY_ENV

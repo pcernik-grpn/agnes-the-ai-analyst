@@ -50,6 +50,13 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # 200 (empty list, nothing seeded). Requires the flag forced on below (this
 # sweep leaves it off by default, unlike the mutation sweep) so the route
 # is actually reached rather than 404ing identically on both backends.
+#
+# `GET /api/facts/ingest-runs` (spec §13.2 source card) is the same shape:
+# parameter-free (its `limit` is a query param with a default, so the
+# route matches with no path template), reaches
+# `facts_ingest_runs_repo().list_recent(...)` — a SEPARATE PG-only repo
+# from `facts_repo()` (see src/repositories/facts_ingest_runs_pg.py) so it
+# needs its own exemption entry even though the reason reads similarly.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     "GET /api/facts/corrections": (
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
@@ -61,6 +68,10 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     "GET /api/admin/ontology/drafts": (
         "ontology_drafts_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/ontology_drafts_pg.py"
+    ),
+    "GET /api/facts/ingest-runs": (
+        "facts_ingest_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/facts_ingest_runs_pg.py"
     ),
 }
 
