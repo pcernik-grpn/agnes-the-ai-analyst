@@ -339,10 +339,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     schema-checks a local file with no server and no token at all. Both helps
     now say, prominently, that `validate` (a document) is not `validate-query`
     (a SQL statement).
-  - `coverage`, `health`, `mute`, `mutes` and `unmute` moved the other way, to
-    `agnes admin semantic …`: every endpoint behind them is `require_admin`,
-    so sitting in the any-user group advertised authority the caller did not
-    have.
+  - `coverage`, `health`, `mute`, `mutes`, `unmute` and the queue half of
+    `feedback` (`feedback list` / `feedback resolve` → `agnes admin semantic
+    feedback list|resolve`) moved the other way, to `agnes admin semantic …`:
+    every endpoint behind them is `require_admin`, so sitting in the any-user
+    group advertised authority the caller did not have. `feedback submit`
+    stays in `agnes semantic-model` — filing "that answer looked wrong" is
+    open to anyone signed in, and belongs beside the analysis that produced
+    the bad number.
   - `agnes admin semantic-layer coverage` is now **`agnes admin semantic
     keboola-import`**. Three commands called themselves coverage while
     answering three different questions; this one predicts what a live Keboola
@@ -359,17 +363,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     stops teaching two names for one thing, and an alias cannot drift from
     what it replaces. The notice goes to stderr so `… --json | jq` is
     unaffected. The aliases will be removed in a later release.
-- **`agnes mcp` is hidden: the stdio MCP server is internal, not an end-user
-  surface.** Wiring it into a client by hand was an experiment. It stays fully
-  functional — the hosted chat sandbox spawns one per session and `agnes global
-  enable` registers it with Claude Code — but it is no longer advertised in
-  `agnes --help` or documented as something to set up, and its tool set is now
+- **The stdio MCP server is internal, not an end-user surface — the bare
+  `agnes mcp` invocation is no longer advertised.** Wiring it into a client by
+  hand was an experiment. It stays fully functional — the hosted chat sandbox
+  spawns one per session and `agnes global enable` registers it with Claude
+  Code — but `agnes mcp --help` now leads with what a user can actually do
+  here, the explicit spelling `agnes mcp serve` is hidden, and the tool set is
   pinned by an exact-set test so it does not grow. An external MCP client
   should use the server's HTTP transports, which carry the full RBAC-filtered
-  foundation tool set. The group's other commands (`agnes mcp connect` /
-  `disconnect` / `my-secret …`) are unchanged and still supported; they are
-  listed by `agnes mcp --help` and documented in `docs/api-reference.md`, just
-  no longer surfaced at the top level.
+  foundation tool set. Only the SERVER is unadvertised: the group itself stays
+  visible in `agnes --help`, because `agnes mcp connect` / `disconnect` /
+  `my-secret …` are supported user commands — and a missing per-user
+  credential is answered by the server with `agnes mcp my-secret set
+  <source-id>` by name, a remedy that hiding the group would have hidden.
 - **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
   The endpoint dials a connection the admin has typed but not saved — with a
   credential attached, or on `stdio` by launching a subprocess with a
@@ -1150,8 +1156,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   and an agent's read path is `agnes semantic-model context` / the semantic
   cache `agnes pull` renders. Removed rather than aliased — an alias would
   keep teaching a path that leads nowhere. Its engine
-  (`src/data_semantics_scaffold.py`) now has no caller and is queued for
-  deletion.
+  (`src/data_semantics_scaffold.py`) loses its CLI entry point but stays a
+  live dependency: `src/semantic/cache_render.py` imports `_dump_yaml` /
+  `humanize` from it and runs on the `agnes pull` path. Only the
+  scaffold-specific generation half is a deletion candidate, and only once
+  those shared helpers move to a module of their own.
 
 - **The old page's Keboola-specific "orphaned rows" count, "also connected
   but not syncing" list, and "legacy / unattributed" bucket are gone.** All

@@ -373,14 +373,15 @@ class TestToolRegistration:
             # disconnected models, invalid documents, static document-quality
             # checks, F4.1's coverage roll-up, and F4.3's active mutes.
             # Triple-surface with GET /api/admin/semantic-layer/health +
-            # `agnes semantic-model health`.
+            # `agnes admin semantic health`.
             "semantic_layer_health",
             # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the
             # one write here an ordinary caller may make — an agent that cannot
             # ground its answer is the intended reporter; the other two are the
             # admin side of the same queue. Triple-surface with
             # /api/semantic-feedback + /api/admin/semantic-feedback* + `agnes
-            # semantic-model feedback submit|list|resolve`.
+            # semantic-model feedback submit` / `agnes admin semantic feedback
+            # list|resolve`.
             "flag_semantic_issue",
             "semantic_feedback_list",
             "semantic_feedback_resolve",

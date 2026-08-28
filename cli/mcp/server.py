@@ -12,8 +12,11 @@ do the wiring themselves:
 experiment, and the supported way for an external MCP client to reach Agnes
 is the server's own HTTP transports (``app/api/mcp_http.py`` /
 ``mcp_streamable.py``, whose tools are defined once in
-``app/api/mcp/foundation_tools.py``). The command is therefore hidden in
-``cli/main.py`` while staying fully functional.
+``app/api/mcp/foundation_tools.py``). The SERVER invocation is therefore
+unadvertised — its explicit spelling ``agnes mcp serve`` is registered
+``hidden=True`` and the group's help leads with the connection commands —
+while staying fully functional. The ``agnes mcp`` GROUP itself stays visible:
+``connect``/``disconnect``/``my-secret`` are supported user commands.
 
 **Its tool set is deliberately closed.** New tools — semantic-layer tools in
 particular — go to the HTTP foundation surface only; the exact set here is

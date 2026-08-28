@@ -4,7 +4,7 @@ Everything here is reachable without admin: find a model (`search`), read its
 metadata (`show`) or its document (`export`), check a document (`validate`) or
 a query (`validate-query`) before either reaches the server, look objects up
 (`context`), read the schema they must conform to (`schema`), propose a change
-(`apply`), and report an answer that looked wrong (`feedback`).
+(`apply`), and report an answer that looked wrong (`feedback submit`).
 
 RBAC is per-model, not per-command: `search`/`show`/`export`/`context`/
 `validate-query` read whatever `status='valid'` models the caller can already
@@ -16,18 +16,20 @@ Two commands are easy to confuse, so both helps say so:
   * ``validate <file>``  — is this DOCUMENT well-formed? Offline, no token.
   * ``validate-query <sql>`` — does this QUERY obey the models I can read?
 
-The admin half — importing, deleting, sources, coverage, health, mutes — is
-``agnes admin semantic`` (:mod:`cli.commands.admin_semantic`). The admin-only
-commands that used to live in THIS group (``coverage``, ``health``, ``mute``,
-``mutes``, ``unmute``) survive here for one release as hidden aliases; they
-were always admin-gated on the API side, so their home was simply wrong.
+The admin half — importing, deleting, sources, coverage, health, mutes, and
+the feedback QUEUE (``feedback list``/``resolve``) — is ``agnes admin
+semantic`` (:mod:`cli.commands.admin_semantic`). The admin-only commands that
+used to live in THIS group (``coverage``, ``health``, ``mute``, ``mutes``,
+``unmute``, ``feedback list``, ``feedback resolve``) survive here for one
+release as hidden aliases; they were always admin-gated on the API side, so
+their home was simply wrong.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import typer
 
@@ -47,17 +49,18 @@ _SEARCH_PATH = "/api/semantic-models/search"
 _SEARCH_LIMIT_MAX = 100
 
 # Feedback (F4.5) — "that answer looked wrong". `submit` is open to any
-# signed-in caller; `list`/`resolve` are the admin side of the same queue.
-# All three ship together on purpose: a report must be fileable from every
-# surface (UI, chat, MCP, CLI), not only the ones an admin uses — and the
-# queue stays beside the form so an admin working a report never has to
-# switch groups mid-task.
-feedback_app = typer.Typer(help="Report a wrong/unsupported answer, and work the report queue")
+# signed-in caller and lives here, beside the analysis that produced the bad
+# number: a report must be fileable from every surface (UI, chat, MCP, CLI),
+# not only the ones an admin uses. `list`/`resolve` call `require_admin`
+# endpoints and therefore live in `agnes admin semantic feedback` — placement
+# follows authority, the same rule that moved `coverage`/`health`/`mute*` out
+# of this group. Both survive here as hidden aliases for one release.
+feedback_app = typer.Typer(
+    help="Report an answer that looked wrong or unsupported (the queue is `agnes admin semantic feedback`)"
+)
 semantic_model_app.add_typer(feedback_app, name="feedback")
 
 _FEEDBACK_SUBMIT_PATH = "/api/semantic-feedback"
-_FEEDBACK_ADMIN_PATH = "/api/admin/semantic-feedback"
-_FEEDBACK_STATUSES = ("open", "acknowledged", "resolved")
 
 
 def _fail(resp) -> None:
@@ -547,112 +550,31 @@ def feedback_submit(
         return
     typer.echo(f"Filed: {body.get('id')} ({body.get('status', 'open')})")
     typer.echo("  An admin sees it at /admin/semantic-layer?tab=feedback")
-
-
-@feedback_app.command("list")
-def feedback_list(
-    status: Optional[str] = typer.Option(
-        None, "--status", help=f"Only this status ({', '.join(_FEEDBACK_STATUSES)}); omit for all"
-    ),
-    limit: int = typer.Option(0, "--limit", min=0, help="Cap rows shown (0 = no cap)"),
-    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
-):
-    """The report queue, newest first (admin only).
-
-    Stays beside `submit` rather than moving to `agnes admin semantic`: an
-    admin working a report reads the same queue the reporter filed into, and
-    splitting the pair across two groups would make the round trip a group
-    switch. Mirrors `GET /api/admin/semantic-feedback` and the MCP
-    `semantic_feedback_list` tool.
-    """
-    if status is not None and status not in _FEEDBACK_STATUSES:
-        typer.echo(f"Unknown status {status!r} — expected one of {', '.join(_FEEDBACK_STATUSES)}", err=True)
-        raise typer.Exit(1)
-
-    resp = api_get(_FEEDBACK_ADMIN_PATH, params={"status": status} if status else None)
-    _fail_needs_postgres(resp, "The feedback queue")
-    if resp.status_code != 200:
-        _fail(resp)
-
-    body = resp.json()
-    items = body.get("items") or []
-    total = len(items)
-    truncated = limit and limit > 0 and total > limit
-    if truncated:
-        items = items[:limit]
-
-    if as_json:
-        # The JSON surface discloses the cap too — a machine caller must not
-        # read a sliced list as "these are all of them" (command-UX standard).
-        out: dict[str, Any] = {"items": items, "count": len(items)}
-        if truncated:
-            out["truncated"] = {"limit": limit, "total": total}
-        typer.echo(json.dumps(out, indent=2, default=str))
-        return
-
-    if not items:
-        scope = f" with status {status}" if status else ""
-        typer.echo(f"No feedback reports{scope}.")
-        typer.echo('  File one: agnes semantic-model feedback submit "<question>"')
-        return
-
-    for item in items:
-        typer.echo(
-            f"{item.get('id')}  {(item.get('status') or '?'):<12} "
-            f"{(item.get('created_by') or 'unknown'):<28} {item.get('question')}"
-        )
-        if item.get("metric_id"):
-            typer.echo(f"    metric: {item['metric_id']}")
-        if item.get("comment"):
-            typer.echo(f"    comment: {item['comment']}")
-        if item.get("sql"):
-            typer.echo(f"    sql: {item['sql']}")
-        if item.get("resolution_note"):
-            typer.echo(f"    resolved by {item.get('resolved_by')}: {item['resolution_note']}")
-    if truncated:
-        typer.echo(f"… {total - len(items)} more — raise --limit or narrow with --status")
-
-
-@feedback_app.command("resolve")
-def feedback_resolve(
-    feedback_id: str = typer.Argument(..., help="Report id from `agnes semantic-model feedback list`"),
-    note: Optional[str] = typer.Option(None, "--note", help="What was done about it — recorded on the report"),
-    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
-):
-    """Close one report, on the record (admin only).
-
-    Mirrors `POST /api/admin/semantic-feedback/{id}/resolve` and the MCP
-    `semantic_feedback_resolve` tool.
-    """
-    resp = api_post(f"{_FEEDBACK_ADMIN_PATH}/{feedback_id}/resolve", json={"resolution_note": note})
-    _fail_needs_postgres(resp, "Resolving feedback")
-    if resp.status_code == 404:
-        typer.echo(f"No semantic feedback {feedback_id!r}.", err=True)
-        typer.echo("  Find the id: agnes semantic-model feedback list", err=True)
-        raise typer.Exit(1)
-    if resp.status_code == 409:
-        typer.echo(f"Already resolved: {feedback_id}", err=True)
-        typer.echo("  See who closed it: agnes semantic-model feedback list --status resolved", err=True)
-        raise typer.Exit(1)
-    if resp.status_code != 200:
-        _fail(resp)
-
-    body = resp.json()
-    if as_json:
-        typer.echo(json.dumps(body, indent=2, default=str))
-        return
-    typer.echo(f"Resolved: {feedback_id} by {body.get('resolved_by')}")
+    typer.echo("  or with: agnes admin semantic feedback list")
 
 
 # ---------------------------------------------------------------------------
 # Deprecated aliases — the admin-gated commands that used to live here
 #
-# `coverage`, `health`, `mute`, `mutes` and `unmute` all call `require_admin`
-# endpoints; sitting in the any-user group advertised authority the caller did
-# not have. They moved to `agnes admin semantic …` and survive here, hidden,
-# for one release. Each delegates to the SAME function the new path runs, so
-# an alias cannot drift from what it replaces.
+# `coverage`, `health`, `mute`, `mutes`, `unmute` and the two admin halves of
+# `feedback` all call `require_admin` endpoints; sitting in the any-user group
+# advertised authority the caller did not have. They moved to `agnes admin
+# semantic …` and survive here, hidden, for one release. Each delegates to the
+# SAME function the new path runs, so an alias cannot drift from what it
+# replaces.
 # ---------------------------------------------------------------------------
+
+for _name, _fn in (
+    ("list", _admin.feedback_list),
+    ("resolve", _admin.feedback_resolve),
+):
+    deprecated_alias(
+        feedback_app,
+        name=_name,
+        old=f"semantic-model feedback {_name}",
+        new=f"admin semantic feedback {_name}",
+        fn=_fn,
+    )
 
 for _name, _fn in (
     ("health", _admin.health),

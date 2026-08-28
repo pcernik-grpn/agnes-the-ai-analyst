@@ -126,9 +126,9 @@ _COHORT: dict[str, tuple[str, str]] = {
     # (credential-provisioning writes, security-posture diagnostics) covers a
     # bug report about a metric.
     "/api/semantic-feedback": ("semantic-model feedback submit", "flag_semantic_issue"),
-    "/api/admin/semantic-feedback": ("semantic-model feedback list", "semantic_feedback_list"),
+    "/api/admin/semantic-feedback": ("admin semantic feedback list", "semantic_feedback_list"),
     "/api/admin/semantic-feedback/{feedback_id}/resolve": (
-        "semantic-model feedback resolve",
+        "admin semantic feedback resolve",
         "semantic_feedback_resolve",
     ),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
@@ -257,11 +257,36 @@ def test_cli_subcommands_registered():
     deprecated alias is still a reachable surface.
     """
     from cli.main import app
+    from typer.models import DefaultPlaceholder
+
+    def invoke_without_command(group_info) -> bool:
+        """Is this GROUP runnable on its own, per Typer's own resolution order?
+
+        Typer resolves a group's settings from three places, first one that
+        was actually set wins: the ``add_typer()`` call, the group's
+        ``@app.callback()``, then the ``typer.Typer()`` constructor. Anything
+        left unset is a ``DefaultPlaceholder``, not a bool — reading the
+        attribute off any single one of them would report ``False`` for a
+        group that IS callable (and, worse, a placeholder is truthy).
+        """
+        instance = group_info.typer_instance
+        for source in (
+            group_info,
+            getattr(instance, "registered_callback", None),
+            getattr(instance, "info", None),
+        ):
+            if source is None:
+                continue
+            value = getattr(source, "invoke_without_command", None)
+            if value is None or isinstance(value, DefaultPlaceholder):
+                continue
+            return bool(value)
+        return False
 
     def resolve(tokens: list[str]) -> bool:
         node = app
         for i, tok in enumerate(tokens):
-            groups = {g.name: g.typer_instance for g in getattr(node, "registered_groups", []) if g.name}
+            groups = {g.name: g for g in getattr(node, "registered_groups", []) if g.name}
             commands = {c.name for c in getattr(node, "registered_commands", []) if c.name}
             last = i == len(tokens) - 1
             if tok in commands:
@@ -270,14 +295,25 @@ def test_cli_subcommands_registered():
                     return True
                 return False
             if tok in groups:
-                node = groups[tok]
-                # A group with `invoke_without_command=True` is itself callable
-                # (`agnes search`, `agnes admin semantic coverage`).
+                group_info = groups[tok]
+                # A path may END on a group only when that group is itself
+                # callable (`agnes search`, `agnes admin semantic coverage`).
+                # A group that is NOT — `agnes admin semantic` alone prints
+                # help and exits 2 — is not a CLI surface for the endpoint,
+                # so the cohort row is unsatisfied and must say so.
                 if last:
-                    return True
+                    return invoke_without_command(group_info)
+                node = group_info.typer_instance
                 continue
             return False
         return False
+
+    # The resolver has to DISCRIMINATE or the loop below is vacuous: a group
+    # that only dispatches (`agnes admin semantic` prints help and exits 2)
+    # is not a CLI surface, while one with `invoke_without_command=True`
+    # (`agnes admin semantic coverage`) is.
+    assert not resolve(["admin", "semantic"])
+    assert resolve(["admin", "semantic", "coverage"])
 
     for path, (cli_cmd, _mcp_tool) in _COHORT.items():
         assert resolve(cli_cmd.split(" ")), (

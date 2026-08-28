@@ -6,17 +6,21 @@ surface:
 * ``connect`` / ``disconnect`` / ``my-secret`` — supported, user-facing:
   your own credential for an admin-registered MCP source (the CLI half of
   ``/me/connections``). Documented in ``docs/api-reference.md``.
-* bare ``agnes mcp`` — **internal**: starts the stdio MCP server
-  (:mod:`cli.mcp.server`). Retired as a documented end-user path in #1707
-  Block 6; nobody should wire it up by hand. It stays fully functional
-  because two callers spawn it for you — the hosted chat sandbox
-  (``app/chat/runner.py::_agnes_mcp_servers``) starts one per session, and
-  ``agnes global enable`` registers it as a user-scope MCP server in Claude
-  Code. The remote HTTP MCP transports (``/mcp``, SSE) are the supported way
-  for an external client to reach Agnes; new tools go there, not here.
+* bare ``agnes mcp`` (and its explicit spelling ``agnes mcp serve``) —
+  **internal**: starts the stdio MCP server (:mod:`cli.mcp.server`). Retired
+  as a documented end-user path in #1707 Block 6; nobody should wire it up by
+  hand. It stays fully functional because two callers spawn it for you — the
+  hosted chat sandbox (``app/chat/runner.py::_agnes_mcp_servers``) starts one
+  per session, and ``agnes global enable`` registers it as a user-scope MCP
+  server in Claude Code, both invoking the BARE form. The remote HTTP MCP
+  transports (``/mcp``, SSE) are the supported way for an external client to
+  reach Agnes; new tools go there, not here.
 
-The group is registered ``hidden=True`` in ``cli/main.py`` for that reason —
-the commands all still run and ``agnes mcp --help`` still lists them.
+So only the SERVER is unadvertised, not the group: ``serve`` is registered
+``hidden=True`` and the group's help leads with the connection commands, while
+the group itself stays visible in ``agnes --help``. Hiding the whole group
+would have hidden the remedy the server itself prints — ``app/api/mcp_policy.py``
+tells a user to run ``agnes mcp my-secret set <source-id>`` by name.
 """
 
 import time
@@ -29,11 +33,14 @@ from cli.client import api_delete, api_get, api_post, api_put
 from cli.config import get_server_url
 
 mcp_app = typer.Typer(
+    # First line only is what `agnes --help` shows, so it names what a USER
+    # can do here. The internal stdio server shares the namespace and is
+    # described below it, not in the group's headline.
     help=(
-        "Your MCP source connections (connect / disconnect / my-secret). "
-        "Bare `agnes mcp` starts the internal stdio MCP server — spawned for you "
-        "by the hosted chat sandbox and by `agnes global enable`, not a supported "
-        "end-user surface."
+        "Your MCP source connections: connect, disconnect, manage your own secret.\n\n"
+        "Bare `agnes mcp` (or the hidden `agnes mcp serve`) starts the internal stdio MCP "
+        "server — spawned for you by the hosted chat sandbox and by `agnes global enable`, "
+        "not a surface to wire up by hand."
     ),
     invoke_without_command=True,
 )
@@ -45,22 +52,8 @@ my_secret_app = typer.Typer(
 mcp_app.add_typer(my_secret_app, name="my-secret")
 
 
-@mcp_app.callback(invoke_without_command=True)
-def mcp_command(ctx: typer.Context) -> None:
-    """Start the internal Agnes stdio MCP server.
-
-    INTERNAL — not a supported end-user surface (#1707 Block 6). The hosted
-    chat sandbox spawns it per session, and `agnes global enable` registers
-    it as a user-scope MCP server in Claude Code; both do the wiring for you.
-    An external MCP client should connect to the server's own HTTP transports
-    instead.
-
-    For diagnostics only:
-        agnes mcp          # starts the server; Ctrl-C to stop
-    """
-    if ctx.invoked_subcommand is not None:
-        return
-
+def _run_stdio_server() -> None:
+    """Start the stdio MCP server, or explain the one thing that can stop it."""
     try:
         from cli.mcp.server import run
     except ImportError as exc:
@@ -77,6 +70,37 @@ def mcp_command(ctx: typer.Context) -> None:
         raise typer.Exit(1)
 
     run()
+
+
+@mcp_app.callback(invoke_without_command=True)
+def mcp_command(ctx: typer.Context) -> None:
+    """Your MCP source connections — and, bare, the internal stdio server.
+
+    With a subcommand this is just the group callback for `connect` /
+    `disconnect` / `my-secret`, all supported user commands.
+
+    With NO subcommand it starts the internal Agnes stdio MCP server, which is
+    not an end-user surface (#1707 Block 6): the hosted chat sandbox spawns it
+    per session and `agnes global enable` registers it as a user-scope MCP
+    server in Claude Code — both do the wiring for you, and both invoke this
+    bare form, which is why it stays. An external MCP client should connect to
+    the server's own HTTP transports instead.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    _run_stdio_server()
+
+
+@mcp_app.command("serve", hidden=True)
+def mcp_serve() -> None:
+    """Start the internal Agnes stdio MCP server (INTERNAL, not advertised).
+
+    The same thing bare `agnes mcp` does, spelled out — for a diagnostic run
+    where "agnes mcp" alone reads like a typo. Hidden on purpose: this is
+    internal wiring, and `agnes mcp --help` should teach the connection
+    commands instead.
+    """
+    _run_stdio_server()
 
 
 def _fail(resp) -> None:

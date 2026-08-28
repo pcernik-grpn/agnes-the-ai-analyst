@@ -4,8 +4,9 @@ Block 6 of #1707 collapsed five semantic-layer command groups into two. This
 group's commands now live in one of two places:
 
   - document CRUD          → ``agnes admin semantic <cmd>``
-    (``list``/``show``/``import``/``delete``/``detach``/``reattach``/
-    ``link-package``/``unlink-package``)
+    (``list``/``show``/``import``/``detach``/``reattach``/``link-package``/
+    ``unlink-package``; ``delete`` is new there and has no alias here,
+    because there was never an old spelling of it to honor)
   - the two that were never admin operations → ``agnes semantic-model <cmd>``
     (``export`` reads the public, resource-gated endpoint; ``validate``
     schema-checks a local file with no server and no token at all)
@@ -41,7 +42,9 @@ for _name, _fn in (
     ("list", admin_semantic.list_models),
     ("show", admin_semantic.show_model),
     ("import", admin_semantic.import_model),
-    ("delete", admin_semantic.delete_model),
+    # No `delete`: `agnes admin semantic delete` is NEW, so there is no old
+    # spelling to keep alive here — an alias for a path that never existed
+    # would ship a deprecated command nobody could have typed before.
     ("detach", admin_semantic.detach_model),
     ("reattach", admin_semantic.reattach_model),
     ("link-package", admin_semantic.link_package),

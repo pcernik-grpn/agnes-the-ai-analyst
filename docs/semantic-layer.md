@@ -76,12 +76,12 @@ A source is where documents come from. Three kinds:
 | `connection` | connector-specific | The adapter fetches from a configured data-source connection |
 
 ```bash
-agnes admin semantic-source add --kind git \
+agnes admin semantic source add --kind git \
   --name "Finance models" \
   --repo-url https://example.com/semantics.git \
   --ref main --glob 'semantic/**/*.yaml'
 
-agnes admin semantic-source sync <source-id>
+agnes admin semantic source sync <source-id>
 ```
 
 A sync that cannot fetch **fails loudly and imports nothing**. This matters more
@@ -130,7 +130,7 @@ credentials — those resolve from the instance's Snowflake connection like ever
 other Snowflake code path:
 
 ```bash
-agnes admin semantic-source add --kind connection --name "Snowflake semantic views" \
+agnes admin semantic source add --kind connection --name "Snowflake semantic views" \
     --adapter snowflake_semantic
 ```
 
@@ -177,7 +177,7 @@ place a workspace token is stored. Register it the same way as the Snowflake
 adapter:
 
 ```bash
-agnes admin semantic-source add --kind connection --name "Databricks semantics" \
+agnes admin semantic source add --kind connection --name "Databricks semantics" \
     --adapter databricks_metric_views
 ```
 
@@ -235,7 +235,7 @@ column descriptions. Metrics and glossary terms are unaffected.
 ## Export
 
 ```bash
-agnes admin semantic-model export retail > retail.yaml
+agnes semantic-model export retail > retail.yaml
 ```
 
 Or over HTTP, gated on a grant for a Data Package the model is linked to (or a
@@ -289,7 +289,7 @@ custom_extensions:
        "rule": "region = 'EU'", "severity": "error", "metrics": ["revenue"]}]}
 ```
 
-Not to be confused with `agnes admin semantic-model validate <file>` below,
+Not to be confused with `agnes semantic-model validate <file>` below,
 which schema-checks a *document*, offline, before it is ever stored.
 
 ## Coverage: what each source still lacks
@@ -384,7 +384,7 @@ somebody unmutes it. Expired mutes drop out of the default list but stay
 readable with `?include_expired=true` / `--include-expired` — the silence ends
 at the expiry, the record of who chose it does not.
 
-Muting is admin-only on every surface (UI, `agnes semantic-model
+Muting is admin-only on every surface (UI, `agnes admin semantic
 mute/unmute/mutes`, MCP `mute_semantic_check` / `unmute_semantic_check` /
 `semantic_mutes_list`, REST), and both mutations are audit-logged.
 `semantic_health_mutes` is **Postgres-only** (see `docs/migrations.md` →
@@ -410,7 +410,8 @@ Four surfaces file the same report, on purpose:
   user agrees: reporting silently on someone's behalf and waiting for the user
   to remember are both wrong. (The matching workspace-prompt sentence ships
   with the agent-grounding rules.)
-- **CLI** — `agnes semantic-model feedback submit/list/resolve`.
+- **CLI** — `agnes semantic-model feedback submit` for anyone signed in;
+  `agnes admin semantic feedback list/resolve` for the queue.
 - **REST** — the endpoints above; the only surface that also accepts
   `model_content_hash`, which pins the report to the document version that
   produced the answer.
@@ -444,8 +445,6 @@ agnes semantic-model context dataset|metric|relationship [--id ...] [--model ...
 agnes semantic-model schema dataset metric relationship
 
 agnes semantic-model feedback submit "<question>" [--sql ...] [--metric ...] [--comment ...]
-agnes semantic-model feedback list [--status open] [--json]   # admin
-agnes semantic-model feedback resolve <id> [--note "..."]     # admin
 ```
 
 `validate` deliberately needs neither a server nor a token — someone fixing a
@@ -483,6 +482,9 @@ agnes admin semantic health [--json]
 agnes admin semantic mute <scope> [--reason "..."] [--expires <ISO8601>]
 agnes admin semantic unmute <mute-id>
 agnes admin semantic mutes [--include-expired] [--json]
+
+agnes admin semantic feedback list [--status open] [--json]
+agnes admin semantic feedback resolve <id> [--note "..."]
 ```
 
 The three reports are three different questions, which is why
@@ -510,6 +512,7 @@ path on stderr, then delegates:
 | `agnes admin semantic-source <cmd>` | `agnes admin semantic source <cmd>` |
 | `agnes admin semantic-layer coverage` | `agnes admin semantic keboola-import` |
 | `agnes semantic-model coverage\|health\|mute\|mutes\|unmute` | `agnes admin semantic <same>` |
+| `agnes semantic-model feedback list\|resolve` | `agnes admin semantic feedback list\|resolve` |
 
 `agnes admin data-semantics` was removed outright with no alias — it scaffolded
 a pre-Ossie workspace pack that nothing reads.

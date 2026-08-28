@@ -1503,8 +1503,9 @@ instance still running the frozen DuckDB app-state backend they answer `501`
 with `error: "requires_postgres_backend"`.
 
 CLI: `agnes semantic-model feedback submit "<question>" [--sql …] [--metric …]
-[--comment …]`, `… feedback list [--status open] [--json]`,
-`… feedback resolve <id> [--note …]`. MCP: `flag_semantic_issue` (the tool a
+[--comment …]` (any signed-in caller), `agnes admin semantic feedback list
+[--status open] [--json]` and `agnes admin semantic feedback resolve <id>
+[--note …]` (admin — the queue follows the endpoint's authority). MCP: `flag_semantic_issue` (the tool a
 chat agent offers to call when it cannot support its own answer),
 `semantic_feedback_list`, `semantic_feedback_resolve`. UI:
 `/admin/semantic-layer?tab=feedback`.

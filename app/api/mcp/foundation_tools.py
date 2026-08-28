@@ -58,7 +58,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # Open semantic-layer contract (Task 12) — read-only search + get over
     # canonical Ossie semantic models. Triple-surface with
     # GET /api/semantic-models/search + GET /api/semantic-models/{slug}.yaml
-    # + `agnes admin semantic-model list/export`.
+    # + `agnes admin semantic list` / `agnes semantic-model export`.
     "semantic_model_search",
     "semantic_model_get",
     # Query-validation engine wiring (wave 3) — validate SQL against the
@@ -130,17 +130,17 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "admin_register_table",
     # Why imported metrics are missing — coverage of each Keboola project's
     # semantic layer against the table registry. Triple-surface with
-    # /api/admin/semantic-layer/coverage + `agnes admin semantic-layer coverage`.
+    # /api/admin/semantic-layer/coverage + `agnes admin semantic keboola-import`.
     "admin_semantic_layer_coverage",
     # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
     # registered tables with NO valid semantic model at all, regardless of
     # which source wrote it. Triple-surface with
-    # /api/admin/semantic-coverage + `agnes semantic-model coverage tables`.
+    # /api/admin/semantic-coverage + `agnes admin semantic coverage tables`.
     "admin_semantic_coverage",
     # Cross-domain, cross-SOURCE completeness (F4.1) — what each connected
     # source lacks in semantics/metrics/glossary/skill/agent/knowledge base.
     # Triple-surface with /api/admin/semantic-model/coverage* + `agnes
-    # semantic-model coverage[ tag| untag]`. The tag/untag pair is NOT
+    # admin semantic coverage[ tag| untag]`. The tag/untag pair is NOT
     # read_only and is deliberately NOT MCP-exempt: CONTRIBUTING.md's only
     # standing exemptions are credential-provisioning writes and
     # security-posture diagnostics, and "low-frequency admin action" is
@@ -1850,7 +1850,7 @@ def register_foundation_tools(
         semantic layer usually describes more than an instance registers.
 
         Mirrors ``GET /api/admin/semantic-layer/coverage`` and
-        ``agnes admin semantic-layer coverage``.
+        ``agnes admin semantic keboola-import``.
 
         Requires an admin PAT.
         """
@@ -1875,7 +1875,7 @@ def register_foundation_tools(
         table appear in ANY valid model's datasets at all.
 
         Returns ``{"tables": [...]}`` — full table_registry rows. Mirrors
-        ``GET /api/admin/semantic-coverage`` and `agnes semantic-model
+        ``GET /api/admin/semantic-coverage`` and `agnes admin semantic
         coverage tables`.
 
         Requires an admin PAT.
@@ -1914,7 +1914,7 @@ def register_foundation_tools(
                 no connection.
 
         Mirrors ``GET /api/admin/semantic-model/coverage`` and
-        ``agnes semantic-model coverage``.
+        ``agnes admin semantic coverage``.
 
         Requires an admin PAT and the Postgres app-state backend (a DuckDB
         instance answers ``501 requires_postgres_backend``).
@@ -1945,7 +1945,7 @@ def register_foundation_tools(
             source_id: The ``source_connections.id`` the resource is about.
 
         Mirrors ``POST /api/admin/semantic-model/coverage/tags`` and
-        ``agnes semantic-model coverage tag``.
+        ``agnes admin semantic coverage tag``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -1972,7 +1972,7 @@ def register_foundation_tools(
                 ``semantic_model_coverage``'s ``domains.<domain>.raw``.
 
         Mirrors ``DELETE /api/admin/semantic-model/coverage/tags/{tag_id}``
-        and ``agnes semantic-model coverage untag``.
+        and ``agnes admin semantic coverage untag``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2000,7 +2000,7 @@ def register_foundation_tools(
                 longer silence anything, but the record of who chose it stands.
 
         Mirrors ``GET /api/admin/semantic-layer/mutes`` and
-        ``agnes semantic-model mutes``.
+        ``agnes admin semantic mutes``.
 
         Requires an admin PAT and the Postgres app-state backend (a DuckDB
         instance answers ``501 requires_postgres_backend``).
@@ -2041,7 +2041,7 @@ def register_foundation_tools(
                 unmutes it". Must be in the future.
 
         Mirrors ``POST /api/admin/semantic-layer/mutes`` and
-        ``agnes semantic-model mute``.
+        ``agnes admin semantic mute``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2064,7 +2064,7 @@ def register_foundation_tools(
             mute_id: The mute's id, from ``semantic_mutes_list``.
 
         Mirrors ``DELETE /api/admin/semantic-layer/mutes/{mute_id}`` and
-        ``agnes semantic-model unmute``.
+        ``agnes admin semantic unmute``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2090,8 +2090,8 @@ def register_foundation_tools(
         one pair of numbers, and every currently active mute — so a finding
         already silenced by an admin does not get reported as news twice.
 
-        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes
-        semantic-model health``.
+        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes admin
+        semantic health``.
 
         Requires an admin PAT and the Postgres app-state backend (a DuckDB
         instance answers ``501 requires_postgres_backend`` — the mute overlay
@@ -2164,7 +2164,7 @@ def register_foundation_tools(
                 ``resolved``. Omit for every report.
 
         Mirrors ``GET /api/admin/semantic-feedback`` and
-        ``agnes semantic-model feedback list``.
+        ``agnes admin semantic feedback list``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2196,7 +2196,7 @@ def register_foundation_tools(
                 the next reader of the same question can see the answer.
 
         Mirrors ``POST /api/admin/semantic-feedback/{id}/resolve`` and
-        ``agnes semantic-model feedback resolve``.
+        ``agnes admin semantic feedback resolve``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """

@@ -266,9 +266,14 @@ class TestTheEndpointsOnPostgres:
 
 
 class TestTheCli:
-    """`agnes semantic-model feedback …` — all three verbs, per the design
-    decision that a report must be fileable from every surface (UI, chat, MCP,
-    CLI), not just the ones an admin uses."""
+    """All three verbs, per the design decision that a report must be fileable
+    from every surface (UI, chat, MCP, CLI), not just the ones an admin uses.
+
+    Filing is `agnes semantic-model feedback submit` (any signed-in caller);
+    the queue is `agnes admin semantic feedback list|resolve` (#1707 Block 6 —
+    placement follows authority, and both call `require_admin` endpoints). The
+    old spellings still run as hidden aliases; that delegation is covered in
+    `tests/test_cli_semantic_consolidation.py`, not duplicated here."""
 
     def test_submit_then_list_round_trips(self, state_backend, cli_client_both):
         if state_backend != "pg":
@@ -289,7 +294,7 @@ class TestTheCli:
         assert submitted.exit_code == 0, submitted.output
         assert "Filed" in submitted.output
 
-        listed = cli_client_both["invoke"](["semantic-model", "feedback", "list", "--json"])
+        listed = cli_client_both["invoke"](["admin", "semantic", "feedback", "list", "--json"])
         assert listed.exit_code == 0, listed.output
         items = json.loads(listed.output)["items"]
         assert [i["question"] for i in items] == ["What was net revenue?"]
@@ -301,7 +306,7 @@ class TestTheCli:
         invoke = cli_client_both["invoke"]
 
         invoke(["semantic-model", "feedback", "submit", "churn is undefined"])
-        result = invoke(["semantic-model", "feedback", "list"])
+        result = invoke(["admin", "semantic", "feedback", "list"])
         assert result.exit_code == 0, result.output
         assert "churn is undefined" in result.output
 
@@ -311,20 +316,20 @@ class TestTheCli:
         invoke = cli_client_both["invoke"]
 
         invoke(["semantic-model", "feedback", "submit", "mrr doubled"])
-        listed = json.loads(invoke(["semantic-model", "feedback", "list", "--json"]).output)
+        listed = json.loads(invoke(["admin", "semantic", "feedback", "list", "--json"]).output)
         feedback_id = listed["items"][0]["id"]
 
-        resolved = invoke(["semantic-model", "feedback", "resolve", feedback_id, "--note", "deduped the join"])
+        resolved = invoke(["admin", "semantic", "feedback", "resolve", feedback_id, "--note", "deduped the join"])
         assert resolved.exit_code == 0, resolved.output
 
-        after = json.loads(invoke(["semantic-model", "feedback", "list", "--status", "resolved", "--json"]).output)
+        after = json.loads(invoke(["admin", "semantic", "feedback", "list", "--status", "resolved", "--json"]).output)
         assert after["items"][0]["resolution_note"] == "deduped the join"
 
     def test_an_empty_queue_says_so_instead_of_printing_nothing(self, state_backend, cli_client_both):
         if state_backend != "pg":
             pytest.skip("PG-only feature")
 
-        result = cli_client_both["invoke"](["semantic-model", "feedback", "list"])
+        result = cli_client_both["invoke"](["admin", "semantic", "feedback", "list"])
         assert result.exit_code == 0, result.output
         assert "No feedback" in result.output
 
@@ -332,6 +337,6 @@ class TestTheCli:
         if state_backend != "pg":
             pytest.skip("PG-only feature")
 
-        result = cli_client_both["invoke"](["semantic-model", "feedback", "resolve", "sfb_nope"])
+        result = cli_client_both["invoke"](["admin", "semantic", "feedback", "resolve", "sfb_nope"])
         assert result.exit_code == 1
         assert "feedback list" in result.output

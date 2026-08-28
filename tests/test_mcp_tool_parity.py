@@ -241,7 +241,7 @@ def test_stdio_tool_set_is_exactly_the_documented_set():
     )
 
 
-"""Every semantic-layer tool, on the surface that is allowed to have them."""
+# Every semantic-layer tool, on the surface that is allowed to have them.
 SEMANTIC_TOOL_NAMES = frozenset(
     {
         "semantic_model_search",

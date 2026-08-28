@@ -214,6 +214,14 @@ class TestExportAndValidateAreUserCommands:
         assert result.exit_code == 0
         assert "OK" in result.stdout
 
+    def test_validate_missing_path_fails_before_reading_anything(self):
+        """The `path.exists()` branch: a typo'd filename must be its own
+        error, not a traceback out of `read_text()`. Moved here with the
+        command (it used to live on `agnes admin semantic-model validate`)."""
+        result = runner.invoke(app, ["semantic-model", "validate", "/nonexistent/nope.yaml"])
+        assert result.exit_code == 1
+        assert "Path not found" in result.output
+
     def test_validate_help_names_the_sibling_it_is_confused_with(self):
         result = runner.invoke(app, ["semantic-model", "validate", "--help"])
         assert "validate-query" in result.output
@@ -235,6 +243,13 @@ class TestAdminSemanticGroup:
         for old in ("admin semantic-model", "admin semantic-source", "admin semantic-layer"):
             assert old in tree, f"{old} must survive as an alias for one release"
             assert tree[old].hidden is True, f"{old} must be hidden from --help"
+
+    def test_no_alias_is_invented_for_a_command_that_never_existed(self):
+        """An alias exists to honor a spelling somebody could have typed
+        before. `delete` is NEW in `agnes admin semantic` — there was no
+        `agnes admin semantic-model delete` to keep alive, and inventing one
+        would ship a deprecated path that was never live."""
+        assert "admin semantic-model delete" not in _tree()
 
     def test_admin_semantic_carries_every_promised_command(self):
         tree = _tree()
@@ -358,8 +373,11 @@ class TestHealthRendersEveryKeyItIsGiven:
     `cli/commands/admin_semantic.py` now. `tests/test_cli_semantic_model_health.py`
     covers the same section on the old path and patches
     `cli.commands.semantic_model.api_get` — which no longer intercepts, because
-    the alias delegates into this module. Its patch target and invocation path
-    need updating when the two branches meet.
+    the alias delegates into this module. Only its PATCH TARGET needs updating
+    when the two branches meet (to `cli.commands.admin_semantic.api_get`); the
+    invocation path it drives, `agnes semantic-model health`, keeps working as
+    a hidden alias and is worth keeping exactly as it is — that is the alias
+    being exercised.
     """
 
     def test_a_clean_report_says_nothing_is_wrong(self):
@@ -414,6 +432,84 @@ class TestHealthRendersEveryKeyItIsGiven:
         assert result.exit_code == 0
         assert _DEPRECATED in result.output
         assert "orders_gone" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 4b. `feedback` obeys the same placement rule as everything else
+# ---------------------------------------------------------------------------
+
+
+class TestFeedbackPlacementFollowsAuthority:
+    """`submit` is any-user, `list`/`resolve` call `require_admin` endpoints.
+
+    Keeping the admin pair in the any-user group is the exact mistake this
+    block fixes for `coverage`/`health`/`mute*`: a group whose placement
+    advertises authority the caller does not have. The queue moves to
+    `agnes admin semantic feedback`; filing stays where the person who saw the
+    bad number already is.
+    """
+
+    def test_the_admin_verbs_live_in_the_admin_group(self):
+        tree = _tree()
+        assert "admin semantic feedback list" in tree
+        assert "admin semantic feedback resolve" in tree
+        # Filing did NOT move: any signed-in caller may report a bad answer.
+        assert "admin semantic feedback submit" not in tree
+        assert tree["semantic-model feedback submit"].hidden is not True
+
+    def test_the_old_admin_paths_survive_as_hidden_aliases(self):
+        tree = _tree()
+        for path in ("semantic-model feedback list", "semantic-model feedback resolve"):
+            assert path in tree, f"{path} must survive as an alias for one release"
+            assert tree[path].hidden is True, f"{path} must be hidden from --help"
+
+    def test_admin_feedback_list_reads_the_admin_endpoint(self):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, {"items": []})) as m:
+            result = runner.invoke(app, ["admin", "semantic", "feedback", "list"])
+        assert result.exit_code == 0
+        assert m.call_args.args[0] == "/api/admin/semantic-feedback"
+
+    def test_admin_feedback_resolve_posts_to_the_admin_endpoint(self):
+        with patch(
+            "cli.commands.admin_semantic.api_post",
+            return_value=_resp(200, {"id": "sfb_1", "resolved_by": "admin@example.com"}),
+        ) as m:
+            result = runner.invoke(app, ["admin", "semantic", "feedback", "resolve", "sfb_1", "--note", "fixed"])
+        assert result.exit_code == 0
+        assert m.call_args.args[0] == "/api/admin/semantic-feedback/sfb_1/resolve"
+
+    def test_submit_stays_on_the_user_group_and_prints_no_notice(self):
+        with patch(
+            "cli.commands.semantic_model.api_post",
+            return_value=_resp(201, {"id": "sfb_1", "status": "open"}),
+        ) as m:
+            result = runner.invoke(app, ["semantic-model", "feedback", "submit", "why is mrr double?"])
+        assert result.exit_code == 0
+        assert m.call_args.args[0] == "/api/semantic-feedback"
+        assert _DEPRECATED not in result.output
+
+    def test_feedback_list_alias_delegates_and_warns(self):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, {"items": []})):
+            result = runner.invoke(app, ["semantic-model", "feedback", "list"])
+        assert result.exit_code == 0
+        assert _DEPRECATED in result.output
+        assert "agnes admin semantic feedback list" in result.output
+
+    def test_feedback_resolve_alias_delegates_and_warns(self):
+        with patch(
+            "cli.commands.admin_semantic.api_post",
+            return_value=_resp(200, {"id": "sfb_1", "resolved_by": "admin@example.com"}),
+        ):
+            result = runner.invoke(app, ["semantic-model", "feedback", "resolve", "sfb_1"])
+        assert result.exit_code == 0
+        assert _DEPRECATED in result.output
+        assert "agnes admin semantic feedback resolve" in result.output
+
+    def test_the_alias_notice_leaves_json_pipeable(self):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, {"items": []})):
+            result = runner.invoke(app, ["semantic-model", "feedback", "list", "--json"])
+        assert _DEPRECATED not in result.stdout
+        json.loads(result.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -551,18 +647,55 @@ def test_data_semantics_group_is_removed_with_no_alias():
 # ---------------------------------------------------------------------------
 
 
-def test_agnes_mcp_is_hidden_but_still_registered():
-    """Retired as a *documented surface*, not as a program: the hosted chat
-    sandbox spawns `agnes mcp` per session (app/chat/runner.py) and
-    `agnes global enable` wires it into Claude Code's user scope. Hiding it
-    stops `agnes --help` teaching it as an end-user path; removing it would
-    break the chat runner."""
+def test_the_mcp_group_stays_visible_for_its_user_commands():
+    """Only the SERVER is internal, not the group it happens to live in.
+
+    `connect` / `disconnect` / `my-secret` are supported end-user commands —
+    `app/api/mcp_policy.py` tells a user to run `agnes mcp my-secret set …` by
+    name — so hiding the whole group would hide the remedy the server prints.
+    """
     tree = _tree()
     assert "mcp" in tree
-    assert tree["mcp"].hidden is True
+    assert tree["mcp"].hidden is not True
+    for path in ("mcp connect", "mcp disconnect", "mcp my-secret", "mcp my-secret set"):
+        assert path in tree, f"{path} must stay a documented user command"
+        assert tree[path].hidden is not True, f"{path} must stay discoverable in --help"
 
 
-def test_agnes_mcp_help_says_it_is_internal():
+def test_the_top_level_help_lists_mcp():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "mcp" in result.output
+
+
+def test_the_group_help_leads_with_the_connections_not_the_server():
+    """`agnes --help` shows a group's FIRST line. It must describe what a user
+    can do here, not the internal server that shares the namespace."""
     result = runner.invoke(app, ["mcp", "--help"])
     assert result.exit_code == 0
+    assert "connect" in result.output
     assert "internal" in result.output.lower()
+
+
+def test_the_bare_invocation_is_hidden_but_still_starts_the_server():
+    """Retired as a *documented surface*, not as a program: the hosted chat
+    sandbox spawns `agnes mcp` per session (app/chat/runner.py) and
+    `agnes global enable` wires it into Claude Code's user scope. Removing it
+    would break both."""
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    tree = _tree()
+    assert "mcp serve" in tree
+    assert tree["mcp serve"].hidden is True, "the server invocation stays unadvertised"
+
+    with patch("cli.mcp.server.run") as run:
+        result = runner.invoke(app, ["mcp"])
+    assert result.exit_code == 0
+    run.assert_called_once()
+
+
+def test_the_hidden_serve_subcommand_starts_the_same_server():
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    with patch("cli.mcp.server.run") as run:
+        result = runner.invoke(app, ["mcp", "serve"])
+    assert result.exit_code == 0
+    run.assert_called_once()
