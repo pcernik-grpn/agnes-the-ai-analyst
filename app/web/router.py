@@ -8691,6 +8691,17 @@ async def admin_moderation_hub_page(
         limit=1,
     )
 
+    # Track C6 — agent-sharing approval queue. PG-only (A3 ratchet): on a
+    # DuckDB-backed instance the feature doesn't exist here at all, so the
+    # zone is simply omitted rather than 501ing the whole moderation hub —
+    # same posture as `app.web.admin_signals._resolve_agent_share_requests`.
+    from src.repositories import use_pg
+
+    agent_share_requests_enabled = use_pg()
+    pending_share_requests: list = []
+    if agent_share_requests_enabled:
+        pending_share_requests = _pending_agent_share_requests_for_admin()
+
     ctx = _build_context(
         request,
         user=user,
@@ -8699,8 +8710,44 @@ async def admin_moderation_hub_page(
         verification_limit=verification_limit,
         pending_submissions_total=pending_submissions_total,
         store_verification_enabled=verification_enabled,
+        agent_share_requests_enabled=agent_share_requests_enabled,
+        pending_share_requests=pending_share_requests,
     )
     return templates.TemplateResponse(request, "admin_moderation_hub.html", ctx)
+
+
+def _pending_agent_share_requests_for_admin() -> list:
+    """Pending rows for the moderation hub's "Pending agent shares" zone,
+    with the ids the template needs resolved to names — mirrors
+    ``app.api.share_requests_admin._serialize``'s projection, kept local
+    to this module rather than importing a private helper across the
+    app.api / app.web boundary."""
+    from src.repositories import (
+        agents_repo,
+        share_requests_repo,
+        user_groups_repo,
+        users_repo,
+    )
+
+    rows, _ = share_requests_repo().list_for_admin(status=["pending"], limit=200)
+    agents = agents_repo()
+    groups = user_groups_repo()
+    users = users_repo()
+    out = []
+    for r in rows:
+        agent = agents.get_by_id(r["resource_id"]) if r["resource_type"] == "agent" else None
+        requester = users.get_by_id(r["requested_by"])
+        group = groups.get(r["requested_group_id"])
+        out.append(
+            {
+                "id": r["id"],
+                "resource_name": (agent or {}).get("name") or r["resource_id"],
+                "requested_group_name": (group or {}).get("name") or r["requested_group_id"],
+                "requested_by_email": (requester or {}).get("email") or r["requested_by"],
+                "created_at": r.get("created_at"),
+            }
+        )
+    return out
 
 
 @router.get("/admin/store/submissions", response_class=HTMLResponse)

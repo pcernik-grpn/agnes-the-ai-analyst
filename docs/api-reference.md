@@ -1537,8 +1537,52 @@ Shareable resource types are `collection` and `agent` — skills are excluded
 because an approved store entity is already readable by every authenticated
 user.
 
+**Track C6 — agent-sharing needs admin approval (Postgres-backed instances).**
+A user may build agents freely, but when a NON-ADMIN actor shares an `agent`
+with a group it has not already reached, the grant is not written
+immediately: it is queued in `share_requests` and `PUT /api/sharing/agent/{id}`
+answers `202` (not `200`), with `pending_group_ids` naming what's awaiting a
+decision. An admin actor (regardless of who owns the agent) and any un-share
+(revoking a group) both stay instant and answer `200`, matching every other
+resource type. `GET /api/sharing/agent/{id}` always echoes the current
+`pending_group_ids` so a page reload still shows "pending approval". The
+queue (`share_requests`) is Postgres-only (A3 ratchet) — see
+`/api/admin/share-requests` below — but sharing itself never regresses: on a
+DuckDB-backed instance the approval step simply isn't active, so a
+non-admin's agent share falls back to the pre-C6 instant grant instead of a
+`501`. Only the admin queue endpoints answer `501` there.
+
 - /api/sharing/groups
 - /api/sharing/{resource_type}/{resource_id}
+
+### `/api/admin/share-requests` — Agent-sharing approval queue (Track C6, PG-only)
+
+Every route requires admin. `GET` lists queued requests, optionally filtered by
+comma-separated `status` (`pending`/`approved`/`rejected`; omitted returns every
+decision, newest first — the queue doubles as its own audit trail). Each row
+carries resolved display fields (`resource_name`, `requested_group_name`,
+`requested_by_email`) alongside the raw ids. `PATCH /api/admin/share-requests/{id}`
+takes `{"decision": "approve" | "reject"}` — the decision rides in the body
+rather than a verb path segment, the same shape as
+`PATCH /api/v1/agents/{agent_id}/memories/{memory_id}`'s `{"action": ...}`
+(`tests/test_api_design_rules.py::test_no_new_verbs_in_path` forbids a new
+verb segment in a path). `decision: "approve"` writes the grant via the same
+`resource_grants_repo().ensure_grant` the admin-curated `/admin/access` layer
+uses — an approved share reaches the grantee through the identical mechanism
+the shared-agent runtime already honors — and marks the request `approved`
+with `decided_by`/`decided_at`. `decision: "reject"` leaves no grant and marks
+it `rejected`. An unrecognized `decision` is `400`. The PATCH is a clean `404`
+on an unknown id OR a request that was already decided (an atomic
+`WHERE status = 'pending'` guard — a double-click can never double-write the
+grant or flip an already-decided verdict). Every decision writes an
+`audit_log` row (`share_request.approved` / `share_request.rejected`).
+PG-only (A3 ratchet): on a DuckDB-backed instance every route here answers
+`501 requires_postgres_backend`. Web-only by design — see the triple-surface
+ratchet's `_SHARE_REQUESTS_ADMIN_REASON` for why no CLI/MCP vocabulary was
+added.
+
+- /api/admin/share-requests
+- /api/admin/share-requests/{request_id}
 
 ### `/api/collections` — File collections (bring-your-files)
 

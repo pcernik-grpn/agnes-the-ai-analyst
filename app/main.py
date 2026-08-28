@@ -550,6 +550,7 @@ from app.api.mcp_builder import router as mcp_builder_router  # MCP-source build
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
+from app.api.share_requests_admin import router as share_requests_admin_router  # C6: agent-share approval queue
 from app.api.knowledge_search import router as knowledge_search_router  # K2: unified search
 from app.api.stack import router as stack_router
 from app.api.stack_views import router as stack_views_router
@@ -2932,6 +2933,7 @@ def create_app() -> FastAPI:
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)
+    app.include_router(share_requests_admin_router)
     app.include_router(knowledge_search_router)
     app.include_router(stack_router)
     app.include_router(stack_views_router)
