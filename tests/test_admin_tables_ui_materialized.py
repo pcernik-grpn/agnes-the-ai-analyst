@@ -10,6 +10,8 @@ running app and asserts the expected element ids + attributes are present
 in the rendered HTML for a `data_source_type='bigquery'` deployment.
 """
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -41,44 +43,21 @@ def bq_instance(monkeypatch):
 
 
 def test_admin_tables_renders_two_question_radio_form(seeded_app, bq_instance):
-    """Q1 = how should analysts access this data? (live / synced).
-    Q2 = (only when synced) what to sync? (whole / custom).
-    Replaces the earlier flat 4-option dropdown that mixed source-kind +
-    distribution-mode into one selector — both UX reviewers (info-arch +
-    analyst persona) flagged the conflation as the core confusion."""
+    """D4 — one registration flow: the BQ-specific Q1 (live/synced) + Q2
+    (whole/custom) radios documented here moved out of the static Jinja
+    template entirely — they're now built by register_table_form.js's
+    generic `#rtfModeGroup` renderer, driven by a per-connector `modes`
+    config (BigQuery: 'live' / 'synced_whole' / 'synced_custom'), the same
+    renderer every connector shares. Assert the shared skeleton is present
+    and the JS asset carries BigQuery's mode config; per-connector radio
+    ids/labels are exercised in test_register_table_form.py against the JS
+    directly, not scraped from server-rendered HTML."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
 
     r = c.get("/admin/tables", headers=_auth(token))
     assert r.status_code == 200, r.text
     html = r.text
-
-    # Q1 radio group.
-    assert 'name="bqAccessMode"' in html
-    assert 'value="live"' in html
-    assert 'value="synced"' in html
-    assert "onBqAccessModeChange" in html
-
-    # Q2 radio group (conditional on Q1).
-    assert 'name="bqSyncMode"' in html
-    assert 'value="whole"' in html
-    assert 'value="custom"' in html
-    assert "onBqSyncModeChange" in html
-
-    # Custom-SQL textarea + "Use table as base" prefill button.
-    assert 'id="bqSourceQuery"' in html
-    assert "prefillFromTable" in html
-    assert "bq-source-custom" in html
-
-    # Table/dataset inputs reused across live + synced/whole.
-    assert 'id="bqDataset"' in html
-    assert 'id="bqSourceTable"' in html
-    assert "bq-source-table" in html
-    assert "bq-access-synced" in html
-
-    # Discover + List tables buttons.
-    assert "discoverBqDatasets" in html
-    assert "discoverBqTables" in html
 
     # No leftover jargon labels from the prior Type-selector iterations.
     assert "Direct query" not in html
@@ -88,17 +67,18 @@ def test_admin_tables_renders_two_question_radio_form(seeded_app, bq_instance):
     assert "Milestone 2" not in html
     assert "issue #108" not in html
 
-    # Package-centric rewrite: connector tabs were dropped. The BQ
-    # register modal stays in DOM as a top-level overlay reachable from
-    # the `+ Register new table ▾` action-bar dropdown. Anchor the
-    # field-scope check on the modal id instead of the deleted
-    # tab-content section.
-    bq_modal_start = html.index('id="registerBqModal"')
-    bq_modal_end = html.index("</div>\n            </div>", bq_modal_start)
-    bq_modal = html[bq_modal_start:bq_modal_end]
-    assert 'name="bqAccessMode"' in bq_modal
-    assert 'id="bqDataset"' in bq_modal
-    assert 'id="bqSourceQuery"' in bq_modal
+    # The shared drawer's generic mode/query/bucket-table skeleton — one
+    # instance in the DOM, not a BQ-specific clone.
+    assert 'id="registerTableModal"' in html
+    assert 'id="rtfModeGroup"' in html
+    assert 'id="rtfCustomQuery"' in html
+    assert "js/register_table_form.js" in html
+
+    js = (Path("app/web/static/js/register_table_form.js")).read_text(encoding="utf-8")
+    assert "bigquery:" in js
+    assert "{ value: 'live', title: 'Live from BigQuery'" in js
+    assert "{ value: 'synced_whole'" in js
+    assert "{ value: 'synced_custom'" in js
 
 
 def test_edit_modal_has_bq_parity_fields(seeded_app, bq_instance):
@@ -156,16 +136,12 @@ def test_edit_modal_has_bq_parity_fields(seeded_app, bq_instance):
 
 
 def test_keboola_register_form_has_three_question_radio(seeded_app, monkeypatch):
-    """Phase G (v26): Keboola tab Register form gains a third radio option
-    'Direct extract (Storage API)' alongside the existing 'whole' and
-    'custom' modes.
-
-    - whole / custom → query_mode='materialized' (DuckDB Keboola extension)
-    - direct → query_mode='local' + v26 sync_strategy panel
-      (incremental / partitioned / full_refresh + where_filters)
-
-    Phase F asserted `kbStrategy` was removed; v26 re-adds it inside the
-    Direct-extract panel (visible only when 'direct' is selected).
+    """D4 — one registration flow: the Keboola register modal this test
+    scraped is gone. Its four modes (whole / direct / custom / remote —
+    'remote' is new, D4 normalized Keboola onto the same live/synced split
+    every other connector offers) now live in register_table_form.js's
+    `CONNECTORS.keboola` config, rendered by the same `#rtfModeGroup` +
+    `#rtfKbStrategyPanel` the shared drawer uses for every connector.
     """
     fake_cfg = {"data_source": {"type": "keboola", "keboola": {}}}
     monkeypatch.setattr(
@@ -181,43 +157,28 @@ def test_keboola_register_form_has_three_question_radio(seeded_app, monkeypatch)
         token = seeded_app["admin_token"]
         r = c.get("/admin/tables", headers=_auth(token))
         html = r.text
-        # Package-centric rewrite: anchor on the Keboola register modal id
-        # (the connector tab that used to wrap this form is gone).
-        kb_modal_start = html.index('id="registerKeboolaModal"')
-        # The modal's outer wrapper closes via "</div>\n            </div>"
-        # (modal -> modal-overlay). Use a generous slice + sanity-bound it
-        # to the next modal-overlay id so we don't bleed into editKeboolaModal.
-        next_modal_idx = html.find('id="editKeboolaModal"', kb_modal_start)
-        kb_tab = html[kb_modal_start:next_modal_idx] if next_modal_idx > 0 else html[kb_modal_start:]
 
-        # All three radios present.
-        assert 'name="kbSyncMode"' in kb_tab
-        assert 'value="whole"' in kb_tab
-        assert 'value="custom"' in kb_tab
-        assert 'value="direct"' in kb_tab
+        # The shared drawer's Keboola-only strategy panel + filter builder —
+        # rendered once, JS-toggled per mode, not cloned per connector.
+        assert 'id="rtfKbStrategyPanel"' in html
+        assert 'id="rtfKbStrategy"' in html
+        assert 'id="rtfKbFilterField"' in html
+        assert 'id="rtfPrimaryKey"' in html
+        assert "<details" in html
+        assert ">Advanced" in html
 
-        # Bucket + source-table inputs reused for whole + direct modes.
-        assert 'id="kbBucket"' in kb_tab
-        assert 'id="kbSourceTable"' in kb_tab
-        # Custom-SQL textarea + Use-table-as-base prefill button.
-        assert 'id="kbSourceQuery"' in kb_tab
-        assert "kbPrefillFromTable" in html or "prefillFromKeboolaTable('kbSourceQuery')" in html
+        js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+        for mode in ("whole", "direct", "custom", "remote"):
+            assert f"value: '{mode}'" in js, f"Keboola mode {mode!r} missing from register_table_form.js"
+        # Direct-extract keeps its v26 sync_strategy fields, wired through
+        # the same shared drawer.
+        assert "sync_strategy: s.kbStrategy" in js
+        assert "incremental_window_days" in js
+        assert "partition_by" in js
 
-        # Sync Schedule input.
-        assert 'id="kbSyncSchedule"' in kb_tab
-
-        # v26: Sync Strategy dropdown re-added (inside the Direct-extract panel)
-        assert 'id="kbStrategy"' in kb_tab
-        assert 'class="form-group kb-direct-only"' in kb_tab or "kb-direct-only" in kb_tab
-
-        # Primary Key — under <details>Advanced.
-        assert 'id="kbPrimaryKey"' in kb_tab
-        assert "<details" in kb_tab
-        assert ">Advanced" in kb_tab
-
-        # Discover datasets / List tables buttons.
-        assert "kbDiscoverBuckets" in html or "discoverKeboolaBuckets(" in html
-        assert "kbListTables" in html or "discoverKeboolaTables(" in html
+        # Discover still routes through the same endpoints (browse step).
+        assert "/api/admin/discover-tables" in js
+        assert "/tables'" in js  # source-connections/{id}/tables
     finally:
         reset_cache()
 
@@ -351,25 +312,24 @@ def test_keboola_discover_buttons_disabled_on_bigquery_instance(seeded_app, monk
         token = seeded_app["admin_token"]
         r = c.get("/admin/tables", headers=_auth(token))
         html = r.text
-        # Inputs stay (manual entry works).
-        assert 'id="kbBucket"' in html
-        assert 'id="kbSourceTable"' in html
-        # #405: the buttons now render (visible) but disabled, carrying a
-        # tooltip that explains Keboola isn't connected.
+        # D4 removed the register-side Keboola discover buttons this test
+        # used to check (register_table_form.js's Browse step tries the
+        # discovery call unconditionally and surfaces a failure inline via
+        # `#rtfBrowseError` instead of pre-emptively disabling a button —
+        # there's no connectedness signal to gate on client-side before the
+        # shared drawer even knows which source_type the operator picked).
+        # The EDIT Keboola modal's #405 disabled+tooltip guard is unchanged
+        # and still scoped here.
+        assert 'id="editKbBucket"' in html
+        assert 'id="editKbSourceTable"' in html
         assert 'data-tooltip="Keboola not connected' in html
         # #347 follow-up: the tooltip's advice must be FOLLOWABLE — the old
         # copy pointed at a token field /admin/server-config never had.
         assert "connect a project in Data sources" in html
         assert "set token in Instance settings" not in html
-        # The functional guarantee that actually matters: no live call sites
-        # on an unreachable instance, so a click can never reach either
-        # discover endpoint. Match the actual CALL SITES, not the function
-        # definitions or JS comments that reference the names verbatim
-        # (#347 moved several helpers out from under the keboola Jinja
-        # guard, so they're defined as dead code on every instance).
-        assert 'onclick="discoverKeboolaBuckets(' not in html
-        assert 'onclick="discoverKeboolaTables(' not in html
-        assert 'onclick="prefillFromKeboolaTable(' not in html
+        assert "onclick=\"discoverKeboolaBuckets(this, 'editKbBucketList')\"" not in html
+        assert "onclick=\"discoverKeboolaTables(this, 'editKbBucket', 'editKbTableList')\"" not in html
+        assert "onclick=\"prefillFromKeboolaTable('editKbSourceQuery')\"" not in html
     finally:
         reset_cache()
 
@@ -398,30 +358,33 @@ def test_keboola_discover_buttons_visible_on_keboola_instance(seeded_app, monkey
 
 
 def test_keboola_test_connection_button_in_register_and_edit_modals(seeded_app):
-    """#402: the Keboola register & edit modals expose a Test-connection
-    button wired to the existing /api/admin/keboola/test-connection probe,
-    with an inline result element and a self-contained onTestKeboola handler."""
+    """#402: the Keboola EDIT modal exposes a Test-connection button wired
+    to the existing /api/admin/keboola/test-connection probe, with an
+    inline result element and a self-contained onTestKeboola handler.
+
+    D4 dropped the second (register-modal) copy of this button along with
+    the modal it lived in — the shared register drawer doesn't offer a
+    Test-connection probe in this first cut (deferred; the connection
+    picker itself still surfaces a failed discovery inline via
+    `#rtfBrowseError`)."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     html = c.get("/admin/tables", headers=_auth(token)).text
-    # Button rendered in BOTH modal footers (register + edit).
-    assert html.count('onclick="onTestKeboola(this)"') >= 2
+    assert html.count('onclick="onTestKeboola(this)"') == 1
     assert "Test connection" in html
-    # Inline result element + handler defined + hits the existing endpoint.
     assert 'class="kbc-test-result"' in html
     assert "function onTestKeboola(" in html
     assert "/api/admin/keboola/test-connection" in html
-    # #402 follow-up (Devin BUG-0001/0003): both modal-open paths clear the
-    # test-result badge so a stale "ok" can't linger over a reopened blank form.
-    assert "kbcResult.hidden = true" in html
     assert "editKbcResult.hidden = true" in html
 
 
 def test_admin_tables_keboola_branch_unchanged(seeded_app, monkeypatch):
-    """Phase E: the BQ form is always rendered (inside #tab-content-bigquery)
-    regardless of data_source.type. On a Keboola instance the BQ tab is
-    just hidden by default; the operator can still click into it. The
-    legacy Type-selector remnant (#bqEntityType) must stay gone."""
+    """D4 — one registration flow: BigQuery and Keboola no longer render
+    separate per-connector forms at all (the legacy Type-selector remnant
+    and the pre-D4 #registerModal / #registerKeboolaModal are all gone the
+    same way) — every source_type opens the ONE shared drawer, so a
+    Keboola-typed instance still renders it (and register_table_form.js's
+    connector config) regardless of data_source.type."""
     fake_cfg = {"data_source": {"type": "keboola", "keboola": {}}}
     monkeypatch.setattr(
         "app.instance_config.load_instance_config",
@@ -440,48 +403,38 @@ def test_admin_tables_keboola_branch_unchanged(seeded_app, monkeypatch):
         html = r.text
         # Legacy Type-selector remnant must stay gone.
         assert 'id="bqEntityType"' not in html
-        # BQ form now always rendered inside #tab-content-bigquery.
-        assert 'id="bqSourceQuery"' in html
-        # C3: legacy #registerModal removed; the Phase F Keboola modal
-        # at #registerKeboolaModal owns the Keboola flow now.
+        # C3/D4: legacy #registerModal AND the later per-connector modals
+        # are both gone; the ONE shared drawer renders regardless of
+        # data_source.type.
         assert 'id="registerModal"' not in html
-        assert 'id="kbBucket"' in html
-        assert 'id="kbViewName"' in html
+        assert 'id="registerKeboolaModal"' not in html
+        assert 'id="registerBqModal"' not in html
+        assert 'id="registerTableModal"' in html
+        assert "openRegisterModal('bigquery')" in html
+        assert "openRegisterModal('keboola')" in html
     finally:
         reset_cache()
 
 
-def test_precheck_failure_pins_field_errors_for_two_step_connectors(seeded_app, bq_instance):
-    """A 422 on a required field can only surface at PRECHECK for the
-    two-step connectors, so the field marks have to be applied there.
-
-    `register_table_precheck` runs "identical Pydantic validation to
-    register-table" (its own docstring), and the BQ / Snowflake confirm step
-    is reachable only after that precheck returned 200. Wiring
-    `_applyFieldErrors` solely into `_confirmRegister{BigQuery,Snowflake}Table`
-    therefore left `BQ_REGISTER_FIELD_MAP` / `SF_REGISTER_FIELD_MAP`
-    unreachable for validation errors — the operator got the readable toast
-    but never the red box that the rest of this feature promises, while the
-    single-POST connectors (Keboola, Databricks) did.
-    """
-    c = seeded_app["client"]
-    html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
-
-    for fn, field_map in (
-        ("function _registerBigQueryTable(", "BQ_REGISTER_FIELD_MAP"),
-        ("function _registerSnowflakeTable(", "SF_REGISTER_FIELD_MAP"),
-    ):
-        start = html.index(fn)
-        end = html.index("\n    function ", start + len(fn))
-        body = html[start:end]
-        assert "'/api/admin/register-table/precheck'" in body, (
-            f"{fn} no longer calls precheck — this guard has nothing to check"
-        )
-        assert f"_applyFieldErrors(d && d.detail, {field_map})" in body, (
-            f"{fn}: a precheck 422 must pin the field marks too, not just toast — "
-            "the confirm step that carries the field map is unreachable until "
-            "precheck has already passed validation"
-        )
+def test_register_table_form_surfaces_readable_row_errors():
+    """D4 collapsed the old two-step precheck→confirm flow (BQ/Snowflake
+    only; Keboola/Databricks already single-POSTed) into ONE path for every
+    connector: `RegisterTableForm.submit()` POSTs `/api/admin/register-table`
+    directly per checked row and renders each row's own result. Per-field
+    red-box pinning (`_applyFieldErrors`/`*_REGISTER_FIELD_MAP`) didn't carry
+    forward — deferred; a failed row still gets a readable per-row message
+    (never a bare `[object Object]`) because it goes through the same
+    `detail`-unwrapping helper (`window.apiDetailText`) the rest of the app
+    uses for FastAPI error shapes, not string-concatenated directly."""
+    js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+    assert "async function submit()" in js
+    assert "'/api/admin/register-table'" in js
+    assert "_errText(res.data && res.data.detail" in js
+    assert "typeof window.apiDetailText === 'function'" in js
+    # Never a bare `+ res.data.detail +`/`String(detail)` shortcut that would
+    # print "[object Object]" for the dict-shaped 422/409 detail FastAPI
+    # sends — the whole reason `_apiErrorMessage`/`apiDetailText` exist.
+    assert "+ res.data.detail" not in js
 
 
 def test_nested_confirm_prompt_dialog_outranks_the_register_drawer(seeded_app, bq_instance):
@@ -551,20 +504,32 @@ def test_keboola_whole_table_payload_is_not_rejected_by_the_register_validator(s
         )
     assert "JSON filter spec" in str(exc.value)
 
+    # Edit modal — unchanged by D4, still guarded here.
     c = seeded_app["client"]
     html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    start = html.index("function _buildKeboolaEditPayload(")
+    end = html.index("\n    function ", start)
+    assert "source_query: 'SELECT * FROM kbc." not in html[start:end], (
+        "_buildKeboolaEditPayload still synthesizes SQL into source_query for "
+        "the whole-table branch — the server rejects exactly that payload"
+    )
 
-    for fn in ("function _buildKeboolaPayload(", "function _buildKeboolaEditPayload("):
-        start = html.index(fn)
-        end = html.index("\n    function ", start + len(fn))
-        body = html[start:end]
-        # Anchored on the assignment, not the bare string: the surrounding
-        # comments legitimately name the payload this guard forbids.
-        assert "source_query: 'SELECT * FROM kbc." not in body, (
-            f"{fn} still synthesizes SQL into source_query for the whole-table "
-            "branch — the server rejects exactly that payload, so the drawer's "
-            "default mode cannot register anything"
-        )
+    # D4's register drawer: the SAME invariant, now in register_table_form.js
+    # (CONNECTORS.keboola.buildPayload). The 'whole' branch never sets
+    # source_query at all (materialized + bucket/source_table only — a NULL
+    # source_query means Storage API full-table export), so there's nothing
+    # to synthesize SQL into in the first place.
+    js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+    kb_start = js.index("keboola: {")
+    kb_end = js.index("\n    bigquery: {", kb_start)
+    kb_config = js[kb_start:kb_end]
+    assert "source_query: 'SELECT * FROM kbc." not in kb_config
+    whole_start = kb_config.rindex("// whole")
+    whole_branch = kb_config[whole_start:]
+    assert "source_query" not in whole_branch, (
+        "Keboola's 'whole' mode payload must not set source_query — a NULL "
+        "source_query is what a full-table Storage API export means"
+    )
 
 
 def test_keboola_edit_back_to_whole_table_clears_the_stored_source_query(seeded_app, monkeypatch):

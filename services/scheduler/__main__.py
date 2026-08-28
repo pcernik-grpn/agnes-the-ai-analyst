@@ -632,6 +632,16 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # audit.retention_days from instance.yaml and short-circuits when
         # set to 0 (default 365). Short 60s timeout — a single DELETE.
         ("audit-prune", "daily 05:30", "/api/admin/run-audit-prune", "POST", 60),
+        # Track E3 Slice 1: generalized per-trail retention sweep for
+        # sync_history / llm_usage / agent_scope_snapshots — the other
+        # unbounded trails alongside audit_log. Offset 15 min after
+        # audit-prune so the two DELETE-only jobs never share a tick. Every
+        # trail defaults to retention_days=0 (keep forever), so on a
+        # freshly-installed instance this job runs and prunes nothing.
+        # Endpoint reads retention.{sync_history,llm_usage,
+        # agent_scope_snapshots}_days from instance.yaml. Short 60s
+        # timeout — a handful of indexed DELETEs.
+        ("retention-prune", "daily 05:45", "/api/admin/run-retention-prune", "POST", 60),
         # wave-2G Task 5: DuckLake merge_adjacent_files/expire_snapshots/
         # cleanup_old_files/VACUUM pass (app/worker/kinds.py::
         # _run_ducklake_maintenance). Offset 30 min after the 04:00 store

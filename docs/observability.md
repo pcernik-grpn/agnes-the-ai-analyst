@@ -7,10 +7,27 @@ actions, viewer: `/admin/activity`), chat transcripts (`chat_messages`, no
 admin viewer — privacy decision), CLI session JSONLs (viewer:
 `/admin/sessions`), usage rollups (`usage_events`, viewer: `/admin/telemetry`),
 `sync_history` (folded into `/admin/activity`), `llm_usage`, and agent-runtime
-forensics. Only `audit_log` has a retention policy today —
-`audit.retention_days` in `instance.yaml` (default 365, `0` = forever),
-enforced by the daily `audit-prune` scheduler job. Retention for the other
-six trails is an open Track E decision, not an oversight.
+forensics (`agent_scope_snapshots`).
+
+Retention, per trail:
+
+| Trail | Config key | Default | Scheduler job |
+|---|---|---|---|
+| `audit_log` | `audit.retention_days` | 365 days | daily `audit-prune` |
+| `sync_history` | `retention.sync_history_days` | 0 = forever | daily `retention-prune` |
+| `llm_usage` | `retention.llm_usage_days` | 0 = forever | daily `retention-prune` |
+| `agent_scope_snapshots` | `retention.agent_scope_snapshots_days` | 0 = forever | daily `retention-prune` |
+| `usage_events` | `retention.usage_events_days` (or `USAGE_EVENTS_RETENTION_DAYS` env, which wins when set) | 0 = forever | own job, `POST /api/admin/usage/prune` (`agnes admin usage prune`) |
+| `chat_messages` | — | no policy | — (privacy decision, deliberately out of scope) |
+| CLI session JSONLs | — | no policy | — (filesystem, out of scope for DB retention) |
+
+`sync_state` (current per-table sync status) and the live `agents` table are
+never touched by any prune above — only the trail tables themselves
+(`sync_history`, `agent_scope_snapshots`) age out. Every non-`audit_log`
+window defaults to `0` = keep forever, so a freshly-installed instance prunes
+nothing until an admin opts in. See `src/audit_retention.py` for the
+dispatcher and `config/instance.yaml.example` for the full `retention:`
+block.
 
 Optional integration that wires four signals into a single PostHog project:
 

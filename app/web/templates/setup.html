@@ -9,6 +9,9 @@
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+{# D4 — one registration flow: step 3's "Browse tables" opens the shared
+   register drawer, same chrome as /admin/tables. #}
+<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
 <style>
   /* Honest guidance pane (Step 2) — same shape as the CSV guidance already
      shipped on /admin/data-sources (`.ds-wguide` in admin_data_sources.html):
@@ -137,9 +140,9 @@
             <!-- Step 3: Discover Tables -->
             <div id="step-3" style="display: none;">
                 <p style="font-size: 14px; color: var(--ds-text-muted); margin-bottom: 16px;">
-                    Discover and register tables from your data source.
+                    Browse your data source and register the tables you want. Use "Select all" for the fast path.
                 </p>
-                {{ ds.button('Discover Tables', variant='primary',
+                {{ ds.button('Browse tables', variant='primary',
                              type='button', id='btn-discover',
                              klass='btn-block',
                              attrs='onclick="discoverTables()"') }}
@@ -148,6 +151,10 @@
                              type='button', id='btn-next-sync',
                              klass='btn-block',
                              attrs='onclick="goToStep(4)" style="margin-top: 12px; display: none;"') }}
+                {{ ds.button('Skip (register tables later)', variant='secondary',
+                             type='button', id='btn-skip-discover',
+                             klass='btn-block',
+                             attrs='onclick="goToStep(4)" style="margin-top: 8px;"') }}
             </div>
 
             <!-- Step 4: First Sync & Done -->
@@ -165,6 +172,13 @@
                              attrs='style="margin-top: 12px; display: none; text-align: center;"') }}
             </div>
 </div>
+
+{# D4 — one registration flow: step 3 opens the SAME shared drawer the
+   tables page's "+ Register new table" uses, instead of the old
+   auto-register-everything call to /api/admin/discover-and-register (a
+   bypass of RegisterTableRequest's validation — see discoverTables()
+   below). #}
+{% include "_register_table_form.html" %}
 
 <script>
 let token = '';
@@ -282,6 +296,10 @@ async function configureSource(e) {
             return false;
         }
         if (!saved.ok) throw new Error(window.apiDetailText(saved.data.detail, 'Request failed'));
+        // Step 3's "Browse tables" needs to know which connector to open —
+        // captured here rather than re-read from the (now-hidden) step-2
+        // <select>, which stays reliable even if a later Skip/Back changes it.
+        _setupSourceType = src;
         showStatus('Connection verified!', 'success');
         goToStep(3);
     } catch (err) {
@@ -293,28 +311,41 @@ async function configureSource(e) {
     return false;
 }
 
-async function discoverTables() {
-    const btn = document.getElementById('btn-discover');
-    btn.disabled = true;
-    btn.textContent = 'Discovering...';
-    try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = 'Bearer ' + token;
-        const resp = await fetch('/api/admin/discover-and-register', { method: 'POST', headers });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(window.apiDetailText(data.detail, 'Discovery failed'));
+// D4 — one registration flow: this used to POST /api/admin/discover-and-
+// register, which auto-registers EVERY discovered Keboola table by calling
+// table_registry_repo().register() directly — bypassing RegisterTableRequest's
+// validation entirely (view-name collisions, unsafe identifiers, source-type
+// availability, …). Opening the same shared drawer /admin/tables uses routes
+// every registration through the validated POST /api/admin/register-table
+// instead, one table at a time, with the SAME "Select all" one-click ease.
+// (The sync-time discovery pass in app/api/sync.py still uses the old
+// discover-and-register helper unchanged — this only rewires the ONBOARDING
+// entry point, per the D4 scope guard.)
+var _setupSourceType = 'keboola';
 
-        const el = document.getElementById('discover-result');
-        el.style.display = 'block';
-        el.textContent = `Registered ${data.registered} tables, skipped ${data.skipped}.`;
-        document.getElementById('btn-next-sync').style.display = 'block';
-        btn.style.display = 'none';
-    } catch (err) {
-        showStatus(err.message, 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = 'Discover Tables';
+function discoverTables() {
+    if (!RegisterTableForm.CONNECTORS[_setupSourceType]) {
+        // BigQuery discovery here is the same two-step (dataset → tables)
+        // flow the tables page uses — still works standalone. Any other
+        // configured type (or none) has no onboarding discovery UI.
+        showStatus('No table browser for this data source yet — register tables from ' + {{ _home_word | tojson }} + ' after setup.', '');
+        goToStep(4);
+        return;
     }
+    RegisterTableForm.open({
+        sourceType: _setupSourceType,
+        authHeaders: token ? { Authorization: 'Bearer ' + token } : {},
+        onDone: function (summary) {
+            const el = document.getElementById('discover-result');
+            el.style.display = 'block';
+            el.textContent = `Registered ${summary.registered} table${summary.registered === 1 ? '' : 's'}` +
+                (summary.failed ? `, ${summary.failed} failed.` : '.');
+            if (summary.registered) {
+                document.getElementById('btn-next-sync').style.display = 'block';
+                document.getElementById('btn-discover').style.display = 'none';
+            }
+        },
+    });
 }
 
 async function triggerSync() {
@@ -343,4 +374,8 @@ if (savedToken) token = savedToken;
 
 {% block scripts %}
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
+{# D4 — one registration flow: same shared drawer + Keboola where_filters
+   builder the tables page uses, for step 3's "Browse tables". #}
+<script src="{{ static_url('js/where-filters-builder.js') }}"></script>
+<script src="{{ static_url('js/register_table_form.js') }}"></script>
 {% endblock %}
