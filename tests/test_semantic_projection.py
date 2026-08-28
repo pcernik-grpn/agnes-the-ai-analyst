@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from src.semantic.projection import project_document
+from src.semantic.projection import project_document, prune_model
 
 
 @pytest.fixture
@@ -466,18 +466,26 @@ class TestDatasetGrain:
 
 
 class TestColumnBinding:
-    """The column leg keys `column_metadata` on the RAW dataset id
-    (`dataset.source` or `dataset.name`), never resolved through the table
-    binder to the Agnes `table_registry` view name — unlike the metric leg.
-    `column_metadata` is keyed `(table_id, column_name)` with a single
-    `source` column (no source dimension), so a naive bind under the view
-    name collides with rows the profiler / import_proposal / admin already
-    own there and clobbers them on every sync. (A view-name bind was tried
-    and reverted — see the regression test below.) Surfacing Keboola
-    per-column descriptions under the view name is deferred pending an
-    ownership-aware design for that key."""
+    """The column leg keys `column_metadata` on the RESOLVED Agnes
+    `table_registry` id (via `resolve_dataset_table`), the same identifier
+    `/api/v2/schema/{table_id}` and every other `column_metadata` reader
+    already key on — mirroring the metric leg's own table-binding above.
+    Before this resolution step, a Keboola dataset's raw tableId
+    (`in.c-shop.orders`) was stored verbatim: nothing else ever reads
+    `column_metadata` under a raw Keboola tableId, so an imported column
+    description was written but never surfaced anywhere (a silent no-op).
 
-    def test_keboola_field_descriptions_land_under_the_raw_id_registered_or_not(self, system_db):
+    Resolving onto a real, shared table id reopens a collision risk a prior
+    attempt at this exact change hit and had to revert: the profiler / admin
+    metadata API / ai_enrichment already own rows under that same id. The
+    write path guards against it (see the regression test below) — an
+    existing row owned by a DIFFERENT writer always wins over this
+    projection's write, the same precedence the manual-model path already
+    had (`_column_source`), now applied unconditionally since resolution can
+    land ANY source's write on an id another writer already owns.
+    """
+
+    def test_keboola_field_descriptions_land_under_the_resolved_agnes_id(self, system_db):
         _register_keboola_table("in.c-shop", "orders", "shop_orders")
 
         doc = {
@@ -502,14 +510,45 @@ class TestColumnBinding:
         from src.repositories import column_metadata_repo
 
         repo = column_metadata_repo()
-        under_raw_id = repo.list_for_table("in.c-shop.orders")
-        assert [c["column_name"] for c in under_raw_id] == ["amount"]
-        assert under_raw_id[0]["description"] == "Order amount, in cents."
-        # Nothing lands under the resolved view name — even though the table
-        # IS registered — because the column leg no longer binds through it.
-        assert repo.list_for_table("shop_orders") == []
+        under_resolved_id = repo.list_for_table("shop_orders")
+        assert [c["column_name"] for c in under_resolved_id] == ["amount"]
+        assert under_resolved_id[0]["description"] == "Order amount, in cents."
+        # Nothing lands under the raw Keboola tableId anymore.
+        assert repo.list_for_table("in.c-shop.orders") == []
 
-    def test_prune_stays_scoped_to_the_raw_id(self, system_db):
+        # And it's retrievable through the actual production read path
+        # (`GET /api/v2/schema/{table_id}`), not just the repo directly.
+        from app.api.v2_schema import _column_metadata_descriptions
+
+        assert _column_metadata_descriptions("shop_orders") == {"amount": "Order amount, in cents."}
+
+    def test_keboola_field_descriptions_fall_back_to_the_raw_id_when_unregistered(self, system_db):
+        """A dataset whose Keboola tableId doesn't resolve to any registered
+        table (yet) keeps the pre-fix behavior — written under the raw id —
+        rather than being dropped outright."""
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "in.c-ghost.nowhere",
+                            "fields": [{"name": "amount", "datatype": "Decimal", "description": "n/a"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        report = project_document(doc, source="keboola_metastore", source_ref="conn-1")
+        assert report.columns_written == 1
+
+        from src.repositories import column_metadata_repo
+
+        under_raw_id = column_metadata_repo().list_for_table("in.c-ghost.nowhere")
+        assert [c["column_name"] for c in under_raw_id] == ["amount"]
+
+    def test_prune_stays_scoped_to_the_resolved_id(self, system_db):
         _register_keboola_table("in.c-shop", "orders", "shop_orders")
 
         def _doc_with_fields(field_names):
@@ -533,16 +572,17 @@ class TestColumnBinding:
 
         from src.repositories import column_metadata_repo
 
-        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("in.c-shop.orders")}
-        assert remaining == {"amount"}, "the dropped field must be pruned under the raw id"
+        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("shop_orders")}
+        assert remaining == {"amount"}, "the dropped field must be pruned under the resolved id"
 
     def test_profiler_authored_description_survives_keboola_projection(self, system_db):
         """Regression guard for the reverted column-binding change: a
         profiler/admin-authored `column_metadata` row for a Keboola-registered
-        table (keyed under the VIEW name) must not be clobbered by a semantic
-        layer sync for that table, because the projector now writes under the
-        raw dataset id — a different key entirely, so no collision, no
-        overwrite, no prune."""
+        table (keyed under the resolved Agnes id) must not be clobbered by a
+        semantic layer sync for that same table — the projection now resolves
+        onto the SAME id the profiler already wrote, so the write-path
+        precedence guard (an existing row owned by a different writer wins)
+        is what keeps this description intact, not a difference in keys."""
         _register_keboola_table("in.c-shop", "orders", "shop_orders")
 
         from src.repositories import column_metadata_repo
@@ -577,6 +617,148 @@ class TestColumnBinding:
         row = repo.get("shop_orders", "amount")
         assert row["description"] == "Authored by the profiler."
         assert row["source"] == "profiler"
+
+    def test_sibling_keboola_models_sharing_a_resolved_table_do_not_prune_each_others_columns(self, system_db):
+        """Regression: the column leg's write path resolves `table_id` via
+        `resolve_dataset_table`, but `_sibling_column_claims` used to key its
+        claims on the RAW dataset id — a mismatch invisible for `source=
+        'manual'` (whose raw id already IS the resolved one) but live for
+        every other source. A partial projection's `keep_by_table.get
+        (resolved_id)` then always missed a sibling's claim, so projecting
+        one Keboola model onto a shared table pruned a sibling model's
+        columns for that same table outright."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+
+        def _doc(model_name, field_names):
+            return {
+                "semantic_model": [
+                    {
+                        "name": model_name,
+                        "datasets": [
+                            {
+                                "name": "orders",
+                                "source": "in.c-shop.orders",
+                                "fields": [{"name": n} for n in field_names],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        # `_sibling_column_claims` reads OTHER models' claims from their
+        # STORED `semantic_models` rows (as the real importer writes them
+        # before projecting, per `src/semantic/importer.py`) — a bare
+        # `project_document` call alone never populates that table, so each
+        # model's document must be seeded here too, or the sibling read sees
+        # nothing and the test can't tell a real fix from a no-op one.
+        from src.repositories import semantic_model_repo
+
+        def _seed(model_name, field_names):
+            doc = _doc(model_name, field_names)
+            semantic_model_repo().upsert(
+                id=f"keboola_metastore/conn-1/{model_name}",
+                slug=model_name,
+                name=model_name,
+                description=None,
+                document="version: '0.2.0.dev0'",
+                document_json=doc,
+                spec_version="0.2.0.dev0",
+                content_hash=model_name,
+                source="keboola_metastore",
+                source_ref="conn-1",
+                status="valid",
+                validation_errors=None,
+                validated_at=None,
+            )
+            return doc
+
+        project_document(_seed("retail", ["col_a"]), source="keboola_metastore", source_ref="conn-1", partial=True)
+        project_document(_seed("finance", ["col_b"]), source="keboola_metastore", source_ref="conn-1", partial=True)
+
+        from src.repositories import column_metadata_repo
+
+        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("shop_orders")}
+        assert remaining == {"col_a", "col_b"}, "projecting finance must not prune retail's sibling columns"
+
+    def test_deleting_a_keboola_model_prunes_its_own_columns_under_the_resolved_id(self, system_db):
+        """Regression: `prune_model`'s `written_by_table` used to key on the
+        RAW dataset id too, so `repo.list_for_table(raw_id)` found nothing
+        for a Keboola model (whose rows now live under the resolved id) and
+        deleting the model's document left its `column_metadata` rows
+        orphaned — never cleaned up."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "in.c-shop.orders",
+                            "fields": [{"name": "amount"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        project_document(doc, source="keboola_metastore", source_ref="conn-1")
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("shop_orders", "amount") is not None
+
+        prune_model(doc, source="keboola_metastore", source_ref="conn-1")
+
+        assert repo.get("shop_orders", "amount") is None, "deleting the model must not orphan its column_metadata row"
+
+    def test_manual_dataset_source_is_never_resolved(self, system_db):
+        """Regression (Devin, PR #1673): a manual dataset's `source` is
+        ALREADY an Agnes table id by convention, so it must land under that
+        literal string, not whatever `resolve_dataset_table` maps it to.
+        `table_registry.id` is derived from `name` (e.g. `request.name
+        .strip().lower().replace(" ", "_")` in `app/api/admin.py`), so a
+        table registered with a display name containing spaces/uppercase
+        has `id != name` — before this guard, a manual dataset whose
+        `source` matched that NAME would silently resolve onto the
+        DIFFERENT `id`, orphaning any pre-existing column row under the
+        raw name key."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="orders_table",
+                name="Orders Table",
+                source_type="local",
+                query_mode="local",
+            )
+        finally:
+            conn.close()
+
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "Orders Table",
+                            "fields": [{"name": "amount"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        project_document(doc, source="manual", source_ref=None)
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("Orders Table", "amount") is not None, "must land under the raw dataset source, unresolved"
+        assert repo.get("orders_table", "amount") is None, "must NOT resolve onto table_registry's derived id"
 
 
 class TestDuplicateModelName:

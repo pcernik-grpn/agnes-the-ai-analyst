@@ -14,11 +14,13 @@ Two tiers:
   (``can_access_table``). A model with no linked package is reachable by
   admins only, since there is no package grant to check.
 
-Ownership rule (the only enforcement point for it, since no UI ships in
-this task): a model whose ``source`` is not ``'manual'`` was written by a
-sync (``import_source``) and refuses edits with 409 ``source_owned`` —
-the next sync would silently revert an edit made here, so editing at the
-source is the only way to make a change stick.
+Ownership rule (``_is_source_owned``, the single predicate every mutating
+endpoint below shares): a model whose ``source`` is not ``'manual'`` was
+written by a sync (``import_source``) and refuses create/update/delete with
+409 ``source_owned`` — a manual create colliding with its slug, an edit, or
+a delete would each be silently reverted or fought by the next sync, so
+editing at the source (or detaching, F3) is the only way to make a change
+stick.
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -67,25 +69,25 @@ _SWEEP_SESSION_TIMEOUT_S = 60
 
 class SemanticModelCreate(BaseModel):
     document: str
-    description: Optional[str] = None
+    description: str | None = None
 
 
 class SemanticModelApply(BaseModel):
     document: str
-    description: Optional[str] = None
+    description: str | None = None
     # Optimistic lock for read → modify → apply loops: the content_hash the
     # caller's edit was based on. A mismatch 409s instead of overwriting.
-    expected_content_hash: Optional[str] = None
+    expected_content_hash: str | None = None
 
 
 class SemanticModelUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
+    name: str | None = None
+    description: str | None = None
 
 
 class SemanticQueryValidate(BaseModel):
     sql: str
-    expected: Optional[list[dict]] = None
+    expected: list[dict] | None = None
     target_engine: str = "duckdb"
 
 
@@ -98,10 +100,10 @@ class SemanticSourceCreate(BaseModel):
 
 
 class SemanticSourceUpdate(BaseModel):
-    name: Optional[str] = None
-    adapter: Optional[str] = None
-    config: Optional[dict] = None
-    enabled: Optional[bool] = None
+    name: str | None = None
+    adapter: str | None = None
+    config: dict | None = None
+    enabled: bool | None = None
 
 
 _VALID_KINDS = ("git", "upload", "connection")
@@ -158,7 +160,7 @@ def _export_denied_message(slug: str) -> str:
     )
 
 
-def _project(document_json: Optional[dict], *, source: str, source_ref: Optional[str]) -> None:
+def _project(document_json: dict | None, *, source: str, source_ref: str | None) -> None:
     """Project one stored model's document into the flat tables
     (``metric_definitions``, ``glossary_terms``, ``column_metadata``) —
     the same call ``src/semantic/importer.py`` makes for a synced source, so
@@ -190,7 +192,32 @@ def _project(document_json: Optional[dict], *, source: str, source_ref: Optional
     project_document(document_json, source=source, source_ref=source_ref, partial=True)
 
 
-def _resolve_model(model_ref: str) -> Optional[dict]:
+def _is_source_owned(row: dict) -> bool:
+    """True iff ``row`` was written by a sync and hasn't been detached (F3)
+    — the single ownership predicate every mutating endpoint (create
+    collision, update, delete, ``_check_apply``) must agree on, so a
+    manual write can never coexist or race with the source that owns the
+    slug. A DETACHED source-owned row is exempt, same as everywhere else
+    this predicate is applied: detaching is the deliberate escape hatch."""
+    return row.get("source") != "manual" and row.get("sync_mode") != "detached"
+
+
+def _source_owned_message(row: dict) -> str:
+    return (
+        f"this model is owned by source '{row['source']}'"
+        + (f" (source_ref={row['source_ref']!r})" if row.get("source_ref") else "")
+        + " — edit it there, then re-sync, rather than here"
+    )
+
+
+def _raise_source_owned(row: dict) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "source_owned", "message": _source_owned_message(row)},
+    )
+
+
+def _resolve_model(model_ref: str) -> dict | None:
     """Accept either a model id or its slug — ids are opaque
     (``<source>/<source_ref>/<slug>``), so a slug is the friendlier handle
     for an interactive admin."""
@@ -216,21 +243,21 @@ class SemanticApplyError(ValueError):
         self.code = code
 
 
-def _check_apply(document: str, expected_content_hash: Optional[str] = None):
+def _check_apply(document: str, expected_content_hash: str | None = None):
     """Validate ``document`` and run the write-independent guards.
 
     Returns ``(slug, validation_result)``. Raises ``SemanticApplyError``:
 
     - ``invalid_document`` — schema errors, or no named ``semantic_model``.
     - ``source_owned`` — the slug belongs to an imported model that hasn't
-      been detached (F3). Unlike the raw admin POST (which would create a
-      shadow ``manual/_/<slug>`` row next to the imported one), apply
-      refuses for admins and non-admins alike — the next source sync would
-      not revert the write, it would coexist with it, and ``get_by_slug``
-      would resolve ambiguously. A DETACHED source-owned model is exempt:
-      that's exactly the danger-flow escape hatch F3 exists for (see
-      ``POST .../detach``) — sync already refuses to touch a detached row,
-      so there is no second-writer ambiguity to guard against here.
+      been detached (F3). Apply refuses for admins and non-admins alike, the
+      same as the raw admin POST/PUT/DELETE (see ``_is_source_owned``): the
+      next source sync would not revert the write, it would coexist with
+      it, and ``get_by_slug`` would resolve ambiguously. A DETACHED
+      source-owned model is exempt: that's exactly the danger-flow escape
+      hatch F3 exists for (see ``POST .../detach``) — sync already refuses
+      to touch a detached row, so there is no second-writer ambiguity to
+      guard against here.
     - ``stale_document`` — ``expected_content_hash`` no longer matches.
     """
     result = validate_document(document)
@@ -242,7 +269,7 @@ def _check_apply(document: str, expected_content_hash: Optional[str] = None):
         raise SemanticApplyError("invalid_document", "Document declares no semantic_model entry with a name")
 
     existing = semantic_model_repo().get_by_slug(slug)
-    if existing is not None and existing.get("source") != "manual" and existing.get("sync_mode") != "detached":
+    if existing is not None and _is_source_owned(existing):
         raise SemanticApplyError(
             "source_owned",
             f"slug '{slug}' is owned by source '{existing['source']}'"
@@ -261,8 +288,8 @@ def _check_apply(document: str, expected_content_hash: Optional[str] = None):
 
 def apply_manual_model(
     document: str,
-    description: Optional[str] = None,
-    expected_content_hash: Optional[str] = None,
+    description: str | None = None,
+    expected_content_hash: str | None = None,
 ) -> dict:
     """The one write pipeline for a hand-authored model: guards → write →
     project. Used by the ``/apply`` admin branch AND the moderation-queue
@@ -292,7 +319,7 @@ def apply_manual_model(
             content_hash=content_hash,
             status="valid",
             validation_errors=None,
-            validated_at=datetime.now(timezone.utc),
+            validated_at=datetime.now(UTC),
         )
         _project(result.parsed, source=existing["source"], source_ref=existing.get("source_ref"))
         return row
@@ -309,7 +336,7 @@ def apply_manual_model(
         source_ref=None,
         status="valid",
         validation_errors=None,
-        validated_at=datetime.now(timezone.utc),
+        validated_at=datetime.now(UTC),
     )
     _project(result.parsed, source="manual", source_ref=None)
     return row
@@ -328,8 +355,8 @@ def _apply_error_to_http(exc: SemanticApplyError) -> HTTPException:
 
 @router.get("/api/admin/semantic-models")
 async def list_semantic_models(
-    source: Optional[str] = None,
-    source_ref: Optional[str] = None,
+    source: str | None = None,
+    source_ref: str | None = None,
     user: dict = Depends(require_admin),
 ):
     """List every stored semantic model (any status), admin-only."""
@@ -545,7 +572,19 @@ async def create_semantic_model(
 ):
     """Create (or replace) a hand-authored (``source='manual'``) model from
     a pasted Ossie document. Invalid input 422s with the schema errors —
-    never stored half-valid."""
+    never stored half-valid.
+
+    A slug colliding with an existing source-owned model 409s ``source_owned``
+    (``_is_source_owned``, shared with PUT/DELETE/``_check_apply``) instead of
+    creating a shadow ``manual/_/<slug>`` row next to the imported one — two
+    rows sharing a slug would leave ``get_by_slug`` (``ORDER BY updated_at
+    DESC LIMIT 1``) to resolve the collision nondeterministically. A slug
+    matching a DETACHED source-owned row is exempt from that 409 (F3), but
+    still can't take the plain upsert path below: that row already owns the
+    slug, so writing a second, new ``manual/_/<slug>`` id next to it would
+    recreate the exact same collision this guard exists to prevent. It's
+    updated in place instead — same handling ``apply_manual_model`` already
+    gives this case."""
     result = validate_document(body.document)
     if not result.ok:
         raise HTTPException(status_code=422, detail={"errors": result.errors})
@@ -558,7 +597,27 @@ async def create_semantic_model(
             detail={"errors": ["Document declares no semantic_model entry with a name"]},
         )
 
+    existing = semantic_model_repo().get_by_slug(slug)
+    if existing is not None and _is_source_owned(existing):
+        _raise_source_owned(existing)
+
     content_hash = hashlib.sha256(body.document.encode()).hexdigest()
+    if existing is not None and existing.get("sync_mode") == "detached":
+        row = semantic_model_repo().update_document(
+            existing["id"],
+            name=slug,
+            description=body.description,
+            document=body.document,
+            document_json=result.parsed,
+            spec_version=result.spec_version,
+            content_hash=content_hash,
+            status="valid",
+            validation_errors=None,
+            validated_at=datetime.now(UTC),
+        )
+        _project(result.parsed, source=existing["source"], source_ref=existing.get("source_ref"))
+        return row
+
     row = semantic_model_repo().upsert(
         id=f"manual/_/{slug}",
         slug=slug,
@@ -572,7 +631,7 @@ async def create_semantic_model(
         source_ref=None,
         status="valid",
         validation_errors=None,
-        validated_at=datetime.now(timezone.utc),
+        validated_at=datetime.now(UTC),
     )
     _project(result.parsed, source="manual", source_ref=None)
     return row
@@ -591,18 +650,8 @@ async def update_semantic_model(model_id: str, body: SemanticModelUpdate, user: 
     row = _resolve_model(model_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{model_id}' not found")
-    if row["source"] != "manual" and row.get("sync_mode") != "detached":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "source_owned",
-                "message": (
-                    f"this model is owned by source '{row['source']}'"
-                    + (f" (source_ref={row['source_ref']!r})" if row.get("source_ref") else "")
-                    + " — edit it there, then re-sync, rather than here"
-                ),
-            },
-        )
+    if _is_source_owned(row):
+        _raise_source_owned(row)
     # F3: `update_document`, not `upsert` — a detached row's provenance
     # (source/source_ref) and sync_mode/detach-tracking must survive a
     # name/description-only edit unchanged. Harmless on a manual row too
@@ -731,6 +780,10 @@ async def delete_semantic_model(model_id: str, user: dict = Depends(require_admi
     row = _resolve_model(model_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{model_id}' not found")
+    if _is_source_owned(row):
+        # A scheduled sync would just recreate it — deleting here would
+        # either destroy provenance history or fight the next sync tick.
+        _raise_source_owned(row)
     # Prune the flat projection (metric_definitions/glossary_terms/
     # column_metadata) BEFORE deleting the document row — the row is the
     # only place that still carries the document once this call returns, and
@@ -813,7 +866,7 @@ async def sync_semantic_source(source_id: str, user: dict = Depends(require_admi
 
     try:
         report = import_source(source_id)
-    except Exception as exc:  # noqa: BLE001 - surfaced to the caller, not swallowed
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=f"sync failed: {exc}") from exc
     return asdict(report)
 
@@ -877,7 +930,7 @@ _NO_MODEL_MESSAGE = (
 
 
 def _accessible_valid_documents(
-    user: dict, conn: duckdb.DuckDBPyConnection, model_refs: Optional[set[str]] = None
+    user: dict, conn: duckdb.DuckDBPyConnection, model_refs: set[str] | None = None
 ) -> list[dict[str, Any]]:
     """The individual model dicts (``document_json["semantic_model"]``
     entries) of every ``status='valid'`` semantic-model row ``user`` may
@@ -994,7 +1047,7 @@ async def get_semantic_context_endpoint(
             "Absent/empty ids returns every object of that type compactly; explicit ids return full attributes."
         ),
     ),
-    model_ids: Optional[list[str]] = Query(
+    model_ids: list[str] | None = Query(
         None,
         description=(
             "Restrict to these models by id, slug, or model name (the `model` label each object "
@@ -1083,7 +1136,7 @@ async def semantic_models_bundle(
     """
     rows = _accessible_valid_rows(user, conn)
     return {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ttl_seconds": DEFAULT_TTL_SECONDS,
         "models": [
             {
@@ -1132,7 +1185,7 @@ async def apply_semantic_model_endpoint(
     from src.repositories import authoring_suggestions_repo
 
     try:
-        slug, result = _check_apply(body.document, body.expected_content_hash)
+        slug, _result = _check_apply(body.document, body.expected_content_hash)
     except SemanticApplyError as exc:
         raise _apply_error_to_http(exc) from None
 
