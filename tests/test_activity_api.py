@@ -313,9 +313,16 @@ def test_activity_endpoints_silent_when_posthog_disabled(seeded_app, admin_user)
 
 class TestKpiTableParity:
     """The regression this whole change exists to prevent: KPI cards, facets
-    and the timeline must tell one story for any filter state."""
+    and the timeline must tell one story for any filter state — INCLUDING
+    the sync_history/llm_usage/agent_scope_snapshots trails folded into the
+    timeline by E3 slice 2. Seeding only audit_log here would miss exactly
+    the bug this class exists to catch (kpis()/facets() silently staying
+    audit_log-only while the timeline widened)."""
 
     def _seed(self):
+        import uuid
+        from datetime import datetime, timezone
+
         from src.db import get_system_db
         from src.repositories.audit import AuditRepository
 
@@ -326,6 +333,26 @@ class TestKpiTableParity:
         repo.log(user_id="alice", action="query.run", result="error.400", client_kind="web")
         repo.log(user_id="bob", action="query.run", result="denied", client_kind="cli")
         repo.log(user_id="sched-user", action="run_session_processor:usage", result="success")
+        now = datetime.now(timezone.utc)
+        # One row per non-audit trail — sync_history/agent_scope_snapshots
+        # carry no user_id (system/agent-runtime actors); the llm_usage row
+        # reuses "alice" as the owning user so the pre-existing
+        # active-users/user_id=alice assertions below stay meaningful rather
+        # than needing an unrelated third identity.
+        conn.execute(
+            "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [str(uuid.uuid4()), "t_kpi", now, 10, 100, "ok", None],
+        )
+        conn.execute(
+            "INSERT INTO llm_usage (id, agent_id, user_id, session_id, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_creation_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [str(uuid.uuid4()), "agent-kpi", "alice", "sess-kpi", "claude-x", 10, 20, 0, 0],
+        )
+        conn.execute(
+            "INSERT INTO agent_scope_snapshots (id, session_id, agent_id, effective_scope) VALUES (?, ?, ?, ?)",
+            [str(uuid.uuid4()), "sess-kpi", "agent-kpi", "{}"],
+        )
         conn.close()
 
     def _counts(self, client, admin_user, qs):
@@ -342,9 +369,46 @@ class TestKpiTableParity:
             "result_class=denied",
             "source=cli",
             "user_id=alice&source=web",
+            # E3 slice 2: the folded-in trails must agree under the SAME
+            # trail= filter the timeline accepts — not just the unfiltered
+            # (all-trails) case above.
+            "trail=audit",
+            "trail=sync",
+            "trail=llm",
+            "trail=agent_scope",
+            "source=agent",
         ):
             k, t = self._counts(c, admin_user, qs)
             assert k == t, f"KPI {k} != timeline {t} for {qs}"
+
+    def test_kpis_and_facets_include_folded_in_trails(self, seeded_app, admin_user):
+        """Unfiltered kpis()/facets() must count the non-audit trails too —
+        the exact bug this fix closes (cards silently undercounting the rows
+        the table right below them shows)."""
+        self._seed()
+        c = seeded_app["client"]
+
+        kpi_all = c.get("/api/admin/observability/kpis?since_minutes=60", headers=admin_user).json()
+        kpi_audit_only = c.get("/api/admin/observability/kpis?since_minutes=60&trail=audit", headers=admin_user).json()
+        assert kpi_all["events_total"] > kpi_audit_only["events_total"]
+        assert kpi_all["events_total"] == kpi_audit_only["events_total"] + 3  # sync + llm + agent_scope
+
+        f = c.get("/api/admin/observability/facets?since_minutes=60", headers=admin_user).json()
+        actions = {a["value"] for a in f["actions"]}
+        assert {"sync.table", "llm.call", "agent.spawn.scope"} <= actions
+        sources = {s["value"] for s in f["sources"]}
+        assert "scheduler" in sources
+        assert "agent" in sources
+
+        f_audit_only = c.get("/api/admin/observability/facets?since_minutes=60&trail=audit", headers=admin_user).json()
+        actions_audit_only = {a["value"] for a in f_audit_only["actions"]}
+        assert "sync.table" not in actions_audit_only
+        assert "llm.call" not in actions_audit_only
+
+    def test_kpis_and_facets_reject_unknown_trail(self, seeded_app, admin_user):
+        c = seeded_app["client"]
+        assert c.get("/api/admin/observability/kpis?trail=bogus", headers=admin_user).status_code == 400
+        assert c.get("/api/admin/observability/facets?trail=bogus", headers=admin_user).status_code == 400
 
     def test_self_reads_hidden_by_default(self, seeded_app, admin_user):
         self._seed()
@@ -370,7 +434,9 @@ class TestKpiTableParity:
         self._seed()
         c = seeded_app["client"]
         f = c.get("/api/admin/observability/facets?since_minutes=60&user_id=alice", headers=admin_user).json()
-        assert {a["value"] for a in f["actions"]} == {"table.read", "query.run"}
+        # "llm.call" is present because _seed()'s llm_usage row is owned by
+        # alice (E3 slice 2 — the unified facets() now see it too).
+        assert {a["value"] for a in f["actions"]} == {"table.read", "query.run", "llm.call"}
         classes = {x["value"]: x["count"] for x in f["result_classes"]}
         assert classes["success"] == 2 and classes["error"] == 1
 

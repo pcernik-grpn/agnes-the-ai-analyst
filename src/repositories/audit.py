@@ -463,24 +463,36 @@ class AuditRepository:
         *,
         since: datetime,
         limit: int = 50,
+        trail: Optional[str] = None,
         **filters: "Any",
     ) -> "dict[str, list[dict]]":
-        """Distinct facet values present in ``audit_log`` since ``since``.
+        """Distinct facet values present across the unified timeline
+        (audit_log + sync_history + llm_usage + agent_scope_snapshots)
+        since ``since``.
 
         Buckets: users, actions, results, result_classes, resources,
         sources — largest-first, capped at ``limit``. Accepts the same
-        filter kwargs as :meth:`query` (via ``_filters_where``) so the
-        dropdown counts always describe the same row set the timeline
-        shows. Source classification uses the shared
-        ``AUDIT_SOURCE_CASE_SQL`` rule — no caller-supplied action list.
+        filter kwargs as :meth:`query_unified` (via ``_filters_where``), plus
+        ``trail`` to narrow to one physical trail, so the dropdown counts
+        always describe the same row set the (now-unified) timeline shows —
+        the whole page tells one story. Source classification uses the
+        shared ``AUDIT_SOURCE_CASE_SQL`` rule — no caller-supplied action
+        list.
         """
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
         where, params = self._filters_where(since=since, **filters)
+        if trail is not None:
+            where.append("trail = ?")
+            params.append(trail)
         w = ("WHERE " + " AND ".join(where)) if where else ""
 
         def _bucket(select: str, extra: str = "", group: str = "1") -> list:
             clause = w + (f" AND {extra}" if (w and extra) else (f"WHERE {extra}" if extra else ""))
             return self.conn.execute(
-                f"SELECT {select}, COUNT(*) AS n FROM audit_log {clause} GROUP BY {group} ORDER BY n DESC LIMIT ?",
+                f"SELECT {select}, COUNT(*) AS n FROM ({_UNIFIED_UNION_SQL}) unified {clause} "
+                f"GROUP BY {group} ORDER BY n DESC LIMIT ?",
                 params + [limit],
             ).fetchall()
 
@@ -554,10 +566,13 @@ class AuditRepository:
         ).fetchone()
         return int(row[0] or 0) if row else 0
 
-    def kpis(self, *, since: datetime, **filters: "Any") -> "dict[str, Any]":
-        """Headline KPIs over the window: events, active users, errors, p95,
-        duration coverage. Accepts the same filter kwargs as :meth:`query`
-        so the KPI cards always agree with the timeline.
+    def kpis(self, *, since: datetime, trail: Optional[str] = None, **filters: "Any") -> "dict[str, Any]":
+        """Headline KPIs over the window, across the unified timeline
+        (audit_log + sync_history + llm_usage + agent_scope_snapshots):
+        events, active users, errors, p95, duration coverage. Accepts the
+        same filter kwargs as :meth:`query_unified`, plus ``trail`` to
+        narrow to one physical trail, so the KPI cards always agree with the
+        (now-unified) timeline.
 
         ``active_users`` counts people — rows whose computed source is
         ``scheduler``/``system`` are excluded from the distinct-user count
@@ -566,7 +581,13 @@ class AuditRepository:
         ``p95`` uses DuckDB's ``approx_quantile`` (the PG sibling uses an
         exact ``percentile_cont``; results may differ within tolerance).
         """
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
         where, params = self._filters_where(since=since, **filters)
+        if trail is not None:
+            where.append("trail = ?")
+            params.append(trail)
         w = ("WHERE " + " AND ".join(where)) if where else ""
         row = self.conn.execute(
             f"""
@@ -580,7 +601,7 @@ class AuditRepository:
               CAST(approx_quantile(duration_ms, 0.95) AS INTEGER) AS p95,
               COUNT(duration_ms) AS measured,
               COUNT(*) AS total
-            FROM audit_log {w}
+            FROM ({_UNIFIED_UNION_SQL}) unified {w}
             """,
             params,
         ).fetchone()

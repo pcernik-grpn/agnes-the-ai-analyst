@@ -20,9 +20,13 @@ filter/facet/cursor machinery `audit_log`-only queries always used
 (`AUDIT_SOURCE_CASE_SQL`, `RESULT_CLASS_CASE_SQL`), implemented in lockstep
 on both backends (`AuditRepository.query_unified` /
 `AuditPgRepository.query_unified` in `src/repositories/audit.py` /
-`audit_pg.py`). **`chat_messages` is never part of this union** — customer
-data in transcripts, no admin viewer by design; it is not one of the four
-SELECTs the projection UNIONs.
+`audit_pg.py`). The page's KPI cards and facet dropdowns
+(`GET /api/admin/observability/kpis` + `/facets`, backed by
+`AuditRepository.kpis`/`facets`) read the SAME union and accept the SAME
+`trail=` filter as the timeline — the cards, dropdowns and table can never
+tell different stories for one filter state. **`chat_messages` is never
+part of this union** — customer data in transcripts, no admin viewer by
+design; it is not one of the four SELECTs the projection UNIONs.
 
 Retention, per trail:
 

@@ -910,3 +910,83 @@ def test_query_unified_never_surfaces_chat_messages(audit_repo):
     assert secret not in blob
     assert "leak-sess" not in blob
     assert "leak-msg" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Blocking fix follow-up: kpis()/facets() widened to the SAME unified union
+# as query_unified() — the sibling endpoints backing the KPI cards + facet
+# dropdowns on /admin/activity must count/list the folded-in trails too, or
+# the page tells two different stories.
+# ---------------------------------------------------------------------------
+
+
+def _seed_kpi_facet_trails(audit_repo):
+    """One row per trail, same shape as TestKpiTableParity._seed() in
+    tests/test_activity_api.py — kept in sync deliberately (not imported,
+    since that lives in the top-level app-test module, this in the PG
+    contract module)."""
+    repo, _, _ = audit_repo
+    now = datetime.now(timezone.utc)
+    repo.log(user_id="alice", action="table.read", result="success", client_kind="web")
+    repo.log(user_id="bob", action="query.run", result="denied", client_kind="cli")
+    _insert_sync_history(audit_repo, id_="kf-sh1", table_id="t_kf", synced_at=now, status="ok")
+    _insert_llm_usage(audit_repo, id_="kf-lu1", agent_id="agent-kf", user_id="alice", session_id="sess-kf", model="m")
+    _insert_agent_scope_snapshot(
+        audit_repo, id_="kf-ss1", session_id="sess-kf", agent_id="agent-kf", effective_scope="{}"
+    )
+
+
+def test_kpis_events_total_matches_query_unified_row_count(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    rows, _ = repo.query_unified(since=since, limit=200)
+    k = repo.kpis(since=since)
+    assert k["events_total"] == len(rows) == 5
+
+
+def test_kpis_trail_filter_matches_query_unified_trail_filter(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    for trail in ("audit", "sync", "llm", "agent_scope"):
+        rows, _ = repo.query_unified(since=since, trail=trail, limit=200)
+        k = repo.kpis(since=since, trail=trail)
+        assert k["events_total"] == len(rows), f"trail={trail}"
+
+
+def test_kpis_rejects_unknown_trail(audit_repo):
+    repo, _, _ = audit_repo
+    with pytest.raises(ValueError):
+        repo.kpis(since=datetime(2000, 1, 1, tzinfo=timezone.utc), trail="not-a-real-trail")
+
+
+def test_facets_actions_include_folded_in_trails(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    out = repo.facets(since=since, limit=50)
+    actions = {a["value"] for a in out["actions"]}
+    assert {"sync.table", "llm.call", "agent.spawn.scope", "table.read", "query.run"} <= actions
+    sources = {s["value"] for s in out["sources"]}
+    assert "scheduler" in sources
+    assert "agent" in sources
+
+
+def test_facets_trail_filter_narrows_to_one_trail(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    out = repo.facets(since=since, trail="audit", limit=50)
+    actions = {a["value"] for a in out["actions"]}
+    assert actions == {"table.read", "query.run"}
+
+
+def test_facets_rejects_unknown_trail(audit_repo):
+    repo, _, _ = audit_repo
+    with pytest.raises(ValueError):
+        repo.facets(since=datetime(2000, 1, 1, tzinfo=timezone.utc), trail="not-a-real-trail")

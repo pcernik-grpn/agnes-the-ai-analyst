@@ -459,11 +459,20 @@ class AuditPgRepository:
         *,
         since: datetime,
         limit: int = 50,
+        trail: Optional[str] = None,
         **filters: Any,
     ) -> "dict[str, list[dict]]":
         """Mirror of the DuckDB sibling: filter-aware facet buckets
-        (users/actions/results/result_classes/resources/sources)."""
+        (users/actions/results/result_classes/resources/sources) over the
+        unified timeline (audit_log + sync_history + llm_usage +
+        agent_scope_snapshots). ``trail`` narrows to one physical trail."""
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
         where, params = self._filters_where(since=since, **filters)
+        if trail is not None:
+            where.append("trail = :trail")
+            params["trail"] = trail
         w = ("WHERE " + " AND ".join(where)) if where else ""
         out: dict = {}
         with self._engine.connect() as conn:
@@ -472,7 +481,7 @@ class AuditPgRepository:
                 clause = w + (f" AND {extra}" if (w and extra) else (f"WHERE {extra}" if extra else ""))
                 return conn.execute(
                     sa.text(
-                        f"SELECT {select}, COUNT(*) AS n FROM audit_log {clause} "
+                        f"SELECT {select}, COUNT(*) AS n FROM ({_UNIFIED_UNION_SQL}) unified {clause} "
                         f"GROUP BY {group} ORDER BY n DESC LIMIT :facet_limit"
                     ),
                     {**params, "facet_limit": limit},
@@ -541,13 +550,21 @@ class AuditPgRepository:
             ).first()
         return int(row[0] or 0) if row else 0
 
-    def kpis(self, *, since: datetime, **filters: Any) -> "dict[str, Any]":
+    def kpis(self, *, since: datetime, trail: Optional[str] = None, **filters: Any) -> "dict[str, Any]":
         """Mirror of the DuckDB sibling — same filter kwargs, same output
-        keys. ``p95`` uses Postgres' exact ``percentile_cont`` (DuckDB uses
-        ``approx_quantile``; results may differ within tolerance).
-        ``active_users`` counts people (source ∉ scheduler/system);
-        ``errors`` counts ``result_class = 'error'``."""
+        keys, over the unified timeline (audit_log + sync_history +
+        llm_usage + agent_scope_snapshots). ``trail`` narrows to one
+        physical trail. ``p95`` uses Postgres' exact ``percentile_cont``
+        (DuckDB uses ``approx_quantile``; results may differ within
+        tolerance). ``active_users`` counts people (source ∉
+        scheduler/system); ``errors`` counts ``result_class = 'error'``."""
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
         where, params = self._filters_where(since=since, **filters)
+        if trail is not None:
+            where.append("trail = :trail")
+            params["trail"] = trail
         w = ("WHERE " + " AND ".join(where)) if where else ""
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -563,7 +580,7 @@ class AuditPgRepository:
                       CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS INTEGER) AS p95,
                       COUNT(duration_ms) AS measured,
                       COUNT(*) AS total
-                    FROM audit_log {w}
+                    FROM ({_UNIFIED_UNION_SQL}) unified {w}
                     """
                 ),
                 params,
