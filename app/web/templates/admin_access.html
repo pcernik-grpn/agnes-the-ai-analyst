@@ -1834,6 +1834,35 @@
   /* Folding hides the rows, never the header — the count is the reason to
      unfold, so it has to survive the fold. */
   .ax-picker__fam.is-shut .ax-pk-r { display: none; }
+  /* ── Tabs, filter, folding categories ─────────────────────────────────
+     The three readings are tabs (they change what the list is OF); the kind
+     filter is a segment beside the search (it narrows what you are looking
+     at). Two different jobs, two different controls — they had been the same
+     control, which is why switching view and filtering felt alike. */
+  .ax-by { margin: 0; border-bottom: 0; gap: 2px; }
+  .ax-by__n {
+    margin-left: 5px; font-size: 11px; font-weight: 600;
+    color: var(--ds-text-muted); font-variant-numeric: tabular-nums;
+  }
+  .ax-by .is-active .ax-by__n { color: var(--ds-text-link); }
+  .ax-kindfilter { flex: 0 0 auto; flex-wrap: wrap; }
+  .ax-kindfilter[hidden] { display: none; }
+
+  /* A category run folds like a picker section: the caret is the same
+     component's, driven off the button's own `aria-expanded`. */
+  .ax-kindrun {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    background: none; border: 0; cursor: pointer; font: inherit; text-align: left;
+  }
+  .ax-kindrun:hover { background: var(--ds-surface-dim); }
+  .ax-kindrun:focus-visible { outline: var(--ds-focus-outline); outline-offset: -2px; }
+  .ax-kindrun .fbar-group__caret {
+    width: 13px; height: 13px; flex: none; color: var(--ds-text-muted);
+    transition: transform .15s ease;
+  }
+  .ax-kindrun[aria-expanded="false"] .fbar-group__caret { transform: rotate(-90deg); }
+  @media (prefers-reduced-motion: reduce) { .ax-kindrun .fbar-group__caret { transition: none; } }
+  .ax-kindrun__c { margin-left: 4px; }
 </style>
 {% endblock %}
 
@@ -1862,6 +1891,22 @@
    switch that moves between them, and a control that hides the pane it
    lives in cannot bring you back. #}
 <div class="ax-toolbar">
+  {# The three readings are TABS, not a segmented filter. A segment says
+     "narrow what you are looking at"; these change what the list is OF —
+     groups, bundles, or one person's chain — which is what a tab says.
+     `.tab-strip` is the component every other sectioned surface uses, and
+     the counts say what switching would show before you switch. #}
+  <nav class="tab-strip ax-by" id="ax-by" role="tablist" aria-label="How to read these grants">
+    <button type="button" role="tab" class="tab-strip__item is-active" data-by="group" aria-selected="true">
+      By group <span class="ax-by__n" data-by-n="group"></span>
+    </button>
+    <button type="button" role="tab" class="tab-strip__item" data-by="bundle" aria-selected="false">
+      By bundle <span class="ax-by__n" data-by-n="bundle"></span>
+    </button>
+    <button type="button" role="tab" class="tab-strip__item" data-by="person" aria-selected="false">
+      By person <span class="ax-by__n" data-by-n="person"></span>
+    </button>
+  </nav>
   <div class="ax-onebar">
       {# The shared search input. Present from the start rather than appearing
          past some group count: a control that materializes when a list grows
@@ -1876,6 +1921,11 @@
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16.5 16.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <input type="search" id="ax-group-find" placeholder="Search groups, bundles or people…" autocomplete="off" aria-label="Search groups, bundles or people">
       </div>
+      {# The list's own filter. Search answers "where is X"; this answers
+         "show me only the packages" — the question you have when you are
+         auditing rather than looking something up, and until now the only
+         way to answer it was to scroll. #}
+      <span class="fbar-seg ax-kindfilter" id="ax-kindfilter" role="group" aria-label="Filter by kind"></span>
       {# The audience that does not exist yet. "Grant this to the finance
          team" is one thought, and it used to break in half here: no Finance
          group meant leaving for the group list, creating it there, coming
@@ -1883,15 +1933,7 @@
          selected in this list the moment it exists — the thought never
          leaves the page. It sits at the foot of the list because that is
          where a list you have just read to the end of ends. #}
-      {# One list, read three ways. By group answers "what does this group
-         get"; by bundle answers "who gets this", which the group view
-         structurally cannot show — including the bundles granted to NOBODY,
-         which simply never appear when you are looking one group at a time. #}
-      <span class="fbar-seg ax-by" id="ax-by" role="group" aria-label="How to group the list">
-        <button type="button" class="fbar-seg__btn is-active" data-by="group">By group</button>
-        <button type="button" class="fbar-seg__btn" data-by="bundle">By bundle</button>
-        <button type="button" class="fbar-seg__btn" data-by="person">By person</button>
-      </span>
+
       {# "New group" is not toolbar furniture: it makes a row of the list
          below, so it IS a row of that list — see `newGroupRow` in
          renderGroups. #}
@@ -2085,6 +2127,8 @@
      alias for `?by=person` so every existing link into Simulate — including
      each group row's "See it as a person" — still lands where it always
      did. */
+  //: The list's kind filter — "" is every kind.
+  let listKind = "";
   const _q0 = new URLSearchParams(window.location.search);
   let viewMode = _q0.get("lens") === "simulate" ? "person"
     : (["bundle", "person"].includes(_q0.get("by")) ? _q0.get("by") : "group");
@@ -2691,6 +2735,7 @@
         for (const i of (b.items || [])) {
           const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
           if (!grant) continue;             // the holding, not the catalogue
+          if (listKind && t.type_key !== listKind) continue;
           if (!hits(t, i)) continue;
           rows.push(grantedRow(t, i, blockName, grant));
         }
@@ -3339,7 +3384,51 @@
     if (nu) nu.hidden = person;
   }
 
+  /* A tab that carries its own count says what switching would show before
+     you switch — the Library's tabs do the same. */
+  /* Built from what the ACTIVE view actually holds, with counts, so the
+     control never offers a kind that would empty the list. Hidden in the
+     person view, which is not a list of things. */
+  function paintKindFilter() {
+    const host = el("ax-kindfilter");
+    if (!host) return;
+    if (viewMode === "person") { host.hidden = true; return; }
+    /* Only the kinds the ACTIVE view can show. By bundle lists the kinds an
+       admin hands out as a unit, so offering it "Cloud chat" would be a chip
+       that empties the list — a filter has to describe the set it filters. */
+    const BUNDLE_LEAD = new Set(["data_package", "memory_domain", "semantic_model", "recipe",
+                                 "marketplace_plugin", "store_entity", "data_app", "agent", "collection"]);
+    const counts = new Map();
+    for (const g of (overview.grants || [])) {
+      if (viewMode === "bundle" && !BUNDLE_LEAD.has(g.resource_type)) continue;
+      counts.set(g.resource_type, (counts.get(g.resource_type) || 0) + 1);
+    }
+    const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
+    const label = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
+    host.innerHTML = [
+      `<button type="button" class="fbar-seg__btn${listKind ? "" : " is-active"}" data-list-kind="">All</button>`,
+      ...[...counts.keys()].sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99))
+        .map((k) => `<button type="button" class="fbar-seg__btn${listKind === k ? " is-active" : ""}"
+                        data-list-kind="${esc(k)}">${esc(label.get(k) || k)}
+                        <span class="fbar-seg__n">${counts.get(k)}</span></button>`),
+    ].join("");
+    host.hidden = !listKind && counts.size < 2;
+  }
+
+  function paintTabCounts() {
+    const set = (k, n) => {
+      const el2 = document.querySelector(`[data-by-n="${k}"]`);
+      if (el2) el2.textContent = n == null ? "" : String(n);
+    };
+    set("group", (overview.groups || []).length);
+    const bundles = new Set((overview.grants || []).map((g) => `${g.resource_type}:${g.resource_id}`));
+    set("bundle", bundles.size);
+    set("person", (overview.groups || []).reduce((n, g) => Math.max(n, g.member_count ?? 0), 0) ? null : null);
+  }
+
   async function repaint() {
+    paintTabCounts();
+    paintKindFilter();
     if (viewMode === "person") { showPane("person"); return; }
     syncQuery();
     if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
@@ -3369,6 +3458,8 @@
      write from inside an open bundle (a tier change, a revoke) therefore
      shut the thing you were working in, right after acting on it. */
   const openBundles = new Set();
+  //: Category runs folded away in the bundle list, by kind.
+  const shutKinds = new Set();
 
   function renderBundles() {
     const host = el("ax-groups");
@@ -3386,6 +3477,7 @@
     const rows = [];
     for (const t of (overview.resources || [])) {
       if (!LEAD.has(t.type_key)) continue;
+      if (listKind && t.type_key !== listKind) continue;
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           const hay = `${i.name || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
@@ -3533,12 +3625,17 @@
         || byName(a, b));
       let lastKind = null;
       const body = mine.map((r) => {
+        const shut = shutKinds.has(r.t.type_key);
         const head = r.t.type_key !== lastKind
-          ? `<div class="ax-kindrun"><span class="ax-kindrun__n">${esc(r.t.type_display)}</span>
-               <span class="ax-kindrun__c">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span></div>`
+          ? `<button type="button" class="ax-kindrun" data-kindrun="${esc(r.t.type_key)}"
+                     aria-expanded="${shut ? "false" : "true"}">
+               <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+               <span class="ax-kindrun__n">${esc(r.t.type_display)}</span>
+               <span class="ax-kindrun__c">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>
+             </button>`
           : "";
         lastKind = r.t.type_key;
-        return head + section(r);
+        return head + (shut ? "" : section(r));
       }).join("");
       return `
       <div class="ax-fam">
@@ -3714,6 +3811,13 @@
       return;
     }
 
+    const kindBtn = e.target.closest("[data-list-kind]");
+    if (kindBtn) {
+      listKind = kindBtn.dataset.listKind || "";
+      await repaint();
+      return;
+    }
+
     const byBtn = e.target.closest("[data-by]");
     if (byBtn) {
       const next = ["bundle", "person"].includes(byBtn.dataset.by) ? byBtn.dataset.by : "group";
@@ -3729,10 +3833,21 @@
         showPane(viewMode);
         // Arriving by URL is no longer the only way into the person view.
         if (viewMode === "person") loadUsers();
-        el("ax-by").querySelectorAll("[data-by]").forEach((b) =>
-          b.classList.toggle("is-active", b.dataset.by === viewMode));
+        el("ax-by").querySelectorAll("[data-by]").forEach((b) => {
+          const on = b.dataset.by === viewMode;
+          b.classList.toggle("is-active", on);
+          b.setAttribute("aria-selected", on ? "true" : "false");
+        });
         await repaint();
       }
+      return;
+    }
+
+    const kindRun = e.target.closest("[data-kindrun]");
+    if (kindRun) {
+      const k = kindRun.dataset.kindrun;
+      if (shutKinds.has(k)) shutKinds.delete(k); else shutKinds.add(k);
+      renderBundles();
       return;
     }
 
@@ -4592,8 +4707,11 @@
     const wantedRes = PICK && known(recalledSelection()) ? recalledSelection() : null;
     selectedGroup = known(wanted) ? wanted : wantedRes;
     rememberSelection(selectedGroup);
-    el("ax-by").querySelectorAll("[data-by]").forEach((b) =>
-      b.classList.toggle("is-active", b.dataset.by === viewMode));
+    el("ax-by").querySelectorAll("[data-by]").forEach((b) => {
+      const on = b.dataset.by === viewMode;
+      b.classList.toggle("is-active", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
     // A `?resource=` arrival lands with the tree already narrowed to what the
     // caller came to grant — the filter is pre-filled rather than merely
     // suggested, so the row is on screen before anything is clicked.

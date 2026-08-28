@@ -201,6 +201,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **By group / By bundle / By person are tabs, and the lists get a filter.**
+  They were a segmented control, which says "narrow what you are looking at";
+  these change what the list is *of*, which is what a tab says. They use
+  `.tab-strip`, the component every other sectioned surface uses, and each
+  carries a count so switching is a decision made before the switch. Beside
+  the search — a different job, so a different control — the lists gain the
+  **kind filter** they never had: previously the only way to find every
+  package was to scroll. It offers only kinds the active view can actually
+  show (By bundle lists what an admin hands out as a unit, so it is never
+  offered *Cloud chat*, a chip that would empty the list). A bundle's category
+  runs fold, like the picker's sections and the Library's groups.
 - **The Add / Share picker is built from the app's own parts.** Its family
   sections are `.fbar-grouptoggle` — the Library's group header — so a section
   folds here exactly as it folds there, caret driven off `aria-expanded`. It
