@@ -1614,6 +1614,10 @@
      table's surface, so it contributes rows, not a box. */
   .ax-table {
     background: none; border: 0; border-radius: 0; overflow: visible;
+    /* The add row inherits this, so it lands on exactly the columns its
+       neighbours use — one grid definition, not two that can drift. */
+    grid-template-columns: 5.5rem minmax(0, 1fr) 12rem 13rem;
+    gap: 16px;
   }
   .ax-table .ax-colhd { padding-left: 0; }
   .ax-table .ax-fam__hd { padding-left: 8px; box-shadow: inset 3px 0 0 var(--ds-border); }
@@ -1675,6 +1679,65 @@
     display: block; margin-top: 1px; font-size: 12px; color: var(--ds-text-muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62ch;
   }
+  /* ══ Add is a row, not a button above the table ════════════════════════
+     It sat outside the table as a link with a hint beside it, which made it
+     read as page furniture rather than as something the table can do. It is
+     the table's first row now, on the table's own grid: the `+` lands in the
+     Kind column where every other row's chip is, the label in the column
+     that names things, and the row hovers like its neighbours. The pattern a
+     data grid uses for "new row", because that is what it is. */
+  .ax-add {
+    display: grid;
+    grid-template-columns: inherit;
+    gap: inherit;
+    align-items: center;
+    width: 100%; margin: 0;
+    padding: 10px 10px 10px 8px;
+    text-align: left; background: none; border: 0;
+    border-bottom: 1px solid var(--ds-border-light);
+    cursor: pointer; font: inherit;
+  }
+  .ax-table .ax-add { grid-template-columns: inherit; }
+  .ax-add:hover { background: var(--ds-surface-dim); }
+  .ax-add:focus-visible { outline: var(--ds-focus-outline); outline-offset: -2px; }
+
+  /* The plus sits where the kind chip sits — same column, same optical
+     weight — so the eye reads down one column of row-openers. */
+  .ax-add__plus {
+    justify-self: start;
+    width: 18px; height: 18px; line-height: 17px; text-align: center;
+    border: 1px dashed var(--ds-border); border-radius: 3px;
+    color: var(--ds-text-link); font-size: 13px;
+  }
+  .ax-add:hover .ax-add__plus { border-color: var(--ds-text-link); border-style: solid; }
+  .ax-add__body { min-width: 0; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .ax-add__label { font-size: 13.5px; font-weight: 600; color: var(--ds-text-link); }
+  .ax-add__hint {
+    font-size: 12px; color: var(--ds-text-muted); font-weight: 400;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* The add row rides the SAME grid definition as its neighbours, at every
+     breakpoint — `inherit` looked right and was not: it reads the parent's
+     specified value, and the parent is not the element that owns the
+     table's real column widths, so the action's columns drifted from the
+     rows' by a few pixels at some widths and a lot at others. */
+  .ax-table .ax-add { grid-template-columns: 5.25rem minmax(0, 1fr) 10.5rem 10.5rem; gap: 16px; }
+  @media (min-width: 1240px) {
+    .ax-table .ax-add { grid-template-columns: 5.5rem minmax(0, 1fr) 12rem 13rem; }
+  }
+  @media (max-width: 900px) {
+    .ax-table .ax-add { grid-template-columns: 4.75rem minmax(0, 1fr) 10.5rem; }
+  }
+  @media (max-width: 640px) {
+    .ax-table .ax-add { grid-template-columns: 4.75rem minmax(0, 1fr); gap: 12px; }
+  }
+  /* A bundle's table has no Kind column — its first column names the group —
+     so the action's marker sits at that column's leading edge instead. */
+  .ax-gs--bb .ax-table .ax-add { grid-template-columns: 18px minmax(0, 1fr); gap: 10px; }
+
+  /* One line: the hint gives way before the label does. */
+  .ax-add__body { flex-wrap: nowrap; }
+  .ax-add__label { white-space: nowrap; }
 </style>
 {% endblock %}
 
@@ -2541,8 +2604,10 @@
     const addRow = `
       <button type="button" class="ax-add" data-add-grant>
         <span class="ax-add__plus" aria-hidden="true">+</span>
-        <span>Add to this group</span>
-        <span class="ax-add__hint">packages, memory, plugins, tables — anything grantable</span>
+        <span class="ax-add__body">
+          <span class="ax-add__label">Add to this group</span>
+          <span class="ax-add__hint">packages, memory, plugins, tables — anything grantable</span>
+        </span>
       </button>`;
 
     // The column header belongs to the GROUP, not to each family. Repeated
@@ -2562,8 +2627,8 @@
 
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const table = sections ? `<div class="ax-table">${colhd}${sections}</div>` : "";
-    const painted = (addRow + table) || (fq
+    const table = sections ? `<div class="ax-table">${colhd}${addRow}${sections}</div>` : "";
+    const painted = table || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
       : `<div class="dsec-empty"><strong>This group has nothing granted yet</strong>
@@ -3275,22 +3340,31 @@
           </span>
         </summary>
         <div class="ax-gs__body">
-          <button type="button" class="ax-add" data-share-bundle
-                  data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
-                  data-blabel="${esc(r.i.name || r.i.resource_id)}">
-            <span class="ax-add__plus" aria-hidden="true">+</span>
-            <span>${nobody ? "Share it with a group" : "Share with another group"}</span>
-            <span class="ax-add__hint">every group in the list below already has it</span>
-          </button>
-          ${nobody
-            ? `<div class="ax-empty">Authored, then never handed to anyone.</div>`
-            : `<div class="ax-table">
-                 <div class="ax-colhd">
-                   <span>Group</span><span>Who that reaches</span>
-                   <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
-                 </div>
-                 ${r.held.map((grant) => groupRow(r, grant)).join("")}
-               </div>`}
+          ${(() => {
+            const share = `
+              <button type="button" class="ax-add ax-add--bb" data-share-bundle
+                      data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
+                      data-blabel="${esc(r.i.name || r.i.resource_id)}">
+                <span class="ax-add__plus" aria-hidden="true">+</span>
+                <span class="ax-add__body">
+                  <span class="ax-add__label">${nobody ? "Share it with a group" : "Share with another group"}</span>
+                  <span class="ax-add__hint">${nobody
+                    ? "authored, then never handed to anyone"
+                    : "every group in the list below already has it"}</span>
+                </span>
+              </button>`;
+            /* Even with nothing granted the table is the right shape: a
+               header, the action as its first row, and no rows under it —
+               rather than a button floating beside an empty sentence. */
+            return `<div class="ax-table">
+                      <div class="ax-colhd">
+                        <span>Group</span><span>Who that reaches</span>
+                        <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
+                      </div>
+                      ${share}
+                      ${r.held.map((grant) => groupRow(r, grant)).join("")}
+                    </div>`;
+          })()}
         </div>
       </details>`;
     };

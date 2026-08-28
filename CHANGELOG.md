@@ -201,6 +201,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **Add / Share are the table's first row, not a link above it.** Outside the
+  table they read as page furniture; inside, on the table's own grid, they
+  read as something the table can do — the `+` in the Kind column where every
+  row's chip sits, the label aligned to the column that names things, and the
+  same hover as its neighbours. The pattern a data grid uses for "new row",
+  which is what it is. A bundle's table has no Kind column, so its marker sits
+  at the leading edge of the column that names groups. An empty bundle keeps
+  the shape too — header, action, no rows — rather than a button beside an
+  empty-state sentence.
 - **Access rows get a third state, and the headers stop competing.** An open
   row wore the hover's own grey, so "the row I am pointing at" and "the row I
   am inside" were the same colour: default white → hover `--ds-surface-dim` →
