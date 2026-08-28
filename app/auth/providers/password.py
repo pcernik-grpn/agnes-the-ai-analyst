@@ -481,6 +481,14 @@ async def password_setup(
         must_change_password=False,
     )
     token = create_access_token(user["id"], user["email"])
+    # Same two events its web sibling `setup_confirm` writes — the invite was
+    # consumed and a session began — but `client_kind="cli"`, because this
+    # route hands back a bearer token to a non-interactive client rather than
+    # setting a browser cookie. Returning a credential IS a completed sign-in;
+    # omitting the row here would let the whole invite→activated→signed-in
+    # lifecycle happen with nothing in the trail (Devin Review on this PR).
+    audit_auth_event(ACCOUNT_ACTIVATED, user["id"], provider="password", request=request, client_kind="cli")
+    audit_login_success(user["id"], provider="password", request=request, client_kind="cli")
     return {"access_token": token, "token_type": "bearer", "message": "Password set successfully"}
 
 
@@ -730,6 +738,11 @@ async def reset_confirm(
 
     response = RedirectResponse(url="/login/password?msg=password_reset", status_code=302)
     _set_login_cookie(response, user["id"], user["email"], request)
+    # A completed reset signs the person straight in, so it owes the trail the
+    # same row the login routes write. No `account_activated` beside it: this
+    # is an existing account regaining access, not an invite being consumed
+    # (Devin Review on this PR).
+    audit_login_success(user["id"], provider="password", request=request)
     return response
 
 

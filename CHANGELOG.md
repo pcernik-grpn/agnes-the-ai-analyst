@@ -43,9 +43,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sign-in it also performs, and the self-service `/auth/password/setup/request`
   writes `setup_link_requested` — whose anti-enumeration response is identical
   whether or not the address matched, making the audit row the only place the
-  real outcome is visible. A new guard walks `app/auth/providers/` by source
-  rather than a hand-maintained list, so the next provider to mint a session
-  cookie cannot ship without recording it. Separately, the user-management
+  real outcome is visible. Completing a password reset
+  (`/auth/password/reset/confirm`) and the JSON `/auth/password/setup` sibling
+  both finish a sign-in too — one sets the cookie, the other hands back a
+  bearer token — and both wrote nothing; they record it now, the JSON one as
+  `client_kind="cli"` with `account_activated` beside it, matching its web
+  sibling. Two guards keep this from rotting: one walks `app/auth/providers/`
+  by source rather than a hand-maintained list, so the next provider to mint a
+  session cookie cannot ship without recording it, and a second checks
+  per-FUNCTION — the module-level walk is satisfied the moment a file audits
+  anywhere, which is exactly why those two routes were missed. Separately, the user-management
   audit helper in `app/api/users.py` swallowed every write failure with a bare
   `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
   which keeps the same never-block-the-request policy but leaves a line in the

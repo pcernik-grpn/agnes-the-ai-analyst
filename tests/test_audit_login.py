@@ -62,6 +62,20 @@ def client(tmp_path, monkeypatch, shared_app):
         setup_token_created=datetime.now(timezone.utc),
     )
     ur.create(id="pending1", email="pending@test.com", name="Pending")
+    # A second invitee, for the JSON /setup sibling of the web form above.
+    ur.create(id="invitee2", email="invitee-json@test.com", name="Invitee JSON")
+    ur.update(
+        id="invitee2",
+        setup_token=hash_token("setup-token-json"),
+        setup_token_created=datetime.now(timezone.utc),
+    )
+    # An existing account that asked for a password reset.
+    ur.create(id="resetter1", email="resetter@test.com", name="Resetter", password_hash=pw_hash)
+    ur.update(
+        id="resetter1",
+        reset_token=hash_token("reset-token-123"),
+        reset_token_created=datetime.now(timezone.utc),
+    )
     conn.close()
 
     return TestClient(shared_app)
@@ -191,6 +205,47 @@ class TestInviteLifecycleIsRecorded:
         assert len(rows) == 1, "activating an account from an invite must be recorded"
         assert rows[0]["user_id"] == "invitee1"
 
+    def test_completing_a_password_reset_is_recorded(self, client):
+        """A finished reset signs the person straight back in — same session
+        the login routes mint — so it owes the trail the same row. It wrote
+        nothing (Devin Review on this PR); the module-level provider walk
+        missed it because password.py already audited elsewhere."""
+        resp = client.post(
+            "/auth/password/reset/confirm",
+            data={
+                "email": "resetter@test.com",
+                "token": "reset-token-123",
+                "password": "reset-new-pass-1",
+                "confirm_password": "reset-new-pass-1",
+            },
+            follow_redirects=False,
+        )
+        # A rejected reset re-renders the form with 200; only the redirect
+        # means the password was actually changed and the cookie set.
+        assert resp.status_code in (302, 303), resp.text
+
+        rows = _audit_rows("login_success")
+        assert [r["user_id"] for r in rows] == ["resetter1"], rows
+        assert rows[0]["params"]["provider"] == "password"
+
+    def test_json_setup_route_records_activation_and_sign_in(self, client):
+        """Its web sibling writes two rows; this one returned a bearer token
+        and wrote none. Handing back a credential is a completed sign-in, and
+        `client_kind` must say `cli` — calling a non-interactive token grant a
+        browser session would misrepresent it."""
+        resp = client.post(
+            "/auth/password/setup",
+            json={"email": "invitee-json@test.com", "token": "setup-token-json", "password": "json-new-pass-1"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["access_token"]
+
+        activated = _audit_rows("account_activated")
+        assert [r["user_id"] for r in activated] == ["invitee2"], activated
+
+        signed_in = _audit_rows("login_success")
+        assert [r["user_id"] for r in signed_in] == ["invitee2"], signed_in
+
     def test_self_service_setup_request_is_recorded(self, client):
         """It mints a setup token and sends mail. Anti-enumeration means the
         response is identical either way, so the audit row is the only place
@@ -250,4 +305,53 @@ def test_every_cookie_minting_provider_audits_its_success_path():
         "these providers set a login cookie without recording it: "
         f"{offenders}. Import audit_login_success from app.auth.login_audit "
         "and call it on the success path."
+    )
+
+
+def test_every_session_minting_ROUTE_audits_its_own_success_path():
+    """Per-callsite, not per-module — the module-level check above passes the
+    moment a file imports `login_audit` even once, so a provider that audits
+    four of its six sign-in routes looks clean. That is exactly what happened:
+    `reset_confirm` and the JSON `password_setup` both completed a sign-in
+    (one sets the cookie, the other returns a bearer token) with nothing in
+    the trail, inside a module the walker above was already happy with.
+
+    So: every FUNCTION that mints a session must audit inside that same
+    function. `create_access_token` is included because handing a token back
+    to a client is as much a completed sign-in as setting a cookie is.
+    """
+    import ast
+
+    MINTERS = {"_set_login_cookie", "create_access_token"}
+    AUDITORS = {"audit_login_success", "audit_auth_event"}
+
+    def called_names(node):
+        out = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                fn = sub.func
+                if isinstance(fn, ast.Name):
+                    out.add(fn.id)
+                elif isinstance(fn, ast.Attribute):
+                    out.add(fn.attr)
+        return out
+
+    offenders = []
+    for path in sorted(Path("app/auth/providers").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names = called_names(node)
+            # `_set_login_cookie` itself is the helper, not a sign-in route.
+            if node.name.startswith("_"):
+                continue
+            if names & MINTERS and not (names & AUDITORS):
+                offenders.append(f"{path.name}::{node.name}")
+
+    assert not offenders, (
+        "these routes complete a sign-in without recording it: "
+        f"{offenders}. Call audit_login_success (and audit_auth_event with "
+        "ACCOUNT_ACTIVATED when an invite is being consumed) on the success "
+        "path of each."
     )
