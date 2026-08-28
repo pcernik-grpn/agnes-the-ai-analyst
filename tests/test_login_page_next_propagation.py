@@ -125,3 +125,59 @@ def test_login_password_page_hostile_next_is_blanked(web_client, apps_on, hostil
     resp = web_client.get("/login/password", params={"next": hostile})
     assert resp.status_code == 200
     assert 'name="next" value=""' in resp.text, resp.text
+
+
+# --- the terminal consumer: the password form's own POST handler -----------
+
+
+def _seed_password_user(email: str, user_id: str, password: str) -> None:
+    from argon2 import PasswordHasher
+
+    from src.db import get_system_db
+    from src.repositories.users import UserRepository
+
+    conn = get_system_db()
+    UserRepository(conn).create(
+        id=user_id,
+        email=email,
+        name="Pw User",
+        password_hash=PasswordHasher().hash(password),
+    )
+    conn.close()
+
+
+def test_password_form_post_returns_the_visitor_to_the_app_origin(web_client, apps_on):
+    """The login PAGE carrying `next` is only half the journey — the form it
+    renders POSTs to `/auth/password/login/web`, which held a THIRD copy of the
+    old relative-only rule. So a visitor bounced out of a data app, signing in
+    with a password, still landed on the home route while OAuth and magic-link
+    returned them to the app. That handler calls `safe_next_path` now.
+    """
+    pw = "TestPass1!"
+    _seed_password_user("pwnext@test.com", "pw_next_1", pw)
+    resp = web_client.post(
+        "/auth/password/login/web",
+        data={"email": "pwnext@test.com", "password": pw, "next": APP_ORIGIN},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    assert resp.headers["location"] == APP_ORIGIN, resp.headers
+
+
+@pytest.mark.parametrize("hostile", ["//evil.example/", "http://evil.example/", "javascript:alert(1)", "dashboard"])
+def test_password_form_post_still_refuses_a_hostile_next(web_client, apps_on, hostile):
+    """The open-redirect guard is the half that must NOT loosen."""
+    pw = "TestPass1!"
+    _seed_password_user(f"pwh{abs(hash(hostile)) % 10000}@test.com", f"pw_h_{abs(hash(hostile)) % 10000}", pw)
+    resp = web_client.post(
+        "/auth/password/login/web",
+        data={
+            "email": f"pwh{abs(hash(hostile)) % 10000}@test.com",
+            "password": pw,
+            "next": hostile,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    assert resp.headers["location"] != hostile, resp.headers
+    assert resp.headers["location"].startswith("/"), resp.headers
