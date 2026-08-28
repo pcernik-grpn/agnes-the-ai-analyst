@@ -109,6 +109,7 @@ class TestFeatureFlagsRegistry:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
+            "extraction",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -294,6 +295,7 @@ class TestServerConfigFeatureFlagsInventory:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
+            "extraction",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"
