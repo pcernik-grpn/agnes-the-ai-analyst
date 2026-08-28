@@ -197,6 +197,25 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="chat_broker_admin_reads",
+        config_keys=("chat", "broker_admin_reads"),
+        env_var="AGNES_CHAT_BROKER_ADMIN_READS",
+        kind="bool",
+        default=True,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Replay read-only (GET/HEAD) admin API routes through the chat secret broker "
+            "(`agnes admin list-users`/`list-tables`/… inside a chat sandbox). The replay "
+            "runs under the session user's own identity and the route's live `require_admin` "
+            "still decides — non-admin users and agent principals get 403 regardless. Admin "
+            "MUTATIONS are always refused from sandboxes, independent of this switch. Read "
+            "live per request by `app/api/broker.py` (no restart needed), unlike the other "
+            "chat.* switches that resolve through `load_chat_config` at boot."
+        ),
+    ),
+    Switch(
         name="data_apps",
         config_keys=("data_apps", "enabled"),
         env_var="AGNES_DATA_APPS_ENABLED",

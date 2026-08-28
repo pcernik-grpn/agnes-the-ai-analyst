@@ -221,6 +221,77 @@ def test_admin_route_off_admin_prefix_rejected(broker_app, e2e_env):
     assert r.json().get("detail") == "admin_mutations_require_interactive_auth"
 
 
+def _replay_via_broker(broker_app, tok: str, method: str, path: str):
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/agnes-api",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"method": method, "path": path, "body": None},
+            )
+
+    return asyncio.run(_run())
+
+
+def _seed_admin_session(email: str, user_id: str) -> str:
+    """A user in the Admin group + a web chat session; returns a main ticket."""
+    from src.db import SYSTEM_ADMIN_GROUP, get_system_db
+    from src.repositories.user_group_members import UserGroupMembersRepository
+
+    conn = get_system_db()
+    UserRepository(conn).create(id=user_id, email=email, name="Broker Admin")
+    admin_row = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]).fetchone()
+    assert admin_row is not None
+    UserGroupMembersRepository(conn).add_member(user_id, admin_row[0], source="system_seed")
+    conn.close()
+    session = chat_session_repo().create_session(user_email=email, surface=Surface.WEB)
+    return ticket_repo().mint(session.id, "main")
+
+
+def test_admin_read_route_replayed_for_admin(broker_app, e2e_env):
+    """Read-only (GET) admin routes ARE brokered: the replay runs under the
+    resolved identity and the route's own require_admin passes for a real
+    admin — so `agnes admin list-users` (GET /api/users, off-prefix) and
+    `agnes admin list-tables` (GET /api/admin/registry, on-prefix) both work
+    from a chat sandbox. Mutations stay refused (test above)."""
+    tok = _seed_admin_session("broker_admin_r@test.com", "broker_admin_r1")
+
+    r = _replay_via_broker(broker_app, tok, "GET", "/api/users")
+    assert r.status_code == 200, r.text
+    assert any(u.get("email") == "broker_admin_r@test.com" for u in r.json())
+
+    r2 = _replay_via_broker(broker_app, tok, "GET", "/api/admin/registry")
+    assert r2.status_code == 200, r2.text
+
+
+def test_admin_read_route_still_requires_admin_downstream(broker_app, e2e_env):
+    """The broker adds no privilege on the read path: a NON-admin identity's
+    GET replay reaches the route and gets the route's own require_admin 403
+    ("Admin access required"), not the broker's refusal detail."""
+    conn = get_system_db()
+    UserRepository(conn).create(id="broker_plain1", email="broker_plain@test.com", name="Plain User")
+    conn.close()
+    session = chat_session_repo().create_session(user_email="broker_plain@test.com", surface=Surface.WEB)
+    tok = ticket_repo().mint(session.id, "main")
+
+    r = _replay_via_broker(broker_app, tok, "GET", "/api/users")
+    assert r.status_code == 403, r.text
+    assert r.json().get("detail") == "Admin access required"
+
+
+def test_admin_read_switch_off_refuses_even_get(broker_app, e2e_env, monkeypatch):
+    """`chat.broker_admin_reads` off (env kill-switch) restores the old
+    behavior: even a read-only admin GET from an actual admin is refused by
+    the broker's own gate."""
+    monkeypatch.setenv("AGNES_CHAT_BROKER_ADMIN_READS", "0")
+    tok = _seed_admin_session("broker_admin_off@test.com", "broker_admin_off1")
+
+    r = _replay_via_broker(broker_app, tok, "GET", "/api/users")
+    assert r.status_code == 403, r.text
+    assert r.json().get("detail") == "admin_mutations_require_interactive_auth"
+
+
 def test_anthropic_route_accepts_subpath(broker_app):
     """The Anthropic proxy must match sub-paths — the SDK appends
     ``/v1/messages`` to its base URL, so the real request arrives at

@@ -16,6 +16,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
 
 ### Changed
+- **The chat sandbox now tells the agent the truth about its runtime, and
+  read-only admin commands work there.** Three coupled fixes to the same
+  confusion (an in-chat agent concluding its auth was broken and recommending
+  `agnes pull`): (1) the secret broker now replays **read-only (GET/HEAD)
+  admin routes** under the session user's own identity — `agnes admin
+  list-users` / `list-tables` work for an actual admin in chat, while the
+  route's live `require_admin` still refuses non-admins and agent principals,
+  and admin **mutations** stay interactive-only (403
+  `admin_mutations_require_interactive_auth`); switchable via the new live
+  flag `chat.broker_admin_reads` / `AGNES_CHAT_BROKER_ADMIN_READS` (default
+  on). (2) `agnes auth whoami` inside a sandbox (`AGNES_SESSION_ID` set, no
+  token by design) no longer answers "Not logged in" — it verifies the
+  brokered identity live via `/api/me/effective-access` and reports it,
+  including whether read-only admin commands are available. (3) the workspace
+  prompt (`config/claude_md_template.txt`) grew a sandbox-specific "This
+  sandbox — how you run and authenticate" section and stops giving the
+  sandbox laptop-only advice (`agnes pull`/`push`/`init`/`login`, Private
+  sessions, Corporate Memory, laptop Directory Structure); the bundled
+  fallback `app/initial_workspace_default/CLAUDE.md` carries the same truths.
 - **The chat Files drawer got a layout fix and a visual pass.** The file
   list now flexes across the panel's full remaining height (a fixed `46vh`
   box left most of the drawer an empty framed rectangle), rows are
