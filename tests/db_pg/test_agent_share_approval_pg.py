@@ -4,7 +4,10 @@
 APPROVAL." Only ``resource_type == 'agent'`` is gated, and only when the
 ACTOR (not the agent's owner) is not an admin — every other combination
 stays the pre-existing instant path. PG-only (A3 ratchet): the DuckDB half
-of this file asserts the fail-clean 501, not a working queue.
+of this file asserts that the queue ENHANCEMENT is unavailable there (the
+admin ``/api/admin/share-requests*`` surface fails clean with a 501) while
+sharing ITSELF never regresses — a non-admin owner's share falls back to
+the pre-C6 instant grant rather than a 501.
 """
 
 from __future__ import annotations
@@ -366,11 +369,20 @@ def test_admin_endpoints_403_for_non_admin(tmp_path, monkeypatch, pg_engine):
 
 
 # ---------------------------------------------------------------------------
-# DuckDB-backed instance: fails clean (501), never crashes
+# DuckDB-backed instance: the approval QUEUE is unavailable (PG-only), but
+# sharing itself must never regress — it falls back to the pre-C6 instant
+# grant rather than failing clean with a 501. The 501 stays reserved for the
+# genuinely PG-only admin queue surface below, which has no old-behavior
+# equivalent to fall back to.
 # ---------------------------------------------------------------------------
 
 
-def test_duckdb_backend_non_admin_agent_share_fails_clean_501(tmp_path, monkeypatch, pg_engine):
+def test_duckdb_backend_non_admin_agent_share_falls_back_to_instant_grant(tmp_path, monkeypatch, pg_engine):
+    """The approval queue doesn't exist on DuckDB (A3 ratchet), so a
+    non-admin owner's share must behave exactly as it did before C6 —
+    instant grant, not a 501 regression (see CI catch on PR #1710:
+    tests/test_v1_builder_parity.py's DuckDB-backend agent-sharing tests
+    broke against the first cut of this gate)."""
     client, admin_token = _duckdb_client(tmp_path, monkeypatch, pg_engine)
 
     from app.auth.jwt import create_access_token
@@ -381,9 +393,12 @@ def test_duckdb_backend_non_admin_agent_share_fails_clean_501(tmp_path, monkeypa
 
     conn = get_system_db()
     UserRepository(conn).create(id="owner1", email="owner@test.com", name="Owner")
+    UserRepository(conn).create(id="grantee1", email="grantee@test.com", name="Grantee")
     group = UserGroupsRepository(conn).create(name="c6-duckdb-group", created_by="admin1")
     UserGroupMembersRepository(conn).add_member("owner1", group["id"], source="admin", added_by="admin1")
+    UserGroupMembersRepository(conn).add_member("grantee1", group["id"], source="admin", added_by="admin1")
     owner_token = create_access_token("owner1", "owner@test.com")
+    grantee_token = create_access_token("grantee1", "grantee@test.com")
 
     agent_id = _create_agent(client, owner_token)
 
@@ -392,12 +407,21 @@ def test_duckdb_backend_non_admin_agent_share_fails_clean_501(tmp_path, monkeypa
         json={"group_ids": [group["id"]]},
         headers=_auth(owner_token),
     )
-    assert r.status_code == 501, r.text
-    assert r.json()["error"] == "requires_postgres_backend"
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_ids"] == [group["id"]]
+    assert body["pending_group_ids"] == []
 
-    # Fails clean, doesn't half-write: no grant exists.
+    # The grant is real and instant — no queue, no admin step, no 501.
     got = client.get(f"/api/sharing/agent/{agent_id}", headers=_auth(owner_token))
-    assert got.json()["group_ids"] == []
+    assert got.json()["group_ids"] == [group["id"]]
+
+    runtime = client.get(f"/api/v1/agents/{agent_id}", headers=_auth(grantee_token))
+    assert runtime.status_code == 200
+
+    # The (unreachable) admin queue never saw this share.
+    queue = client.get("/api/admin/share-requests", headers=_auth(admin_token))
+    assert queue.status_code == 501
 
 
 def test_duckdb_backend_admin_agent_share_still_works(tmp_path, monkeypatch, pg_engine):

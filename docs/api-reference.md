@@ -1519,18 +1519,20 @@ Shareable resource types are `collection` and `agent` — skills are excluded
 because an approved store entity is already readable by every authenticated
 user.
 
-**Track C6 — agent-sharing needs admin approval (PG-only).** A user may build
-agents freely, but when a NON-ADMIN actor shares an `agent` with a group it has
-not already reached, the grant is not written immediately: it is queued in
-`share_requests` and `PUT /api/sharing/agent/{id}` answers `202` (not `200`),
-with `pending_group_ids` naming what's awaiting a decision. An admin actor
-(regardless of who owns the agent) and any un-share (revoking a group) both
-stay instant and answer `200`, matching every other resource type. `GET
-/api/sharing/agent/{id}` always echoes the current `pending_group_ids` so a
-page reload still shows "pending approval". This gate requires a Postgres
-app-state backend (A3 ratchet) — see `/api/admin/share-requests` below; a
-DuckDB-backed instance answers `501 requires_postgres_backend` only for the
-narrow non-admin+new-group case, never for the admin or un-share paths.
+**Track C6 — agent-sharing needs admin approval (Postgres-backed instances).**
+A user may build agents freely, but when a NON-ADMIN actor shares an `agent`
+with a group it has not already reached, the grant is not written
+immediately: it is queued in `share_requests` and `PUT /api/sharing/agent/{id}`
+answers `202` (not `200`), with `pending_group_ids` naming what's awaiting a
+decision. An admin actor (regardless of who owns the agent) and any un-share
+(revoking a group) both stay instant and answer `200`, matching every other
+resource type. `GET /api/sharing/agent/{id}` always echoes the current
+`pending_group_ids` so a page reload still shows "pending approval". The
+queue (`share_requests`) is Postgres-only (A3 ratchet) — see
+`/api/admin/share-requests` below — but sharing itself never regresses: on a
+DuckDB-backed instance the approval step simply isn't active, so a
+non-admin's agent share falls back to the pre-C6 instant grant instead of a
+`501`. Only the admin queue endpoints answer `501` there.
 
 - /api/sharing/groups
 - /api/sharing/{resource_type}/{resource_id}

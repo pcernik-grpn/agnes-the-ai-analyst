@@ -285,6 +285,15 @@ def set_shares(
     immediate path, matching every other "admins pass" rule in this module.
     Un-sharing (``to_remove``) is never gated.
 
+    The approval queue is a PG-only ENHANCEMENT, not a new requirement —
+    ``share_requests_repo()`` is unreachable on a DuckDB-backed instance
+    (``RequiresPostgresBackend``, A3 ratchet). Gating a write behind a repo
+    the active backend cannot provide would regress pre-C6 behavior (a
+    non-admin owner could always share their own agent instantly), so this
+    falls back to the OLD instant-grant path whenever the queue itself is
+    unavailable — the approval step simply doesn't exist yet on that
+    backend, it isn't a hard failure of the share.
+
     Returns ``{visibility, group_ids, added, removed, pending_group_ids,
     queued_group_ids}``. ``pending_group_ids`` is every outstanding
     request on the resource (including ones queued by an earlier call);
@@ -293,7 +302,7 @@ def set_shares(
     ``ValueError`` with a stable machine token when a requested group isn't
     shareable by this caller.
     """
-    from src.repositories import resource_grants_repo
+    from src.repositories import RequiresPostgresBackend, resource_grants_repo
 
     allowed = shareable_group_ids(actor_id, is_admin=is_admin)
     requested = {g for g in group_ids if g}
@@ -309,11 +318,20 @@ def set_shares(
     to_remove = (existing & allowed) - requested
 
     gate_approval = resource_type in _APPROVAL_GATED_TYPES and not is_admin
-    queued: Set[str] = set()
-    if gate_approval and to_add:
+    sr_repo = None
+    if gate_approval:
         from src.repositories import share_requests_repo
 
-        sr_repo = share_requests_repo()
+        try:
+            sr_repo = share_requests_repo()
+        except RequiresPostgresBackend:
+            # Backend can't provide the queue — fall through to the
+            # instant-grant path below, exactly as if this weren't a
+            # gated type at all.
+            gate_approval = False
+
+    queued: Set[str] = set()
+    if gate_approval and to_add:
         for gid in sorted(to_add):
             sr_repo.create(
                 resource_type=resource_type,
