@@ -714,6 +714,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **The SharePoint source card no longer shows "(no connection URL)".** The
+  generic card subtitle rendered a connection's `stack_url`/host, which a
+  SharePoint connection has none of (Graph auth is tenant + app
+  registration, not a host) — every SharePoint card read as broken. It now
+  shows the tenant (shortened GUID) and a scope summary, e.g. `a1b2c3d4… ·
+  2 scopes · Communication site`, or `N sites` when the selected scopes span
+  more than one site.
 - The group picker on `/admin/users/{id}` ("Add to group") showed only its
   first option under themes that render the custom dropdown: the section
   card's `overflow: hidden` clipped the popover at the card's bottom edge,

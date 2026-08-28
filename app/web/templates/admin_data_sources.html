@@ -1995,12 +1995,42 @@ function _sourceSubtitle(row) {
   const bits = [];
   if (row.derived) {
     if (row.subtitle) bits.push(_esc(row.subtitle));
+  } else if (row.source_type === "sharepoint") {
+    bits.push(_sharepointIdentityLine(config));
   } else {
     const stackUrl = (config.stack_url || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
     bits.push(stackUrl ? `<code>${_esc(stackUrl)}</code>` : "(no connection URL)");
     if (config.project_id != null) {
       bits.push(`${_esc(config.project_name || "unnamed")} · project ${_esc(String(config.project_id))}`);
     }
+  }
+  return bits.join(" · ");
+}
+
+/* SharePoint has no "connection URL" — Graph auth is tenant + app
+   registration, not a host — so the generic branch above always fell
+   through to "(no connection URL)", which tells the admin nothing true or
+   false. Two honest facts instead: the tenant (shortened — it is a GUID,
+   the value itself is not the identifying part, just that it's stable) and
+   how many scopes are selected, plus their common site when there is one.
+   `display_path`'s first " / "-segment is the site name
+   (`connectors/sharepoint/graph_client.py`'s BFS prefixes every match with
+   `[site["name"], drive["name"]]` before appending folder names). Graph's
+   `webUrl` is never fetched or stored on a scope row — verified against
+   `app/api/admin_sharepoint.py`, where a scope is exactly
+   `{source_scope_id, display_path, anonymize, collection_id}` — so there is
+   no real link to prefer over this summary. */
+function _sharepointIdentityLine(config) {
+  const bits = [];
+  const tenantId = String(config.tenant_id || "");
+  bits.push(tenantId ? `<code>${_esc(tenantId.slice(0, 8))}…</code>` : "(no tenant configured)");
+  const scopes = Array.isArray(config.scopes) ? config.scopes : [];
+  if (scopes.length) {
+    const sites = new Set(scopes.map((s) => String((s && s.display_path) || "").split(" / ")[0]));
+    const siteLabel = sites.size === 1 ? [...sites][0] : `${sites.size} sites`;
+    bits.push(`${scopes.length} scope${scopes.length === 1 ? "" : "s"} · ${_esc(siteLabel)}`);
+  } else {
+    bits.push("no scopes selected");
   }
   return bits.join(" · ");
 }

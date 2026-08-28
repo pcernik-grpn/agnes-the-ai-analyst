@@ -1896,6 +1896,173 @@ class TestSharePointCertificateMetadataRendering:
         assert html.count("Thumbprint") == 0
 
 
+class TestSourceCardSubtitleIdentity:
+    """`_sourceSubtitle` executed for real via `node`. A SharePoint connection
+    has no `config.stack_url` — the generic branch always fell through to
+    the literal `"(no connection URL)"`, which is not an honest fact about a
+    SharePoint connection (there is no connection URL to report). Pins the
+    SharePoint-specific identity line (tenant + scope summary) and that
+    every non-SharePoint card is byte-for-byte unchanged.
+    """
+
+    @staticmethod
+    def _extract_function(tpl: str, signature: str) -> str:
+        start = tpl.index(signature)
+        depth = 0
+        started = False
+        for i in range(start, len(tpl)):
+            ch = tpl[i]
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return tpl[start : i + 1]
+        raise AssertionError(f"unbalanced braces extracting {signature!r}")
+
+    def _run(self, row: dict) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _sourceSubtitle(row) {",
+                "function _sharepointIdentityLine(config) {",
+            )
+        )
+        script = f"""
+{fns}
+
+const row = {json.dumps(row)};
+console.log(_sourceSubtitle(row));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout.strip()
+
+    def test_sharepoint_card_shows_tenant_and_single_shared_site(self):
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scopes": [
+                    {
+                        "source_scope_id": "s1",
+                        "display_path": "Communication site / Shared Documents",
+                        "anonymize": False,
+                        "collection_id": "c1",
+                    },
+                    {
+                        "source_scope_id": "s2",
+                        "display_path": "Communication site / Reports",
+                        "anonymize": False,
+                        "collection_id": "c2",
+                    },
+                ],
+            },
+        }
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "<code>a1b2c3d4…</code>" in out
+        assert "2 scopes · Communication site" in out
+
+    def test_sharepoint_card_shows_n_sites_when_scopes_span_multiple_sites(self):
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scopes": [
+                    {
+                        "source_scope_id": "s1",
+                        "display_path": "Marketing site / Docs",
+                        "anonymize": False,
+                        "collection_id": "c1",
+                    },
+                    {
+                        "source_scope_id": "s2",
+                        "display_path": "Finance site / Docs",
+                        "anonymize": False,
+                        "collection_id": "c2",
+                    },
+                ],
+            },
+        }
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "2 scopes · 2 sites" in out
+
+    def test_sharepoint_card_with_no_scopes_is_honest_not_a_url_placeholder(self):
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {"tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "scopes": []},
+        }
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "no scopes selected" in out
+
+    def test_sharepoint_card_with_no_tenant_is_honest(self):
+        row = {"derived": False, "source_type": "sharepoint", "config": {"scopes": []}}
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "(no tenant configured)" in out
+
+    def test_sharepoint_identity_line_escapes_the_site_name(self):
+        """`display_path` comes from a SharePoint site name — untrusted text
+        rendered into innerHTML — so the site label must go through `_esc`
+        like everything else on the card."""
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scopes": [
+                    {
+                        "source_scope_id": "s1",
+                        "display_path": "<img src=x onerror=alert(1)> / Docs",
+                        "anonymize": False,
+                        "collection_id": "c1",
+                    },
+                ],
+            },
+        }
+        out = self._run(row)
+        assert "<img" not in out
+        assert "&lt;img" in out
+
+    def test_non_sharepoint_card_with_no_stack_url_is_unchanged(self):
+        row = {"derived": False, "source_type": "keboola", "config": {}}
+        out = self._run(row)
+        assert out == "(no connection URL)"
+
+    def test_non_sharepoint_card_with_stack_url_is_unchanged(self):
+        row = {
+            "derived": False,
+            "source_type": "keboola",
+            "config": {"stack_url": "https://connection.keboola.com", "project_id": 42, "project_name": "My Project"},
+        }
+        out = self._run(row)
+        assert out == "<code>connection.keboola.com</code> · My Project · project 42"
+
+
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
     """`_registerErrorText` output goes to `textContent`, so it must not be
     `_esc`'d first.
