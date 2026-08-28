@@ -80,6 +80,7 @@ class JobsPgRepository:
     #: sibling module.
     HEAVY_LANE = "heavy"
     LIGHT_LANE = "light"
+    EXTRACTION_LANE = "extraction"
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine

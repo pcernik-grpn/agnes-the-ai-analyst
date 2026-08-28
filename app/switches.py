@@ -637,6 +637,30 @@ SWITCHES: tuple[Switch, ...] = (
             "edges use the same rule."
         ),
     ),
+    Switch(
+        name="extraction",
+        config_keys=("extraction", "enabled"),
+        env_var="AGNES_EXTRACTION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=False,
+        lock_reason=(
+            "The flag itself is read per request, but the `corpus-extraction` job kind "
+            "it gates needs a configured `extraction.producer` command AND a worker "
+            "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
+            "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
+            "feature whose backend is absent. Enable the profile/producer and this flag "
+            "together."
+        ),
+        description=(
+            "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "
+            "own worker lane — gates the `corpus-extraction` job kind's handler, which "
+            "shells out to the operator-configured `extraction.producer` command/module. "
+            "New feature — off by default."
+        ),
+    ),
 )
 
 _BY_NAME: dict[str, Switch] = {s.name: s for s in SWITCHES}

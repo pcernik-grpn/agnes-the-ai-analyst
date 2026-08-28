@@ -1144,6 +1144,66 @@ facts:
   single_valued_edges: ["owned_by", "for_client"]
 
 
+# --- Document extraction worker lane (optional, off by default) ---
+# Runs document extraction (crawl -> convert -> anonymize -> extract ->
+# ingest against POST /api/facts/ingest) as its OWN worker lane, driven by
+# the `corpus-extraction` job kind (app/worker/kinds.py) — its own process
+# when run via the `extraction-worker` compose service / the Dockerfile's
+# `worker` build target, so a corpus re-extraction never competes with, or
+# blocks, ordinary table syncs (spec §7.5 "Extraction inside Agnes (later)",
+# §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
+# collections-design.md).
+#
+# Agnes does NOT ship the producer (crawl/convert/anonymize/extract) — this
+# block only configures HOW to invoke whatever producer command the
+# deployment provides. The producer is a separate project of your own, adopted
+# per spec §7.1; it is never vendored into this repo. A plain `docker
+# compose up` (no `--target worker` build, no EXTRACTION_PRODUCER_INSTALL
+# build-arg) has nothing to invoke here — `corpus-extraction` fails clean
+# with a config error rather than a crash until a producer is configured.
+#
+# `extraction.enabled` is a registered switch (app/switches.py) — set it
+# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
+# NOT editable from /admin/server-config (locked: requires the
+# extraction-worker deployment) — this is operator/deploy-time config, not
+# a runtime toggle. The rest of this block (`producer`, `timeout_s`) is
+# plain instance data, read directly via get_value.
+extraction:
+  enabled: false
+  producer:
+    # Full command line for the producer entrypoint, e.g.:
+    #   command: "python -m your_producer.run"
+    # OR, when the worker image installed it as a package (see the
+    # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
+    #   module: your_producer.run
+    # `command` wins when both are set. Either form MAY be a YAML list
+    # instead of a string, taken verbatim (no shell-splitting needed then).
+    command: ""
+    module: ""
+    # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
+    # from this process's own environment, beyond the curated non-secret
+    # allowlist below (PATH/locale/timezone/tempdir/TLS/proxy vars). Empty
+    # by default. Only the NAMES listed here are copied — this is not a way
+    # back to forwarding the whole environment.
+    env_passthrough: []
+  # Hard ceiling on one producer run, in seconds — the subprocess is killed
+  # at this timeout and the job fails (no automatic retry: a failed
+  # producer run usually needs an operator to look at it).
+  timeout_s: 3600
+  # SECURITY: credentials are NEVER configured here. The producer's
+  # SharePoint tenant/client id + certificate are resolved from the
+  # connection's own vault slot, or the server's SHAREPOINT_CERT_PRIVATE_KEY
+  # env var — the SAME resolution connectors/sharepoint/settings.py already
+  # does for the SharePoint admin UI. They reach the producer ONLY via its
+  # child process environment (AGNES_SHAREPOINT_TENANT_ID / _CLIENT_ID /
+  # _PRIVATE_KEY / AGNES_EXTRACTION_CORPUS_ID), never on argv, never logged.
+  # That child env is NOT this server's full environment — `producer` names
+  # an EXTERNAL, admin-configurable binary, so it gets only a curated
+  # non-secret allowlist (+ any `env_passthrough` above) plus the four vars
+  # named above. No other instance secret (vault key, LLM API key, DB DSN,
+  # OAuth client secrets, ...) is ever forwarded to it.
+
+
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
 # agents, data packages, connections, and corporate memory).
 #

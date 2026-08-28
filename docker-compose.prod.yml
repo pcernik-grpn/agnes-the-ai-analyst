@@ -34,5 +34,15 @@ services:
   # deployment brings its own overlay for.
   kai-agent-stub:
     image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
+  # extraction-worker (compose profile `extraction-worker`) is `build:`
+  # like the services above and needs the same source-less-prod-VM override
+  # for the same reason. It runs the SAME image as `app`/`scheduler` here —
+  # this override does NOT publish a separate producer-bundled variant; a
+  # deployment that built its own `worker`-target image with
+  # EXTRACTION_PRODUCER_INSTALL (see the Dockerfile) points this at that
+  # image instead (mirrors the `-rich` tag pattern .github/workflows/
+  # image-rich.yml uses for docling/embeddings).
+  extraction-worker:
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # corporate-memory and session-collector were dropped in #176 —
   # the scheduler container drives them via /api/admin/run-* endpoints.
