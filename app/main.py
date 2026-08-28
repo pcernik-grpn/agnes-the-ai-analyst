@@ -510,6 +510,7 @@ from app.api.data_packages import router as data_packages_router
 from app.api.admin_mcp import router as admin_mcp_router
 from app.api.admin_contributed_skills import router as admin_contributed_skills_router
 from app.api.admin_datasource_secrets import router as admin_datasource_secrets_router
+from app.api.admin_sharepoint import router as admin_sharepoint_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
 from app.api.admin_source_connections import router as source_connections_admin_router
 from app.api.admin_source_discovery import router as source_discovery_admin_router
@@ -538,6 +539,7 @@ from app.api.memory_mining import (
 from app.api.uploads import router as admin_uploads_router
 from app.api.collections import router as collections_router  # Slice 2: file corpus upload
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
+from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
 from app.api.knowledge_search import router as knowledge_search_router  # K2: unified search
 from app.api.stack import router as stack_router
@@ -2874,6 +2876,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_datasource_secrets_router)
     app.include_router(admin_slack_secrets_router)
     app.include_router(source_connections_admin_router)
+    app.include_router(admin_sharepoint_router)
     app.include_router(source_discovery_admin_router)
     app.include_router(mcp_passthrough_router)
     app.include_router(mcp_user_secrets_router)
@@ -2892,6 +2895,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_uploads_router)
     app.include_router(collections_router)
     app.include_router(facts_router)
+    app.include_router(ontology_router)
     app.include_router(sharing_router)
     app.include_router(knowledge_search_router)
     app.include_router(stack_router)

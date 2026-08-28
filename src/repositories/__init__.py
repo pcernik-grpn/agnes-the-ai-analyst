@@ -151,6 +151,8 @@ __all__ = [
     "corpus_file_sources_repo",
     # Fact graph over Collections
     "facts_repo",
+    "ontology_drafts_repo",
+    "facts_ingest_runs_repo",
     # Agent registry (v103) — the Library's agent items
     "agents_repo",
     # Maintained digests (K4, #799)
@@ -552,6 +554,18 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "facts": {
         PG: ("src.repositories.facts_pg", "FactsPgRepository"),
     },
+    # Ontology builder draft state (fact-graph-over-Collections §13.2) —
+    # PG-only, A3 ratchet: no DuckDB backend.
+    "ontology_drafts": {
+        PG: ("src.repositories.ontology_drafts_pg", "OntologyDraftsPgRepository"),
+    },
+    # Persisted ingest run reports (design doc §7.2/§13.2) — PG-only, A3
+    # ratchet: no DuckDB backend. Separate repo/table from "facts" above so
+    # a report-write failure is structurally never part of the ingest
+    # transaction.
+    "facts_ingest_runs": {
+        PG: ("src.repositories.facts_ingest_runs_pg", "FactsIngestRunsPgRepository"),
+    },
     # agent registry (v103)
     "agents": {
         DUCKDB: ("src.repositories.agents", "AgentsRepository"),
@@ -913,6 +927,20 @@ def facts_repo() -> Any:
     corrections — design doc §2 consequences). PG-only — raises
     ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
     return _build("facts")
+
+
+def ontology_drafts_repo() -> Any:
+    """Ontology builder draft state (design doc §13.2, "Ontology builder").
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance."""
+    return _build("ontology_drafts")
+
+
+def facts_ingest_runs_repo() -> Any:
+    """Persisted run reports for ``POST /api/facts/ingest`` (design doc
+    §7.2/§13.2 source card). PG-only — raises ``RequiresPostgresBackend``
+    on a DuckDB-backed instance."""
+    return _build("facts_ingest_runs")
 
 
 # Maintained digests (K4, #799)

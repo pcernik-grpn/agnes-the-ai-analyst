@@ -124,6 +124,16 @@
     <span class="apg-strip__end"><a href="/catalog/semantics">Browse it →</a></span>
   </div>
 
+  {# Ontology builder entry point — zero new navigation (fact-graph-over-
+     Collections §13.2): "ontology = a semantic model in the builder shell",
+     reached only from here, no admin-nav item of its own. The page itself
+     explains the facts flag / Postgres-backend prerequisites when either is
+     unmet, so this link is unconditional. #}
+  <div class="apg-strip">
+    <span><strong>Ontology:</strong> author the entity and relationship types the fact graph extracts against.</span>
+    <span class="apg-strip__end"><a href="/admin/ontology">Ontology builder →</a></span>
+  </div>
+
   {# The warning rows are built in JS, but their icon is not: it is rendered
      once here by the shared macro and cloned, so no markup string is assembled
      client-side. #}

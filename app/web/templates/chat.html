@@ -343,8 +343,23 @@
            role="complementary" aria-labelledby="chat-files-title">
       <header class="cloud-chat-files-drawer-head">
         <h2 id="chat-files-title" class="cloud-chat-files-drawer-title">Session files</h2>
+        <button type="button" id="chat-files-refresh"
+                class="cloud-chat-files-drawer-close" aria-label="Refresh session files"
+                title="Refresh">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="14" height="14">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
+            <path d="M13.5 1.5v3h-3"/>
+          </svg>
+        </button>
         <button type="button" id="chat-files-close"
-                class="cloud-chat-files-drawer-close" aria-label="Close session files">&#x2715;</button>
+                class="cloud-chat-files-drawer-close" aria-label="Close session files">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+               stroke-linecap="round" aria-hidden="true" width="14" height="14">
+            <path d="M4 4l8 8"/>
+            <path d="M12 4l-8 8"/>
+          </svg>
+        </button>
       </header>
       <p class="cloud-chat-files-drawer-desc">
         Files this conversation produced &mdash; deliverables first. Download a copy, or save it
@@ -353,9 +368,6 @@
       <div id="chat-files-status" class="cloud-chat-files-status" hidden></div>
       <ul id="chat-files-list" class="cloud-chat-files-list"></ul>
       <div id="chat-files-error" class="cloud-chat-upload-error" hidden></div>
-      <footer class="cloud-chat-files-drawer-foot">
-        <button type="button" id="chat-files-refresh" class="btn btn-secondary">Refresh</button>
-      </footer>
     </aside>
 
     {# Dialog 1: Data file upload #}

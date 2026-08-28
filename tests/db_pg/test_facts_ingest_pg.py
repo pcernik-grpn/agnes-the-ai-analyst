@@ -591,9 +591,7 @@ def test_merge_facts_survives_shared_evidence_and_split_restores_it(pg_env, repo
 
     # The SAME document + the SAME quote evidences both facts.
     for fid in (canonical_id, duplicate_id):
-        repo.add_claim(
-            fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote
-        )
+        repo.add_claim(fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote)
     # ...plus one claim only the duplicate holds, which must repoint normally.
     repo.add_claim(
         fact_id=duplicate_id,
@@ -1060,6 +1058,23 @@ def test_http_happy_path_upload_then_ingest_then_search_finds_the_subject(tmp_pa
     claims = claims_resp.json()["claims"]
     assert claims[0]["quote"] == "Acme Rollout is sponsored by Alice Adams."
     assert claims[0]["corpus_file_id"] == file_id
+
+    # The ingest above also persisted a run report (spec §7.2/§13.2) — the
+    # source card's data. Written OUTSIDE the ingest transaction (see
+    # app/api/facts.py::facts_ingest's docstring); this proves the wiring,
+    # not just that FactsIngestRunsPgRepository works in isolation (that is
+    # tests/db_pg/test_facts_ingest_runs_pg.py's job).
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.status_code == 200, runs_resp.text
+    runs = runs_resp.json()["runs"]
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["corpus_ids"] == [corpus_id]
+    assert run["documents_seen"] == 1
+    assert run["claims_written"] == 1
+    assert run["claims_rejected_count"] == 0
+    assert run["subjects_created"] == 1
+    assert run["caller"] == "admin@test.com"
 
 
 def test_http_verbatim_gate_rejects_a_fabricated_quote(tmp_path, monkeypatch, pg_engine):
