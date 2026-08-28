@@ -625,9 +625,12 @@ _EXEMPT: dict[str, str] = {
     ),
     "/api/admin/sso/identities": (
         "linked external identities list — CLI-reachable via `agnes admin "
-        "sso identities`, deliberately never MCP-exposed: it enumerates "
-        "which users an external tenant can authenticate as (auth-posture "
-        "reconnaissance), and is admin recovery tooling, not analyst tooling"
+        "sso identities`, deliberately never MCP-exposed (own reasoning, "
+        "not a standing-exemption citation): a per-user roster of which "
+        "external principal can authenticate as whom (emails + subject "
+        "GUIDs) is admin recovery tooling, and handing it to an "
+        "agent-invokable tool would give a prompt-injected session a "
+        "one-call identity map of the instance; it is not analyst tooling"
     ),
     "/api/admin/sso/identities/{user_id}": (
         "admin unlink of one external identity — CLI-reachable via `agnes "
@@ -638,9 +641,11 @@ _EXEMPT: dict[str, str] = {
     "/api/me/external-identity": (
         "the caller's own external-identity linkage — CLI-reachable via the "
         "`agnes whoami` linked-identity line, deliberately never MCP-exposed "
-        "per the 'operator security-posture diagnostics' standing exemption "
-        "in CONTRIBUTING.md: it enumerates the caller's auth linkage (which "
-        "external principal can authenticate as them)"
+        "(own reasoning, not a standing-exemption citation: the operator-"
+        "diagnostics clause covers instance-wide posture, and this is "
+        "self-scoped): it reveals which external principal can authenticate "
+        "as the caller (`oid`/`tid`) — auth-linkage reconnaissance a "
+        "prompt-injected chat session has no analyst-tooling reason to hold"
     ),
     "/api/admin/users/{user_id}/library-preview": (
         "feeds the Simulate lens's Library-shaped preview on /admin/access — "

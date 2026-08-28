@@ -1486,6 +1486,15 @@ class TestSsoClaimEvaluation:
         cfg = {"tenant_id": self.CFG["tenant_id"], "allowed_email_domains": []}
         error, *_ = self._eval(self._userinfo(), cfg)
         assert error == "domain_not_allowed"
+        # A missing/None allowlist key must fail closed too — refuse, never
+        # raise (Gemini second-opinion finding: the `or []` fallback was
+        # parsed as `(domain not in X) or []` and could not fire).
+        cfg = {"tenant_id": self.CFG["tenant_id"]}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+        cfg = {"tenant_id": self.CFG["tenant_id"], "allowed_email_domains": None}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
 
 
 class TestSsoAvailabilityOnDuckDB:
@@ -1569,3 +1578,33 @@ class TestSsoRouteGating:
     def test_test_mode_refuses_anonymous_on_duckdb_too(self, sso_client):
         # Admin gate fires BEFORE any config/backend read.
         assert sso_client.get("/auth/sso/login?mode=test", follow_redirects=False).status_code == 403
+
+
+class TestAdminSessionPredicateLockstep:
+    """`app.auth.access.is_admin_session` is the boolean form of
+    `require_admin` for optional-user routes (the SSO test mode). Pin the
+    shared primitive set so a check added to one without the other fails
+    loudly instead of drifting silently."""
+
+    PRIMITIVES = ("PRINCIPAL_TYPES", "is_user_admin", "elevation_paused")
+
+    def test_both_gates_compose_the_same_primitives(self):
+        import inspect
+
+        from app.auth import access
+
+        require_src = inspect.getsource(access.require_admin)
+        boolean_src = inspect.getsource(access.is_admin_session)
+        for name in self.PRIMITIVES:
+            assert name in require_src, f"require_admin lost {name} — update the lockstep pin"
+            assert name in boolean_src, f"is_admin_session misses {name} — mirror require_admin"
+
+    def test_sso_test_mode_delegates_to_the_canonical_predicate(self):
+        import inspect
+
+        from app.auth.providers import sso
+
+        src = inspect.getsource(sso._is_admin_session)
+        assert "is_admin_session" in src
+        for name in self.PRIMITIVES:
+            assert name not in src, "sso must delegate, not re-compose the admin checks"

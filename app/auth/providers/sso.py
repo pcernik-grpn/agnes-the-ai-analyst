@@ -216,7 +216,7 @@ def evaluate_claims(user_info: dict, cfg: dict) -> tuple[Optional[str], str, str
     if _is_directory_guid(configured) and tid != configured.lower():
         return "sso_wrong_tenant", email, oid, tid
     domain = email.split("@")[-1]
-    if domain not in cfg.get("allowed_email_domains") or []:
+    if domain not in (cfg.get("allowed_email_domains") or []):
         return "domain_not_allowed", email, oid, tid
     return None, email, oid, tid
 
@@ -371,18 +371,14 @@ def _resolve_link_race(ids_repo, user: dict, tenant_id: str, subject: str) -> tu
 def _is_admin_session(user: Optional[Any]) -> bool:
     """Whether this request carries a real admin's interactive session.
 
-    Mirrors ``require_admin``'s ordering: restricted principals (session /
-    agent sandbox tokens) are hard-denied BEFORE the membership lookup, and a
-    paused elevation counts as not-admin for the test flow too.
+    Delegates to the canonical :func:`app.auth.access.is_admin_session` —
+    the boolean form of ``require_admin``'s checks — so this route (which
+    resolves the user optionally, serving anonymous normal-mode traffic on
+    the same path) can never drift from the admin gate.
     """
-    from app.auth.access import PRINCIPAL_TYPES, is_user_admin
-    from app.auth.elevation import elevation_paused
+    from app.auth.access import is_admin_session
 
-    if not user or isinstance(user, PRINCIPAL_TYPES):
-        return False
-    if not is_user_admin(user["id"]):
-        return False
-    return not elevation_paused()
+    return is_admin_session(user)
 
 
 def _normal_mode_gate() -> None:
@@ -497,6 +493,12 @@ async def sso_callback(request: Request, user: Optional[dict] = Depends(get_opti
         return response
 
     except HTTPException:
+        raise
+    except RequiresPostgresBackend:
+        # Unreachable behind the gates above (both swallow it to a 404 /
+        # redirect first), but if it ever fires it is a backend-routing
+        # problem, not an OAuth failure — let the app-wide typed-501 handler
+        # answer instead of mislabeling it below.
         raise
     except Exception as e:
         # %r, not f-string: authlib raises OAuthError built verbatim from the
