@@ -62,6 +62,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **A generated file is handed over IN the conversation, as a chip on the
+  answer that produced it.** The turn that writes a deliverable now renders it
+  as a chip under that answer — a filename and a size at rest, with Download
+  and Save to Library appearing on hover or keyboard focus. The file is a
+  result of that turn, so it belongs beside the sentence naming it rather than
+  behind a panel thrown over the conversation, and a chip that says nothing
+  until you reach for it keeps a quiet turn quiet. The drawer stays reachable
+  from the header for everything a session has accumulated (older turns, after
+  a reload); it simply no longer opens itself. Its rows also stop squeezing
+  the actions beside a wrapping path — in a 380px panel they now sit on their
+  own line under the name.
 - **Admin and workspace pages now use the plain page header.** 25 templates that
   are lists, tables or editors switch from the bordered gradient hero panel to the
   plain title + lede that `/library`, `/agents` and `/chats` already render, via the
@@ -157,6 +168,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving the previous chat's rows on screen with their old download links.
 
 ### Fixed
+- **Session files: the workspace template no longer shows up as session
+  output on kai-agent instances.** The exclusion shipped for the host walk,
+  but a `chat.provider: kai-agent` session is listed by the ENGINE's own
+  sandbox browser — which filters dot-directories only, so `.claude` was
+  hidden while `scaffolds/` and `CLAUDE.md` came straight through. Live, that
+  meant a drawer full of `scaffolds/nodejs-dashboard/{package.json,index.html,
+  postcss.config.js,…}` with the user's actual document nowhere in it. The
+  engine walk now skips the same top-level template entries, derived from the
+  same `WORKSPACE_LINK_ENTRIES` source of truth as the host side, and no
+  longer even requests those subdirectories.
 - **Dark theme: several light-hex backgrounds that never flipped now use
   `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
   `.news-content` renderer, `.btn-danger`, several `.group-chip` variants),

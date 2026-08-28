@@ -2752,11 +2752,81 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   border-radius: var(--ds-radius-md, 8px);
 }
 .cloud-chat-files-list:empty { display: none; }
+/* File chips in the transcript — the primary way a deliverable is handed
+   over. They ride the answer that produced them, so the reader meets the file
+   next to the sentence naming it. At rest a chip is just a filename and a
+   size; the actions appear on hover / keyboard focus, because most turns want
+   this to read as a mention, not as a toolbar. Touch has no hover, so there
+   the actions are always shown (see the coarse-pointer rule below). */
+.cloud-chat-file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.cloud-chat-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface);
+  font-size: var(--text-xs);
+}
+.cloud-chat-file-chip:hover,
+.cloud-chat-file-chip:focus-within {
+  border-color: var(--ds-primary);
+}
+.cloud-chat-file-chip-label {
+  font-weight: var(--font-semibold);
+  color: var(--ds-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cloud-chat-file-chip-size {
+  color: var(--ds-text-muted);
+  flex: 0 0 auto;
+}
+.cloud-chat-file-chip-actions {
+  display: none;
+  gap: var(--space-2);
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--ds-border);
+}
+.cloud-chat-file-chip:hover .cloud-chat-file-chip-actions,
+.cloud-chat-file-chip:focus-within .cloud-chat-file-chip-actions {
+  display: inline-flex;
+}
+@media (hover: none) {
+  .cloud-chat-file-chip-actions { display: inline-flex; }
+}
+.cloud-chat-file-chip-action {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--ds-primary);
+  font-size: var(--text-xs);
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cloud-chat-file-chip-action:hover { text-decoration: underline; }
+.cloud-chat-file-chip-action:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+
+/* Drawer rows keep the full inventory. In a 380px panel the actions no longer
+   sit BESIDE the name — the path wrapped to three lines and squeezed the
+   buttons — they sit under it, on their own line. */
 .cloud-chat-files-row {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
   padding: var(--space-3);
 }
 .cloud-chat-files-row + .cloud-chat-files-row {
@@ -2783,6 +2853,7 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   display: flex;
   gap: var(--space-2);
   flex-shrink: 0;
+  justify-content: flex-end;
 }
 .cloud-chat-files-btn {
   font-size: var(--text-xs);

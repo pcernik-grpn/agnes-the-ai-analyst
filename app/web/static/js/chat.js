@@ -5931,13 +5931,112 @@ function renderCoPresence(host, participants) {
     updateFilesBadge(files.length);
     const fresh = files.filter(isDeliverable).filter((f) => !_knownOutputs.has(f.path));
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    if (drawerOpen()) renderFileList(chatId, files, truncated, supported);
     if (!fresh.length) return;
-    if (drawerOpen()) {
-      renderFileList(chatId, files, truncated, supported);
-      return;
-    }
-    openFilesDrawer();
+    // The file belongs to the turn that made it, so it is delivered THERE —
+    // as a chip on the answer, beside the sentence naming it — rather than by
+    // throwing a panel over the conversation. The drawer stays reachable from
+    // the header for everything the session has accumulated; it just stops
+    // being the thing that interrupts the read.
+    renderFileChips(chatId, fresh);
   });
+
+  /** Attach file chips to the newest assistant bubble. Hovering (or focusing)
+   *  a chip reveals its actions — the resting state stays a quiet mention of
+   *  a filename, which is what most turns want. */
+  function renderFileChips(chatId, files) {
+    const articles = document.querySelectorAll("#chat-messages .msg-assistant");
+    const bubble = articles.length
+      ? articles[articles.length - 1].querySelector(".msg-bubble")
+      : null;
+    if (!bubble || !files.length) return;
+
+    let row = bubble.querySelector(":scope > .cloud-chat-file-chips");
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "cloud-chat-file-chips";
+      // Sit above the message-actions row, same seam renderNextActions uses,
+      // so live and reloaded bubbles agree about the tail's order.
+      const actionsRow = bubble.querySelector(":scope > .msg-actions");
+      if (actionsRow) bubble.insertBefore(row, actionsRow);
+      else bubble.appendChild(row);
+    }
+
+    for (const f of files) {
+      if (row.querySelector(`[data-path="${CSS.escape(f.path)}"]`)) continue;
+      row.appendChild(buildFileChip(chatId, f));
+    }
+  }
+
+  function buildFileChip(chatId, f) {
+    const chip = document.createElement("div");
+    chip.className = "cloud-chat-file-chip";
+    chip.dataset.path = f.path;
+
+    const label = document.createElement("span");
+    label.className = "cloud-chat-file-chip-label";
+    // textContent — an agent chose this filename.
+    label.textContent = f.name;
+    label.title = f.path;
+
+    const size = document.createElement("span");
+    size.className = "cloud-chat-file-chip-size";
+    size.textContent = fmtSize(f.size_bytes);
+
+    const actions = document.createElement("div");
+    actions.className = "cloud-chat-file-chip-actions";
+
+    const dl = document.createElement("a");
+    dl.className = "cloud-chat-file-chip-action";
+    dl.textContent = "Download";
+    dl.href =
+      "/api/chat/sessions/" + encodeURIComponent(chatId) +
+      "/files/download?path=" + encodeURIComponent(f.path);
+    dl.setAttribute("download", f.name);
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "cloud-chat-file-chip-action";
+    save.textContent = "Save to Library";
+    save.addEventListener("click", () => saveChipToLibrary(chatId, f, save));
+
+    actions.appendChild(dl);
+    actions.appendChild(save);
+    chip.appendChild(label);
+    chip.appendChild(size);
+    chip.appendChild(actions);
+    return chip;
+  }
+
+  async function saveChipToLibrary(chatId, f, btn) {
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+    try {
+      const res = await fetch(
+        "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files/save-artefact",
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: f.path }),
+        }
+      );
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const link = document.createElement("a");
+      link.className = "cloud-chat-file-chip-action";
+      link.textContent = "In Library ↗";
+      link.href = data.library_url || "/library";
+      link.target = "_blank";
+      link.rel = "noopener";
+      btn.replaceWith(link);
+      showToast("Saved to your Library", "ok");
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Save to Library";
+      showToast("Could not save to Library", "error");
+    }
+  }
 
 })();
 
