@@ -116,7 +116,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   in one batch are rejected up front (`400
   duplicate_source_stable_id_in_batch`), matching the existing
   `duplicate_path_in_batch` guard — the second would otherwise overwrite the
-  first's row in place and silently drop its bytes. The stable-id mapping
+  first's row in place and silently drop its bytes — and a read-only
+  pre-flight resolves every file's target row before anything is stored, so
+  the two collisions that cross the stable-id/path boundary are refused
+  cleanly too: two files landing on the same existing row through different
+  anchors (`400 duplicate_target_row_in_batch`) and a stable-id match whose
+  `path` is already held by another row, which previously violated the
+  `(corpus_id, path)` unique index and surfaced as a `500` with earlier files
+  in the batch already written (`409 path_owned_by_another_file`). The old
+  blob is now unlinked whenever a matched row's `storage_path` moves rather
+  than only when its content changed — blob paths are `{sha256}{ext}` with
+  the extension taken from the filename, so an extension-only rename kept the
+  sha, allocated a new blob and orphaned the old one on disk. On a role-split
+  `api` replica a content-changed re-upload now rides ONE ordered
+  `collections-purge` job carrying `reingest_after_purge=True`, exactly as
+  `…/reingest` already did, instead of enqueueing a bare derived-table purge
+  while running the re-ingest in-process — because the row id (and therefore
+  the derived `table_id`) is now preserved, those two could land in either
+  order and the purge could delete the table the re-ingest had just rebuilt.
+  The stable-id mapping upsert also `COALESCE`s its optional columns, so a
+  rename-only re-sync carrying `source_stable_ids` without `source_doc_ids`
+  no longer resets a stored `source_doc_id` to NULL. The stable-id mapping
   table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
   instance returns `501`; omitting the field keeps today's flow unchanged.
 

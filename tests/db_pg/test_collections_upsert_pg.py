@@ -575,3 +575,196 @@ def test_upload_files_endpoint_with_source_stable_id_end_to_end(pg_engine, monke
     import src.repositories as factory
 
     assert factory.corpus_file_sources_repo().resolve(corpus_id, "graph:e2e-1") == file_id
+
+
+def _e2e_client(pg_engine, monkeypatch, tmp_path):
+    from ._parity_sweep_util import build_seeded_client
+
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    cr = client.post("/api/collections", json={"name": "PG Preflight"}, headers=auth)
+    assert cr.status_code == 201, cr.text
+    return client, auth, cr.json()["id"]
+
+
+def test_cross_anchor_collision_in_one_batch_rejected(pg_engine, monkeypatch, tmp_path):
+    """The per-key guards compare `paths` against itself and
+    `source_stable_ids` against itself, but the match is stable_id FIRST then
+    path — so a batch where file 1's stable id and file 2's path resolve to
+    the SAME existing row slips through both, and the second overwrites the
+    first in place: file 1's bytes lost, one `file_id` returned twice. The
+    read-only pre-flight resolves each file's target row up front and refuses
+    the batch (Devin Review on #1655)."""
+    import io
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"original"), "text/markdown")},
+        data={"source_stable_ids": "graph:cross", "paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    anchored_id = first.json()[0]["file_id"]
+
+    # File 1 targets the row by stable id; file 2 targets the SAME row by its
+    # path. Neither per-key guard fires: the stable ids differ (one is blank)
+    # and the paths differ (one is blank).
+    resp = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files=[
+            ("files", ("a.md", io.BytesIO(b"via stable id"), "text/markdown")),
+            ("files", ("a.md", io.BytesIO(b"via path"), "text/markdown")),
+        ],
+        data={"source_stable_ids": ["graph:cross", ""], "paths": ["", "docs/a.md"]},
+        headers=auth,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "duplicate_target_row_in_batch" in resp.text
+
+    # Nothing was written: the anchored row still holds its original bytes.
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    rows = listing.json()["files"]
+    assert [r["file_id"] for r in rows] == [anchored_id]
+    assert rows[0]["size_bytes"] == len(b"original")
+
+
+def test_stable_id_match_onto_a_path_owned_by_another_row_is_refused(pg_engine, monkeypatch, tmp_path):
+    """A stable-id match resolves row R while the upload's `path` is already
+    held by a DIFFERENT row: `update_in_place` issues an unconditional UPDATE
+    and violates the `(corpus_id, path)` unique index — an unhandled
+    IntegrityError, i.e. a 500 with earlier files in the batch already
+    written. The pre-flight answers a typed 409 naming both rows instead
+    (Devin Review on #1655)."""
+    import io
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    anchored = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"anchored"), "text/markdown")},
+        data={"source_stable_ids": "graph:mover", "paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert anchored.status_code == 201, anchored.text
+
+    occupier = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("b.md", io.BytesIO(b"occupier"), "text/markdown")},
+        data={"paths": "docs/b.md"},
+        headers=auth,
+    )
+    assert occupier.status_code == 201, occupier.text
+    occupier_id = occupier.json()[0]["file_id"]
+
+    # The crawler now reports graph:mover living at docs/b.md — a path
+    # another row already owns.
+    resp = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"moved"), "text/markdown")},
+        data={"source_stable_ids": "graph:mover", "paths": "docs/b.md"},
+        headers=auth,
+    )
+    assert resp.status_code == 409, resp.text
+    assert "path_owned_by_another_file" in resp.text
+    assert occupier_id in resp.text
+
+    # Both rows survive untouched — no partial write, no 500.
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    by_path = {r["path"]: r for r in listing.json()["files"]}
+    assert by_path["docs/a.md"]["size_bytes"] == len(b"anchored")
+    assert by_path["docs/b.md"]["size_bytes"] == len(b"occupier")
+
+
+def test_preflight_allows_a_stable_id_move_onto_a_free_path(pg_engine, monkeypatch, tmp_path):
+    """Negative control: the ordinary crawler move — same stable id, new path
+    nobody holds — must still succeed and keep the row id."""
+    import io
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+        data={"source_stable_ids": "graph:free", "paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    file_id = first.json()[0]["file_id"]
+
+    moved = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+        data={"source_stable_ids": "graph:free", "paths": "docs/moved/a.md"},
+        headers=auth,
+    )
+    assert moved.status_code == 201, moved.text
+    assert moved.json()[0]["file_id"] == file_id
+    assert moved.json()[0]["path"] == "docs/moved/a.md"
+
+
+def test_content_changed_reupload_on_api_plane_uses_one_ordered_job(pg_engine, monkeypatch, tmp_path):
+    """A content-changed re-upload keeps the row id, and the derived
+    `table_id` is derived from that id — so on a process WITHOUT the worker
+    role, enqueueing a bare derived purge while scheduling `ingest_file`
+    in-process lets the purge land AFTER the rebuild and delete the table it
+    just built. (The replaced delete+insert path was immune: a fresh row id
+    meant a different `table_id`.) The upload path must instead do what
+    `reingest_file` does — ONE `collections-purge` job carrying
+    `reingest_after_purge=True` — and must not run the ingest in-process
+    (Devin Review on #1655)."""
+    import io
+
+    import sqlalchemy as _sa
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.csv", io.BytesIO(b"a,b\n1,2\n"), "text/csv")},
+        data={"paths": "docs/a.csv"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    file_id = first.json()[0]["file_id"]
+
+    # Now pretend this replica has no worker role.
+    import app.roles as roles
+
+    real_role_enabled = roles.role_enabled
+    monkeypatch.setattr(roles, "role_enabled", lambda r: False if r is roles.Role.WORKER else real_role_enabled(r))
+
+    with pg_engine.begin() as conn:
+        conn.execute(_sa.text("DELETE FROM jobs WHERE kind = 'collections-purge'"))
+
+    second = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.csv", io.BytesIO(b"a,b\n3,4\n5,6\n"), "text/csv")},
+        data={"paths": "docs/a.csv"},
+        headers=auth,
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()[0]["file_id"] == file_id  # id preserved, hence same table_id
+
+    import json
+
+    with pg_engine.begin() as conn:
+        jobs = (
+            conn.execute(_sa.text("SELECT payload_json FROM jobs WHERE kind = 'collections-purge' ORDER BY created_at"))
+            .scalars()
+            .all()
+        )
+    payloads = [j if isinstance(j, dict) else json.loads(j) for j in jobs]
+    mine = [p for p in payloads if p.get("file_id") == file_id]
+    assert len(mine) == 1, f"expected exactly one ordered job for this file, got {payloads}"
+    assert mine[0].get("reingest_after_purge") is True, (
+        f"the purge must carry its re-ingest, not race an in-process one: {mine[0]}"
+    )
+
+    # ...and nothing ran in-process: TestClient drains BackgroundTasks, so an
+    # in-process ingest would have moved the row off 'pending'.
+    assert second.json()[0]["processing_status"] == "pending"
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    row = next(r for r in listing.json()["files"] if r["file_id"] == file_id)
+    assert row["processing_status"] == "pending", "ingest must be left to the worker plane's ordered job"
