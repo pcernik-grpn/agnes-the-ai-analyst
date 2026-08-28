@@ -209,6 +209,48 @@ def test_get_or_create_default_idempotent(repo):
     assert len(repo.list_for_user("u1")) == 1
 
 
+def test_the_seeded_default_is_ready_not_a_draft(repo):
+    """The default is the one agent nobody builds — it exists so a fresh
+    instance can be chatted with before anyone opens the builder — so it was
+    never a draft in any sense its readers meant. While it was one, every
+    surface that separates ready agents from unfinished ones (the /agents
+    index, the composer's agent picker) filed the only always-usable agent
+    under drafts, and a picker that offers ready agents only would have
+    dropped it entirely, making a switch away from it one-way.
+    """
+    assert repo.get_or_create_default("u1")["status"] == "ready"
+
+
+def test_a_pre_existing_draft_default_is_promoted_on_first_touch(repo):
+    """Instances seeded before the fix carry `status='draft'` on their
+    default. The DuckDB migration ladder is frozen (A3) and a PG-only Alembic
+    revision would leave DuckDB instances behind, so the repair rides the path
+    every web chat session already takes. Idempotent by construction.
+    """
+    d = repo.get_or_create_default("u1")
+    repo.update(d["id"], status="draft")
+    assert repo.get_by_id(d["id"])["status"] == "draft"
+
+    healed = repo.get_or_create_default("u1")
+    assert healed["id"] == d["id"], "the repair must not seed a second default"
+    assert healed["status"] == "ready"
+    # Persisted, not just patched into the returned dict.
+    assert repo.get_by_id(d["id"])["status"] == "ready"
+    assert len(repo.list_for_user("u1")) == 1
+
+
+def test_a_revived_default_comes_back_ready(repo):
+    """The revive path returns early, so it needs the promotion of its own —
+    otherwise deleting and restoring the default reintroduces the draft."""
+    d = repo.get_or_create_default("u1")
+    repo.update(d["id"], status="draft")
+    repo.soft_delete(d["id"])
+
+    revived = repo.get_or_create_default("u1")
+    assert revived["id"] == d["id"]
+    assert revived["status"] == "ready"
+
+
 def test_get_or_create_default_revives_soft_deleted(repo):
     """A soft-deleted default agent is revived, not re-inserted.
 
@@ -408,6 +450,27 @@ def test_agent_for_scope_item_skips_deleted_agents(repo):
     repo.set_scope("a-gone", [("slack_channel", "C777")])
     repo.soft_delete("a-gone")
     assert repo.agent_for_scope_item("slack_channel", "C777") is None
+
+
+def test_scratch_agents_are_hidden_from_the_owners_list(repo):
+    """`status='scratch'` is the throwaway identity an agent-TEMPLATE preview
+    runs as (app/api/entity_builder.py). It has to be a real row because a
+    chat session runs as an agent id, but it is machinery: listing it would
+    show the owner a thing they did not create and cannot explain.
+
+    Both backends, because the filter is in SQL in each — a fix applied to one
+    is exactly the kind of drift this file exists to catch.
+    """
+    repo.create(id="a-real", owner_user_id="u1", name="Real", slug="real")
+    repo.create(id="a-scratch", owner_user_id="u1", name="Preview", slug="template-preview", status="scratch")
+
+    slugs = {row["slug"] for row in repo.list_for_user("u1")}
+    assert slugs == {"real"}, "a scratch agent leaked into the owner's list"
+
+    # ...but it is still reachable by slug — that is how the preview session
+    # resolves the agent it runs as.
+    found = repo.get_by_slug("u1", "template-preview")
+    assert found is not None and found["id"] == "a-scratch"
 
 
 # ---------------------------------------------------------------------------

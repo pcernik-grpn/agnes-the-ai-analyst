@@ -12,6 +12,16 @@ from typing import Protocol, runtime_checkable
 SANDBOX_WORKDIR = "/work"
 
 
+class SandboxCapacityError(RuntimeError):
+    """A provider with a host-wide sandbox ceiling has reached it.
+
+    Typed rather than a bare ``RuntimeError`` so ChatManager can tell "this
+    host is full — free a slot and retry" apart from "this spawn is broken"
+    (see ``ChatManager._spawn_with_capacity_reclaim``). A ``RuntimeError``
+    subclass so callers that only catch the base class keep working.
+    """
+
+
 def _coerce_to_bytes(data) -> bytes:
     if isinstance(data, bytes):
         return data

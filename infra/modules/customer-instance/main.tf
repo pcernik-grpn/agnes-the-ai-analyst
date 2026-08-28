@@ -153,10 +153,15 @@ locals {
   # D1: studio toggle — same first-boot-seed handoff as theme/experience/
   # home_route above, module-wide (studio_enabled applies uniformly to every
   # VM, mirroring its historical `var.studio_enabled` env behavior). Emitted
-  # only when explicitly false: true is both the Terraform default and the
-  # app's own default, so a non-customized instance's seed stays
-  # byte-for-byte identical to before this change.
-  instance_studio_map = var.studio_enabled ? {} : { enabled = false }
+  # only when explicitly TRUE, and the variable defaults to false: the app's
+  # own default flipped to false when the admin cleanup retired the Studio
+  # surface, so a non-customized instance's seed stays empty — the rule is
+  # "seed nothing when the request matches the app default", and this
+  # condition inverted with that default. Leaving it as
+  # `var.studio_enabled ? {} : {enabled = false}` would have seeded nothing
+  # for an operator asking for `true` and quietly given them a disabled
+  # Studio.
+  instance_studio_map = var.studio_enabled ? { enabled = true } : {}
   # D1 residual (2026-08): `data_source.type` — the last knob still rewritten
   # by an always-wins `.env` line (`DATA_SOURCE=...`) on every boot, which
   # permanently shadowed the admin UI's `/admin/server-config` control of the

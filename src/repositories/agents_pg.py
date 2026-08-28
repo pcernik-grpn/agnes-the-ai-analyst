@@ -172,6 +172,19 @@ class AgentsPgRepository:
         return None
 
     def list_for_user(self, owner_user_id: str) -> List[Dict[str, Any]]:
+        """Every agent this user owns — EXCEPT scratch rows.
+
+        A `status='scratch'` agent is not an agent anyone made; it is the
+        throwaway identity a Preview runs as while someone is authoring an
+        agent TEMPLATE on /skills (see app/api/entity_builder.py). It has to
+        be a real row because a chat session runs as an agent id, but it is
+        machinery, and showing it in the owner's list — or an admin's — would
+        be showing them a thing they cannot explain and did not create.
+
+        Filtered here rather than at the two call sites so a third caller
+        cannot forget. Fetch-by-id and by-slug deliberately still find it:
+        that is how the preview session resolves.
+        """
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -179,6 +192,7 @@ class AgentsPgRepository:
                         """
                     SELECT * FROM agents
                     WHERE owner_user_id = :owner_user_id AND deleted_at IS NULL
+                      AND (status IS NULL OR status <> 'scratch')
                     ORDER BY is_default DESC, name
                     """
                     ),
@@ -256,7 +270,9 @@ class AgentsPgRepository:
 
         Parity sibling of ``src/repositories/agents.py`` — see that docstring
         for why the soft-deleted-default revive and the free-slug fallback
-        exist (a permanent 500 on every web chat session create).
+        exist (a permanent 500 on every web chat session create), and why the
+        default is seeded ``status='ready'`` with an older draft one promoted
+        on first touch instead of by a migration step.
         """
         with self._engine.connect() as conn:
             row = (
@@ -271,7 +287,15 @@ class AgentsPgRepository:
                 .first()
             )
         if row:
-            return dict(row)
+            existing = dict(row)
+            if (existing.get("status") or "") != "ready":
+                with self._engine.begin() as conn:
+                    conn.execute(
+                        sa.text("UPDATE agents SET status = 'ready' WHERE id = :id"),
+                        {"id": existing["id"]},
+                    )
+                existing["status"] = "ready"
+            return existing
 
         with self._engine.begin() as conn:
             stale = conn.execute(
@@ -286,7 +310,7 @@ class AgentsPgRepository:
                 conn.execute(
                     sa.text(
                         "UPDATE agents SET deleted_at = NULL, is_default = TRUE, "
-                        "updated_at = :updated_at WHERE id = :id"
+                        "status = 'ready', updated_at = :updated_at WHERE id = :id"
                     ),
                     {"updated_at": datetime.now(timezone.utc), "id": stale[0]},
                 )
@@ -305,6 +329,7 @@ class AgentsPgRepository:
             memory_mode="all",
             memory_write_mode="propose",
             is_default=True,
+            status="ready",
         )
         result = self.get_by_id(agent_id)
         assert result is not None

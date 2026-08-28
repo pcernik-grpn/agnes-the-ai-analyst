@@ -209,12 +209,22 @@ class TestFirstBootSeedCarriesTheKnobs:
         assert re.search(r"home_route\s*=\s*var\.home_route", block)
 
     def test_instance_studio_map_local_exists(self):
+        """Seeded only when the operator departs from the app's own default.
+
+        The polarity inverted when the admin cleanup flipped `studio.enabled`
+        to false: the map used to be `? {} : {enabled = false}` and is now
+        `? {enabled = true} : {}`. The RULE is unchanged and is what this pins
+        — a non-customized instance's seed stays byte-for-byte unchanged, so
+        the block appears only for an operator who asked for something other
+        than the default. `tests/test_startup_studio_toggle.py` asserts the two
+        defaults agree, which is the half a regex here cannot see.
+        """
         assert re.search(
-            r"instance_studio_map\s*=\s*var\.studio_enabled\s*\?\s*\{\}\s*:\s*\{\s*enabled\s*=\s*false\s*\}",
+            r"instance_studio_map\s*=\s*var\.studio_enabled\s*\?\s*\{\s*enabled\s*=\s*true\s*\}\s*:\s*\{\}",
             MAIN_TF_TEXT,
         ), (
             "instance_studio_map must omit the block entirely when studio_enabled "
-            "is true (the default) so a non-customized instance's seed stays "
+            "is false (the default) so a non-customized instance's seed stays "
             "byte-for-byte unchanged"
         )
 
