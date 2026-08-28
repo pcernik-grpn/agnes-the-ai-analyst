@@ -864,6 +864,27 @@ _EXEMPT: dict[str, str] = {
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
         "admin-only, no analyst CLI/MCP analogue"
     ),
+    # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
+    # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
+    # ontology is consumed as a semantic model, which has its own surface.
+    "/api/admin/ontology/drafts": (
+        "ontology builder draft CRUD (create/list) — admin-only builder UI, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/ontology/drafts/{draft_id}": (
+        "ontology builder draft read/edit/discard — admin-only builder UI, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/ontology/drafts/{draft_id}/import": (
+        "translate a pasted/uploaded ontology into the unsaved draft — admin-only "
+        "builder action, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/ontology/drafts/{draft_id}/save": (
+        "materialize the frozen draft into a semantic model — admin-only builder "
+        "action; the semantic-model surface is where analysts consume it"
+    ),
+    "/api/admin/ontology/dry-run": (
+        "run the draft's types over one document via the server-side LLM — admin-only "
+        "builder preview, no analyst CLI/MCP analogue"
+    ),
     # Open semantic-layer contract (Task 10) — admin CRUD over the
     # semantic-model registry and its sync sources. The public,
     # resource-gated export endpoint carries the triple-surface contract in
