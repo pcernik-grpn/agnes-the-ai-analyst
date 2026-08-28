@@ -94,14 +94,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   alongside the existing `paths` field. A match is tried on
   `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
   as before; either way, the existing `corpus_files` row is now updated IN
-  PLACE — a content-unchanged match (a rename/move) only refreshes
-  filename/path and skips re-chunking entirely, while a changed-content
-  match purges chunks/derived tables and resets `processing_status` on the
-  SAME row. A manual `paths`-only re-upload of a file previously anchored by
-  a stable id now also preserves that row's id, so a hand upload can no
-  longer orphan anything referencing it. The stable-id mapping table is
-  Postgres-only: supplying `source_stable_ids` on a DuckDB-backed instance
-  returns `501`; omitting the field keeps today's flow unchanged.
+  PLACE — a content-unchanged match against an already-`indexed` row (a
+  rename/move) only refreshes filename/path and skips re-chunking entirely,
+  while a changed-content match purges chunks/derived tables and resets
+  `processing_status` on the SAME row. Content-unchanged against a row whose
+  ingest never completed (`rejected`, `needs_review`, or a parked `pending`)
+  counts as a **retry** instead: the row resets to `pending` and ingestion is
+  re-scheduled, so re-uploading the same bytes after fixing the cause works
+  without a separate `…/reingest` call — a row mid-ingest is left alone. A
+  manual `paths`-only re-upload of a file previously anchored by a stable id
+  now also preserves that row's id, so a hand upload can no longer orphan
+  anything referencing it. Two files sharing a non-blank `source_stable_id`
+  in one batch are rejected up front (`400
+  duplicate_source_stable_id_in_batch`), matching the existing
+  `duplicate_path_in_batch` guard — the second would otherwise overwrite the
+  first's row in place and silently drop its bytes. The stable-id mapping
+  table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
+  instance returns `501`; omitting the field keeps today's flow unchanged.
 
 - **Session files are a side drawer that opens itself when a deliverable
   lands.** The Files panel was a modal, which covered the very sentence
