@@ -695,6 +695,10 @@ ai:
 #   # "mandatory_only" — admin controls everything, no user voting
 #   # "admin_curated" — admin controls, users vote as feedback signal
 #   # "hybrid" — mandatory from admin + optional from user voting (default)
+#   #
+#   # NOT YET ENFORCED (#1573): GET /api/memory/bundle currently ships every
+#   # approved item to every user regardless of this value — changing it has
+#   # no effect on distribution yet.
 #   distribution_mode: "hybrid"
 #
 #   # How new AI-extracted items enter the system:
@@ -703,10 +707,17 @@ ai:
 #   # "threshold" — high-confidence auto-publish, low-confidence to review queue
 #   approval_mode: "review_queue"
 #
+#   # Confidence cutoff for approval_mode="threshold" — items scoring >= this
+#   # auto-publish, below it they go to the review queue. Ignored unless
+#   # approval_mode is "threshold". Compare against corporate_memory.confidence.base
+#   # below to pick a realistic cutoff per source type.
+#   auto_publish_min_confidence: 0.80
+#
 #   # Default review period for approved/mandatory items (months)
 #   review_period_months: 6
 #
-#   # Notify km_admins about new pending items
+#   # Notify every Admin-group member's desktop when a collection run
+#   # leaves new items pending review
 #   notify_on_new_items: true
 #
 #   # --- V1 Context Engineering ---

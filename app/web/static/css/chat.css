@@ -385,11 +385,18 @@ body.chat-page-body main { margin: 0; padding: 0; }
      topnav title is the header's only content and gets the full row. */
 }
 
-/* Header actions (Copy transcript). ``margin-left:auto`` pushes them to the
-   trailing edge; ``flex-shrink:0`` keeps the label whole and lets the title's
-   ellipsis absorb the squeeze instead. Under the rail this owns the header's
-   trailing edge outright — the status pill floats below the header and only
-   while something is worth saying. */
+/* Header actions (Files, Copy transcript). ``margin-left:auto`` on the FIRST
+   action pushes the whole group to the trailing edge; ``flex-shrink:0`` keeps
+   the labels whole and lets the title's ellipsis absorb the squeeze instead.
+   Under the rail this owns the header's trailing edge outright — the status
+   pill floats below the header and only while something is worth saying.
+
+   The sibling reset below is load-bearing: the auto margin was written when
+   Copy transcript was the header's only action, and `auto` on EVERY action
+   splits the free space between them instead of pooling it before the group —
+   which left Files stranded mid-header and the pair reading as two unrelated
+   controls (#1611 follow-up). Only the first action may claim the slack; the
+   rest ride the header's own `gap`. */
 .cloud-chat-thread-action {
   margin-left: auto;
   flex: 0 0 auto;
@@ -406,6 +413,7 @@ body.chat-page-body main { margin: 0; padding: 0; }
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease;
 }
+.cloud-chat-thread-action + .cloud-chat-thread-action { margin-left: 0; }
 .cloud-chat-thread-action svg { width: 14px; height: 14px; }
 .cloud-chat-thread-action:hover {
   background: var(--ds-surface-dim);
@@ -2579,8 +2587,97 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   justify-content: flex-end;
 }
 
-/* Session-files dialog (#1611) — list of files the agent generated in this
-   session's workspace, each row with Download + Save-to-Library actions. */
+/* Session-files DRAWER (#1611 follow-up) — docked to the trailing edge so the
+   list and the answer naming the file stay readable together. No backdrop by
+   design: this is a companion panel, not a modal, and the conversation stays
+   scrollable while it is open. */
+.cloud-chat-files-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(380px, 92vw);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--ds-surface);
+  border-left: 1px solid var(--ds-border);
+  box-shadow: var(--ds-shadow-lg);
+  overflow-y: auto;
+}
+.cloud-chat-files-drawer[hidden] { display: none; }
+/* Where there is room, the open drawer PUSHES the conversation instead of
+   sitting on top of it — otherwise it covers the right end of the composer
+   and the reader has to close the panel to type. Below that width there is
+   nothing to push into, so it overlays and the close button is the way out. */
+@media (min-width: 1100px) {
+  body.chat-files-open .cloud-chat-main { padding-right: 380px; }
+}
+.cloud-chat-files-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.cloud-chat-files-drawer-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--font-semibold);
+  color: var(--ds-text-primary);
+}
+.cloud-chat-files-drawer-close {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--ds-text-muted);
+  font-size: var(--text-sm);
+  line-height: 1;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.cloud-chat-files-drawer-close:hover {
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-primary);
+}
+.cloud-chat-files-drawer-close:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+.cloud-chat-files-drawer-desc {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
+  line-height: 1.5;
+}
+.cloud-chat-files-drawer-desc a { color: var(--ds-primary); }
+.cloud-chat-files-drawer-foot {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: var(--space-2);
+}
+
+/* Count on the header button — how many files the drawer would show. */
+.cloud-chat-files-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-primary);
+  color: var(--ds-text-inverse);
+  font-size: 11px;
+  font-weight: var(--font-semibold);
+  line-height: 1;
+}
+.cloud-chat-files-badge[hidden] { display: none; }
+
+/* Rows inside the drawer — each with Download + Save-to-Library actions. */
 .cloud-chat-files-status {
   font-size: var(--text-sm);
   color: var(--ds-text-secondary);
@@ -2866,6 +2963,23 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-messages {
 html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main > #chat-form {
   position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
   margin: 0 auto var(--space-4);
+}
+/* …and inside a live thread the composer is absolutely positioned against the
+   shell, not the main column, so the column's padding cannot move it — the
+   open drawer would sit on top of the input. Pull its trailing edge in by the
+   drawer's width instead (same 1100px floor as the padding rule: below it the
+   drawer overlays and there is nothing to make room in). */
+@media (min-width: 1100px) {
+  html[data-ui-layout="rail"] body.chat-files-open .cloud-chat-shell.has-thread .cloud-chat-main > #chat-form {
+    right: 380px;
+    /* `left: 0` + the reading-width `max-width` + `right` is over-constrained,
+       and CSS resolves that by DROPPING `right` — the composer kept its full
+       880px and stayed under the drawer. Releasing the cap lets the width
+       resolve from the left/right pair instead, so the composer shrinks into
+       the band the drawer leaves rather than hiding behind it. */
+    max-width: 100%;
+    width: auto;
+  }
 }
 html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::before,
 html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::after {

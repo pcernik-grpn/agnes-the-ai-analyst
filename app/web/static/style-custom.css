@@ -2445,7 +2445,7 @@ footer {
 
 /* Next step card */
 .next-step-card {
-    background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+    background: var(--ds-accent-info-bg);
     border: 1px solid var(--primary);
     border-left: 3px solid var(--primary);
 }
@@ -2886,9 +2886,13 @@ a.slack-badge:hover {
 }
 
 .notif-channel-icon.telegram {
-    background: #e3f2fd;
+    background: var(--ds-accent-info-bg);
 }
 
+/* No --ds-* token represents a neutral violet without borrowing
+   --ds-kind-agent (entity-kind semantic) or --ds-readonly (sharing-state
+   semantic) — see the raw-hex allowlist note in
+   tests/test_design_system_contract.py (#1625). Left as raw hex. */
 .notif-channel-icon.desktop {
     background: #f3e8ff;
 }
@@ -4455,9 +4459,13 @@ a.app-header-logo:focus-visible {
     margin: 12px 0;
 }
 .callout-info    { border-left-color: var(--primary); background: var(--primary-light); }
-.callout-warn    { border-left-color: #C2410C; background: #FED7AA; }
-.callout-success { border-left-color: #047857; background: #D1FAE5; }
-.callout-danger  { border-left-color: #B91C1C; background: #FEE2E2; }
+/* warn/success/danger backgrounds ride the --ds-accent-* family (dark-theme
+   safe) instead of raw hex; ink flips alongside so the pair stays readable
+   under dark (#1625) — the border-left accent stays the pre-existing literal,
+   it is decorative and not a text/background contrast pair. */
+.callout-warn    { border-left-color: #C2410C; background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+.callout-success { border-left-color: #047857; background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+.callout-danger  { border-left-color: #B91C1C; background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
 .callout > :first-child { margin-top: 0; }
 .callout > :last-child  { margin-bottom: 0; }
 
@@ -4524,7 +4532,12 @@ a.news-cta:hover { background: #0056A3; }
    Anything inside the long-form body needs these refinements; they
    would over-style chrome elsewhere on the site so we scope them. */
 
-.news-content { font-size: 15px; line-height: 1.6; color: #111827; }
+/* Every color below is a --ds-* token (#1625): .news-content renders inside
+   .news-card, whose background is var(--surface) and DOES flip under dark
+   theme, so a literal ink here (e.g. the previous `color: #111827`) went
+   invisible the moment the card flipped — measured at 1.16:1 on the dark
+   surface, the exact bug class this file is being swept for. */
+.news-content { font-size: 15px; line-height: 1.6; color: var(--ds-text-primary); }
 .news-content h1 { font-size: 24px; margin: 24px 0 12px; line-height: 1.25; }
 .news-content h2 { font-size: 20px; margin: 22px 0 10px; line-height: 1.3; }
 .news-content h3 { font-size: 17px; margin: 18px 0 8px; }
@@ -4533,12 +4546,12 @@ a.news-cta:hover { background: #0056A3; }
 .news-content ol { margin: 0 0 12px 24px; }
 .news-content li { margin: 4px 0; }
 .news-content blockquote {
-    border-left: 4px solid #E5E7EB;
+    border-left: 4px solid var(--ds-border);
     padding: 6px 16px;
     margin: 14px 0;
-    color: #4B5563;
+    color: var(--ds-text-secondary);
     font-style: italic;
-    background: #F9FAFB;
+    background: var(--ds-surface-dim);
     border-radius: 0 6px 6px 0;
 }
 
@@ -4548,13 +4561,16 @@ a.news-cta:hover { background: #0056A3; }
    the light background from the inline rule, producing the
    "yellow-on-silver" unreadable combo. */
 .news-content code {
-    background: #F3F4F6;
-    color: #0F172A;
+    background: var(--ds-surface-dim);
+    color: var(--ds-text-primary);
     padding: 1px 6px;
     border-radius: 4px;
     font-family: var(--font-mono);
     font-size: 13px;
 }
+/* .news-content pre stays a deliberate always-dark code panel (like the
+   /home terminal mock) — navy bg + amber ink, legible under every theme
+   without flipping, so it is not part of the #1625 sweep. */
 .news-content pre {
     background: #0F172A;
     color: #FBBF24;
@@ -4580,30 +4596,31 @@ a.news-cta:hover { background: #0056A3; }
     border-collapse: collapse;
     margin: 14px 0;
     font-size: 14px;
-    background: white;
-    border: 1px solid #E5E7EB;
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
     border-radius: 8px;
     overflow: hidden;
 }
-.news-content thead { background: #F9FAFB; }
+.news-content thead { background: var(--ds-surface-dim); }
 .news-content th {
     text-align: left;
     padding: 10px 14px;
     font-weight: 600;
-    color: #374151;
-    border-bottom: 1px solid #E5E7EB;
+    color: var(--ds-text-secondary);
+    border-bottom: 1px solid var(--ds-border);
 }
 .news-content td {
     padding: 10px 14px;
-    border-bottom: 1px solid #F3F4F6;
+    border-bottom: 1px solid var(--ds-border-light);
     vertical-align: top;
 }
 .news-content tbody tr:last-child td { border-bottom: none; }
-.news-content tbody tr:hover { background: #F9FAFB; }
+.news-content tbody tr:hover { background: var(--ds-surface-dim); }
 .news-content table code {
-    /* Inline code inside table cells reads better with a slightly
-       lighter background than the page default. */
-    background: #EEF2F7;
+    /* Same tint as the inline-code pill above — the original's slightly
+       lighter #EEF2F7 vs #F3F4F6 was a marginal, unintentional-looking
+       difference not worth a second token. */
+    background: var(--ds-surface-dim);
 }
 
 /* Reusable hero block — blue gradient, eyebrow + title + lead.
@@ -4828,7 +4845,7 @@ a.news-cta:hover { background: #0056A3; }
 }
 
 .btn-danger {
-    background-color: #fff;
+    background-color: var(--surface);
     color: var(--error);
     border: 1px solid var(--error);
 }
@@ -6024,7 +6041,14 @@ details.section-card > summary {
 
 /* Group chip — semantic role pill used on /me/profile and /admin/users.
    Name-match wins: Admin/Everyone keep their canonical color even when
-   their server-side origin is google_sync. */
+   their server-side origin is google_sync.
+
+   is-admin/is-everyone/is-google_sync ride the --ds-accent-* and
+   --ds-border-light family (dark-theme safe, #1625). The base + is-custom violet pair is left
+   as raw hex on purpose: no --ds-* token represents a neutral "other/custom
+   group" violet without borrowing --ds-kind-agent (entity-kind semantic) or
+   --ds-readonly (sharing-state semantic) — either would misattribute meaning.
+   See the allowlist note in tests/test_design_system_contract.py. */
 .group-chip {
     display: inline-block;
     padding: 3px 10px;
@@ -6034,9 +6058,9 @@ details.section-card > summary {
     background: #ede9fe;
     color: #6d28d9;
 }
-.group-chip.is-admin       { background: #fef3c7; color: #92400e; font-weight: 600; }
-.group-chip.is-everyone    { background: #f3f4f6; color: #4b5563; }
-.group-chip.is-google_sync { background: #dcfce7; color: #166534; }
+.group-chip.is-admin       { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); font-weight: 600; }
+.group-chip.is-everyone    { background: var(--ds-border-light); color: var(--ds-text-secondary); }
+.group-chip.is-google_sync { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
 .group-chip.is-custom      { background: #ede9fe; color: #6d28d9; }
 
 /* =====================================================

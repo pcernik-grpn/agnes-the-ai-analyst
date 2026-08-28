@@ -199,6 +199,15 @@ def diagnose(
     if ctx.invoked_subcommand is not None:
         return
 
+    # #1312 (remaining scope, item 3): `diagnose` never named the workspace
+    # it inspected anywhere, even though `_local_delivery_check` below
+    # already resolves and reads one internally. Resolved the same way the
+    # data commands do (`resolve_data_workspace()` — AGNES_LOCAL_DIR
+    # override → cwd if workspace-shaped → the anchored workspace_root),
+    # not the push/session anchor `get_workspace_root()` used a few checks
+    # down — the two are deliberately different resolvers.
+    workspace = resolve_data_workspace()
+
     checks = []
     # ``caller_role`` is present only on servers shipping the
     # role-aware health fields (issue #345 B). Legacy servers don't
@@ -350,6 +359,9 @@ def diagnose(
             )
 
     result = {
+        # #1312 — the workspace this run inspected (None when nothing
+        # resolves — no AGNES_LOCAL_DIR, cwd unshaped, no anchor).
+        "workspace": str(workspace) if workspace is not None else None,
         "overall": overall,
         "caller_role": caller_role,
         "checks": checks,
@@ -359,6 +371,7 @@ def diagnose(
     if as_json:
         typer.echo(json.dumps(result, indent=2))
     else:
+        typer.echo(f"Workspace: {workspace if workspace is not None else 'none found — run `agnes init` first'}")
         # When analysts are filtered to analyst-only aggregation, surface
         # any operator-side warnings as a secondary line so they're not
         # invisible — they just don't get to drive the headline.

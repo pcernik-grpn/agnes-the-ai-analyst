@@ -1547,6 +1547,18 @@ async function openSession(chatId, wsUrlOverride) {
   const _switchingSession = currentChatId !== chatId;
   currentChatId = chatId;
   markActiveSidebar(chatId);
+  // The session-files drawer keeps per-conversation state — the count badge,
+  // the rendered rows (whose download links carry a chat id), and the
+  // baseline of deliverables the auto-open compares against. Nothing else
+  // told it the conversation changed, so it kept announcing the previous
+  // chat's numbers until a turn landed here, and it had to guess its own
+  // baseline lazily on the first turn-end — too late to notice that turn's
+  // own deliverable. This is the only place a non-null currentChatId is
+  // assigned, so it is the one honest signal. Fired for a re-open too: a
+  // reconnect is not a new conversation, but the listing may have moved on.
+  document.dispatchEvent(
+    new CustomEvent("agnes:session-open", { detail: { chatId, switching: _switchingSession } })
+  );
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
@@ -1782,6 +1794,12 @@ function handleFrame(frame) {
       $("cancel-btn").hidden = true;
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
+      // The session-files block listens for this to refresh its count and to
+      // surface a deliverable the turn just wrote (see §6). A CustomEvent
+      // rather than a direct call: that block is a separate IIFE with no
+      // exported handle, and the frame switch should not grow a dependency
+      // on it.
+      document.dispatchEvent(new CustomEvent("agnes:turn-end"));
       break;
     case "session_participants":
       // §5.3 Co-presence: full re-render of the participant roster.
@@ -5387,7 +5405,6 @@ function renderCoPresence(host, participants) {
   // (POST .../files/save-artefact). Rows are built with createElement +
   // textContent — file names/paths are agent-chosen strings, never innerHTML.
 
-  const FILES_OVERLAY = "chat-files-overlay";
   const filesListEl = $("chat-files-list");
   const filesStatusEl = $("chat-files-status");
   const filesErrorEl = $("chat-files-error");
@@ -5414,7 +5431,10 @@ function renderCoPresence(host, participants) {
     name.title = f.path;
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
-    hint.textContent = f.path + " · " + fmtSize(f.size_bytes) + " · " + fmtWhen(f.modified_at);
+    // Engine listings carry no mtime (modified_at is null) — skip the segment
+    // rather than render the epoch.
+    hint.textContent =
+      f.path + " · " + fmtSize(f.size_bytes) + (f.modified_at ? " · " + fmtWhen(f.modified_at) : "");
     meta.appendChild(name);
     meta.appendChild(hint);
 
@@ -5482,13 +5502,10 @@ function renderCoPresence(host, participants) {
     return li;
   }
 
-  async function loadSessionFiles() {
-    if (!filesListEl) return;
-    const chatId = currentChatId;
-    if (!chatId) return;
-    clearDialogError(filesErrorEl);
-    setFilesStatus("Loading…");
-    filesListEl.replaceChildren();
+  /** Fetch the listing. Returns the file array (empty on failure — callers
+   *  that run unattended, like the turn-end check, must not surface an error
+   *  banner for a background poll). */
+  async function fetchSessionFiles(chatId, { quiet = false } = {}) {
     try {
       const res = await fetch(
         "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files",
@@ -5496,19 +5513,106 @@ function renderCoPresence(host, participants) {
       );
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
-      const files = data.files || [];
-      if (!files.length) {
-        setFilesStatus(
-          "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
-        );
-        return;
-      }
-      setFilesStatus(data.truncated ? "Showing the most recent files only." : "");
-      files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+      // `supported: false` is an engine-backed session (kai-agent) whose
+      // engine exposes no files channel for this chat. Carried through as a
+      // flag rather than rendered here: this function is also the unattended
+      // turn-end poll, which must not paint into the drawer.
+      return {
+        files: data.files || [],
+        truncated: !!data.truncated,
+        supported: data.supported !== false,
+        ok: true,
+      };
     } catch (err) {
-      setFilesStatus("");
-      showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+      if (!quiet) showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+      return { files: [], truncated: false, supported: true, ok: false };
     }
+  }
+
+  function renderFileList(chatId, files, truncated, supported = true) {
+    if (!filesListEl) return;
+    filesListEl.replaceChildren();
+    if (!supported) {
+      // Engine-backed session whose engine has no files channel — an honest
+      // notice, not an empty list that reads as "your agent produced nothing".
+      setFilesStatus(
+        "Files for this conversation live in the engine's sandbox, and the engine connected " +
+          "to this instance doesn't expose them yet. Ask the assistant to include the content " +
+          "in its reply, or ask your operator about an engine upgrade."
+      );
+      return;
+    }
+    if (!files.length) {
+      setFilesStatus(
+        "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
+      );
+      return;
+    }
+    setFilesStatus(truncated ? "Showing the most recent files only." : "");
+    files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+  }
+
+  function updateFilesBadge(count) {
+    const badge = $("chat-files-count");
+    if (!badge) return;
+    badge.textContent = String(count);
+    badge.hidden = count === 0;
+  }
+
+  async function loadSessionFiles() {
+    if (!filesListEl) return;
+    const chatId = currentChatId;
+    if (!chatId) return;
+    clearDialogError(filesErrorEl);
+    setFilesStatus("Loading…");
+    filesListEl.replaceChildren();
+    const seq = ++_filesSeq;
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId);
+    // Third writer of the auto-open baseline, and it must claim the sequence
+    // like the other two: an open-time seed still in flight would otherwise
+    // land on top of what the user is looking at right now. The guard comes
+    // BEFORE the render, not just before the baseline write — painting rows
+    // for a conversation the user has since left puts that conversation's
+    // download links under their cursor.
+    if (seq !== _filesSeq || currentChatId !== chatId) return;
+    if (!ok) {
+      // A failed listing knows nothing, so it must not be written into the
+      // baseline: `files` is `[]` on failure, and adopting that would make
+      // the next turn re-report every pre-existing deliverable as fresh and
+      // pop the drawer over the reader. fetchSessionFiles has already
+      // surfaced the error banner (this path is not quiet); just retire the
+      // "Loading…" line and leave what we knew before intact.
+      setFilesStatus("");
+      return;
+    }
+    renderFileList(chatId, files, truncated, supported);
+    updateFilesBadge(files.length);
+    _filesSessionId = chatId;
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    _baselineKnown = true;
+  }
+
+  // ── drawer open/close ─────────────────────────────────────────────────────
+
+  const drawer = $("chat-files-drawer");
+
+  function drawerOpen() {
+    return drawer && !drawer.hidden;
+  }
+
+  function openFilesDrawer() {
+    if (!drawer) return;
+    drawer.hidden = false;
+    document.body.classList.add("chat-files-open");
+    if (filesBtn) filesBtn.setAttribute("aria-expanded", "true");
+    loadSessionFiles();
+  }
+
+  function closeFilesDrawer() {
+    if (!drawer) return;
+    drawer.hidden = true;
+    document.body.classList.remove("chat-files-open");
+    if (filesBtn) filesBtn.setAttribute("aria-expanded", "false");
   }
 
   const filesBtn = $("chat-session-files");
@@ -5518,13 +5622,129 @@ function renderCoPresence(host, participants) {
         showToast("Open a conversation first", "error");
         return;
       }
-      openOverlay(FILES_OVERLAY);
-      loadSessionFiles();
+      if (drawerOpen()) { closeFilesDrawer(); return; }
+      openFilesDrawer();
     });
   }
+  const filesCloseBtn = $("chat-files-close");
+  if (filesCloseBtn) filesCloseBtn.addEventListener("click", closeFilesDrawer);
   const filesRefreshBtn = $("chat-files-refresh");
   if (filesRefreshBtn) filesRefreshBtn.addEventListener("click", loadSessionFiles);
-  wireCloseButtons(FILES_OVERLAY);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && drawerOpen()) {
+      closeFilesDrawer();
+      if (filesBtn) filesBtn.focus();
+    }
+  });
+
+  // ── open by itself when a turn lands a deliverable ────────────────────────
+  // Only for files under `outputs/` — the directory the workspace prompt
+  // reserves for things meant FOR the user. An agent touches plenty of other
+  // files mid-task (scratch, a script it wrote to run once); popping a panel
+  // for those would interrupt the read for something nobody asked to see.
+  // Anything else only moves the count on the button.
+
+  const OUTPUTS_PREFIX = "outputs/";
+  let _knownOutputs = new Set();
+  // Two different questions, and conflating them was a bug: `_filesSessionId`
+  // is which conversation the drawer is BOUND to (claimed synchronously, so
+  // the badge/row reset can happen before the listing round-trip), while
+  // `_baselineKnown` is whether `_knownOutputs` actually reflects it. A seed
+  // that failed or was superseded leaves the drawer bound but ignorant — and
+  // an ignorant baseline reports every pre-existing file as fresh.
+  let _filesSessionId = null;
+  let _baselineKnown = false;
+  // Bumped by every baseline write. Two fetches for the same conversation can
+  // be in flight at once (the open-time seed and a turn-end poll), and they
+  // can land out of order; without this, a slow seed overwrites the newer
+  // turn-end baseline and the next turn re-reports files as fresh.
+  let _filesSeq = 0;
+
+  function isDeliverable(f) {
+    return typeof f.path === "string" && f.path.startsWith(OUTPUTS_PREFIX);
+  }
+
+  // The baseline is established when the conversation OPENS. Deriving it
+  // lazily from the first turn-end could not work: that listing is fetched
+  // AFTER the turn ran, so the turn's own deliverable was already in the
+  // baseline it seeded, and the first turn of a conversation — much the
+  // commonest way to get a deliverable — could never auto-open the drawer.
+  // Doing it here also retires the stale badge/rows a switch used to leave
+  // behind.
+  document.addEventListener("agnes:session-open", async (e) => {
+    const detail = e.detail || {};
+    const chatId = detail.chatId || currentChatId;
+    if (!chatId) return;
+    // A RE-open of the same conversation is not a switch. `ensureWsReady`
+    // re-enters openSession whenever the socket is closed, so this fires
+    // mid-turn on a reconnect — and folding the listing into the baseline
+    // there would absorb a deliverable written while the socket was down as
+    // "already seen", leaving the turn-end that follows with nothing fresh
+    // and the drawer shut. Nothing about the conversation changed, and the
+    // turn-end poll refreshes the view after every turn, so the honest
+    // response to a reconnect is to do nothing at all.
+    if (detail.switching === false && _filesSessionId === chatId && _baselineKnown) return;
+    // Reset synchronously, before the round-trip: until it lands the badge
+    // and any open drawer would otherwise still show the previous
+    // conversation's count and rows, whose links carry the old chat id.
+    const seq = ++_filesSeq;
+    _filesSessionId = chatId;
+    _knownOutputs = new Set();
+    _baselineKnown = false;
+    updateFilesBadge(0);
+    if (drawerOpen() && filesListEl) {
+      filesListEl.replaceChildren();
+      setFilesStatus("Loading…");
+    }
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    // A newer switch (or a turn-end baseline) landed while this was in
+    // flight — that one owns the state now.
+    if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    _baselineKnown = true;
+    updateFilesBadge(files.length);
+    if (drawerOpen()) renderFileList(chatId, files, truncated, supported);
+  });
+
+  document.addEventListener("agnes:turn-end", async () => {
+    const chatId = currentChatId;
+    if (!chatId) return;
+    // Defensive only: agnes:session-open seeds the baseline for every
+    // conversation before a turn can end in it. If some future path reaches a
+    // turn-end with no baseline at all, re-seed rather than treat every
+    // pre-existing file as new — a spurious auto-open on someone else's old
+    // files is worse than one missed.
+    if (_filesSessionId !== chatId || !_baselineKnown) {
+      const seq = ++_filesSeq;
+      const seed = await fetchSessionFiles(chatId, { quiet: true });
+      // Same ok/ownership rules as the other two writers. Nothing is
+      // assigned until the listing actually succeeds: claiming the session
+      // with an empty baseline would make the NEXT turn read every
+      // pre-existing file as fresh — the spurious auto-open this branch
+      // exists to avoid — and would stop this branch from retrying.
+      if (!seed.ok || seq !== _filesSeq || currentChatId !== chatId) return;
+      _filesSessionId = chatId;
+      _knownOutputs = new Set(seed.files.filter(isDeliverable).map((f) => f.path));
+      _baselineKnown = true;
+      updateFilesBadge(seed.files.length);
+      return;
+    }
+    const seq = ++_filesSeq;
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    // Same in-flight guard as the seed above: a slower open-time fetch must
+    // not overwrite this newer baseline, or the next turn re-reports these
+    // same files as fresh.
+    if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
+    updateFilesBadge(files.length);
+    const fresh = files.filter(isDeliverable).filter((f) => !_knownOutputs.has(f.path));
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    if (!fresh.length) return;
+    if (drawerOpen()) {
+      renderFileList(chatId, files, truncated, supported);
+      return;
+    }
+    openFilesDrawer();
+  });
 
 })();
 
