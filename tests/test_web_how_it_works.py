@@ -13,11 +13,12 @@ The connector content is not *summarized* here, it LIVES here. That is the
 point: two pages both explaining "how do I connect" had already drifted
 ("Four places" vs. six tool tabs), and a summary drifts by construction.
 
-The eight section anchors are a PUBLIC CONTRACT — the chat landing's "Take
-Agnes to your tools" door, the rail's "Use Agnes elsewhere" row, the onboarding
-checklist's "Use Agnes from other AI tools" step, the tour's "Connect my AI
-tools" button, and every redirected /me/ai-connector bookmark all point into
-them.
+The eight section anchors are a PUBLIC CONTRACT. Four surfaces point into
+#connect under ONE label — "Take {brand} to your tools": the chat landing's
+door, the rail's foot row, the onboarding checklist's step and the tour's
+closing button (first person there, "to my tools"). The Library connect banner
+and /home use the same phrase on their CTAs, and every redirected
+/me/ai-connector bookmark lands here too.
 """
 
 from __future__ import annotations

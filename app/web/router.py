@@ -1283,11 +1283,11 @@ async def how_it_works_page(
     from app.services.journey import mark_journey
     from src.repositories import mcp_sources_repo
 
-    # "Use Agnes outside this tab" is earned by ARRIVING here — this page is where
+    # "Take Agnes to your tools" is earned by ARRIVING here — this page is where
     # every connector lives, and it is the checklist row's own destination. The
     # row used to tick itself the instant it was clicked, before the reader had
-    # seen anything; the tour's "Connect my AI tools" button already marks it the
-    # same way (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
+    # seen anything; the tour's closing button already marks it the same way
+    # (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
     # app/services/journey.py) — a bookkeeping write must never fail a render.
     mark_journey(user.get("id"), use_anywhere=True)
 

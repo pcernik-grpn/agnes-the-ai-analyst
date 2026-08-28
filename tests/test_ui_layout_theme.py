@@ -759,14 +759,14 @@ class TestRailChatHistory:
         assert "Get started" not in text
         assert "rail-getstarted-check" not in text
         # The row lives in the FOOT — the zone that survives collapse — under
-        # "Use Agnes elsewhere" and above the profile. It is not part of the
+        # "Take Agnes to your tools" and above the profile. It is not part of the
         # nav proper: setup is a thing you finish and stop seeing, so it sits
         # with the other always-reachable rows rather than among destinations.
         foot = text.split('class="rail-foot"', 1)[1]
         row_pos = foot.find('class="rail-getstarted"')
         assert row_pos != -1, "the onboarding row belongs in the rail foot"
         assert foot.find('href="/how-it-works#connect"') < row_pos < foot.find('id="userMenu"'), (
-            "the onboarding row belongs under 'Use Agnes elsewhere', above the profile"
+            "the onboarding row belongs under 'Take Agnes to your tools', above the profile"
         )
         # …and nothing left it behind in the collapsible nav above.
         assert "rail-getstarted" not in text.split('class="rail-foot"', 1)[0]

@@ -155,7 +155,7 @@ export const TOURS = {
       centered: true,
       finalChoice: true,
       title: 'That\'s the tour',
-      desc: 'Ask questions, add what\'s missing, share what works. Want the same company knowledge in Claude Code, Cursor, and VS Code? Use Connect my AI tools below.',
+      desc: 'Ask questions, add what\'s missing, share what works. Want the same company knowledge in Claude Code, Cursor, and VS Code? Use Take Agnes to my tools below.',
       points: [],
     },
   ],
@@ -326,7 +326,7 @@ function getPending() {
 //     left the checklist ticking a step the user had not done, two rows below
 //     one they had (see STEP_KEYS in chat_onboarding.js for the ordering half
 //     of that same bug);
-//   • `use_anywhere`: the final step OFFERS "Connect my AI tools" but finishing
+//   • `use_anywhere`: the final step OFFERS "Take Agnes to my tools" but finishing
 //     the tour is not the same as having connected one. The button itself marks
 //     it — see markUseAnywhereDone.
 async function markTourStepsDone() {
@@ -339,8 +339,8 @@ async function markTourStepsDone() {
   } catch (_) { /* fire-and-forget — onboarding is soft state */ }
 }
 
-// Mark the "Use Agnes from other AI tools" step — fired when the final step's
-// "Connect my AI tools" button navigates to the connect section.
+// Mark the "Take Agnes to your tools" step — fired when the final step's
+// "Take Agnes to my tools" button navigates to the connect section.
 async function markUseAnywhereDone() {
   try {
     // keepalive: the one call site fires this immediately before a full-page
@@ -868,7 +868,7 @@ function _buildPopover(step, index, total) {
   actions.className = 'tour-actions';
 
   if (step.finalChoice) {
-    // Final step: Back · Finish onboarding · Connect my AI tools
+    // Final step: Back · Finish onboarding · Take Agnes to my tools
     const backBtn = document.createElement('button');
     backBtn.type = 'button';
     backBtn.className = 'tour-btn tour-btn-back';
@@ -890,22 +890,26 @@ function _buildPopover(step, index, total) {
     const connectBtn = document.createElement('button');
     connectBtn.type = 'button';
     connectBtn.className = 'tour-btn tour-btn-connect';
-    connectBtn.textContent = 'Connect my AI tools';
+    // First person because this button is the reader's own choice at the end
+    // of the tour; everywhere else the same route is labelled "Take {brand} to
+    // your tools". Same phrase, same direction — only the pronoun follows the
+    // voice of the surface it sits on.
+    connectBtn.textContent = 'Take Agnes to my tools';
     connectBtn.addEventListener('click', () => {
       markSeen(_active ? _active.id : 'welcome');
       // Navigating to the connect section is exactly what the journey panel's
-      // "Use Agnes from other AI tools" step does, and that step marks itself
+      // "Take Agnes to your tools" step does, and that step marks itself
       // done on click — mirror it so the same action doesn't behave two ways.
       // Fire-and-forget: the navigation below must not wait on it.
       markUseAnywhereDone();
       _endTour(true);
       // /how-it-works#connect is the per-tool MCP guide (Claude Code · Cursor ·
       // VS Code · …) that matches this button's intent — the same destination
-      // the chat landing's "Take Agnes to your tools" door and the rail's "Use
-      // Agnes elsewhere" row point at. It was the standalone /me/ai-connector
-      // page until that was absorbed into the consolidated orientation page,
-      // which still 302s here. /setup is the narrower CLI-install page, reached
-      // from getting-started, not from here.
+      // the chat landing's door, the rail's row and the onboarding checklist's
+      // step point at, under the same label. It was the standalone
+      // /me/ai-connector page until that was absorbed into the consolidated
+      // orientation page, which still 302s here. /setup is the narrower
+      // CLI-install page, reached from getting-started, not from here.
       window.location.href = '/how-it-works#connect';
     });
 
