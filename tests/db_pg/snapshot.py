@@ -18,6 +18,7 @@ Intentionally NOT covered (yet):
     sequence names per-revision adds noise without catching real drift)
   - functions / triggers (Agnes doesn't use them today)
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -59,9 +60,17 @@ def _table_snapshot(inspector, table: str) -> Dict[str, Any]:
 
     indexes: List[Dict[str, Any]] = []
     for idx in inspector.get_indexes(table, schema="public") or []:
+        # A functional/expression index (e.g. a COALESCE(...) element) has
+        # ``None`` at that position in ``column_names``; the PG dialect
+        # aligns a parallel ``expressions`` list with the raw SQL text for
+        # every element (plain columns included), so fall back to it
+        # per-position instead of sorting a list that mixes str and None.
+        raw_cols = idx.get("column_names") or []
+        exprs = idx.get("expressions") or raw_cols
+        names = [c if c is not None else e for c, e in zip(raw_cols, exprs)]
         indexes.append(
             {
-                "columns": sorted(idx.get("column_names") or []),
+                "columns": sorted(names),
                 "unique": bool(idx.get("unique")),
             }
         )

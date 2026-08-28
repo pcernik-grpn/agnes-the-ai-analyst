@@ -1284,6 +1284,62 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   overflow: auto;
 }
 
+/* fact_claims tool result — quote + document, not a JSON dump (design doc
+   §13.2 "Chat"). */
+.cloud-chat-fact-claims-note {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--ds-text-muted);
+}
+.cloud-chat-fact-claims-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cloud-chat-fact-claim {
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: var(--radius-sm);
+}
+.cloud-chat-fact-claim-quote {
+  margin: 0;
+  padding: 0 0 0 var(--space-2);
+  border-left: 2px solid var(--ds-border);
+  font-size: var(--text-sm, 0.85rem);
+  font-style: italic;
+  color: var(--ds-text-primary);
+}
+.cloud-chat-fact-claim-quote > :first-child { margin-top: 0; }
+.cloud-chat-fact-claim-quote > :last-child { margin-bottom: 0; }
+.cloud-chat-fact-claim-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--ds-text-muted);
+}
+.cloud-chat-fact-claim-source {
+  color: var(--ds-primary);
+  text-decoration: none;
+}
+.cloud-chat-fact-claim-source:hover { text-decoration: underline; }
+
+/* End-of-turn facts scope line — same voice as .msg-sources above (a hairline
+   trailer, not a banner), one plain sentence instead of chips: there is
+   nothing per-item to verify here, only a caller-scoped honesty statement. */
+.msg-facts-scope {
+  margin: var(--space-2) 0 0;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--ds-border-light, var(--ds-border));
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
+}
+
 /* ============================================================ composer
    ChatGPT-style "card" form: a single rounded rectangle wrapping
    textarea + send button. The wrapper owns the focus ring so the

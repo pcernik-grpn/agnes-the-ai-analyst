@@ -134,6 +134,10 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     # source table at all (see GenericCopyTask's "table absent in DuckDB"
     # handling); PK is the mapped corpus_files.id, not a generated "id".
     "corpus_file_sources": ["corpus_file_id"],
+    # fact-graph facts tables (0076) — likewise PG-only with no DuckDB
+    # source; registered here so validate() never falls back to SELECT id.
+    "fact_aliases": ["type", "natural_key"],
+    "corrections": ["subject_kind", "subject_id"],
 }
 
 

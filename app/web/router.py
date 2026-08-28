@@ -1732,6 +1732,26 @@ def _data_package_entry_dict(
     return out
 
 
+def _facts_repo_if_available() -> Optional[Any]:
+    """The facts repo when the ``facts`` feature flag is on AND the active
+    backend is Postgres, else ``None`` — the single "is the facts UI even
+    reachable" gate every facts-aware web surface uses (spec §13.2: "flag
+    off / DuckDB backend / zero facts -> the section simply absent, no
+    error, no empty shell"). Swallows ``RequiresPostgresBackend`` (frozen
+    DuckDB app-state) and any other resolution error so a facts-adjacent
+    page never 500s over what is, this round, an optional surface."""
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return None
+    try:
+        from src.repositories import facts_repo
+
+        return facts_repo()
+    except Exception:
+        return None
+
+
 # ── Unified catalog-card normalizers ─────────────────────────────────
 # Adapt an entry dict -> the single `c` contract consumed by the reusable
 # catalog_card() macro (templates/macros/_catalog_card.html) and its JS
@@ -1751,8 +1771,16 @@ def _catalog_card_upload(c: dict) -> dict:
       ``N files`` meta, label "Collection").
 
     Artefacts aren't stack-toggled (they're owned files); the action opens the
-    detail page, where adding a second file promotes a File into a Collection."""
+    detail page, where adding a second file promotes a File into a Collection.
+
+    ``fact_count`` (spec §13.2 "Library" — a collection card reads "N files ·
+    M facts"), when > 0, is appended to the meta line on both branches. It is
+    the caller-scoped `facts` count the route already computed via
+    `count_visible_facts_for_collection` (feature-flagged, PG-only, absent
+    entirely when there are no facts) — never re-derived here."""
     n = c.get("file_count", 0) or 0
+    fact_count = c.get("fact_count", 0) or 0
+    fact_suffix = f" · {fact_count} fact{'s' if fact_count != 1 else ''}" if fact_count else ""
     ff = c.get("first_file") or None
     if n == 1 and ff:
         size = _human_size(ff.get("size_bytes") or 0)
@@ -1761,7 +1789,7 @@ def _catalog_card_upload(c: dict) -> dict:
         # filename — otherwise several single-file artefacts with distinct
         # names all render as the same filename. The filename + size move to
         # the meta line so the file's identity stays visible.
-        meta = f"{fname} · {size}" if fname else size
+        meta = (f"{fname} · {size}" if fname else size) + fact_suffix
         return {
             "kind": "library",
             "glyph": "doc",  # single-document glyph — see kind_glyph()
@@ -1787,7 +1815,7 @@ def _catalog_card_upload(c: dict) -> dict:
         "description": c.get("description") or "A private collection of files — searchable by your agents.",
         "tags": [],
         "meta_icon": "doc",
-        "meta_text": f"{n} file{'s' if n != 1 else ''}",
+        "meta_text": f"{n} file{'s' if n != 1 else ''}" + fact_suffix,
         "action": {"mode": "link", "href": f"/library/{c['slug']}", "label": "Open"},
     }
 
@@ -2260,8 +2288,26 @@ async def library_page(
     # ── Artefacts (file_corpora) ──────────────────────────────────────────
     fc_repo = file_corpora_repo()
     cf_repo = corpus_files_repo()
+    # Resolved ONCE, not per collection: the flag/backend check is the same
+    # for every row, and a fresh count query per row is only worth paying
+    # when the surface is actually on (spec §13.2 "Library" — "N files ·
+    # M facts").
+    facts_repo_ = _facts_repo_if_available()
+    _all_cols = fc_repo.list()
+    # One batch call for every card, not one call per card: each singular
+    # count re-resolved the caller's readable-collection set (a grants query
+    # plus a full owned-collections scan), so the page cost grew with the
+    # number of collections the caller can see. The batch resolves that set
+    # once — visibility still decided inside the repo, never here.
+    _fact_counts: dict = {}
+    if facts_repo_ is not None:
+        _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
+        try:
+            _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
+        except Exception as e:
+            logger.warning("/library: fact counts failed: %s", e)
     try:
-        for col in fc_repo.list():
+        for col in _all_cols:
             owned = col.get("created_by") == uid
             if not owned and col["id"] not in granted_to_me:
                 continue  # not yours and not shared with you -> invisible here
@@ -2278,6 +2324,7 @@ async def library_page(
                     "file_type": f0.get("file_type"),
                     "size_bytes": f0.get("size_bytes"),
                 }
+            fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
                     "id": col["id"],
@@ -2286,6 +2333,7 @@ async def library_page(
                     "slug": col.get("slug"),
                     "file_count": file_count,
                     "first_file": first_file,
+                    "fact_count": fact_count,
                 }
             )
             shared = col["id"] in shared_ids
@@ -4222,10 +4270,17 @@ async def library_file_detail(
     return templates.TemplateResponse(request, "library_file_detail.html", ctx)
 
 
+# Facts section page size (spec §13.2 "Collection detail" — a paged per-fact
+# row list). Small on purpose: each row can carry a conflict block, so the
+# page stays a state read-out, not a data dump.
+_FACTS_SECTION_PAGE_SIZE = 20
+
+
 @router.get("/library/{slug}", response_class=HTMLResponse)
 async def library_detail(
     slug: str,
     request: Request,
+    facts_page: int = 1,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -4251,6 +4306,29 @@ async def library_detail(
     # surface that stated neither, so "who can see this folder?" was only
     # answerable from the Library table it was opened from.
     owner_id = col.get("created_by")
+
+    # Facts section (spec §13.2 "Collection detail" — state, not settings):
+    # flag off / DuckDB backend / zero facts -> `facts_summary` stays None and
+    # the template simply omits the section, no error, no empty shell. Scoped
+    # to the ACTUAL CALLER (`user`), never `owner_id` — a caller who can open
+    # this page via a group grant must see exactly what their own grants
+    # cover, not the owner's.
+    facts_summary = None
+    facts_repo_ = _facts_repo_if_available()
+    if facts_repo_ is not None:
+        try:
+            page = max(1, facts_page)
+            summary = facts_repo_.collection_facts_summary(
+                user,
+                col["id"],
+                limit=_FACTS_SECTION_PAGE_SIZE,
+                offset=(page - 1) * _FACTS_SECTION_PAGE_SIZE,
+            )
+            if summary["total"] > 0:
+                facts_summary = {**summary, "page": page, "page_size": _FACTS_SECTION_PAGE_SIZE}
+        except Exception as e:
+            logger.warning("/library/%s: facts summary failed: %s", slug, e)
+
     ctx = _build_context(
         request,
         user=user,
@@ -4261,6 +4339,7 @@ async def library_detail(
         owner_name=(_resolve_owner_display(owner_id) if owner_id else None),
         collection_visibility=visibility_for(ResourceType.COLLECTION.value, col["id"]),
         can_share=is_admin or owner_id == user["id"],
+        facts_summary=facts_summary,
     )
     return templates.TemplateResponse(request, "library_detail.html", ctx)
 

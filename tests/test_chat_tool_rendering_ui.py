@@ -721,7 +721,9 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     on both. A part with NO state (a pre-v123 row) still claims nothing."""
     js = _read(CHAT_JS)
     fn = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
-    assert "_renderToolResultPreview(result)" in fn, "one result renderer for both paths"
+    # `tool` rides along too (facts-graph wave — routes `fact_claims` through
+    # its own preview) but it is still the ONE shared call for both paths.
+    assert "_renderToolResultPreview(result, tool)" in fn, "one result renderer for both paths"
     assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
         "the persisted state maps onto the same is-error / is-done classes a live result produces"
     )
