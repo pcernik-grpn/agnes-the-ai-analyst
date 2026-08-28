@@ -98,6 +98,25 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "ontology_drafts_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/ontology_drafts_pg.py"
     ),
+    # External SSO login config (design 2026-08-28). The two DELETEs and the
+    # test-config POST are parameter-free and reach sso_config_repo() (the
+    # last-login-door guard's availability probe swallows
+    # RequiresPostgresBackend by contract, so the repo call in the handler
+    # body is what raises) -- DuckDB -> typed 501, Postgres -> 404 (nothing
+    # configured). The two PUTs carry required bodies, so an empty body 422s
+    # identically on both backends before any repo is reached.
+    "DELETE /api/admin/sso/client-secret": (
+        "sso_config_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/sso_config_pg.py"
+    ),
+    "DELETE /api/admin/sso/config": (
+        "sso_config_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/sso_config_pg.py"
+    ),
+    "POST /api/admin/sso/test-config": (
+        "sso_config_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/sso_config_pg.py"
+    ),
 }
 
 

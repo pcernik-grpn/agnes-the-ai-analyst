@@ -232,7 +232,13 @@ repo module.
    repo directly).
 
 Skip the `scripts/migrate_duckdb_to_pg/__init__.py:TASKS` step entirely — a
-brand-new table has no DuckDB-side data to carry over.
+brand-new table has no DuckDB-side data to carry over. One registration in
+that file still applies: if the table's primary key is anything other than a
+plain `id` column, add it to `_PK_COLUMNS` — the PG→PG copy/validate paths
+(cloud↔side-car DR) iterate `Base.metadata` and default to `SELECT id`, so
+an unregistered non-`id` PK fails them
+(`tests/db_pg/test_data_migration.py::test_non_id_pk_tables_are_in_pk_columns_map`
+names the miss).
 
 ## Extending an EXISTING (frozen pre-A3) pair — no schema change
 

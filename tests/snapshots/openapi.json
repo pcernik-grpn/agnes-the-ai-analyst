@@ -9327,6 +9327,55 @@
         "title": "SourceRequest",
         "type": "object"
       },
+      "SsoConfigBody": {
+        "properties": {
+          "allowed_email_domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Email Domains",
+            "type": "array"
+          },
+          "client_id": {
+            "title": "Client Id",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "client_id",
+          "display_name",
+          "allowed_email_domains"
+        ],
+        "title": "SsoConfigBody",
+        "type": "object"
+      },
+      "SsoSecretBody": {
+        "properties": {
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "SsoSecretBody",
+        "type": "object"
+      },
       "StoreEntityListResponse": {
         "properties": {
           "items": {
@@ -30189,6 +30238,463 @@
         ]
       }
     },
+    "/api/admin/sso/client-secret": {
+      "delete": {
+        "description": "Clear the stored secret (the provider becomes unavailable).",
+        "operationId": "clear_sso_client_secret_api_admin_sso_client_secret_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Sso Client Secret",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "put": {
+        "description": "Store (or rotate) the client secret. Write-only.",
+        "operationId": "set_sso_client_secret_api_admin_sso_client_secret_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoSecretBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Sso Client Secret",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/config": {
+      "delete": {
+        "description": "Delete the config row + secret. KEEPS ``user_external_identities``\nrows \u2014 they are historically true links, inert unless the same tenant is\nconfigured again; purgeable per-user via the identities endpoint.",
+        "operationId": "delete_sso_config_api_admin_sso_config_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "get": {
+        "description": "Config status for the admin panel. Never returns the secret.",
+        "operationId": "get_sso_config_api_admin_sso_config_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "put": {
+        "description": "Upsert the singleton config. Validates the tenant via the imported\nsingle-tenant validator; ``enabled=true`` additionally requires a stored,\ndecryptable secret (and the always-required non-empty domain list).",
+        "operationId": "put_sso_config_api_admin_sso_config_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoConfigBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/identities": {
+      "get": {
+        "description": "Paginated list of linked external identities, newest link first.",
+        "operationId": "list_sso_identities_api_admin_sso_identities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Sso Identities",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/identities/{user_id}": {
+      "delete": {
+        "description": "Admin unlink \u2014 hard delete of the identity row; the recovery tool for\na mis-attach. Does not touch the user row itself.",
+        "operationId": "unlink_sso_identity_api_admin_sso_identities__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Sso Identity",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/test-config": {
+      "post": {
+        "description": "Server-side reachability probe: tenant validation, secret presence +\ndecryptability, then the tenant's OIDC discovery document. No SSRF\nsurface: fixed host, tenant validated and quoted into a single path\nsegment (the ``microsoft.py`` discovery-URL pattern).",
+        "operationId": "test_sso_config_api_admin_sso_test_config_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
     "/api/admin/store/lint-audit": {
       "post": {
         "description": "Run (or skip) a full-corpus lint audit.\n\n``body`` defaults so a body-less POST (the scheduler sends none) is valid\nrather than 422.\n\nSelf-guard: unless ``force``, refuses to re-run within\n``get_lint_audit_min_interval_hours()`` of the most recent *full-audit* run\n(``scheduler``/``admin`` trigger only \u2014 per-publish runs are ignored, else\nroutine publishing would perpetually reset the interval), to keep a\nmisconfigured scheduler (or an admin mashing the button) from hammering the\nLLM craft-review tier.",
@@ -41855,6 +42361,60 @@
           }
         },
         "summary": "Post Elevation",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/external-identity": {
+      "get": {
+        "description": "The calling user's linked external identity (design 2026-08-28).\n\nLive repo lookup, deliberately NOT a JWT claim: link state must stay\nrevocable (an admin unlink takes effect on the next call, not after a\n30-day stateless token expires). None of the returned fields is a\nsecret \u2014 the ``subject`` is the Entra directory object ID the admin\nidentities list shows too. Postgres-only feature: on a DuckDB-backed\ninstance the repo factory raises ``RequiresPostgresBackend`` and the\napp-wide handler answers the typed 501.",
+        "operationId": "get_external_identity_api_me_external_identity_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get External Identity",
         "tags": [
           "me"
         ]
@@ -54650,6 +55210,102 @@
           }
         },
         "summary": "Refresh Groups",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/callback": {
+      "get": {
+        "description": "Code exchange -> claims -> identity -> bind -> JWT cookie.\n\nThe test-mode leg (this flow's ``state`` matches the stashed test state)\nre-verifies the CURRENT session user is an admin, completes the exchange,\nand renders the result page \u2014 without ``ensure_user``, without an\nidentity row, without a cookie.",
+        "operationId": "sso_callback_auth_sso_callback_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/login": {
+      "get": {
+        "description": "Redirect to the configured tenant's Entra authorize endpoint.\n\n``?mode=test`` (admin-only, works pre-enable and outside the allowlist)\nstashes THIS flow's OAuth ``state`` so the callback renders the\nside-effect-free result page instead of signing anyone in \u2014 a concurrent\nnormal sign-in carries a different ``state`` and follows the normal path\nuntouched.",
+        "operationId": "sso_login_auth_sso_login_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Login",
         "tags": [
           "auth"
         ]

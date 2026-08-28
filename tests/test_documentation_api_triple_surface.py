@@ -667,6 +667,54 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/sso/config": (
+        "external SSO login config (design 2026-08-28) — CLI-reachable via "
+        "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
+        "the PUT/DELETE reconfigure which external tenant this instance "
+        "trusts to assert identities (the 'admin credential-provisioning "
+        "writes' standing exemption in CONTRIBUTING.md), and the GET "
+        "enumerates the instance's auth posture (the 'operator "
+        "security-posture diagnostics' standing exemption)"
+    ),
+    "/api/admin/sso/client-secret": (
+        "external SSO client secret (write-only vault write) — CLI-reachable "
+        "via `agnes admin sso set-secret|clear-secret`, deliberately never "
+        "MCP-exposed per the 'admin credential-provisioning writes' standing "
+        "exemption in CONTRIBUTING.md: an agent-invokable tool that stores "
+        "the credential a third-party tenant authenticates with is a "
+        "privilege-escalation seam, not a convenience"
+    ),
+    "/api/admin/sso/test-config": (
+        "external SSO discovery probe — CLI-reachable via `agnes admin sso "
+        "test`, deliberately never MCP-exposed per the 'admin "
+        "credential-provisioning writes' standing exemption in "
+        "CONTRIBUTING.md (it validates the same credential-trust config the "
+        "writes provision, against the live tenant)"
+    ),
+    "/api/admin/sso/identities": (
+        "linked external identities list — CLI-reachable via `agnes admin "
+        "sso identities`, deliberately never MCP-exposed (own reasoning, "
+        "not a standing-exemption citation): a per-user roster of which "
+        "external principal can authenticate as whom (emails + subject "
+        "GUIDs) is admin recovery tooling, and handing it to an "
+        "agent-invokable tool would give a prompt-injected session a "
+        "one-call identity map of the instance; it is not analyst tooling"
+    ),
+    "/api/admin/sso/identities/{user_id}": (
+        "admin unlink of one external identity — CLI-reachable via `agnes "
+        "admin sso unlink`, deliberately never MCP-exposed: unlinking "
+        "re-opens first-login email attach for that user (an auth-trust "
+        "mutation), and is admin recovery tooling, not analyst tooling"
+    ),
+    "/api/me/external-identity": (
+        "the caller's own external-identity linkage — CLI-reachable via the "
+        "`agnes whoami` linked-identity line, deliberately never MCP-exposed "
+        "(own reasoning, not a standing-exemption citation: the operator-"
+        "diagnostics clause covers instance-wide posture, and this is "
+        "self-scoped): it reveals which external principal can authenticate "
+        "as the caller (`oid`/`tid`) — auth-linkage reconnaissance a "
+        "prompt-injected chat session has no analyst-tooling reason to hold"
+    ),
     # `/api/agents/{agent_id}/builder/turn` is NOT here: it sits with the other
     # four builder-turn routes further down, as `_AGENTS_BUILDER_TURN_REASON`.
     # It used to be in both places — an inline prose entry here and the
