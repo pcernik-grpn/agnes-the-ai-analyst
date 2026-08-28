@@ -166,6 +166,14 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/data-apps/{slug}/drafts": ("app draft create", "data_app_create_draft"),
     "/api/data-apps/{slug}/drafts/{draft_slug}": ("app draft delete", "data_app_delete_draft"),
     "/api/data-apps/{slug}/git-credential": ("app git-credential", "data_app_git_credential"),
+    # Fact graph over Collections — query surface (build order step 6,
+    # docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md
+    # §12/§16). REST landed REST-only in a prior task (see the historical
+    # note that used to sit in _EXEMPT here); CLI (`agnes facts …`) and MCP
+    # tools (`fact_search`/`fact_neighbors`/`fact_claims`) now land together.
+    "/api/facts/search": ("facts search", "fact_search"),
+    "/api/facts/neighbors": ("facts neighbors", "fact_neighbors"),
+    "/api/facts/{subject_id}/claims": ("facts claims", "fact_claims"),
 }
 
 
@@ -1153,6 +1161,25 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven idle-app reaper trigger (data-apps platform Task 9) — "
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
+    ),
+    # Build order step 4 (write path). Unlike the read routes (which live
+    # in _COHORT with their CLI/MCP halves), this IS a permanent
+    # exemption: the producer contract (ingest,
+    # corrections CRUD/export) is scheduler-token-or-admin surface, not an
+    # analyst command — spec §12's REST/CLI/MCP table covers only
+    # search/neighbors/claims, and ingest/corrections never appear there.
+    # Mirrors the run-knowledge-digests / run-corporate-memory / reap-idle
+    # exemptions above: a producer/admin maintenance op, no analyst CLI/MCP
+    # analogue by design.
+    "/api/facts/ingest": (
+        "fact graph producer contract (spec §7.2) — scheduler-token-or-admin "
+        "ingest endpoint, not an analyst command; no CLI/MCP analogue"
+    ),
+    "/api/facts/corrections/{subject_kind}/{subject_id}": (
+        "admin correction management (spec §4) — PUT/DELETE, no analyst CLI/MCP analogue"
+    ),
+    "/api/facts/corrections": (
+        "producer corrections export (spec §7.4) — scheduler-token-or-admin, no analyst CLI/MCP analogue"
     ),
 }
 

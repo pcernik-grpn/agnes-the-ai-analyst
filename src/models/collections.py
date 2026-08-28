@@ -11,6 +11,12 @@ PG notes:
   no JSONB cast needed since reads come back as strings.
 - CorpusChunk.text_ is mapped to the DB column "text" via __table_args__
   style; we use sa.text_ alias to avoid shadowing the imported sa.text().
+- CorpusFileSource (v125-equivalent, PG-only — A3 ratchet, no DuckDB side)
+  is the crawler-anchor mapping from the fact-graph-over-Collections design
+  (docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md
+  §6): maps a producer's stable id to a ``corpus_files`` row so a re-sync or
+  a manual path re-upload of the same document preserves that row's id
+  instead of cascading its (future) claims away.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import sqlalchemy as sa
-from sqlalchemy import REAL, BigInteger, DateTime, Integer, String
+from sqlalchemy import REAL, BigInteger, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -114,3 +120,28 @@ class CorpusChunk(Base):
         server_default=_text("CURRENT_TIMESTAMP"),
         nullable=True,
     )
+
+
+class CorpusFileSource(Base):
+    """Crawler-anchor mapping (PG-only, A3 ratchet — see module docstring).
+
+    ``(corpus_id, source_stable_id)`` is the producer's delta key (survives
+    rename/move); ``corpus_file_id`` is the row it currently resolves to.
+    """
+
+    __tablename__ = "corpus_file_sources"
+    __table_args__ = (
+        sa.UniqueConstraint("corpus_id", "source_stable_id", name="uq_corpus_file_sources_corpus_stable_id"),
+        sa.Index("idx_corpus_file_sources_corpus_doc", "corpus_id", "source_doc_id"),
+    )
+
+    corpus_file_id: Mapped[str] = mapped_column(
+        String, ForeignKey("corpus_files.id", ondelete="CASCADE"), primary_key=True
+    )
+    corpus_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_stable_id: Mapped[str] = mapped_column(String, nullable=False)
+    # Rewritten when a provisional doc_id (sha256(cTag|stable_id)) is
+    # replaced by the real one on first content crawl (spec §6).
+    source_doc_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String, nullable=True)

@@ -452,6 +452,13 @@ def test_update_sync_state_partitioned_corrupt_part_excluded_when_no_prior_state
     assert state is not None
     assert not state.get("parts")
     assert state["hash"] == ""
+    # #1364 — the byte-served/frozen manifest above is unchanged; what's new is
+    # that the corruption is no longer invisible above the log line: the same
+    # `sync_state.status`/`error` mechanism `GET /api/admin/registry` /
+    # `agnes admin list-tables` already surface as `last_sync_status`/
+    # `last_sync_error` names the rejected part's path.
+    assert state["status"] == "error"
+    assert "month=2026-01/data.parquet" in (state["error"] or "")
 
 
 def test_update_sync_state_partitioned_healthy_part_still_published_alongside_corrupt_one(system_db_path, tmp_path):
@@ -498,6 +505,7 @@ def test_update_sync_state_partitioned_corrupt_part_with_prior_good_copy_is_froz
     assert before["parts"] == [
         {"path": "month=2026-01/data.parquet", "hash": hashlib.md5(good).hexdigest(), "size_bytes": len(good)}
     ]
+    assert before["status"] == "ok"
 
     # The part goes corrupt on disk (e.g. a killed webhook write) before the
     # next rebuild — the SAME failure mode #1354 documents.
@@ -513,6 +521,11 @@ def test_update_sync_state_partitioned_corrupt_part_with_prior_good_copy_is_froz
     # and NOT the corrupt bytes' own (self-consistent) hash.
     assert after["parts"] == before["parts"]
     assert after["hash"] == before["hash"]
+    # #1364 — but no longer silent: the freeze is now flagged, naming the
+    # rejected part, so an operator sees "this table is serving stale-but-
+    # good data because a part went bad" instead of a plain green row.
+    assert after["status"] == "error"
+    assert "month=2026-01/data.parquet" in (after["error"] or "")
 
 
 def test_update_sync_state_partitioned_all_corrupt_first_sync_publishes_nothing(system_db_path, tmp_path):
@@ -572,7 +585,15 @@ def test_update_sync_state_partitioned_all_corrupt_with_prior_state_stays_fully_
 
 def test_update_sync_state_single_file_corrupt_no_prior_state_publishes_nothing(system_db_path, tmp_path, caplog):
     """Single-file sibling, (a): a corrupt flat parquet with no prior good
-    sync leaves no sync_state row — never published — and warns."""
+    sync publishes no hash/rows — never served — and warns.
+
+    #1364: this used to leave NO sync_state row at all, which `GET
+    /api/admin/registry` reports as `last_sync_status: "pending"` — i.e.
+    indistinguishable from "never attempted". That is exactly the invisible
+    failure the issue is about, so this table must now show up flagged
+    (`status="error"`, the corrupt path in `error`) instead of silently
+    vanishing back to "pending".
+    """
     extracts = tmp_path / "extracts" / "keboola" / "data"
     extracts.mkdir(parents=True)
     (extracts / "orders.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
@@ -588,7 +609,12 @@ def test_update_sync_state_single_file_corrupt_no_prior_state_publishes_nothing(
         state = SyncStateRepository(conn).get_table_state("orders")
     finally:
         conn.close()
-    assert state is None
+    assert state is not None, "the corrupt file must be flagged, not silently absent"
+    assert state["status"] == "error"
+    assert "orders.parquet" in (state["error"] or "")
+    # Nothing was ever published for this table — no hash/rows to freeze.
+    assert not state.get("hash")
+    assert state.get("rows") is None
 
 
 def test_update_sync_state_single_file_corrupt_with_prior_good_state_is_frozen(system_db_path, tmp_path):
@@ -609,6 +635,7 @@ def test_update_sync_state_single_file_corrupt_with_prior_good_state_is_frozen(s
     finally:
         conn.close()
     assert before["hash"] == hashlib.md5(good).hexdigest()
+    assert before["status"] == "ok"
 
     pq_path.write_bytes(CORRUPT_PARQUET_BYTES)
     _run_update(system_db_path, meta_rows=[("orders", 100, pq_path.stat().st_size, "local")], data_dir=tmp_path)
@@ -620,6 +647,10 @@ def test_update_sync_state_single_file_corrupt_with_prior_good_state_is_frozen(s
         conn.close()
     assert after["hash"] == before["hash"]
     assert after["rows"] == before["rows"]
+    # #1364 — frozen AND flagged: the served bytes/rows are unchanged, but
+    # the freeze itself is no longer invisible.
+    assert after["status"] == "error"
+    assert "orders.parquet" in (after["error"] or "")
 
 
 def test_update_sync_state_single_file_valid_real_writer_parquet_still_passes(system_db_path, tmp_path):
@@ -763,3 +794,80 @@ def test_dir_only_layout_is_not_flagged_as_a_collision(system_db_path, tmp_path,
         conn.close()
     assert state["status"] == "ok"
     assert not state.get("error")
+
+
+# ---------------------------------------------------------------------------
+# #1364, second shape: a connector's own `_meta.rows` can be NULL — "could
+# not count this pass" (e.g. Jira's view build hit a part that passes the
+# byte-magic check above but still fails DuckDB's own parse; see
+# `connectors/jira/extract_init.py::_rebuild_view_and_stats`). That is
+# distinct from a genuinely empty table's `_meta.rows == 0` — conflating the
+# two back together here would recreate the bug this fix closes.
+# ---------------------------------------------------------------------------
+
+
+def test_update_sync_state_count_unavailable_is_flagged_not_silently_zeroed(system_db_path, tmp_path):
+    """`_meta.rows=None` (count failed) still publishes `rows=0` — sync_state
+    has nowhere else numeric to put it — but it MUST be flagged, so it never
+    looks identical to a genuinely empty table on the same surface."""
+    good = b"PAR1" + b"good" * 20 + b"PAR1"
+    tdir = tmp_path / "extracts" / "keboola" / "data" / "orders" / "month=2026-01"
+    tdir.mkdir(parents=True)
+    (tdir / "data.parquet").write_bytes(good)
+
+    _run_update(system_db_path, meta_rows=[("orders", None, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["rows"] == 0
+    assert state["status"] == "error"
+    assert "orders" in (state["error"] or "")
+    assert "unavailable" in (state["error"] or "").lower()
+
+
+def test_update_sync_state_genuinely_empty_table_is_not_flagged(system_db_path, tmp_path):
+    """The contrast case: `_meta.rows=0` for a REAL empty table (no parquet
+    on disk at all) must stay `status="ok"` with no error — this
+    distinction is the whole point of #1364. A test that conflated "empty"
+    and "damaged" would recreate the bug this fix closes, just one layer up."""
+    (tmp_path / "extracts" / "keboola" / "data").mkdir(parents=True)
+
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["rows"] == 0
+    assert state["status"] == "ok"
+    assert not state.get("error")
+
+
+def test_update_sync_state_count_unavailable_and_rejected_part_together_keeps_the_specific_message(
+    system_db_path, tmp_path
+):
+    """The common real-world case for a partitioned table: a corrupt part is
+    typically exactly why the extractor's OWN view build/count also failed
+    (`_meta.rows=None`), so `count_unavailable` and `rejected` fire on the
+    SAME pass. `set_error` replaces, not appends — the more useful,
+    path-naming message (`rejected`) must be the one left standing, not the
+    generic "check the logs" one."""
+    tdir = tmp_path / "extracts" / "keboola" / "data" / "orders" / "month=2026-01"
+    tdir.mkdir(parents=True)
+    (tdir / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+
+    _run_update(system_db_path, meta_rows=[("orders", None, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["status"] == "error"
+    assert "month=2026-01/data.parquet" in (state["error"] or ""), (
+        f"expected the specific rejected-part message to win; got {state['error']!r}"
+    )

@@ -11,6 +11,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Fact graph over Collections — read surface** (`facts.enabled`, off by default; Postgres-only). Typed subjects (facts/edges) extracted from Collections documents, each claim carrying its evidencing document, a verbatim quote and a date. `POST /api/facts/search` (typed subject search with attribute filters, projected per-caller from readable claims), `POST /api/facts/neighbors` (bounded graph traversal, depth ≤2, capped fanout/result, statement-timeout guarded — a node now carries the SAME projected shape `search` returns, aliases and per-caller-projected attrs and claim/quote counts included, and an edge carries its own projected attrs too, so walking the graph no longer needs a follow-up `search`/`claims` round trip per node just to learn its attributes; the projection runs once, after truncation, over the already-capped node/edge set), and `GET /api/facts/{subject_id}/claims` (the caller's readable evidence for one subject) — any authenticated caller, no admin gate; every bit of visibility enforcement lives server-side in the repository, never in a route dependency, so an agent's restricted scope or a group's collection grants are the only thing that decides what a caller sees. A subject under an admin `revealed` correction is served instance-wide without quotes; `restricted`/`wrong` withhold it everywhere; a nonexistent id and an unreadable one are indistinguishable (`404`, never `403`). A fact's visibility (search/neighbors/claims and the orphan sweep) now also counts a readable, non-withheld incident edge's claim as evidence of that fact's own existence — a node created only to anchor an evidenced edge (no evidence of its own, permitted by the producer wire contract) is no longer invisible or garbage-collected; its `attrs` and claim list still project from its own claims only. Honest scope: this is the READ surface only (build order steps 2+3) — the write surface and the CLI/MCP query surface ship alongside it (their own bullets below). DuckDB-backed instances answer a typed `501` (A3 PG-first ratchet). See `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
+- **`agnes facts search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/`fact_claims` (MCP foundation tools) — the query surface over the fact graph** (build order step 6). Facts have no local scope, so unlike `agnes query`'s local/server auto-routing there is no `--scope` flag — every CLI result labels its origin `[server]` on stderr with a hint explaining the deliberate deviation. The MCP tools call `src.repositories.facts_repo()` directly (never an HTTP self-call) with the caller's own resolved principal, so a scoped `AgentPrincipal` sees exactly its own narrowed subset rather than an owner's full authority. A `404` (never `403`) from `neighbors`/`claims` gets one honest hint covering all three indistinguishable causes — wrong id, no readable evidence, or the `facts` feature is off — never a probe that tells them apart.
+- **Fact graph over Collections — eval-critical UI surfaces** (behind the same `facts.enabled` flag, Postgres-only): the collection detail page grows a **Facts** section (fact count by type, a paged per-fact row list with display name/claim/quote counts, same-attribute-key conflicts rendered inline where the fact lives with both values and their evidencing documents' names/dates, and `possible_duplicate_of` review-item rows naming both subjects) — caller-scoped through `facts_repo().collection_facts_summary`, absent entirely (no error, no empty shell) when the flag is off, the backend is DuckDB, or the collection has zero facts. The Library collection card gains a caller-scoped "N files · M facts" count (omitted at zero). `/admin/access` collection rows carry a "⚠ nobody" badge when no group holds a grant on them ("indexed but invisible"). Web chat renders `fact_search`/`fact_neighbors`/`fact_claims` tool calls with a human head ("Searched the knowledge graph" / "Walked related facts" / "Read the evidence"), `fact_claims` results as a quote + document list (open-in-source link only when available, sanitized through the same markdown renderer as every other message body), and an end-of-turn "answered from N documents in M collections you can access" scope line. Connect wizard, source card and ontology builder remain out of scope for this round.
+- **Fact graph over Collections — write surface** (build order step 4, same `facts.enabled`/Postgres-only gate). `POST /api/facts/ingest` — scheduler token or admin PAT, no CLI/MCP by design (a producer contract, not an analyst command) — accepts the crawler's wire format verbatim: `documents[]` (`make_row` rows + `corpus_id`) upsert through the Collections source-anchor mapping; `doc_id` resolves via `corpus_file_sources`, refusing (`400`, itemized) an unresolved id when `documents` is omitted; a claim referencing a not-yet-`indexed` file is `deferred`, never rejected; every quote passes the verbatim gate (a substring of one chunk of the evidencing document's extracted text) before it's stored; `full_documents` replaces a document's whole claim set — every existing claim for it is deleted in one statement before any incoming claim is written, so a subject the re-extraction drops loses its stale claim; the batch as a whole is not one transaction, and does not need to be, because ingest is replayable by construction (union mode merges by `(subject, corpus_file_id, quote_hash)`, so replaying a batch is a true no-op and re-sending a batch that died halfway converges on the same state); unknown node/edge ids mint a new subject + alias, a type disagreement against an existing alias is rejected and itemized, `possible_duplicate_of` edges need no evidence and surface as review items; a same-date attribute conflict introduced by the batch is flagged as a review item, a different-date one silently succeeds (later wins); a functionally single-valued edge type (`facts.single_valued_edges`, default `owned_by`/`for_client`) with more than one distinct dst carrying a live claim — including a dst written by an earlier batch — becomes a `single_valued_conflict` review item too, never persisted and recomputed caller-scoped on the collection detail page the same way `possible_duplicate_of` rows are; batch caps (≤500 documents, ≤5000 claims/request, `413`) and a single document's evidence alone over the claim cap (`422`, never split). Response is the run report (`claims_written`/`claims_rejected`/`deferred`/`subjects_created`/`subjects_deleted`/`corrections_active`/`review_items`). Admin corrections — `PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}` (`wrong`/`restricted`/`revealed`, reasoned, audit-logged) and the producer export `GET /api/facts/corrections` — snapshot a subject's natural keys at write time so a `wrong` correction re-attaches even after its subject is deleted and later re-created under a new id. A post-ingest orphan sweep deletes and counts zero-claim subjects; the same sweep also runs after a file delete through the Collections API (`DELETE /api/collections/{id}/files/{file_id}`) and after a **content replace** — re-uploading a file with different bytes deletes that document's claims at replace time rather than leaving them to the producer's next extraction. A claim quotes a verbatim span of the bytes that are being replaced (and whose blob is unlinked in the same step), nothing in the read path filters on `claims.file_sha256`, and the claims read joins `corpus_files` for the document's *current* name and path — so the deferral window would serve a quote of deleted text under the new document's identity, and keep its subject alive in `search`/`neighbors`, for as long as the producer took to come back (forever, for a file replaced by hand). Fresh claims still arrive only on the next extraction, and replace-mode ingest is unchanged and still idempotent.
+- **`scripts/ontology/import_ontology.py` translates a producer's ontology.yaml into an Agnes semantic-model (Apache Ossie) document** — node types become datasets, edge types become relationships, guidance/rules with no Ossie field fold into `ai_context` verbatim, and every judgment call (a hierarchy inferred from a plain attribute, a wildcard-endpoint relationship) is named in a leftover report printed before writing or posting. Validates against the vendored Ossie schema before writing (`--out`) or importing through `POST /api/admin/semantic-models` (`--server`/`--token`); refuses loudly on a schema-invalid translation. Fact-graph build-order step 1.
+
+- **`scripts/eval/` — the fact-graph evaluation measurement harness, encoding eval workbook v0.2 exactly (EQ0/EQ3/EQ9).** `run_eval.py` drives an eval round from a YAML run-config against the frozen ten-prompt set (`tests/fixtures/eval/workbook_v0_2/`, sha256-pinned — the harness refuses to run on a locally-edited prompt) across five arms: A0 (bare Anthropic API) and A4 (Agnes, via a pluggable surface — `chat` implemented against the same one-shot endpoint `agnes agent ask` uses) run directly; A1/A2/A3 run in external product UIs this harness cannot drive headlessly, so `import-transcript` ingests an operator-pasted transcript into the same machine-readable record shape. `grade.py` produces blind grading sheets (arm identity hidden behind a nonce until scored), computes the composite (seven 0/1/2 dimensions, frozen weights, a governance-gate FAIL zeroing the question), and supports `--llm-assist` grading (always labeled, never a silent substitute for human grading). `decision.py` computes the five pre-registered decision thresholds with PASS/FAIL/incomplete verdicts. `metrics.py` computes EQ3 (precision/recall per fact type) and EQ9 (entity-resolution cluster purity, conflict rate, orphan rate) against the facts REST API's documented response shapes, against a planted ground-truth manifest (`tests/fixtures/eval/ground_truth.schema.json`); EQ3 matches each planted fact at most once, so a second extracted subject for the same planted fact scores as a false positive rather than a second true positive — otherwise duplicated entities, the failure EQ9 exists to measure, would have *raised* the precision the decision thresholds read. Fact-graph build-order step 5.
+
 - **Claude can run through Google Vertex AI — chat and server-side, keyless.**
   Two new provider switches, both authenticated by Google Application Default
   Credentials (no Anthropic key anywhere): `chat.llm.provider: vertex` (+
@@ -217,6 +225,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **Admin and workspace pages now use the plain page header.** 25 templates that
+  are lists, tables or editors switch from the bordered gradient hero panel to the
+  plain title + lede that `/library`, `/agents` and `/chats` already render, via the
+  existing `page_hero_plain` opt-in in `_page_hero.html` — no new CSS or components.
+  This closes the most visible reason admin read as an older product than the rest of
+  the app. The hero is kept on `mcp_connect` and `admin_session_detail`, which
+  introduce themselves rather than being workspace pages, and eyebrows are retained
+  everywhere: they carry the admin grouping (Agent Experience, Users & Access).
 - **BREAKING: Databricks Unity Catalog metric views now flow through the
   semantic-source adapter contract, like Snowflake — no more direct
   `metric_definitions` writer.** A new `databricks_semantic` adapter
@@ -241,6 +257,84 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   nothing. This was the last connector writing `metric_definitions`
   directly — every source (native, git, upload, Keboola, Snowflake,
   Databricks) now goes through the same document → projector pipeline.
+- **Collections file upload now preserves a matched file's id on every
+  re-upload, instead of delete+insert.** `POST /api/collections/{id}/files`
+  gains optional positionally-paired form fields — `source_stable_ids` (+
+  `source_doc_ids`, `source_sha256s`, `document_dates`) — so a doc-sync
+  client can supply a producer's own stable id (e.g. a crawler's delta key)
+  alongside the existing `paths` field. A match is tried on
+  `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
+  as before; either way, the existing `corpus_files` row is now updated IN
+  PLACE — a content-unchanged match against an already-`indexed` row (a
+  rename/move) only refreshes filename/path and skips re-chunking entirely,
+  while a changed-content match purges chunks/derived tables and resets
+  `processing_status` on the SAME row. Content-unchanged against a row whose
+  ingest never completed (`rejected`, `needs_review`, or a parked `pending`)
+  counts as a **retry** instead: the row resets to `pending` and ingestion is
+  re-scheduled, so re-uploading the same bytes after fixing the cause works
+  without a separate `…/reingest` call — a row mid-ingest is left alone. A
+  manual `paths`-only re-upload of a file previously anchored by a stable id
+  now also preserves that row's id, so a hand upload can no longer orphan
+  anything referencing it. Two files sharing a non-blank `source_stable_id`
+  in one batch are rejected up front (`400
+  duplicate_source_stable_id_in_batch`), matching the existing
+  `duplicate_path_in_batch` guard — the second would otherwise overwrite the
+  first's row in place and silently drop its bytes — and a read-only
+  pre-flight resolves every file's target row before anything is stored, so
+  the two collisions that cross the stable-id/path boundary are refused
+  cleanly too: two files landing on the same existing row through different
+  anchors (`400 duplicate_target_row_in_batch`) and a stable-id match whose
+  `path` is already held by another row, which previously violated the
+  `(corpus_id, path)` unique index and surfaced as a `500` with earlier files
+  in the batch already written (`409 path_owned_by_another_file`). The old
+  blob is now unlinked whenever a matched row's `storage_path` moves rather
+  than only when its content changed — blob paths are `{sha256}{ext}` with
+  the extension taken from the filename, so an extension-only rename kept the
+  sha, allocated a new blob and orphaned the old one on disk. On a role-split
+  `api` replica a content-changed re-upload now rides ONE ordered
+  `collections-purge` job carrying `reingest_after_purge=True`, exactly as
+  `…/reingest` already did, instead of enqueueing a bare derived-table purge
+  while running the re-ingest in-process — because the row id (and therefore
+  the derived `table_id`) is now preserved, those two could land in either
+  order and the purge could delete the table the re-ingest had just rebuilt.
+  The stable-id mapping upsert also `COALESCE`s its optional columns, so a
+  rename-only re-sync carrying `source_stable_ids` without `source_doc_ids`
+  no longer resets a stored `source_doc_id` to NULL. The stable-id mapping
+  table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
+  instance returns `501`; omitting the field keeps today's flow unchanged.
+
+- **Session files are a side drawer that opens itself when a deliverable
+  lands.** The Files panel was a modal, which covered the very sentence
+  ("I saved it as …") the reader was checking the list against. It now docks
+  to the trailing edge with no backdrop, the conversation stays readable and
+  scrollable beside it, and where there is room (≥1100px) the composer makes
+  way instead of sitting underneath. The header button carries a count, and a
+  turn that writes a new file under `outputs/` opens the drawer on its own —
+  `outputs/` only, so the scratch files an agent touches mid-task do not
+  interrupt the read. The drawer learns which conversation it is looking at
+  when that conversation **opens**, so the first turn of a fresh chat is the
+  one that opens it (deriving the baseline from the first completed turn put
+  that turn's own deliverable into the baseline, and the commonest case —
+  ask, receive a document — never opened anything), and switching
+  conversations resets the count and reloads an open drawer instead of
+  leaving the previous chat's rows on screen with their old download links.
+
+- **The chat agent's file-handover rule now covers the case that actually
+  failed: a skill writing its output next to its own scaffolds.** The
+  sandbox-only `Files you produce` section already named `outputs/` as the
+  place to write a deliverable; what it did not say is that a skill whose
+  scaffolds live under `.claude/skills/<name>/` must still write its *output*
+  to `outputs/` — which is exactly what the repro did, producing a file no
+  surface could show. `outputs/` is the one location all three collectors
+  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
+  file browser lists the workspace tree while filtering dot-directories, and
+  the host walk lists the session dir. The section also now tells the agent
+  not to promise a download control it cannot see from inside the sandbox, and
+  keeps the chart/document split explicit. Sandbox surface only — on a laptop
+  workspace the filesystem IS the user's machine and naming the path is the
+  delivery. Mirrored across both prompt files
+  (`app/initial_workspace_default/CLAUDE.md` and
+  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 - **The data-package drawer shows the package, not the warehouse.** Its tables
   field rendered the *entire* registry — ~500 rows in a project › bucket tree
@@ -691,6 +785,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
+- **The session-files list no longer presents the workspace template as
+  session output.** `WorkdirManager.prepare_session_dir` symlinks `.claude`,
+  `scaffolds`, `snapshots`, `scripts` and `CLAUDE.md` into every session dir
+  for every provider, and the listing walked them: on a real conversation the
+  document the user asked for sat below dozens of
+  `scaffolds/nodejs-dashboard/...` rows, and on some turns never made the
+  page at all. Those trees are now excluded at the top level, and `outputs/`
+  sorts ahead of everything else. This also aligns the two sources: the
+  engine's own sandbox browser filters dot-directories for the same reason.
+- **The chat sandbox prompt now says where deliverables go.** It didn't — the
+  `outputs/` convention was real in the harvest code and in the Files panel
+  above, but no prompt ever named it, so the exclusion above could drop the
+  one location skills actually used (`.claude/skills/<name>/`) with nothing
+  pointing anywhere else, and the auto-open had no trigger to fire on. A
+  "Files you produce" section (sandbox render only — a laptop workspace *is*
+  the user's computer) names `outputs/` and says plainly that `.claude/`,
+  `/tmp` and a bare filename are invisible to the reader. The Charts section
+  no longer claims the sandbox has "no way to hand the user a file", which
+  stopped being true when the panel shipped and contradicted the new
+  section; the rule it still needs — a chart belongs inline in the reply, not
+  handed over as a file — is stated in its own right.
+- **The chat header's action buttons no longer drift apart.** `margin-left:
+  auto` was written when Copy transcript was the header's only action; with
+  Files beside it, each button claimed the slack and the free space was split
+  between them, stranding Files mid-header. Only the first action claims it
+  now, so the pair reads as one group at the trailing edge.
 - **Three Corporate Memory governance knobs are wired up; the fourth is
   clearly marked as not yet enforced (#1573).** `corporate_memory.approval_mode:
   "threshold"` used to silently behave exactly like `"review_queue"` — there
@@ -768,6 +888,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   detail surface and the run path a grantee legitimately relies on are
   unaffected.
 
+- **Legacy `--primary` brand tokens now flip in dark mode.** The dark-theme
+  block in `design-tokens.css` shims `--background`/`--surface`/`--text-*`/etc.
+  so components still reading the pre-redesign token family re-skin together,
+  but was missing `--primary` / `--primary-dark` / `--primary-light` — a rule
+  reading them directly (e.g. the rail's active user-menu item) kept its
+  light-theme blue under dark, measuring ~3.3:1 against the dark surface
+  (below WCAG AA). Now aliased to `var(--ds-primary*)` like the rest of the
+  family (#1625).
+- **A known-bad table no longer looks like a healthy, empty one.** A corrupt
+  parquet part is refused at hash time since #1559, but the refusal died in a
+  WARNING log line — `sync_state` (and so `GET /api/admin/registry` /
+  `agnes admin list-tables`) still reported `status: ok`, indistinguishable
+  from a genuinely empty or fully synced table. `_update_sync_state`
+  (`src/orchestrator.py`) now flags the row via the existing `sync_state`
+  `status`/`error` columns — the same mechanism already used for the
+  both-layouts collision (#1339) — naming the rejected part(s) whether the
+  table's manifest just got frozen at its last known-good state or nothing
+  was ever published for it. Separately, Jira's `extract_init.py` was
+  collapsing a failed view build into `rows=0`, identical to a real empty
+  table even though DuckDB's own exception names the offending file; it now
+  reports `rows=NULL` ("could not count") through `_meta`, which
+  `_update_sync_state` flags the same way instead of publishing a plain,
+  unflagged zero. No change to what is refused or served — refusal at hash
+  time (#1559) and quarantining a corrupt part at view build (deliberately
+  not pursued, per the issue's decision memo) are unaffected. (#1364)
+
 ### Removed
 
 - Removed the unused OpenMetadata catalog export (`src/catalog_export.py`,
@@ -787,6 +933,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   written, and no authority or grant changes. Off the dev gate every value is
   ignored outright and the toggle is not rendered, so it adds no surface to a
   real deployment.
+
+- **`docs/llm-routing.md` scrubbed of customer-specific and stale planning
+  content.** The provider-selection table and one config-example heading named
+  a specific company where every neighbouring entry is a neutral deployment
+  profile; both now read as profiles ("Single-vendor deployment"). The
+  "Files to Modify" plan table is gone — it described a two-repo OSS/private
+  split and listed `server/bin/collect-knowledge`, `server/deploy.sh`,
+  `requirements.txt` and `tests/test_corporate_memory.py`, none of which exist
+  in this repo — and the "Deployment" section it fed is rewritten to the
+  configuration-only steps that actually apply now that the connector ships
+  with the platform. Docs only; no behaviour change.
+- **`scripts/eval/corpus_gen.py` generates the planted proving-run corpus for
+  the fact-graph spec's Run P (§15.5).** A deterministic (seeded), SharePoint-
+  shaped filesystem corpus — ≥4 sites, 2-3 libraries each, mixed
+  .md/.docx/.pptx/.xlsx (falls back to Markdown when an Office writer library
+  isn't installed) — plus `ground_truth.json` recording every planted
+  fact/edge in the producer wire format (§7.0), the S1-S4 security fixtures,
+  six traps (scan / duplicate / superseded version / same-date contradiction
+  / entity-resolution pair / adversarial fabrication), and the AN1 canary +
+  AN2 Czech-inflected-name pair, plus a `sharing.yaml` mapping every
+  site/library to the groups it would be granted to. `--small` (~30 docs, no
+  filler) is committed at `tests/fixtures/eval/planted_corpus_small/` for
+  CI-speed acceptance tests; the full ≥1000-document mode is invoked at Run P
+  time. Fixture factory only — no application code changed.
+
+- **A SharePoint connection resolves its certificate from the vault or from
+  the deployment.** Microsoft Graph refuses client secrets for app-only
+  access, so the certificate is the credential: an admin either uploads their
+  own (held encrypted in the connection's vault slot, and preferred when both
+  exist) or points at one the deployment already injects, named by
+  `config.cert_private_key_env` and defaulting to
+  `SHAREPOINT_CERT_PRIVATE_KEY`. That name is admin-writable, so it is checked
+  against the shared credential-variable allowlist — a connection cannot name
+  an unrelated secret and have its value handed out as the certificate.
+  Groundwork for the file-source crawler (no user-facing surface yet).
 
 ## [0.90.0] - 2026-08-27
 

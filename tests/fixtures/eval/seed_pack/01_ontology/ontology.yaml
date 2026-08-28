@@ -1,0 +1,161 @@
+# Cuesta Star knowledge-graph ontology
+# TCRD-185 · owner: jordan.burger@keboola.com
+version: 0.2.0   # 0.2.0 (2026-08-26 eve): + uses_technology (client -> tool).
+                 # Found by eval-question writing: "which clients run UKG?" was
+                 # unrepresentable — used_tool covers delivery tooling only.
+date: 2026-08-26
+status: draft-for-agreement   # TCRD-185 acceptance criterion 1: "written down and agreed before the first full run"
+
+purpose: >
+  Schema for the graph the extraction agent builds from the SharePoint corpus.
+  Designed backwards from the eval prompts the demo must win — above all
+  the relational pair G1 (sponsor aggregation + de-duplicated industry
+  enumeration) and G2 (entity resolution: parent/subsidiary structures) —
+  prompt IDs from Cuesta's eval scoring workbook v0.2 (FROZEN 2026-08-27);
+  full text in eval/questions.yaml. (v0.1 called this pair M1/S1; staffing
+  prompts were dropped in v0.2.) Store-agnostic: everything serializes to JSONL
+  (nodes + edges) and loads into whichever fact store TCRD-182 lands on
+  (PostgreSQL as of 2026-08-26 2:03 PM ET).
+
+conventions:
+  id: "<type>:<kebab-slug>"          # deterministic → upserts are merges, re-runs are idempotent
+  document_id: "document:<sha256-16>" # first 16 hex chars of the file's sha256
+  merge_keys:
+    node: id
+    edge: [src, type, dst]
+  evidence:
+    rule: >
+      Every edge MUST carry evidence: a list of {doc_id, quote} where quote is
+      VERBATIM from the source document — never paraphrased. (Paraphrase skews
+      and compounds errors down the relation chain — T. Fejfar, 2026-08-26.)
+      Nodes SHOULD carry evidence for any non-obvious attribute.
+    shape: [{doc_id: string, quote: string}]
+  entity_resolution: >
+    Merge on exact normalized slug only. A probable-but-unsure match is NEVER
+    auto-merged: emit both nodes plus a "possible_duplicate_of" edge with
+    evidence, for human review.
+
+node_types:
+
+  person:
+    description: Anyone named in the corpus — Cuesta staff, client staff, sponsor contacts.
+    attrs:
+      name: {type: string, required: true}
+      org: {type: string}              # e.g. Cuesta Partners, Riveron, client name
+      title: {type: string}
+      availability_note: {type: string}  # serves S2 ("starting in three weeks")
+
+  engagement:
+    description: One unit of delivered/contracted work (an SOW, a project).
+    attrs:
+      name: {type: string, required: true}
+      sow_date: {type: date}
+      start_date: {type: date}
+      end_date: {type: date}
+      duration: {type: string}         # e.g. "5 weeks + Week 0 mobilization"
+      price_usd: {type: number}
+      price_note: {type: string}            # raw price cell when it said more than a bare number
+      execution_credit_usd: {type: number}  # fee credit toward follow-on execution work
+      status: {type: string, enum: [proposed, active, completed, unknown]}
+      sharepoint_folder: {type: string}
+      summary: {type: string}
+
+  client:
+    description: The target company the work was for.
+    attrs:
+      name: {type: string, required: true}
+      revenue_usd_estimate: {type: number}   # serves P2 ("roughly $200M revenue")
+      ownership: {type: string}              # e.g. "PE-owned"
+
+  sponsor:
+    description: The PE firm (or parent) that sourced/owns the client. Not in
+      TCRD-185's sketch but REQUIRED by M1's "sponsors worked with" and P1's
+      "tell me the sponsor".
+    attrs:
+      name: {type: string, required: true}
+      type: {type: string, enum: [private_equity, corporate_parent, other]}
+
+  industry:
+    description: Sector vocabulary. Keep coarse; A1 disambiguation needs
+      groupings ("manufacturing"), not precision.
+    attrs:
+      name: {type: string, required: true}
+      parent: {type: string}           # optional broader term, e.g. "manufacturing"
+
+  service_offering:
+    description: The kind of work. P1 filters on it ("sell-side IT due diligence"),
+      R1 assembles a proposal of one type, A1 needs it to disambiguate.
+    attrs:
+      name: {type: string, required: true}   # e.g. AI Value Backlog, IOP (Industrial Opportunity Partners) AI Assessment,
+                                             # Sell-side IT DD, Data Platform Build
+
+  skill:
+    description: A capability a person demonstrably has. Shared node; the
+      person-specific proof lives on the has_skill EDGE (see evidence rule).
+    attrs:
+      name: {type: string, required: true}   # e.g. "Keboola implementation",
+                                             # "NetSuite", "data architecture"
+      category: {type: string, enum: [tool, domain, method]}
+
+  tool:
+    description: Technology used on an engagement.
+    attrs:
+      name: {type: string, required: true}
+      vendor: {type: string}
+
+  document:
+    description: A file in the corpus. THE citation target — every fact traces
+      here, and the query agent hands originals back via the SharePoint MCP.
+      "Deliverable" from TCRD-185's sketch = document with doc_type deliverable.
+    attrs:
+      doc_id: {type: string, required: true}   # sha256-16, same as node id suffix
+      name: {type: string, required: true}
+      path: {type: string, required: true}     # SharePoint path (the handback key)
+      mime: {type: string}
+      modified: {type: datetime}
+      doc_type: {type: string, enum: [sow, deliverable, notes, email, feedback, other]}
+
+  finding:
+    description: A stated outcome tied to an engagement ("outcome" in TCRD-185's
+      sketch). Serves P1 ("headline finding"), T1 (takeaways), T2 (client
+      feedback "in their words" → verbatim_text is mandatory for that type).
+    attrs:
+      finding_type: {type: string, required: true,
+                     enum: [headline, takeaway, lesson, client_feedback, risk]}
+      text: {type: string, required: true}     # verbatim where finding_type = client_feedback
+
+edge_types:
+
+  worked_on:        {src: person, dst: engagement, attrs: {role: string, period: string}}
+  for_client:       {src: engagement, dst: client}
+  owned_by:         {src: client, dst: sponsor}
+  of_type:          {src: engagement, dst: service_offering}
+  in_industry:      {src: client, dst: industry}
+  has_skill:        {src: person, dst: skill}      # evidence on THIS edge is the S1 answer
+  used_tool:        {src: engagement, dst: tool}   # tooling used in DELIVERY
+  uses_technology:  {src: client, dst: tool}       # the client's own stack (P2/S2 precedent-matching signal)
+  has_finding:      {src: engagement, dst: finding}
+  part_of:          {src: document, dst: engagement}
+  evidenced_by:     {src: "*", dst: document, attrs: {quote: string}}
+                    # materialized form of inline evidence, for stores/queries
+                    # that want the TCRD-185 literal chain: skill -[evidenced_by]-> document
+  possible_duplicate_of: {src: "*", dst: "*", attrs: {reason: string}}
+                    # entity-resolution escape hatch — reviewed by a human, never auto-merged
+
+serialization:
+  nodes_jsonl: '{"id","type","attrs":{...},"evidence":[{"doc_id","quote"}]}'
+  edges_jsonl: '{"src","type","dst","attrs":{...},"evidence":[{"doc_id","quote"}]}'
+  loader_note: >
+    Postgres mapping: three tables (documents, nodes, edges), attrs/evidence as
+    JSONB, merge keys as above. A GraphQL layer (for the Agnes MCP server) sits
+    on top of these three tables; nothing in this schema assumes a query language.
+
+change_policy: >
+  Attribute additions are free. New node/edge TYPES bump the minor version and
+  require re-extraction of affected documents — re-passes over the corpus are
+  the real cost driver (re-index of a full site ~ full LLM pass), so the type
+  set FREEZES once the first full run starts. Get it agreed first (AC1).
+
+out_of_scope:
+  - X1 (utilization by business unit) — structured/semantic-layer question, not graph.
+  - Anonymization — extraction is general; this corpus is our own material (per TCRD-185).

@@ -544,6 +544,7 @@ from app.api.agent_builder import router as agent_builder_router  # builder assi
 from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
 from app.api.package_builder import router as package_builder_router  # data-package builder turns
 from app.api.mcp_builder import router as mcp_builder_router  # MCP-source builder turns
+from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
 from app.api.knowledge_search import router as knowledge_search_router  # K2: unified search
 from app.api.stack import router as stack_router
@@ -2901,6 +2902,7 @@ def create_app() -> FastAPI:
     app.include_router(entity_builder_router)
     app.include_router(package_builder_router)
     app.include_router(mcp_builder_router)
+    app.include_router(facts_router)
     app.include_router(sharing_router)
     app.include_router(knowledge_search_router)
     app.include_router(stack_router)

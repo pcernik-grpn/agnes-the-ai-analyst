@@ -350,6 +350,7 @@
 <div class="upload-page">
   {% set page_hero_eyebrow = "Store" %}
   {% set page_hero_title = "Upload an entity" %}
+  {% set page_hero_plain = True %}
   {% set page_hero_subtitle %}Share a skill, agent, or plugin with everyone on this instance. Display name will be suffixed with <code>-by-{{ session.user.email.split('@')[0] }}</code> so it doesn't collide.{% endset %}
   {% set page_hero_class = "upload-hero" %}
   {% include "_page_hero.html" %}

@@ -1444,6 +1444,65 @@ viewable by the person it was shared with.
 - /api/collections/{collection_id}/files/{file_id}/raw
 - /api/collections/{collection_id}/files/{file_id}/reingest
 
+### `/api/facts` — Fact graph over Collections
+
+Typed subjects (facts/edges) extracted from Collections documents, each
+claim carrying its evidencing document, a verbatim quote and a date. Behind
+the `facts` feature flag (off by default; `404` on the whole router when
+disabled) and Postgres-only (A3 ratchet — a DuckDB-backed instance answers a
+typed `501`). See
+`docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
+
+**Read surface** (build order steps 2+3+6) — any authenticated caller, no
+admin gate; visibility is enforced entirely server-side, per caller, from
+readable collection grants (§4/§5). `search` and `neighbors` project
+attributes and traverse edges from readable claims only; `claims` returns
+the caller's readable evidence for one subject, `404` (never `403`) when it
+does not exist or has no readable claim. Triple-surface: `agnes facts
+search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/
+`fact_claims` (MCP foundation tools) call the same repository directly —
+facts have no local scope, so every result is labeled `[server]` on the
+CLI's stderr, a deliberate deviation from the `--scope auto|local|server`
+convention (spec §12).
+
+**Write surface** (build order step 4) — scheduler token or admin PAT, no
+CLI/MCP by design (a producer contract, not an analyst command). `ingest`
+is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
+`413`; a single document's evidence alone over the claim cap is a `422`
+`document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
+must be a substring of one chunk of the evidencing document's extracted
+text), union vs `full_documents` replace mode, alias/edge resolution,
+`wrong`-correction re-attachment across a subject's delete-then-recreate,
+and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
+`review_items` mixes two self-describing shapes (a `kind` discriminator on
+each) — `possible_duplicate_of` entity-resolution candidates, and (§7.3)
+`single_valued_conflict`: a functionally single-valued edge type
+(`facts.single_valued_edges` in instance.yaml, default `owned_by`/
+`for_client`) whose src carries >1 distinct dst with a live claim — pre-
+existing edges included, nothing persisted, so it clears the moment a
+dst's claims are gone. Same detection re-runs at read time in
+`collection_facts_summary` (surfaced on the collection detail page),
+caller-scoped: a dst the caller cannot independently read (its own claim
+AND the edge's own claim both readable, the same discipline
+`possible_duplicate_of` review items get) never appears. Response is the
+run report: `{claims_written, claims_rejected: [{row,
+reason}], deferred: [...], subjects_created, subjects_deleted,
+corrections_active: [...], review_items: [...]}`. `documents` may be
+omitted only when every evidence `doc_id` already resolves through a prior
+upload's `corpus_file_sources` mapping — otherwise `400` with the
+unresolved ids itemized. Corrections management
+(`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
+`wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
+producer export (`GET /api/facts/corrections` — every `wrong` subject's
+natural keys, spec §7.4) round out the write surface.
+
+- /api/facts/search
+- /api/facts/neighbors
+- /api/facts/{subject_id}/claims
+- /api/facts/ingest
+- /api/facts/corrections
+- /api/facts/corrections/{subject_kind}/{subject_id}
+
 ### `/api/connectors` — Connector manifest
 
 - /api/connectors/manifest
