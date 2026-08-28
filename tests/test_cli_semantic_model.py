@@ -172,6 +172,64 @@ class TestSemanticModelImportExport:
         assert out.read_text() == DOC
 
 
+class TestSemanticModelPackageLink:
+    def test_link_package_reports_the_updated_list(self):
+        with patch(
+            "cli.commands.admin_semantic_model.api_post",
+            return_value=_resp(200, {"package_ids": ["pkg_1"]}),
+        ) as m:
+            result = runner.invoke(app, ["admin", "semantic-model", "link-package", "retail", "pkg_1"])
+        assert result.exit_code == 0
+        assert m.call_args.kwargs["json"] == {"package_id": "pkg_1"}
+        assert "pkg_1" in result.output
+
+    def test_link_package_json_output(self):
+        with patch(
+            "cli.commands.admin_semantic_model.api_post",
+            return_value=_resp(200, {"package_ids": ["pkg_1"]}),
+        ):
+            result = runner.invoke(app, ["admin", "semantic-model", "link-package", "retail", "pkg_1", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"package_ids": ["pkg_1"]}
+
+    def test_link_package_missing_model_hints_the_next_step(self):
+        with patch(
+            "cli.commands.admin_semantic_model.api_post",
+            return_value=_resp(404, {"detail": "Semantic model 'nope' not found"}),
+        ):
+            result = runner.invoke(app, ["admin", "semantic-model", "link-package", "nope", "pkg_1"])
+        assert result.exit_code == 1
+        assert "agnes admin semantic-model list" in result.output
+
+    def test_link_package_missing_package(self):
+        with patch(
+            "cli.commands.admin_semantic_model.api_post",
+            return_value=_resp(404, {"detail": "data_package_not_found"}),
+        ):
+            result = runner.invoke(app, ["admin", "semantic-model", "link-package", "retail", "nope"])
+        assert result.exit_code == 1
+        assert "Data package not found" in result.output
+
+    def test_unlink_package_reports_the_updated_list(self):
+        with patch(
+            "cli.commands.admin_semantic_model.api_delete",
+            return_value=_resp(200, {"package_ids": []}),
+        ) as m:
+            result = runner.invoke(app, ["admin", "semantic-model", "unlink-package", "retail", "pkg_1"])
+        assert result.exit_code == 0
+        assert m.call_args.args[0] == "/api/admin/semantic-models/retail/packages/pkg_1"
+        assert "retail" in result.output
+
+    def test_unlink_package_missing_model_hints_the_next_step(self):
+        with patch(
+            "cli.commands.admin_semantic_model.api_delete",
+            return_value=_resp(404, {"detail": "Semantic model 'nope' not found"}),
+        ):
+            result = runner.invoke(app, ["admin", "semantic-model", "unlink-package", "nope", "pkg_1"])
+        assert result.exit_code == 1
+        assert "agnes admin semantic-model list" in result.output
+
+
 class TestSemanticSourceAdd:
     def test_add_git_source(self):
         with patch(
