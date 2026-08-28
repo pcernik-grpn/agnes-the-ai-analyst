@@ -803,6 +803,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   user was actively resuming. Any other spawn failure still propagates
   untouched.
 
+- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  **Not fully closed:** a third copy of the same rule lives in the password
+  provider's web-form POST handler, which is the terminal consumer of the form
+  `/login/password` renders — so signing in *with a password* still lands on the
+  home route rather than back in the app. OAuth (Google, Microsoft, Keboola) and
+  magic-link all route through `safe_next_path` and do return you to the app.
+  The underlying fault is that this one rule had four implementations; three of
+  them still exist.
+
 ### Removed
 
 ### Internal
