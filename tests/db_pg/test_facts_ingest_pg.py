@@ -1075,6 +1075,60 @@ def test_http_happy_path_upload_then_ingest_then_search_finds_the_subject(tmp_pa
     assert run["claims_rejected_count"] == 0
     assert run["subjects_created"] == 1
     assert run["caller"] == "admin@test.com"
+    # No `anonymization` block was sent — the persisted run report still
+    # carries the field, defaulted to `{}` (spec §9.2's "never null").
+    assert run["anonymization"] == {}
+
+
+def test_http_anonymization_block_persists_into_the_run_report(tmp_path, monkeypatch, pg_engine):
+    """Spec §9.2: an OPTIONAL producer declaration rides into the persisted
+    run report (never the direct ingest response) so
+    `GET /api/facts/ingest-runs` and the source card can distinguish
+    "requested" from "declared"."""
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Anon E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+
+    content = b"Acme Rollout is sponsored by Alice Adams."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-anon", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout-anon",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-anon", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+        "anonymization": {
+            "declared": True,
+            "scopes": {corpus_id: {"docs_anonymized": 1, "docs_skipped": 0}},
+        },
+    }
+    ingest_resp = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert ingest_resp.status_code == 200, ingest_resp.text
+    # The direct response is still the plain run report — anonymization is
+    # NOT echoed there, only persisted.
+    assert "anonymization" not in ingest_resp.json()
+
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.status_code == 200, runs_resp.text
+    run = runs_resp.json()["runs"][0]
+    assert run["anonymization"] == {
+        "declared": True,
+        "scopes": {corpus_id: {"docs_anonymized": 1, "docs_skipped": 0}},
+    }
 
 
 def test_http_verbatim_gate_rejects_a_fabricated_quote(tmp_path, monkeypatch, pg_engine):

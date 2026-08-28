@@ -2427,6 +2427,14 @@ KNOWN_UNTESTED = {
     # tests/test_web_nav_cowork.py.
     "GET /how-it-works",
     "GET /install",
+    # Logout (#1675): GET renders the CSRF confirm form, POST validates the
+    # double-submit token, revokes server-side and clears the cookie. Both
+    # verbs are covered behaviourally in tests/test_web_logout.py, and the
+    # revocation half is contract-tested on BOTH backends in
+    # tests/db_pg/test_session_revocation.py — richer than this harness's
+    # status-code sweep can express.
+    "GET /auth/logout",
+    "POST /auth/logout",
     "GET /login",
     "GET /login/email",
     "GET /login/password",
@@ -2903,6 +2911,13 @@ KNOWN_UNTESTED = {
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
+    # Agent-sharing approval queue (Track C6, PG-only). Covered end to end
+    # (queue/approve/reject, C2.3 runtime honoring an approved grant, admin
+    # RBAC, moderation-hub UI wiring, DuckDB typed-501 fail-clean) by
+    # tests/db_pg/test_agent_share_approval_pg.py + the repo-level tests in
+    # tests/db_pg/test_share_requests_pg.py; not duplicated here.
+    "GET /api/admin/share-requests",
+    "PATCH /api/admin/share-requests/{request_id}",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
     # Data-package builder page — the same HTML surface, hosting the drawer

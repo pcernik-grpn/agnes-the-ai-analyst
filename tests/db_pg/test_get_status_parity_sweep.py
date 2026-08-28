@@ -87,6 +87,16 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
         "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
     ),
+    # Agent-sharing approval queue (Track C6) — genuinely parameter-free
+    # (`status`/`limit`/`skip` are query params with defaults) and reaches
+    # share_requests_repo() -- DuckDB -> typed 501, Postgres -> 200 (empty
+    # list, nothing seeded). This is the admin QUEUE surface only; sharing
+    # ITSELF (`PUT /api/sharing/agent/{id}`) falls back to an instant grant
+    # on DuckDB instead of a 501 — see app/services/library_sharing.py.
+    "GET /api/admin/share-requests": (
+        "share_requests_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/share_requests_pg.py"
+    ),
 }
 
 

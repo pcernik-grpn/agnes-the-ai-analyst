@@ -152,6 +152,7 @@ __all__ = [
     # Fact graph over Collections
     "facts_repo",
     "ontology_drafts_repo",
+    "share_requests_repo",
     "facts_ingest_runs_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
@@ -577,6 +578,11 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "user_external_identities": {
         PG: ("src.repositories.user_external_identities_pg", "UserExternalIdentitiesPgRepository"),
     },
+    # Agent-sharing approval queue (Track C6) — PG-only, A3 ratchet: no
+    # DuckDB backend.
+    "share_requests": {
+        PG: ("src.repositories.share_requests_pg", "ShareRequestsPgRepository"),
+    },
     # agent registry (v103)
     "agents": {
         DUCKDB: ("src.repositories.agents", "AgentsRepository"),
@@ -966,6 +972,12 @@ def user_external_identities_repo() -> Any:
     (design 2026-08-28). PG-only — raises ``RequiresPostgresBackend`` on a
     DuckDB-backed instance."""
     return _build("user_external_identities")
+
+
+def share_requests_repo() -> Any:
+    """Agent-sharing approval queue (Track C6). PG-only — raises
+    ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
+    return _build("share_requests")
 
 
 # Maintained digests (K4, #799)

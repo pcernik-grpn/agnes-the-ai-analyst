@@ -1449,6 +1449,32 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 },
             },
         },
+        # Microsoft Entra ID group sync. Declared so `group_sync_enabled`
+        # renders as a toggle rather than a free-text box — same rationale
+        # as `keboola.allow_token_header` above (Devin Review on PR #1288).
+        # Read by app/auth/microsoft_group_sync.py.
+        "microsoft": {
+            "kind": "object",
+            "hint": (
+                "Mirror the signed-in user's Entra ID group memberships into "
+                "user_group_members (source='microsoft_sync') on every Microsoft "
+                "sign-in. See docs/auth-microsoft-oauth.md before enabling — it "
+                "needs its own Entra admin-consent grant."
+            ),
+            "fields": {
+                "group_sync_enabled": {
+                    "kind": "bool",
+                    "default": _flag_default_path(("auth", "microsoft", "group_sync_enabled"), False),
+                    "hint": (
+                        "Off by default: enabling it also widens the OAuth consent "
+                        "scope requested at /auth/microsoft/login to the delegated "
+                        "Graph permission GroupMember.Read.All, which needs admin "
+                        "consent in the Entra app registration and a restart to take "
+                        "effect. See docs/feature-flags.md."
+                    ),
+                },
+            },
+        },
     },
     "ai": {
         "base_url": {
@@ -8270,6 +8296,10 @@ async def admin_override_store_submission(
         },
         result="success",
     )
+
+    from app.api.store import _notify_submitter
+
+    _notify_submitter(sub, decision="overridden", note=body.reason)
     return {"ok": True, "submission_id": submission_id, "entity_id": entity_id}
 
 
@@ -8520,7 +8550,7 @@ async def admin_delete_store_submission(
     wrong call. The audit_log row preserves what was deleted in case
     triage needs the evidence trail later.
     """
-    from app.api.store import _entity_dir
+    from app.api.store import _entity_dir, _notify_submitter
 
     subs = store_submissions_repo()
     sub = subs.get(submission_id)
@@ -8545,6 +8575,8 @@ async def admin_delete_store_submission(
             "status": sub.get("status"),
         },
     )
+
+    _notify_submitter(sub, decision="deleted")
 
 
 # ---------------------------------------------------------------------------

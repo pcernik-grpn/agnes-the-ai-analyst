@@ -33,7 +33,18 @@ Surface (all gated by ``Depends(require_admin)``):
   GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the flat
                                                                 ``{source_scope_id: collection_id}``
                                                                 mapping ``ship_to_agnes.py
-                                                                --corpus-map`` consumes.
+                                                                --corpus-map`` consumes. Per-scope
+                                                                ``anonymize`` is NOT in this shape
+                                                                (kept flat/backward-compatible) —
+                                                                a producer that needs it reads the
+                                                                sibling ``GET .../scopes`` endpoint
+                                                                instead (each row already carries
+                                                                ``anonymize``). Agnes's own
+                                                                ``corpus-extraction`` job handler
+                                                                (``app/worker/kinds.py``) builds an
+                                                                anonymize-scoped mapping the same
+                                                                way, for the same reason: this
+                                                                endpoint's contract does not move.
   GET    /api/admin/sharepoint/connections/{id}/certificate  — read-only certificate metadata
                                                                 (thumbprint, subject/issuer, expiry)
                                                                 derived at request time from the
@@ -177,13 +188,51 @@ def _group_ids_for_collection(collection_id: str) -> List[str]:
     return [g["group_id"] for g in grants if g.get("resource_id") == collection_id]
 
 
-def _scope_out(scope: Dict[str, Any]) -> Dict[str, Any]:
+def _latest_run_anonymized_corpus_ids() -> set:
+    """Which collection ids the LATEST persisted ``facts_ingest_runs`` row
+    declares it anonymized (spec §9.2 — the producer's own declaration, see
+    ``app/api/facts.py``'s ``FactsIngestAnonymizationReport``). This is what
+    turns "requested" (the wizard's checkbox, below) into "anonymized" —
+    never rendering the latter from the checkbox alone (spec §13.2: "on a
+    collection detail it is a state plus a named batch task, never a
+    toggle").
+
+    Best-effort: ``facts_ingest_runs_repo()`` is PG-only (A3 ratchet) and
+    may not exist yet on a DuckDB-backed instance, or there may be no runs
+    yet — either degrades to "nothing declared yet", never a 500 on the
+    wizard's own scope listing (a badge that cannot prove itself should
+    read as unproven, not crash the page that shows it).
+    """
+    try:
+        from src.repositories import facts_ingest_runs_repo
+
+        runs = facts_ingest_runs_repo().list_recent(limit=1)
+    except Exception:
+        return set()
+    if not runs:
+        return set()
+    anonymization = runs[0].get("anonymization") or {}
+    scopes = anonymization.get("scopes")
+    return set(scopes.keys()) if isinstance(scopes, dict) else set()
+
+
+def _scope_out(scope: Dict[str, Any], declared_corpus_ids: Optional[set] = None) -> Dict[str, Any]:
     collection = file_corpora_repo().get(scope.get("collection_id") or "")
     group_ids = _group_ids_for_collection(scope.get("collection_id") or "")
+    if declared_corpus_ids is None:
+        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
+    anonymize = bool(scope.get("anonymize"))
     return {
         "source_scope_id": scope.get("source_scope_id"),
         "display_path": scope.get("display_path"),
-        "anonymize": bool(scope.get("anonymize")),
+        "anonymize": anonymize,
+        # The checkbox above only RECORDS an admin's intent — this field is
+        # the honest other half: whether the producer's LAST ingest run
+        # actually declared this collection anonymized. `anonymize=true,
+        # anonymization_declared=false` is "anonymization requested"; both
+        # true is "anonymized". Never collapse the two (see module docstring
+        # note + docs/anonymization.md's badge semantics).
+        "anonymization_declared": anonymize and (scope.get("collection_id") in declared_corpus_ids),
         "collection_id": scope.get("collection_id"),
         "collection": (
             {"id": collection["id"], "slug": collection["slug"], "name": collection["name"]} if collection else None
@@ -351,7 +400,8 @@ async def list_scopes(
     """The wizard's step-2/3 source of truth: every confirmed scope row,
     enriched with its collection and current group grants."""
     row = _sharepoint_connection_or_404(connection_id)
-    return {"items": [_scope_out(s) for s in _scopes(row)]}
+    declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
+    return {"items": [_scope_out(s, declared) for s in _scopes(row)]}
 
 
 @router.post("/connections/{connection_id}/scopes", status_code=201)
@@ -465,7 +515,14 @@ async def corpus_map(
     ``{source_scope_id: collection_id}`` mapping the external crawl pipeline
     reads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside
     Agnes. Not wrapped in an envelope key — the producer consumes this
-    verbatim as the mapping itself."""
+    verbatim as the mapping itself.
+
+    Deliberately does NOT carry ``anonymize`` — that would break this
+    endpoint's flat, backward-compatible shape. A producer that needs to
+    know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
+    row already carries ``anonymize``); Agnes's own ``corpus-extraction``
+    job handler does the equivalent lookup internally
+    (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
     row = _sharepoint_connection_or_404(connection_id)
     return {s["source_scope_id"]: s["collection_id"] for s in _scopes(row) if s.get("source_scope_id")}
 

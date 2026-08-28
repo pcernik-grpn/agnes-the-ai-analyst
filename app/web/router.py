@@ -586,7 +586,7 @@ _URL_MAP = {
     "admin_activity": "/admin/activity",
     "index": "/",
     "auth.login": "/login",
-    "auth.logout": "/login",  # No logout route — redirect to login
+    "auth.logout": "/auth/logout",
     "password_auth.login_email": "/auth/password/login",
     "password_auth.reset_request": "/auth/password/reset",
     "password_auth.request_access": "/auth/password/setup",
@@ -5551,6 +5551,87 @@ def _web_csrf_ok(request: Request, supplied: str) -> bool:
     )
 
 
+@router.get("/auth/logout", response_class=HTMLResponse)
+async def logout_page(request: Request, user: Optional[dict] = Depends(get_optional_user)):
+    """Logout CONFIRMATION page (no state change) — issue #1675.
+
+    The Logout menu item used to be a plain ``GET`` link to ``/login``,
+    which neither cleared the ``access_token`` cookie nor ended the session
+    — it just LOOKED like sign-out (the app happily reopened on the next
+    visit). Ending a session is a mutation, so it cannot happen on a GET
+    (security playbook #10, F2); this route only renders a confirm form
+    with a double-submit CSRF token. The actual cookie-clear + server-side
+    revocation is :func:`logout_submit` (POST) — same GET-confirms /
+    POST-mutates shape this codebase already uses for :func:`slack_bind` /
+    :func:`slack_bind_confirm`.
+
+    An already-signed-out visitor has nothing to confirm — straight to
+    ``/login``.
+    """
+    if user is None:
+        return RedirectResponse(url="/login", status_code=302)
+
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx = _build_context(request, user=user, csrf_token=csrf_token)
+    response = templates.TemplateResponse(request, "logout.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
+
+
+@router.post("/auth/logout", response_class=HTMLResponse)
+async def logout_submit(
+    request: Request,
+    csrf_token: str = Form(""),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """End the session — clear the cookie AND revoke it server-side.
+
+    Issue #1675 (clear the browser's ``access_token`` cookie) and #1676
+    (revoke the token so a copy captured before logout — a synced browser
+    profile, host malware, a shared machine — stops working too, not only
+    the browser that clicked Logout) land together: a client-side-only fix
+    leaves every other copy of the token valid for the rest of its 30-day
+    ``exp``.
+
+    Requires the double-submit ``web_csrf`` token minted by the GET
+    confirmation above (F2) — a state-changing action reachable from a menu
+    item on every page must not fire on ambient cookie auth alone, the same
+    reasoning the F2 security review applied to :func:`slack_bind_confirm`.
+    """
+    if not _web_csrf_ok(request, csrf_token):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    if user is not None:
+        try:
+            from src.repositories import users_repo
+
+            users_repo().revoke_sessions(user["id"])
+        except Exception:
+            # Best-effort: clearing the browser's own cookie below is the
+            # primary contract of "logout" and must complete even if the
+            # DB-backed revocation write fails (e.g. a brief outage).
+            logger.exception("session revocation failed on logout for user %s", user.get("id"))
+
+    from app.auth.public_url import cookie_secure
+    from app.instance_config import session_cookie_domain
+
+    response = RedirectResponse(url="/login", status_code=303)
+    # Must match the attributes every provider sets the cookie with
+    # (google.py / microsoft.py / email.py / password.py / keboola.py) —
+    # `domain` in particular, since session_cookie_domain() returns a
+    # `.<parent-domain>` when data_apps.subdomain_base is configured and a
+    # mismatched Domain attribute makes the deletion a silent no-op (#1675).
+    response.delete_cookie(
+        key="access_token",
+        path="/",
+        domain=session_cookie_domain(),
+        secure=cookie_secure(request),
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
 _SLACK_BIND_CSRF_COOKIE = "slack_bind_csrf"
 
 
@@ -7748,6 +7829,32 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
     cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
 
+    # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
+    # own confirmed scopes marked anonymize=true, read straight off `conn` —
+    # the SAME config `app/api/admin_sharepoint.py` writes) vs "declared"
+    # (the LATEST persisted run report's `anonymization.scopes` — the
+    # producer's own claim). Never collapse the two: a collection can be
+    # requested with nothing declared yet (badge: "anonymization
+    # requested", warn), or declared (badge: "anonymized", ok). A
+    # collection declared but never requested is surfaced too — an operator
+    # misconfiguration worth seeing, not hiding.
+    requested_ids = {
+        s.get("collection_id")
+        for s in (conn.get("config") or {}).get("scopes") or []
+        if isinstance(s, dict) and s.get("anonymize") and s.get("collection_id")
+    }
+    declared_ids: set[str] = set()
+    if last_run is not None:
+        anon = last_run.get("anonymization") or {}
+        run_scopes = anon.get("scopes")
+        if isinstance(run_scopes, dict):
+            declared_ids = set(run_scopes.keys())
+    cell["anonymization"] = {
+        "requested": sorted(requested_ids),
+        "declared": sorted(requested_ids & declared_ids),
+        "pending": sorted(requested_ids - declared_ids),
+    }
+
     return cell
 
 
@@ -8691,6 +8798,17 @@ async def admin_moderation_hub_page(
         limit=1,
     )
 
+    # Track C6 — agent-sharing approval queue. PG-only (A3 ratchet): on a
+    # DuckDB-backed instance the feature doesn't exist here at all, so the
+    # zone is simply omitted rather than 501ing the whole moderation hub —
+    # same posture as `app.web.admin_signals._resolve_agent_share_requests`.
+    from src.repositories import use_pg
+
+    agent_share_requests_enabled = use_pg()
+    pending_share_requests: list = []
+    if agent_share_requests_enabled:
+        pending_share_requests = _pending_agent_share_requests_for_admin()
+
     ctx = _build_context(
         request,
         user=user,
@@ -8699,8 +8817,44 @@ async def admin_moderation_hub_page(
         verification_limit=verification_limit,
         pending_submissions_total=pending_submissions_total,
         store_verification_enabled=verification_enabled,
+        agent_share_requests_enabled=agent_share_requests_enabled,
+        pending_share_requests=pending_share_requests,
     )
     return templates.TemplateResponse(request, "admin_moderation_hub.html", ctx)
+
+
+def _pending_agent_share_requests_for_admin() -> list:
+    """Pending rows for the moderation hub's "Pending agent shares" zone,
+    with the ids the template needs resolved to names — mirrors
+    ``app.api.share_requests_admin._serialize``'s projection, kept local
+    to this module rather than importing a private helper across the
+    app.api / app.web boundary."""
+    from src.repositories import (
+        agents_repo,
+        share_requests_repo,
+        user_groups_repo,
+        users_repo,
+    )
+
+    rows, _ = share_requests_repo().list_for_admin(status=["pending"], limit=200)
+    agents = agents_repo()
+    groups = user_groups_repo()
+    users = users_repo()
+    out = []
+    for r in rows:
+        agent = agents.get_by_id(r["resource_id"]) if r["resource_type"] == "agent" else None
+        requester = users.get_by_id(r["requested_by"])
+        group = groups.get(r["requested_group_id"])
+        out.append(
+            {
+                "id": r["id"],
+                "resource_name": (agent or {}).get("name") or r["resource_id"],
+                "requested_group_name": (group or {}).get("name") or r["requested_group_id"],
+                "requested_by_email": (requester or {}).get("email") or r["requested_by"],
+                "created_at": r.get("created_at"),
+            }
+        )
+    return out
 
 
 @router.get("/admin/store/submissions", response_class=HTMLResponse)
