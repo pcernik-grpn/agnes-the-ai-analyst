@@ -289,9 +289,10 @@ def test_link_second_identity_for_user_without_replace_raises_conflict(pg_engine
         ids_repo.link(**_link_kwargs("u1", subject="oid-other"))
 
 
-def test_link_replace_existing_swaps_the_binding(pg_engine, monkeypatch):
+def test_link_replace_of_swaps_the_binding(pg_engine, monkeypatch):
     """Stale-binding replacement after a tenant re-point (design: binding
-    algorithm, replacement rule)."""
+    algorithm, replacement rule) — a compare-and-swap against the observed
+    stale identity."""
     _, ids_repo = _make_repos(pg_engine, monkeypatch)
     _add_user(pg_engine, "u1", "user1@fabrikam.com")
     ids_repo.link(**_link_kwargs("u1"))
@@ -301,7 +302,7 @@ def test_link_replace_existing_swaps_the_binding(pg_engine, monkeypatch):
     other_tid = "00000000-0000-0000-0000-000000000001"
     ids_repo.link(
         **_link_kwargs("u1", tenant_id=other_tid, subject="oid-new", email_at_link="u1@new.example"),
-        replace_existing=True,
+        replace_of=("entra_oidc", TID, "oid-user-1"),
     )
     row = ids_repo.get_by_user_id("u1")
     assert row["tenant_id"] == other_tid
@@ -313,17 +314,46 @@ def test_link_replace_existing_swaps_the_binding(pg_engine, monkeypatch):
     assert ids_repo.get_by_subject("entra_oidc", TID, "oid-user-1") is None
 
 
-def test_link_replace_existing_still_raises_on_foreign_subject(pg_engine, monkeypatch):
+def test_link_replace_of_is_a_compare_and_swap(pg_engine, monkeypatch):
+    """Two logins racing after a tenant re-point must not both succeed: the
+    second swap, keyed on the identity it OBSERVED, misses the row the first
+    one already rewrote and must raise instead of clobbering the winner."""
+    from src.repositories.user_external_identities_pg import IdentityLinkConflictError
+
+    _, ids_repo = _make_repos(pg_engine, monkeypatch)
+    _add_user(pg_engine, "u1", "user1@fabrikam.com")
+    ids_repo.link(**_link_kwargs("u1"))  # the stale row both logins observe
+
+    stale = ("entra_oidc", TID, "oid-user-1")
+    other_tid = "00000000-0000-0000-0000-000000000001"
+    ids_repo.link(
+        **_link_kwargs("u1", tenant_id=other_tid, subject="oid-winner"),
+        replace_of=stale,
+    )
+    with pytest.raises(IdentityLinkConflictError):
+        ids_repo.link(
+            **_link_kwargs("u1", tenant_id=other_tid, subject="oid-loser"),
+            replace_of=stale,
+        )
+    assert ids_repo.get_by_user_id("u1")["subject"] == "oid-winner"
+
+
+def test_link_replace_of_still_raises_on_foreign_subject(pg_engine, monkeypatch):
+    """The CAS update can also lose to the subject uniqueness key — a swap
+    targeting a subject another user already holds must raise, not clobber."""
     from src.repositories.user_external_identities_pg import IdentityLinkConflictError
 
     _, ids_repo = _make_repos(pg_engine, monkeypatch)
     _add_user(pg_engine, "u1", "user1@fabrikam.com")
     _add_user(pg_engine, "u2", "user2@fabrikam.com")
     ids_repo.link(**_link_kwargs("u1"))
+    other_tid = "00000000-0000-0000-0000-000000000001"
+    ids_repo.link(**_link_kwargs("u2", tenant_id=other_tid, subject="oid-u2", email_at_link="user2@fabrikam.com"))
     with pytest.raises(IdentityLinkConflictError):
+        # u2's swap targets u1's subject key in TID.
         ids_repo.link(
             **_link_kwargs("u2", email_at_link="user2@fabrikam.com"),
-            replace_existing=True,
+            replace_of=("entra_oidc", other_tid, "oid-u2"),
         )
 
 

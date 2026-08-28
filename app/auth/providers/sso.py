@@ -49,19 +49,34 @@ from urllib.parse import quote
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.auth._common import safe_next_path
 from app.auth.dependencies import get_optional_user
 from app.auth.jwt import SESSION_COOKIE_MAX_AGE_SECONDS, create_access_token
 from app.auth.providers.microsoft import _is_directory_guid, resolve_identity
-from src.repositories import (
-    RequiresPostgresBackend,
-    audit_repo,
-    sso_config_repo,
-    user_external_identities_repo,
-)
+
+# The repositories package is held as a MODULE, never from-imported: the test
+# harness reloads it when switching backends (`build_seeded_client`), and a
+# from-import would freeze this module onto the pre-reload factory functions
+# and — worse — the pre-reload `RequiresPostgresBackend` class identity, so
+# the `except _repositories.RequiresPostgresBackend` clauses below would stop
+# matching what the live factories raise. Attribute access on the module
+# object always resolves to the current definitions.
+from src import repositories as _repositories
 
 logger = logging.getLogger(__name__)
+
+
+def sso_config_repo():
+    """Live factory passthrough (reload-safe; monkeypatchable in tests)."""
+    return _repositories.sso_config_repo()
+
+
+def user_external_identities_repo():
+    """Live factory passthrough (reload-safe; monkeypatchable in tests)."""
+    return _repositories.user_external_identities_repo()
+
 
 PROVIDER_TYPE = "entra_oidc"
 
@@ -72,7 +87,11 @@ router = APIRouter(prefix="/auth/sso", tags=["auth"])
 
 oauth = OAuth()
 
-_TEST_MARKER_SESSION_KEY = "sso_test"
+# The admin test sign-in stashes the flow's own OAuth `state` under this key
+# (never a session-wide boolean): the callback treats a flow as a test run
+# only when the incoming `state` matches, so a normal sign-in started in a
+# second tab of the same browser can neither consume nor inherit the marker.
+_TEST_STATE_SESSION_KEY = "sso_test_state"
 _client_fingerprint: Optional[tuple] = None
 
 
@@ -90,7 +109,7 @@ def _config_state() -> tuple[Optional[dict[str, Any]], Optional[str]]:
         if cfg is None:
             return None, None
         return cfg, repo.get_client_secret()
-    except RequiresPostgresBackend:
+    except _repositories.RequiresPostgresBackend:
         return None, None
 
 
@@ -149,7 +168,7 @@ def startup_warnings() -> list[str]:
                 "scoped to domains the external tenant is entitled to assert."
             )
         ]
-    except RequiresPostgresBackend:
+    except _repositories.RequiresPostgresBackend:
         return []
 
 
@@ -229,7 +248,7 @@ def _audit_linked(user_id: str, subject: str, replaced_subject: Optional[str] = 
     if replaced_subject:
         params["replaced_subject"] = replaced_subject
     try:
-        audit_repo().log(user_id=user_id, action="sso.identity.linked", resource=f"user:{user_id}", params=params)
+        _repositories.audit_repo().log(user_id=user_id, action="sso.identity.linked", resource=f"user:{user_id}", params=params)
     except Exception:
         logger.warning("audit log failed for sso.identity.linked")
 
@@ -302,13 +321,16 @@ def bind_external_identity(
                 subject,
             )
             try:
+                # Compare-and-swap against the OBSERVED stale row: a
+                # concurrent login that already replaced it must surface as a
+                # conflict for the race rule, never be silently clobbered.
                 ids_repo.link(
                     user_id=user["id"],
                     provider_type=PROVIDER_TYPE,
                     tenant_id=tenant_id,
                     subject=subject,
                     email_at_link=email,
-                    replace_existing=True,
+                    replace_of=(existing["provider_type"], existing["tenant_id"], existing["subject"]),
                 )
             except IdentityLinkConflictError:
                 return _resolve_link_race(ids_repo, user, tenant_id, subject)
@@ -363,6 +385,41 @@ def _resolve_link_race(ids_repo, user: dict, tenant_id: str, subject: str) -> tu
     return None, "sso_identity_conflict"
 
 
+def preview_binding(*, subject: str, tenant_id: str, email: str) -> dict[str, Any]:
+    """Read-only mirror of :func:`bind_external_identity` for the admin test
+    sign-in: what a REAL sign-in with these validated claims would do, with
+    no user row, identity write, ``last_login_at`` touch, or audit row.
+
+    Returns ``{"outcome", "refusal", "account_email"}`` where ``outcome`` is
+    ``sign_in`` (subject already bound), ``attach`` (first SSO sign-in links
+    an existing account), ``create`` (a new account would be provisioned), or
+    ``refused`` (with ``refusal`` carrying the same error code the real
+    callback would redirect with). Kept in lockstep with the binding
+    algorithm — a rule added there belongs here too, or the test page lies.
+    """
+    from src.repositories import users_repo
+
+    ids_repo = user_external_identities_repo()
+    hit = ids_repo.get_by_subject(PROVIDER_TYPE, tenant_id, subject)
+    if hit:
+        bound = users_repo().get_by_id(hit["user_id"])
+        if bound is None:
+            return {"outcome": "refused", "refusal": "sso_identity_conflict", "account_email": None}
+        if not bool(bound.get("active", True)):
+            return {"outcome": "refused", "refusal": "deactivated", "account_email": bound["email"]}
+        return {"outcome": "sign_in", "refusal": None, "account_email": bound["email"]}
+
+    existing_user = users_repo().get_by_email_ci(email)
+    if existing_user is None:
+        return {"outcome": "create", "refusal": None, "account_email": None}
+    if not bool(existing_user.get("active", True)):
+        return {"outcome": "refused", "refusal": "deactivated", "account_email": existing_user["email"]}
+    row = ids_repo.get_by_user_id(existing_user["id"])
+    if row and (row["provider_type"], row["tenant_id"]) == (PROVIDER_TYPE, tenant_id) and row["subject"] != subject:
+        return {"outcome": "refused", "refusal": "sso_identity_conflict", "account_email": existing_user["email"]}
+    return {"outcome": "attach", "refusal": None, "account_email": existing_user["email"]}
+
+
 # ---------------------------------------------------------------------------
 # routes (inline gating — see module docstring)
 # ---------------------------------------------------------------------------
@@ -390,26 +447,33 @@ def _normal_mode_gate() -> None:
         raise HTTPException(status_code=404, detail="Not Found")
 
 
+def _redirect_state(response: Any) -> str:
+    """The OAuth ``state`` parameter from an authorize redirect's Location."""
+    from urllib.parse import parse_qs, urlsplit
+
+    location = response.headers.get("location", "") if hasattr(response, "headers") else ""
+    return (parse_qs(urlsplit(location).query).get("state") or [""])[0]
+
+
 @router.get("/login")
 async def sso_login(request: Request, user: Optional[dict] = Depends(get_optional_user)):
     """Redirect to the configured tenant's Entra authorize endpoint.
 
     ``?mode=test`` (admin-only, works pre-enable and outside the allowlist)
-    stashes a session marker so the callback renders the side-effect-free
-    result page instead of signing anyone in.
+    stashes THIS flow's OAuth ``state`` so the callback renders the
+    side-effect-free result page instead of signing anyone in — a concurrent
+    normal sign-in carries a different ``state`` and follows the normal path
+    untouched.
     """
-    if request.query_params.get("mode") == "test":
+    test_mode = request.query_params.get("mode") == "test"
+    if test_mode:
         if not _is_admin_session(user):
             raise HTTPException(status_code=403, detail="Admin access required")
         if not is_configured():
             return RedirectResponse(url="/login?error=sso_not_configured")
-        request.session[_TEST_MARKER_SESSION_KEY] = True
         request.session.pop("login_next", None)
     else:
         _normal_mode_gate()
-        # A stale test marker from an abandoned admin test must never leak
-        # into a normal sign-in.
-        request.session.pop(_TEST_MARKER_SESSION_KEY, None)
         next_path = safe_next_path(request.query_params.get("next"), default="")
         if next_path:
             request.session["login_next"] = next_path
@@ -425,20 +489,32 @@ async def sso_login(request: Request, user: Optional[dict] = Depends(get_optiona
     # and without the picker Entra may silently SSO an already-signed-in
     # identity — e.g. a B2B guest session — which then dies on the domain
     # allowlist with no chance to pick the right account.
-    return await client.authorize_redirect(request, redirect_uri, prompt="select_account")
+    response = await client.authorize_redirect(request, redirect_uri, prompt="select_account")
+    if test_mode:
+        state = _redirect_state(response)
+        if not state:
+            # Without a state to bind to, the callback could not tell this
+            # test flow from a real sign-in — refuse rather than risk one.
+            logger.error("SSO test sign-in could not extract the OAuth state from the authorize redirect")
+            return RedirectResponse(url="/login?error=sso_oauth_failed")
+        request.session[_TEST_STATE_SESSION_KEY] = state
+    return response
 
 
 @router.get("/callback")
 async def sso_callback(request: Request, user: Optional[dict] = Depends(get_optional_user)):
     """Code exchange -> claims -> identity -> bind -> JWT cookie.
 
-    The test-mode leg (session marker) re-verifies the CURRENT session user
-    is an admin, completes the exchange, and renders the result page —
-    without ``ensure_user``, without an identity row, without a cookie.
+    The test-mode leg (this flow's ``state`` matches the stashed test state)
+    re-verifies the CURRENT session user is an admin, completes the exchange,
+    and renders the result page — without ``ensure_user``, without an
+    identity row, without a cookie.
     """
-    # Pop unconditionally: the marker is single-use whatever happens next.
-    test_mode = bool(request.session.pop(_TEST_MARKER_SESSION_KEY, None))
+    incoming_state = str(request.query_params.get("state") or "")
+    test_mode = bool(incoming_state) and request.session.get(_TEST_STATE_SESSION_KEY) == incoming_state
     if test_mode:
+        # Single-use: consume the marker only for ITS flow.
+        request.session.pop(_TEST_STATE_SESSION_KEY, None)
         if not _is_admin_session(user):
             raise HTTPException(status_code=403, detail="Admin access required")
         if not is_configured():
@@ -460,12 +536,20 @@ async def sso_callback(request: Request, user: Optional[dict] = Depends(get_opti
         error, email, oid, tid = evaluate_claims(user_info, cfg)
 
         if test_mode:
-            return _render_test_result(request, cfg, user_info, error, email, oid, tid)
+            binding = None
+            if error is None:
+                # Same threadpool rule as the real binding below — these are
+                # synchronous Postgres reads.
+                binding = await run_in_threadpool(preview_binding, subject=oid, tenant_id=tid, email=email)
+            return _render_test_result(request, cfg, error, email, oid, tid, binding)
 
         if error:
             return RedirectResponse(url=f"/login?error={error}")
 
-        bound_user, bind_error = bind_external_identity(
+        # Synchronous Postgres reads/writes — off the event loop, like the
+        # keboola provider's provisioning path.
+        bound_user, bind_error = await run_in_threadpool(
+            bind_external_identity,
             subject=oid,
             tenant_id=tid,
             email=email,
@@ -473,6 +557,10 @@ async def sso_callback(request: Request, user: Optional[dict] = Depends(get_opti
         )
         if bind_error:
             return RedirectResponse(url=f"/login?error={bind_error}")
+
+        from app.auth.login_audit import audit_login_success
+
+        audit_login_success(bound_user["id"], provider="sso", request=request)
 
         jwt_token = create_access_token(bound_user["id"], bound_user["email"])
         target = safe_next_path(request.session.pop("login_next", None))
@@ -494,7 +582,7 @@ async def sso_callback(request: Request, user: Optional[dict] = Depends(get_opti
 
     except HTTPException:
         raise
-    except RequiresPostgresBackend:
+    except _repositories.RequiresPostgresBackend:
         # Unreachable behind the gates above (both swallow it to a 404 /
         # redirect first), but if it ever fires it is a backend-routing
         # problem, not an OAuth failure — let the app-wide typed-501 handler
@@ -511,31 +599,21 @@ async def sso_callback(request: Request, user: Optional[dict] = Depends(get_opti
 
 
 def _render_test_result(
-    request: Request, cfg: dict, user_info: dict, error: Optional[str], email: str, oid: str, tid: str
+    request: Request,
+    cfg: dict,
+    error: Optional[str],
+    email: str,
+    oid: str,
+    tid: str,
+    binding: Optional[dict],
 ):
     """The admin test sign-in's result page: resolved claims, the
-    domain-allowlist verdict, and which account the login WOULD attach to —
-    computed read-only (no ``ensure_user``, no identity write, no cookie)."""
+    domain-allowlist verdict, and the :func:`preview_binding` prediction of
+    what a real sign-in would do — computed read-only (no ``ensure_user``,
+    no identity write, no cookie)."""
     from app.web.router import _build_context, templates
-    from src.repositories import users_repo
 
-    would_attach = None
-    identity_bound_to = None
-    if email:
-        try:
-            existing = users_repo().get_by_email_ci(email)
-            would_attach = existing["email"] if existing else None
-        except Exception:
-            would_attach = None
-    if oid and tid:
-        try:
-            row = user_external_identities_repo().get_by_subject(PROVIDER_TYPE, tid, oid)
-            if row:
-                bound = users_repo().get_by_id(row["user_id"])
-                identity_bound_to = bound["email"] if bound else None
-        except Exception:
-            identity_bound_to = None
-
+    binding = binding or {}
     domain = email.split("@")[-1] if email and "@" in email else ""
     ctx = _build_context(
         request,
@@ -547,7 +625,8 @@ def _render_test_result(
         domain_allowed=bool(domain and domain in cfg.get("allowed_email_domains", [])),
         allowed_domains=cfg.get("allowed_email_domains", []),
         display_name=cfg.get("display_name", ""),
-        would_attach=would_attach,
-        identity_bound_to=identity_bound_to,
+        binding_outcome=binding.get("outcome"),
+        binding_refusal=binding.get("refusal"),
+        binding_account_email=binding.get("account_email"),
     )
     return templates.TemplateResponse(request, "sso_test_result.html", ctx)

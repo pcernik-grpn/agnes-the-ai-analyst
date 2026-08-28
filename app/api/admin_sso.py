@@ -259,7 +259,10 @@ async def test_sso_config(user: dict = Depends(require_admin)):
         "/v2.0/.well-known/openid-configuration"
     )
     try:
-        doc = _fetch_discovery_document(url)
+        # Blocking httpx call (up to the 10s timeout) — off the event loop.
+        from starlette.concurrency import run_in_threadpool
+
+        doc = await run_in_threadpool(_fetch_discovery_document, url)
     except Exception as exc:
         # %r + slice: the response body/exception text originates from the
         # network — same logging discipline as the OAuth callbacks.

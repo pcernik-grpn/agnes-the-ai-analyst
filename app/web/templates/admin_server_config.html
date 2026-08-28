@@ -2231,6 +2231,13 @@ slackSecretsLoad();
 // ════════════════════════════════════════════════════════════════════════
 
 const SSO_API = "/api/admin/sso";
+// Last-loaded server state — ssoSave() branches on it: only the INITIAL
+// create uses the disabled-first sequence (the secret column needs a row to
+// live on); an existing config is saved in place with the requested enabled
+// state, so an enabled instance never passes through a disable (which the
+// last-login-door guard would 422 when SSO is the only door, and which
+// would emit stray disable/enable audit pairs).
+let ssoServerState = { configured: false, enabled: false };
 
 function ssoBadge(ok, yes, no, badClass) {
   return ok
@@ -2251,6 +2258,7 @@ async function ssoLoad() {
     }
     if (!r.ok) throw new Error("HTTP " + r.status);
     const s = await r.json();
+    ssoServerState = { configured: !!s.configured, enabled: !!s.enabled };
     el.className = "";
     el.innerHTML = [
       ssoBadge(s.configured, "configured", "not configured"),
@@ -2320,16 +2328,28 @@ async function ssoSave(btn) {
   const secret = secretInput.value.trim();
   btn.disabled = true;
   try {
-    // The secret column lives on the config row, and enabling requires a
-    // stored secret — so: ensure the row exists (disabled), store the
-    // secret, then apply the requested enable state.
-    await ssoPutConfig(false);
-    if (secret) {
-      await ssoPutSecret(secret);
-      secretInput.value = "";  // don't let the secret linger in the DOM
-    }
-    if (wantEnabled) {
-      await ssoPutConfig(true);
+    if (!ssoServerState.configured) {
+      // Initial create: the secret column lives on the config row, and
+      // enabling requires a stored secret — create the row (disabled),
+      // store the secret, then apply the requested enable state. No login
+      // door exists yet, so the disabled-first step removes nothing.
+      await ssoPutConfig(false);
+      if (secret) {
+        await ssoPutSecret(secret);
+        secretInput.value = "";  // don't let the secret linger in the DOM
+      }
+      if (wantEnabled) {
+        await ssoPutConfig(true);
+      }
+    } else {
+      // Existing config: store a rotated secret first (so enabling in the
+      // same save sees it), then one PUT with the requested enabled state —
+      // an enabled instance never passes through a disable.
+      if (secret) {
+        await ssoPutSecret(secret);
+        secretInput.value = "";
+      }
+      await ssoPutConfig(wantEnabled);
     }
     showBanner("SSO config saved.", "success");
   } catch (e) {

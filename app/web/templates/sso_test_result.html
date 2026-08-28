@@ -19,6 +19,16 @@
     The sign-in would be refused: <code>{{ result_error }}</code>.
     {% endif %}
 </div>
+{% elif binding_refusal %}
+<div class="flash flash-error" role="alert">
+    {% if binding_refusal == 'deactivated' %}
+    The claims are valid, but the Agnes account this login resolves to is <strong>deactivated</strong> — a real sign-in would be refused.
+    {% elif binding_refusal == 'sso_identity_conflict' %}
+    The claims are valid, but this mailbox's Agnes account is already bound to a <strong>different</strong> external identity in the same tenant — a real sign-in would be refused (<code>sso_identity_conflict</code>); unlink the stale identity or deactivate the account.
+    {% else %}
+    A real sign-in would be refused: <code>{{ binding_refusal }}</code>.
+    {% endif %}
+</div>
 {% else %}
 <div class="flash flash-success" role="status">
     The end-to-end exchange with tenant <code>{{ resolved_tid }}</code> succeeded and every check passed —
@@ -53,14 +63,16 @@
             </td>
         </tr>
         <tr>
-            <th scope="row">Would attach to</th>
+            <th scope="row">A real sign-in would</th>
             <td>
-                {% if identity_bound_to %}
-                {{ identity_bound_to }} (already linked to this external identity)
-                {% elif would_attach %}
-                existing account {{ would_attach }} (first SSO sign-in would link it)
-                {% elif resolved_email %}
-                a NEW account for {{ resolved_email }} (created on first sign-in)
+                {% if binding_outcome == 'sign_in' %}
+                sign in as {{ binding_account_email }} (already linked to this external identity)
+                {% elif binding_outcome == 'attach' %}
+                link existing account {{ binding_account_email }} (first SSO sign-in attaches by email)
+                {% elif binding_outcome == 'create' %}
+                create a NEW account for {{ resolved_email }}
+                {% elif binding_outcome == 'refused' %}
+                be <strong>refused</strong>{% if binding_account_email %} for {{ binding_account_email }}{% endif %} (<code>{{ binding_refusal }}</code>)
                 {% else %}
                 —
                 {% endif %}

@@ -55,18 +55,26 @@ def _userinfo(**overrides):
 
 
 class _FakeOAuthClient:
-    """Stands in for the authlib client: records the authorize kwargs and
-    returns a canned token from the callback exchange."""
+    """Stands in for the authlib client: records the authorize kwargs, mints
+    a per-flow OAuth state (like the real client), and returns a canned
+    token from the callback exchange."""
 
     def __init__(self, token=None, exchange_error=None):
         self.token = token
         self.exchange_error = exchange_error
         self.authorize_kwargs: dict = {}
+        self.states: list[str] = []
         self.authorize_access_token = AsyncMock(side_effect=self._exchange)
+
+    @property
+    def last_state(self) -> str:
+        return self.states[-1] if self.states else ""
 
     async def authorize_redirect(self, request, redirect_uri, **kwargs):
         self.authorize_kwargs = {"redirect_uri": redirect_uri, **kwargs}
-        return RedirectResponse("https://login.microsoftonline.com/fake/authorize")
+        state = f"fake-state-{len(self.states) + 1}"
+        self.states.append(state)
+        return RedirectResponse(f"https://login.microsoftonline.com/fake/authorize?state={state}")
 
     async def _exchange(self, request):
         if self.exchange_error is not None:
@@ -325,7 +333,7 @@ def _run_flow(client, monkeypatch, *, userinfo, next_path=None, exchange_error=N
     url = "/auth/sso/login" + (f"?next={next_path}" if next_path else "")
     r1 = client.get(url, follow_redirects=False)
     assert r1.status_code in (302, 307)
-    r2 = client.get("/auth/sso/callback?code=x&state=y", follow_redirects=False)
+    r2 = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
     return fake, r2
 
 
@@ -347,6 +355,9 @@ def test_callback_happy_path_sets_cookie_and_links(sso_pg, monkeypatch, pg_engin
     with pg_engine.connect() as conn:
         actions = [x[0] for x in conn.execute(sa.text("SELECT action FROM audit_log")).fetchall()]
     assert "sso.identity.linked" in actions
+    # The completed sign-in itself is recorded too (tests/test_audit_login.py
+    # guards every cookie-minting provider).
+    assert "login_success" in actions
 
 
 def test_callback_error_paths(sso_pg, monkeypatch):
@@ -427,7 +438,7 @@ def test_test_mode_works_pre_enable_and_outside_allowlist_without_side_effects(s
     assert r1.status_code in (302, 307)
     assert fake.authorize_kwargs["prompt"] == "select_account"
 
-    r2 = client.get("/auth/sso/callback?code=x&state=y", follow_redirects=False)
+    r2 = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
     assert r2.status_code == 200
     page = r2.text
     assert _userinfo()["oid"].lower() in page.lower()
@@ -445,7 +456,7 @@ def test_test_mode_reports_domain_verdict(sso_pg, monkeypatch):
     fake = _install_fake_client(monkeypatch, token={"userinfo": _userinfo(email="user@evil.example")})
     client.cookies.set("access_token", admin_token)
     client.get("/auth/sso/login?mode=test", follow_redirects=False)
-    r = client.get("/auth/sso/callback?code=x&state=y", follow_redirects=False)
+    r = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
     assert r.status_code == 200
     assert "not permitted" in r.text.lower()
     assert fake.authorize_access_token.await_count == 1
@@ -455,12 +466,12 @@ def test_test_mode_callback_reverifies_admin_session(sso_pg, monkeypatch):
     """A stashed test marker must not complete for a session that is no
     longer (or never was) an admin."""
     client, admin_token = sso_pg
-    _install_fake_client(monkeypatch, token={"userinfo": _userinfo()})
+    fake = _install_fake_client(monkeypatch, token={"userinfo": _userinfo()})
     client.cookies.set("access_token", admin_token)
     client.get("/auth/sso/login?mode=test", follow_redirects=False)
 
     client.cookies.delete("access_token")
-    r = client.get("/auth/sso/callback?code=x&state=y", follow_redirects=False)
+    r = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
     assert r.status_code == 403
 
     from src.repositories import users_repo
@@ -530,3 +541,69 @@ def test_login_page_renders_sso_error_copy(sso_pg):
     ):
         page = client.get(f"/login?error={code}").text
         assert 'role="alert"' in page, code
+
+
+def test_concurrent_normal_flow_does_not_hijack_test_mode(sso_pg, monkeypatch):
+    """The test marker is bound to ITS flow's OAuth state: an admin starting
+    a normal sign-in in a second tab must neither consume the marker (which
+    would turn the test callback into a REAL sign-in) nor inherit it."""
+    client, admin_token = sso_pg
+    from src.repositories import user_external_identities_repo, users_repo
+
+    fake = _install_fake_client(monkeypatch, token={"userinfo": _userinfo()})
+    client.cookies.set("access_token", admin_token)
+
+    # Tab A: admin test flow.
+    client.get("/auth/sso/login?mode=test", follow_redirects=False)
+    test_state = fake.last_state
+    # Tab B: a normal flow in the same browser session.
+    client.get("/auth/sso/login", follow_redirects=False)
+    normal_state = fake.last_state
+    assert normal_state != test_state
+
+    # Tab A's callback still runs as a TEST: result page, no side effects.
+    r = client.get(f"/auth/sso/callback?code=x&state={test_state}", follow_redirects=False)
+    assert r.status_code == 200
+    assert users_repo().get_by_email("user@fabrikam.com") is None
+    assert user_external_identities_repo().count() == 0
+    assert "access_token" not in r.headers.get("set-cookie", "")
+
+    # Tab B's callback still runs as a NORMAL sign-in.
+    r = client.get(f"/auth/sso/callback?code=x&state={normal_state}", follow_redirects=False)
+    assert r.status_code == 302
+    assert "access_token" in r.headers.get("set-cookie", "")
+    assert users_repo().get_by_email("user@fabrikam.com") is not None
+
+
+def test_test_mode_predicts_deactivated_refusal(sso_pg, monkeypatch, pg_engine):
+    """The test page must apply the real binding checks read-only: a
+    deactivated account renders as a refusal, not 'every check passed'."""
+    import sqlalchemy as sa
+
+    client, admin_token = sso_pg
+    from src.repositories import users_repo
+
+    users_repo().create(id="u-off", email="user@fabrikam.com", name="Off")
+    with pg_engine.begin() as conn:
+        conn.execute(sa.text("UPDATE users SET active = FALSE WHERE id = 'u-off'"))
+
+    fake = _install_fake_client(monkeypatch, token={"userinfo": _userinfo()})
+    client.cookies.set("access_token", admin_token)
+    client.get("/auth/sso/login?mode=test", follow_redirects=False)
+    r = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
+    assert r.status_code == 200
+    assert "deactivated" in r.text
+    assert "every check passed" not in r.text
+
+
+def test_test_mode_predicts_identity_conflict(sso_pg, monkeypatch):
+    client, admin_token = sso_pg
+    _bind(subject="oid-old")  # binds user@fabrikam.com's account to oid-old
+
+    fake = _install_fake_client(monkeypatch, token={"userinfo": _userinfo(oid="oid-new")})
+    client.cookies.set("access_token", admin_token)
+    client.get("/auth/sso/login?mode=test", follow_redirects=False)
+    r = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
+    assert r.status_code == 200
+    assert "sso_identity_conflict" in r.text
+    assert "every check passed" not in r.text

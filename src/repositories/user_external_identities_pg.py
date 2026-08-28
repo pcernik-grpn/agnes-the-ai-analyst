@@ -81,15 +81,20 @@ class UserExternalIdentitiesPgRepository:
         tenant_id: str,
         subject: str,
         email_at_link: str,
-        replace_existing: bool = False,
+        replace_of: tuple[str, str, str] | None = None,
     ) -> None:
         """Insert this user's identity row.
 
-        ``replace_existing=True`` swaps a stale binding in place (tenant
-        re-point — design: replacement rule): the row is rewritten with a
-        fresh ``linked_at`` and ``last_login_at`` reset to NULL, because a
-        replacement is a NEW binding. Any uniqueness conflict this call may
-        not resolve raises :class:`IdentityLinkConflictError`.
+        ``replace_of=(provider_type, tenant_id, subject)`` swaps a stale
+        binding in place (tenant re-point — design: replacement rule) as a
+        compare-and-swap against the OBSERVED stale identity: the row is
+        rewritten — fresh ``linked_at``, ``last_login_at`` reset to NULL,
+        because a replacement is a NEW binding — only if it still carries
+        exactly that identity. A concurrent login that already replaced it
+        makes the swap miss (rowcount 0), which raises
+        :class:`IdentityLinkConflictError` so the caller re-reads and applies
+        the race rule instead of silently clobbering the winner. Any
+        uniqueness conflict raises the same error.
         """
         params = {
             "user_id": user_id,
@@ -98,28 +103,43 @@ class UserExternalIdentitiesPgRepository:
             "subject": subject,
             "email_at_link": email_at_link,
         }
-        if replace_existing:
-            stmt = (
-                "INSERT INTO user_external_identities "
-                "(user_id, provider_type, tenant_id, subject, email_at_link) "
-                "VALUES (:user_id, :provider_type, :tenant_id, :subject, :email_at_link) "
-                "ON CONFLICT (user_id) DO UPDATE SET "
-                "provider_type = EXCLUDED.provider_type, "
-                "tenant_id = EXCLUDED.tenant_id, "
-                "subject = EXCLUDED.subject, "
-                "email_at_link = EXCLUDED.email_at_link, "
-                "linked_at = CURRENT_TIMESTAMP, "
-                "last_login_at = NULL"
-            )
-        else:
-            stmt = (
-                "INSERT INTO user_external_identities "
-                "(user_id, provider_type, tenant_id, subject, email_at_link) "
-                "VALUES (:user_id, :provider_type, :tenant_id, :subject, :email_at_link)"
-            )
         try:
             with self._engine.begin() as conn:
-                conn.execute(sa.text(stmt), params)
+                if replace_of is not None:
+                    params.update(
+                        {
+                            "old_provider_type": replace_of[0],
+                            "old_tenant_id": replace_of[1],
+                            "old_subject": replace_of[2],
+                        }
+                    )
+                    result = conn.execute(
+                        sa.text(
+                            "UPDATE user_external_identities SET "
+                            "provider_type = :provider_type, "
+                            "tenant_id = :tenant_id, "
+                            "subject = :subject, "
+                            "email_at_link = :email_at_link, "
+                            "linked_at = CURRENT_TIMESTAMP, "
+                            "last_login_at = NULL "
+                            "WHERE user_id = :user_id "
+                            "AND provider_type = :old_provider_type "
+                            "AND tenant_id = :old_tenant_id "
+                            "AND subject = :old_subject"
+                        ),
+                        params,
+                    )
+                    if result.rowcount == 0:
+                        raise IdentityLinkConflictError("stale-binding replacement lost a concurrent update")
+                else:
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO user_external_identities "
+                            "(user_id, provider_type, tenant_id, subject, email_at_link) "
+                            "VALUES (:user_id, :provider_type, :tenant_id, :subject, :email_at_link)"
+                        ),
+                        params,
+                    )
         except sa.exc.IntegrityError as exc:
             raise IdentityLinkConflictError("external identity link conflicts with an existing binding") from exc
 
