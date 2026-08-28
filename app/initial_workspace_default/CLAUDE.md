@@ -27,26 +27,17 @@ than inventing your own.
 ## Numbers that come from a dashboard or an app
 
 When the user asks about a figure they saw in a dashboard, report or data
-app, that figure already has a definition somewhere — **start from the app,
-not from the name**. The label on screen was chosen by whoever built the
-app; it does not tell you which metric, table or filter produced the
-number, and a metric whose id merely looks like the label may be a
-different figure entirely. Never open with a guess at a metric id, and
-never conclude a metric does or does not exist from the wording of the
-question.
+app, start by finding the app they mean — `agnes app list`, then
+`agnes app show <slug>` to read its `Description`, which usually says what
+the app covers and often where its figures come from. That context is worth
+having before you go looking for a definition. Both calls read the registry
+only, so they work on a sleeping app.
 
-1. `agnes app list` — find the app the user means (slug, name, URL).
-2. `agnes app show <slug>` — read its `Description`: what the app covers
-   and, where its author recorded it, where the precise definition lives.
-   Both calls read the registry only, so they work on a sleeping app.
-3. Only then map the figure onto a definition — `agnes catalog --metrics`
-   for the canonical metric, `agnes catalog` / `agnes schema` for the
-   tables behind it — and reconcile your own number against the one on
-   screen before you report it.
-
-If no app matches, or its description doesn't cover the figure, say that
-and ask which dashboard is meant rather than answering from a metric whose
-name looked close.
+The description is context, not a contract. If it doesn't cover the figure,
+carry on with `agnes catalog --metrics` and the tables behind it — but say so
+in your answer: you cannot see how the report itself builds the figure, so
+the metric you picked is your best match for the label on screen, not the
+app's own definition.
 
 ## Say where every number came from
 
