@@ -127,8 +127,7 @@ class TestPreviewDoesNotPromiseWhatItCannotDo:
         # a return statement would carry rather than the word anywhere in the
         # file — a comment explaining this history must not fail the test.
         assert "in the browser console'" not in preview_js, (
-            "the fallback sends the reader to devtools instead of telling them "
-            "what happened"
+            "the fallback sends the reader to devtools instead of telling them what happened"
         )
         assert "'The preview could not answer: ' + detail" in preview_js, (
             "the unrecognised case must put the engine's own words on screen"
