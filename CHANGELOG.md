@@ -201,6 +201,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   standard — that reference is accurate, not the retired synonym).
   `/admin/data-sources`' browser tab title is now "Connections" (the hero
   and nav tab stay "Data"/"Sources"). No REST route paths changed.
+- **The chat page's suggested actions moved above the composer.** "Suggested for you" used to close the empty state from under the input; it now sits between the page's lede and the composer. The chips answer "what can I even ask here", which is a question the reader has *before* they reach an empty field, not after they have already passed it — read top-down the page is now "here is what you could ask" then "ask it". The ways out (the two cards + trust line) did not move: they still close the page, because every one of them navigates away from the composer. The chips render from the same typed task model and keep the same shared column grid as the composer; they still hide the moment a conversation starts.
 - **The chat sandbox now tells the agent the truth about its runtime, and
   read-only admin commands work there.** Three coupled fixes to the same
   confusion (an in-chat agent concluding its auth was broken and recommending

@@ -154,26 +154,36 @@ class TestChatEmptyStatePill:
         assert "Operated by" not in body
         assert "Suggested questions" not in body
 
-    def test_below_the_input_is_the_suggestions_and_nothing_else(self, seeded_app, monkeypatch):
-        """Below the composer carries the suggested questions and nothing else —
-        no onboarding, no marketing, no documentation link.
+    def test_the_span_from_suggestions_to_the_input_is_nothing_else(self, seeded_app, monkeypatch):
+        """The suggested questions run straight into the composer — no
+        onboarding, no marketing, no documentation link between them.
 
-        The rule protects the INTENT ZONE: the span a reader crosses between
-        having a question and the suggestions that help them phrase it, where a
-        navigate-away control is a detour. It used to also allow two readouts
-        here (the Stack count line and the agent picker); the picker moved into
-        the composer pill and the count line is retired, so the zone is now
-        strictly empty of everything but the chips.
+        The rule protects the INTENT ZONE: the span a reader crosses between the
+        suggestions that help them phrase a question and the field they type it
+        into, where a navigate-away control is a detour. The zone used to sit
+        BELOW the composer, when the chips trailed it; the chips lead it now, so
+        the span runs from the chips down to `</form>` instead. Same invariant,
+        mirrored.
+
+        It used to also allow two readouts here (the Stack count line and the
+        agent picker); the picker moved into the composer pill and the count
+        line is retired, so the zone is strictly the chips and then the input.
         """
         _enable_rail_chat(seeded_app, monkeypatch)
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
-        below = body[body.index("</form>") :]
-        below = below[: below.index('id="rdb-actions-list"')]
+        # The chips precede the input they feed.
+        assert body.index('id="rdb-actions-list"') < body.index('id="chat-form"'), (
+            "the suggestions belong above the composer"
+        )
+        zone = body[body.index('id="rdb-actions"') : body.index("</form>")]
         for retired in ("rdb-orient", "New here?", 'href="/how-it-works"', 'class="rdb-context"'):
-            assert retired not in below, f"below-input area is not suggestions-only: {retired}"
-        # The picker is in the composer, not under it.
+            assert retired not in zone, f"suggestions-to-input span is not clean: {retired}"
+        # Nothing trails the composer but the ways out.
+        below = body[body.index("</form>") :]
+        assert 'id="rdb-actions"' not in below
+        # The picker is in the composer, not beside it.
         composer = body[body.index('class="cloud-chat-composer"') : body.index("</form>")]
         assert 'id="chat-agent-btn"' in composer
 
