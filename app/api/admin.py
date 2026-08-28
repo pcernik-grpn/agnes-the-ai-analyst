@@ -388,6 +388,15 @@ def _validate_auth_providers_in_patch(sections: Dict[str, Dict[str, Any]]) -> No
                 "GOOGLE_CLIENT_SECRET environment variables at process start — a Google "
                 "OAuth client configured only in instance.yaml is not detected."
             )
+        if "sso" in known:
+            # SSO is configured on its own admin panel, not in instance.yaml —
+            # without this note a refused [sso] allowlist gives the operator
+            # no pointer to where the provider actually gets configured.
+            detail += (
+                " Note: the external SSO provider is configured at runtime on the SSO admin "
+                "panel (/api/admin/sso/config) — it reads available only once its config is "
+                "saved with a stored client secret and enabled=true."
+            )
         if "microsoft" in known:
             # Same env-capture property as Google, and the base detail names
             # neither Microsoft nor its variables — so a Microsoft-only save
@@ -451,6 +460,15 @@ def _provider_available_after_save(name: str, auth_patch: Dict[str, Any], sectio
         from app.auth.providers.microsoft import is_available as microsoft_available
 
         return microsoft_available()
+    if name == "sso":
+        # DB-configured (the /api/admin/sso panel), not instance.yaml — this
+        # patch cannot change it, so current availability == availability
+        # after save (the same argument the env-var branches make). Without
+        # this branch an `auth.providers: [sso]` allowlist would always be
+        # refused as "no usable sign-in method".
+        from app.auth.providers.sso import is_available as sso_available
+
+        return sso_available()
     return False
 
 

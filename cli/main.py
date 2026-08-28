@@ -349,10 +349,13 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(docs_app, name="docs")
 app.add_typer(collections_app, name="collections")
 app.add_typer(facts_app, name="facts")
-app.add_typer(connectors_app, name="connectors")
-# Hidden verb alias: `agnes connector` resolves to the SAME Typer as
-# `agnes connectors` (the thin-install-prompt design names the singular).
-# One implementation, two spellings — no divergence possible.
+app.add_typer(connectors_app, name="tools")
+# Deprecated aliases: `agnes connectors` was the original name, but it
+# collides with "Connector" = data source (Keboola/BigQuery/…) used
+# throughout the docs — these are optional MCP *tools* (Asana, Atlassian,
+# …), a different concept. `tools` is now canonical; `connectors`/
+# `connector` keep resolving to the SAME Typer so no script breaks.
+app.add_typer(connectors_app, name="connectors", help="(deprecated alias of `tools`)")
 app.add_typer(connectors_app, name="connector", hidden=True)
 app.add_typer(data_apps_app, name="app")
 app.add_typer(search_app, name="search")

@@ -14,6 +14,12 @@ groups into `user_group_members` at sign-in (see
 [`auth-groups.md`](auth-groups.md)). Grant everything else through
 [`RBAC.md`](RBAC.md).
 
+This provider is for the **operator's own** tenant, configured at deploy
+time. To let users of an **external** organization's Entra tenant sign in —
+configured by an admin at runtime, with the external subject (`oid`/`tid`)
+captured per user — use the separate `sso` provider instead:
+[`auth-sso-entra.md`](auth-sso-entra.md). The two coexist.
+
 ## Env vars
 
 | Var | Required for Microsoft | Notes |

@@ -29,6 +29,7 @@ from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, IngestRun
+from src.models.jobs import Job
 from src.models.knowledge import (
     KnowledgeContradiction,
     KnowledgeItem,
@@ -40,13 +41,23 @@ from src.models.knowledge import (
     MemoryDomainSuggestion,
     VerificationEvidence,
 )
-from src.models.jobs import Job
 from src.models.knowledge_digests import KnowledgeDigest
 from src.models.lookup import (
     BqMetadataCache,
     ColumnMetadata,
     UserSyncSettings,
     ViewOwnership,
+)
+from src.models.mcp import (
+    MCPOAuthFlow,
+    MCPSecret,
+    MCPSource,
+    MCPSourceOAuthClient,
+    MCPUserOAuthToken,
+    MCPUserSecret,
+    SetupToken,
+    ToolGrant,
+    ToolRegistry,
 )
 from src.models.misc import (
     NewsTemplate,
@@ -55,8 +66,19 @@ from src.models.misc import (
     TableProfile,
     TelegramLink,
 )
+from src.models.oauth import OAuthAccessToken, OAuthAuthCode, OAuthClient, OAuthRefreshToken
+from src.models.ontology_drafts import OntologyDraft
 from src.models.ops import SyncHistory, SyncState, TableRegistry
+from src.models.rbac import (
+    ResourceGrant,
+    User,
+    UserGroup,
+    UserGroupMember,
+)
 from src.models.recipes import Recipe
+from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
+from src.models.share_requests import ShareRequest
+from src.models.sso import SsoConfig, UserExternalIdentity
 from src.models.store import (
     MarketplacePlugin,
     MarketplaceRegistry,
@@ -71,7 +93,6 @@ from src.models.store import (
     UserStackSubscription,
     UserStoreInstall,
 )
-from src.models.user_journey import UserJourneyState
 from src.models.telemetry import (
     SessionProcessorState,
     UsageEvent,
@@ -81,28 +102,8 @@ from src.models.telemetry import (
     UsageToolDaily,
     UserObservabilityView,
 )
-from src.models.mcp import (
-    MCPOAuthFlow,
-    MCPSecret,
-    MCPSource,
-    MCPSourceOAuthClient,
-    MCPUserOAuthToken,
-    MCPUserSecret,
-    SetupToken,
-    ToolGrant,
-    ToolRegistry,
-)
-from src.models.rbac import (
-    ResourceGrant,
-    User,
-    UserGroup,
-    UserGroupMember,
-)
-from src.models.oauth import OAuthAccessToken, OAuthAuthCode, OAuthClient, OAuthRefreshToken
-from src.models.ontology_drafts import OntologyDraft
-from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
+from src.models.user_journey import UserJourneyState
 from src.models.vault import SystemSecret
-
 
 __all__ = [
     "Agent",
@@ -120,20 +121,20 @@ __all__ = [
     "Claim",
     "ColumnMetadata",
     "ConnectionSecret",
-    "Correction",
     "CorpusChunk",
     "CorpusFile",
     "CorpusFileSource",
-    "FileCorpus",
+    "Correction",
     "DataApp",
     "DataPackage",
-    "GlossaryTerm",
     "DataPackageSemanticModel",
     "DataPackageTable",
     "DataPackageTool",
     "Edge",
     "Fact",
     "FactAlias",
+    "FileCorpus",
+    "GlossaryTerm",
     "IdempotencyKey",
     "IngestRun",
     "InstanceTemplate",
@@ -158,16 +159,23 @@ __all__ = [
     "MemoryDomainSuggestion",
     "MetricDefinition",
     "NewsTemplate",
+    "OAuthAccessToken",
+    "OAuthAuthCode",
+    "OAuthClient",
+    "OAuthRefreshToken",
+    "OntologyDraft",
     "PendingCode",
     "PersonalAccessToken",
     "Recipe",
     "ResourceGrant",
-    "SetupToken",
     "ScriptRegistry",
     "SemanticModel",
     "SemanticSource",
+    "ShareRequest",
     "SessionProcessorState",
+    "SetupToken",
     "SourceConnection",
+    "SsoConfig",
     "StoreEntity",
     "StoreEntityVote",
     "StoreLintDismissal",
@@ -181,28 +189,24 @@ __all__ = [
     "TableProfile",
     "TableRegistry",
     "TelegramLink",
-    "VerificationEvidence",
+    "ToolGrant",
+    "ToolRegistry",
     "UsageEvent",
     "UsageMarketplaceItemDaily",
     "UsageMarketplaceItemWindow",
     "UsageSessionSummary",
     "UsageToolDaily",
-    "ToolGrant",
-    "ToolRegistry",
     "User",
+    "UserExternalIdentity",
     "UserGroup",
     "UserGroupMember",
+    "UserJourneyState",
     "UserObservabilityView",
     "UserPluginOptout",
     "UserStackSubscription",
     "UserStoreInstall",
-    "UserJourneyState",
     "UserSyncSettings",
     "UserWorkdir",
+    "VerificationEvidence",
     "ViewOwnership",
-    "OAuthAccessToken",
-    "OAuthAuthCode",
-    "OAuthClient",
-    "OAuthRefreshToken",
-    "OntologyDraft",
 ]

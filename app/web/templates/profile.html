@@ -514,6 +514,13 @@
           <div class="pf-pv-row"><span class="pf-pv-k">Groups</span><span class="pf-pv-v">{{ memberships | length }}</span></div>
           <div class="pf-pv-row"><span class="pf-pv-k">Resources</span><span class="pf-pv-v" id="pf-aside-access">—</span></div>
           <div class="pf-pv-row"><span class="pf-pv-k">Administrator</span><span class="pf-pv-v">{{ "Yes" if is_admin else "No" }}</span></div>
+          <div class="pf-pv-row"><span class="pf-pv-k">Linked identity</span><span class="pf-pv-v">
+            {%- if external_identity -%}
+            <span title="Entra tenant {{ external_identity.tenant_id }}, linked {{ external_identity.linked_at | string | truncate(10, true, '') }}">{{ external_identity.subject }}</span>
+            {%- else -%}
+            —
+            {%- endif -%}
+          </span></div>
         </div>
       </div>
     </div>

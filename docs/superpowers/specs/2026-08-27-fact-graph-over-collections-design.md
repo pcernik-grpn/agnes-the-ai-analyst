@@ -652,6 +652,36 @@ citation names the document, not a clickable original. The original itself is
 never served by Agnes — it opens in the source under the caller's own
 identity (the TCRD-178 "resolve to the source" decision).
 
+### 8.1 The canonical-source contract (ratified 2026-08-28)
+
+Stated once, as a contract, so every consumer builds to it instead of
+rediscovering it (Slack, 28 Aug — proposed in the crawler thread, ratified
+by the project owner):
+
+1. **The canonical copy stays in the source system.** Agnes never re-homes
+   source content. What Agnes stores is a *derivation*: the converted
+   markdown (uploaded through the normal collections path, §7.2) and the
+   chunks over it — and for an anonymized scope, only the anonymized
+   derivation (§9).
+2. **Citations resolve to the source system only.** A claim's user-facing
+   citation is the document name + source deep link (`source_url`, O7).
+   Chunks are the **internal substrate** the verbatim gate checks quotes
+   against — a chunk is never a citation target, never surfaced as an
+   address, and never treated as an authority. (This was the actual defect
+   in the first metadata-crawler shape — chunks as citable objects — not
+   the chunks' existence.)
+3. **Raw-file consumers read the source live.** Anything that needs an
+   *original* file (e.g. a proposal plugin pulling template documents)
+   fetches it from the source drive under its own access, at use time —
+   never from a copy vendored into a repo or served by Agnes. Copies
+   drift the moment the customer edits the original; the contract makes
+   staleness impossible rather than managed. (Consumer-side design: O8.)
+
+Rules 1–2 are enforced by construction in this design (upload path,
+endpoint-evidence read path, `/raw`-serves-derivation-only); rule 3 binds
+consumers outside this repo and is restated here so their designs cite one
+place.
+
 Conversion fidelity is therefore a **correctness dependency**, gated by test
 EQ8 (§15.3).
 
@@ -1414,3 +1444,7 @@ overclaim).
 - **O6 — cross-language extraction vs the verbatim gate** (§8).
 - **O7 — `source_url`**: who extends the crawler rows and
   `corpus_file_sources` so citations link to the source system.
+- **O8 — plugin raw-file access** (§8.1 rule 3): the proposal plugin needs
+  live reads of template files from the source drive — same credential
+  story as the crawler, designed with the plugin owner; blocked on the
+  tenant-access work, not on this repo.

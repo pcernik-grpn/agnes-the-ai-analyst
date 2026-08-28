@@ -14,6 +14,9 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import re
+import unicodedata
+from typing import Any, Dict, List, Optional
 
 import httpx
 import jwt as pyjwt
@@ -200,6 +203,227 @@ class TestBrowseLevels:
         _install_transport(monkeypatch, handler)
         with pytest.raises(gc.SharePointGraphError, match="403"):
             asyncio.run(gc.list_sites("tok"))
+
+
+class TestListItemChildren:
+    def test_list_item_children(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/items/it1/children"
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {"id": "sub1", "name": "Subfolder", "folder": {"childCount": 2}},
+                        {"id": "doc1", "name": "report.pdf", "file": {}},
+                    ]
+                },
+            )
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_item_children("tok", "drv1", "it1"))
+        assert items == [
+            {"id": "sub1", "name": "Subfolder", "is_folder": True, "child_count": 2},
+            {"id": "doc1", "name": "report.pdf", "is_folder": False, "child_count": None},
+        ]
+
+    def test_non_200_raises_typed_error(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
+
+        _install_transport(monkeypatch, handler)
+        with pytest.raises(gc.SharePointGraphError, match="404"):
+            asyncio.run(gc.list_item_children("tok", "drv1", "missing"))
+
+
+class TestBuildFolderMatcher:
+    def test_prefix_mode_is_case_insensitive(self):
+        matcher = gc.build_folder_matcher("con", "prefix")
+        assert matcher("Contracts") is True
+        assert matcher("CONTRACTS 2026") is True
+        assert matcher("Subcontracts") is False
+
+    def test_contains_mode(self):
+        matcher = gc.build_folder_matcher("tract", "contains")
+        assert matcher("Contracts") is True
+        assert matcher("Subcontracts") is True
+        assert matcher("Invoices") is False
+
+    def test_glob_mode(self):
+        matcher = gc.build_folder_matcher("Contracts-*", "glob")
+        assert matcher("Contracts-2026") is True
+        assert matcher("contracts-old") is True  # case-insensitive
+        assert matcher("Contracts") is False
+
+    def test_glob_mode_question_mark_and_charclass(self):
+        matcher = gc.build_folder_matcher("Q[1-4]-report", "glob")
+        assert matcher("Q1-report") is True
+        assert matcher("Q9-report") is False
+
+    def test_czech_diacritics_prefix_match_case_and_composition_insensitive(self):
+        # Precomposed (NFC) vs. decomposed (NFD: base letter + combining
+        # caron) forms of the same visible string must match identically.
+        precomposed = "Přehledy"
+        decomposed = unicodedata.normalize("NFD", precomposed)
+        matcher = gc.build_folder_matcher(decomposed, "prefix")
+        assert matcher(precomposed) is True
+        assert matcher("PŘEHLEDY archiv") is True
+
+    def test_diacritics_are_not_stripped(self):
+        """Distinct from the client-side filter: `e` must NOT match `é` here."""
+        matcher = gc.build_folder_matcher("elektrina", "contains")
+        assert matcher("elektřina") is False
+
+    def test_unbalanced_brackets_in_glob_is_malformed(self):
+        with pytest.raises(ValueError, match="malformed glob"):
+            gc.build_folder_matcher("Contracts[2026", "glob")
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="unknown search mode"):
+            gc.build_folder_matcher("x", "fuzzy")
+
+
+class _FakeGraphTree:
+    """A tiny in-memory Graph server for :func:`gc.search_folders` tests —
+    routes ``/sites``, ``/sites/{id}/drives``, ``/drives/{id}/root/children``
+    and ``/drives/{id}/items/{id}/children`` off one hand-built tree, so the
+    BFS walk can be exercised without a live tenant."""
+
+    def __init__(self):
+        self.sites = [{"id": "s1", "displayName": "Corp Site", "webUrl": "https://x/s1"}]
+        self.drives = {"s1": [{"id": "d1", "name": "Documents", "driveType": "documentLibrary"}]}
+        # (drive_id, item_id_or_None) -> Graph `value` list
+        self.children: Dict[Any, List[Dict[str, Any]]] = {}
+        self.calls: List[str] = []
+
+    def set_children(self, drive_id: str, item_id: Optional[str], items: List[Dict[str, Any]]) -> None:
+        self.children[(drive_id, item_id)] = items
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.calls.append(path)
+        if path == "/v1.0/sites":
+            return httpx.Response(200, json={"value": self.sites})
+        m = re.match(r"^/v1\.0/sites/([^/]+)/drives$", path)
+        if m:
+            return httpx.Response(200, json={"value": self.drives.get(m.group(1), [])})
+        m = re.match(r"^/v1\.0/drives/([^/]+)/root/children$", path)
+        if m:
+            return httpx.Response(200, json={"value": self.children.get((m.group(1), None), [])})
+        m = re.match(r"^/v1\.0/drives/([^/]+)/items/([^/]+)/children$", path)
+        if m:
+            return httpx.Response(200, json={"value": self.children.get((m.group(1), m.group(2)), [])})
+        raise AssertionError(f"unexpected path in fake Graph tree: {path}")
+
+
+def _folder(id_: str, name: str) -> Dict[str, Any]:
+    return {"id": id_, "name": name, "folder": {"childCount": 0}}
+
+
+def _file(id_: str, name: str) -> Dict[str, Any]:
+    return {"id": id_, "name": name, "file": {}}
+
+
+class TestSearchFolders:
+    def test_matches_within_a_single_drive_scoped_search(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.set_children("d1", None, [_folder("a1", "Contracts"), _folder("a2", "Invoices")])
+        tree.set_children("d1", "a1", [_folder("a1x", "Contracts 2026")])
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=5, max_visited=500))
+        assert result["truncated"] is False
+        names = sorted(m["display_path"] for m in result["matches"])
+        assert names == ["Contracts", "Contracts / Contracts 2026"]
+        assert all(m["drive_id"] == "d1" for m in result["matches"])
+
+    def test_search_scoped_to_a_subtree_via_item_id(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.set_children("d1", None, [_folder("a1", "Contracts"), _folder("a2", "ContractsArchive")])
+        tree.set_children("d1", "a2", [_folder("a2x", "Contracts old")])
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(
+            gc.search_folders("tok", matcher=matcher, drive_id="d1", item_id="a2", max_depth=5, max_visited=500)
+        )
+        # Root-level "Contracts" (a1) is OUTSIDE the a2 subtree — must not appear.
+        assert [m["display_path"] for m in result["matches"]] == ["Contracts old"]
+
+    def test_max_depth_stops_the_walk_and_reports_truncated(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.set_children("d1", None, [_folder("l0", "Level0")])
+        tree.set_children("d1", "l0", [_folder("l1", "Level1")])
+        tree.set_children("d1", "l1", [_folder("l2", "Level2")])  # beyond max_depth=1
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("level", "prefix")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=1, max_visited=500))
+        names = sorted(m["display_path"] for m in result["matches"])
+        # Level0 (depth 0) and Level1 (depth 1, its parent's children fetched
+        # since depth 0 -> 1 is within max_depth=1) are found; Level2 would
+        # require expanding a depth-1 folder past the cap, so it is never
+        # fetched and never appears.
+        assert names == ["Level0", "Level0 / Level1"]
+        assert result["truncated"] is True
+
+    def test_no_truncation_when_everything_reachable_was_covered(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.set_children("d1", None, [_folder("a1", "OnlyFolder")])
+        tree.set_children("d1", "a1", [])
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("only", "prefix")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=5, max_visited=500))
+        assert result["truncated"] is False
+        assert [m["display_path"] for m in result["matches"]] == ["OnlyFolder"]
+
+    def test_max_visited_stops_the_walk_and_reports_truncated(self, monkeypatch):
+        tree = _FakeGraphTree()
+        # A wide root: many sibling folders, each with further children —
+        # a small max_visited must stop well before the whole tree is walked.
+        root_children = [_folder(f"f{i}", f"Folder{i}") for i in range(10)]
+        tree.set_children("d1", None, root_children)
+        for i in range(10):
+            tree.set_children("d1", f"f{i}", [_folder(f"f{i}x", f"Folder{i}x")])
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("folder", "prefix")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=5, max_visited=2))
+        assert result["truncated"] is True
+        assert result["visited"] <= 2
+
+    def test_files_are_never_matched_or_descended_into(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.set_children("d1", None, [_file("doc1", "Contracts.pdf")])
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=5, max_visited=500))
+        assert result["matches"] == []
+        assert result["truncated"] is False
+
+    def test_global_search_walks_every_site_and_drive_when_none_given(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.sites = [
+            {"id": "s1", "displayName": "Site One", "webUrl": "https://x/s1"},
+            {"id": "s2", "displayName": "Site Two", "webUrl": "https://x/s2"},
+        ]
+        tree.drives = {
+            "s1": [{"id": "d1", "name": "Docs", "driveType": "documentLibrary"}],
+            "s2": [{"id": "d2", "name": "Docs2", "driveType": "documentLibrary"}],
+        }
+        tree.set_children("d1", None, [_folder("a1", "Contracts")])
+        tree.set_children("d2", None, [_folder("b1", "Contracts EU")])
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+        assert result["truncated"] is False
+        paths = sorted(m["display_path"] for m in result["matches"])
+        assert paths == ["Site One / Docs / Contracts", "Site Two / Docs2 / Contracts EU"]
+        drives_hit = {m["drive_id"] for m in result["matches"]}
+        assert drives_hit == {"d1", "d2"}
 
 
 class TestCertificateMetadata:

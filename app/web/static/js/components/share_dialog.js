@@ -134,6 +134,11 @@
       var groups = out[0];
       var selected = {};
       (out[1].group_ids || []).forEach(function (g) { selected[g] = true; });
+      // Track C6: an agent share an owner requested may be queued rather
+      // than granted yet — checked (it reflects what the owner asked for)
+      // but flagged, so the dialog never silently implies access exists.
+      var pending = {};
+      (out[1].pending_group_ids || []).forEach(function (g) { pending[g] = true; });
       els.loading.hidden = true;
       if (!groups.length) {
         els.note.textContent = "You're not in any groups yet, so there's nobody to share with. "
@@ -147,7 +152,7 @@
         var cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.value = g.id;
-        cb.checked = !!selected[g.id];
+        cb.checked = !!selected[g.id] || !!pending[g.id];
         var name = document.createElement('span');
         name.textContent = g.name;
         label.appendChild(cb);
@@ -157,6 +162,11 @@
           hint.className = 'share-dialog__grp-hint';
           hint.textContent = 'everyone here';
           label.appendChild(hint);
+        } else if (pending[g.id]) {
+          var pendingHint = document.createElement('span');
+          pendingHint.className = 'share-dialog__grp-hint';
+          pendingHint.textContent = 'pending admin approval';
+          label.appendChild(pendingHint);
         }
         els.groups.appendChild(label);
       });
@@ -194,16 +204,21 @@
       body: JSON.stringify({ group_ids: ids }),
     }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function (state) {
+      // Track C6: 202 means at least one group was queued for admin
+      // approval rather than granted — carry the status through so the
+      // toast can say so instead of claiming sharing is already updated.
+      var queued = r.status === 202;
+      return r.json().then(function (state) { return { state: state, queued: queued }; });
+    }).then(function (result) {
+      var state = result.state;
       if (typeof opts.onSaved === 'function') opts.onSaved(state, opts.trigger);
       else refreshBadge(opts.trigger, state.visibility);
       close();
       if (window.appToast) {
-        window.appToast({
-          kind: 'success',
-          msg: state.visibility === 'private' ? 'Sharing turned off' : 'Sharing updated',
-        });
+        var msg = result.queued
+          ? 'Share requested — waiting for admin approval'
+          : (state.visibility === 'private' ? 'Sharing turned off' : 'Sharing updated');
+        window.appToast({ kind: 'success', msg: msg });
       }
     }).catch(function (e) {
       showErr('Could not save: ' + (e && e.message ? e.message : e));

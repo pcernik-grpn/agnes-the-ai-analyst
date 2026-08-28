@@ -76,7 +76,7 @@ def check_login_door() -> dict:
     doors: list[str] = []
     if "password" in offered and holders:
         doors.append(f"password ({len(holders)} user(s) hold a password)")
-    for oauth in ("google", "microsoft", "keboola"):
+    for oauth in ("google", "microsoft", "keboola", "sso"):
         if oauth in offered:
             doors.append(f"{oauth} OAuth")
     email_open = "email" in offered
