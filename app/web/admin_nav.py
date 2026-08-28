@@ -80,10 +80,19 @@ exist for that reason and carry constraints worth knowing before editing:
   - `/admin/studio` — the Studio authoring surface is available to every
     signed-in user (`get_current_user`, not `require_admin`); it shares the
     `/admin` URL prefix without being an admin-only page. It carries
-    ``"when": "can_studio"``, the ONLY conditional item mechanism here: the
+    ``"when": "can_studio"``, the conditional item mechanism here: the
     partial drops the row when that context flag is falsey, matching the gate
     the old hub grid applied. `can_studio` is `get_studio_enabled()`, set on
     every context by `_build_context`.
+
+    Four more rows use `when` since the admin cleanup retired their surfaces
+    by default — Studio (and its suggestions queue) on `can_studio`, Knowledge
+    digests on `can_knowledge_digests`, News on `can_news`, Contribute a skill
+    on `can_contribute_skill`. The rows STAY in this inventory on purpose:
+    it is what `tests/test_web_admin_nav.py` walks to prove every admin page
+    has a home in the column, and the pages are hidden, not deleted. Add a new
+    flag in BOTH places — here and `_nav_flags` in `_admin_nav.html`, which
+    fails closed on a name it does not know.
   - `/admin/chat` — genuinely `require_admin`, but registered from
     `app/api/admin_chat.py` (a router with `prefix="/admin/chat"`), not
     `app/web/router.py`. `tests/test_web_admin_nav.py` reads BOTH modules for
@@ -305,15 +314,30 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             # decision 8 retires the WORD flea, never the URLs.
             {"label": "Submissions", "href": "/admin/store/submissions", "match": ["/admin/store/submissions"]},
             {"label": "Store lint", "href": "/admin/store/lint", "match": ["/admin/store/lint"]},
+            # Conditional too, on the SAME flag as the Studio row below: the
+            # route reads `get_studio_enabled()` and redirects home when it is
+            # off, so an unconditional row here would have shipped a link to
+            # nowhere the moment Studio's default flipped.
             {
                 "label": "Studio suggestions",
                 "href": "/admin/studio/suggestions",
                 "match": ["/admin/studio/suggestions"],
+                "when": "can_studio",
             },
             {"label": "Corporate memory", "href": "/admin/corporate-memory", "match": ["/admin/corporate-memory"]},
-            {"label": "Knowledge digests", "href": "/admin/knowledge-digests", "match": ["/admin/knowledge-digests"]},
-            {"label": "News", "href": "/admin/news", "match": ["/admin/news"]},
-            {"label": "Contribute a skill", "href": "/admin/contribute-skill", "match": ["/admin/contribute-skill"]},
+            {
+                "label": "Knowledge digests",
+                "href": "/admin/knowledge-digests",
+                "match": ["/admin/knowledge-digests"],
+                "when": "can_knowledge_digests",
+            },
+            {"label": "News", "href": "/admin/news", "match": ["/admin/news"], "when": "can_news"},
+            {
+                "label": "Contribute a skill",
+                "href": "/admin/contribute-skill",
+                "match": ["/admin/contribute-skill"],
+                "when": "can_contribute_skill",
+            },
             # Conditional — see the module docstring. `match` stays the bare
             # prefix: `/admin/studio/suggestions` is its own row above and
             # wins on longest-prefix, so the two never light together.

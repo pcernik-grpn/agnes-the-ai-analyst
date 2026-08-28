@@ -219,8 +219,7 @@
    Focus-within keeps it reachable from the keyboard, and an open menu keeps its
    own trigger visible. */
 .ch-rowmenu { flex: 0 0 28px; display: inline-flex; justify-content: flex-end; }
-.ch-rowmenu .chat-rowmenu-btn,
-.ch-card__menu .chat-rowmenu-btn {
+.ch-rowmenu .chat-rowmenu-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -235,17 +234,13 @@
   line-height: 1;
   cursor: pointer;
 }
-.ch-rowmenu .chat-rowmenu-btn svg,
-.ch-card__menu .chat-rowmenu-btn svg { width: 15px; height: 15px; }
+.ch-rowmenu .chat-rowmenu-btn svg { width: 15px; height: 15px; }
 .ch-rowmenu .chat-rowmenu-btn:hover,
-.ch-rowmenu .chat-rowmenu-btn[aria-expanded="true"],
-.ch-card__menu .chat-rowmenu-btn:hover,
-.ch-card__menu .chat-rowmenu-btn[aria-expanded="true"] {
+.ch-rowmenu .chat-rowmenu-btn[aria-expanded="true"] {
   background: color-mix(in srgb, var(--ds-text-primary) 8%, transparent);
   color: var(--ds-text-primary);
 }
-.ch-rowmenu .chat-rowmenu-btn:focus-visible,
-.ch-card__menu .chat-rowmenu-btn:focus-visible {
+.ch-rowmenu .chat-rowmenu-btn:focus-visible {
   outline: var(--ds-focus-outline);
   outline-offset: var(--ds-focus-outline-offset);
 }
@@ -257,31 +252,6 @@
   /* No hover to reveal on: show them at rest rather than stranding the actions. */
   .ch-rowmenu .chat-rowmenu-btn { opacity: 1; }
 }
-
-/* ── Grid view ────────────────────────────────────────────────────────
-   Cards are projected from the rows (chats_page.js). The grid itself is the
-   shared `.fbar-grid`; these rules are the chat card's own anatomy. */
-.ch-grid { margin: 0; }
-.ch-card { position: relative; display: flex; flex-direction: column; gap: 8px; }
-.ch-card__head { display: flex; align-items: flex-start; gap: 8px; }
-.ch-card__pin svg { width: 14px; height: 14px; color: var(--ds-primary); fill: currentColor; }
-.ch-card__check { margin-left: auto; accent-color: var(--ds-primary); width: 15px; height: 15px; cursor: pointer; flex: 0 0 auto; }
-.ch-card__title { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.ch-card__title a { color: inherit; text-decoration: none; }
-.ch-card__title a:hover { color: var(--ds-primary); }
-.ch-card__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ds-text-secondary); }
-.ch-card__pills { display: flex; flex-wrap: wrap; gap: 6px; }
-/* The card's "⋮" — bottom-right, out of the title's way, on the same
-   reveal-on-interaction rule as the row's. */
-.ch-card__menu { position: absolute; right: 8px; bottom: 6px; }
-.ch-card__menu .chat-rowmenu-btn { opacity: 0; transition: opacity 90ms ease; }
-.ch-card:hover .chat-rowmenu-btn,
-.ch-card:focus-within .chat-rowmenu-btn,
-.ch-card__menu .chat-rowmenu-btn[aria-expanded="true"] { opacity: 1; }
-@media (hover: none) {
-  .ch-card__menu .chat-rowmenu-btn { opacity: 1; }
-}
-.ch-card.is-selected { border-color: var(--ds-primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ds-primary) 18%, transparent); }
 
 /* ── Empty / no-results ───────────────────────────────────────────────
    Same voice as the Library's: what is (not) here, then the one thing to do. */
