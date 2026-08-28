@@ -415,7 +415,9 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     BEFORE its session is invoked, not after — a concurrent or overlapping
     sweep tick can then never pick up the same table twice. The flag
     clears when an admin resolves the resulting suggestion, approve or
-    reject alike (``app/api/authoring_suggestions.py``).
+    reject alike (``app/api/authoring_suggestions.py``) — and, when no
+    suggestion was ever filed, on the way out of this tick (see the
+    ``no_apply_call`` note below).
 
     A session hitting the chat manager's per-user concurrency cap
     (``ConcurrencyCapHit``) is counted and skipped, never raised as a
@@ -443,7 +445,9 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     suggestion count immediately before and after each session (sessions
     run strictly in order, one at a time, so the diff cannot be confused
     by another table's suggestion); ``no_apply_call`` is everything else
-    the session actually ran for. ``remaining`` is how many eligible
+    the session actually ran for — and, having filed nothing an admin can
+    resolve, each of those tables is un-stamped too, for the same reason
+    the two failure branches above are. ``remaining`` is how many eligible
     tables were left over after this tick's batch.
 
     A3 PG-first ratchet: the dedup flag this sweep relies on
@@ -560,6 +564,17 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
         if _pending_count() > before:
             applied += 1
         else:
+            # The session ran to completion but chose not to submit a
+            # suggestion. Third face of the same stuck-flag hazard as the
+            # two branches above: the stamp is cleared when an admin
+            # resolves this table's suggestion, and there is no suggestion
+            # — so nothing will ever clear it and the table is filtered out
+            # of every future tick's candidates, permanently and silently.
+            # Clearing it costs at most a retry per tick for a table the
+            # drafter keeps declining (bounded, visible, and self-limiting
+            # once a draft does land and an admin resolves it), where
+            # leaving it stamped costs the table its eligibility forever.
+            registry.clear_semantic_draft_pending(table["id"])
             no_apply_call += 1
 
     result = {

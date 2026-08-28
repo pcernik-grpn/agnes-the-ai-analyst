@@ -190,16 +190,28 @@ class TestDedup:
     def test_selected_table_is_stamped_pending_before_the_session_runs(
         self, state_backend, seeded_app_both, fake_chat_manager, monkeypatch
     ):
+        """The stamp must be visible while the session is running — that is
+        what stops a concurrent tick picking the same table up. Asserted
+        from INSIDE the mocked session rather than after the response,
+        because a session that files no suggestion has its stamp cleared
+        again on the way out (``TestNoApplyCallDegradation``)."""
         _skip_unless_pg(state_backend)
+        from app.chat import headless
         from src.repositories import table_registry_repo
 
         _register_uncovered("t1")
-        _patch_run_one_shot(monkeypatch)
+        seen: list = []
+
+        async def _fake(manager, *, user_email, agent_id, prompt, timeout_s, owner_user_id=None, profile=None):
+            seen.append(table_registry_repo().get("t1")["semantic_draft_pending_at"])
+            return {"chat_id": "chat-fake", "answer": "ok", "timed_out": False}
+
+        monkeypatch.setattr(headless, "run_one_shot", _fake)
 
         c = seeded_app_both["client"]
         r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
         assert r.status_code == 200, r.text
-        assert table_registry_repo().get("t1")["semantic_draft_pending_at"] is not None
+        assert seen and seen[0] is not None
 
 
 class TestBatchLimit:
@@ -254,7 +266,7 @@ class TestConcurrencyCapDegradation:
 
         _register_uncovered("capped")
         _register_uncovered("fine")
-        _patch_run_one_shot(monkeypatch, raise_cap_for=("capped",))
+        _patch_run_one_shot(monkeypatch, raise_cap_for=("capped",), apply_for=("fine",))
 
         c = seeded_app_both["client"]
         r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
@@ -263,8 +275,9 @@ class TestConcurrencyCapDegradation:
 
         registry = table_registry_repo()
         assert registry.get("capped")["semantic_draft_pending_at"] is None
-        # The table that DID get a session keeps its stamp — that one has a
-        # suggestion resolution coming to clear it.
+        # The table whose session FILED a suggestion keeps its stamp — that
+        # one has an admin resolution coming to clear it. (A session that
+        # files nothing is un-stamped too; see TestNoApplyCallDegradation.)
         assert registry.get("fine")["semantic_draft_pending_at"] is not None
 
         # And it really is picked up again: a second tick re-triggers it.
@@ -290,7 +303,10 @@ class TestSessionErrorDegradation:
 
         _register_uncovered("boom")
         _register_uncovered("fine")
-        calls = _patch_run_one_shot(monkeypatch, raise_error_for=("boom",))
+        # `fine` FILES a suggestion so its stamp survives the tick — a
+        # silent session is un-stamped too (TestNoApplyCallDegradation),
+        # which would blur what this test is pinning.
+        calls = _patch_run_one_shot(monkeypatch, raise_error_for=("boom",), apply_for=("fine",))
 
         c = seeded_app_both["client"]
         r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
@@ -412,3 +428,55 @@ class TestSystemIdentityAndSurface:
         from src.repositories import users_repo
 
         assert users_repo().get_by_email(SEMANTIC_DRAFTER_USER_EMAIL) is not None
+
+
+class TestNoApplyCallDegradation:
+    """A session that ran cleanly but produced no suggestion (the
+    ``no_apply_call`` branch) is the same stuck-flag hazard the cap and
+    error branches already un-stamp for: the flag clears when an admin
+    resolves the resulting suggestion, and there is no suggestion — so
+    nothing will ever clear it and the table is filtered out of every
+    future tick's candidates, permanently and silently.
+    """
+
+    def test_a_session_that_files_no_suggestion_clears_its_flag(
+        self, state_backend, seeded_app_both, fake_chat_manager, monkeypatch
+    ):
+        _skip_unless_pg(state_backend)
+        from src.repositories import table_registry_repo
+
+        _register_uncovered("quiet")
+        _register_uncovered("drafts_ok")
+        _patch_run_one_shot(monkeypatch, apply_for=("drafts_ok",))
+
+        c = seeded_app_both["client"]
+        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["applied"] == 1
+        assert body["no_apply_call"] == 1
+
+        registry = table_registry_repo()
+        # No suggestion exists for `quiet`, so no resolution will ever clear
+        # its stamp — the sweep must clear it itself.
+        assert registry.get("quiet")["semantic_draft_pending_at"] is None
+        # The table that DID file one keeps its stamp: an admin's approve/
+        # reject on that suggestion is what clears it.
+        assert registry.get("drafts_ok")["semantic_draft_pending_at"] is not None
+
+    def test_the_table_is_picked_up_again_on_a_later_tick(
+        self, state_backend, seeded_app_both, fake_chat_manager, monkeypatch
+    ):
+        _skip_unless_pg(state_backend)
+        _register_uncovered("quiet")
+        _patch_run_one_shot(monkeypatch)
+
+        c = seeded_app_both["client"]
+        h = _auth(seeded_app_both["admin_token"])
+        assert c.post("/api/admin/semantic-auto-draft-sweep", headers=h).json()["no_apply_call"] == 1
+
+        calls = _patch_run_one_shot(monkeypatch)
+        r2 = c.post("/api/admin/semantic-auto-draft-sweep", headers=h)
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["triggered"] == 1
+        assert len(calls) == 1 and "quiet" in calls[0]["prompt"]

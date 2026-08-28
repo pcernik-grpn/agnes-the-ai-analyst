@@ -772,6 +772,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   invisible to the old page's coverage engine entirely.
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 ### Fixed
+- **The semantic auto-draft sweep no longer strands a table it drafted nothing
+  for.** Each selected table is stamped `semantic_draft_pending_at` before its
+  headless drafting session runs, and that stamp is cleared when an admin
+  resolves the suggestion the session filed. A session that ran cleanly but
+  filed no suggestion (`no_apply_call`) left the stamp set with nothing that
+  could ever clear it, so the table was silently excluded from every later
+  sweep tick — permanently, without an admin clearing the flag by hand. It is
+  now un-stamped on the way out, exactly as the concurrency-cap and
+  session-error branches already were, and the table falls back into the
+  candidate pool for a later tick.
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser
