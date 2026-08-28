@@ -931,8 +931,25 @@ async def delete_semantic_source(source_id: str, user: dict = Depends(require_ad
 
 @router.post("/api/admin/semantic-sources/{source_id}/sync")
 async def sync_semantic_source(source_id: str, user: dict = Depends(require_admin)):
-    if semantic_source_repo().get(source_id) is None:
+    row = semantic_source_repo().get(source_id)
+    if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
+    # `enabled=False` excludes a source from BOTH the scheduled sweep
+    # (app/api/semantic_sources_refresh.py) and this manual escape hatch —
+    # an admin who disabled a source expects nothing to touch it until they
+    # flip it back on.
+    if row.get("enabled") is False:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "source_disabled",
+                "hint": (
+                    f"Semantic source '{source_id}' is disabled and excluded from sync. "
+                    f"Re-enable it first: PUT /api/admin/semantic-sources/{source_id} "
+                    '{"enabled": true}'
+                ),
+            },
+        )
 
     from dataclasses import asdict
 

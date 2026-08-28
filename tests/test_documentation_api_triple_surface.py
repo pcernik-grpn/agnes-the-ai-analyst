@@ -1142,6 +1142,14 @@ _EXEMPT: dict[str, str] = {
         "views) sync trigger — admin/scheduler maintenance op, mirrors the "
         "run-keboola-semantic-layer-refresh exemption; no analyst CLI/MCP analogue"
     ),
+    "/api/admin/run-semantic-sources-refresh": (
+        "scheduler-driven generic refresh over registered semantic_sources "
+        "rows (Block 3 step 2 of #1707) — admin/scheduler maintenance op, "
+        "mirrors the run-keboola-semantic-layer-refresh / "
+        "run-databricks-semantic-layer-refresh exemptions; no analyst CLI/MCP "
+        "analogue (the per-source `agnes admin semantic-source sync <id>` "
+        "manual command already exists and is unrelated to this scheduled sweep)"
+    ),
     "/api/admin/run-audit-prune": (
         "scheduler-driven audit_log retention pruning trigger (B8 audit-trail "
         "seam) — admin/scheduler maintenance op, mirrors the run-blocked-purge "
