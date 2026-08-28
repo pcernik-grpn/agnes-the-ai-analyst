@@ -678,6 +678,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- A built-in marketplace row (e.g. `agnes-builtin`) that had picked up a
+  `last_error` from a git-sync attempt before such syncs were correctly
+  refused (a built-in row has no git remote — it's a sentinel `builtin://`
+  URL) is no longer stuck showing a permanently red "failed" badge with no
+  way to clear it. `MarketplaceRegistryRepository.register()` /
+  `MarketplaceRegistryPgRepository.register()` now clear a built-in row's
+  `last_error` on every re-register, so the next boot's re-seed self-heals
+  the fossil instead of leaving it forever stamped. Non-builtin rows are
+  unaffected — a real sync failure still survives an admin edit.
+
 - **Keboola-imported column descriptions now actually surface somewhere.**
   `project_document`'s column leg (`src/semantic/projection.py`) wrote
   `column_metadata` keyed on the raw Keboola tableId (e.g.

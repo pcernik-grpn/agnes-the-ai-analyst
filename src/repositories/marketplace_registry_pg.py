@@ -34,6 +34,15 @@ class MarketplaceRegistryPgRepository:
         # seed so re-seeding on upgrade cannot flip admin-registered rows.
         # `ref` is always overwritten on conflict, mirroring `branch` — see
         # the DuckDB sibling for the rationale.
+        #
+        # last_error self-heal: a built-in row has no git remote, so it can
+        # never legitimately fail a sync — any last_error sitting on one is
+        # a fossil from before sync_one() refused built-in rows up front
+        # (see MarketplaceNotSyncable). Clear it on every re-register of a
+        # built-in row (i.e. every boot's seed_builtin_marketplace() call)
+        # so a stale error can't get permanently stuck with no way to clear
+        # it. Non-builtin rows are untouched — an admin edit must not wipe
+        # a real sync failure off the board.
         now = datetime.now(timezone.utc)
         with self._engine.begin() as conn:
             conn.execute(
@@ -50,7 +59,8 @@ class MarketplaceRegistryPgRepository:
                         description = EXCLUDED.description,
                         curator_name = COALESCE(EXCLUDED.curator_name, marketplace_registry.curator_name),
                         curator_email = COALESCE(EXCLUDED.curator_email, marketplace_registry.curator_email),
-                        ref = EXCLUDED.ref"""
+                        ref = EXCLUDED.ref,
+                        last_error = CASE WHEN EXCLUDED.is_builtin THEN NULL ELSE marketplace_registry.last_error END"""
                 ),
                 {
                     "id": id,
