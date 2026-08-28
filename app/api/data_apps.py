@@ -65,9 +65,14 @@ from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
 from app.auth.access import can_access, is_user_admin, require_admin
-from app.auth.dependencies import _get_db, get_current_user, reject_keboola_header_credential
+from app.auth.dependencies import (
+    _get_db,
+    get_current_user,
+    reject_keboola_header_credential,
+    revocable_credential_id,
+)
 from app.auth.jwt import create_access_token
-from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX
+from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX, PARENT_TOKEN_ID_CLAIM
 from app.instance_config import feature_enabled, get_data_apps_config, get_public_url
 from app.resource_types import ResourceType
 from app.secrets_vault import VaultKeyNotConfiguredError, decrypt_secret, encrypt_secret
@@ -713,7 +718,7 @@ def _revoke_container_git_tokens(owner_id: str, repo_slug: str, app_slug: str, *
 _GIT_CREDENTIAL_TTL = timedelta(hours=24)
 
 
-def mint_git_token(row: dict) -> tuple[str, str]:
+def mint_git_token(row: dict, *, parent_token_id: str | None = None) -> tuple[str, str]:
     """Mint the raw `data-app-git:<slug>` PAT that `_mint_git_credential`
     embeds, and return ``(token_id, jwt)``.
 
@@ -723,6 +728,19 @@ def mint_git_token(row: dict) -> tuple[str, str]:
     `app/api/broker.py::data_apps_git_broker`). The token id comes back so
     that caller can revoke it the moment the request is done — a per-request
     credential that outlived the request would pile up rows for nothing.
+
+    ``parent_token_id`` binds the minted credential's life to the credential
+    that asked for it (`pat_resolver.PARENT_TOKEN_ID_CLAIM`): revoking that
+    one revokes this one, checked in `resolve_token_to_user`. Pass it whenever
+    the mint is driven by a caller holding a revocable credential — i.e. a
+    PAT, via `app.auth.dependencies.revocable_credential_id`. Without it a
+    leaked PAT's 24-hour successors survived the revocation of the PAT itself,
+    on every data app its owner owned, silently.
+
+    Defaults to ``None`` for the two mints that have no such parent: the
+    broker's per-request token (already revoked in its own ``finally``) and
+    any mint driven by an interactive session JWT, which has no
+    ``personal_access_tokens`` row to bind to.
     """
     owner = users_repo().get_by_id(row["owner_user_id"])
     if not owner:
@@ -736,7 +754,11 @@ def mint_git_token(row: dict) -> tuple[str, str]:
         token_id=token_id,
         typ="pat",
         expires_delta=_GIT_CREDENTIAL_TTL,
-        extra_claims={"scope": f"data-app-git:{slug}"},
+        extra_claims=(
+            {"scope": f"data-app-git:{slug}", PARENT_TOKEN_ID_CLAIM: parent_token_id}
+            if parent_token_id
+            else {"scope": f"data-app-git:{slug}"}
+        ),
     )
     access_token_repo().create(
         id=token_id,
@@ -749,7 +771,7 @@ def mint_git_token(row: dict) -> tuple[str, str]:
     return token_id, jwt_token
 
 
-def _mint_git_credential(row: dict) -> str:
+def _mint_git_credential(row: dict, *, parent_token_id: str | None = None) -> str:
     """Mint a PAT scoped `data-app-git:<slug>` for this app's owner and
     return a clone URL with it embedded as `agnes:<jwt>@` basic-auth.
 
@@ -775,7 +797,7 @@ def _mint_git_credential(row: dict) -> str:
     `AGNES_INTERNAL_URL` unconditionally — that one is used *inside* the
     container's config.json, which only ever runs in-cluster.
     """
-    _token_id, jwt_token = mint_git_token(row)
+    _token_id, jwt_token = mint_git_token(row, parent_token_id=parent_token_id)
     slug = row["slug"]
     base = get_public_url() or (os.environ.get("SERVER_URL") or "").strip().rstrip("/") or AGNES_INTERNAL_URL
     return _clone_url_with_credential(base, jwt_token, slug)
@@ -1452,9 +1474,30 @@ async def deploy_data_app(
 @router.post("/{slug}/git-credential", dependencies=[Depends(reject_keboola_header_credential)])
 async def mint_git_credential(
     slug: str,
+    request: Request,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
+    """Mint the app owner's 24-hour `data-app-git:<slug>` push credential.
+
+    Deliberately gated by `get_current_user`, NOT `require_session_token`:
+    `agnes app git-credential` authenticates with the PAT `agnes login` wrote
+    (`cli/config.py::get_token`), and the same is true of this route's MCP
+    tool over the PAT-authenticated SSE transport. Refusing a PAT here would
+    break a shipped command while changing nothing an attacker can do — the
+    git surface admits a plain PAT for a push directly
+    (`app/api/data_apps_git.py`: `allowed = is_owner or admin`, pinned by
+    `tests/test_data_apps_git.py::test_push_allowed_for_owner`), so a PAT
+    holder reaches the same repo one `git push` away with no mint call at all.
+    The mint is a convenience wrapper over authority the caller already holds,
+    not the gate that grants it.
+
+    What the mint DID add was persistence: the credential is its own
+    `personal_access_tokens` row, so revoking the PAT that produced it left it
+    pushing for the rest of its 24 hours. `revocable_credential_id` closes
+    that — when the caller holds a PAT, the successor is stamped with its id
+    and dies with it.
+    """
     _feature_gate()
     row = _get_row_or_404(slug)
     _require_owner_or_admin(user, row)
@@ -1462,7 +1505,7 @@ async def mint_git_credential(
     # to callers who would otherwise get a plain 403 (Devin Review on #1116).
     _reject_linked(row)
     try:
-        url = _mint_git_credential(row)
+        url = _mint_git_credential(row, parent_token_id=revocable_credential_id(request))
     except OwnerNotFoundError:
         raise HTTPException(status_code=500, detail="owner_not_found")
     _audit(conn, user["id"], "data_app.git_credential", f"data_app:{slug}", {})
@@ -1519,6 +1562,7 @@ async def create_preview_grant(
 async def create_draft(
     slug: str,
     payload: CreateDraftRequest,
+    request: Request,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -1583,7 +1627,11 @@ async def create_draft(
         raise HTTPException(status_code=400, detail="invalid_branch")
 
     try:
-        git_url = _mint_git_credential(parent)  # push credential is against the PROD repo
+        # Push credential is against the PROD repo — and bound to the caller's
+        # own credential, exactly as `mint_git_credential` does it: this route
+        # hands back the same 24-hour token and must not be the one surface
+        # that forgets the binding.
+        git_url = _mint_git_credential(parent, parent_token_id=revocable_credential_id(request))
     except OwnerNotFoundError:
         # Same rollback contract as the two failure paths above — a failed
         # create-draft call must never leave the row or the branch behind,
