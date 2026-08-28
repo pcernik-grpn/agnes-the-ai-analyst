@@ -36,15 +36,31 @@
              name changed (#865 asked for this: the two entities were one word
              apart, and the copy used to spend three places insisting they were
              different things. The name now does that work).
-     plugin  .zip bundle  -> POST /api/store/entities (multipart).
-             The bundle is validated server-side by /entities/preview, whose
-             component rows double as this type's Check result.
+     plugin  two routes into the same entity, chosen per draft
+             (`draft.plugin_source`):
+               'library'  ids of Library items -> POST /entities/from-components
+                          (JSON). The server merges each item's baked subtree
+                          into one plugin tree and delegates to the same create
+                          path, so a composed plugin is indistinguishable
+                          downstream from an uploaded one. Check dry-runs it.
+               'upload'   .zip bundle -> POST /api/store/entities (multipart),
+                          validated by /entities/preview, whose component rows
+                          double as this route's Check result.
+             The 'library' route exists because a plugin is the only entity
+             whose contents CAN be things already in the Library — and until it
+             did, an author who had written their skills here had no way to
+             bundle them without packaging a .zip by hand somewhere else.
+             Worth keeping in mind when writing copy for this type: a saved
+             skill is already served as a one-skill plugin
+             (`_bake_plugin_tree`), so a plugin is never a prerequisite for
+             shipping one — only for shipping several at once.
 
    Drafts are per-type and live in localStorage only (never the store) — the
    same honesty-about-persistence pattern the single-type builder used, now
    keyed by type so starting a plugin can't clobber a half-written skill. A
    plugin draft keeps its metadata but NOT its .zip: a File cannot be
-   serialized, so resuming one says so and asks for the bundle again. #}
+   serialized, so resuming an UPLOAD draft says so and asks for the bundle
+   again. A composed one resumes whole — its contents are ids, not a File. #}
 {% block title %}Builder — {{ config.INSTANCE_NAME }}{% endblock %}
 {% block container_modifier %}container--wide{% endblock %}
 
@@ -54,6 +70,10 @@
    to the unstyled browser default. #}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+{# The builder workspace, shared with /agents — same shell, same affordances,
+   one copy. What stays in the <style> below is this page's own: the type
+   picker, the body editor, the card preview and the linter rows. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <style>
   .sk-no-review {
     margin-bottom: var(--space-4);
@@ -126,10 +146,30 @@
      separated from the build head by the shell's 28px inter-band gap. */
   .sk-back { display: inline-flex; align-items: center; gap: 6px; border: none; background: none; color: var(--ds-text-secondary); font: inherit; font-size: 13px; cursor: pointer; padding: 0; margin: 0 0 14px; text-decoration: none; }
   .sk-back:hover { color: var(--ds-primary); }
+  /* The left pane's scroll region. The shell gives each pane a fixed height
+     and expects its content to scroll inside — without this the card preview
+     is clipped instead of scrollable. Mirrors .ag-conv. */
+  .sk-pvpane { flex: 1; overflow-y: auto; padding: 4px 22px 20px; }
+  .sk-pvpane .sk-preview { position: static; }
   .sk-build-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 0 0 18px; }
+  /* What is being made, beside the title. Carries the kind accent so the
+     three types are told apart at a glance without a card to say so. */
+  .sk-typechip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 650;
+    padding: 3px 10px 3px 8px; border-radius: var(--ds-radius-pill); white-space: nowrap; }
+  .sk-typechip-ico { display: inline-flex; width: 15px; height: 15px; }
+  .sk-typechip-ico svg { width: 15px; height: 15px; }
+  .sk-typechip--skill { color: var(--ds-kind-skill); background: var(--ds-kind-skill-soft); }
+  .sk-typechip--plugin { color: var(--ds-kind-plugin); background: var(--ds-kind-plugin-soft); }
+  .sk-typechip--agent { color: var(--ds-kind-agent); background: var(--ds-kind-agent-soft); }
+  .sk-typechip-change { font: inherit; font-size: 12px; padding: 2px 6px; border: none; background: none;
+    color: var(--ds-text-muted); text-decoration: underline; cursor: pointer; border-radius: 5px; }
+  .sk-typechip-change:hover, .sk-typechip-change:focus-visible { color: var(--ds-text-primary); }
   .sk-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-kind-skill); }
   .sk-build-kicker--skill { color: var(--ds-kind-skill); }
   .sk-build-kicker--plugin { color: var(--ds-kind-plugin); }
+  /* The interview's progress line lives in builder.css now (.ag-prog) — it is
+     the shell's, and keeping it here made it invisible on every other builder
+     that rendered the same markup. */
   .sk-build-kicker--agent { color: var(--ds-kind-agent); }
   .sk-build-head h2 { font-size: 24px; margin: 2px 0 0; word-break: break-word; }
   .sk-build-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex: 1 1 320px; flex-wrap: wrap; min-width: 0; margin-top: 4px; }
@@ -154,6 +194,11 @@
   .sk-access-hint { font-size: 12.5px; line-height: 1.45; color: var(--ds-text-secondary); }
 
   /* Numbered sections. */
+  /* Step 1 keeps its own markup (it is a decision already made, not an
+     editable section) and must match the shared sections' LOOK. Those are
+     cards again (see builder.css `.ag-sec` — the flat pass made the panel
+     unscannable), so a hairline row here would now be the one flat thing in a
+     column of cards, which is the same mistake inverted. */
   .sk-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
   .sk-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
   .sk-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
@@ -399,6 +444,10 @@
 {% endblock %}
 
 {% block scripts %}
+{# NOT deferred: this page renders on boot, so BuilderShell has to exist
+   before the script below runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script src="{{ static_url('js/components/builder_preview.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -419,6 +468,9 @@
   // Save so the server never rejects on format alone.
   var NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
   var MAX_BUNDLE_BYTES = 10 * 1024 * 1024;
+  // Mirrors MAX_COMPONENTS in app/api/store.py. Enforced here only so the
+  // count stops climbing in the picker; the server is the authority.
+  var MAX_COMPONENTS = 25;
   /* An uploaded markdown body is kept in the draft, and the draft lives in
      localStorage — so this cap is about the ~5 MB the browser gives all three
      type slots together, not about what the store would accept. */
@@ -449,6 +501,9 @@
   var TYPES = {
     skill: {
       key: 'skill',
+      convOpening: 'Hi! Tell me what this skill should do and I will draft it — the recipe, when an agent should reach for it, and a name. For example, “how to pull last quarter’s revenue by region”.',
+      convPlaceholder: 'Tell me what this skill should do…',
+      convStarters: ['A recipe for our weekly revenue report', 'How to check a pipeline is healthy', 'Our house rules for writing SQL'],
       label: 'Skill',
       kicker: 'Authoring skill',
       newTitle: 'New skill',
@@ -473,15 +528,18 @@
     },
     plugin: {
       key: 'plugin',
+      convOpening: 'Hi! A plugin is one install that hands someone several things at once. Pick what it should carry on the right — skills and agent templates already in the Library — or upload a packaged .zip. Worth knowing: a skill you save here already ships on its own, so a plugin is only for bundling several together.',
+      convPlaceholder: 'Tell me what this plugin does…',
+      convStarters: ['It adds Jira commands', 'Describe it for someone who has not used it', 'Suggest a category'],
       label: 'Plugin',
       kicker: 'Authoring plugin',
       newTitle: 'New plugin',
       source: 'bundle',
-      what: 'A packaged bundle — commands, hooks, MCP servers, agents — installed as one unit. Built outside this page and uploaded here.',
-      takes: 'A .zip with .claude-plugin/plugin.json',
-      secTitle: 'Bundle',
-      secNote: 'the plugin .zip',
-      secSub: 'Attach the packaged plugin. The server reads its manifest and lists what’s inside before you save.',
+      what: 'One install that hands someone several things at once — skills and agent templates you pick from the Library, or a bundle with commands, hooks and MCP servers packaged elsewhere.',
+      takes: 'Items from the Library, or a .zip',
+      secTitle: 'Contents',
+      secNote: 'what it carries',
+      secSub: 'Pick what this plugin installs. Anything in the Library can go in; a packaged .zip works too.',
       descLabel: 'Description',
       descNote: '— what it does',
       descPlaceholder: 'What the plugin adds and who should install it.',
@@ -493,6 +551,9 @@
     },
     agent: {
       key: 'agent',
+      convOpening: 'Hi! Describe the role this template should give an agent — who it is, what it does, what it should refuse — and I will draft the brief. Remember it carries no data access of its own.',
+      convPlaceholder: 'Describe the role this template gives…',
+      convStarters: ['A careful finance analyst', 'Someone who triages support tickets', 'A reviewer that never guesses a number'],
       label: 'Agent Template',
       kicker: 'Authoring agent template',
       newTitle: 'New agent template',
@@ -520,6 +581,76 @@
   var type = null;        // null → step 1 expanded, nothing below it yet
   var typeOpen = false;   // step 1 re-opened via Change while a type is set
   var draft = null;       // the in-progress item in the builder
+  /* Which configuration sections are folded away. Content is what an author
+     is here to write, so it opens; Identity opens because it gates saving.
+     Access is a pre-answered publishing choice and Type is already decided by
+     the time this renders, so both start shut. */
+  var collapsed = { type: true, identity: false, content: false, access: true };
+
+  /* ── The Create conversation ──
+     Per-type, like the drafts themselves: switching type must not carry a
+     skill's transcript into a plugin. In memory only — a reload starts the
+     conversation over while the DRAFT survives, which is the honest split
+     (the draft is the work; the conversation is how you got there). */
+  var builderTab = 'create';
+  var convs = { skill: [], plugin: [], agent: [] };
+  var convBusy = false, convErr = null, convDraft = '', convChips = [];
+  /* What the last turn reported. `engine` is which one answered — a scripted
+     stand-in runs whenever AGNES_BUILDER_STUB (or TESTING) is set, and a
+     degraded mode that looks identical to the real one is a lie the page
+     would otherwise tell. `slots` is the interview's state, computed
+     server-side so the two cannot disagree about what is still missing. */
+  var convEngine = null, convSlots = { skill: null, plugin: null, agent: null };
+  var openedFor = {};   // types whose opening turn has already been fired
+  function conv() { return convs[type] || []; }
+
+  /* Live preview, for agent templates only. A template IS a system prompt, so
+     trying one means running an agent with that prompt — which needs a row,
+     because a session runs as an agent id. The server points a single
+     invisible scratch agent at the draft and hands back its slug; see
+     app/api/entity_builder.py for why there is exactly one per user and no
+     delete endpoint racing the next preview.
+
+     A skill or a plugin has no equivalent: making one invokable means
+     materializing it into a session workspace, which is its own phase. Their
+     Preview stays the card. */
+  var preview = BuilderPreview({
+    label: 'skills',
+    /* A SKILL previews by being made invokable: the session is opened with
+       the draft, the server writes it into that session's own workspace, and
+       the agent can load it. Nothing is sent for a template — that runs as an
+       agent, not as a skill — and nothing for a plugin, whose contents are an
+       archive we do not unpack. */
+    sessionExtras: function () {
+      if (type !== 'skill') return {};
+      return { preview_skill: { name: draft.name || '', body: draft.body || '' } };
+    },
+    resolveSlug: function () {
+      var body = (draft && draft.body || '').trim();
+      if (!body) return null;
+      /* A skill runs inside a normal session — the caller's own default
+         agent, with the draft skill added to it. There is no scratch agent
+         to point anywhere. */
+      if (type === 'skill') return Promise.resolve('');
+      return fetch('/api/store/entities/builder/preview-agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ name: draft.name || '', body: body }),
+      }).then(function (r) {
+        if (!r.ok) throw new Error('Could not start a preview (HTTP ' + r.status + ').');
+        return r.json();
+      }).then(function (d) { return d.slug; });
+    },
+    onUpdate: function () { renderLeftPane(); },
+  });
+  /* A skill and an agent template can both be tried live, by different
+     routes: a template BECOMES an agent (a scratch one, pointed at the
+     draft), a skill is added TO one (materialized into the session's
+     workspace). A plugin can be neither — its contents are an uploaded
+     archive, and unpacking an untrusted zip into a session workspace is a
+     bigger question than this tab. Its Preview stays the card. */
+  function canPreviewLive() { return type === 'agent' || type === 'skill'; }
   var bundle = null;      // plugin only: the attached File (never persisted)
   var check = null;       // last Check result, or null
   var inFlight = false;
@@ -530,11 +661,9 @@
   var problems = [];
   var problemsLead = '';   // "Couldn’t save"; the count is derived, see alertsHtml
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
+  /* Delegated, not duplicated — see builder_shell.js on why there is one
+     escaper across both builder pages. */
+  var esc = BuilderShell.esc;
   function cfg() { return TYPES[type]; }
 
   /* ── Draft persistence (localStorage only — see DRAFT_KEY note above) ──
@@ -563,7 +692,8 @@
   // pre-selected, so it alone never counts as content.
   function isBlank() {
     return !(draft.name || '').trim() && !(draft.description || '').trim() &&
-           !(draft.body || '').trim() && !draft.category && !bundle;
+           !(draft.body || '').trim() && !draft.category && !bundle &&
+           !componentIds().length;
   }
   function persist() {
     if (!type || !draft) return;
@@ -606,7 +736,12 @@
     // provenance of an uploaded one; unlike a plugin's .zip it survives a
     // reload, because the text itself is in the draft.
     return { name: '', description: '', category: '', body: '', access: 'private',
-             source_mode: 'write', source_file: null };
+             source_mode: 'write', source_file: null,
+             // Plugin only. `plugin_source` is how the contents are being
+             // given; `components` is the Library selection, denormalized
+             // ({id, type, name, title, description}) so a resumed draft can
+             // render its own rows without waiting on the pool.
+             plugin_source: 'library', components: [] };
   }
 
   /* Which input the content section shows. Upload mode with a body but no file
@@ -616,6 +751,20 @@
     if (!draft) return 'write';
     if (draft.source_mode !== 'upload') return 'write';
     return (draft.source_file || !(draft.body || '').trim()) ? 'upload' : 'write';
+  }
+
+  /* How a plugin's contents are being given: 'library' folds items already in
+     the Library into one bundle server-side, 'upload' attaches a .zip packaged
+     elsewhere. Unlike the .zip — a File, which cannot be persisted — a Library
+     selection is only ids, so it survives a reload with the rest of the draft. */
+  function pluginSource() {
+    if (!draft) return 'library';
+    return draft.plugin_source === 'upload' ? 'upload' : 'library';
+  }
+  function components() { return (draft && draft.components) || []; }
+  function contentFieldLabel() { return pluginSource() === 'library' ? 'Contents' : 'Bundle'; }
+  function componentIds() {
+    return components().map(function (c) { return c.id; });
   }
 
   /* ── Validation — per type, but one shape so the shell stays type-agnostic ── */
@@ -635,7 +784,9 @@
   // Gate for Save to Library: a valid name plus this type's content.
   function canPublish() {
     if (!nameState().ok) return false;
-    if (cfg().source === 'bundle') return !!bundle;
+    if (cfg().source === 'bundle') {
+      return pluginSource() === 'upload' ? !!bundle : componentIds().length > 0;
+    }
     return (draft.body || '').trim().length > 0;
   }
   // Check needs the same inputs as Save — both send the real payload.
@@ -643,7 +794,11 @@
 
   function bodyStats() {
     if (cfg().source === 'bundle') {
-      return bundle ? fmtSize(bundle.size) : '—';
+      if (pluginSource() === 'library') {
+        var n = componentIds().length;
+        return n ? n + ' item' + (n === 1 ? '' : 's') : 'none yet';
+      }
+      return bundle ? fmtSize(bundle.size) : 'no bundle yet';
     }
     var t = (draft.body || '').trim();
     if (!t) return '—';
@@ -814,17 +969,82 @@
     '</div>';
   }
 
+  /* Which of the two routes into a plugin is showing. Same toggle-button
+     contract as the markdown types' write/upload switch — two states of one
+     field, pressed state on aria-pressed rather than colour alone. */
+  function pluginModeSwitchHtml() {
+    var m = pluginSource();
+    function btn(k, icon, label) {
+      return '<button type="button" class="sk-mode" data-sk-psrc="' + k + '" aria-pressed="' + (m === k) + '">' +
+        icon + '<span>' + label + '</span></button>';
+    }
+    return '<div class="sk-modes" role="group" aria-label="What this plugin carries">' +
+      btn('library', ICONS.skill, 'Pick from the Library') +
+      btn('upload', ICONS.upload, 'Upload a .zip') +
+    '</div>';
+  }
+
+  /* One selected-or-selectable item. `mode` decides only the action: the
+     picker offers Add/Added, the section offers Remove — the row itself reads
+     the same in both places, which is what makes the picker feel like the
+     section with more of it. */
+  function componentRowHtml(c, mode) {
+    var kind = c.type === 'agent' ? 'agent' : 'skill';
+    var picked = componentIds().indexOf(c.id) >= 0;
+    var act = mode === 'picker'
+      ? '<button type="button" class="ag-tglbtn' + (picked ? ' on' : '') + '" data-sk-pick="' + esc(c.id) + '">' +
+          (picked ? '✓ Added' : '+ Add') + '</button>'
+      : '<button type="button" class="ag-tglbtn ag-tglbtn--rm" data-sk-unpick="' + esc(c.id) + '">Remove</button>';
+    return '<div class="ag-row">' +
+        '<div class="ag-row-body">' +
+          '<div class="ag-row-name">' + esc(c.title || c.name || c.id) +
+            '<span class="ag-kind ag-kind--' + kind + '">' + (kind === 'agent' ? 'agent template' : 'skill') + '</span>' +
+          '</div>' +
+          '<div class="ag-row-desc">' + esc(c.description || '') + '</div>' +
+        '</div>' + act +
+      '</div>';
+  }
+
+  function contentsPanelHtml() {
+    var picked = components();
+    // Empty reads like the agent builder's empty slots (`.ag-slot`): a bold
+    // line naming the state, one sentence on how to leave it. A single grey
+    // sentence reads as a caption on a broken list rather than an invitation.
+    var rows = picked.length
+      ? '<div class="ag-rows">' + picked.map(function (c) { return componentRowHtml(c, 'section'); }).join('') + '</div>'
+      : '<div class="ag-slot">' +
+          '<p class="ag-slot-head">Nothing in it yet.</p>' +
+          '<p class="ag-slot-body">Add the skills and agent templates this plugin should install. ' +
+          'They stay where they are — this copies them into one bundle.</p>' +
+        '</div>';
+    return rows +
+      '<button type="button" class="ag-addrow" data-sk-openpick>+ Add from the Library</button>' +
+      // The sentence the builder was missing: someone who came here to ship a
+      // skill they already saved is finished, and should be told so rather
+      // than left packaging something they do not need. Grey, like every other
+      // routine helper in the panel — the blue info treatment is for a NOTICE
+      // (see the engine one), and spending it on standing guidance is how a
+      // page ends up with three tinted blocks per section.
+      '<div class="ag-note">Each item you save to the Library already installs on its own — ' +
+      'a plugin is for handing several over at once.</div>';
+  }
+
+  function bundlePanelHtml() {
+    var attached = bundle
+      ? fileCardHtml(bundle.name, bundle.size, 'ready to check', '')
+      : dropZoneHtml('Drop the plugin <strong>.zip</strong> here', '', '.zip · up to ' + fmtSize(MAX_BUNDLE_BYTES));
+    return attached + fileInputHtml('.zip,application/zip') +
+      '<div class="sk-note">The archive must contain <code>.claude-plugin/plugin.json</code>. ' +
+      '<strong>Check bundle</strong> validates the layout and lists every command, hook and agent the server finds inside — run it before saving.</div>';
+  }
+
   function bodySectionHtml() {
     var c = cfg();
     if (c.source === 'bundle') {
-      var attached = bundle
-        ? fileCardHtml(bundle.name, bundle.size, 'ready to check', '')
-        : dropZoneHtml('Drop the plugin <strong>.zip</strong> here', '', '.zip · up to ' + fmtSize(MAX_BUNDLE_BYTES));
       return '<div class="sk-sec-body" id="sk-drop">' +
-        attached + fileInputHtml('.zip,application/zip') +
+        pluginModeSwitchHtml() +
+        (pluginSource() === 'library' ? contentsPanelHtml() : bundlePanelHtml()) +
         fieldErrHtml('bundle') +
-        '<div class="sk-note">The archive must contain <code>.claude-plugin/plugin.json</code>. ' +
-        '<strong>Check bundle</strong> validates the layout and lists every command, hook and agent the server finds inside — run it before saving.</div>' +
       '</div>';
     }
 
@@ -869,7 +1089,7 @@
       (type === 'agent'
         ? '<div class="sk-pv-row"><span class="sk-pv-k">Kind</span><span class="sk-pv-v">Library resource</span></div>'
         : '<div class="sk-pv-row"><span class="sk-pv-k">Invoked as</span><span class="sk-pv-v"><code id="sk-pv-inv">' + (esc(draft.name) || '—') + '</code></span></div>') +
-      '<div class="sk-pv-row"><span class="sk-pv-k">' + (c.source === 'bundle' ? 'Bundle' : 'Content') + '</span><span class="sk-pv-v" id="sk-pv-stats">' + bodyStats() + '</span></div>' +
+      '<div class="sk-pv-row"><span class="sk-pv-k">' + (c.source !== 'bundle' ? 'Content' : (pluginSource() === 'library' ? 'Contents' : 'Bundle')) + '</span><span class="sk-pv-v" id="sk-pv-stats">' + bodyStats() + '</span></div>' +
       // Provenance, once there is any. Which file a body came from is the first
       // thing an author checks when two drafts start to look alike.
       (c.source !== 'bundle' && draft.source_file
@@ -883,7 +1103,6 @@
       '<div class="sk-pv-row"><span class="sk-pv-k">Status</span><span class="sk-pv-v" id="sk-pv-status">' + (canPublish() ? 'Ready to save' : 'Draft') + '</span></div>';
 
     return '<div>' +
-      '<h3>Preview</h3>' +
       '<div class="sk-pv-card">' +
         '<div class="sk-pv-hd">' +
           '<span class="sk-ava sk-ava--' + type + '">' + ICONS[type] + '</span>' +
@@ -967,6 +1186,10 @@
     // (the shell puts 28px between the two bands, which is right between
     // zones but far too much between a back link and its heading).
     if (pageHeadBand) pageHeadBand.hidden = !!type;
+    /* Same full-bleed breakout /agents uses: once a type is chosen this is a
+       workspace, not a document, and it drops the index shell's centred
+       column. Cleared on the type picker, which IS a document. */
+    document.body.classList.toggle('ag-building', !!type);
 
     if (!type) {
       view.innerHTML = '<div class="sk-bgrid sk-bgrid--solo"><div>' + typeSectionHtml() + '</div></div>';
@@ -975,39 +1198,283 @@
 
     var c = cfg(), ns = nameState();
     view.innerHTML =
-      '<a class="sk-back" href="/library">← Library</a>' +
-      '<div class="sk-build-head">' +
-        '<div style="min-width:0">' +
-          '<div class="sk-build-kicker sk-build-kicker--' + type + '">' + esc(c.kicker) + '</div>' +
-          '<h2 id="sk-build-title">' + (esc(draft.name) || esc(c.newTitle)) + '</h2>' +
-        '</div>' +
-        '<div class="sk-build-actions">' +
-          // No status line lives in this row. Receipts go to the toast and the
-          // save verdict goes to #sk-alerts below, so nothing here can grow and
-          // push the buttons off the line the author is aiming at.
-          // Discard replaced the ✕ that used to sit on each row of the picker's
-          // draft list; with the list gone this is the only way to throw work
-          // away, so it has to exist somewhere.
-          (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
-          '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
-          '<button type="button" class="cc-btn" id="sk-check" ' + (canCheck() && !reviewInProgress ? '' : 'disabled') + '>' + esc(c.checkLabel) + '</button>' +
-          '<button type="button" class="cc-btn cc-btn--primary" id="sk-save" ' + (canPublish() && !reviewInProgress ? '' : 'disabled') + '>Save to Library</button>' +
-        '</div>' +
-      '</div>' +
+      BuilderShell.head({
+        backLabel: 'Library',
+        title: draft.name || c.newTitle,
+        titleId: 'sk-build-title',
+        badge: typeBadgeHtml(c),
+        actionsId: 'sk-build-actions',
+        actions: headActionsHtml(),
+      }) +
       // The save verdict, below the action row and above the form it is about.
       // Empty on a good day; it never reserves space.
       '<div id="sk-alerts">' + alertsHtml() + '</div>' +
       agentCalloutHtml() +
-      '<div class="sk-bgrid">' +
-        '<div id="sk-steps">' +
-          typeSectionHtml() +
-          // Section 2 — Identity. Same fields for every type, so switching
-          // type never moves the name field out from under the author.
-          '<div class="sk-sec">' +
-            '<div class="sk-sec-head"><span class="sk-sec-no">2</span>' +
-              '<div class="sk-sec-grow"><h3>Identity</h3><p class="sk-sec-sub">What it is called and when someone should reach for it.</p></div>' +
-            '</div>' +
-            '<div class="sk-sec-body">' +
+      BuilderShell.workspace({
+        /* Left is where the conversation will go (phase 3 of the builder
+           spec). Until then it carries the one thing that already belongs
+           there — what you are making, as it will read — behind the same tab
+           strip, so adding Create later moves nothing. */
+        left: tabsHtml() + leftPaneHtml(c),
+        cfgTitle: 'Configuration',
+        cfgSub: 'everything this ' + c.label.toLowerCase() + ' is, editable by hand',
+        cfgBodyId: 'sk-steps',
+        cfg: progressHostHtml() + stepsHtml(c, ns),
+      }) +
+      // Modal host. Always in the DOM so opening the picker never has to wait
+      // for a re-render, and empty whenever it is closed.
+      '<div id="sk-picker"></div>';
+    afterRender();
+  }
+
+  /* Describe it, or look at it. Preview is still the card — a real
+     "try it with this applied" needs the draft materialized into a session
+     workspace, which is its own phase of the builder spec. */
+  function leftPaneHtml(c) {
+    if (builderTab === 'preview') {
+      if (!canPreviewLive()) {
+        return '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>';
+      }
+      var pv = preview.state;
+      var needs = type === 'skill'
+        ? 'Write the skill on the right, then try invoking it here.'
+        : 'Write the role on the right, then talk to it here.';
+      if (!(draft.body || '').trim()) {
+        return BuilderShell.conversationEmpty({
+            id: 'sk-pv-conv', icon: ICONS[type],
+            text: needs,
+          }) + BuilderShell.composer({
+            kind: 'preview', value: '', placeholder: 'Write it first…', busy: true,
+          });
+      }
+      var rows = pv.msgs.slice();
+      if (pv.stream) rows.push({ role: 'assistant', text: pv.stream });
+      var body = rows.length || pv.err || pv.busy
+        ? BuilderShell.conversation({ id: 'sk-pv-conv', rows: rows, busy: pv.busy, err: pv.err })
+        : BuilderShell.conversationEmpty({
+            id: 'sk-pv-conv', icon: ICONS[type],
+            text: type === 'skill'
+              ? 'Ask for something this skill covers — it is loaded in this session.'
+              : 'Talk to it the way someone who installs it would.',
+          });
+      /* Answers render as plain text — this page has no HTML sanitizer and an
+         engine answer is model output. The full chat page has the real
+         renderer, so link to the same session rather than reimplementing it. */
+      var full = pv.session
+        ? ' <a href="/chat?session=' + encodeURIComponent(pv.session.id) + '">Open in full chat →</a>'
+        : '';
+      return body +
+        '<p class="ag-live-note">' + (type === 'skill'
+          ? 'A real session with this draft skill loaded, and nothing else changed. It exists here only.'
+          : 'A real session running this template as its brief. It has no data access of its own — ' +
+            'neither will anyone who installs it.') + full + '</p>' +
+        BuilderShell.composer({
+          kind: 'preview', value: pv.draft,
+          placeholder: 'Ask it something…', busy: pv.busy,
+        });
+    }
+    /* The opening line used to be a constant in the type table. It is the
+       server's first turn now — generated from the empty draft and the first
+       open slot, which a hardcoded paragraph could not be. `convOpening`
+       survives as the pre-flight line: what the pane says while that turn is
+       still in the air, so the pane is never blank. */
+    var rows = conv().length
+      ? conv()
+      : (convBusy ? [] : [{ role: 'assistant', text: openingMessage(c) }]);
+    return engineNoticeHtml() +
+      BuilderShell.conversation({
+        id: 'sk-conv',
+        rows: rows,
+        busy: convBusy,
+        busyText: conv().length ? 'Thinking…' : 'Getting started…',
+        err: convErr,
+      }) +
+      BuilderShell.composer({
+        kind: 'create',
+        value: convDraft,
+        placeholder: c.convPlaceholder,
+        busy: convBusy,
+        chips: convBusy ? [] : (convChips.length ? convChips : c.convStarters),
+      });
+  }
+
+  /* Written by the page, not the model: it costs nothing, it never fails, and
+     it is what tells a first-time author what kind of sentence this box
+     wants. Per type, because the answer differs. */
+  function openingMessage(c) { return c.convOpening; }
+
+  /* Which engine answered. Only ever rendered for the stub: naming the real
+     one every turn would be noise, but leaving the scripted one unnamed is
+     how someone spends an afternoon judging a string-slicer. */
+  function engineNoticeHtml() {
+    // Kept as a named function because three call sites read better for it;
+    // the notice itself is the shell's (BuilderShell.engineNotice), so all
+    // four builders say the same thing in the same words.
+    return BuilderShell.engineNotice(convEngine);
+  }
+
+  /* The interview's state, straight from the last turn. Computed server-side
+     from the same predicates the prompt is built out of, so the panel and the
+     assistant cannot disagree about what is still missing. */
+  /* A stable host, so a landed turn can repaint the progress line alone —
+     re-rendering the whole panel for it would rebuild the form under whatever
+     field has focus. */
+  function progressHostHtml() { return '<div id="sk-prog-host">' + progressHtml() + '</div>'; }
+  function syncProgress() {
+    var host = document.getElementById('sk-prog-host');
+    if (host) host.innerHTML = progressHtml();
+  }
+
+  function progressHtml() {
+    var slots = convSlots[type];
+    if (!slots || !slots.length) return '';
+    var known = slots.filter(function (s) { return s.known; }).length;
+    var open = slots.filter(function (s) { return !s.known; });
+    return '<div class="ag-prog">' +
+      '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
+      '<span class="ag-prog-t">' + (open.length
+        ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
+        : 'nothing missing — ready to save') + '</span>' +
+    '</div>';
+  }
+
+  /* Re-render ONLY the left pane. A full render() would rebuild the form and
+     pull the caret out of whatever field is focused. */
+  function renderLeftPane() {
+    var pane = view.querySelector('.ag-work > .ag-pane');
+    if (!pane) { render(); return; }
+    /* The TAB STRIP is part of this pane, not chrome above it. Keeping it and
+       replacing only what follows left `aria-selected` on whichever tab was
+       active at first paint — so Preview's pane rendered under a Create tab
+       still styled as the selected one. The strip is cheap; rebuild it. */
+    pane.innerHTML = tabsHtml() + leftPaneHtml(cfg());
+    var el = document.getElementById('sk-conv');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  function tabsHtml() {
+    return BuilderShell.tabs({
+      active: builderTab,
+      tabs: [{ id: 'create', label: 'Create' }, { id: 'preview', label: 'Preview' }],
+    });
+  }
+
+  /* One builder turn. The reply is inserted as TEXT (BuilderShell.message) —
+     the model's output is untrusted and neither builder page has a
+     sanitizer. Nothing is written server-side: the patch is merged into the
+     local draft and Save to Library stays the only thing that creates. */
+  /* `text` empty means the builder opens the conversation itself: the server
+     generates the opening from the empty draft and the first open slot, which
+     a hardcoded paragraph could not do. Only valid with an empty transcript —
+     the endpoint refuses a later empty message. */
+  function sendBuilderTurn(text) {
+    if (!type || !draft || convBusy) return;
+    var opening = !text && !conv().length;
+    if (!text && !opening) return;
+    if (!opening) convs[type] = conv().concat([{ role: 'user', text: text }]);
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    renderLeftPane();
+    fetch('/api/store/entities/builder/turn', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        type: type,
+        message: text || '',
+        history: opening ? [] : conv().slice(0, -1),
+        // The panel as it stands, so the turn reasons about what is on screen.
+        draft: {
+          name: draft.name || '', description: draft.description || '',
+          category: draft.category || '', body: draft.body || '',
+        },
+      }),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) {
+          var d = (body && body.detail) || {};
+          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
+        }
+        return body;
+      });
+    }).then(function (body) {
+      convs[type] = conv().concat([{ role: 'assistant', text: body.reply || '' }]);
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      convEngine = body.engine || null;
+      convSlots[type] = body.slots || null;
+      syncProgress();
+      var patch = body.patch || {};
+      var keys = Object.keys(patch);
+      if (keys.length) {
+        keys.forEach(function (k) { draft[k] = patch[k]; });
+        persist();
+        // The form is the source of truth and stays hand-editable; re-render
+        // it so the fields show what the turn wrote.
+        renderConfigPane();
+      }
+    }).catch(function (err) {
+      console.error('skills: builder turn failed', err);
+      convErr = err.message;
+    }).finally(function () {
+      convBusy = false;
+      renderLeftPane();
+    });
+  }
+
+  /* Re-render ONLY the configuration. Keeps the conversation pane — and any
+     half-typed message in its composer — untouched. */
+  function renderConfigPane() {
+    var body = document.getElementById('sk-steps');
+    if (!body) { render(); return; }
+    body.innerHTML = progressHostHtml() + stepsHtml(cfg(), nameState());
+    syncProblems();
+    if (window.dsDropdownInit) body.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
+  }
+
+  /* The header verbs. Split out of render() for the same reason /agents did
+     it: they change on their own (a draft appearing, a check finishing) and
+     repainting just this row must not rebuild the form under the caret. */
+  function headActionsHtml() {
+    var c = cfg();
+    // No status line lives in this row. Receipts go to the toast and the save
+    // verdict goes to #sk-alerts below, so nothing here can grow and push the
+    // buttons off the line the author is aiming at.
+    // Discard replaced the ✕ that used to sit on each row of the picker's
+    // draft list; with the list gone this is the only way to throw work away,
+    // so it has to exist somewhere.
+    return (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
+          '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
+          '<button type="button" class="cc-btn" id="sk-check" ' + (canCheck() && !reviewInProgress ? '' : 'disabled') + '>' + esc(c.checkLabel) + '</button>' +
+      '<button type="button" class="cc-btn cc-btn--primary" id="sk-save" ' + (canPublish() && !reviewInProgress ? '' : 'disabled') + '>Save to Library</button>';
+  }
+
+  /* The configuration itself — the numbered sections, on the shell's own
+     section component so they read identically to the agent builder's. */
+  /* What is being made, for the header. The type used to be section 1 of the
+     panel: a card with a ✓ where every other section has a number, spending
+     the most valuable slot in the column re-asking what "+ Add → Build a
+     skill" had already answered. It is identity, not configuration, so it
+     sits beside the title now and the sections start at Identity. Change is
+     still one click, and switching still parks the outgoing draft. */
+  function typeBadgeHtml(c) {
+    return '<span class="sk-typechip sk-typechip--' + type + '">' +
+        '<span class="sk-typechip-ico">' + ICONS[type] + '</span>' + esc(c.label) +
+      '</span>' +
+      '<button type="button" class="sk-typechip-change" data-sk-change>Change</button>';
+  }
+
+  function stepsHtml(c, ns) {
+    // Section 1 — Identity. Same fields for every type, so switching type
+    // never moves the name field out from under the author.
+    //
+    // The comment goes ABOVE the return, not after it: `return` followed by a
+    // newline is a `return;` under automatic semicolon insertion, which is
+    // exactly how this rendered the word "undefined" into the panel once.
+    return BuilderShell.section({
+        key: 'identity',
+        collapsed: !!collapsed['identity'], no: 1, title: 'Identity',
+        sub: 'What it is called and when someone should reach for it.',
+        summary: draft.name || 'Unnamed',
+        body:
               '<label class="sk-field"><span>Name <em>— lowercase-hyphenated handle</em></span>' +
                 '<input type="text" data-sk-field="name" value="' + esc(draft.name) + '" placeholder="' + esc(c.namePlaceholder) + '" maxlength="64" autocomplete="off" spellcheck="false"></label>' +
               '<p class="sk-hint' + (ns.err ? ' err' : '') + '" id="sk-name-hint">' + esc(ns.msg) + '</p>' +
@@ -1017,29 +1484,26 @@
               fieldErrHtml('description') +
               '<label class="sk-field"><span>Category</span>' +
                 '<div class="sk-selectwrap"><select id="sk-category" data-sk-field="category" class="ds-dropdown-native">' + catOptions() + '</select>' + catDropdownHtml() + '</div></label>' +
-              fieldErrHtml('category') +
-            '</div>' +
-          '</div>' +
-          // Section 3 — the type's content: markdown body, or a .zip bundle.
-          '<div class="sk-sec">' +
-            '<div class="sk-sec-head"><span class="sk-sec-no">3</span>' +
-              '<div class="sk-sec-grow"><h3>' + esc(c.secTitle) + ' <span class="sk-sec-note">' + esc(c.secNote) + '</span></h3>' +
-              '<p class="sk-sec-sub">' + esc(c.secSub) + '</p></div>' +
-            '</div>' +
-            bodySectionHtml() +
-          '</div>' +
-          // Section 4 — Access. It used to sit ABOVE the sections as unnumbered
-          // preamble, which was fine while the sections started at Identity;
-          // once Type became step 1 that put an un-numbered decision in front
-          // of step 1 and broke the sequence. It is a publishing choice, so it
+          fieldErrHtml('category'),
+      }) +
+      // Section 2 — the type's content: markdown body, or a .zip bundle.
+      BuilderShell.section({
+        key: 'content',
+        collapsed: !!collapsed['content'], no: 2, title: c.secTitle, note: c.secNote, sub: c.secSub,
+        summary: bodyStats(),
+        body: bodySectionHtml(),
+      }) +
+          // Section 3 — Access. It used to sit ABOVE the sections as
+          // unnumbered preamble, which put an un-numbered decision in front of
+          // step 1 and broke the sequence. It is a publishing choice, so it
           // belongs last — pre-answered with the safe default, read right
           // before Save.
-          '<div class="sk-sec">' +
-            '<div class="sk-sec-head"><span class="sk-sec-no">4</span>' +
-              '<div class="sk-sec-grow"><h3>Access</h3>' +
-              '<p class="sk-sec-sub">Who can use this ' + esc(c.label.toLowerCase()) + ' once it is saved.</p></div>' +
-            '</div>' +
-            '<div class="sk-sec-body">' +
+      BuilderShell.section({
+        key: 'access',
+        collapsed: !!collapsed['access'], no: 3, title: 'Access',
+        sub: 'Who can use this ' + c.label.toLowerCase() + ' once it is saved.',
+        summary: draft.access === 'everyone' ? 'Everyone' : 'Private',
+        body:
               '<div class="sk-access" role="radiogroup" aria-label="Who can use this">' +
                 '<label class="sk-access-opt' + (draft.access === 'everyone' ? '' : ' is-on') + '">' +
                   '<input type="radio" name="sk-access" value="private" ' + (draft.access === 'everyone' ? '' : 'checked') + '>' +
@@ -1051,13 +1515,16 @@
                   '<span class="sk-access-body"><span class="sk-access-name">Everyone in the organization</span>' +
                   '<span class="sk-access-hint">Published to the Library after the automated review, then available to everyone here.</span></span>' +
                 '</label>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above.</div>' +
-        '</div>' +
-        '<aside class="sk-preview" id="sk-preview">' + previewHtml() + '</aside>' +
-      '</div>';
+              '</div>',
+      }) +
+      '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above.</div>';
+  }
+
+  /* Everything render() has to do once the markup is in the DOM. */
+  function afterRender() {
+    // A full render replaces the modal host, so an open picker has to be put
+    // back — otherwise a re-render mid-selection closes it under the pointer.
+    renderPicker();
 
     // Re-insert the review banner if one was shown before this re-render (e.g. the
     // author changed the access radio after saving — without this the banner disappears).
@@ -1066,7 +1533,7 @@
       wrap.id = 'sk-review-banner-wrap';
       wrap.style.marginBottom = '16px';
       wrap.innerHTML = _reviewBannerHtml;
-      var buildHead = view.querySelector('.sk-build-head');
+      var buildHead = view.querySelector('.ag-build-head');
       var insertAfter = buildHead ? buildHead.nextSibling : null;
       if (insertAfter) {
         view.insertBefore(wrap, insertAfter);
@@ -1089,6 +1556,18 @@
   /* Light-touch preview sync while typing (no re-render → keeps focus). */
   function syncPreview() {
     var el, c = cfg(), ns = nameState();
+    /* The collapsed summaries are the only thing a folded section shows, so
+       they have to track the fields inside it — a section that still reads
+       "Unnamed" after you typed a name is worse than no summary at all. */
+    if ((el = document.querySelector('[data-sec="identity"] .ag-sec-sum'))) {
+      el.textContent = draft.name || 'Unnamed';
+    }
+    if ((el = document.querySelector('[data-sec="content"] .ag-sec-sum'))) {
+      el.textContent = bodyStats();
+    }
+    if ((el = document.querySelector('[data-sec="access"] .ag-sec-sum'))) {
+      el.textContent = draft.access === 'everyone' ? 'Everyone' : 'Private';
+    }
     if ((el = document.getElementById('sk-pv-name'))) el.textContent = draft.name || ('your-' + type);
     if ((el = document.getElementById('sk-pv-cat'))) el.textContent = draft.category || c.label;
     if ((el = document.getElementById('sk-pv-desc'))) el.textContent = draft.description || c.descPreview;
@@ -1121,6 +1600,12 @@
     var incoming = drafts[k] || null;
 
     type = k;
+    /* The live preview belongs to ONE draft. Carrying its socket across a
+       type switch would leave the author talking to the previous template
+       under the new one's name — the same reason /agents resets its panes
+       when the open agent changes. */
+    preview.reset();
+    builderTab = 'create';
     // Clone rather than reuse the stored reference, so editing a resumed
     // draft doesn't mutate the persisted copy in place.
     draft = incoming ? JSON.parse(JSON.stringify(incoming)) : makeDraft();
@@ -1138,15 +1623,136 @@
     // render() must run first — it replaces view.innerHTML, so anything written
     // into the builder's own DOM before it (the #sk-alerts host) is wiped out.
     render();
+    // The builder speaks first. Once per type per page load: a re-render or a
+    // switch back must not re-open a conversation that is already going, and a
+    // resumed draft with work in it does not want to be greeted from scratch.
+    if (!openedFor[k] && !conv().length) {
+      openedFor[k] = true;
+      sendBuilderTurn('');
+    }
     // Say what happened to the work, in priority order: a restored draft is
     // the most surprising state, then a parked one.
-    if (incoming && cfg().source === 'bundle') {
+    if (incoming && cfg().source === 'bundle' && pluginSource() === 'upload') {
+      // Only the .zip route loses anything on a reload; a composed draft is
+      // whole, and telling its author to re-attach a file would be nonsense.
       toast('Draft restored — re-attach the .zip to save it.', 'info', 7000);
     } else if (incoming) {
       toast('Restored your saved ' + cfg().label.toLowerCase() + ' draft.');
     } else if (previous) {
       toast('Your ' + previous.toLowerCase() + ' draft is saved — switch back any time.');
     }
+  }
+
+  /* ── The contents picker ──
+     Its pool is everything in the Library the caller can already see, which is
+     exactly the set the server will let them compose: POST
+     /entities/from-components re-resolves and re-authorizes every id, so this
+     list is a convenience and never the authority.
+
+     A modal, for the same reason /agents' ingredient picker is one — browsing
+     the catalogue is a detour from building, and it should end by putting you
+     back where you were. */
+  var pool = null, poolErr = false, poolQuery = '', pickerOpen = false;
+
+  function loadPool() {
+    if (pool !== null) return Promise.resolve();
+    return Promise.all(['skill', 'agent'].map(function (t) {
+      return fetch('/api/store/entities?type=' + t + '&limit=100', { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function (d) { return (d && d.items) || []; });
+    })).then(function (lists) {
+      pool = lists[0].concat(lists[1]);
+      poolErr = false;
+    }).catch(function () { pool = null; poolErr = true; });
+  }
+
+  function poolMatches() {
+    var q = (poolQuery || '').trim().toLowerCase();
+    if (!q) return pool || [];
+    return (pool || []).filter(function (c) {
+      return [c.title, c.name, c.description, c.category].some(function (v) {
+        return String(v || '').toLowerCase().indexOf(q) >= 0;
+      });
+    });
+  }
+
+  function pickerRowsHtml() {
+    if (poolErr) return '<p class="ag-emptyrows">Could not load the Library right now — try reloading the page.</p>';
+    if (pool === null) return '<p class="ag-emptyrows">Loading…</p>';
+    var rows = poolMatches();
+    if (!rows.length) {
+      return '<p class="ag-emptyrows">' + (pool.length
+        ? 'Nothing matches that.'
+        : 'No skills or agent templates in the Library yet — author one first, then come back to bundle it.') + '</p>';
+    }
+    return rows.map(function (c) { return componentRowHtml(c, 'picker'); }).join('');
+  }
+
+  function pickerHtml() {
+    if (!pickerOpen) return '';
+    return BuilderShell.picker({
+      key: 'components',
+      title: 'Add to this plugin',
+      sub: 'Skills and agent templates already in the Library. Adding one copies it into your bundle and leaves the original where it is.',
+      searchPlaceholder: 'Search skills & agent templates…',
+      query: poolQuery,
+      shown: pool === null ? 0 : poolMatches().length,
+      total: pool === null ? 0 : pool.length,
+      rows: pickerRowsHtml(),
+      foot: 'Nothing that fits? Author it as a skill first — it publishes on its own, and you can bundle it afterwards.',
+    });
+  }
+
+  function renderPicker() {
+    var host = document.getElementById('sk-picker');
+    if (host) host.innerHTML = pickerHtml();
+  }
+
+  /* Rows + count only, so the search input keeps its focus and caret — the
+     same reason the agents builder partial-renders its picker. */
+  function renderPickerRows() {
+    var el = document.querySelector('[data-rows="components"]');
+    if (el) el.innerHTML = pickerRowsHtml();
+    var cnt = document.querySelector('[data-count="components"]');
+    if (cnt && pool !== null) cnt.textContent = poolMatches().length + ' of ' + pool.length;
+  }
+
+  function openPicker() {
+    pickerOpen = true;
+    poolQuery = '';
+    renderPicker();
+    loadPool().then(function () { if (pickerOpen) renderPickerRows(); });
+    var box = document.querySelector('[data-ag-search="components"]');
+    if (box) box.focus();
+  }
+
+  function closePicker() {
+    if (!pickerOpen) return;
+    pickerOpen = false;
+    renderPicker();
+    render();   // the selection changed under the modal; the section shows it
+  }
+
+  function togglePick(id) {
+    if (!draft) return;
+    if (!draft.components) draft.components = [];
+    var i = componentIds().indexOf(id);
+    if (i >= 0) {
+      draft.components.splice(i, 1);
+    } else {
+      var found = (pool || []).filter(function (c) { return c.id === id; })[0];
+      if (!found) return;
+      if (draft.components.length >= MAX_COMPONENTS) {
+        toast('A plugin can hold at most ' + MAX_COMPONENTS + ' items.', 'warning');
+        return;
+      }
+      draft.components.push({ id: found.id, type: found.type, name: found.name,
+                              title: found.title, description: found.description });
+    }
+    check = null;              // the contents moved; the last Check is stale
+    dropProblem('bundle');
+    persist();
+    renderPickerRows();
   }
 
   /* ── Server calls ── */
@@ -1176,6 +1782,31 @@
     type_locked:
       'Cannot change the type. Publish a new item if you need a different form factor.',
   };
+  /* Compose refusals carry specifics the flat table cannot hold — which item,
+     which path, what the cap is — so they are built from the response. */
+  var COMPOSE_MESSAGES = {
+    no_components: function () { return 'Add at least one skill or agent template first.'; },
+    too_many_components: function (d) {
+      return 'A plugin can hold at most ' + d.limit + ' items — this one has ' + d.given + '.';
+    },
+    duplicate_component: function () { return 'The same item is in there twice.'; },
+    component_not_found: function () {
+      return 'One of the items is no longer in the Library. Remove it and try again.';
+    },
+    component_type_unsupported: function () {
+      return 'A plugin cannot contain another plugin. Remove it, or upload a packaged .zip instead.';
+    },
+    component_bundle_missing: function (d) {
+      return 'There are no files for “' + (d.component_name || 'one of the items') +
+             '” — it may still be under review. Remove it and try again.';
+    },
+    component_path_conflict: function (d) {
+      return 'Two of the items ship the same file (' + d.path + '). Leave one of them out.';
+    },
+    components_too_large: function () { return 'That selection is too big to bundle. Pick fewer items.'; },
+    components_empty: function () { return 'The selected items contributed no files.'; }
+  };
+
   /* Look a code up before showing it. Unknown codes fall through to the raw
      token so debugging stays possible — but with a readable prefix. */
   function humanizeError(code) {
@@ -1202,6 +1833,7 @@
       });
       if (msgs.length) return msgs.join(' ');
     }
+    if (detail.code && COMPOSE_MESSAGES[detail.code]) return COMPOSE_MESSAGES[detail.code](detail);
     if (detail.code) return humanizeError(detail.code);
     return detail.detail || ('HTTP ' + status);
   }
@@ -1247,6 +1879,19 @@
     if (extra) Object.keys(extra).forEach(function (k) { p[k] = extra[k]; });
     return p;
   }
+  /* The Library-composed sibling of bundleForm: the server assembles the
+     bundle from these ids, so the request carries no file at all. */
+  function componentsPayload(extra) {
+    var p = {
+      name: (draft.name || '').trim(),
+      description: (draft.description || '').trim(),
+      category: draft.category || null,
+      components: componentIds(),
+      publisher_kind: IS_ADMIN ? 'organization' : 'user'
+    };
+    if (extra) Object.keys(extra).forEach(function (k) { p[k] = extra[k]; });
+    return p;
+  }
   function bundleForm(extra) {
     var fd = new FormData();
     fd.append('file', bundle, bundle.name);
@@ -1276,8 +1921,10 @@
      itself. `field` is null for anything we cannot attribute. */
   var PROBLEM_FIELDS = ['name', 'description', 'category', 'body', 'bundle'];
   function fieldLabel(f) {
-    if (f === 'body') return cfg().source === 'bundle' ? 'Bundle' : cfg().bodyLabel;
-    if (f === 'bundle') return 'Bundle';
+    // A plugin's content section is named for the route it is showing, so a
+    // refusal about the Library selection is not headed "Bundle".
+    if (f === 'body') return cfg().source === 'bundle' ? contentFieldLabel() : cfg().bodyLabel;
+    if (f === 'bundle') return contentFieldLabel();
     if (f === 'category') return 'Category';
     return f === 'name' ? 'Name' : 'Description';
   }
@@ -1373,6 +2020,11 @@
           push(field, trimHint(i.hint || i.code || phase), field + '|' + (i.code || phase));
         });
       });
+    }
+    /* A compose refusal is about the contents section, so it marks it: the
+       headline goes to the alert, the whole sentence onto the field. */
+    if (detail && detail.code && COMPOSE_MESSAGES[detail.code]) {
+      push('bundle', COMPOSE_MESSAGES[detail.code](detail), 'compose|' + detail.code);
     }
     if (!out.length) push(null, (err && err.message) || 'Something went wrong.');
     return out;
@@ -1492,8 +2144,12 @@
     if (inFlight || !canCheck()) return;
     inFlight = true;
     var done = busy('sk-check', 'Checking…');
+    /* Both plugin routes answer in the same preview shape — the composed one
+       by dry-running the real compose — so the mapping below is shared. */
     var call = cfg().source === 'bundle'
-      ? postForm('/api/store/entities/preview', bundleForm())
+      ? (pluginSource() === 'library'
+          ? postJson('/api/store/entities/from-components', componentsPayload({ dry_run: true }))
+          : postForm('/api/store/entities/preview', bundleForm()))
           .then(function (res) {
             // The preview response carries more than component rows, and
             // dropping the rest is what made this a half-check: `name` /
@@ -1572,11 +2228,14 @@
       done();
     }
 
-    // Plugin bundles: POST the .zip directly and redirect to the Library.
-    // Server-side async review handles content checking; no synchronous LLM
-    // pre-check is needed for ZIP uploads.
+    /* Plugins: POST the contents — the .zip itself, or the ids the server
+       assembles one from — and redirect to the Library. Server-side async
+       review handles content checking; neither route needs the synchronous
+       LLM pre-check the markdown path below runs. */
     if (cfg().source === 'bundle') {
-      postForm('/api/store/entities', bundleForm({ access: access }))
+      (pluginSource() === 'library'
+        ? postJson('/api/store/entities/from-components', componentsPayload({ access: access }))
+        : postForm('/api/store/entities', bundleForm({ access: access })))
         .then(function (created) {
           discardDraft(type);
           flashToast(created, access, name);
@@ -1601,7 +2260,7 @@
       var banner = document.createElement('div');
       banner.id = 'sk-review-banner-wrap';
       banner.style.marginBottom = '16px';
-      var buildHead = view.querySelector('.sk-build-head');
+      var buildHead = view.querySelector('.ag-build-head');
       var insertAfter = buildHead ? buildHead.nextSibling : null;
       if (insertAfter) {
         view.insertBefore(banner, insertAfter);
@@ -1929,9 +2588,60 @@
   document.addEventListener('click', function (e) {
     var t = e.target.closest('[data-sk-type],[data-sk-change],[data-sk-mode],[data-sk-browse],' +
                              '[data-sk-removefile],[data-sk-jump],[data-sk-dismiss],' +
+                             '[data-sk-psrc],[data-sk-openpick],[data-sk-pick],[data-sk-unpick],' +
+                             '[data-ag-pick-close],' +
+                             '[data-ag-back],[data-ag-toggle-sec],' +
+                             '[data-ag-tab],[data-ag-send],[data-ag-chip],' +
                              '#sk-check,#sk-save,#sk-draft,#sk-discard');
-    if (!t) return;
-    if (t.hasAttribute('data-sk-type')) { chooseType(t.getAttribute('data-sk-type')); }
+    if (!t) {
+      // Outside the card but inside the overlay — the standard way out of a
+      // modal, and the only one a pointer user reaches for first.
+      if (pickerOpen && e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) closePicker();
+      return;
+    }
+    if (t.hasAttribute('data-ag-tab')) {
+      var tab = t.getAttribute('data-ag-tab');
+      if (tab !== builderTab) {
+        // Carry the half-typed line across the switch — losing it is the
+        // cheapest possible way to make a tab feel destructive.
+        var live = view.querySelector('[data-ag-comp]');
+        if (live) { if (builderTab === 'preview') preview.setDraft(live.value); else convDraft = live.value; }
+        builderTab = tab;
+        renderLeftPane();
+      }
+    }
+    else if (t.hasAttribute('data-ag-send')) {
+      var box = view.querySelector('[data-ag-comp]');
+      var text = box ? box.value.trim() : '';
+      if (!text) return;
+      if (builderTab === 'preview') preview.send(text); else sendBuilderTurn(text);
+    }
+    else if (t.hasAttribute('data-ag-chip')) {
+      sendBuilderTurn(t.getAttribute('data-ag-chip'));
+    }
+    else if (t.hasAttribute('data-ag-back')) {
+      /* Straight out, no confirmation — and that is NOT an oversight.
+         /agents asks before you leave because it holds the only copy of your
+         edits; this page has written every keystroke to localStorage
+         (`persist`), so the draft is still here when you come back. A
+         "your changes will be discarded" dialog would be claiming a loss
+         that does not happen, which is how people learn to click through
+         the dialogs that do matter. */
+      window.location.href = '/library';
+    }
+    else if (t.hasAttribute('data-ag-toggle-sec')) {
+      /* In place, never a re-render: rebuilding would throw away the panel's
+         scroll position and the caret in whatever field has focus — the same
+         bug /agents had. Every section body is always in the DOM. */
+      var sk = t.getAttribute('data-ag-toggle-sec');
+      collapsed[sk] = !collapsed[sk];
+      var sec = view.querySelector('[data-sec="' + sk + '"]');
+      if (sec) {
+        sec.classList.toggle('collapsed', collapsed[sk]);
+        t.setAttribute('aria-expanded', String(!collapsed[sk]));
+      } else { render(); }
+    }
+    else if (t.hasAttribute('data-sk-type')) { chooseType(t.getAttribute('data-sk-type')); }
     else if (t.hasAttribute('data-sk-change')) { typeOpen = true; render(); }
     else if (t.hasAttribute('data-sk-dismiss')) { clearProblems(); }
     else if (t.hasAttribute('data-sk-jump')) { jumpTo(t.getAttribute('data-sk-jump')); }
@@ -1946,6 +2656,38 @@
       var input = document.getElementById('sk-file-input');
       if (input) input.click();
     }
+    else if (t.hasAttribute('data-sk-psrc')) {
+      /* Switching route keeps both sides intact — the .zip stays attached and
+         the selection stays picked — so trying one is never a decision that
+         throws the other away. Only the last Check is dropped, because it
+         described contents that are no longer the ones being saved. */
+      var psrc = t.getAttribute('data-sk-psrc');
+      if (draft && pluginSource() !== psrc) {
+        draft.plugin_source = psrc;
+        check = null;
+        dropProblem('bundle');
+        persist();
+        render();
+      }
+    }
+    else if (t.hasAttribute('data-sk-openpick')) { openPicker(); }
+    else if (t.hasAttribute('data-sk-pick')) { togglePick(t.getAttribute('data-sk-pick')); }
+    else if (t.hasAttribute('data-sk-unpick')) {
+      /* No confirm: the item itself is untouched — this only takes it out of
+         the plugin, and putting it back is one click in the picker. */
+      var rid = t.getAttribute('data-sk-unpick');
+      var ri = componentIds().indexOf(rid);
+      if (ri >= 0) {
+        var gone = components()[ri];
+        draft.components.splice(ri, 1);
+        check = null;
+        dropProblem('bundle');
+        persist();
+        render();
+        toast('Removed ' + (gone.title || gone.name) + ' from this plugin.');
+      }
+    }
+    else if (t.hasAttribute('data-ag-pick-close')) { closePicker(); }
     else if (t.hasAttribute('data-sk-removefile')) {
       var isBundle = cfg().source === 'bundle';
       var label = isBundle ? (bundle && bundle.name) : (draft.source_file && draft.source_file.name);
@@ -1986,6 +2728,21 @@
   });
 
   function handleFieldInput(e) {
+    if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'components') {
+      poolQuery = e.target.value;
+      renderPickerRows();
+      return;
+    }
+    /* The composer is state, not just DOM: the left pane re-renders whenever
+       a turn lands, and a half-typed message that only lived in the textarea
+       would vanish under the author mid-sentence. */
+    var comp = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
+    if (comp) {
+      if (comp === 'preview') preview.setDraft(e.target.value); else convDraft = e.target.value;
+      e.target.style.height = 'auto';
+      e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
+      return;
+    }
     var f = e.target.getAttribute && e.target.getAttribute('data-sk-field');
     if (!f || !draft) return;
     draft[f] = e.target.value;
@@ -2011,6 +2768,19 @@
     syncPreview();
   }
   document.addEventListener('input', handleFieldInput);
+
+  /* Enter sends, Shift+Enter opens a line — the convention every chat box on
+     this site follows, so a composer that behaved otherwise would be the
+     surprising one. */
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && pickerOpen) { closePicker(); return; }
+    if (!e.target.getAttribute || !e.target.getAttribute('data-ag-comp')) return;
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    var text = e.target.value.trim();
+    if (!text) return;
+    if (builderTab === 'preview') preview.send(text); else sendBuilderTurn(text);
+  });
   // ds_dropdown.js only dispatches "change" on the paired native <select>
   // when a branded item is picked (never "input", unlike a real <select>'s
   // own direct-interaction firing of both) — without this, picking a

@@ -1,0 +1,569 @@
+"""Agent Builder assistant — turn a description into agent configuration.
+
+``POST /api/agents/{agent_id}/builder/turn`` takes what the owner just typed
+plus the conversation so far, and returns (a) a prose reply and (b) a
+**config patch** that has already been applied to the agent. The ``/agents``
+builder renders the reply in its Create pane and re-renders the Configuration
+panel from the returned agent row, which is how a conversation fills the form
+without the owner typing into it.
+
+Design notes
+------------
+
+**Stateless turns.** The transcript lives in the page and is replayed on each
+call; the server keeps no conversation state, so this needed no schema change
+(A3: new app-state would be Postgres-only, and a chat log is not worth a
+table until drafts need to survive a reload).
+
+**One LLM call per turn**, through the existing ``connectors.llm`` structured
+extractor — the same seam corporate memory and knowledge digests use. There
+is no sandbox and no tool loop: what the agent may be grounded in is handed
+to the model as a candidate list, and it picks ids from that list. A
+sandbox-backed engine with real catalog tools can replace ``_llm_turn`` later
+without the wire contract changing.
+
+**The model's output is untrusted.** ``_sanitize_patch`` is the trust
+boundary: unknown keys are dropped, ids not present in the candidate lists
+are dropped, tone must be one of the four the UI offers, surfaces must be
+known keys with boolean values, and the survivors are re-validated by
+``UpdateAgentRequest`` (which enforces the column lengths) before anything is
+written. The patch is then applied through the ordinary
+:func:`app.api.agents_admin.update_agent` path, so the builder-declaration →
+enforced-scope derivation (`_sync_builder_scope`) runs exactly as it does for
+a hand edit.
+
+Even a patch that slipped a bogus id past all of that would convey no
+authority: an agent's live authority is ``owner grants ∩ agent scope``,
+recomputed per request (``src/agent_scope_intersection.py``). Declaring an
+id the owner does not hold widens nothing.
+
+**Degrading without a model.** With no LLM credential configured the endpoint
+answers ``503 builder_llm_unavailable`` and the page falls back to the
+hand-editable panel, which is fully functional on its own — the assistant is
+an accelerator, never the only door. Under ``LOCAL_DEV_MODE``/``TESTING`` a
+scripted stub stands in so the surface can be exercised end-to-end with no
+key (mirrors ``services/kai_engine_stub`` for chat).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+import duckdb
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+
+# `app.api.agents` was deleted in C1.2 (/api/agents retired into
+# /api/v1/agents). The three names this module needs live in the v1
+# router now: `AgentUpdate` -> `UpdateAgentRequest`, and `_writable`'s
+# owner-checked load -> `_load_agent(..., require_owner=True)`.
+from app.api.agents_admin import UpdateAgentRequest, _load_agent, update_agent
+from app.api.builder_core import (
+    ENGINE_MODEL,
+    ENGINE_STUB,
+    MAX_MESSAGE_CHARS,
+    OPENING_JOB,
+    SUGGESTIONS_DESCRIPTION,
+    BuilderMessage,
+    Slot,
+    history_prompt_section,
+    is_opening_turn,
+    merged_draft,
+    slots_prompt_section,
+    stub_enabled,
+    turn_response,
+)
+from app.auth.access import require_agent_profiles_enabled
+from app.auth.dependencies import _get_db
+from app.auth.dependencies import get_current_user
+from app.services.agent_ingredients import knowledge_sources_for
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/agents",
+    tags=["agents"],
+    dependencies=[Depends(require_agent_profiles_enabled)],
+)
+
+#: Tones the builder UI offers. The model may not invent a fifth.
+TONES = ("concise", "friendly", "formal", "playful")
+
+#: The placeholder a brand-new agent is created with. `POST /api/v1/agents`
+#: rejects a blank name, so the builder page sends this instead
+#: (agents.html: `payload.name = payload.name || 'Untitled'`). It has to
+#: count as UNNAMED here, or the first turn would decline to name the agent
+#: from the owner's description — the placeholder would occupy the field
+#: forever, which is what the old blank-name create avoided by accident.
+PLACEHOLDER_NAME = "untitled"
+
+#: Column lengths the sanitizer enforces, mirroring the `agents` table. The
+#: retired `AgentUpdate` model owned these; v1's `UpdateAgentRequest` leaves
+#: every string unbounded, so they live here now.
+_PATCH_MAX_LENGTHS = {
+    "name": 120,
+    "role": 200,
+    "tone": 40,
+    "greeting": 500,
+    "instructions": 20000,
+}
+
+#: Surface keys the builder UI offers.
+SURFACES = ("web", "slack", "telegram", "cli", "mcp")
+
+#: Fields the assistant may write. Deliberately excludes `status`,
+#: `is_default` and every `*_mode` column: promoting a draft to ready and
+#: widening a scope axis are owner decisions, not conversational side effects.
+PATCHABLE = ("name", "role", "instructions", "tone", "greeting", "knowledge", "plugins", "surfaces")
+
+#: Candidate lists sent to the model, capped so the prompt stays bounded.
+MAX_CANDIDATES = 60
+
+
+def _filled(config: Dict[str, Any], key: str, *, chars: int = 1) -> bool:
+    value = config.get(key)
+    return isinstance(value, str) and len(value.strip()) >= chars
+
+
+#: What an agent needs before it is worth saving, in the order that unblocks
+#: the most. Deliberately excludes `knowledge` and `plugins`: an agent
+#: grounded in nothing is a legitimate final state (the prompt says so — an
+#: agent claiming data it cannot reach is worse), so a slot for them could
+#: never be settled and the progress line would never complete.
+_SLOTS = (
+    Slot(
+        key="job",
+        label="what it does",
+        known=lambda c: _filled(c, "role", chars=10) or _filled(c, "instructions", chars=80),
+        ask="the job this agent is for, in the owner's own terms.",
+    ),
+    Slot(
+        key="behaviour",
+        label="how it should answer",
+        known=lambda c: _filled(c, "instructions", chars=200),
+        ask="how it should answer and what it must refuse — this becomes its system prompt.",
+    ),
+    Slot(
+        key="role",
+        label="a one-line description",
+        known=lambda c: _filled(c, "role", chars=10),
+        ask="the single line shown before anyone opens it. Write one; do not ask.",
+    ),
+    Slot(
+        key="name",
+        label="a name",
+        known=lambda c: _filled(c, "name") and (c.get("name") or "").strip().lower() != PLACEHOLDER_NAME,
+        ask="a name. Propose one from what it does; do not ask.",
+    ),
+    Slot(
+        key="greeting",
+        label="its first line",
+        known=lambda c: _filled(c, "greeting", chars=10),
+        ask="the one sentence it opens with for its users. Write one; do not ask.",
+    ),
+)
+
+
+class PluginCandidate(BaseModel):
+    """A capability the page is offering in its picker.
+
+    Sent by the client because the marketplace ids the picker uses are
+    assembled there (curated ∪ store, with their display prefixes); the
+    server validates the model's choices against this same list. Safe as a
+    candidate set for the reason in the module docstring: a declared scope id
+    grants nothing on its own.
+    """
+
+    id: str = Field(max_length=200)
+    name: str = Field(default="", max_length=200)
+    description: str = Field(default="", max_length=400)
+
+
+class BuilderTurnRequest(BaseModel):
+    message: str = Field(max_length=MAX_MESSAGE_CHARS)
+    history: List[BuilderMessage] = Field(default_factory=list)
+    plugin_candidates: List[PluginCandidate] = Field(default_factory=list)
+    # The builder page holds an unsaved working copy and commits it on Save,
+    # so a turn must be able to run WITHOUT writing: `apply=False` returns the
+    # sanitized patch for the page to merge into that copy, and the write
+    # happens later through the ordinary PATCH. Default True — the persisting
+    # behaviour is the original contract and every other caller relies on it.
+    apply: bool = True
+    # ...and with an unsaved copy in play, the row is no longer what the owner
+    # is looking at. `config` carries that copy so the turn reasons about the
+    # configuration on screen rather than the last-saved one. Untrusted like
+    # any other request field: it is narrowed to PATCHABLE keys and only ever
+    # reaches the PROMPT — ids in the returned patch are still gated against
+    # the caller's own RBAC-scoped candidate lists by _sanitize_patch.
+    config: Optional[Dict[str, Any]] = None
+
+
+def _candidate_block(rows: List[Dict[str, Any]], empty: str) -> str:
+    if not rows:
+        return empty
+    return "\n".join(
+        "- id={id} kind={kind} name={name} — {desc} ({meta})".format(
+            id=r.get("id", ""),
+            kind=r.get("kind", ""),
+            name=r.get("name", ""),
+            desc=(r.get("description") or "no description")[:200],
+            meta=r.get("meta", ""),
+        )
+        for r in rows[:MAX_CANDIDATES]
+    )
+
+
+SYSTEM = """You are the agent builder inside Agnes, a governed data platform.
+
+An owner describes an assistant they want; you turn that into configuration.
+You are talking to the owner, not to end users of the agent.
+
+Rules:
+- You LEAD. The owner knows what they want and not what an agent needs, so
+  work through what is still unknown, one thing at a time, in the order you
+  are given below. Never ask them to describe the whole thing at once.
+- Every turn must leave the configuration further along. Filling something
+  in and saying what you assumed beats asking, whenever you can infer it
+  well. A turn that only asks a question made the owner do the work.
+- One question per turn, at most, and only about the slot you were given.
+  Never re-ask something already settled or already answered above.
+- Ground the agent only in the candidate knowledge sources listed below,
+  by id. Never invent an id. If nothing fits, say so plainly and leave
+  knowledge empty rather than guessing — an agent grounded in nothing is
+  honest, an agent claiming data it cannot reach is not.
+- `instructions` is the agent's system prompt: its role, how it should
+  answer, what it must refuse or avoid. Write it in the second person
+  ("You are…"), a few short paragraphs at most. It is visible to the
+  agent's users, so never put secrets in it.
+- `greeting` is the agent's first line to its users. One sentence.
+- `role` is a one-line description shown before anyone opens it.
+- Keep `reply` short — two or three sentences, plain text, no markdown
+  headings and no bullet lists. Say what you set and what is still open.
+
+Return only the fields you are changing this turn."""
+
+RESPONSE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string", "description": "What to say to the owner."},
+        "patch": {
+            "type": "object",
+            "description": "Configuration fields to change this turn.",
+            "properties": {
+                "name": {"type": "string"},
+                "role": {"type": "string"},
+                "instructions": {"type": "string"},
+                "tone": {"type": "string", "enum": list(TONES)},
+                "greeting": {"type": "string"},
+                "knowledge": {"type": "array", "items": {"type": "string"}},
+                "plugins": {"type": "array", "items": {"type": "string"}},
+                "surfaces": {
+                    "type": "object",
+                    "properties": {k: {"type": "boolean"} for k in SURFACES},
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "suggestions": {
+            "type": "array",
+            "description": SUGGESTIONS_DESCRIPTION,
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["reply"],
+    "additionalProperties": False,
+}
+
+
+def _prompt(
+    *,
+    message: str,
+    history: List[BuilderMessage],
+    config: Dict[str, Any],
+    knowledge: List[Dict[str, Any]],
+    plugins: List[PluginCandidate],
+) -> str:
+    lines: List[str] = []
+    lines.append("## Knowledge sources this owner can ground the agent in")
+    lines.append(
+        _candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artefact collections)")
+    )
+    lines.append("")
+    lines.append("## Capabilities this owner can give the agent")
+    if plugins:
+        lines.append(
+            "\n".join(
+                f"- id={p.id} name={p.name} — {(p.description or 'no description')[:200]}"
+                for p in plugins[:MAX_CANDIDATES]
+            )
+        )
+    else:
+        lines.append("(none available)")
+    lines.append("")
+    lines.append("## Current configuration")
+    lines.append(json.dumps(config, indent=2, sort_keys=True))
+    lines += slots_prompt_section(_SLOTS, config)
+    lines += history_prompt_section(history)
+    lines.append("")
+    lines.append(OPENING_JOB if is_opening_turn(message, history) else f"Owner: {message}")
+    return "\n".join(lines)
+
+
+def _sanitize_patch(
+    raw: Any,
+    *,
+    knowledge_ids: set,
+    plugin_ids: set,
+    current_surfaces: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Reduce a model-proposed patch to what it is allowed to change.
+
+    Silent dropping is deliberate: a hallucinated id or an invented tone is a
+    model error, not an owner error, and failing the whole turn over it would
+    lose the good half of the patch. What survived is echoed back to the page
+    in the response, so the owner sees exactly what changed.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    patch: Dict[str, Any] = {}
+    for key in PATCHABLE:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if key in ("name", "role", "instructions", "greeting"):
+            if isinstance(value, str) and value.strip():
+                patch[key] = value.strip()
+        elif key == "tone":
+            if value in TONES:
+                patch[key] = value
+        elif key == "knowledge":
+            if isinstance(value, list):
+                patch[key] = [v for v in value if isinstance(v, str) and v in knowledge_ids]
+        elif key == "plugins":
+            if isinstance(value, list):
+                patch[key] = [v for v in value if isinstance(v, str) and v in plugin_ids]
+        elif key == "surfaces":
+            if isinstance(value, dict):
+                clean = {k: bool(v) for k, v in value.items() if k in SURFACES and isinstance(v, bool)}
+                if clean:
+                    # MERGED over what the agent already runs on, never
+                    # substituted for it. `surfaces` is one opaque JSON column
+                    # and both writers replace it wholesale — `update_agent`
+                    # json.dumps the patch, and the page assigns
+                    # `a[k] = patch[k]` into its working copy — while the
+                    # prompt asks the model for "only the fields you are
+                    # changing", whose honest answer for one surface is
+                    # `{"mcp": true}`. Taking that literally would switch an
+                    # owner's Slack and Telegram off as a side effect of
+                    # turning MCP on, and the reply would say only that MCP was
+                    # enabled. Merging HERE rather than at either writer means
+                    # the patch the page merges is complete too, so both paths
+                    # are fixed at the boundary that already exists for this.
+                    merged = {k: bool(v) for k, v in (current_surfaces or {}).items() if k in SURFACES}
+                    merged.update(clean)
+                    # Web chat is the base surface the builder itself previews
+                    # on; an assistant turning it off would silently break
+                    # Preview.
+                    merged["web"] = True
+                    patch[key] = merged
+    if not patch:
+        return {}
+    # Second gate: the column-length constraints. The deleted `AgentUpdate`
+    # carried these as pydantic max_lengths; v1's `UpdateAgentRequest` does
+    # not constrain them at all, so validating through it alone would let a
+    # model-proposed 5000-character name reach the database. Enforced here
+    # instead of trusting the request model — this function IS the trust
+    # boundary, and a patch that violates a column is refused rather than
+    # truncated, because silently storing something other than what the
+    # conversation agreed is worse than an error.
+    for field, limit in _PATCH_MAX_LENGTHS.items():
+        value = patch.get(field)
+        if isinstance(value, str) and len(value) > limit:
+            raise HTTPException(
+                status_code=422,
+                detail={"kind": "field_too_long", "field": field, "limit": limit},
+            )
+    return UpdateAgentRequest(**patch).model_dump(exclude_unset=True, exclude_none=True)
+
+
+def _stub_turn(message: str, config: Dict[str, Any], knowledge: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not message.strip():
+        from app.api.builder_core import open_slots
+
+        still_open = open_slots(_SLOTS, config)
+        first = still_open[0].label if still_open else None
+        return {
+            "reply": (
+                f"[stub] Let's build an agent. First thing I need: {first}."
+                if first
+                else "[stub] Let's build an agent. Tell me what it should do."
+            ),
+            "patch": {},
+            "suggestions": [],
+        }
+    return _stub_turn_body(message, config, knowledge)
+
+
+def _stub_turn_body(message: str, config: Dict[str, Any], knowledge: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """A deterministic stand-in for the model.
+
+    Not a simulation of quality — it exists so the whole path (page → API →
+    sanitize → PATCH → re-render) can be exercised, screenshotted and pinned
+    in CI without a credential. Keyword-driven so a demo reads sensibly.
+    """
+    text = (message or "").lower()
+    if "revenue" in text or "finance" in text or "margin" in text:
+        topic, name, tone = "revenue", "Revenue Analyst", "concise"
+    elif "hr" in text or "policy" in text or "handbook" in text:
+        topic, name, tone = "policy", "Policy Helper", "friendly"
+    elif "pipeline" in text or "sales" in text:
+        topic, name, tone = "pipeline", "Pipeline Analyst", "concise"
+    else:
+        topic, name, tone = "general", "Data Assistant", "concise"
+
+    patch: Dict[str, Any] = {}
+    if (config.get("name") or "").strip().casefold() in ("", PLACEHOLDER_NAME):
+        patch["name"] = name
+        patch["role"] = f"Answers {topic} questions from governed data."
+        patch["tone"] = tone
+        patch["greeting"] = f"Hi — ask me anything about {topic}."
+        patch["instructions"] = (
+            f"You are {name}. You answer {topic} questions for the team.\n\n"
+            "Always use the canonical metric definitions rather than inventing a "
+            "calculation. Cite the table you queried. If the data cannot answer "
+            "the question, say so instead of estimating."
+        )
+        if knowledge:
+            patch["knowledge"] = [knowledge[0]["id"]]
+        reply = (
+            f"Set it up as {name} — {topic} questions, {tone} tone. "
+            + (f"Grounded it in {knowledge[0]['name']}. " if knowledge else "It has no data yet. ")
+            + "Anything it should refuse to answer?"
+        )
+        suggestions = ["It should never guess a number", "Add a second data source", "Make the tone friendlier"]
+    else:
+        reply = "Updated the instructions with that. Try it in Preview when you are ready."
+        instructions = (config.get("instructions") or "").rstrip()
+        patch["instructions"] = (instructions + "\n\n" + message.strip()).strip()
+        suggestions = ["Show me a preview", "Change the greeting"]
+    return {"reply": reply, "patch": patch, "suggestions": suggestions}
+
+
+def _llm_turn(prompt: str) -> Dict[str, Any]:
+    """One structured call. Raises ``ValueError`` when nothing is configured."""
+    from app.instance_config import load_instance_config
+    from connectors.llm import create_extractor_from_env_or_config
+
+    try:
+        instance_config = load_instance_config()
+    except (ValueError, FileNotFoundError):
+        instance_config = {}
+    extractor = create_extractor_from_env_or_config((instance_config or {}).get("ai"))
+    return extractor.extract_json(
+        prompt=prompt,
+        max_tokens=2000,
+        json_schema=RESPONSE_SCHEMA,
+        schema_name="agent_builder_turn",
+        system=SYSTEM,
+    )
+
+
+def _current_config(row: dict) -> Dict[str, Any]:
+    from app.api.agents_builder_shared import _decode
+
+    return {
+        "name": row.get("name") or "",
+        "role": row.get("role") or "",
+        "instructions": row.get("system_prompt") or "",
+        "tone": row.get("tone") or "concise",
+        "greeting": row.get("greeting") or "",
+        "knowledge": _decode(row.get("knowledge"), []),
+        "plugins": _decode(row.get("plugins"), []),
+        "surfaces": _decode(row.get("surfaces"), {}),
+    }
+
+
+@router.post("/{agent_id}/builder/turn")
+async def builder_turn(
+    agent_id: str,
+    payload: BuilderTurnRequest,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Run one builder turn against an agent the caller owns."""
+    row = _load_agent(agent_id, user, conn, require_owner=True)
+    message = (payload.message or "").strip()
+    # An empty message on the FIRST turn is the builder opening the
+    # conversation. Later it is a client bug.
+    if not message and not is_opening_turn(message, payload.history):
+        raise HTTPException(status_code=400, detail={"kind": "empty_message"})
+
+    knowledge = knowledge_sources_for(user)
+    knowledge_ids = {str(k["id"]) for k in knowledge}
+    plugin_ids = {p.id for p in payload.plugin_candidates}
+    config = _current_config(row)
+    if payload.config is not None:
+        # Overlay the caller's unsaved working copy over the saved row, key by
+        # key, so a field the page did not send keeps the stored value rather
+        # than being blanked in the prompt.
+        config.update({k: v for k, v in payload.config.items() if k in PATCHABLE})
+
+    engine = ENGINE_STUB if stub_enabled() else ENGINE_MODEL
+    if engine == ENGINE_STUB:
+        result: Dict[str, Any] = _stub_turn(message, config, knowledge)
+    else:
+        prompt = _prompt(
+            message=message,
+            history=payload.history,
+            config=config,
+            knowledge=knowledge,
+            plugins=payload.plugin_candidates,
+        )
+        try:
+            result = await asyncio.to_thread(_llm_turn, prompt)
+        except ValueError as e:
+            # Nothing configured — say so in a way the page can act on, and
+            # keep the hand-editable panel as the working path.
+            logger.warning("agent builder: no LLM configured: %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "kind": "builder_llm_unavailable",
+                    "hint": "No AI credential is configured on this instance — "
+                    "fill the configuration in by hand, or ask an admin to set one up.",
+                },
+            ) from e
+        except Exception as e:
+            logger.warning("agent builder: turn failed: %s", e)
+            raise HTTPException(
+                status_code=502,
+                detail={"kind": "builder_turn_failed", "hint": "The assistant could not answer. Try again."},
+            ) from e
+
+    patch = _sanitize_patch(
+        result.get("patch"),
+        knowledge_ids=knowledge_ids,
+        plugin_ids=plugin_ids,
+        # `config` is the effective state — the saved row overlaid with the
+        # page's unsaved copy — which is what a partial surfaces patch has to
+        # merge over.
+        current_surfaces=config.get("surfaces") if isinstance(config.get("surfaces"), dict) else None,
+    )
+    agent: Optional[Dict[str, Any]] = None
+    if patch and payload.apply:
+        agent = await update_agent(agent_id, UpdateAgentRequest(**patch), user, conn)
+
+    return turn_response(
+        result,
+        patch=patch,
+        engine=engine,
+        slots=_SLOTS,
+        draft=merged_draft(config, patch),
+        fallback_reply="Updated the configuration.",
+        extra={"agent": agent},
+    )

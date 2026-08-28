@@ -42,10 +42,18 @@ truthy operator intent silently degrading to disabled because of a casing
 mismatch.
 
 **Default posture**: **new user-visible features default OFF** (`default=False`).
-Two flags are grandfathered on (`studio`, `guardrails`) because they shipped
-enabled before this convention existed and flipping them off by default would
-be a breaking change for existing instances — don't use them as a precedent
-for a new flag's default.
+One flag is grandfathered on (`guardrails`) because it shipped enabled before
+this convention existed and flipping it off by default would be a breaking
+change for existing instances — don't use it as a precedent for a new flag's
+default.
+
+`studio` was the other grandfathered flag and is now `false`. That was a
+deliberate behavior change, not a drift: the admin cleanup retired four
+surfaces the Library builders had replaced, so `studio` joined the three new
+off-by-default flags (`news`, `knowledge_digests`, `contribute_skill`) rather
+than staying on for continuity. It is the precedent for *retiring* a surface —
+default the flag off, leave the pages and the API in place, and gate the entry
+points as well as the routes so nothing on screen links to a redirect.
 
 ## The helper
 
@@ -186,7 +194,10 @@ that shipped `mcp.allow_query_param_token` without a write path.
 
 | Flag | Config key | Env var | Default | Editable | Notes |
 |---|---|---|---|---|---|
-| `studio` | `studio.enabled` | `AGNES_STUDIO_ENABLED` | `true` | yes | Grandfathered — shipped enabled before this convention. |
+| `studio` | `studio.enabled` | `AGNES_STUDIO_ENABLED` | `false` | yes | Authoring Studio: `/admin/studio`, its per-domain builders, the `/admin/studio/suggestions` moderation queue, their nav + command-palette entries, and the public suggestion API (403 when off). Was grandfathered ON; **off by default since the admin cleanup** — the Library builders (`/library`, "+ New") do the same authoring jobs, so two surfaces offered one job. Nothing is deleted: set it true to restore the whole surface. |
+| `news` | `features.news_enabled` | `AGNES_NEWS_ENABLED` | `false` | yes | In-product news: the `/admin/news` editor, the `/news` reader, the `/home` "What's new" strip, and the rail + palette entries. Off by default since the admin cleanup. Hides UI only — `/api/admin/news/*` keeps serving and a published version stays in the table, so turning it on restores the surface with its content intact. |
+| `knowledge_digests` | `features.knowledge_digests_enabled` | `AGNES_KNOWLEDGE_DIGESTS_ENABLED` | `false` | yes | The `/admin/knowledge-digests` admin PAGE and its nav row. Off by default since the admin cleanup. Deliberately narrow — gates the page, not the feature: `/api/admin/knowledge-digests/*`, `agnes admin digest`, the digest scheduler job and `agnes pull`'s digest delivery are untouched, so an instance already running digests keeps running them headlessly. |
+| `contribute_skill` | `features.contribute_skill_enabled` | `AGNES_CONTRIBUTE_SKILL_ENABLED` | `false` | yes | The paste-a-SKILL.md publish page (`/admin/contribute-skill`), the landing target for an external "Load skill to Agnes" button. Off by default since the admin cleanup — the Library's skill builder is the supported path. Both POST handlers carry the gate too, so a stale external button gets a redirect home rather than a silent publish. |
 | `guardrails` | `guardrails.enabled` | `AGNES_GUARDRAILS_ENABLED` | `true` | yes | Grandfathered. Env override added in #1022 (new, additive). |
 | `chat` | `chat.enabled` | `AGNES_CHAT_ENABLED` | `false` | yes | New feature — off by default. |
 | `chat_provider` | `chat.provider` | `AGNES_CHAT_PROVIDER` | `kai-agent` | yes (applies after restart) | Which engine runs web/Slack chat sessions: `kai-agent` (the embedded kai-agent turn engine, the default — see docs/cloud-chat.md) or `docker` (self-hosted container per session). Resolved by `load_chat_config` (env > instance.yaml > default) at boot; every provider rides deployment-provisioned backing (kai-agent sidecar + `KAI_HOST_JWT_SECRET`, or the apps-runner sidecar), and app/main.py's boot gates refuse a provider whose backing is absent, loudly. Pin it in infrastructure via the customer-instance module's per-VM `chat_provider` field (`AGNES_CHAT_PROVIDER`) so a fresh data disk boots into the right engine. |

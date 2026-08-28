@@ -1,0 +1,317 @@
+"""Three bugs the builders shipped with, and the shape of each.
+
+All three are the same class of mistake in different clothes: something that
+is rendered once and then partially updated, or sized against a number that
+was only ever right for one page.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SKILLS = ROOT / "app" / "web" / "templates" / "skills.html"
+DRAWER = ROOT / "app" / "web" / "static" / "js" / "components" / "package_drawer.js"
+PAGE = ROOT / "app" / "web" / "templates" / "admin_package_builder.html"
+LIBRARY = ROOT / "app" / "web" / "templates" / "library.html"
+CSS = ROOT / "app" / "web" / "static" / "css" / "builder.css"
+
+
+@pytest.fixture(scope="module")
+def skills() -> str:
+    return SKILLS.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def drawer() -> str:
+    return DRAWER.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def css() -> str:
+    return CSS.read_text(encoding="utf-8")
+
+
+class TestTheTabStripTracksTheOpenTab:
+    def test_the_left_pane_rebuilds_its_tabs(self, skills):
+        """The strip is part of the pane, not chrome above it. Keeping it and
+        replacing only what follows left `aria-selected` on whichever tab was
+        active at first paint — Preview's pane rendered under a Create tab
+        still styled as selected."""
+        block = re.search(r"function renderLeftPane\(\) \{(.*?)\n  \}", skills, re.S)
+        assert block, "renderLeftPane not found"
+        body = block.group(1)
+        assert "tabsHtml()" in body, "the tab strip is not re-rendered with the pane"
+        assert "tabs.nextSibling" not in body, "the old keep-the-strip approach is back"
+
+    def test_there_is_one_definition_of_the_tabs(self, skills):
+        """Two copies is how the strip and the pane disagree in the first
+        place."""
+        assert skills.count("id: 'create', label: 'Create'") == 1
+
+
+class TestTheWorkspaceFillsTheWindow:
+    def test_it_does_not_subtract_a_guessed_chrome_height(self, css):
+        """`height: calc(100vh - 150px)` was tuned to ONE page's header. On
+        the other builder the header is 70px, so the workspace stopped short
+        and left a band of dead white under it — and either header rewrapping
+        would have broken both."""
+        rule = re.search(r"\.ag-work \{([^}]*)\}", css)
+        assert rule, ".ag-work rule not found"
+        body = rule.group(1)
+        assert "100vh" not in body, "the workspace is sized against a guessed chrome height again"
+        assert "flex: 1" in body
+
+    def test_the_column_above_it_flexes_all_the_way_down(self, css):
+        """Flexing the workspace only works if every ancestor does too."""
+        for sel in (
+            "body.ag-building .idx ",
+            "body.ag-building .idx-band ",
+            "body.ag-building .idx-band-inner ",
+        ):
+            assert sel in css, f"{sel.strip()} is not part of the flex column"
+        assert "#sk-builder-view" in css and "#ag-builder-view" in css
+
+    def test_the_stacked_layout_can_still_scroll(self, css):
+        """Pinning the shell to the viewport is right only while the panes sit
+        side by side; stacked, it would trap the lower one."""
+        assert re.search(
+            r"@media \(max-width: 900px\) \{\s*[^}]*body\.ag-building \.idx \{[^}]*height: auto", css, re.S
+        )
+
+
+class TestTheDrawerWearsOneHeaderAtATime:
+    def test_the_builder_uses_the_shell_header(self, drawer):
+        """Back on the left, the verb that commits on the right — the same
+        header every other builder has. A workspace whose primary action sits
+        in a footer under a scrolling form reads as a dialog, and the action
+        leaves the screen as soon as the form is long enough to scroll."""
+        assert "BuilderShell.head({" in drawer
+        # The label is configurable now (the page and the drawer can name
+        # different destinations), but it still defaults to Library.
+        assert "backLabel: (st && st.backLabel) || 'Library'" in drawer
+
+    def test_the_commit_button_is_moved_on_every_open_not_once(self, drawer):
+        """One node, one DOM, two sizes. Placed once at build, the button
+        stayed in the shell header — and the next compact open showed a footer
+        with nothing in it but Cancel."""
+        block = re.search(r"function placeSubmit\(\) \{(.*?)\n  \}", drawer, re.S)
+        assert block, "placeSubmit not found"
+        body = block.group(1)
+        assert "st.builder" in body and "els.foot" in body
+        # ...and it is actually called from open(), not just defined.
+        assert re.search(r"placeSubmit\(\);", drawer)
+
+    def test_each_header_is_hidden_in_the_other_mode(self, css):
+        assert ".ds-drawer--builder .ds-drawer__head" in css
+        assert ".ds-drawer--builder .ds-drawer__foot" in css
+        assert ".ds-drawer:not(.ds-drawer--builder) .ag-build-head" in css
+
+    def test_back_closes_without_pretending_there_is_something_to_lose(self, drawer):
+        """The package does not exist until Create and there is no draft store
+        here, so leaving costs nothing — a confirmation would be theatre."""
+        block = re.search(r"\[data-ag-back\]'\)\) \{(.*?)\n      \}", drawer, re.S)
+        assert block, "the shell's back button is not handled — it would do nothing"
+        body = block.group(1)
+        # As a page it navigates; as an overlay it closes. Neither confirms.
+        assert "st.backHref" in body and "close()" in body
+        assert "confirmModal" not in drawer
+
+
+class TestThePackageBuilderIsAPage:
+    """A grown drawer is still an overlay. Authoring a package is not a detour
+    from another page — it is the thing you came to do — so it looks like the
+    other two places you come to do the thing: rail, shell header, two panes.
+
+    The drawer itself is unchanged and stays where it belongs: /admin/tables,
+    opened mid-sentence while assigning a table to a package that does not
+    exist yet. One component, two mountings, no second package form.
+    """
+
+    @pytest.fixture(scope="class")
+    def page(self) -> str:
+        return PAGE.read_text(encoding="utf-8")
+
+    def test_the_page_reuses_the_drawer_component(self, page):
+        """Not a second implementation of a package's fields and grants."""
+        assert "package_drawer.js" in page
+        assert "AgnesPackageDrawer.open(" in page
+        assert "mount:" in page
+
+    def test_the_page_loads_the_shared_shell(self, page):
+        assert "builder_shell.js" in page and "css/builder.css" in page
+
+    def test_the_page_head_is_empty_so_the_shell_header_is_the_only_title(self, page):
+        block = re.search(r"\{% block page_head %\}(.*?)\{% endblock %\}", page, re.S)
+        assert block, "page_head block missing"
+        assert "<h1" not in block.group(1) and "<h2" not in block.group(1)
+
+    def test_mounting_moves_the_root_not_just_the_panel(self, drawer):
+        """Every rule that dresses this thing is scoped from the root
+        (`.ds-drawer--builder .ds-drawer__head`). Relocating the panel alone
+        left those selectors matching nothing, and the drawer arrived on the
+        page wearing its overlay chrome and none of its builder chrome."""
+        assert "st.mount.appendChild(els.root)" in drawer
+
+    def test_a_page_cannot_be_closed_like_an_overlay(self, drawer):
+        """There is no backdrop and no Escape to dismiss — leaving is a
+        navigation, and close() would leave a blank page behind."""
+        block = re.search(r"function close\(\) \{(.*?)\n  \}", drawer, re.S)
+        assert block and "st.mount" in block.group(1)
+
+    def test_the_back_label_and_destination_are_taken_together(self, drawer):
+        """They are one promise. Split, the header says Library while the
+        button goes somewhere else."""
+        assert "backLabel: opts.backLabel" in drawer and "backHref: opts.backHref" in drawer
+
+    def test_the_library_navigates_rather_than_opening_a_drawer(self):
+        lib = LIBRARY.read_text(encoding="utf-8")
+        block = re.search(r"data-new-package\][^;]*?\{(.*?)\}\)\);", lib, re.S)
+        assert block, "the + New package handler moved"
+        body = block.group(1)
+        assert "/admin/data-packages/new" in body
+        # A navigation gated on a script being loaded silently does nothing.
+        assert "AgnesPackageDrawer)" not in body
+
+    def test_the_head_band_is_fully_collapsed_while_building(self, css):
+        """/agents hides the band outright, so only its bottom padding ever
+        showed. A builder PAGE renders it empty, and its 32px top padding
+        pushed the whole workspace down by exactly that much."""
+        assert re.search(r"body\.ag-building \.idx-head \{ padding: 0; \}", css)
+
+
+class TestThePageBuilderDoesNotPaintOverTheRail:
+    def test_page_mode_gives_up_the_overlay_z_index(self, css):
+        """An overlay sits above everything (drawer.css: z-index 1200). A page
+        must not: the app rail is a fixed element at z-index 40, so a
+        page-mounted drawer that kept 1200 paints OVER the sidebar wherever the
+        two meet — during a rail expand/collapse transition, for instance,
+        when the content offset and the rail width are briefly inconsistent.
+
+        `position: static` does NOT neutralise this on its own: the root is a
+        flex item, and z-index applies to flex items whether or not they are
+        positioned. That is the trap this pins.
+        """
+        rule = re.search(r"\.ds-drawer\.is-page \{([^}]*)\}", css, re.S)
+        assert rule, ".ds-drawer.is-page rule not found"
+        body = rule.group(1)
+        assert "z-index: auto" in body, "page mode is keeping the overlay stacking order"
+        assert "position: static" in body
+
+
+class TestTheConfigurationSectionsAreCards:
+    """Each section is a bounded card, not a hairline-separated row.
+
+    This guard was written the other way round (`TestTheConfigurationPanelIsOne
+    Surface`, cc2247518): sections were flattened onto the grey panel because
+    six white cards inside a panel that is itself a surface is two levels of
+    container for one list. That argument was real but the cost was worse — with
+    only a hairline, a section's heading, its labels, its hints and its inputs
+    all sit on one flat field, and the white input boxes become the strongest
+    edges in the column. The emphasis lands on the fields instead of the
+    structure and nothing marks where one section ends and the next starts, so
+    the panel stopped being scannable. Reverted deliberately; this class now
+    pins the cards so a future flattening has to argue with the reason it was
+    undone rather than rediscovering it.
+    """
+
+    def test_each_section_is_its_own_card(self, css):
+        rule = re.search(r"\n\.ag-sec \{([^}]*)\}", css)
+        assert rule, ".ag-sec rule not found"
+        body = rule.group(1)
+        assert "background:" in body, "the section is not painting a surface — it is flat again"
+        assert "border-radius" in body, "the section has no radius — it is not a card"
+        assert "border:" in body, "the section has no edge"
+
+    def test_the_body_is_divided_from_its_header(self, css):
+        """Inside a bounded card a rule between header and body reads as
+        internal structure. (It read as a heading cut off from what it names
+        only while the sections were flat on the panel.)"""
+        rule = re.search(r"\.ag-sec-body \{([^}]*)\}", css)
+        assert rule and "border-top" in rule.group(1), "the header/body divider is missing"
+
+    def test_sections_are_separated_by_the_gap_not_a_line(self, css):
+        """Cards are spaced apart, so the between-sections hairline the flat
+        design needed would now draw a line in the gutter between two cards."""
+        rule = re.search(r"\n\.ag-sec \{([^}]*)\}", css)
+        assert rule and "margin-bottom" in rule.group(1), "cards need the gap that separates them"
+        assert ".ag-sec:last-child { border-bottom: none; }" not in css, (
+            "a leftover from the flat design — there is no between-section border to cancel"
+        )
+
+    def test_the_skills_type_step_matches(self):
+        """Step 1 keeps its own markup but must match the shared sections' look.
+        With cards back, a hairline row here would be the one flat thing in a
+        column of cards — the same mistake inverted."""
+        skills = (ROOT / "app" / "web" / "templates" / "skills.html").read_text(encoding="utf-8")
+        rule = re.search(r"\n  \.sk-sec \{([^}]*)\}", skills)
+        assert rule, ".sk-sec rule not found"
+        assert "background:" in rule.group(1), "the Type step is flat while the others are cards"
+        assert "border-radius" in rule.group(1), "the Type step is not a card"
+
+
+class TestThePackageBuilderShipsItsOwnControls:
+    """The page mounts package_drawer.js, so it has to carry that component's
+    stylesheet too — the table tree, the grant rows and their Optional /
+    Automatic toggles are its markup. Without it they render as native
+    checkboxes and unstyled buttons.
+    """
+
+    @pytest.fixture(scope="class")
+    def page(self) -> str:
+        return (ROOT / "app" / "web" / "templates" / "admin_package_builder.html").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("asset", ["css/package_drawer.css", "css/drawer.css", "css/ds_dropdown.css"])
+    def test_the_drawers_own_sheets_are_loaded(self, page, asset):
+        assert asset in page, f"{asset} missing — the drawer's controls will render unstyled"
+
+    def test_the_dropdown_script_is_loaded(self, page):
+        """The category picker initialises from it; without it the branded
+        markup renders with nothing driving it."""
+        assert "js/components/ds_dropdown.js" in page
+
+
+class TestDeadPresentationFieldsAreGone:
+    """Icon, Colour and Cover image are gone from the package builder.
+
+    Icon and Colour never had an effect: under the paper/rail redesign the
+    resource hero draws a kind glyph (`cards.kind_glyph`), and
+    macros/_detail.html accepts `icon`/`color` as parameters and emits
+    neither. The cover image DID paint — it was dropped as a decision, not a
+    bug: a package is identified by what it carries, and an admin uploading
+    artwork per package is work with no reader on the other end.
+
+    The `hero()` macro still supports `cover_image_url` for whoever else calls
+    it; what changed is that the package detail page stops passing one, so
+    there is no longer anything for the builder to set.
+    """
+
+    def test_none_of_the_three_are_offered(self, drawer):
+        for dead in (
+            "pdw-icon",
+            "pdw-color",
+            "els.icon",
+            "els.color",
+            "pdw-cover-file",
+            "els.cover",
+            "renderCover",
+        ):
+            assert dead not in drawer, f"{dead} is back in the builder"
+
+    def test_the_builder_does_not_send_them_either(self, drawer):
+        """Removing the controls but still posting the keys would leave a
+        package quietly carrying artwork nobody can change."""
+        for key in ("cover_image_url", "icon", "color"):
+            assert f'"{key}"' not in drawer and f"'{key}'" not in drawer, f"the builder still puts {key} in a payload"
+
+    def test_the_detail_page_asks_for_no_presentation(self):
+        """The hero macro keeps supporting all three for its other callers;
+        what must stay true is that the package page passes none of them."""
+        page = (ROOT / "app" / "web" / "templates" / "catalog_package_detail.html").read_text(encoding="utf-8")
+        hero = page[page.index("detail.hero(") :]
+        hero = hero[: hero.index(") }}") + 4]
+        for key in ("cover_image_url", "icon=", "color="):
+            assert key not in hero, f"the package hero is passed {key} again"
