@@ -69,7 +69,10 @@ class TestAccessCanCreateInPlace:
     def test_group_list_carries_a_create_control(self, seeded_app):
         c = seeded_app["client"]
         body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
-        assert 'id="ax-new-group"' in body
+        # The control is the list's own first row now, not a toolbar button
+        # with an id: `#ax-groups` is rewritten on every repaint, so it is
+        # addressed by attribute and bound by delegation.
+        assert "data-new-group" in body
         assert "New group" in body
 
     def test_it_opens_the_drawer_rather_than_navigating(self, seeded_app):
