@@ -109,14 +109,41 @@ class TestPreviewDoesNotPromiseWhatItCannotDo:
         # the textarea and the send button in composerHtml.
         assert re.search(r"composerHtml\('preview', '', 'Start by defining your agent\.', true\)", body)
 
-    def test_an_engine_error_is_translated_not_pasted(self, preview_js):
+    def test_a_recognised_engine_error_is_translated_not_pasted(self, preview_js):
         """Internal kinds pasted verbatim read as a broken page and send the
         author hunting for a mistake in a configuration that is fine."""
         assert "function errorCopy(" in preview_js
         assert "not_configured" in preview_js
-        # The author is told whose problem it is; the raw kind stays in console.
         assert "an admin sets one up" in preview_js
         assert "console.error" in preview_js
+
+    def test_an_unrecognised_engine_error_still_names_itself(self, preview_js):
+        """The fallback used to read "the details are in the browser console",
+        which is worth nothing to anyone not holding devtools open — a preview
+        failing on a deployed instance told its author, and whoever they
+        reported it to, precisely nothing. Translating the errors we know is
+        not a licence to withhold the ones we don't."""
+        # The banned string is the one that reached the SCREEN, so match what
+        # a return statement would carry rather than the word anywhere in the
+        # file — a comment explaining this history must not fail the test.
+        assert "in the browser console'" not in preview_js, (
+            "the fallback sends the reader to devtools instead of telling them "
+            "what happened"
+        )
+        assert "'The preview could not answer: ' + detail" in preview_js, (
+            "the unrecognised case must put the engine's own words on screen"
+        )
+        assert "errorCopy(frame.message, frame.kind)" in preview_js, (
+            "several error frames carry the useful half in `kind` and an empty "
+            "`message`, so both have to reach errorCopy"
+        )
+
+    def test_a_slow_engine_start_reads_as_retryable(self, preview_js):
+        """`runner_not_ready` ("Runner did not become ready within 30 s") is the
+        one failure here that is usually nobody's mistake — the first session on
+        an instance fetches the sandbox. It said nothing actionable before."""
+        assert "runner_not_ready" in preview_js
+        assert "did not start in time" in preview_js
 
     def test_model_output_is_escaped_into_the_dom(self, shell_js):
         """Assistant text goes through `esc()`, never raw innerHTML — neither

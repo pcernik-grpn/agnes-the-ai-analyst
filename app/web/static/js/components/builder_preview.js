@@ -39,23 +39,63 @@
   }
 
   /* Engine errors arrive as internal kinds (`kai_integration_not_configured`,
-     `concurrency_cap`). Pasted verbatim they read as a broken page and send
-     the author looking for a mistake in a configuration that is in fact fine
-     — what is missing is instance-level plumbing only an admin can supply.
-     Say which of the two it is; keep the kind in the console. */
-  function errorCopy(raw) {
-    var msg = String(raw || '');
-    if (/not_configured|no_provider|provider_unavailable|integration/i.test(msg)) {
+     `concurrency_cap`, `runner_not_ready`). Pasted verbatim they read as a
+     broken page and send the author looking for a mistake in a configuration
+     that is in fact fine — what is missing is usually instance-level plumbing
+     only an admin can supply. So the ones we recognise get a sentence that
+     says whose problem it is and what to do.
+
+     THE FALLBACK NAMES THE REASON. It used to send the reader to devtools,
+     which is worth nothing to anyone who does not have them open — a preview
+     failing on a deployed instance told its author, and the person they
+     reported it to, precisely nothing. The recognised
+     cases exist so the common failures read as prose; an unrecognised one is
+     not a reason to withhold what the engine said. `kind` is taken as well as
+     `message` because several frames carry the useful half in the kind and an
+     empty string in the message. */
+  /* An engine error often arrives with the useful sentence wrapped in the
+     upstream's JSON — `engine refused the turn (500): {"detail":"...set the
+     SAME value here and on the Agnes process..."}`. That sentence is the whole
+     answer; the braces around it are noise, and a reader who has to parse JSON
+     out of an error banner is barely better off than one sent to the console.
+     Unwrap `detail`/`message`/`error` when the tail parses, keep the prefix
+     that says which step failed, and leave anything else exactly as it came. */
+  function unwrapDetail(msg) {
+    var open = msg.indexOf('{');
+    if (open < 0 || msg.lastIndexOf('}') < open) return msg;
+    var parsed;
+    try { parsed = JSON.parse(msg.slice(open)); } catch (e) { return msg; }
+    if (!parsed || typeof parsed !== 'object') return msg;
+    var inner = parsed.detail || parsed.message || parsed.error;
+    if (inner && typeof inner === 'object') inner = inner.hint || inner.message || inner.detail;
+    if (typeof inner !== 'string' || !inner.trim()) return msg;
+    return (msg.slice(0, open).trim() + ' ' + inner.trim()).trim();
+  }
+
+  function errorCopy(raw, kind) {
+    var msg = String(raw == null ? '' : raw).trim();
+    var k = String(kind == null ? '' : kind).trim();
+    var both = k + ' ' + msg;
+    if (/not_configured|no_provider|provider_unavailable|integration/i.test(both)) {
       return 'Preview needs a chat engine, and none is configured on this instance — ' +
         'an admin sets one up. Your work is saved either way.';
     }
-    if (/concurrency_cap/i.test(msg)) {
+    if (/concurrency_cap/i.test(both)) {
       return 'Too many sessions are running right now. Try the preview again in a moment.';
     }
-    if (/budget|429/i.test(msg)) {
+    if (/budget|429/i.test(both)) {
       return 'This agent has used its budget for the month. An admin can raise it.';
     }
-    return 'The preview could not answer. The details are in the browser console.';
+    if (/runner_not_ready|did not become ready/i.test(both)) {
+      return 'The preview engine did not start in time. The first session on an instance ' +
+        'is the slow one (it fetches the sandbox), so trying again usually works — ' +
+        'if it keeps failing, an admin should check the chat engine.';
+    }
+    var detail = unwrapDetail(msg) || k;
+    if (!detail) return 'The preview could not answer, and the engine gave no reason.';
+    // Both halves when they differ, so a kind-only frame and a message-only
+    // frame both read completely and neither repeats itself.
+    return 'The preview could not answer: ' + detail + (msg && k && k !== msg ? ' (' + k + ')' : '');
   }
 
   function create(opts) {
@@ -139,7 +179,11 @@
                 state.msgs.push({ role: 'assistant', text: frame.content || state.stream || '' });
                 state.stream = ''; state.busy = false; onUpdate();
               } else if (frame.type === 'error') {
-                state.err = errorCopy(frame.message);
+                // Logged as well as shown: the console keeps the whole frame
+                // for whoever has devtools open, and the pane no longer needs
+                // them to.
+                console.error(label + ': preview engine error', frame);
+                state.err = errorCopy(frame.message, frame.kind);
                 state.stream = ''; state.busy = false; onUpdate();
               }
             };

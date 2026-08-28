@@ -738,6 +738,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   while the conversation had room to spare.
 
 ### Fixed
+- **A failed builder Preview now says why, instead of pointing at the browser
+  console.** Reported from a deployed instance: the agent builder's Preview
+  answered "The preview could not answer. The details are in the browser
+  console." — useless to the author, to the person they reported it to, and to
+  the engineer after that. Reproducing it against the scripted engine showed
+  what the copy was discarding: an `engine_error` frame carrying
+  `engine refused the turn (500): {"detail":"… KAI_HOST_JWT_SECRET is unset …
+  Set the SAME value here and on the Agnes process …"}` — a complete diagnosis,
+  thrown away because `engine_error` matched none of the recognised patterns
+  and the fallback named devtools rather than the reason. The unrecognised case
+  now puts the engine's own words on screen (unwrapping the upstream's JSON
+  `detail`, keeping the prefix that says which step failed), `kind` is read as
+  well as `message` since several frames carry the useful half in the kind, and
+  `runner_not_ready` — the 30-second engine-start timeout, usually nobody's
+  mistake on a cold instance — gets its own retryable sentence. The whole error
+  frame is logged as well, so devtools keeps everything it had.
+
 - **All four conversational builders now say when they are talking to the
   scripted stand-in.** Every turn endpoint has always reported which engine
   answered it — that is the whole point of naming the engine — but only the
