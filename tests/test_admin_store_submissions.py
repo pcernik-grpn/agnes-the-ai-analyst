@@ -642,6 +642,196 @@ class TestAdminDelete:
 
 
 # ---------------------------------------------------------------------------
+# TCRD-235 — submitter notification on terminal admin decisions
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitterNotifications:
+    def test_override_notifies_submitter(self, web_client, monkeypatch):
+        from src.repositories.store_entities import StoreEntitiesRepository
+        from src.repositories.store_submissions import StoreSubmissionsRepository
+
+        user_id, _ = _create_user(web_client, "submitter@x.com")
+        conn = get_system_db()
+        StoreEntitiesRepository(conn).create(
+            id="ent-notify-1",
+            owner_user_id=user_id,
+            owner_username="submitter",
+            type="skill",
+            name="notify-me",
+            description="x" * 30,
+            category=None,
+            version="1.0.0",
+            file_size=10,
+            visibility_status="pending",
+        )
+        sid = StoreSubmissionsRepository(conn).create(
+            submitter_id=user_id,
+            submitter_email="submitter@x.com",
+            type="skill",
+            name="notify-me",
+            version="1.0.0",
+            status="blocked_llm",
+            entity_id="ent-notify-1",
+            llm_findings={"risk_level": "high", "summary": "exfil"},
+        )
+        conn.close()
+
+        calls = []
+        monkeypatch.setattr(
+            "app.notifications.publish_notification",
+            lambda user, payload: calls.append((user, payload)),
+        )
+
+        _, admin_cookies = _create_admin(web_client)
+        r = web_client.post(
+            f"/api/admin/store/submissions/{sid}/override",
+            json={"reason": "false positive — internal-only constants"},
+            cookies=admin_cookies,
+        )
+        assert r.status_code == 200, r.text
+
+        assert len(calls) == 1
+        user, payload = calls[0]
+        assert user == user_id
+        assert payload["kind"] == "store_submission"
+        assert payload["decision"] == "overridden"
+        assert payload["submission_id"] == sid
+        assert payload["name"] == "notify-me"
+        assert payload["note"] == "false positive — internal-only constants"
+
+    def test_delete_notifies_submitter(self, web_client, monkeypatch):
+        from src.repositories.store_entities import StoreEntitiesRepository
+        from src.repositories.store_submissions import StoreSubmissionsRepository
+
+        user_id, _ = _create_user(web_client, "u3@x.com")
+        conn = get_system_db()
+        StoreEntitiesRepository(conn).create(
+            id="ent-notify-2",
+            owner_user_id=user_id,
+            owner_username="u3",
+            type="skill",
+            name="deleted-thing",
+            description="x" * 30,
+            category=None,
+            version="1.0.0",
+            file_size=10,
+            visibility_status="approved",
+        )
+        sid = StoreSubmissionsRepository(conn).create(
+            submitter_id=user_id,
+            submitter_email="u3@x.com",
+            type="skill",
+            name="deleted-thing",
+            version="1.0.0",
+            status="approved",
+            entity_id="ent-notify-2",
+        )
+        conn.close()
+
+        calls = []
+        monkeypatch.setattr(
+            "app.notifications.publish_notification",
+            lambda user, payload: calls.append((user, payload)),
+        )
+
+        _, admin_cookies = _create_admin(web_client)
+        r = web_client.delete(
+            f"/api/admin/store/submissions/{sid}",
+            cookies=admin_cookies,
+        )
+        assert r.status_code == 204, r.text
+
+        assert len(calls) == 1
+        user, payload = calls[0]
+        assert user == user_id
+        assert payload["decision"] == "deleted"
+        assert payload["name"] == "deleted-thing"
+
+    def test_override_notification_failure_does_not_break_endpoint(self, web_client, monkeypatch):
+        """A broken notification channel must never fail the admin action —
+        the override still lands even though the notify call raised."""
+        from src.repositories.store_entities import StoreEntitiesRepository
+        from src.repositories.store_submissions import StoreSubmissionsRepository
+
+        user_id, _ = _create_user(web_client, "u4@x.com")
+        conn = get_system_db()
+        StoreEntitiesRepository(conn).create(
+            id="ent-notify-3",
+            owner_user_id=user_id,
+            owner_username="u4",
+            type="skill",
+            name="still-works",
+            description="x" * 30,
+            category=None,
+            version="1.0.0",
+            file_size=10,
+            visibility_status="pending",
+        )
+        sid = StoreSubmissionsRepository(conn).create(
+            submitter_id=user_id,
+            submitter_email="u4@x.com",
+            type="skill",
+            name="still-works",
+            version="1.0.0",
+            status="blocked_llm",
+            entity_id="ent-notify-3",
+        )
+        conn.close()
+
+        def boom(user, payload):
+            raise RuntimeError("coordination backend exploded")
+
+        monkeypatch.setattr("app.notifications.publish_notification", boom)
+
+        _, admin_cookies = _create_admin(web_client)
+        r = web_client.post(
+            f"/api/admin/store/submissions/{sid}/override",
+            json={"reason": "false positive — verified clean offline"},
+            cookies=admin_cookies,
+        )
+        assert r.status_code == 200, r.text
+
+        conn = get_system_db()
+        ent = StoreEntitiesRepository(conn).get("ent-notify-3")
+        assert ent["visibility_status"] == "approved"
+        conn.close()
+
+    def test_rescan_does_not_notify(self, web_client, monkeypatch, tmp_path):
+        """rescan re-queues review — an intermediate state, not a terminal
+        decision — so the submitter must not be notified."""
+        from src.repositories.store_submissions import StoreSubmissionsRepository
+
+        user_id, _ = _create_user(web_client, "u5@x.com")
+        eid = _stage_entity_with_bundle(tmp_path, user_id, "rescan-notify")
+        conn = get_system_db()
+        sid = StoreSubmissionsRepository(conn).create(
+            submitter_id=user_id,
+            submitter_email="u5@x.com",
+            type="skill",
+            name="rescan-notify",
+            version="1.0.0",
+            status="approved",
+            entity_id=eid,
+        )
+        conn.close()
+
+        calls = []
+        monkeypatch.setattr(
+            "app.notifications.publish_notification",
+            lambda user, payload: calls.append((user, payload)),
+        )
+
+        _, admin_cookies = _create_admin(web_client)
+        r = web_client.post(
+            f"/api/admin/store/submissions/{sid}/rescan",
+            cookies=admin_cookies,
+        )
+        assert r.status_code == 200, r.text
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # List filters + pagination
 # ---------------------------------------------------------------------------
 
