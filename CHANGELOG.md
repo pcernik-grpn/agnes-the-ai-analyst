@@ -680,6 +680,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   its grants materialized for every group), and `/admin/access` extends the
   collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
   same grants payload the checkboxes read so the two can never disagree.
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser
