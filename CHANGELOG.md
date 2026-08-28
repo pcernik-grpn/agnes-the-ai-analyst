@@ -86,6 +86,51 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   nothing. This was the last connector writing `metric_definitions`
   directly — every source (native, git, upload, Keboola, Snowflake,
   Databricks) now goes through the same document → projector pipeline.
+- **Collections file upload now preserves a matched file's id on every
+  re-upload, instead of delete+insert.** `POST /api/collections/{id}/files`
+  gains optional positionally-paired form fields — `source_stable_ids` (+
+  `source_doc_ids`, `source_sha256s`, `document_dates`) — so a doc-sync
+  client can supply a producer's own stable id (e.g. a crawler's delta key)
+  alongside the existing `paths` field. A match is tried on
+  `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
+  as before; either way, the existing `corpus_files` row is now updated IN
+  PLACE — a content-unchanged match against an already-`indexed` row (a
+  rename/move) only refreshes filename/path and skips re-chunking entirely,
+  while a changed-content match purges chunks/derived tables and resets
+  `processing_status` on the SAME row. Content-unchanged against a row whose
+  ingest never completed (`rejected`, `needs_review`, or a parked `pending`)
+  counts as a **retry** instead: the row resets to `pending` and ingestion is
+  re-scheduled, so re-uploading the same bytes after fixing the cause works
+  without a separate `…/reingest` call — a row mid-ingest is left alone. A
+  manual `paths`-only re-upload of a file previously anchored by a stable id
+  now also preserves that row's id, so a hand upload can no longer orphan
+  anything referencing it. Two files sharing a non-blank `source_stable_id`
+  in one batch are rejected up front (`400
+  duplicate_source_stable_id_in_batch`), matching the existing
+  `duplicate_path_in_batch` guard — the second would otherwise overwrite the
+  first's row in place and silently drop its bytes — and a read-only
+  pre-flight resolves every file's target row before anything is stored, so
+  the two collisions that cross the stable-id/path boundary are refused
+  cleanly too: two files landing on the same existing row through different
+  anchors (`400 duplicate_target_row_in_batch`) and a stable-id match whose
+  `path` is already held by another row, which previously violated the
+  `(corpus_id, path)` unique index and surfaced as a `500` with earlier files
+  in the batch already written (`409 path_owned_by_another_file`). The old
+  blob is now unlinked whenever a matched row's `storage_path` moves rather
+  than only when its content changed — blob paths are `{sha256}{ext}` with
+  the extension taken from the filename, so an extension-only rename kept the
+  sha, allocated a new blob and orphaned the old one on disk. On a role-split
+  `api` replica a content-changed re-upload now rides ONE ordered
+  `collections-purge` job carrying `reingest_after_purge=True`, exactly as
+  `…/reingest` already did, instead of enqueueing a bare derived-table purge
+  while running the re-ingest in-process — because the row id (and therefore
+  the derived `table_id`) is now preserved, those two could land in either
+  order and the purge could delete the table the re-ingest had just rebuilt.
+  The stable-id mapping upsert also `COALESCE`s its optional columns, so a
+  rename-only re-sync carrying `source_stable_ids` without `source_doc_ids`
+  no longer resets a stored `source_doc_id` to NULL. The stable-id mapping
+  table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
+  instance returns `501`; omitting the field keeps today's flow unchanged.
 
 - **Session files are a side drawer that opens itself when a deliverable
   lands.** The Files panel was a modal, which covered the very sentence
