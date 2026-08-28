@@ -157,49 +157,33 @@ class TestOrphanedModels:
         health = compute_semantic_layer_health()
         assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]
 
-    def test_a_databricks_model_matching_the_configured_workspace_is_not_flagged(self, pg_state, monkeypatch):
-        """The legacy Databricks sync stamps ``source_ref`` with the
-        warehouse hostname, never a ``semantic_sources`` row. Liveness must
-        hold even with no resolvable token — the health-report process may
-        not carry Databricks credentials at all."""
-        import src.connection_resolver as connection_resolver
+    def test_a_databricks_model_with_a_live_semantic_source_is_not_flagged(self, pg_state):
+        """Since the semantic-layer Phase 1 cutover, a Databricks model
+        flows through the standard connection-kind pipeline like every other
+        source — ``source='ossie_connection'`` + ``source_ref=<semantic
+        source id>`` (the fixed ``databricks_default`` id,
+        :func:`connectors.databricks.semantic_layer.ensure_semantic_source`)
+        — so it needs no dispatch entry of its own: the generic
+        ``source_ref in known_source_ids`` check already asks the right
+        question. Pre-cutover this stamped ``source='databricks_metrics'`` +
+        ``source_ref=<workspace host>`` instead, which is what the retired
+        per-host dispatch this test used to exercise was for."""
         from src.semantic.coverage import compute_semantic_layer_health
 
-        monkeypatch.setattr(
-            connection_resolver,
-            "resolve_source_connection",
-            lambda source_type: (
-                {"config": {"host": "my-workspace.cloud.databricks.com"}} if source_type == "databricks" else None
-            ),
-        )
-        _model("m1", slug="revenue", source="databricks_metrics", source_ref="my-workspace.cloud.databricks.com")
+        _source("databricks_default", name="Databricks metric views")
+        _model("m1", slug="revenue", source="ossie_connection", source_ref="databricks_default")
 
         health = compute_semantic_layer_health()
         assert health["orphaned_models"] == []
 
-    def test_a_databricks_model_from_a_reconfigured_workspace_is_flagged(self, pg_state, monkeypatch):
-        import src.connection_resolver as connection_resolver
+    def test_a_databricks_model_whose_semantic_source_row_is_gone_is_flagged(self, pg_state):
+        """The fixed ``databricks_default`` row missing means Databricks was
+        never (re)synced since the row was deleted or the instance never
+        configured it — same shape as any other connection-kind source
+        going stale."""
         from src.semantic.coverage import compute_semantic_layer_health
 
-        monkeypatch.setattr(
-            connection_resolver,
-            "resolve_source_connection",
-            lambda source_type: (
-                {"config": {"host": "new-workspace.cloud.databricks.com"}} if source_type == "databricks" else None
-            ),
-        )
-        _model("m1", slug="revenue", source="databricks_metrics", source_ref="old-workspace.cloud.databricks.com")
-
-        health = compute_semantic_layer_health()
-        assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]
-
-    def test_a_databricks_model_is_flagged_when_no_workspace_is_configured(self, pg_state, monkeypatch):
-        import src.connection_resolver as connection_resolver
-        from src.semantic.coverage import compute_semantic_layer_health
-
-        monkeypatch.setattr(connection_resolver, "resolve_source_connection", lambda source_type: None)
-        monkeypatch.setattr("app.instance_config.get_value", lambda *a, **k: "")
-        _model("m1", slug="revenue", source="databricks_metrics", source_ref="some-workspace.cloud.databricks.com")
+        _model("m1", slug="revenue", source="ossie_connection", source_ref="databricks_default")
 
         health = compute_semantic_layer_health()
         assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]

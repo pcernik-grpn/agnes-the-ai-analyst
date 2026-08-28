@@ -3060,7 +3060,35 @@ class TestSemanticLayerSmoke:
         "GET /api/semantic-models/schema",
         "GET /api/semantic-models/bundle",
         "POST /api/semantic-models/apply",
+        "POST /api/admin/semantic-models/{slug}/packages",
+        "DELETE /api/admin/semantic-models/{slug}/packages/{package_id}",
     }
+
+    def test_package_link_and_unlink_are_wired_on_both_backends(self, seeded_app_both):
+        from src.repositories import data_packages_repo
+
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+
+        created = c.post("/api/admin/semantic-models", json={"document": _SEMANTIC_DOC}, headers=h)
+        assert created.status_code == 201
+        slug = created.json()["slug"]
+
+        pkg_id = data_packages_repo().create(
+            name="Smoke Pkg", slug="smoke-pkg", description=None, icon=None, color=None, created_by="test"
+        )
+
+        linked = c.post(
+            f"/api/admin/semantic-models/{slug}/packages",
+            json={"package_id": pkg_id},
+            headers=h,
+        )
+        assert linked.status_code == 200, linked.text
+        assert linked.json()["package_ids"] == [pkg_id]
+
+        unlinked = c.delete(f"/api/admin/semantic-models/{slug}/packages/{pkg_id}", headers=h)
+        assert unlinked.status_code == 200, unlinked.text
+        assert unlinked.json()["package_ids"] == []
 
     def test_detach_and_reattach_are_wired_on_both_backends(self, seeded_app_both):
         """F3 detach/re-attach. A hand-authored model is the wrong subject for
