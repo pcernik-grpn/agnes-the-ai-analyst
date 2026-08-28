@@ -194,6 +194,26 @@
   .ds-badge.badge-unset::before { background: var(--ds-text-muted); }
   .ds-badge.badge-default { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
+  /* The file-source card's error-category badges are BUTTONS (they open the
+     filtered drawer, spec §13.2) — normalize away the browser's default
+     button chrome so a clickable badge still reads as a badge. */
+  button.ds-badge { font: inherit; border: none; cursor: pointer; }
+  button.ds-badge:disabled { cursor: default; opacity: 0.55; }
+  button.ds-badge:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
+
+  /* File-source error drawer (spec §13.2): the itemized rows for whichever
+     error badge is active. */
+  .ds-filesource-drawer { margin: 4px 16px 8px; }
+  .ds-filesource-drawer__list {
+    margin: 0; padding: 0; list-style: none;
+    border: 1px solid var(--border, var(--ds-border));
+    border-radius: 8px; overflow: hidden;
+  }
+  .ds-filesource-drawer__list li {
+    padding: 6px 12px; font-size: 12.5px;
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+  }
+  .ds-filesource-drawer__list li:last-child { border-bottom: none; }
 
   /* The Test verdict. It reports on the whole card, so it lands at the top
      of the body under the fact it is about, not floating after a button in
@@ -1498,6 +1518,11 @@ const CONNECTOR = {
   databricks: { abbr: "DB", cls: "databricks", wizard: "databricks" },
   jira:       { abbr: "JR", cls: "jira",      wizard: "jira" },
   local:      { abbr: "FS", cls: "local",     wizard: "csv" },
+  // The connect wizard for this type ships separately; this entry only
+  // gives an EXISTING sharepoint connection row (however it got created) a
+  // logo/palette instead of falling back to raw initials. `local`'s palette
+  // is reused rather than adding a new one — this is a file source too.
+  sharepoint: { abbr: "SP", cls: "local",     wizard: "sharepoint" },
 };
 function _connector(type) {
   return CONNECTOR[type] || { abbr: (type || "?").slice(0, 2).toUpperCase(), cls: "local", wizard: "keboola" };
@@ -1516,7 +1541,44 @@ function _relAge(minutes) {
   return `${d} day${d === 1 ? "" : "s"} ago`;
 }
 
+/* A file source's pipeline is a DIFFERENT shape entirely — crawl → text
+   extraction + scan transcription → facts → graph (spec §13.2 "Source
+   card"), not tables/sync/feeds. Cells are plain (not links): there is no
+   monitoring page to send an admin to — "no new pages" is the point — so
+   the strip stays a verdict, and the itemized detail lives one click below
+   in the error-badge drawer (`_sharepointFactsHtml`). */
+function _sharepointPipelineStripHtml(row) {
+  const fs = (SOURCE_PIPELINES[row.id] || {}).file_source;
+  if (!fs) return "";
+  const extract = fs.extract || {};
+  const extractedTotal = Object.values(extract).reduce((a, b) => a + b, 0);
+  const extractTitle = extractedTotal
+    ? Object.entries(extract).map(([k, v]) => `${k}: ${v}`).join(" · ")
+    : "Nothing extracted yet";
+  const cost = fs.cost_estimate || { amount_usd: 0 };
+  const cells = [
+    `<div class="ds-pipe__cell">
+       <span class="ds-pipe__k">Crawl</span>
+       <span class="ds-pipe__v">${fs.crawl.documents} document${fs.crawl.documents === 1 ? "" : "s"}</span>
+     </div>`,
+    `<div class="ds-pipe__cell" title="${_esc(extractTitle)}">
+       <span class="ds-pipe__k">Extraction</span>
+       <span class="ds-pipe__v ${extractedTotal ? "" : "is-warn"}">${extractedTotal ? `${extract.indexed || 0} indexed` : "Nothing yet"}</span>
+     </div>`,
+    `<div class="ds-pipe__cell">
+       <span class="ds-pipe__k">Facts → graph</span>
+       <span class="ds-pipe__v">${fs.graph.facts} fact${fs.graph.facts === 1 ? "" : "s"} · ${fs.graph.edges} edge${fs.graph.edges === 1 ? "" : "s"}</span>
+     </div>`,
+    `<div class="ds-pipe__cell" title="Estimated from the last run's rejected/deferred queue — not a real cost model.">
+       <span class="ds-pipe__k">Queue cost</span>
+       <span class="ds-pipe__v">~$${(cost.amount_usd || 0).toFixed(2)}</span>
+     </div>`,
+  ];
+  return `<div class="ds-pipe ds-pipe--${cells.length}">${cells.join("")}</div>`;
+}
+
 function _pipelineStripHtml(row) {
+  if (row.source_type === "sharepoint") return _sharepointPipelineStripHtml(row);
   const p = SOURCE_PIPELINES[row.id];
   if (!p) return "";
   const cells = [];
@@ -1639,10 +1701,26 @@ function _pipelineStripHtml(row) {
 function _sourceHealth(row) {
   const p = SOURCE_PIPELINES[row.id];
   if (!p) return null;
+  if (row.source_type === "sharepoint") return _sharepointHealth(p.file_source);
   const s = p.sync || {}, t = p.tables || {}, f = p.feeds || {};
   if (s.errors) return { tone: "is-err", label: `${s.errors} failing sync${s.errors === 1 ? "" : "s"}` };
   if (!t.count && !t.unlinked) return { tone: "is-warn", label: "No tables yet" };
   if (!f.packages) return { tone: "is-warn", label: "Reaches nobody" };
+  return { tone: "is-ok", label: "Healthy" };
+}
+
+/* The file-source verdict has nothing to do with "tables" — its own ladder:
+   an ungranted collection (fail-closed, spec §13.1) is the worst silent
+   state, then any error in the last run, else healthy. */
+function _sharepointHealth(fs) {
+  if (!fs) return null;
+  const identity = fs.identity || {};
+  if (identity.collections_no_group) {
+    return { tone: "is-warn", label: `${identity.collections_no_group} collection${identity.collections_no_group === 1 ? "" : "s"} with no group` };
+  }
+  const lastRun = fs.last_run;
+  const errCount = lastRun ? lastRun.rejected_quotes.length + lastRun.protocol_errors.length : 0;
+  if (errCount) return { tone: "is-warn", label: `${errCount} error${errCount === 1 ? "" : "s"} in last run` };
   return { tone: "is-ok", label: "Healthy" };
 }
 
@@ -1663,6 +1741,96 @@ function _sourceSubtitle(row) {
     }
   }
   return bits.join(" · ");
+}
+
+/* File-source card body (spec §13.2 "Source card"): schedule (static text —
+   the crawl runs externally), certificate (origin + set-date, NEVER the
+   value), identity matching (fail-closed grant coverage), and error badges
+   from the LAST run report — each opens a drawer filtered to that one
+   category. `_sharepointPipelineStripHtml` above already covers the
+   crawl/extract/facts/graph counts, so this is everything ELSE on the card. */
+function _sharepointFactsHtml(row) {
+  const fs = (SOURCE_PIPELINES[row.id] || {}).file_source;
+  if (!fs) {
+    return `
+    <div class="ds-src__fact">
+      <span class="ds-src__fact-k">File source</span>
+      <span class="ds-src__fact-v">Pipeline data needs a Postgres backend (facts graph is PG-only).</span>
+    </div>`;
+  }
+
+  const cert = fs.certificate || {};
+  const certBadge = cert.error
+    ? `<span class="ds-badge badge-unset">not configured</span>`
+    : `<span class="ds-badge ${cert.origin === "vault" ? "badge-vault" : "badge-env"}">${_esc(cert.origin || "unset")}</span>`;
+  const certDetail = cert.error
+    ? _esc(cert.error)
+    : cert.origin === "vault"
+      ? (cert.set_at ? `set ${_esc(new Date(cert.set_at).toLocaleDateString())}` : "set date unknown")
+      : `env <code>${_esc(cert.env_name || "")}</code>`;
+
+  const identity = fs.identity || { groups_matched: 0, collections_no_group: 0 };
+  const identityTone = identity.collections_no_group ? "is-warn" : "";
+  const identityText = `${identity.groups_matched} group${identity.groups_matched === 1 ? "" : "s"} matched`
+    + ` · ${identity.collections_no_group} collection${identity.collections_no_group === 1 ? "" : "s"} with no group`;
+
+  const lastRun = fs.last_run;
+  const badgeDefs = [
+    ["rejected_quotes", "Rejected quotes"],
+    ["deferred", "Deferred"],
+    ["protocol_errors", "Protocol errors"],
+  ];
+  const badgesHtml = lastRun
+    ? badgeDefs.map(([key, label]) => {
+        const n = (lastRun[key] || []).length;
+        return `<button type="button" class="ds-badge ${n ? "badge-env" : "badge-unset"}" ${n ? "" : "disabled"}
+                  onclick="toggleFileSourceDrawer('${row.id}', '${key}')" title="${_esc(label)} — click to filter the drawer below">
+                  ${_esc(label)} ${n}
+                </button>`;
+      }).join(" ")
+    : `<span style="color:var(--ds-text-muted)">No ingest runs yet</span>`;
+
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Crawl runs externally — this line is a label, not live state.">Schedule</span>
+    <span class="ds-src__fact-v">${_esc(fs.schedule.text)}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Certificate</span>
+    <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Identity matching</span>
+    <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Last run</span>
+    <span class="ds-src__fact-v">${badgesHtml}</span>
+  </div>
+  <div class="ds-filesource-drawer" id="ds-fs-drawer-${row.id}" hidden></div>`;
+}
+
+/* Segmented switch: click a badge, see that category's itemized rows below
+   it; click the same one again to close. One category open at a time. */
+function toggleFileSourceDrawer(connId, category) {
+  const el = document.getElementById(`ds-fs-drawer-${connId}`);
+  if (!el) return;
+  const fs = (SOURCE_PIPELINES[connId] || {}).file_source;
+  const lastRun = fs && fs.last_run;
+  if (!lastRun) { el.hidden = true; return; }
+  if (el.dataset.category === category && !el.hidden) {
+    el.hidden = true;
+    delete el.dataset.category;
+    return;
+  }
+  const rows = lastRun[category] || [];
+  el.dataset.category = category;
+  el.hidden = false;
+  el.innerHTML = rows.length
+    ? `<ul class="ds-filesource-drawer__list">${rows.map((r) =>
+        `<li><code>${_esc(r.doc_id || "")}</code> — ${_esc(r.reason || "")}</li>`
+      ).join("")}</ul>`
+    : `<div class="ds-empty">Nothing in this category in the last run.</div>`;
 }
 
 function _connectionCardHtml(row) {
@@ -1701,6 +1869,8 @@ function _connectionCardHtml(row) {
       <span class="ds-src__fact-v">Registered against this connector, not against a stored connection.</span>
       <span class="ds-src__fact-a"><a class="btn btn-secondary" href="/admin/tables">View tables</a></span>
     </div>`
+    : row.source_type === "sharepoint"
+    ? _sharepointFactsHtml(row)
     : `
     <div class="ds-src__fact">
       <span class="ds-src__fact-k" title="Where Agnes reads this project's storage token from.">Storage token</span>

@@ -1096,6 +1096,10 @@ _EXEMPT: dict[str, str] = {
     "/api/facts/corrections": (
         "producer corrections export (spec §7.4) — scheduler-token-or-admin, no analyst CLI/MCP analogue"
     ),
+    "/api/facts/ingest-runs": (
+        "persisted ingest run reports (spec §7.2/§13.2) — admin-only, feeds the "
+        "/admin/data-sources source card, not an analyst query surface; no CLI/MCP analogue"
+    ),
 }
 
 

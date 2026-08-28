@@ -1301,6 +1301,271 @@ class TestDatabricksWizardCredentialAndRestartNotice:
         assert "_dbxSaveDone" not in handler
 
 
+class TestSharePointSourceCard:
+    """The file-source source card (`_sharepoint_pipeline_cell`, spec §13.2
+    "Source card") — DuckDB-side coverage: graceful degrade when
+    `facts_ingest_runs_repo()`/`facts_repo()` raise `RequiresPostgresBackend`
+    (A3 ratchet — every fact-graph repo is PG-only), the certificate row
+    (which needs no Postgres at all), and the "no connection yet" state.
+    Counts/badges that genuinely need a live Postgres backend are covered in
+    `tests/db_pg/test_facts_source_card_pg.py`.
+    """
+
+    def test_no_sharepoint_connection_means_no_file_source_cell(self, seeded_app):
+        """Zero new navigation, zero placeholder card — a source type with
+        no connection row simply contributes nothing extra, same as every
+        other connector that needs credentials it does not have."""
+        from app.web.router import _source_inventory
+
+        inv = _source_inventory()
+        for cells in inv["pipelines"].values():
+            assert "file_source" not in cells
+
+    def test_sharepoint_connection_degrades_gracefully_without_postgres(self, seeded_app):
+        """No Postgres backend active -> every fact-graph repo raises
+        `RequiresPostgresBackend` -> the cell still renders, with the
+        PG-dependent numbers at their honest zero/empty rather than a 500
+        for the whole page."""
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+        try:
+            inv = _source_inventory(user={"id": "admin1", "email": "admin@test.com"})
+            fs = inv["pipelines"][conn_id]["file_source"]
+            assert fs["crawl"]["documents"] == 0
+            assert fs["extract"] == {}
+            assert fs["graph"] == {"facts": 0, "edges": 0}
+            assert fs["last_run"] is None
+            assert fs["cost_estimate"] == {"amount_usd": 0.0, "placeholder": True}
+            assert fs["identity"] == {"groups_matched": 0, "collections_no_group": 0}
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_schedule_row_is_static_and_honest(self, seeded_app):
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+        try:
+            inv = _source_inventory()
+            assert inv["pipelines"][conn_id]["file_source"]["schedule"] == {"text": "external producer · hourly delta"}
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_certificate_row_reports_a_resolution_error_without_crashing(self, seeded_app):
+        """A misconfigured connection (no tenant_id/client_id) must not take
+        the whole card down — the certificate row carries the error text
+        instead, same "status row, not a gate" posture every other cell on
+        this page follows."""
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={},
+        )
+        try:
+            inv = _source_inventory()
+            cert = inv["pipelines"][conn_id]["file_source"]["certificate"]
+            assert cert["origin"] is None
+            assert cert["error"] is not None
+            assert "tenant_id" in cert["error"]
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_certificate_row_never_carries_the_value(self, seeded_app, monkeypatch):
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1", "cert_private_key_env": "SHAREPOINT_CERT_PRIVATE_KEY"},
+        )
+        monkeypatch.setenv(
+            "SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nvalue\n-----END PRIVATE KEY-----"
+        )
+        try:
+            inv = _source_inventory()
+            cert = inv["pipelines"][conn_id]["file_source"]["certificate"]
+            assert cert["origin"] == "env"
+            assert cert["env_name"] == "SHAREPOINT_CERT_PRIVATE_KEY"
+            assert "-----BEGIN PRIVATE KEY-----" not in str(cert)
+        finally:
+            source_connections_repo().delete(conn_id)
+
+
+class TestSharePointSourceCardRendering:
+    """`_sharepointPipelineStripHtml` / `_sharepointFactsHtml` /
+    `toggleFileSourceDrawer` executed for real via `node` against a seeded
+    `SOURCE_PIPELINES` fixture — proves the RENDERED markup (counts, badge
+    counts, drawer content), not just the server-side data shape
+    `TestSharePointSourceCard` above pins. Same pattern as
+    `TestImportKeboolaConnectionBehavior`.
+    """
+
+    _FILE_SOURCE = {
+        "crawl": {"documents": 12},
+        "extract": {"indexed": 9, "processing": 2, "needs_review": 1},
+        "graph": {"facts": 7, "edges": 3},
+        "cost_estimate": {"amount_usd": 0.06, "placeholder": True},
+        "schedule": {"text": "external producer · hourly delta"},
+        "certificate": {"origin": "vault", "env_name": None, "set_at": "2026-08-20T12:00:00+00:00", "error": None},
+        "identity": {"groups_matched": 2, "collections_no_group": 1},
+        "last_run": {
+            "id": "ir_abc123",
+            "created_at": "2026-08-27T10:00:00+00:00",
+            "rejected_quotes": [{"row": 0, "reason": "verbatim_gate_failed", "doc_id": "doc-a"}],
+            "deferred": [{"row": 1, "doc_id": "doc-b"}],
+            "protocol_errors": [
+                {"row": 2, "reason": "unresolved_doc_id", "doc_id": "doc-c"},
+                {"row": 3, "reason": "malformed_edge"},
+            ],
+        },
+    }
+
+    @staticmethod
+    def _extract_function(tpl: str, signature: str) -> str:
+        start = tpl.index(signature)
+        depth = 0
+        started = False
+        for i in range(start, len(tpl)):
+            ch = tpl[i]
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return tpl[start : i + 1]
+        raise AssertionError(f"unbalanced braces extracting {signature!r}")
+
+    def _run(self, body: str, *, file_source=None) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _sharepointPipelineStripHtml(row) {",
+                "function _sharepointFactsHtml(row) {",
+                "function toggleFileSourceDrawer(connId, category) {",
+            )
+        )
+        fs = file_source if file_source is not None else self._FILE_SOURCE
+        script = f"""
+{fns}
+
+const SOURCE_PIPELINES = {{ "sp-conn-1": {{ file_source: {json.dumps(fs)} }} }};
+const _elements = {{ "ds-fs-drawer-sp-conn-1": {{ dataset: {{}}, hidden: true, innerHTML: "" }} }};
+const document = {{ getElementById: (id) => _elements[id] }};
+const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
+
+{body}
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_pipeline_strip_renders_the_four_stage_counts(self):
+        result = self._run("console.log(JSON.stringify({ html: _sharepointPipelineStripHtml(row) }));")
+        html = result["html"]
+        assert "12 documents" in html
+        assert "9 indexed" in html
+        assert "7 facts · 3 edges" in html
+        assert "~$0.06" in html
+
+    def test_facts_html_renders_certificate_identity_and_badge_counts(self):
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert "external producer · hourly delta" in html
+        assert "vault" in html
+        # Never the certificate value, only origin/set-date.
+        assert "BEGIN PRIVATE KEY" not in html
+        assert "2 groups matched" in html
+        assert "1 collection with no group" in html
+        assert "Rejected quotes 1" in html
+        assert "Deferred 1" in html
+        assert "Protocol errors 2" in html
+
+    def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
+        result = self._run(
+            """
+            toggleFileSourceDrawer("sp-conn-1", "rejected_quotes");
+            const afterOpen = { ..._elements["ds-fs-drawer-sp-conn-1"] };
+            toggleFileSourceDrawer("sp-conn-1", "rejected_quotes");
+            const afterToggleClose = { ..._elements["ds-fs-drawer-sp-conn-1"] };
+            toggleFileSourceDrawer("sp-conn-1", "protocol_errors");
+            const afterSwitch = { ..._elements["ds-fs-drawer-sp-conn-1"] };
+            console.log(JSON.stringify({ afterOpen, afterToggleClose, afterSwitch }));
+            """
+        )
+        after_open = result["afterOpen"]
+        assert after_open["hidden"] is False
+        assert "doc-a" in after_open["innerHTML"]
+        assert "verbatim_gate_failed" in after_open["innerHTML"]
+        assert "doc-c" not in after_open["innerHTML"]
+
+        assert result["afterToggleClose"]["hidden"] is True
+
+        after_switch = result["afterSwitch"]
+        assert after_switch["hidden"] is False
+        assert "doc-c" in after_switch["innerHTML"]
+        assert "unresolved_doc_id" in after_switch["innerHTML"]
+        assert "doc-a" not in after_switch["innerHTML"]
+
+    def test_drawer_reports_empty_category_honestly(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["deferred"] = []
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "deferred"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        assert "Nothing in this category" in result["innerHTML"]
+
+
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
     """`_registerErrorText` output goes to `textContent`, so it must not be
     `_esc`'d first.

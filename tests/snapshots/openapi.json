@@ -35488,7 +35488,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -35549,6 +35549,76 @@
           }
         },
         "summary": "Facts Ingest",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/ingest-runs": {
+      "get": {
+        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.",
+        "operationId": "list_ingest_runs_api_facts_ingest_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Ingest Runs Api Facts Ingest Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Ingest Runs",
         "tags": [
           "facts"
         ]
