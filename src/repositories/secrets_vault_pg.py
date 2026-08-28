@@ -312,3 +312,12 @@ class ConnectionSecretsPgRepository:
                 {"connection_id": connection_id},
             ).fetchone()
         return row is not None
+
+    def updated_at(self, connection_id: str) -> Optional[str]:
+        """See ``app.secrets_vault.ConnectionSecretsRepository.updated_at``."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT updated_at FROM connection_secrets WHERE connection_id = :connection_id"),
+                {"connection_id": connection_id},
+            ).fetchone()
+        return str(row[0]) if row and row[0] is not None else None

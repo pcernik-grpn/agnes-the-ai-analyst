@@ -1142,6 +1142,71 @@ source lands with **no** `tool_grants`, so nothing is exposed until an admin
 grants the tools to a group. CLI: `agnes admin connection chat-tools [--disable]`.
 Deliberately not MCP-exposed (credential-provisioning exemption, `CONTRIBUTING.md`).
 
+### `/api/admin/sharepoint/connections/{connection_id}` — SharePoint connect wizard (spec 2026-08-27 §13.2)
+
+Admin-only surface behind the "connect → scope → share" file-source wizard on
+`/admin/data-sources`. The SharePoint connection itself is an ordinary
+`source_type=sharepoint` row through `/api/admin/source-connections` (tenant/
+client id, certificate via vault secret or `config.cert_private_key_env`);
+these three routes are the wizard's own steps 2/3.
+
+- /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/scopes
+- /api/admin/sharepoint/connections/{connection_id}/corpus-map
+
+`GET …/tree` browses the live Microsoft Graph folder tree one level per call
+(no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
+libraries; both → the drive's root children) using the connection's resolved
+certificate. A missing/unresolvable certificate is a typed `409
+sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
+rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+
+`GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
+site/library/folder, stored as `{source_scope_id, display_path, anonymize,
+collection_id}` inside the connection's own `config.scopes` (no new table).
+`POST` confirms a scope: creates its collection on first confirmation and
+reuses the same collection on every re-confirmation of the same
+`source_scope_id` (idempotent — a rename/move in the source updates
+`display_path` in place rather than forking a second collection), and
+optionally applies group grants (ordinary `resource_grants` rows on the
+collection — never duplicated onto the scope row itself). The response's
+`no_group_warning` flags a collection with no granted group ("indexed but
+invisible"). `DELETE` (`?source_scope_id=`) unselects a scope — an explicit
+exclusion — without touching its already-created collection.
+
+`GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
+collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
+crawling moves inside Agnes.
+
+Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
+document surface is `agnes facts …`.
+
+### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
+
+Admin-only, behind the `facts` feature flag. The builder shell on
+`/admin/ontology` authors the entity/relationship types the fact graph
+extracts against. Everything fills an **unsaved draft**; only `save`
+materializes it — conversation and import never apply on their own.
+
+- /api/admin/ontology/drafts
+- /api/admin/ontology/drafts/{draft_id}
+- /api/admin/ontology/drafts/{draft_id}/import
+- /api/admin/ontology/drafts/{draft_id}/save
+- /api/admin/ontology/dry-run
+
+`POST/GET /drafts` create and list drafts; `GET/PUT/DELETE /drafts/{id}` read,
+edit and discard one. `POST …/import` translates a pasted or uploaded
+ontology (the producer's YAML) into the draft, reporting the leftovers the
+translator could not place structurally (mirrors the allowlisted
+`/api/admin/metrics/import`). `POST …/save` validates the frozen draft against
+the vendored Ossie schema and materializes it into a semantic model through
+the same path `agnes admin semantic-model import` uses. `POST /dry-run` runs
+the draft's current types over one selected document through the server-side
+LLM and returns proposed facts/edges plus a **not-captured** block; it is a
+typed `501` when no LLM provider is configured. Admin-only authoring with no
+analyst CLI/MCP analogue (the ontology is consumed as a semantic model, which
+has its own surface).
+
 ### `/api/admin/contributed-skills` — Contributed skill management
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.
@@ -1455,10 +1520,20 @@ unresolved ids itemized. Corrections management
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
 
+Every successful ingest batch also persists a copy of its run report to
+`facts_ingest_runs` — written AFTER the ingest transaction commits, so a
+report-write failure never rolls back or fails the ingest itself (see
+`app/api/facts.py::facts_ingest`). `GET /api/facts/ingest-runs?limit=`
+(admin, default `20`, max `200`) lists them newest-first: this is what the
+`/admin/data-sources` source card (spec §13.2) reads for its pipeline-strip
+counts and per-category error badges — an admin-only, UI-internal surface,
+not an analyst query (no CLI/MCP analogue).
+
 - /api/facts/search
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
+- /api/facts/ingest-runs
 - /api/facts/corrections
 - /api/facts/corrections/{subject_kind}/{subject_id}
 

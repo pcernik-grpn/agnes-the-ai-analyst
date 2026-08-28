@@ -6,6 +6,14 @@ docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md §3
 for the schema rationale and §5 for why every read goes through
 ``src/repositories/facts_pg.py``'s single shared visibility helper rather
 than through these models directly.
+
+``IngestRun`` (mirrors ``migrations/versions/0077_facts_ingest_runs.py``) is
+a separate concern — one row per ``POST /api/facts/ingest`` batch, the
+persisted run report the source card (spec §13.2) reads its pipeline counts
+and error badges from. Written by ``src/repositories/facts_ingest_runs_pg.py``,
+a distinct PG-only repository, AFTER ``facts_repo().ingest_batch()``
+commits — see ``app/api/facts.py::facts_ingest`` for why that write is
+deliberately outside the ingest transaction.
 """
 
 from __future__ import annotations
@@ -125,3 +133,35 @@ class Correction(Base):
     decided_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
     )
+
+
+class IngestRun(Base):
+    """One persisted run report per ``POST /api/facts/ingest`` batch (spec
+    §7.2's response shape, §13.2's source-card pipeline strip + error
+    badges).
+
+    ``claims_rejected_count`` is a plain integer alongside the
+    ``claims_rejected`` JSONB detail list so the card's pipeline-strip cost
+    placeholder and badge counts never have to decode JSONB just to sum —
+    every OTHER list field (``deferred``, ``review_items``) has no separate
+    count column because nothing on the card needs to aggregate across many
+    runs' worth of them, only itemize the single latest one.
+    """
+
+    __tablename__ = "facts_ingest_runs"
+    __table_args__ = (sa.Index("idx_facts_ingest_runs_created_at", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
+    )
+    corpus_ids: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    caller: Mapped[str] = mapped_column(String, nullable=False)
+    documents_seen: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    claims_written: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    claims_rejected_count: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    claims_rejected: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    deferred: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    subjects_created: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    subjects_deleted: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    review_items: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
