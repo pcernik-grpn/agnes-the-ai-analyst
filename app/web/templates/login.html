@@ -168,6 +168,7 @@
                     'microsoft_oauth_failed': "Microsoft sign-in failed. Please try again.",
                     'microsoft_no_email': "Microsoft didn't return an email for this account.",
                     'microsoft_not_configured': "Microsoft sign-in is not configured on this server.",
+                    'microsoft_not_in_allowed_group': "Your Microsoft account isn't a member of any Entra ID group permitted to use this " ~ (instance_brand or "Agnes") ~ " instance. Ask your " ~ (instance_brand or "Agnes") ~ " administrator to grant you access.",
                     'keboola_not_permitted': "Your Keboola token or project role is not permitted to sign in here. Contact your " ~ (instance_brand or "Agnes") ~ " administrator.",
                     'keboola_oauth_not_master': "Keboola sign-in was refused: the session Keboola issued did not verify as a master token, which is unexpected for an interactive login. Please report this to your " ~ (instance_brand or "Agnes") ~ " administrator.",
                     'keboola_project_mismatch': "Your Keboola session belongs to a different project than this instance. Retry and pick project " ~ (keboola_expected_project or "configured for this instance") ~ " on the Keboola sign-in screen.",
