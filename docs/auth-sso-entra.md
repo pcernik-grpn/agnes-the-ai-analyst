@@ -42,13 +42,17 @@ Assignment:    on the app's Enterprise Application, set Properties →
                unassigned users — any account in the tenant could
                authenticate (Agnes's domain allowlist still applies, but
                the tenant-side gate would be open)
-Consent:       optional but recommended — grant admin consent once for the
-               organization (Enterprise applications → Permissions →
-               "Grant admin consent for <tenant>"). The scopes above need
-               no admin approval to work; without the grant every user
-               simply clicks through a consent prompt on their first
-               sign-in. Requires Privileged Role Administrator or Global
-               Administrator — an Application Developer cannot do it
+Consent:       grant admin consent once for the organization (Enterprise
+               applications → Permissions → "Grant admin consent for
+               <tenant>"). Do this even though the scopes above are not
+               admin-restricted: without the grant, first sign-in either
+               shows every user a consent prompt (default policy) or
+               fails outright (tenants that disable user consent), and
+               Entra requires administrator consent regardless of policy
+               once "Assignment required" is on — which the line above
+               asks for. Application Administrator or Cloud Application
+               Administrator suffices for these delegated scopes;
+               Application Developer does not
 ```
 
 **Customer IdP admin → you** (entered into the admin panel or `agnes admin sso set`):
@@ -61,13 +65,16 @@ Consent:       optional but recommended — grant admin consent once for the
 - **Client secret value** + its expiry date (calendar the rotation — an
   expired secret surfaces as `/login?error=sso_oauth_failed` only).
 - **The email domain(s) to permit** — the customer's own domains only. See
-  the trust model below; this list is the whole game. What matters is the
-  domain the tenant actually puts in the `email` claim, which is not
-  necessarily the organization's public domain — a tenant that has never
-  had its vanity domain verified asserts `<user>@<tenant>.onmicrosoft.com`.
-  Guessing it from the customer's website or from the address you exchange
-  mail with fails closed as `domain_not_allowed`; the test sign-in in step 4
-  below prints the resolved email, so run it before you settle the list.
+  the trust model below; this list is the whole game. The domain is taken
+  from the identity Agnes *resolves* — the `email` claim when the token
+  carries one, otherwise a mail-shaped `preferred_username`
+  (`resolve_identity`, shared with the `microsoft` provider) — and that
+  address need not sit on the organization's public domain: a tenant
+  without a verified vanity domain typically asserts
+  `<user>@<tenant>.onmicrosoft.com`. Deriving the list from the customer's
+  website, or from the address you exchange mail with, fails closed as
+  `domain_not_allowed`. The test sign-in in step 4 below prints the
+  resolved identity, so run it before you settle the list.
 
 ## Configure, prove, enable
 
