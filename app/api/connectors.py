@@ -188,8 +188,7 @@ async def get_connector_prompt(
             detail={
                 "kind": "unknown_connector",
                 "hint": (
-                    f"No connector named {slug!r} on this instance. "
-                    "Run `agnes connectors list` to see what is available."
+                    f"No connector named {slug!r} on this instance. Run `agnes tools list` to see what is available."
                 ),
             },
         )

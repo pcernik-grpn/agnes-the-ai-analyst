@@ -68,7 +68,9 @@ admin_app.add_typer(
 )
 admin_app.add_typer(admin_mcp_app, name="mcp", help="Universal MCP source + tool admin")
 admin_app.add_typer(admin_semantic_layer_app, name="semantic-layer", help="Keboola semantic-layer import status")
-admin_app.add_typer(admin_semantic_model_app, name="semantic-model", help="Semantic-model CRUD (Ossie documents)")
+admin_app.add_typer(
+    admin_semantic_model_app, name="semantic-model", help="Semantic-model CRUD (semantic model documents)"
+)
 admin_app.add_typer(admin_semantic_source_app, name="semantic-source", help="Semantic-source sync configuration")
 admin_app.add_typer(
     admin_connection_app, name="connection", help="Named source-connection CRUD (multi-project Keboola)"
