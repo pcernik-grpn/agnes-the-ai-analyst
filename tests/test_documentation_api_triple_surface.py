@@ -402,6 +402,15 @@ _SEMANTIC_MODELS_ADMIN_REASON = (
     "above), not the admin corpus-management surface, mirroring the "
     "/api/admin/data-packages and /api/admin/metrics admin-CRUD precedent."
 )
+_SEMANTIC_MODEL_PACKAGE_LINK_REASON = (
+    "admin junction management between a semantic model and a Data Package "
+    "(open semantic-layer contract) — linking/unlinking is the "
+    "administrative visibility control the module docstring describes ('a "
+    "model with no linked package is reachable by admins only'), same tier "
+    "as the rest of the admin CRUD above. Reachable via `agnes admin "
+    "semantic-model link-package/unlink-package`; no MCP analogue by "
+    "design, mirroring _SEMANTIC_MODELS_ADMIN_REASON above."
+)
 _SEMANTIC_SOURCES_ADMIN_REASON = (
     "admin CRUD + manual sync-trigger over registered semantic-layer sync "
     "sources (git/upload/connection), open semantic-layer contract Task 10 "
@@ -897,6 +906,8 @@ _EXEMPT: dict[str, str] = {
     # no MCP analogue for the same reason the rest of this row has none.
     "/api/admin/semantic-models/{model_id}/detach": _SEMANTIC_MODELS_ADMIN_REASON,
     "/api/admin/semantic-models/{model_id}/reattach": _SEMANTIC_MODELS_ADMIN_REASON,
+    "/api/admin/semantic-models/{slug}/packages": _SEMANTIC_MODEL_PACKAGE_LINK_REASON,
+    "/api/admin/semantic-models/{slug}/packages/{package_id}": _SEMANTIC_MODEL_PACKAGE_LINK_REASON,
     "/api/admin/semantic-sources": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/admin/semantic-sources/{source_id}": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/admin/semantic-sources/{source_id}/sync": _SEMANTIC_SOURCES_ADMIN_REASON,

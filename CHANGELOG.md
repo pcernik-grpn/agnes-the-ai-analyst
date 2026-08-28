@@ -12,6 +12,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 - **Semantic-layer detach & re-attach (F3), Postgres app-state only (post-A3).** `POST /api/admin/semantic-models/{id}/detach` lets an admin fix a source-owned model that's wrong at the source: the flat `409 source_owned` guard now exempts a detached row, so the client edits it directly (`PUT`, or the existing `/apply` path) without a sync silently reverting the fix. Sync stops overwriting a detached row but keeps tracking drift — `source_content_hash` parks the latest hash seen from the source, and `source_missing_since` distinguishes "source changed since you detached" from "source stopped sending this slug entirely" (the two-column split closes a real gap: a detached row would otherwise have silently vanished on the next prune). Sync also stops re-projecting the source's version of a detached model into the flat tables `agnes catalog --metrics`, chat and search read — both writers key those rows on the model's `(source, source_ref)`, which a detached row keeps, so the admin's local edit owns that projection from detach onward instead of being overwritten on every tick. `POST .../reattach` returns to the sync path — without `confirm_reattach=true` it 400s with a staleness preview instead of acting, and 409s `source_gone` if the source no longer has the slug at all. Export of a detached model works unchanged, surfaced next to the new "Detach to edit"/"Re-attach" buttons on `/semantic-layer/{slug}`. CLI: `agnes admin semantic-model detach|reattach <id>`. On a DuckDB-backed instance (the app-state ladder is frozen at A3), both actions fail clean with a typed `501` rather than crash — the six new columns and the two repo methods backing them exist in Postgres only.
+
+- **An admin can link/unlink a semantic model to a Data Package.** The
+  `link_package`/`unlink_package` repository methods existed since the open
+  semantic-layer contract shipped but had no admin-reachable surface — a
+  model with no linked package is admin-only (per
+  `app/api/semantic_models.py`'s own RBAC rule), and there was no way to
+  change that short of hand-editing the database. `POST
+  /api/admin/semantic-models/{slug}/packages` and `DELETE
+  .../packages/{package_id}` close that gap, alongside `agnes admin
+  semantic-model link-package/unlink-package`. Not gated by the existing
+  ownership rule (source-owned models can be linked too) — the link lives
+  in the junction table, not the document a re-sync would rewrite.
+
 - **A hosted data app's description can be edited after it is created.**
   `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
   not_managed`, so a hosted app's description was write-once: `POST

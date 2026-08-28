@@ -240,6 +240,155 @@ class TestSemanticModelCrud:
         )
 
 
+class TestPackageLinking:
+    """`POST/DELETE /api/admin/semantic-models/{slug}/packages[/{package_id}]`
+    — the admin surface over the `link_package`/`unlink_package`/
+    `list_packages_for_model` repo methods, which previously had no caller
+    outside tests (see the module docstring's "A model with no linked
+    package is reachable by admins only")."""
+
+    def test_link_package_returns_the_updated_package_list(self, seeded_app):
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+
+        r = c.post(
+            f"/api/admin/semantic-models/{model['slug']}/packages",
+            json={"package_id": pkg_id},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["package_ids"] == [pkg_id]
+
+    def test_relinking_the_same_package_is_idempotent(self, seeded_app):
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+
+        for _ in range(2):
+            r = c.post(
+                f"/api/admin/semantic-models/{model['slug']}/packages",
+                json={"package_id": pkg_id},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            assert r.status_code == 200
+            assert r.json()["package_ids"] == [pkg_id]
+
+    def test_unlink_package_returns_the_updated_package_list(self, seeded_app):
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+        c.post(
+            f"/api/admin/semantic-models/{model['slug']}/packages",
+            json={"package_id": pkg_id},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        r = c.delete(
+            f"/api/admin/semantic-models/{model['slug']}/packages/{pkg_id}",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["package_ids"] == []
+
+    def test_unlink_is_idempotent_on_an_already_unlinked_pair(self, seeded_app):
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+
+        r = c.delete(
+            f"/api/admin/semantic-models/{model['slug']}/packages/{pkg_id}",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert r.json()["package_ids"] == []
+
+    def test_linking_a_nonexistent_package_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+
+        r = c.post(
+            f"/api/admin/semantic-models/{model['slug']}/packages",
+            json={"package_id": "nope"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_linking_a_nonexistent_model_slug_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        pkg_id = _make_package()
+        r = c.post(
+            "/api/admin/semantic-models/nope/packages",
+            json={"package_id": pkg_id},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_unlinking_from_a_nonexistent_model_slug_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        pkg_id = _make_package()
+        r = c.delete(
+            f"/api/admin/semantic-models/nope/packages/{pkg_id}",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_a_source_owned_model_can_still_be_linked(self, seeded_app, git_backed_model):
+        """Linking is not a content edit gated by the ownership rule — the
+        junction lives outside the document/row a re-sync would rewrite."""
+        c = seeded_app["client"]
+        pkg_id = _make_package()
+        r = c.post(
+            f"/api/admin/semantic-models/{git_backed_model['slug']}/packages",
+            json={"package_id": pkg_id},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["package_ids"] == [pkg_id]
+
+    def test_non_admin_cannot_link_or_unlink(self, seeded_app):
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+
+        r = c.post(
+            f"/api/admin/semantic-models/{model['slug']}/packages",
+            json={"package_id": pkg_id},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+        r = c.delete(
+            f"/api/admin/semantic-models/{model['slug']}/packages/{pkg_id}",
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+
 class TestSemanticSourceCrud:
     def test_create_list_get_update_delete(self, seeded_app):
         c = seeded_app["client"]
