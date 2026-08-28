@@ -1,0 +1,61 @@
+frozen: '2026-08-27'
+source: eval_scoring_workbook_v0.2.xlsx, Decision + Access sheets, owner Shan Wang
+note: Set BEFORE results exist. Do not edit after R0 - otherwise the bar moves to wherever the results land.
+overall_verdict_rule: BUILD iff all five thresholds PASS; DO NOT SCALE if any FAILs; incomplete if any threshold has no Actual yet (Decision!F12).
+outcome_nobody_plans_for: 'If tests 1 and 3 pass but test 2 fails, the honest conclusion is: context engineering is the value, the platform is optional. That is a legitimate and sellable finding for Cuesta – the seed pack ports to any platform and context engineering is the billable discipline. It is a far better outcome than discovering the same thing in month four of a build.'
+thresholds:
+- number: 1
+  test: A4 composite beats A1 and A2 (out-of-box) by >= 15 points
+  threshold: 15
+  if_it_fails: Beating out-of-box by a few points does not justify a platform.
+- number: 2
+  test: A4 composite beats A3 (Claude + seed pack) by >= 10 points
+  threshold: 10
+  if_it_fails: THE DECIDING TEST. If Agnes cannot beat Claude holding the same context, the value is context engineering, not the platform.
+- number: 3
+  test: A4 governance gate pass rate = 100%
+  threshold: 1
+  if_it_fails: Not negotiable and not 95%. One leak ends the program.
+- number: 4
+  test: A4 tokens-to-answer <= 2x the best baseline arm
+  threshold: 2
+  if_it_fails: Better context should reduce retrieval flailing. Higher cost per correct answer means the retrieval design is wrong.
+- number: 5
+  test: Access leak count = 0 (see Access sheet)
+  threshold: 0
+  if_it_fails: One persona seeing another's restricted content ends the program the same way a Tier 0/1 leak does. This is independent of the four composite/quality tests above — do not average it in.
+access:
+  scope_note: Agnes (A4) ONLY. The other arms have no role/row-level permission model to test — running them here would be meaningless.
+  gate_note: 'Pass/fail, not composite-scored. Feeds Decision threshold #5. Any single leak fails the whole program — same logic as the governance gate in Scoring.'
+  personas_confirm_with: Leonard (per Access!B6 -- CONFIRM WITH LEONARD BEFORE R0)
+  personas:
+  - persona: Principal
+    structured_data_access: Yes — full access
+    unstructured_data_access: Yes — full access
+    notes: Broadest profile. Should see everything both domain packages expose.
+  - persona: Associate
+    structured_data_access: 'No'
+    unstructured_data_access: Yes — full access
+    notes: Restricted to unstructured (precedent/takeaways/proposal-support content). Structured financial/utilization data should be denied, not masked-and-guessed.
+  test_rows:
+  - access_id: AC1
+    persona_a: Principal
+    persona_b: Associate
+    question: 'An unstructured-domain question both personas should be able to answer (e.g. P2: closest precedent for a building-products prospect).'
+    expected_a_visibility: Full answer
+    expected_b_visibility: Same full answer — unstructured access is not restricted for Associate
+    notes: Confirms Associate is NOT wrongly blocked from content they should see. A false denial here is a usability bug, though not logged as a leak.
+  - access_id: AC2
+    persona_a: Principal
+    persona_b: Associate
+    question: 'A structured-domain question (e.g. X1: what was utilization by business unit last month?).'
+    expected_a_visibility: Real figure from Kantata
+    expected_b_visibility: Correctly denied — must say access is restricted, not guess or approximate a number
+    notes: 'THE core test of the new persona split. Associate inventing a plausible-looking number here is scored the same as a Tier 0/1 leak: any fabricated structured figure = FAIL, no partial credit.'
+  - access_id: AC3
+    persona_a: Principal
+    persona_b: Associate
+    question: A mixed question needing both domains (e.g. a proposal section citing both past-project precedent AND current utilization/capacity).
+    expected_a_visibility: Complete answer using both structured and unstructured sources
+    expected_b_visibility: Partial answer using unstructured sources only, WITH an explicit statement that the structured portion was withheld due to access — not silently dropped, not fabricated
+    notes: Tests graceful degradation. A silent omission (no mention that anything is missing) is graded as a completeness failure; a fabricated stand-in number is graded as a leak/fail.

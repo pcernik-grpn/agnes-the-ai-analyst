@@ -28,27 +28,44 @@ Scope and posture:
   ``application/octet-stream`` so a crafted file cannot become same-origin
   markup. Mirrors the collections raw-file posture
   (``app/api/collections.py``).
-- **Remote engines degrade to empty, not errors.** A session whose sandbox
-  ran on a remote turn engine has no local files; the listing is empty
-  rather than a failure (the files live in the remote sandbox, which is a
-  provider-side gap, not a caller error).
+- **Provider-gated.** The host walk above is only correct for providers
+  whose sandbox works directly on the host session dir (``docker``). Under
+  ``chat.provider: kai-agent`` — the default — the agent runs in the
+  engine's own remote sandbox and its files never land on this host, while
+  the host session dir still exists and holds nothing but workspace-template
+  symlinks (``prepare_session_dir`` runs for every provider). Walking it
+  would list hundreds of template files that are not session output, so
+  engine-backed sessions never touch the host walk: they answer with
+  ``source="engine"`` and either the engine's actual sandbox files (proxied
+  via ``app.chat.kai_engine_files``) or ``supported=false`` when the engine
+  exposes no files channel for the chat.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from app.auth.access import require_resource_access
-from app.chat.workdir import _safe_email_dir
+from app.chat.kai_engine_files import (
+    EngineFilesUnavailable,
+    EngineFileTooLarge,
+    fetch_engine_file_bytes,
+    fetch_engine_listing,
+    open_engine_download,
+)
+from app.chat.workdir import WORKSPACE_LINK_ENTRIES, _safe_email_dir
 from app.resource_types import ResourceType
 from app.utils import get_data_dir
 
@@ -64,11 +81,30 @@ require_chat_access = require_resource_access(ResourceType.CHAT, "chat")
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Directory names never descended into during the listing walk. The
-#: ``.claude`` tree is deliberately NOT excluded — the #1611 repro wrote its
-#: deliverables into ``.claude/skills/<name>/`` — so the walk only skips
-#: unambiguous machine noise.
+#: Directory names never descended into during the listing walk — unambiguous
+#: machine noise, at any depth.
 _SKIP_DIR_NAMES = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"})
+
+#: Top-level entries that are the WORKSPACE TEMPLATE, not session output.
+#: ``WorkdirManager.prepare_session_dir`` symlinks these into every session
+#: dir for every provider, so walking them listed the operator's bundled
+#: skills, hooks and scaffolds as if the agent had just produced them — on a
+#: real conversation the deliverable was buried under dozens of
+#: ``scaffolds/nodejs-dashboard/...`` rows. Excluded at the TOP LEVEL only:
+#: the exclusion is about "this tree came from the template", not about the
+#: name, so a directory the agent itself creates deeper in the session dir is
+#: unaffected.
+#:
+#: This also aligns the two sources: the engine's own sandbox browser filters
+#: dot-directories for the same reason, so a deliverable under ``.claude/``
+#: was never going to be reachable there either. The workspace prompt now
+#: tells the agent to write deliverables to ``outputs/`` instead.
+_TEMPLATE_ENTRIES = frozenset(WORKSPACE_LINK_ENTRIES)
+
+#: Deliverables live here by convention (the workspace prompt says so, and the
+#: agent-API harvest scans the same directory). Sorted ahead of everything
+#: else so the thing the user asked for is never below incidental scratch.
+_OUTPUTS_PREFIX = "outputs/"
 
 #: Hard ceiling on files examined per listing — a runaway tree (a vendored
 #: dependency, an extracted archive) stops here instead of stat-ing forever.
@@ -94,6 +130,67 @@ _ACTIVE_CONTENT_TYPES = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Provider gating
+# ---------------------------------------------------------------------------
+
+#: Providers whose sessions run in a remote engine sandbox: their files are
+#: never on this host, so the routes below must not walk the host session dir
+#: for them. Mirrors the provider-branching resolver pattern of
+#: ``app.chat.skills_catalog.marketplace_delivery``.
+_ENGINE_SANDBOX_PROVIDERS = frozenset({"kai-agent"})
+
+
+def _files_source(chat_config: object) -> str:
+    """``"host"`` or ``"engine"`` — where this instance's session files live.
+
+    Defensive ``getattr`` on purpose: a config double without ``provider``
+    (and a MagicMock-style object) must resolve to the local, no-outbound-HTTP
+    host path — the same duck-typed-double rule the provider capability flags
+    follow (see tests/test_kai_engine_provider.py).
+    """
+    provider = str(getattr(chat_config, "provider", "") or "").strip().lower()
+    return "engine" if provider in _ENGINE_SANDBOX_PROVIDERS else "host"
+
+
+def _chat_config(request: Request):
+    """One definition of "the chat config", shared with the skills catalog."""
+    from app.api.chat import _chat_config_for_delivery
+
+    return _chat_config_for_delivery(request)
+
+
+#: Test seam: swaps the engine HTTP transport (httpx.ASGITransport onto the
+#: stub app / MockTransport) — same injection idea as KaiEngineProvider's
+#: ``transport=`` constructor arg, adapted to a module without a constructor.
+_ENGINE_TRANSPORT: httpx.AsyncBaseTransport | None = None
+
+#: Hard ceiling on one proxied engine download. The engine enforces its own
+#: (smaller) cap; this bounds the proxy even against a misbehaving engine.
+_MAX_PROXY_DOWNLOAD_BYTES = 100 * 1024 * 1024
+
+
+def _engine_base_url(chat_config: object) -> str:
+    url = str(getattr(chat_config, "kai_agent_url", "") or "").strip()
+    if not url:
+        # provider says kai-agent but no engine URL — operator misconfig.
+        raise _engine_unavailable_502()
+    return url
+
+
+def _engine_unavailable_502() -> HTTPException:
+    return HTTPException(status_code=502, detail={"kind": "engine_files_unavailable"})
+
+
+async def _engine_token(user: dict, chat_id: str) -> str:
+    """Session JWT for the engine calls — the provider's own mint, off-loop
+    (it is synchronous and does a repo write; its 503 propagates as-is)."""
+    from app.api.kai import mint_engine_session_token
+
+    token, _expires = await asyncio.to_thread(mint_engine_session_token, user["email"], chat_id)
+    return token
+
+
+# ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
 
@@ -102,12 +199,19 @@ class SessionFileEntry(BaseModel):
     path: str
     name: str
     size_bytes: int
-    modified_at: str
+    # Engine listings carry no mtime, so the field is optional there.
+    modified_at: str | None = None
 
 
 class SessionFilesResponse(BaseModel):
     files: list[SessionFileEntry]
     truncated: bool
+    #: Where the listing came from: "host" (docker session dir) or "engine"
+    #: (the kai-agent engine's remote sandbox).
+    source: str = "host"
+    #: False when the session's files live in an engine sandbox the connected
+    #: engine does not expose (no files channel for this chat).
+    supported: bool = True
 
 
 class SaveArtefactBody(BaseModel):
@@ -192,7 +296,14 @@ def _resolve_file_or_404(email: str, chat_id: str, rel_path: str) -> Path:
 
 def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
     """Collect files reachable from the session dir (symlinks followed while
-    they stay inside the containment bases), newest-first, capped."""
+    they stay inside the containment bases), deliverables first, capped.
+
+    The workspace-template trees (``_TEMPLATE_ENTRIES``) are excluded at the
+    top level — they are the operator's bundled skills/scaffolds, present in
+    every session for every provider, and listing them buried the actual
+    deliverable. Within what remains, ``outputs/`` sorts ahead of everything
+    else and the rest is newest-first.
+    """
     sdir = _session_dir(email, chat_id)
     if not sdir.is_dir():
         return [], False
@@ -207,9 +318,10 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
         root_path = Path(root)
         # Prune in-place: skip noise dirs, dirs escaping containment, and
         # already-visited real dirs (symlink cycle guard).
+        at_top = root_path == sdir
         kept_dirs = []
         for d in sorted(dirs):
-            if d in _SKIP_DIR_NAMES:
+            if d in _SKIP_DIR_NAMES or (at_top and d in _TEMPLATE_ENTRIES):
                 continue
             try:
                 real = (root_path / d).resolve()
@@ -225,6 +337,8 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
             if scanned >= _MAX_SCAN_FILES:
                 truncated = True
                 break
+            if at_top and fname in _TEMPLATE_ENTRIES:
+                continue
             scanned += 1
             fpath = root_path / fname
             try:
@@ -242,14 +356,15 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
                         "path": rel.replace(os.sep, "/"),
                         "name": fname,
                         "size_bytes": st.st_size,
-                        "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                        "modified_at": datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat(),
                     },
                 )
             )
         if truncated:
             break
 
-    collected.sort(key=lambda item: item[0], reverse=True)
+    # Deliverables first, then newest-first within each group.
+    collected.sort(key=lambda item: (not item[1]["path"].startswith(_OUTPUTS_PREFIX), -item[0]))
     if len(collected) > _MAX_LIST_FILES:
         truncated = True
     return [entry for _, entry in collected[:_MAX_LIST_FILES]], truncated
@@ -293,12 +408,45 @@ async def list_session_files(
     into your workspace, where skills write their deliverables), skipping
     machine noise (``.git``, ``__pycache__``, …) and anything resolving
     outside your own session/workspace. Returns at most 300 entries sorted
-    by modification time; ``truncated`` reports when more existed. A session
-    whose sandbox ran remotely has no local files and lists empty.
+    by modification time; ``truncated`` reports when more existed. Sessions
+    on an engine-sandbox provider (``kai-agent``) never walk the host dir —
+    see the module docstring; they report ``source="engine"``.
     """
     user = _owned_session_or_404(request, chat_id, user)
+    cfg = _chat_config(request)
+    if _files_source(cfg) == "engine":
+        return await _list_engine_files(user, chat_id, cfg)
     files, truncated = _walk_session_files(user["email"], chat_id)
     return SessionFilesResponse(files=[SessionFileEntry(**f) for f in files], truncated=truncated)
+
+
+async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFilesResponse:
+    """Proxy the listing from the engine's sandbox file browser."""
+    token = await _engine_token(user, chat_id)
+    try:
+        listing = await fetch_engine_listing(
+            base_url=_engine_base_url(cfg),
+            chat_id=chat_id,
+            token=token,
+            max_files=_MAX_LIST_FILES,
+            transport=_ENGINE_TRANSPORT,
+        )
+    except EngineFilesUnavailable:
+        logger.warning("chat_session_files: engine listing unavailable for session %s", chat_id, exc_info=True)
+        raise _engine_unavailable_502() from None
+    if listing is None:
+        return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
+    entries, truncated = listing
+    files: list[SessionFileEntry] = []
+    for entry in entries:
+        # Engine listings reflect agent-chosen names — re-validate each path
+        # with the same rule the download route enforces, drop what fails.
+        try:
+            _validate_rel_path(entry["path"])
+        except HTTPException:
+            continue
+        files.append(SessionFileEntry(**entry))
+    return SessionFilesResponse(files=files, truncated=truncated, source="engine", supported=True)
 
 
 @router.get("/sessions/{chat_id}/files/download")
@@ -317,16 +465,54 @@ async def download_session_file(
     """
     user = _owned_session_or_404(request, chat_id, user)
     rel = _validate_rel_path(path)
+    cfg = _chat_config(request)
+    if _files_source(cfg) == "engine":
+        return await _download_engine_file(user, chat_id, rel, cfg)
     resolved = _resolve_file_or_404(user["email"], chat_id, rel)
-
-    media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
-    if media_type in _ACTIVE_CONTENT_TYPES:
-        media_type = "application/octet-stream"
 
     return FileResponse(
         path=str(resolved),
-        media_type=media_type,
+        media_type=_download_media_type(resolved.name),
         headers=_attachment_headers(resolved.name),
+    )
+
+
+def _download_media_type(filename: str) -> str:
+    """Filename-derived media type with active content pinned to a
+    non-renderable one — never taken from any upstream header."""
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    if media_type in _ACTIVE_CONTENT_TYPES:
+        media_type = "application/octet-stream"
+    return media_type
+
+
+async def _download_engine_file(user: dict, chat_id: str, rel: str, cfg: object) -> Response:
+    """Stream one engine sandbox file through, with the exact response
+    posture of the host path (attachment + nosniff + pinned media type)."""
+    token = await _engine_token(user, chat_id)
+    try:
+        opened = await open_engine_download(
+            base_url=_engine_base_url(cfg),
+            chat_id=chat_id,
+            path=rel,
+            token=token,
+            max_bytes=_MAX_PROXY_DOWNLOAD_BYTES,
+            transport=_ENGINE_TRANSPORT,
+        )
+    except EngineFileTooLarge:
+        raise HTTPException(status_code=413, detail="File exceeds the download size ceiling.") from None
+    except EngineFilesUnavailable:
+        logger.warning("chat_session_files: engine download unavailable for session %s", chat_id, exc_info=True)
+        raise _engine_unavailable_502() from None
+    if opened is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    iterator, handle = opened
+    name = rel.rsplit("/", 1)[-1]
+    return StreamingResponse(
+        iterator,
+        media_type=_download_media_type(name),
+        headers=_attachment_headers(name),
+        background=BackgroundTask(handle.aclose),
     )
 
 
@@ -345,34 +531,65 @@ async def save_session_file_as_artefact(
     composer. 415 for file types the corpus cannot ingest; 413 above the
     corpus's per-file ceiling.
     """
-    from app.corpus_ingest import create_single_file_artefact
     from src.corpus_allowlist import MAX_UPLOAD_BYTES, classify
+
+    def _unsupported_type_415(filename: str) -> HTTPException:
+        return HTTPException(
+            status_code=415,
+            detail=(f"'{filename}' is not a file type the Library can ingest. Download it instead."),
+        )
+
+    over_ceiling = HTTPException(
+        status_code=413,
+        detail=f"File exceeds the {MAX_UPLOAD_BYTES // 1024 // 1024} MB Library ceiling. Download it instead.",
+    )
 
     user = _owned_session_or_404(request, chat_id, user)
     rel = _validate_rel_path(body.path)
-    resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    cfg = _chat_config(request)
+    if _files_source(cfg) == "engine":
+        name = rel.rsplit("/", 1)[-1]
+        # Classify before spending the engine round-trip.
+        if classify(name) is None:
+            raise _unsupported_type_415(name)
+        token = await _engine_token(user, chat_id)
+        try:
+            data = await fetch_engine_file_bytes(
+                base_url=_engine_base_url(cfg),
+                chat_id=chat_id,
+                path=rel,
+                token=token,
+                max_bytes=MAX_UPLOAD_BYTES,
+                transport=_ENGINE_TRANSPORT,
+            )
+        except EngineFileTooLarge:
+            raise over_ceiling from None
+        except EngineFilesUnavailable:
+            logger.warning("chat_session_files: engine fetch unavailable for session %s", chat_id, exc_info=True)
+            raise _engine_unavailable_502() from None
+        if data is None:
+            raise HTTPException(status_code=404, detail="file not found")
+    else:
+        resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+        name = resolved.name
+        if classify(name) is None:
+            raise _unsupported_type_415(name)
+        if resolved.stat().st_size > MAX_UPLOAD_BYTES:
+            raise over_ceiling
+        data = resolved.read_bytes()
 
-    if classify(resolved.name) is None:
-        raise HTTPException(
-            status_code=415,
-            detail=(f"'{resolved.name}' is not a file type the Library can ingest. Download it instead."),
-        )
-    size = resolved.stat().st_size
-    if size > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File exceeds the {MAX_UPLOAD_BYTES // 1024 // 1024} MB Library ceiling. Download it instead.",
-        )
     if not user.get("id"):
         raise HTTPException(status_code=403, detail="Saving to the Library requires a personal user account.")
 
+    from app.corpus_ingest import create_single_file_artefact
+
     created = create_single_file_artefact(
         owner_id=user["id"],
-        filename=resolved.name,
-        data=resolved.read_bytes(),
+        filename=name,
+        data=data,
     )
     if not created:
-        raise HTTPException(status_code=415, detail=f"'{resolved.name}' could not be saved as an artefact.")
+        raise HTTPException(status_code=415, detail=f"'{name}' could not be saved as an artefact.")
 
     slug = (created.get("collection") or {}).get("slug") or ""
     from src.ingest.runner import ingest_file

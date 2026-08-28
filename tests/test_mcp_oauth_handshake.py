@@ -421,6 +421,155 @@ def test_consent_post_rejects_missing_origin_when_unpinned(seeded_app, monkeypat
     assert r.status_code == 403, r.text
 
 
+# ---------------------------------------------------------------------------
+# The consent bridge is INTERACTIVE-SESSION-ONLY
+#
+# Its POST mints an authorization code that the client exchanges for an access
+# token AND a 30-day refresh token. Accepting a non-interactive credential
+# there launders it into a durable successor that outlives revoking the
+# original — so `_get_session_user` must reject exactly what
+# `require_session_token` rejects on `POST /auth/tokens`.
+# ---------------------------------------------------------------------------
+
+
+def _mint_full_surface_pat(user_id: str, email: str) -> str:
+    """Create a real, live, FULL-surface PAT for ``user_id`` and return the JWT.
+
+    Full surface (the `surface="all"` default) on purpose: it proves the guard
+    rejects on the PAT `typ` claim itself, not merely on a narrowed
+    `credential_surface`. The token_hash must be the sha256 of the JWT or the
+    defense-in-depth check in `resolve_token_to_user` rejects it as
+    `pat_mismatch` before the guard under test ever runs.
+    """
+    import hashlib
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from app.auth.jwt import create_access_token
+    from src.repositories import access_token_repo
+
+    tid = str(uuid.uuid4())
+    pat = create_access_token(user_id=user_id, email=email, token_id=tid, typ="pat")
+    access_token_repo().create(
+        id=tid,
+        user_id=user_id,
+        name="stolen-pat",
+        token_hash=hashlib.sha256(pat.encode()).hexdigest(),
+        prefix=tid.replace("-", "")[:8],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=90),
+    )
+    return pat
+
+
+def _pending_for_new_client(client) -> str:
+    """Register a client, drive /authorize, return the pending consent token."""
+    reg = _register_client(client)
+    _, challenge = _pkce()
+    r = client.get(
+        f"{MCP_MOUNT}/authorize",
+        params={
+            "response_type": "code",
+            "client_id": reg["client_id"],
+            "redirect_uri": "http://localhost:9999/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "xyz",
+            "scope": "read",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307), r.text
+    return parse_qs(urlparse(r.headers["location"]).query)["pending"][0]
+
+
+def test_consent_post_rejects_pat(seeded_app):
+    """A caller holding only a stolen PAT must not be able to mint an OAuth
+    authorization code — the code exchanges for a 30-day refresh token, i.e. a
+    durable credential that would survive revoking the PAT it was minted from.
+
+    `_same_origin` does NOT cover this: it is a CSRF control against a tricked
+    *browser*, and an Origin header is trivially forged by the programmatic
+    caller a PAT holder is — so this request sends the correct same-origin
+    Origin and must still be refused on authentication grounds.
+    """
+    client = seeded_app["client"]
+    pat = _mint_full_surface_pat("admin1", "admin@test.com")
+    pending = _pending_for_new_client(client)
+
+    r = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {pat}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 401, f"a PAT must not mint an authorization code (got {r.status_code})"
+    # Belt and braces: whatever the status, no code may have been handed out.
+    assert "code=" not in r.headers.get("location", ""), "PAT-authenticated consent leaked an authorization code"
+
+
+def test_consent_get_rejects_pat(seeded_app):
+    """The consent GET is the same door: a PAT holder is not a logged-in
+    browser, so they get bounced to login rather than shown the page (which
+    leaks the account's email and the requesting client's name)."""
+    client = seeded_app["client"]
+    pat = _mint_full_surface_pat("admin1", "admin@test.com")
+    pending = _pending_for_new_client(client)
+
+    r = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {pat}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 302, f"a PAT must not be shown the consent page (got {r.status_code})"
+    assert "Authorize access" not in r.text
+
+
+def test_consent_post_rejects_agent_surface_session_jwt(seeded_app):
+    """An MCP-OAuth connector token (`scope="mcp-oauth"`) is a session JWT, not
+    a PAT — but it is an AGENT credential, resolved onto the narrowed 'stack'
+    surface. Letting it consent would let an 8-hour connector token re-mint
+    itself an endless chain of fresh 30-day refresh tokens. Same rule applies
+    to the web-chat sandbox JWT (`scope="chat"`)."""
+    from app.auth.jwt import create_access_token
+
+    client = seeded_app["client"]
+    connector_jwt = create_access_token("admin1", "admin@test.com", extra_claims={"scope": "mcp-oauth"})
+    pending = _pending_for_new_client(client)
+
+    r = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {connector_jwt}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 401, f"an agent-surface session JWT must not consent (got {r.status_code})"
+    assert "code=" not in r.headers.get("location", "")
+
+
+def test_consent_post_still_accepts_browser_cookie_session(seeded_app):
+    """The counterpart the fix must NOT break: a real browser session — the
+    `access_token` cookie set by the login providers, no Authorization header —
+    still mints the authorization code."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    r = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        cookies={"access_token": admin_token},
+        headers={"Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code in (302, 307), r.text
+    assert "code=" in r.headers["location"], "the real browser consent flow must keep working"
+
+
 def test_provider_rejects_unknown_token(seeded_app):
     """A token that was never issued must not verify."""
     import asyncio

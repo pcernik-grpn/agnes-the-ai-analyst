@@ -18,6 +18,7 @@ transports.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
@@ -79,6 +80,16 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # POST /api/semantic-models/apply + `agnes semantic-model apply`.
     "apply_semantic_model",
     "collections_reingest",
+    # Fact graph over Collections — query surface (build order step 6,
+    # docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md
+    # §12). Triple-surface with POST /api/facts/search, POST
+    # /api/facts/neighbors, GET /api/facts/{subject_id}/claims, and `agnes
+    # facts search/neighbors/claims`. Behind the `facts` feature flag; calls
+    # `src.repositories.facts_repo()` directly rather than self-calling over
+    # HTTP (see `_facts_caller`'s docstring below).
+    "fact_search",
+    "fact_neighbors",
+    "fact_claims",
     "schema",
     "describe",
     "query",
@@ -221,6 +232,62 @@ DATA_APP_TOOL_NAMES: tuple[str, ...] = (
 # Full docstrings by tool name — the wire description carries only the first
 # paragraph; the rest is served on demand by the `tool_docs` tool.
 TOOL_DOCS: dict[str, str] = {}
+
+
+# Mirrors cli/query_hints.py::facts_not_found_hint's MCP wording — kept as a
+# short literal here rather than imported, since app/ never imports from
+# cli/ (the dependency runs the other way: cli/mcp/server.py and
+# cli/commands/*.py import from app/ and src/, never back). If the wording
+# ever needs to change, change both.
+_FACTS_NOT_FOUND_HINT = (
+    "No readable fact/edge {subject_id!r}. This means one of: the id is wrong, "
+    "you don't have access to any of its evidence, or the `facts` feature isn't "
+    "enabled on this instance. Use `fact_search` to find a valid id, or ask an "
+    "admin about the `facts` feature flag."
+)
+
+
+def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
+    """Resolve the MCP session's caller into the SAME user/Principal object
+    ``app.auth.dependencies.get_current_user`` would produce for the
+    matching REST call — via ``app.auth.pat_resolver.resolve_token_to_user``,
+    the very function that dependency delegates to.
+
+    The facts repository (design doc §5) enforces every bit of visibility
+    off this object — never off a re-derived identity — so the tools below
+    call ``src.repositories.facts_repo()`` directly instead of following
+    every other foundation tool's HTTP-self-call pattern: an HTTP round
+    trip back into this same process buys nothing here (there is no
+    separate route-level RBAC gate on ``/api/facts*`` to exercise — §5
+    says all enforcement lives in the repository), and it would depend on
+    every MCP transport being willing to forward a restricted principal's
+    own token, which the SSE transport's auth middleware explicitly refuses
+    at the door (see ``app/api/mcp_http.py::_AuthMiddleware``) before a
+    self-call could ever reach it. Calling the repository directly, with
+    THIS function's resolved caller, is what actually lets a scoped
+    ``AgentPrincipal`` see its own narrowed subset rather than silently
+    widening to its owner's.
+
+    Raises :class:`PermissionError` when the token is missing or invalid —
+    surfaced to the MCP client as a tool-call error, the same shape every
+    other foundation tool's ``r.raise_for_status()`` produces for a 401.
+
+    Always calls ``resolve_token_to_user`` with ``conn=None`` — its own
+    docstring is explicit that the argument is ignored (repositories
+    resolve through ``src.repositories``'s factory regardless of backend),
+    so there is nothing to gain from opening a DuckDB handle here, and
+    doing so unconditionally would be a NEW backend-split-guard caller
+    (``tests/test_backend_split_guard.py``) for a connection nothing reads.
+    """
+    from app.auth.pat_resolver import resolve_token_to_user
+
+    auth_header = headers_fn().get("Authorization", "")
+    token = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
+
+    caller, reason = resolve_token_to_user(None, token)
+    if caller is None:
+        raise PermissionError(f"facts: could not authenticate this MCP session ({reason})")
+    return caller
 
 
 def register_foundation_tools(
@@ -713,6 +780,122 @@ def register_foundation_tools(
             )
             r.raise_for_status()
             return r.json()
+
+    @tool(read_only=True)
+    async def fact_search(
+        type: str | None = None,
+        filters: dict[str, Any] | None = None,
+        limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    ) -> dict:
+        """Search typed subjects (facts) extracted from Collections documents, by type and attribute filters.
+
+        Facts have no local scope — this always runs server-side, filtered
+        entirely to evidence YOU can read (design doc §5): a subject
+        surfaces only if at least one of its claims sits in a collection
+        you're granted (or ALL of them, under `facts.visibility_mode:
+        all_evidence`). `attrs` are projected per key from your readable
+        claims, latest-`document_date` wins — a genuine tie shows as
+        `{"conflicted": true, "values": [...]}` instead of picking one
+        silently. Use `fact_claims` on a result's `id` to see the
+        underlying quotes, or `fact_neighbors` to traverse its edges.
+        Behind the `facts` feature flag (off by default); requires the
+        Postgres app-state backend. Mirrors `POST /api/facts/search` and
+        `agnes facts search`.
+
+        Args:
+            type: Subject type to search (e.g. "person"). Omit for every type.
+            filters: Attribute equality filters, e.g. {"status": "active"} —
+                evaluated against the PROJECTED value, so a filter on a
+                conflicted key never matches.
+            limit: Max results (server caps at 100).
+
+        Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
+        "claim_count", "quote_count", "revealed"}], "limit_applied"}`` —
+        `limit_applied` is true only when YOUR OWN readable results exceed
+        `limit`, never a signal that grants hid additional matches.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, limit=limit)
+
+    @tool(read_only=True)
+    async def fact_neighbors(
+        subject_id: str,
+        edge_types: list[str] | None = None,
+        depth: Annotated[int, Field(ge=1, le=2)] = 1,
+        fanout: Annotated[int, Field(ge=1, le=100)] = 100,
+        limit: Annotated[int, Field(ge=1, le=500)] = 500,
+    ) -> dict:
+        """Bounded graph traversal from one fact or edge (depth <= 2, design doc §12).
+
+        Re-checks visibility at EVERY hop — an edge into a subject whose
+        claims you cannot read is dropped silently, never revealed as
+        "there but hidden" (design doc §5 rule 3). Use `fact_search` first
+        to find a starting `subject_id`. Mirrors `POST /api/facts/neighbors`
+        and `agnes facts neighbors`.
+
+        Args:
+            subject_id: Fact id to traverse from (from `fact_search`).
+            edge_types: Restrict traversal to these edge types. Omit for all.
+            depth: Traversal depth, 1 (default) or 2.
+            fanout: Max edges expanded per node (server caps at 100).
+            limit: Max total nodes+edges returned (server caps at 500).
+
+        Returns ``{"nodes": [...], "edges": [...], "truncated": {"depth",
+        "fanout", "result"}}``. Errors for a `subject_id` that does not
+        exist OR has no readable claim — indistinguishable from your point
+        of view on purpose (design doc §5 rule 2); re-check the id with
+        `fact_search` rather than treating this as a permission signal.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+        from src.repositories.facts_pg import FactNotFound
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        try:
+            return await asyncio.to_thread(
+                facts_repo().neighbors,
+                caller,
+                subject_id,
+                edge_types=edge_types,
+                depth=depth,
+                fanout=fanout,
+                limit=limit,
+            )
+        except FactNotFound:
+            raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
+
+    @tool(read_only=True)
+    async def fact_claims(subject_id: str) -> dict:
+        """Your readable evidence for one fact or edge — quote, document, date.
+
+        Mirrors `GET /api/facts/{subject_id}/claims` and `agnes facts claims`.
+
+        Args:
+            subject_id: Fact or edge id (from `fact_search` / `fact_neighbors`).
+
+        Returns ``{"claims": [{"id", "corpus_id", "corpus_file_id",
+        "document": {"name", "path", "source_url"?}, "quote", "attrs",
+        "document_date"}], "revealed"}``. A subject under an admin
+        `revealed` correction is served to every authenticated caller with
+        every `quote` suppressed to an empty string. Errors for a
+        `subject_id` that does not exist OR has no readable claim — same
+        failure either way, on purpose (design doc §5 rule 2).
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+        from src.repositories.facts_pg import FactNotFound
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        try:
+            return await asyncio.to_thread(facts_repo().claims, caller, subject_id)
+        except FactNotFound:
+            raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
 
     @tool(read_only=True)
     async def schema(table_id: str) -> dict:

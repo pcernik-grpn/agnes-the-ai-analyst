@@ -527,6 +527,40 @@ function stripNextActionsFence(markdown) {
 /** One-click follow-ups under the LATEST assistant answer. Exactly one chip
  *  row exists at a time — a new row (or a new user message) removes the old
  *  one, mirroring how suggestions age out the moment the conversation moves. */
+// ---------- Facts scope line -------------------------------------------
+// design doc §13.2 "Chat": "answered from N documents in M collections you
+// can access" — the one line that lets a reader tell "we don't have it"
+// apart from "you can't see it" after a fact-graph-using turn.
+
+/** Append the end-of-turn scope line under an answer, when this turn's
+ *  `fact_claims` tool results named at least one document.
+ *
+ *  MECHANISM, stated plainly: N/M are a purely CLIENT-SIDE tally of the
+ *  `corpus_file_id`/`corpus_id` pairs already shown in this turn's rendered
+ *  `fact_claims` result cards (`_turnFactDocumentIds` / `_turnFactCollectionIds`,
+ *  filled by `_recordFactClaimsEvidence` as each tool_result frame arrives) —
+ *  NOT a fresh server-side aggregate query. That makes it honest in one
+ *  direction only: since every `fact_claims` call already ran through the
+ *  caller-scoped repository (spec §5), the tally can never OVERCLAIM more
+ *  than the caller can actually see — but it CAN undercount, e.g. an agent
+ *  that called `fact_search`/`fact_neighbors` without ever reading evidence
+ *  via `fact_claims` shows no line at all, same as a turn with no sources.
+ *  Resets the tally after rendering — see `_resetFactsTurnEvidence`. */
+function renderFactsScopeLine(bubble) {
+  if (!bubble) return;
+  const docCount = _turnFactDocumentIds.size;
+  if (docCount > 0) {
+    const colCount = _turnFactCollectionIds.size;
+    const line = document.createElement("p");
+    line.className = "msg-facts-scope";
+    const docWord = docCount === 1 ? "document" : "documents";
+    const colWord = colCount === 1 ? "collection" : "collections";
+    line.textContent = `Answered from ${docCount} ${docWord} in ${colCount} ${colWord} you can access.`;
+    bubble.appendChild(line);
+  }
+  _resetFactsTurnEvidence();
+}
+
 function renderNextActions(bubble, actions) {
   _clearNextActions();
   if (!bubble || !actions || actions.length === 0) return;
@@ -1547,6 +1581,18 @@ async function openSession(chatId, wsUrlOverride) {
   const _switchingSession = currentChatId !== chatId;
   currentChatId = chatId;
   markActiveSidebar(chatId);
+  // The session-files drawer keeps per-conversation state — the count badge,
+  // the rendered rows (whose download links carry a chat id), and the
+  // baseline of deliverables the auto-open compares against. Nothing else
+  // told it the conversation changed, so it kept announcing the previous
+  // chat's numbers until a turn landed here, and it had to guess its own
+  // baseline lazily on the first turn-end — too late to notice that turn's
+  // own deliverable. This is the only place a non-null currentChatId is
+  // assigned, so it is the one honest signal. Fired for a re-open too: a
+  // reconnect is not a new conversation, but the listing may have moved on.
+  document.dispatchEvent(
+    new CustomEvent("agnes:session-open", { detail: { chatId, switching: _switchingSession } })
+  );
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
@@ -1782,6 +1828,12 @@ function handleFrame(frame) {
       $("cancel-btn").hidden = true;
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
+      // The session-files block listens for this to refresh its count and to
+      // surface a deliverable the turn just wrote (see §6). A CustomEvent
+      // rather than a direct call: that block is a separate IIFE with no
+      // exported handle, and the frame switch should not grow a dependency
+      // on it.
+      document.dispatchEvent(new CustomEvent("agnes:turn-end"));
       break;
     case "session_participants":
       // §5.3 Co-presence: full re-render of the participant roster.
@@ -2675,6 +2727,7 @@ function finalizeAssistantMessage(frame) {
     const bubble = article.querySelector(".msg-bubble");
     renderSourcesChips(bubble, frame && frame.sources);
     renderNextActions(bubble, extractNextActions(content).actions);
+    renderFactsScopeLine(bubble);
     attachMessageActions(article, stripNextActionsFence(content));
     _markLatestAssistant(article);
     // Every other finish path caps an over-long answer; this one must too, or
@@ -2698,6 +2751,7 @@ function finalizeAssistantMessage(frame) {
     // identically by GET /sessions/{id}/messages.
     renderSourcesChips(currentAssistantBody.closest(".msg-bubble"), frame && frame.sources);
     renderNextActions(currentAssistantBody.closest(".msg-bubble"), extractNextActions(content).actions);
+    renderFactsScopeLine(currentAssistantBody.closest(".msg-bubble"));
     // The copy row hands over the WHOLE answer — the bubble shows the tail,
     // but nobody copying "the answer" wants it cut at the last tool card.
     attachMessageActions(currentAssistantArticle, stripNextActionsFence(content));
@@ -2721,10 +2775,13 @@ function finalizeAssistantMessage(frame) {
     // end in the same state as the streamed one: chips under the answer.
     // renderMessage marked it latest-assistant and stripped the trailer.
     if (lastAssistantArticle) {
-      renderNextActions(
-        lastAssistantArticle.querySelector(".msg-bubble"),
-        extractNextActions(content).actions,
-      );
+      const bubble = lastAssistantArticle.querySelector(".msg-bubble");
+      renderNextActions(bubble, extractNextActions(content).actions);
+      renderFactsScopeLine(bubble);
+    } else {
+      // No bubble to attach the line to (renderMessage found nothing) — the
+      // tally must still not bleed into the next turn.
+      _resetFactsTurnEvidence();
     }
   }
 }
@@ -2861,6 +2918,13 @@ const _TOOL_LABELS = {
   WebSearch: "Searching the web",
   WebFetch: "Fetching a page",
   TodoWrite: "Planning steps",
+  // Fact graph over Collections (design doc §13.2 "Chat") — the same
+  // "raw tool id -> human head" precedent as everything else in this table;
+  // `fact_claims` additionally gets a bespoke RESULT preview instead of the
+  // generic JSON/table fallback (see _renderFactClaimsPreview below).
+  fact_search: "Searched the knowledge graph",
+  fact_neighbors: "Walked related facts",
+  fact_claims: "Read the evidence",
 };
 
 const _BASH_COMMAND_LABELS = [
@@ -3335,9 +3399,12 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // A replayed card's result, from the persisted part. Routed through the
   // SAME preview builder the live path uses in renderToolCallEnd, so a table
   // is a table and an MCP envelope is unwrapped on both paths — the card is
-  // one component with one body, not two that resemble each other.
+  // one component with one body, not two that resemble each other. `tool`
+  // is passed through so a replayed `fact_claims` card gets the SAME
+  // bespoke quote/document preview a live one does (see
+  // _renderFactClaimsPreview) instead of a generic JSON dump.
   if (status !== "running" && result !== undefined) {
-    const body = _renderToolResultPreview(result);
+    const body = _renderToolResultPreview(result, tool);
     if (body) wrap.appendChild(body);
   }
   return wrap;
@@ -3398,7 +3465,19 @@ function renderToolCallEnd(frame) {
   // payload: tabular → mini-table; string → snippet; everything else
   // → JSON code block. Full payload is always reachable via the
   // "Show full result" toggle even if the preview is truncated.
-  const body = _renderToolResultPreview(result);
+  //
+  // `wrap.dataset.tool` (not `frame.tool`, which for a tool_result frame is
+  // often the CALL ID, not the name — see the tool_result case's own
+  // comment) is the reliable tool name: `_buildToolCard` stamped it at
+  // tool_call time. Facts-graph evidence (fact_claims only — search/
+  // neighbors carry no document identifiers) is recorded here too, once per
+  // result, for the end-of-turn scope-line footer (see
+  // _recordFactClaimsEvidence / finalizeAssistantMessage).
+  const toolName = wrap.dataset.tool;
+  if (_bareToolName(toolName) === "fact_claims") {
+    _recordFactClaimsEvidence(_asToolResultObject(result));
+  }
+  const body = _renderToolResultPreview(result, toolName);
   if (body) wrap.appendChild(body);
 
   maybeScrollToBottom();
@@ -3426,6 +3505,12 @@ function _collapseFinishedToolCalls() {
     wrap.open = false;
   }
   _currentTurnToolCards = [];
+  // Defensive: the normal path resets facts-turn evidence inside
+  // `renderFactsScopeLine` once it has been read. A turn that ends WITHOUT
+  // ever reaching `finalizeAssistantMessage` (cancelled/error/confirmation_
+  // required before any assistant text) would otherwise leak this turn's
+  // tally into the next one's footer — a no-op when already empty.
+  _resetFactsTurnEvidence();
 }
 
 /** Heuristic: a stringified tool error coming back from the agent SDK
@@ -3488,6 +3573,117 @@ function _unwrapMcpEnvelope(result) {
   }
 }
 
+/** Best-effort "give me the parsed JSON object" for a tool result,
+ *  regardless of which of the three shapes it arrived in: an already-parsed
+ *  object, a genuine `{content:[{type:"text",text}]}` MCP envelope (handled
+ *  by `_unwrapMcpEnvelope`), or — the shape the runner's own comment on the
+ *  `tool_result` case above documents — a raw JSON STRING with no envelope
+ *  at all (the runner already joined the content blocks server-side).
+ *  `_unwrapMcpEnvelope` alone leaves that third shape as a string (it only
+ *  substitutes when it recognizes an envelope), which is fine for the
+ *  generic preview but wrong for a shape-checking caller like
+ *  `_renderFactClaimsPreview`, so this tries a direct parse FIRST. Returns
+ *  the original value unchanged if neither path yields an object. */
+function _asToolResultObject(result) {
+  if (typeof result === "string") {
+    try {
+      const parsed = JSON.parse(result);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch (_e) {
+      /* not JSON */
+    }
+  }
+  return _unwrapMcpEnvelope(result);
+}
+
+/** Fact-graph evidence gathered from `fact_claims` tool results during the
+ *  turn in progress — the ONLY fact tool whose response names documents
+ *  (`fact_search`/`fact_neighbors` don't carry document identifiers, so
+ *  they contribute nothing here). Read once at the end of the turn by
+ *  `renderFactsScopeLine` and reset there — see its docstring for the full
+ *  mechanism and its honesty note. */
+let _turnFactDocumentIds = new Set();
+let _turnFactCollectionIds = new Set();
+
+function _resetFactsTurnEvidence() {
+  _turnFactDocumentIds = new Set();
+  _turnFactCollectionIds = new Set();
+}
+
+function _recordFactClaimsEvidence(result) {
+  if (!result || typeof result !== "object" || !Array.isArray(result.claims)) return;
+  for (const claim of result.claims) {
+    if (claim && claim.corpus_file_id) _turnFactDocumentIds.add(claim.corpus_file_id);
+    if (claim && claim.corpus_id) _turnFactCollectionIds.add(claim.corpus_id);
+  }
+}
+
+/** The `fact_claims` tool result's bespoke preview (design doc §13.2
+ *  "Chat"): each claim's verbatim quote + evidencing document name, with an
+ *  "Open in source" link only when `document.source_url` is present. Falls
+ *  back to `null` (letting the generic renderer take over) for anything
+ *  that isn't the expected `{claims: [...], revealed}` shape — an error
+ *  payload (e.g. `{detail: "fact_not_found"}`) still needs to be shown
+ *  somehow, and the generic JSON panel is the honest way to show it. */
+function _renderFactClaimsPreview(result) {
+  if (!result || typeof result !== "object" || !Array.isArray(result.claims)) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "cloud-chat-tool-result is-fact-claims";
+
+  if (result.revealed) {
+    const note = document.createElement("p");
+    note.className = "cloud-chat-fact-claims-note";
+    note.textContent = "Corrected by an admin — shown without its original quotes.";
+    wrap.appendChild(note);
+  }
+
+  if (result.claims.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "cloud-chat-fact-claims-note";
+    empty.textContent = "No readable evidence for this fact.";
+    wrap.appendChild(empty);
+    return wrap;
+  }
+
+  const list = document.createElement("ul");
+  list.className = "cloud-chat-fact-claims-list";
+  for (const claim of result.claims) {
+    const item = document.createElement("li");
+    item.className = "cloud-chat-fact-claim";
+
+    // Verbatim evidence text extracted from a document is untrusted content
+    // — the SAME sanitizer every other rendered message body goes through
+    // (security playbook: never raw innerHTML for untrusted text).
+    const quote = document.createElement("blockquote");
+    quote.className = "cloud-chat-fact-claim-quote";
+    quote.innerHTML = renderMarkdownSafe((claim && claim.quote) || "");
+    item.appendChild(quote);
+
+    const meta = document.createElement("div");
+    meta.className = "cloud-chat-fact-claim-meta";
+    const docName = (claim && claim.document && claim.document.name) || (claim && claim.corpus_file_id) || "document";
+    const docSpan = document.createElement("span");
+    docSpan.className = "cloud-chat-fact-claim-doc";
+    docSpan.textContent = docName;
+    meta.appendChild(docSpan);
+
+    const sourceUrl = claim && claim.document && claim.document.source_url;
+    if (sourceUrl && _SAFE_URL_SCHEME_RE.test(String(sourceUrl).trim())) {
+      const link = document.createElement("a");
+      link.className = "cloud-chat-fact-claim-source";
+      link.href = sourceUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "Open in source";
+      meta.appendChild(link);
+    }
+    item.appendChild(meta);
+    list.appendChild(item);
+  }
+  wrap.appendChild(list);
+  return wrap;
+}
+
 /** Build the preview block for a tool result. The CLI tools route
  *  most JSON / table output via agnes which speaks Markdown — so
  *  result strings often contain `|---|---|` table markup that
@@ -3504,9 +3700,24 @@ function _unwrapMcpEnvelope(result) {
  *
  *  Returns a DOM element ready to append, or null if the result is
  *  empty.
+ *
+ *  `toolName` (optional) routes ONE tool — `fact_claims` — through a
+ *  bespoke preview instead of this generic ladder (design doc §13.2
+ *  "Chat"): the endpoint that carries quotes/documents reads far better as
+ *  a quote list than as a JSON dump or an accidental table. `fact_search`/
+ *  `fact_neighbors` are left on the generic path — their JSON already reads
+ *  fine here, and they get their human head from `_TOOL_LABELS` alone.
  */
-function _renderToolResultPreview(result) {
+function _renderToolResultPreview(result, toolName) {
   if (result == null || result === "") return null;
+
+  if (_bareToolName(toolName) === "fact_claims") {
+    const preview = _renderFactClaimsPreview(_asToolResultObject(result));
+    if (preview) return preview;
+    // Unexpected shape (e.g. an error payload) — fall through to the
+    // generic renderer below rather than showing nothing.
+  }
+
   result = _unwrapMcpEnvelope(result);
   if (result == null || result === "") return null;
 
@@ -5387,7 +5598,6 @@ function renderCoPresence(host, participants) {
   // (POST .../files/save-artefact). Rows are built with createElement +
   // textContent — file names/paths are agent-chosen strings, never innerHTML.
 
-  const FILES_OVERLAY = "chat-files-overlay";
   const filesListEl = $("chat-files-list");
   const filesStatusEl = $("chat-files-status");
   const filesErrorEl = $("chat-files-error");
@@ -5414,7 +5624,10 @@ function renderCoPresence(host, participants) {
     name.title = f.path;
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
-    hint.textContent = f.path + " · " + fmtSize(f.size_bytes) + " · " + fmtWhen(f.modified_at);
+    // Engine listings carry no mtime (modified_at is null) — skip the segment
+    // rather than render the epoch.
+    hint.textContent =
+      f.path + " · " + fmtSize(f.size_bytes) + (f.modified_at ? " · " + fmtWhen(f.modified_at) : "");
     meta.appendChild(name);
     meta.appendChild(hint);
 
@@ -5482,13 +5695,10 @@ function renderCoPresence(host, participants) {
     return li;
   }
 
-  async function loadSessionFiles() {
-    if (!filesListEl) return;
-    const chatId = currentChatId;
-    if (!chatId) return;
-    clearDialogError(filesErrorEl);
-    setFilesStatus("Loading…");
-    filesListEl.replaceChildren();
+  /** Fetch the listing. Returns the file array (empty on failure — callers
+   *  that run unattended, like the turn-end check, must not surface an error
+   *  banner for a background poll). */
+  async function fetchSessionFiles(chatId, { quiet = false } = {}) {
     try {
       const res = await fetch(
         "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files",
@@ -5496,19 +5706,106 @@ function renderCoPresence(host, participants) {
       );
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
-      const files = data.files || [];
-      if (!files.length) {
-        setFilesStatus(
-          "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
-        );
-        return;
-      }
-      setFilesStatus(data.truncated ? "Showing the most recent files only." : "");
-      files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+      // `supported: false` is an engine-backed session (kai-agent) whose
+      // engine exposes no files channel for this chat. Carried through as a
+      // flag rather than rendered here: this function is also the unattended
+      // turn-end poll, which must not paint into the drawer.
+      return {
+        files: data.files || [],
+        truncated: !!data.truncated,
+        supported: data.supported !== false,
+        ok: true,
+      };
     } catch (err) {
-      setFilesStatus("");
-      showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+      if (!quiet) showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+      return { files: [], truncated: false, supported: true, ok: false };
     }
+  }
+
+  function renderFileList(chatId, files, truncated, supported = true) {
+    if (!filesListEl) return;
+    filesListEl.replaceChildren();
+    if (!supported) {
+      // Engine-backed session whose engine has no files channel — an honest
+      // notice, not an empty list that reads as "your agent produced nothing".
+      setFilesStatus(
+        "Files for this conversation live in the engine's sandbox, and the engine connected " +
+          "to this instance doesn't expose them yet. Ask the assistant to include the content " +
+          "in its reply, or ask your operator about an engine upgrade."
+      );
+      return;
+    }
+    if (!files.length) {
+      setFilesStatus(
+        "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
+      );
+      return;
+    }
+    setFilesStatus(truncated ? "Showing the most recent files only." : "");
+    files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+  }
+
+  function updateFilesBadge(count) {
+    const badge = $("chat-files-count");
+    if (!badge) return;
+    badge.textContent = String(count);
+    badge.hidden = count === 0;
+  }
+
+  async function loadSessionFiles() {
+    if (!filesListEl) return;
+    const chatId = currentChatId;
+    if (!chatId) return;
+    clearDialogError(filesErrorEl);
+    setFilesStatus("Loading…");
+    filesListEl.replaceChildren();
+    const seq = ++_filesSeq;
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId);
+    // Third writer of the auto-open baseline, and it must claim the sequence
+    // like the other two: an open-time seed still in flight would otherwise
+    // land on top of what the user is looking at right now. The guard comes
+    // BEFORE the render, not just before the baseline write — painting rows
+    // for a conversation the user has since left puts that conversation's
+    // download links under their cursor.
+    if (seq !== _filesSeq || currentChatId !== chatId) return;
+    if (!ok) {
+      // A failed listing knows nothing, so it must not be written into the
+      // baseline: `files` is `[]` on failure, and adopting that would make
+      // the next turn re-report every pre-existing deliverable as fresh and
+      // pop the drawer over the reader. fetchSessionFiles has already
+      // surfaced the error banner (this path is not quiet); just retire the
+      // "Loading…" line and leave what we knew before intact.
+      setFilesStatus("");
+      return;
+    }
+    renderFileList(chatId, files, truncated, supported);
+    updateFilesBadge(files.length);
+    _filesSessionId = chatId;
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    _baselineKnown = true;
+  }
+
+  // ── drawer open/close ─────────────────────────────────────────────────────
+
+  const drawer = $("chat-files-drawer");
+
+  function drawerOpen() {
+    return drawer && !drawer.hidden;
+  }
+
+  function openFilesDrawer() {
+    if (!drawer) return;
+    drawer.hidden = false;
+    document.body.classList.add("chat-files-open");
+    if (filesBtn) filesBtn.setAttribute("aria-expanded", "true");
+    loadSessionFiles();
+  }
+
+  function closeFilesDrawer() {
+    if (!drawer) return;
+    drawer.hidden = true;
+    document.body.classList.remove("chat-files-open");
+    if (filesBtn) filesBtn.setAttribute("aria-expanded", "false");
   }
 
   const filesBtn = $("chat-session-files");
@@ -5518,13 +5815,129 @@ function renderCoPresence(host, participants) {
         showToast("Open a conversation first", "error");
         return;
       }
-      openOverlay(FILES_OVERLAY);
-      loadSessionFiles();
+      if (drawerOpen()) { closeFilesDrawer(); return; }
+      openFilesDrawer();
     });
   }
+  const filesCloseBtn = $("chat-files-close");
+  if (filesCloseBtn) filesCloseBtn.addEventListener("click", closeFilesDrawer);
   const filesRefreshBtn = $("chat-files-refresh");
   if (filesRefreshBtn) filesRefreshBtn.addEventListener("click", loadSessionFiles);
-  wireCloseButtons(FILES_OVERLAY);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && drawerOpen()) {
+      closeFilesDrawer();
+      if (filesBtn) filesBtn.focus();
+    }
+  });
+
+  // ── open by itself when a turn lands a deliverable ────────────────────────
+  // Only for files under `outputs/` — the directory the workspace prompt
+  // reserves for things meant FOR the user. An agent touches plenty of other
+  // files mid-task (scratch, a script it wrote to run once); popping a panel
+  // for those would interrupt the read for something nobody asked to see.
+  // Anything else only moves the count on the button.
+
+  const OUTPUTS_PREFIX = "outputs/";
+  let _knownOutputs = new Set();
+  // Two different questions, and conflating them was a bug: `_filesSessionId`
+  // is which conversation the drawer is BOUND to (claimed synchronously, so
+  // the badge/row reset can happen before the listing round-trip), while
+  // `_baselineKnown` is whether `_knownOutputs` actually reflects it. A seed
+  // that failed or was superseded leaves the drawer bound but ignorant — and
+  // an ignorant baseline reports every pre-existing file as fresh.
+  let _filesSessionId = null;
+  let _baselineKnown = false;
+  // Bumped by every baseline write. Two fetches for the same conversation can
+  // be in flight at once (the open-time seed and a turn-end poll), and they
+  // can land out of order; without this, a slow seed overwrites the newer
+  // turn-end baseline and the next turn re-reports files as fresh.
+  let _filesSeq = 0;
+
+  function isDeliverable(f) {
+    return typeof f.path === "string" && f.path.startsWith(OUTPUTS_PREFIX);
+  }
+
+  // The baseline is established when the conversation OPENS. Deriving it
+  // lazily from the first turn-end could not work: that listing is fetched
+  // AFTER the turn ran, so the turn's own deliverable was already in the
+  // baseline it seeded, and the first turn of a conversation — much the
+  // commonest way to get a deliverable — could never auto-open the drawer.
+  // Doing it here also retires the stale badge/rows a switch used to leave
+  // behind.
+  document.addEventListener("agnes:session-open", async (e) => {
+    const detail = e.detail || {};
+    const chatId = detail.chatId || currentChatId;
+    if (!chatId) return;
+    // A RE-open of the same conversation is not a switch. `ensureWsReady`
+    // re-enters openSession whenever the socket is closed, so this fires
+    // mid-turn on a reconnect — and folding the listing into the baseline
+    // there would absorb a deliverable written while the socket was down as
+    // "already seen", leaving the turn-end that follows with nothing fresh
+    // and the drawer shut. Nothing about the conversation changed, and the
+    // turn-end poll refreshes the view after every turn, so the honest
+    // response to a reconnect is to do nothing at all.
+    if (detail.switching === false && _filesSessionId === chatId && _baselineKnown) return;
+    // Reset synchronously, before the round-trip: until it lands the badge
+    // and any open drawer would otherwise still show the previous
+    // conversation's count and rows, whose links carry the old chat id.
+    const seq = ++_filesSeq;
+    _filesSessionId = chatId;
+    _knownOutputs = new Set();
+    _baselineKnown = false;
+    updateFilesBadge(0);
+    if (drawerOpen() && filesListEl) {
+      filesListEl.replaceChildren();
+      setFilesStatus("Loading…");
+    }
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    // A newer switch (or a turn-end baseline) landed while this was in
+    // flight — that one owns the state now.
+    if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    _baselineKnown = true;
+    updateFilesBadge(files.length);
+    if (drawerOpen()) renderFileList(chatId, files, truncated, supported);
+  });
+
+  document.addEventListener("agnes:turn-end", async () => {
+    const chatId = currentChatId;
+    if (!chatId) return;
+    // Defensive only: agnes:session-open seeds the baseline for every
+    // conversation before a turn can end in it. If some future path reaches a
+    // turn-end with no baseline at all, re-seed rather than treat every
+    // pre-existing file as new — a spurious auto-open on someone else's old
+    // files is worse than one missed.
+    if (_filesSessionId !== chatId || !_baselineKnown) {
+      const seq = ++_filesSeq;
+      const seed = await fetchSessionFiles(chatId, { quiet: true });
+      // Same ok/ownership rules as the other two writers. Nothing is
+      // assigned until the listing actually succeeds: claiming the session
+      // with an empty baseline would make the NEXT turn read every
+      // pre-existing file as fresh — the spurious auto-open this branch
+      // exists to avoid — and would stop this branch from retrying.
+      if (!seed.ok || seq !== _filesSeq || currentChatId !== chatId) return;
+      _filesSessionId = chatId;
+      _knownOutputs = new Set(seed.files.filter(isDeliverable).map((f) => f.path));
+      _baselineKnown = true;
+      updateFilesBadge(seed.files.length);
+      return;
+    }
+    const seq = ++_filesSeq;
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    // Same in-flight guard as the seed above: a slower open-time fetch must
+    // not overwrite this newer baseline, or the next turn re-reports these
+    // same files as fresh.
+    if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
+    updateFilesBadge(files.length);
+    const fresh = files.filter(isDeliverable).filter((f) => !_knownOutputs.has(f.path));
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    if (!fresh.length) return;
+    if (drawerOpen()) {
+      renderFileList(chatId, files, truncated, supported);
+      return;
+    }
+    openFilesDrawer();
+  });
 
 })();
 

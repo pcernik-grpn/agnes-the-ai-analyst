@@ -1,4 +1,5 @@
 {% extends "base_ds.html" %}
+{% import "macros/_icon.html" as ico %}
 
 {# One noun in both chromes: the former /artefacts surface WAS renamed to
    Library and took over the route (see the back-link comment below), so the
@@ -65,6 +66,40 @@
   {# The "no files yet" line is the shared `detail.empty(…)` component now —
      one empty state for every resource type — so this page's own rule for it
      is gone. #}
+
+  /* Facts section (spec §13.2 "Collection detail") */
+  .facts-type-counts { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 0 0 var(--space-3); }
+  .facts-type-chip {
+    font-size: 0.78rem; font-weight: var(--font-medium); color: var(--ds-text-secondary);
+    background: var(--ds-surface-dim, var(--ds-surface)); border: 1px solid var(--ds-border);
+    border-radius: var(--radius-full); padding: 2px 10px;
+  }
+  .facts-list { display: flex; flex-direction: column; gap: var(--space-2); }
+  .fact-row {
+    padding: var(--space-3) var(--space-4); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: var(--radius-lg);
+  }
+  .fact-row__head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
+  .fact-row__type {
+    font-size: 0.72rem; font-weight: var(--font-medium); text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--kind); background: color-mix(in srgb, var(--kind) 10%, var(--ds-surface));
+    border-radius: var(--radius-full); padding: 1px 8px;
+  }
+  .fact-row__name { font-weight: var(--font-medium); color: var(--ds-text-primary); }
+  .fact-row__meta { font-size: 0.78rem; color: var(--ds-text-muted); margin-left: auto; }
+  .fact-conflict {
+    margin-top: var(--space-2); padding: var(--space-2) var(--space-3);
+    background: var(--ds-warn-bg); border: 1px solid var(--ds-warn-line, var(--ds-border));
+    border-radius: var(--radius-md);
+  }
+  .fact-conflict__key { font-size: 0.78rem; font-weight: var(--font-medium); color: var(--ds-warn-ink); }
+  .fact-conflict__values { margin: var(--space-1) 0 0; padding-left: 1.2em; font-size: 0.82rem; color: var(--ds-text-secondary); }
+  .facts-pager { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-3); font-size: 0.82rem; color: var(--ds-text-secondary); }
+  .facts-pager a { color: var(--kind); text-decoration: none; }
+  .facts-pager a:hover { text-decoration: underline; }
+  .facts-review { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--ds-border); }
+  .facts-review__title { font-size: 0.82rem; font-weight: var(--font-semibold); color: var(--ds-text-secondary); margin: 0 0 var(--space-2); }
+  .fact-review-row { font-size: 0.85rem; color: var(--ds-text-primary); padding: 4px 0; }
 </style>
 {% endblock %}
 
@@ -192,6 +227,79 @@
   </div>
   {% endif %}
 {{ detail.section_close() }}
+
+{# Facts section — spec §13.2 "Collection detail": state, not settings. Absent
+   entirely when the `facts` flag is off, the backend is DuckDB, or this
+   collection has zero facts — the route (`library_detail` in app/web/router.py)
+   never sets `facts_summary` in that case, so there is no empty shell to gate
+   here. Caller-scoped by construction: the route passes the actual visitor
+   (never the collection owner) into `facts_repo().collection_facts_summary`,
+   so a grant-holder without the owner's full access sees only their own
+   readable rows. Ungated by `detail.redesign` — like Files/Add files above,
+   this is main-column state, not a redesign-wave restyle. #}
+{% if facts_summary %}
+{{ detail.section_open('Facts', icon='sitemap') }}
+  {% if facts_summary.type_counts %}
+  <p class="facts-type-counts">
+    {% for t, n in facts_summary.type_counts.items() %}
+    <span class="facts-type-chip">{{ n }} {{ t }}{{ 's' if n != 1 else '' }}</span>
+    {% endfor %}
+  </p>
+  {% endif %}
+  <div class="facts-list">
+    {% for f in facts_summary.facts %}
+    <div class="fact-row">
+      <div class="fact-row__head">
+        <span class="fact-row__type">{{ f.type }}</span>
+        <span class="fact-row__name">{{ f.display_name }}</span>
+        <span class="fact-row__meta">
+          {{ f.claim_count }} claim{{ 's' if f.claim_count != 1 else '' }} ·
+          {{ f.quote_count }} quote{{ 's' if f.quote_count != 1 else '' }}
+          {%- if f.revealed %} · corrected by an admin{% endif %}
+        </span>
+      </div>
+      {# Conflicts render WHERE THE FACT LIVES — never a detached queue. #}
+      {% for c in f.conflicts %}
+      <div class="fact-conflict">
+        <span class="fact-conflict__key">{{ ico.icon('warning', 14) }} "{{ c.key }}" disagrees across documents</span>
+        <ul class="fact-conflict__values">
+          {% for e in c.entries %}
+          <li><strong>{{ e.value }}</strong> — {{ e.document_name }}{% if e.document_date %} ({{ e.document_date }}){% endif %}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+  </div>
+  {% if facts_summary.total > facts_summary.page_size %}
+  <div class="facts-pager">
+    {% if facts_summary.page > 1 %}
+    <a href="?facts_page={{ facts_summary.page - 1 }}">&larr; Previous</a>
+    {% endif %}
+    <span>Page {{ facts_summary.page }} of {{ ((facts_summary.total - 1) // facts_summary.page_size) + 1 }}</span>
+    {% if facts_summary.limit_applied %}
+    <a href="?facts_page={{ facts_summary.page + 1 }}">Next &rarr;</a>
+    {% endif %}
+  </div>
+  {% endif %}
+  {# Self-describing payload: every item carries a `kind` discriminator, so
+     a new review-item shape (spec §7.3's `single_valued_conflict`) is a
+     branch here, not a whole new section. #}
+  {% if facts_summary.review_items %}
+  <div class="facts-review">
+    <h3 class="facts-review__title">Review items</h3>
+    {% for item in facts_summary.review_items %}
+    {% if item.kind == 'single_valued_conflict' %}
+    <div class="fact-review-row">{{ ico.icon('warning', 14) }} {{ item.src.display_name }} has {{ item.dsts|length }} conflicting "{{ item.type }}" values: {{ item.dsts | map(attribute='display_name') | join(', ') }}</div>
+    {% else %}
+    <div class="fact-review-row">{{ item.a.display_name }} &harr; {{ item.b.display_name }}</div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+{{ detail.section_close() }}
+{% endif %}
 
 {# Uploading targets a COLLECTION, so it is this page's affordance and never
    the individual file page's — and it comes AFTER the file list: the page

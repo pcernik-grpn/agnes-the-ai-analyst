@@ -169,7 +169,13 @@ def test_the_server_rendered_default_makes_the_promise_true():
 def _assert_names_chart_channel(md: str) -> None:
     assert "inline SVG" in md
     assert "svg.fonttype" in md, "without this matplotlib emits glyph outlines and the SVG is huge"
-    assert "Never tell the user to open a file path." in md
+    # Was "Never tell the user to open a file path. They cannot reach it."
+    # That stopped being true when the session-files panel shipped: a file
+    # under `outputs/` IS reachable. The rule the agent still needs is the
+    # narrower one — a *chart* belongs in the reply, never handed over as a
+    # file — so the refusal is pinned in its current, honest form rather than
+    # dropped. See "## Files you produce" for the half that is now allowed.
+    assert "Never send a chart as a file." in md
     assert "data:" in md, "the failing alternative has to be named to be refused"
     assert "broken image" in md, "say what the user sees, not just that it is forbidden"
 

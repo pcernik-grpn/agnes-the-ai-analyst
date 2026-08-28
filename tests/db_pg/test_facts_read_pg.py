@@ -1,0 +1,1460 @@
+"""Read-path RBAC tests for the fact graph over Collections (build order
+steps 2+3 of
+docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md).
+
+PG-only, no DuckDB half to parametrize against (A3 ratchet) — see
+``docs/migrations.md`` -> "Adding a PG-only feature". Fixtures are seeded
+directly through :class:`FactsPgRepository`'s write/seed methods (never via
+ingest — that lands in the write-path follow-up task).
+
+Every S-id below is the literal acceptance test named in spec §15.1;
+docstrings restate the failure mode.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CORPUS_A = "col_a"
+CORPUS_B = "col_b"
+
+
+# ---------------------------------------------------------------------------
+# fixtures / seeding helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pg_env(tmp_path, monkeypatch, pg_engine):
+    """Alembic-upgraded Postgres wired as the active backend for the repo
+    factory + ``app.auth.access``'s group/grant primitives (mirrors
+    ``tests/db_pg/test_resolve_agent_authority_pg.py``)."""
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "head")
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    from tests.db_pg._parity_sweep_util import _seed_pg_system_groups
+
+    _seed_pg_system_groups(pg_engine)
+    return pg_engine
+
+
+@pytest.fixture
+def repo(pg_env):
+    from src.repositories.facts_pg import FactsPgRepository
+
+    import src.db_pg as db_pg
+
+    return FactsPgRepository(db_pg.get_engine())
+
+
+def _dict_user(user_id: str) -> dict:
+    return {"id": user_id, "email": f"{user_id}@test.com"}
+
+
+def _agent_principal(collection_ids):
+    """A restricted AgentPrincipal scoped to exactly ``collection_ids`` —
+    constructed the way the agent-authority code does (frozen dataclass,
+    live intersection, no owner identity to fall back on)."""
+    from app.auth.session_principal import AgentPrincipal
+
+    return AgentPrincipal(
+        session_id="sess1",
+        agent_id="agent1",
+        owner_user_id="owner-not-the-caller",
+        owner_email="owner@test.com",
+        intersection={"collection": frozenset(collection_ids)},
+    )
+
+
+def _make_group_with_grant(pg_engine, *, group_name: str, collection_id: str, member_user_id: str) -> None:
+    """Seed a group holding a COLLECTION grant, with ``member_user_id`` as
+    its sole member. The caller must already exist as a ``users`` row
+    (created by ``_seed_uploader`` or an explicit ``users_repo().create``)."""
+    from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo
+
+    grp = user_groups_repo().create(name=group_name, description="test", created_by="test-fixture")
+    user_group_members_repo().add_member(member_user_id, grp["id"], source="admin", added_by="test-fixture")
+    resource_grants_repo().create(grp["id"], "collection", collection_id, "test-fixture", "required")
+
+
+def _seed_uploader(user_id: str) -> None:
+    """Fixtures must be uploaded by an account that is NOT the probed
+    caller (spec §5) — ownership unions into a dict user's readable set, so
+    a fixture uploaded as the probed user is readable regardless of grants
+    and the test would pass vacuously."""
+    from src.repositories import users_repo
+
+    users_repo().create(id=user_id, email=f"{user_id}@test.com", name=user_id)
+
+
+def _seed_collection(*, collection_id: str, created_by: str) -> str:
+    from src.repositories import file_corpora_repo
+
+    with_id = file_corpora_repo()
+    # file_corpora.create mints its own id; insert directly so tests control
+    # the id used for grants/claims below.
+    import sqlalchemy as sa
+
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("INSERT INTO file_corpora (id, slug, name, created_by) VALUES (:id, :slug, :name, :by)"),
+            {"id": collection_id, "slug": collection_id, "name": collection_id, "by": created_by},
+        )
+    del with_id
+    return collection_id
+
+
+def _seed_corpus_file(*, corpus_id: str, file_id: str, sha256: str = "sha1") -> None:
+    from src.repositories import corpus_files_repo
+    import sqlalchemy as sa
+
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_files (id, corpus_id, filename, sha256) "
+                "VALUES (:id, :corpus_id, :filename, :sha256)"
+            ),
+            {"id": file_id, "corpus_id": corpus_id, "filename": f"{file_id}.md", "sha256": sha256},
+        )
+    del corpus_files_repo  # keep import for parity with the pattern; unused directly
+
+
+def _seed_full_fixture(uploader="uploader1"):
+    """One collection (CORPUS_A), one file, uploaded by ``uploader`` (NOT
+    the probed caller in any S-test below)."""
+    _seed_uploader(uploader)
+    _seed_collection(collection_id=CORPUS_A, created_by=uploader)
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+
+# ---------------------------------------------------------------------------
+# S1 — a collection granted only to group C contributes nothing to Alice in
+# group B: no fact, no quote, no paraphrase, no acknowledgement.
+# ---------------------------------------------------------------------------
+
+
+def test_s1_ungranted_collection_contributes_nothing(pg_env, repo):
+    """S1. Fails if the planted value or "something exists that you cannot
+    see" appears in any form — a bare empty result is the only pass."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:secret-project")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Secret Project kicked off in March.",
+        attrs={"status": "active"},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    result = repo.search(_dict_user("alice"), type="engagement")
+    assert result["subjects"] == []
+
+    # Direct claims lookup on the fact must 404 (never leak existence).
+    from src.repositories.facts_pg import FactNotFound
+
+    with pytest.raises(FactNotFound):
+        repo.claims(_dict_user("alice"), fact_id)
+
+
+# ---------------------------------------------------------------------------
+# S2 — the attribute oracle.
+# ---------------------------------------------------------------------------
+
+
+def test_s2_attribute_oracle_is_closed(pg_env, repo):
+    """S2. One fact, two claims: one readable (existence only), one not
+    (carrying attrs.price). Alice sees the fact without `price`, and
+    `search(filters={price: ...})` returns no match. This is the test rev 1
+    of the design would have failed."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:oracle-target")
+    # Readable claim: existence only, no price.
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The engagement is underway.",
+        attrs={},
+    )
+    # Unreadable claim: carries the price.
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_b1",
+        corpus_id=CORPUS_B,
+        file_sha256="sha1",
+        quote="The contract value is $412,000.",
+        attrs={"price": 412000},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="engagement")
+    assert len(result["subjects"]) == 1
+    assert "price" not in result["subjects"][0]["attrs"]
+
+    filtered = repo.search(_dict_user("alice"), type="engagement", filters={"price": 412000})
+    assert filtered["subjects"] == []
+
+
+# ---------------------------------------------------------------------------
+# S3 — edge visibility is never inferred from endpoints.
+# ---------------------------------------------------------------------------
+
+
+def test_s3_edge_with_only_unreadable_claim_is_never_returned(pg_env, repo):
+    """S3. An edge whose only claim is in an unreadable collection, between
+    two readable facts: fact_neighbors never returns it. Fails if edge
+    visibility is inferred from endpoint visibility."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    repo.add_claim(
+        fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Person A exists."
+    )
+    repo.add_claim(
+        fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Person B exists."
+    )
+    edge_id = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    # ONLY claim on the edge lives in the unreadable collection.
+    repo.add_claim(edge_id=edge_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="A knows B.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.neighbors(_dict_user("alice"), fact_a)
+    edge_ids = {e["id"] for e in result["edges"]}
+    assert edge_id not in edge_ids
+    # B is still unreachable AS A NEIGHBOR of A via this edge (no other path).
+    node_ids = {n["id"] for n in result["nodes"]}
+    assert fact_b not in node_ids
+
+
+# ---------------------------------------------------------------------------
+# S4 — traversal does not tunnel.
+# ---------------------------------------------------------------------------
+
+
+def test_s4_traversal_does_not_reveal_continuation_past_an_unreadable_node(pg_env, repo):
+    """S4. A->B->C where C has GENUINELY no readable evidence anywhere — not
+    its own claim, and not any incident edge's claim either — returns A,B
+    and does not reveal that a path continues to C. (Refined per spec §4 rev
+    3.2: since an edge's readable claim now evidences its endpoints too, the
+    B-C edge's OWN claim must ALSO be unreadable here for this to still be a
+    genuine tunnel — see the companion test right below for the case where
+    it IS readable.)"""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    fact_c = repo.create_fact(type="person")
+    for f in (fact_a, fact_b):
+        repo.add_claim(fact_id=f, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"{f} exists.")
+    # C's only claim is in the unreadable collection.
+    repo.add_claim(fact_id=fact_c, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="C exists.")
+
+    edge_ab = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(edge_id=edge_ab, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A knows B.")
+    edge_bc = repo.create_edge(src=fact_b, type="knows", dst=fact_c)
+    # Edge B-C's claim is ALSO in the unreadable collection — C has zero
+    # readable evidence anywhere, own or incident.
+    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="B knows C.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.neighbors(_dict_user("alice"), fact_a, depth=2)
+    node_ids = {n["id"] for n in result["nodes"]}
+    edge_ids = {e["id"] for e in result["edges"]}
+    assert node_ids == {fact_a, fact_b}
+    assert edge_ids == {edge_ab}
+    assert edge_bc not in edge_ids
+    assert fact_c not in node_ids
+
+
+def test_s4_refined_endpoint_evidence_reveals_a_node_via_its_incident_edges_readable_claim(pg_env, repo):
+    """S4 refined (spec §4 rev 3.2, found by Run P): SAME A->B->C shape as
+    the test above, except the B-C edge's OWN claim IS readable this time —
+    C's own claim stays unreadable, but the edge now evidences C's existence
+    too, so C and the edge ARE revealed. This is not tunneling: the caller
+    can already read the exact claim ("B knows C.") that names C; hiding C
+    itself would be inconsistent, not safer."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    fact_c = repo.create_fact(type="person")
+    for f in (fact_a, fact_b):
+        repo.add_claim(fact_id=f, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"{f} exists.")
+    repo.add_claim(fact_id=fact_c, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="C exists.")
+
+    edge_ab = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(edge_id=edge_ab, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A knows B.")
+    edge_bc = repo.create_edge(src=fact_b, type="knows", dst=fact_c)
+    # The B-C edge's OWN claim is readable — it evidences C's existence too.
+    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B knows C.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="bella", email="bella@test.com", name="Bella")
+    _make_group_with_grant(pg_env, group_name="group-bella", collection_id=CORPUS_A, member_user_id="bella")
+
+    result = repo.neighbors(_dict_user("bella"), fact_a, depth=2)
+    node_ids = {n["id"] for n in result["nodes"]}
+    edge_ids = {e["id"] for e in result["edges"]}
+    assert node_ids == {fact_a, fact_b, fact_c}
+    assert edge_ids == {edge_ab, edge_bc}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-only facts (spec §4 rev 3.2) — a fact with ZERO own claims,
+# visible only through a readable incident edge's claim (the exact shape of
+# the Run P live failure: nodes created purely to anchor an evidenced edge).
+# ---------------------------------------------------------------------------
+
+
+def _seed_endpoint_only_fixture(repo, *, readable_edge_claim: bool):
+    """A src fact with its own readable claim (CORPUS_A), an edge to a dst
+    fact that NEVER receives an own claim (the endpoint-only case), and the
+    edge's claim placed in CORPUS_A (readable) or CORPUS_B (unreadable) per
+    ``readable_edge_claim``."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    src = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=src, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
+    dst = repo.create_fact(type="industry")
+    repo.add_alias(fact_id=dst, type="industry", natural_key="industry:saas")
+    edge_id = repo.create_edge(src=src, type="works_in_industry", dst=dst)
+    corpus_id = CORPUS_A if readable_edge_claim else CORPUS_B
+    file_id = "cf_a1" if readable_edge_claim else "cf_b1"
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256="sha1",
+        quote="Acme is a SaaS company.",
+    )
+    return src, dst, edge_id
+
+
+def test_endpoint_only_fact_visible_in_search_via_readable_edge_claim(pg_env, repo):
+    """Bullet 1: an endpoint-only fact (never given its own claim) IS
+    visible in search() to a caller who can read the anchoring edge's claim,
+    and serves attrs: {} — attrs stay own-claims-only (S2's attribute-oracle
+    guarantee untouched)."""
+    _src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="jules", email="jules@test.com", name="Jules")
+    _make_group_with_grant(pg_env, group_name="group-jules", collection_id=CORPUS_A, member_user_id="jules")
+
+    result = repo.search(_dict_user("jules"), type="industry")
+    subjects = {s["id"]: s for s in result["subjects"]}
+    assert dst in subjects
+    assert subjects[dst]["attrs"] == {}
+    assert subjects[dst]["claim_count"] == 0  # own-claims-only, matching claims()
+
+
+def test_endpoint_only_fact_visible_in_neighbors_via_readable_edge_claim(pg_env, repo):
+    """Bullet 1: neighbors() from the src also reaches the endpoint-only
+    dst — this is exactly the shape of the live Run P failure."""
+    src, dst, edge_id = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="kara", email="kara@test.com", name="Kara")
+    _make_group_with_grant(pg_env, group_name="group-kara", collection_id=CORPUS_A, member_user_id="kara")
+
+    result = repo.neighbors(_dict_user("kara"), src)
+    assert {n["id"] for n in result["nodes"]} == {src, dst}
+    assert {e["id"] for e in result["edges"]} == {edge_id}
+
+
+def test_endpoint_only_fact_claims_returns_empty_list_not_404(pg_env, repo):
+    """Bullet 1: claims() on a VISIBLE endpoint-only fact is a 200 with an
+    empty claims list, not a 404 — the visibility GATE uses the union, the
+    list itself stays own-claims-only."""
+    _src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="liam", email="liam@test.com", name="Liam")
+    _make_group_with_grant(pg_env, group_name="group-liam", collection_id=CORPUS_A, member_user_id="liam")
+
+    result = repo.claims(_dict_user("liam"), dst)
+    assert result == {"claims": [], "revealed": False}
+
+
+def test_endpoint_only_fact_hidden_when_edge_claim_unreadable(pg_env, repo):
+    """Bullet 2: S3 discipline extended to endpoints — no existence leak.
+    When the anchoring edge's ONLY claim lives in an unreadable collection,
+    the endpoint-only fact stays invisible everywhere (search AND claims)."""
+    _src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=False)
+
+    from src.repositories import users_repo
+    from src.repositories.facts_pg import FactNotFound
+
+    users_repo().create(id="mona", email="mona@test.com", name="Mona")
+    _make_group_with_grant(pg_env, group_name="group-mona", collection_id=CORPUS_A, member_user_id="mona")
+
+    result = repo.search(_dict_user("mona"), type="industry")
+    assert result["subjects"] == []
+    with pytest.raises(FactNotFound):
+        repo.claims(_dict_user("mona"), dst)
+
+
+# ---------------------------------------------------------------------------
+# S5 — a restricted AgentPrincipal sees the subset only, on EVERY read path.
+# ---------------------------------------------------------------------------
+
+
+def test_s5_agent_principal_scoped_subset_search(pg_env, repo):
+    """S5 (search). Fails if any path reaches for `can_access_collection`
+    with the owner id (which would elevate to the owner's full authority)."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="engagement")
+    fact_b = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A.")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="B.")
+
+    # Owner (the "real" identity behind the agent) can reach BOTH collections
+    # — the agent's OWN scope is narrower, and that narrowing must hold even
+    # though the owner is not restricted.
+    principal = _agent_principal([CORPUS_A])
+    result = repo.search(principal, type="engagement")
+    ids = {s["id"] for s in result["subjects"]}
+    assert ids == {fact_a}
+
+
+def test_s5_agent_principal_scoped_subset_neighbors(pg_env, repo):
+    """S5 (neighbors)."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A.")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B.")
+    edge_id = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    # Edge claim lives ONLY in the collection the agent cannot reach.
+    repo.add_claim(edge_id=edge_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="A knows B.")
+
+    principal = _agent_principal([CORPUS_A])
+    result = repo.neighbors(principal, fact_a)
+    assert result["edges"] == []
+
+
+def test_s5_agent_principal_scoped_subset_claims(pg_env, repo):
+    """S5 (claims) — 404, not an empty/partial list, for a subject with zero
+    readable claims under the agent's scope."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="B.")
+
+    from src.repositories.facts_pg import FactNotFound
+
+    principal = _agent_principal(["col_other"])
+    with pytest.raises(FactNotFound):
+        repo.claims(principal, fact_id)
+
+
+# ---------------------------------------------------------------------------
+# S6 — no existence oracle.
+# ---------------------------------------------------------------------------
+
+
+def test_s6_nonexistent_and_unreadable_ids_404_identically(pg_env, repo):
+    """S6 (identity of 404s). A nonexistent id and a no-readable-claim id
+    must raise the same exception type/shape — the REST layer maps both to
+    an identical 404 body."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Hidden.")
+
+    from src.repositories import users_repo
+    from src.repositories.facts_pg import FactNotFound
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    # Alice has NO grants at all.
+
+    with pytest.raises(FactNotFound) as exc_no_claim:
+        repo.claims(_dict_user("alice"), fact_id)
+    with pytest.raises(FactNotFound) as exc_nonexistent:
+        repo.claims(_dict_user("alice"), "f_does_not_exist_at_all")
+
+    # Same exception type, same constructor shape (subject_id is not part of
+    # any externally-serialized 404 body — the REST layer never echoes it).
+    assert type(exc_no_claim.value) is type(exc_nonexistent.value)
+
+
+def test_s6_limit_shortfall_is_not_signaled(pg_env, repo):
+    """S6 (shortfall oracle). limit=20 where 50 facts match the type but
+    only 5 are readable by the caller returns exactly 5, with
+    limit_applied=False — nothing distinguishes "RBAC filtered the rest"
+    from "there simply were only 5"."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    for i in range(5):
+        fid = repo.create_fact(type="engagement")
+        repo.add_claim(
+            fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"readable {i}"
+        )
+    for i in range(45):
+        fid = repo.create_fact(type="engagement")
+        repo.add_claim(
+            fact_id=fid, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote=f"unreadable {i}"
+        )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="engagement", limit=20)
+    assert len(result["subjects"]) == 5
+    assert result["limit_applied"] is False
+
+
+def test_s6_limit_applied_true_when_the_callers_own_visible_set_is_truncated(pg_env, repo):
+    """Companion to the shortfall test: when MORE than `limit` subjects are
+    genuinely visible to the caller, limit_applied is True — this is a
+    legitimate signal about the caller's OWN result set, never about what
+    RBAC hid."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    for i in range(10):
+        _seed_corpus_file(corpus_id=CORPUS_A, file_id=f"cf_a{i}")
+        fid = repo.create_fact(type="engagement")
+        repo.add_claim(
+            fact_id=fid, corpus_file_id=f"cf_a{i}", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"visible {i}"
+        )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="engagement", limit=5)
+    assert len(result["subjects"]) == 5
+    assert result["limit_applied"] is True
+
+
+# ---------------------------------------------------------------------------
+# S8 (read side) — corrections enforced at read time.
+# ---------------------------------------------------------------------------
+
+
+def test_s8_revealed_serves_without_quotes_regardless_of_grants(pg_env, repo):
+    """S8. A `revealed` correction serves the fact instance-wide, without
+    quotes, to a caller with ZERO grants on the evidencing collection."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The engagement went ahead as planned.",
+        attrs={"status": "active"},
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="revealed",
+        reason="publicly announced",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="bob", email="bob@test.com", name="Bob")
+    # Bob has NO grants at all.
+
+    result = repo.search(_dict_user("bob"), type="engagement")
+    assert len(result["subjects"]) == 1
+    subject = result["subjects"][0]
+    assert subject["revealed"] is True
+    assert subject["quote_count"] == 0
+    assert subject["attrs"]["status"]["value"] == "active"
+
+    claims_result = repo.claims(_dict_user("bob"), fact_id)
+    assert claims_result["revealed"] is True
+    assert len(claims_result["claims"]) == 1
+    assert claims_result["claims"][0]["quote"] == ""
+    # Review tightening (spec §4, 2026-08-28): revealed reveals the FACT,
+    # not the geography of its evidence — an ungranted caller gets NO
+    # document name/path/URL for the unreadable claim, opaque ids only.
+    assert claims_result["claims"][0]["document"] is None
+    assert claims_result["claims"][0]["corpus_file_id"] == "cf_a1"
+
+    # A caller who CAN read the evidencing collection (the uploader owns
+    # it — ownership unions into a dict user's readable set) keeps full
+    # document identity on the same revealed subject.
+    owner_claims = repo.claims(_dict_user("uploader1"), fact_id)
+    assert owner_claims["claims"][0]["document"] is not None
+    assert owner_claims["claims"][0]["document"]["name"]
+
+
+def test_s8_restricted_hides_from_a_caller_with_full_grants(pg_env, repo):
+    """S8. `restricted` withholds the subject even from a caller who holds a
+    normal, full grant on the evidencing collection (legal hold /
+    personnel — reach beats grants)."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Sensitive record."
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="restricted",
+        reason="legal hold",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+    from src.repositories.facts_pg import FactNotFound
+
+    users_repo().create(id="carol", email="carol@test.com", name="Carol")
+    _make_group_with_grant(pg_env, group_name="group-full", collection_id=CORPUS_A, member_user_id="carol")
+
+    result = repo.search(_dict_user("carol"), type="person")
+    assert fact_id not in {s["id"] for s in result["subjects"]}
+
+    with pytest.raises(FactNotFound):
+        repo.claims(_dict_user("carol"), fact_id)
+
+
+def test_s8_wrong_hides_at_read_time(pg_env, repo):
+    """`wrong` is withheld everywhere, same as `restricted`, from the read
+    path's point of view (the write-side "survives re-ingest" half of S8
+    belongs to the ingest task)."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Incorrect claim."
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="wrong",
+        reason="hallucinated",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+    from src.repositories.facts_pg import FactNotFound
+
+    users_repo().create(id="carol", email="carol@test.com", name="Carol")
+    _make_group_with_grant(pg_env, group_name="group-wrong", collection_id=CORPUS_A, member_user_id="carol")
+
+    result = repo.search(_dict_user("carol"), type="person")
+    assert fact_id not in {s["id"] for s in result["subjects"]}
+    with pytest.raises(FactNotFound):
+        repo.claims(_dict_user("carol"), fact_id)
+
+
+# ---------------------------------------------------------------------------
+# attrs projection — unit tests over search()'s SQL-side projection.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_claims(repo, *, dates, values, key="status"):
+    """Two claims on ONE fact, both in CORPUS_A (both readable to any caller
+    holding a CORPUS_A grant) — the projection scenario under test."""
+    fact_id = repo.create_fact(type="engagement")
+    for i, (d, v) in enumerate(zip(dates, values)):
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"claim {i} says {v}",
+            attrs={key: v},
+            document_date=d,
+        )
+    return fact_id
+
+
+def _search_one(repo, user_id, fact_type="engagement"):
+    result = repo.search(_dict_user(user_id), type=fact_type)
+    assert len(result["subjects"]) == 1
+    return result["subjects"][0]
+
+
+def test_projection_latest_document_date_wins(pg_env, repo):
+    """Two dated, differing-value claims: the LATEST document_date wins,
+    with no conflict marker."""
+    import datetime as dt
+
+    _seed_full_fixture()
+    fact_id = _seed_two_claims(
+        repo,
+        dates=[dt.date(2026, 1, 1), dt.date(2026, 6, 1)],
+        values=["planning", "active"],
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="dan", email="dan@test.com", name="Dan")
+    _make_group_with_grant(pg_env, group_name="group-proj1", collection_id=CORPUS_A, member_user_id="dan")
+
+    subject = _search_one(repo, "dan")
+    assert subject["id"] == fact_id
+    assert subject["attrs"]["status"] == {"value": "active", "document_date": "2026-06-01"}
+
+
+def test_projection_same_date_differing_values_conflict(pg_env, repo):
+    """Equal dates, differing values -> conflicted marker, never a silent
+    pick."""
+    import datetime as dt
+
+    _seed_full_fixture()
+    same_day = dt.date(2026, 3, 1)
+    fact_id = _seed_two_claims(repo, dates=[same_day, same_day], values=["red", "blue"])
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="dan", email="dan@test.com", name="Dan")
+    _make_group_with_grant(pg_env, group_name="group-proj2", collection_id=CORPUS_A, member_user_id="dan")
+
+    subject = _search_one(repo, "dan")
+    assert subject["id"] == fact_id
+    proj = subject["attrs"]["status"]
+    assert proj["conflicted"] is True
+    assert sorted(proj["values"]) == ["blue", "red"]
+
+
+def test_projection_dated_beats_undated(pg_env, repo):
+    """A dated claim beats an undated one, even with a differing value."""
+    import datetime as dt
+
+    _seed_full_fixture()
+    fact_id = _seed_two_claims(repo, dates=[None, dt.date(2026, 2, 1)], values=["stale-guess", "confirmed"])
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="dan", email="dan@test.com", name="Dan")
+    _make_group_with_grant(pg_env, group_name="group-proj3", collection_id=CORPUS_A, member_user_id="dan")
+
+    subject = _search_one(repo, "dan")
+    assert subject["id"] == fact_id
+    assert subject["attrs"]["status"] == {"value": "confirmed", "document_date": "2026-02-01"}
+
+
+def test_projection_two_undated_differing_values_conflict(pg_env, repo):
+    """Two undated, differing-value claims conflict — never a silent pick
+    (deliberate refinement over "null always conflicts": here it's the ONLY
+    branch where that rule still applies, since no dated claim exists at
+    all)."""
+    _seed_full_fixture()
+    fact_id = _seed_two_claims(repo, dates=[None, None], values=["east", "west"])
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="dan", email="dan@test.com", name="Dan")
+    _make_group_with_grant(pg_env, group_name="group-proj4", collection_id=CORPUS_A, member_user_id="dan")
+
+    subject = _search_one(repo, "dan")
+    assert subject["id"] == fact_id
+    proj = subject["attrs"]["status"]
+    assert proj["conflicted"] is True
+    assert sorted(proj["values"]) == ["east", "west"]
+
+
+# ---------------------------------------------------------------------------
+# all_evidence mode flip.
+# ---------------------------------------------------------------------------
+
+
+def _force_all_evidence_mode(monkeypatch):
+    monkeypatch.setenv("AGNES_FACTS_VISIBILITY_MODE", "all_evidence")
+
+
+def test_all_evidence_mode_hides_strictly_more(pg_env, repo, monkeypatch):
+    """A subject with one readable + one unreadable claim is visible under
+    the default `any_evidence` mode, and invisible under `all_evidence`."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Readable.")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="Unreadable.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="erin", email="erin@test.com", name="Erin")
+    _make_group_with_grant(pg_env, group_name="group-ae", collection_id=CORPUS_A, member_user_id="erin")
+
+    any_evidence_result = repo.search(_dict_user("erin"), type="engagement")
+    assert fact_id in {s["id"] for s in any_evidence_result["subjects"]}
+
+    _force_all_evidence_mode(monkeypatch)
+    all_evidence_result = repo.search(_dict_user("erin"), type="engagement")
+    assert fact_id not in {s["id"] for s in all_evidence_result["subjects"]}
+
+
+# ---------------------------------------------------------------------------
+# neighbors truncation flags.
+# ---------------------------------------------------------------------------
+
+
+def test_neighbors_fanout_truncation(pg_env, repo):
+    """A hub node with more visible edges than `fanout` sets
+    truncated.fanout and caps the returned edges at `fanout`."""
+    _seed_full_fixture()
+    hub = repo.create_fact(type="person")
+    repo.add_claim(fact_id=hub, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Hub.")
+    leaves = []
+    for i in range(4):
+        leaf = repo.create_fact(type="person")
+        repo.add_claim(fact_id=leaf, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"Leaf {i}.")
+        edge_id = repo.create_edge(src=hub, type="knows", dst=leaf)
+        repo.add_claim(
+            edge_id=edge_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"Hub knows leaf {i}.",
+        )
+        leaves.append(leaf)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="frank", email="frank@test.com", name="Frank")
+    _make_group_with_grant(pg_env, group_name="group-fanout", collection_id=CORPUS_A, member_user_id="frank")
+
+    result = repo.neighbors(_dict_user("frank"), hub, fanout=2, limit=500)
+    assert result["truncated"]["fanout"] is True
+    assert len(result["edges"]) == 2
+
+
+def test_neighbors_result_truncation(pg_env, repo):
+    """A small `limit` truncates the combined nodes+edges result and sets
+    truncated.result."""
+    _seed_full_fixture()
+    hub = repo.create_fact(type="person")
+    repo.add_claim(fact_id=hub, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Hub.")
+    for i in range(4):
+        leaf = repo.create_fact(type="person")
+        repo.add_claim(fact_id=leaf, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"Leaf {i}.")
+        edge_id = repo.create_edge(src=hub, type="knows", dst=leaf)
+        repo.add_claim(
+            edge_id=edge_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"Hub knows leaf {i}.",
+        )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="gina", email="gina@test.com", name="Gina")
+    _make_group_with_grant(pg_env, group_name="group-result", collection_id=CORPUS_A, member_user_id="gina")
+
+    result = repo.neighbors(_dict_user("gina"), hub, fanout=100, limit=3)
+    assert result["truncated"]["result"] is True
+    assert len(result["nodes"]) + len(result["edges"]) <= 3
+
+
+def test_neighbors_depth_truncation_flag_true_when_graph_continues(pg_env, repo):
+    """depth=1 on an A-B-C chain returns A,B and flags truncated.depth —
+    there genuinely is more graph past B."""
+    _seed_full_fixture()
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    fact_c = repo.create_fact(type="person")
+    for f in (fact_a, fact_b, fact_c):
+        repo.add_claim(fact_id=f, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"{f} exists.")
+    edge_ab = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(edge_id=edge_ab, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A knows B.")
+    edge_bc = repo.create_edge(src=fact_b, type="knows", dst=fact_c)
+    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B knows C.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="hank", email="hank@test.com", name="Hank")
+    _make_group_with_grant(pg_env, group_name="group-depth", collection_id=CORPUS_A, member_user_id="hank")
+
+    result = repo.neighbors(_dict_user("hank"), fact_a, depth=1)
+    assert {n["id"] for n in result["nodes"]} == {fact_a, fact_b}
+    assert result["truncated"]["depth"] is True
+
+
+def test_neighbors_depth_truncation_flag_false_when_graph_ends_exactly_at_the_cap(pg_env, repo):
+    """depth=2 on the SAME A-B-C chain fully explores it — no further edges
+    exist past C, so truncated.depth must be False (a leaf reached exactly
+    at the depth ceiling is not "cut off")."""
+    _seed_full_fixture()
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    fact_c = repo.create_fact(type="person")
+    for f in (fact_a, fact_b, fact_c):
+        repo.add_claim(fact_id=f, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"{f} exists.")
+    edge_ab = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(edge_id=edge_ab, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A knows B.")
+    edge_bc = repo.create_edge(src=fact_b, type="knows", dst=fact_c)
+    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B knows C.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="hank", email="hank@test.com", name="Hank")
+    _make_group_with_grant(pg_env, group_name="group-depth2", collection_id=CORPUS_A, member_user_id="hank")
+
+    result = repo.neighbors(_dict_user("hank"), fact_a, depth=2)
+    assert {n["id"] for n in result["nodes"]} == {fact_a, fact_b, fact_c}
+    assert result["truncated"]["depth"] is False
+
+
+# ---------------------------------------------------------------------------
+# neighbors response shape (spec §12) — nodes/edges carry the SAME projected
+# subject shape search() returns, not a bare {id, type, revealed}.
+# ---------------------------------------------------------------------------
+
+
+def test_neighbors_node_carries_the_full_subject_shape(pg_env, repo):
+    """Spec §12: a neighbors node is the SAME subject shape search() returns
+    — aliases, projected attrs, claim_count, quote_count — not the bare
+    {id, type, revealed} of the pre-fix response. Walking the graph must not
+    force a second fact_search/fact_claims round trip just to learn a node's
+    own attributes."""
+    _seed_full_fixture()
+    fact_a = repo.create_fact(type="person")
+    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:alice-doe")
+    repo.add_claim(
+        fact_id=fact_a,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Alice Doe leads the engagement.",
+        attrs={"role": "lead"},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="nora", email="nora@test.com", name="Nora")
+    _make_group_with_grant(pg_env, group_name="group-nora", collection_id=CORPUS_A, member_user_id="nora")
+
+    result = repo.neighbors(_dict_user("nora"), fact_a)
+    node = next(n for n in result["nodes"] if n["id"] == fact_a)
+    assert node["aliases"] == ["person:alice-doe"]
+    assert node["attrs"]["role"]["value"] == "lead"
+    assert node["claim_count"] == 1
+    assert node["quote_count"] == 1
+    assert node["revealed"] is False
+
+
+def test_neighbors_endpoint_only_fact_serves_empty_attrs_with_its_aliases(pg_env, repo):
+    """An endpoint-only fact (visible purely via its anchoring edge's
+    readable claim) still carries its OWN aliases in the walk, but attrs
+    stay {} and claim_count 0 — own-claims-only, same as search()."""
+    src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="oscar", email="oscar@test.com", name="Oscar")
+    _make_group_with_grant(pg_env, group_name="group-oscar", collection_id=CORPUS_A, member_user_id="oscar")
+
+    result = repo.neighbors(_dict_user("oscar"), src)
+    node = next(n for n in result["nodes"] if n["id"] == dst)
+    assert node["attrs"] == {}
+    assert node["aliases"] == ["industry:saas"]
+    assert node["claim_count"] == 0
+    assert node["quote_count"] == 0
+
+
+def test_neighbors_s2_shaped_attrs_never_reopen_through_the_walk(pg_env, repo):
+    """S2 extended to neighbors: the SAME fact with one readable
+    (existence-only) claim and one unreadable claim carrying `price` must
+    NOT leak `price` through a neighbors() node either — the oracle must not
+    reopen through the walk just because search() closes it."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The engagement is underway.",
+        attrs={},
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_b1",
+        corpus_id=CORPUS_B,
+        file_sha256="sha1",
+        quote="The contract value is $412,000.",
+        attrs={"price": 412000},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="petra", email="petra@test.com", name="Petra")
+    _make_group_with_grant(pg_env, group_name="group-petra", collection_id=CORPUS_A, member_user_id="petra")
+
+    result = repo.neighbors(_dict_user("petra"), fact_id)
+    node = next(n for n in result["nodes"] if n["id"] == fact_id)
+    assert "price" not in node["attrs"]
+
+
+def test_neighbors_revealed_node_serves_attrs_with_zero_quote_count(pg_env, repo):
+    """A `revealed` node in the walk shows its attrs (revealed bypasses
+    grants entirely per spec §4, same as search()) but quote_count is 0 —
+    the caller still never sees a quote through neighbors()."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The engagement went ahead as planned.",
+        attrs={"status": "active"},
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="revealed",
+        reason="publicly announced",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="quinn", email="quinn@test.com", name="Quinn")
+    # Quinn has NO grants at all.
+
+    result = repo.neighbors(_dict_user("quinn"), fact_id)
+    node = next(n for n in result["nodes"] if n["id"] == fact_id)
+    assert node["revealed"] is True
+    assert node["attrs"]["status"]["value"] == "active"
+    assert node["quote_count"] == 0
+
+
+def test_neighbors_edge_carries_projected_attrs(pg_env, repo):
+    """Spec §12: an edge's attrs are projected the same way as a node's,
+    from the edge's OWN readable claims."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A exists.")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B exists.")
+    edge_id = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="A knows B since 2019.",
+        attrs={"since": 2019},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="rex", email="rex@test.com", name="Rex")
+    _make_group_with_grant(pg_env, group_name="group-rex", collection_id=CORPUS_A, member_user_id="rex")
+
+    result = repo.neighbors(_dict_user("rex"), fact_a)
+    edge = next(e for e in result["edges"] if e["id"] == edge_id)
+    assert edge["attrs"]["since"]["value"] == 2019
+
+
+# ---------------------------------------------------------------------------
+# statement-timeout smoke test.
+# ---------------------------------------------------------------------------
+
+
+def test_statement_timeout_mechanism_actually_cancels(pg_env, repo):
+    """Direct proof that the exact SQL primitive `neighbors()` applies
+    (`SET LOCAL statement_timeout`, spec §12) genuinely cancels a slow
+    query within the same transaction — not a no-op. Deliberately isolated
+    from a real `neighbors()` call: gating this on wall-clock timing of the
+    actual traversal query would be a flaky test rather than a smoke test
+    of the mechanism."""
+    import sqlalchemy as sa
+    import sqlalchemy.exc
+
+    with repo._engine.begin() as conn:
+        conn.execute(sa.text("SET LOCAL statement_timeout = 50"))
+        with pytest.raises(sqlalchemy.exc.DBAPIError):
+            conn.execute(sa.text("SELECT pg_sleep(1)"))
+
+
+# ---------------------------------------------------------------------------
+# collection-scoped summaries (spec §13.2 "Surfaces") — Library card count +
+# collection-detail facts section.
+# ---------------------------------------------------------------------------
+
+
+def test_count_visible_facts_for_collection_is_caller_scoped(pg_env, repo):
+    """Two users, different grants on the SAME collection under
+    `all_evidence` mode -> different M: alice can reach every collection a
+    fact is evidenced from and sees it counted, bob can reach only CORPUS_A
+    and does not."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    # Fully-in-A fact: both callers should count it once they can read A.
+    fact_solo = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_solo, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Solo.")
+    # Spans A and B: only a caller who can read BOTH sees it under all_evidence.
+    fact_spans = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_spans, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Part A.")
+    repo.add_claim(fact_id=fact_spans, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="Part B.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    users_repo().create(id="bob", email="bob@test.com", name="Bob")
+    _make_group_with_grant(pg_env, group_name="group-alice", collection_id=CORPUS_A, member_user_id="alice")
+    _make_group_with_grant(pg_env, group_name="group-alice-b", collection_id=CORPUS_B, member_user_id="alice")
+    _make_group_with_grant(pg_env, group_name="group-bob", collection_id=CORPUS_A, member_user_id="bob")
+
+    import pytest as _pytest  # local import keeps the monkeypatch fixture explicit
+
+    def _force_all_evidence(mp):
+        mp.setenv("AGNES_FACTS_VISIBILITY_MODE", "all_evidence")
+
+    mp = _pytest.MonkeyPatch()
+    try:
+        _force_all_evidence(mp)
+        alice_count = repo.count_visible_facts_for_collection(_dict_user("alice"), CORPUS_A)
+        bob_count = repo.count_visible_facts_for_collection(_dict_user("bob"), CORPUS_A)
+    finally:
+        mp.undo()
+
+    assert alice_count == 2  # fact_solo + fact_spans (alice can read both A and B)
+    assert bob_count == 1  # fact_solo only (fact_spans has an unreadable claim in B)
+
+
+def test_count_visible_facts_for_collection_zero_when_no_facts(pg_env, repo):
+    _seed_full_fixture()
+    from src.repositories import users_repo
+
+    users_repo().create(id="zoe", email="zoe@test.com", name="Zoe")
+    _make_group_with_grant(pg_env, group_name="group-zoe", collection_id=CORPUS_A, member_user_id="zoe")
+    assert repo.count_visible_facts_for_collection(_dict_user("zoe"), CORPUS_A) == 0
+
+
+def test_collection_facts_summary_type_counts_and_paged_facts(pg_env, repo):
+    """type_counts + a paged fact row list (type, display name from natural
+    key, claim_count, quote_count)."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:acme-renewal")
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Renewal signed."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="carla", email="carla@test.com", name="Carla")
+    _make_group_with_grant(pg_env, group_name="group-carla", collection_id=CORPUS_A, member_user_id="carla")
+
+    summary = repo.collection_facts_summary(_dict_user("carla"), CORPUS_A)
+    assert summary["total"] == 1
+    assert summary["type_counts"] == {"engagement": 1}
+    assert len(summary["facts"]) == 1
+    row = summary["facts"][0]
+    assert row["id"] == fact_id
+    assert row["type"] == "engagement"
+    assert row["display_name"] == "engagement:acme-renewal"
+    assert row["claim_count"] == 1
+    assert row["quote_count"] == 1
+    assert row["conflicts"] == []
+    assert summary["limit_applied"] is False
+
+
+def test_collection_facts_summary_hides_facts_the_caller_cannot_read(pg_env, repo):
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Hidden.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="dave", email="dave@test.com", name="Dave")
+    # Dave has NO grant on CORPUS_A at all.
+    summary = repo.collection_facts_summary(_dict_user("dave"), CORPUS_A)
+    assert summary["total"] == 0
+    assert summary["facts"] == []
+    assert summary["type_counts"] == {}
+
+
+def test_collection_facts_summary_conflict_rendered_inline(pg_env, repo):
+    """Two readable claims on one fact with differing values for the same
+    attr key -> a conflict entry carrying BOTH values and their document
+    names/dates (spec §13.2: "the conflict row inline ... both values +
+    their document names/dates")."""
+    import datetime as dt
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Status is active per doc 1.",
+        attrs={"status": "active"},
+        document_date=dt.date(2026, 1, 1),
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a2",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Status is closed per doc 2.",
+        attrs={"status": "closed"},
+        document_date=dt.date(2026, 2, 1),
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="erin2", email="erin2@test.com", name="Erin2")
+    _make_group_with_grant(pg_env, group_name="group-erin2", collection_id=CORPUS_A, member_user_id="erin2")
+
+    summary = repo.collection_facts_summary(_dict_user("erin2"), CORPUS_A)
+    row = summary["facts"][0]
+    assert row["claim_count"] == 2
+    assert len(row["conflicts"]) == 1
+    conflict = row["conflicts"][0]
+    assert conflict["key"] == "status"
+    values = {e["value"] for e in conflict["entries"]}
+    assert values == {"active", "closed"}
+    docs = {e["document_name"] for e in conflict["entries"]}
+    assert docs == {"cf_a1.md", "cf_a2.md"}
+
+
+def test_collection_facts_summary_revealed_hides_conflict_quotes_not_attrs(pg_env, repo):
+    """A revealed subject: quote_count is 0 (quotes suppressed at the
+    `claims()` endpoint), but attrs/conflicts still surface — matching
+    `claims()`'s own "quote blanked, everything else stays" contract."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Sensitive.",
+        attrs={"role": "exec"},
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="revealed",
+        reason="publicly announced",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="finn", email="finn@test.com", name="Finn")
+    # Finn has NO grants at all — revealed serves him regardless.
+    summary = repo.collection_facts_summary(_dict_user("finn"), CORPUS_A)
+    assert summary["total"] == 1
+    row = summary["facts"][0]
+    assert row["revealed"] is True
+    assert row["claim_count"] == 1
+    assert row["quote_count"] == 0
+
+
+def test_collection_facts_summary_review_items_possible_duplicate_of(pg_env, repo):
+    """`possible_duplicate_of` edges surfaced as review-item rows naming
+    both subjects — spec §7.2's entity-resolution review, §13.2's rendering."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    fact_a = repo.create_fact(type="person")
+    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:jane-doe")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Jane Doe.")
+    fact_b = repo.create_fact(type="person")
+    repo.add_alias(fact_id=fact_b, type="person", natural_key="person:j-doe")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="J. Doe.")
+    edge_id = repo.create_edge(src=fact_a, type="possible_duplicate_of", dst=fact_b)
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Possibly the same."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="gale", email="gale@test.com", name="Gale")
+    _make_group_with_grant(pg_env, group_name="group-gale", collection_id=CORPUS_A, member_user_id="gale")
+
+    summary = repo.collection_facts_summary(_dict_user("gale"), CORPUS_A)
+    assert len(summary["review_items"]) == 1
+    item = summary["review_items"][0]
+    assert item["edge_id"] == edge_id
+    names = {item["a"]["display_name"], item["b"]["display_name"]}
+    assert names == {"person:jane-doe", "person:j-doe"}
+
+
+def test_collection_facts_summary_review_item_hidden_when_edge_claim_unreadable(pg_env, repo):
+    """S3-equivalent for review items: the edge's ONLY claim lives in an
+    unreadable collection -> not surfaced, even though both endpoints are
+    independently visible."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A.")
+    fact_b = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B.")
+    edge_id = repo.create_edge(src=fact_a, type="possible_duplicate_of", dst=fact_b)
+    repo.add_claim(edge_id=edge_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="Maybe.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="hana", email="hana@test.com", name="Hana")
+    _make_group_with_grant(pg_env, group_name="group-hana", collection_id=CORPUS_A, member_user_id="hana")
+
+    summary = repo.collection_facts_summary(_dict_user("hana"), CORPUS_A)
+    assert summary["review_items"] == []
+
+
+def test_collection_facts_summary_pagination(pg_env, repo):
+    _seed_full_fixture()
+    for i in range(5):
+        fid = repo.create_fact(type="engagement")
+        repo.add_claim(fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"claim {i}")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="ivy", email="ivy@test.com", name="Ivy")
+    _make_group_with_grant(pg_env, group_name="group-ivy", collection_id=CORPUS_A, member_user_id="ivy")
+
+    page1 = repo.collection_facts_summary(_dict_user("ivy"), CORPUS_A, limit=2, offset=0)
+    assert len(page1["facts"]) == 2
+    assert page1["limit_applied"] is True
+    assert page1["total"] == 5
+
+    page2 = repo.collection_facts_summary(_dict_user("ivy"), CORPUS_A, limit=2, offset=2)
+    assert len(page2["facts"]) == 2
+    ids_page1 = {f["id"] for f in page1["facts"]}
+    ids_page2 = {f["id"] for f in page2["facts"]}
+    assert ids_page1.isdisjoint(ids_page2)
+
+
+def test_neighbors_applies_a_statement_timeout(pg_env, repo):
+    """`neighbors()` runs cleanly under its real, non-degenerate timeout —
+    the companion positive case to the cancellation test above, so the
+    mechanism is proven to fire only when it should."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Exists.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="ivan", email="ivan@test.com", name="Ivan")
+    _make_group_with_grant(pg_env, group_name="group-timeout", collection_id=CORPUS_A, member_user_id="ivan")
+
+    result = repo.neighbors(_dict_user("ivan"), fact_id)
+    assert result["nodes"][0]["id"] == fact_id

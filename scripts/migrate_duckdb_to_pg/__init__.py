@@ -43,15 +43,14 @@ from typing import Any, Dict, List, Optional
 import duckdb
 from sqlalchemy.engine import Engine
 
-from scripts.migrate_duckdb_to_pg.tasks import (
-    _JSON_COLUMNS,  # re-exported for any external consumers
-    EXPLICIT_TASKS,
-    GenericCopyTask,
-    _build_insert,
-    _checksum,
-    _normalize_for_pg,
-    _resolved_columns,
-)
+from scripts.migrate_duckdb_to_pg.tasks import EXPLICIT_TASKS, GenericCopyTask
+from scripts.migrate_duckdb_to_pg.tasks import _build_insert as _build_insert
+from scripts.migrate_duckdb_to_pg.tasks import _checksum as _checksum
+
+# re-exported for any external consumers
+from scripts.migrate_duckdb_to_pg.tasks import _JSON_COLUMNS as _JSON_COLUMNS
+from scripts.migrate_duckdb_to_pg.tasks import _normalize_for_pg as _normalize_for_pg
+from scripts.migrate_duckdb_to_pg.tasks import _resolved_columns as _resolved_columns
 from src.sql_ident import quote_ident
 
 log = logging.getLogger(__name__)
@@ -131,6 +130,14 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     "mcp_source_oauth_clients": ["source_id"],
     "mcp_user_oauth_tokens": ["source_id", "user_id"],
     "mcp_oauth_flows": ["nonce"],
+    # fact-graph-over-Collections §6 prerequisite — PG-only, no DuckDB
+    # source table at all (see GenericCopyTask's "table absent in DuckDB"
+    # handling); PK is the mapped corpus_files.id, not a generated "id".
+    "corpus_file_sources": ["corpus_file_id"],
+    # fact-graph facts tables (0076) — likewise PG-only with no DuckDB
+    # source; registered here so validate() never falls back to SELECT id.
+    "fact_aliases": ["type", "natural_key"],
+    "corrections": ["subject_kind", "subject_id"],
 }
 
 
