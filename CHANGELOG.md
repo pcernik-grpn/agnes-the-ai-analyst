@@ -176,6 +176,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **Vocabulary pass (D5, v1): the same concept now has one name across UI,
+  CLI and MCP help text — the old name keeps working as a deprecated
+  alias.** `agnes connectors`/`agnes connector` → **`agnes tools`**
+  (optional MCP tool connectors — Asana, Atlassian, … — were colliding with
+  "Connector" = data source used throughout the docs); `agnes stack
+  artefacts` → **`agnes stack collections`**, and its `corpus_id` argument
+  is now documented as a collection id ("Collection" is the established
+  canonical name for a file corpus — see `agnes collections` — the
+  `stack_artefact_*` MCP tool descriptions now lead with "collection" too).
+  `agnes agent`'s help text drops "agent profile" in favor of "agent"; the
+  agent builder's schedules panel says "agents are disabled" instead of
+  "agent profiles are disabled". The semantic-model CLI (`agnes admin
+  semantic-model`, `agnes semantic-model apply`) drops "Ossie document" in
+  favor of "semantic model document" (`agnes semantic-model schema`, which
+  prints the actual vendored Apache Ossie JSON Schema, keeps naming the
+  standard — that reference is accurate, not the retired synonym).
+  `/admin/data-sources`' browser tab title is now "Connections" (the hero
+  and nav tab stay "Data"/"Sources"). No REST route paths changed.
 - **The chat sandbox now tells the agent the truth about its runtime, and
   read-only admin commands work there.** Three coupled fixes to the same
   confusion (an in-chat agent concluding its auth was broken and recommending

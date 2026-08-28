@@ -1144,7 +1144,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def stack_artefacts_candidates() -> dict:
-        """List artefacts (file Collections) you could add to your Stack.
+        """List Collections (file corpora) you could add to your Stack.
 
         Candidates are accessible to you (owned, shared with you/your team,
         or workspace-published) and NOT already in your Stack. Adding one to
@@ -1167,14 +1167,14 @@ def register_foundation_tools(
 
     @tool(read_only=False, idempotent=True)
     async def stack_artefact_add(corpus_id: str) -> dict:
-        """Add an artefact (file Collection) to your Stack.
+        """Add a Collection (file corpus) to your Stack.
 
-        Makes the default agent able to use it. 404 if the artefact doesn't
-        exist; 403 if you don't have access to it (not owned, not shared
-        with you/your team, not workspace-published). Idempotent.
+        Makes the default agent able to use it. 404 if the collection
+        doesn't exist; 403 if you don't have access to it (not owned, not
+        shared with you/your team, not workspace-published). Idempotent.
 
         Args:
-            corpus_id: The artefact id, from ``stack_artefacts_candidates``.
+            corpus_id: The collection id, from ``stack_artefacts_candidates``.
 
         Returns ``{"added": true, "card": {...}}``.
         """
@@ -1189,12 +1189,12 @@ def register_foundation_tools(
 
     @tool(read_only=False, destructive=True, idempotent=True)
     async def stack_artefact_remove(corpus_id: str) -> dict:
-        """Remove an artefact from your Stack — drops the default agent's
-        access only. The artefact itself, its files, ownership, and sharing
-        are unaffected.
+        """Remove a Collection from your Stack — drops the default agent's
+        access only. The collection itself, its files, ownership, and
+        sharing are unaffected.
 
         Args:
-            corpus_id: The artefact id to remove from your Stack.
+            corpus_id: The collection id to remove from your Stack.
 
         Returns ``{"removed": true}`` on success.
         """
