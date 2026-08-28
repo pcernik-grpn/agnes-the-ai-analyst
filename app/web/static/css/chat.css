@@ -2867,9 +2867,8 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   outline-offset: var(--ds-focus-outline-offset);
 }
 
-/* Drawer rows keep the full inventory. In a 380px panel the actions no longer
-   sit BESIDE the name — the path wrapped to three lines and squeezed the
-   buttons — they sit under it, on their own line. */
+/* Drawer rows: icon actions are compact enough to sit beside the name even
+   at the panel's 380px width; the meta column ellipsizes on one line. */
 .cloud-chat-files-row {
   display: flex;
   align-items: center;
