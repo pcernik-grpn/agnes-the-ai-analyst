@@ -330,6 +330,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   detail surface and the run path a grantee legitimately relies on are
   unaffected.
 
+- **Legacy `--primary` brand tokens now flip in dark mode.** The dark-theme
+  block in `design-tokens.css` shims `--background`/`--surface`/`--text-*`/etc.
+  so components still reading the pre-redesign token family re-skin together,
+  but was missing `--primary` / `--primary-dark` / `--primary-light` — a rule
+  reading them directly (e.g. the rail's active user-menu item) kept its
+  light-theme blue under dark, measuring ~3.3:1 against the dark surface
+  (below WCAG AA). Now aliased to `var(--ds-primary*)` like the rest of the
+  family (#1625).
+
 ### Removed
 
 - Removed the unused OpenMetadata catalog export (`src/catalog_export.py`,
