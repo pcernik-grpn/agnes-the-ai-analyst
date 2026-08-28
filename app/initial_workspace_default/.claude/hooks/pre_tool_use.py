@@ -95,6 +95,25 @@ ADMIN_PROMPT_PREFIXES = (
     "agnes admin user",
 )
 
+# Data-app mutations. Parity with the chat approval gate, which raises a card
+# for every non-read-only MCP tool (`app/chat/runner.py::ApprovalGate`): the
+# very same mutations are one Bash call away through the CLI
+# (`cli/commands/data_apps.py`, mounted as `agnes app`), and a gate that
+# covers only the MCP door is a front door with the back door open. Mirrors
+# the MCP annotations one-for-one — the read commands (`list`, `show`,
+# `logs`, `open`) are deliberately absent, exactly as their MCP twins are
+# annotated read-only.
+DATA_APP_PROMPT_PREFIXES = (
+    "agnes app create",
+    "agnes app delete",
+    "agnes app deploy",
+    "agnes app draft create",
+    "agnes app draft delete",
+    "agnes app git-credential",
+    "agnes app set-description",
+    "agnes app stop",
+)
+
 _ENUM_PREFIXES = ("find /", "ls /home", "ls /etc", "cat /etc/", "cat /proc/")
 
 
@@ -899,6 +918,16 @@ def _scan(cmd: str) -> list[tuple[str, str]]:
                 (
                     "ask",
                     "This command mutates the Agnes access-control layer; confirm before running.",
+                )
+            )
+
+        # Data-app mutations need it for the same reason (see the prefix list)
+        if any(unwrapped_lower.startswith(p) for p in DATA_APP_PROMPT_PREFIXES):
+            verdicts.append(
+                (
+                    "ask",
+                    "This command creates, changes or tears down a hosted data app; "
+                    "confirm before running.",
                 )
             )
 
