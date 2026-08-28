@@ -50,8 +50,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   least-recently-paused sandbox (the paused-TTL sweep's own teardown, triggered
   by pressure instead of by the clock — the evicted transcript is untouched and
   respawns on its owner's next message) and retrying, up to three reclaims per
-  spawn. A session this process is actively serving is never evicted, and any
-  other spawn failure still propagates untouched.
+  spawn. A session this process is actively serving is never evicted — and
+  neither is one being brought back: `_resume_live` holds a per-session lock
+  across `provider.resume()` + runner install while the session is still
+  PAUSED with a stale `sandbox_paused_at`, so both the reclaim and the
+  long-standing paused-TTL sweep now take that same lock, which closes a
+  window where either could have destroyed the sandbox of a conversation a
+  user was actively resuming. Any other spawn failure still propagates
+  untouched.
 
 ### Removed
 

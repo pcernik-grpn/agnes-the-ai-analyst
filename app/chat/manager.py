@@ -3771,6 +3771,17 @@ class ChatManager:
         ``sandbox_paused_at`` between a resume and the write that clears it,
         so ``self._live`` is the authority on "in use", not the row.
 
+        "In use" has to include *being brought back into use*.
+        ``_resume_live`` holds ``live._resume_lock`` across
+        ``provider.resume()`` + ``_install_runner`` — real I/O, seconds — and
+        the session stays PAUSED with its ``sandbox_paused_at`` still set for
+        that whole window, so the state check alone would happily destroy the
+        sandbox of a conversation a user is actively bringing online (Devin
+        Review on this PR). Taking the same lock is what makes this safe, and
+        a candidate whose lock is already held is skipped rather than waited
+        on: the spawning user should get the next-oldest slot now, not queue
+        behind someone else's resume.
+
         Returns True when a slot was actually freed. Never raises.
         """
         try:
@@ -3782,35 +3793,56 @@ class ChatManager:
         candidates.sort(key=lambda s: s.sandbox_paused_at)
         for session in candidates:
             live = self._live.get(session.id)
-            if live is not None and live.state != SessionState.PAUSED:
-                continue
-            try:
-                await self._provider.destroy(sandbox_id=session.sandbox_id)
-            except Exception:
-                # Already gone is a success for our purposes — the slot is
-                # free either way, and the refs below still need clearing.
-                logger.debug("capacity reclaim: destroy failed for %s (already gone?)", session.sandbox_id)
-            try:
-                self._repo.clear_sandbox_ref(session.id)
-            except Exception:
-                # The container is gone but the row still points at it; leaving
-                # the row would make the owner's next attach try to resume a
-                # sandbox that no longer exists. Do not claim the slot.
-                logger.exception("capacity reclaim: clearing sandbox ref failed for %s", session.id)
+            if live is None:
+                if await self._evict_paused_sandbox(session):
+                    return True
                 return False
-            self._live.pop(session.id, None)
-            try:
-                await self._release_routing_lease(session.id)
-            except Exception:
-                logger.debug("capacity reclaim: routing lease release failed for %s", session.id)
-            logger.info(
-                "capacity reclaim: freed sandbox %s (session %s, paused since %s) to admit a new one",
-                session.sandbox_id,
-                session.id,
-                session.sandbox_paused_at,
-            )
-            return True
+            if live.state != SessionState.PAUSED or live._resume_lock.locked():
+                continue
+            async with live._resume_lock:
+                # Re-check under the lock: a resume may have won the race for
+                # it between the fast skip above and this acquire, in which
+                # case the session is no longer ours to take.
+                if live.state != SessionState.PAUSED or self._live.get(session.id) is not live:
+                    continue
+                if await self._evict_paused_sandbox(session):
+                    return True
+                return False
         return False
+
+    async def _evict_paused_sandbox(self, session) -> bool:
+        """Destroy one paused sandbox and clear everything pointing at it.
+
+        Split out of ``_reclaim_paused_sandbox`` only so the eviction itself
+        reads the same whether or not the caller had a ``LiveSession`` lock to
+        take. Returns True when the slot is genuinely free.
+        """
+        try:
+            await self._provider.destroy(sandbox_id=session.sandbox_id)
+        except Exception:
+            # Already gone is a success for our purposes — the slot is
+            # free either way, and the refs below still need clearing.
+            logger.debug("capacity reclaim: destroy failed for %s (already gone?)", session.sandbox_id)
+        try:
+            self._repo.clear_sandbox_ref(session.id)
+        except Exception:
+            # The container is gone but the row still points at it; leaving
+            # the row would make the owner's next attach try to resume a
+            # sandbox that no longer exists. Do not claim the slot.
+            logger.exception("capacity reclaim: clearing sandbox ref failed for %s", session.id)
+            return False
+        self._live.pop(session.id, None)
+        try:
+            await self._release_routing_lease(session.id)
+        except Exception:
+            logger.debug("capacity reclaim: routing lease release failed for %s", session.id)
+        logger.info(
+            "capacity reclaim: freed sandbox %s (session %s, paused since %s) to admit a new one",
+            session.sandbox_id,
+            session.id,
+            session.sandbox_paused_at,
+        )
+        return True
 
     async def _spawn_with_capacity_reclaim(self, *, workdir, env, argv) -> SandboxHandle:
         """``provider.spawn``, but a full host frees a parked slot and retries.
@@ -4003,6 +4035,19 @@ class ChatManager:
                     logger.exception("reaper: list_paused_sessions failed; skipping paused sweep this cycle")
                     paused_sessions = []
                 for session in paused_sessions:
+                    # A session this process is bringing back online is not
+                    # expired, whatever its row says: _resume_live holds
+                    # `live._resume_lock` across provider.resume() +
+                    # _install_runner while the session is still PAUSED with
+                    # its stale sandbox_paused_at, so a tick landing inside
+                    # that window would destroy the sandbox out from under the
+                    # user. Same window the capacity reclaim closes with the
+                    # same lock — rarer here (it needs a resume to coincide
+                    # with the TTL expiring) but the same bug. It resumes; the
+                    # next tick, 60s later, will find its timestamp cleared.
+                    live = self._live.get(session.id)
+                    if live is not None and live._resume_lock.locked():
+                        continue
                     # #867: guard the whole per-session teardown — a destroy
                     # failure was already tolerated, but a failing
                     # clear_sandbox_ref (DB hiccup) previously aborted the

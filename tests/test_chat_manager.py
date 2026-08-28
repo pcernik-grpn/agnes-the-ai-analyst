@@ -4529,6 +4529,64 @@ def test_capacity_error_propagates_when_there_is_nothing_to_reclaim(manager: Cha
     asyncio.run(_run())
 
 
+def test_capacity_reclaim_skips_a_session_that_is_mid_resume(manager: ChatManager):
+    """A session inside `_resume_live` is PAUSED with its `sandbox_paused_at`
+    still set for the whole `provider.resume()` + `_install_runner` window —
+    seconds of real I/O — so the state check alone would let a concurrent
+    capped spawn destroy the sandbox of a conversation the user is actively
+    bringing back online (Devin Review on this PR). `_resume_live` holds
+    `live._resume_lock` across exactly that window; a held lock means hands
+    off, and the reclaim takes the next-oldest slot instead of queueing behind
+    someone else's resume."""
+    from types import SimpleNamespace
+
+    async def _run():
+        resuming_row = _paused_session(manager, sandbox_id="sbx-resuming", paused_ago_seconds=9000)
+        resume_lock = asyncio.Lock()
+        manager._live[resuming_row.id] = SimpleNamespace(state=SessionState.PAUSED, _resume_lock=resume_lock)
+        parked = _paused_session(manager, sandbox_id="sbx-parked", paused_ago_seconds=60, email="other@test.com")
+        destroyed, _ = _capacity_provider(manager, fail_times=1)
+
+        async with resume_lock:  # stand in for _resume_live's body
+            await manager._spawn_with_capacity_reclaim(workdir=Path("/tmp"), env={}, argv=["x"])
+
+        assert destroyed == ["sbx-parked"], "the resuming session must be skipped despite being older"
+        assert manager._repo.get_session(resuming_row.id).sandbox_id == "sbx-resuming"
+        assert manager._repo.get_session(parked.id).sandbox_id is None
+
+    asyncio.run(_run())
+
+
+def test_capacity_reclaim_holds_the_resume_lock_while_it_evicts(manager: ChatManager):
+    """Skipping a lock that is already held is only half of it: the eviction
+    itself has to hold the same lock, or a resume starting one await later
+    walks straight into a sandbox being destroyed. Asserted from inside
+    `provider.destroy`, which runs in the middle of the teardown."""
+    from types import SimpleNamespace
+
+    async def _run():
+        parked = _paused_session(manager, sandbox_id="sbx-parked", paused_ago_seconds=9000)
+        resume_lock = asyncio.Lock()
+        manager._live[parked.id] = SimpleNamespace(state=SessionState.PAUSED, _resume_lock=resume_lock)
+        destroyed, _ = _capacity_provider(manager, fail_times=1)
+
+        held: list[bool] = []
+        inner_destroy = manager._provider.destroy
+
+        async def _destroy(*, sandbox_id):
+            held.append(resume_lock.locked())
+            await inner_destroy(sandbox_id=sandbox_id)
+
+        manager._provider.destroy = _destroy
+
+        await manager._spawn_with_capacity_reclaim(workdir=Path("/tmp"), env={}, argv=["x"])
+
+        assert destroyed == ["sbx-parked"]
+        assert held == [True], "the eviction must run under the session's own resume lock"
+
+    asyncio.run(_run())
+
+
 def test_capacity_reclaim_never_evicts_a_session_being_served(manager: ChatManager):
     """A row can carry a stale sandbox_paused_at while this process is already
     serving it again; the in-memory state is the authority on 'in use'."""
