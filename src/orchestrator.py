@@ -1629,6 +1629,11 @@ class SyncOrchestrator:
                 # is never retried until the next day.
                 if query_mode == "materialized":
                     continue
+                # #1364: a connector's own `_meta.rows` can be NULL — "could not
+                # count this pass" (e.g. Jira's view build hit a corrupt part) —
+                # distinct from a genuinely empty table's `0`. `rows or 0` below
+                # would otherwise silently collapse both into the same plain `0`.
+                count_unavailable = rows is None
                 # B1: sync_state.table_id / sync_history.table_id are keyed
                 # by the registry id, resolved from this table's name (see
                 # src.sync_state_key) — the parquet filename below is a
@@ -1639,6 +1644,7 @@ class SyncOrchestrator:
                 table_dir = extracts_dir / source_name / "data" / table_name
                 file_hash = ""
                 parts = None
+                rejected: list[str] = []
                 out_size = size_bytes or 0
                 # #1339: a table can have BOTH a flat `<table>.parquet` file
                 # AND a `<table>/` partition directory at once — e.g. a
@@ -1723,6 +1729,20 @@ class SyncOrchestrator:
                                 table_name,
                                 source_name,
                             )
+                            # Visible beyond the log line (#1364): flags the row via
+                            # the same set_error() mechanism `GET /api/admin/registry`
+                            # / `agnes admin list-tables` already surface as
+                            # `last_sync_status`/`last_sync_error`. Deliberately NOT
+                            # paired with `update_sync` here — the `continue` above it
+                            # skips that call, so rows/hash/parts stay exactly as
+                            # frozen (untouched on a prior good sync, absent on a
+                            # first-ever one); this only adds the flag.
+                            repo.set_error(
+                                sync_key,
+                                f"Corrupt parquet {pq_path} for table {table_name!r} in "
+                                f"source {source_name!r} — missing/invalid PAR1 magic; "
+                                f"not (re)published this pass. See #1364.",
+                            )
                             continue
                         h = hashlib.md5()
                         for chunk in iter(lambda: f.read(8192), b""):
@@ -1753,7 +1773,7 @@ class SyncOrchestrator:
 
                 repo.update_sync(
                     table_id=sync_key,
-                    rows=rows or 0,
+                    rows=0 if count_unavailable else rows,
                     file_size_bytes=out_size,
                     hash=file_hash,
                     parts=parts,
@@ -1771,6 +1791,46 @@ class SyncOrchestrator:
                         f"Both a flat parquet ({pq_path}) and a partition "
                         f"directory ({table_dir}) exist for this table; "
                         f"serving the flat file, which may be stale. See #1339.",
+                    )
+                # Both of the checks below can fire on the SAME pass for the SAME
+                # table — a corrupt part is typically exactly why the extractor's
+                # own view build/count also failed. `set_error` replaces (not
+                # appends to) `error`, so `count_unavailable` — generic, "check
+                # the logs" — is deliberately checked FIRST and `rejected` —
+                # specific, names the exact path(s) — LAST, so the more useful
+                # message is the one left standing when both apply.
+                if count_unavailable:
+                    # #1364: the extractor's own `_meta.rows` came back NULL — it
+                    # could not build/count its view this pass (e.g. Jira hit a
+                    # part that passes the magic check above but still fails a
+                    # full parse). `rows` was just published as `0` above so the
+                    # column stays numeric, but that `0` is NOT a verified empty
+                    # table — flag it the same way, so an operator checking
+                    # `last_sync_status`/`last_sync_error` never mistakes "could
+                    # not count" for "counted zero".
+                    repo.set_error(
+                        sync_key,
+                        f"Row count unavailable for table {table_name!r} in source "
+                        f"{source_name!r} — the extractor could not build/count its "
+                        f"view this pass; the published rows=0 is NOT a verified "
+                        f"empty table. See server logs for the extractor's own error "
+                        f"and #1364.",
+                    )
+                if rejected:
+                    # #1364: one or more parts in this partitioned table failed
+                    # the structural check — some frozen at their last known-good
+                    # manifest entry above, some (never-distributed) simply
+                    # omitted. Either way the served/manifested bytes are exactly
+                    # as before this flag; only the visibility is new. Called
+                    # AFTER `update_sync` above, same ordering as `both_layouts`,
+                    # so this only flips status/error and leaves the rows/hash/
+                    # parts just written untouched.
+                    repo.set_error(
+                        sync_key,
+                        f"Corrupt parquet part(s) for table {table_name!r} in source "
+                        f"{source_name!r}: {', '.join(sorted(rejected))} — missing/"
+                        f"invalid PAR1 magic; frozen at last known-good manifest entry "
+                        f"where one exists. See #1364.",
                     )
         except Exception as e:
             logger.warning("Could not update sync_state: %s", e)

@@ -355,6 +355,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   light-theme blue under dark, measuring ~3.3:1 against the dark surface
   (below WCAG AA). Now aliased to `var(--ds-primary*)` like the rest of the
   family (#1625).
+- **A known-bad table no longer looks like a healthy, empty one.** A corrupt
+  parquet part is refused at hash time since #1559, but the refusal died in a
+  WARNING log line — `sync_state` (and so `GET /api/admin/registry` /
+  `agnes admin list-tables`) still reported `status: ok`, indistinguishable
+  from a genuinely empty or fully synced table. `_update_sync_state`
+  (`src/orchestrator.py`) now flags the row via the existing `sync_state`
+  `status`/`error` columns — the same mechanism already used for the
+  both-layouts collision (#1339) — naming the rejected part(s) whether the
+  table's manifest just got frozen at its last known-good state or nothing
+  was ever published for it. Separately, Jira's `extract_init.py` was
+  collapsing a failed view build into `rows=0`, identical to a real empty
+  table even though DuckDB's own exception names the offending file; it now
+  reports `rows=NULL` ("could not count") through `_meta`, which
+  `_update_sync_state` flags the same way instead of publishing a plain,
+  unflagged zero. No change to what is refused or served — refusal at hash
+  time (#1559) and quarantining a corrupt part at view build (deliberately
+  not pursued, per the issue's decision memo) are unaffected. (#1364)
 
 ### Removed
 
