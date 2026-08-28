@@ -960,6 +960,59 @@
     .ax-colhd, .ax-r { grid-template-columns: 4.5rem minmax(0, 1fr) 10rem; }
     .ax-colhd__u, .ax-r__rd { display: none; }
   }
+  /* ── + Add row ───────────────────────────────────────────────────────
+     One way in, sitting at the foot of the list it adds to. */
+  .ax-add {
+    display: flex; align-items: baseline; gap: 8px; width: 100%;
+    margin-top: 14px; padding: 10px 2px; text-align: left;
+    background: none; border: 0; border-top: 1px dashed var(--ds-border);
+    color: var(--ds-text-link); font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .ax-add:hover { background: var(--ds-surface-dim); }
+  .ax-add__plus { font-size: 15px; line-height: 1; }
+  .ax-add__hint { color: var(--ds-text-muted); font-weight: 400; font-size: 12px; }
+
+  /* ── The picker ──────────────────────────────────────────────────────
+     Same overlay chrome as the group drawer; the rows are the same shape as
+     the group's own, minus the controls, so what you pick looks like what
+     you get. */
+  .ax-picker .ds-drawer__panel { width: min(680px, 100vw); }
+  .ax-picker__find { margin-bottom: 12px; }
+  .ax-picker__find input {
+    width: 100%; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn, 4px);
+    padding: 7px 10px; font-size: 13px; background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .ax-picker__list { max-height: 58vh; overflow-y: auto; }
+  .ax-picker__fam { margin-top: 14px; }
+  .ax-picker__fam:first-child { margin-top: 0; }
+
+  .ax-pk-r {
+    display: grid; grid-template-columns: 20px 5.5rem minmax(0, 1fr);
+    gap: 10px; align-items: center; width: 100%; text-align: left;
+    padding: 8px 4px; background: none; border: 0;
+    border-bottom: 1px solid var(--ds-border-light); cursor: pointer;
+  }
+  .ax-pk-r:hover { background: var(--ds-surface-dim); }
+  .ax-pk-r__box {
+    width: 16px; height: 16px; border: 1px solid var(--ds-border);
+    border-radius: 3px; display: grid; place-items: center;
+    font-size: 11px; color: var(--ds-text-inverse, #fff); background: var(--ds-surface);
+  }
+  .ax-pk-r.is-on .ax-pk-r__box {
+    background: var(--ds-primary); border-color: var(--ds-primary);
+  }
+  .ax-pk-r__nm { font-size: 13px; font-weight: 600; min-width: 0; color: var(--ds-text-primary); }
+
+  .ax-picker .ds-drawer__foot {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 22px; border-top: 1px solid var(--ds-border);
+  }
+  .ax-picker__count { margin-right: auto; font-size: 12px; color: var(--ds-text-muted); }
+  .ax-pk-r--g { grid-template-columns: 20px minmax(0, 1fr); }
+  /* In By bundle the add sits inside the bundle's own section, so it is
+     quieter than the group view's — it belongs to the rows above it rather
+     than closing the whole list. */
+  .ax-add--bb { margin-top: 4px; border-top: 0; font-size: 12px; padding: 6px 2px; }
 </style>
 {% endblock %}
 
@@ -1120,16 +1173,11 @@
              "Granted only" was a checkbox up in the section head; as a
              segment beside the search it reads as the scope it is, and each
              half carries its own count. #}
-          <div class="ax-frow" id="ax-rfind-wrap" hidden>
-            <div class="fbar__search">
-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16.5 16.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-              <input type="search" id="ax-rfind" placeholder="Filter by name, marketplace, category…" autocomplete="off" aria-label="Filter what this group can use">
-            </div>
-            <span class="fbar-seg" id="ax-scope" role="group" aria-label="What to show">
-              <button type="button" class="fbar-seg__btn is-active" data-scope="all">All <span class="fbar-seg__n" id="ax-scope-all"></span></button>
-              <button type="button" class="fbar-seg__btn" data-scope="granted">Granted <span class="fbar-seg__n" id="ax-scope-granted"></span></button>
-            </span>
-          </div>
+          {# The All / Granted segment lived here. Once the list became the
+             group's HOLDING rather than the instance's catalogue, "all" and
+             "granted" named the same set — and the hidden per-group search
+             beside it duplicated the one in the header. Adding is now an
+             explicit act (+ Add), not a scope you browse in. #}
           <div id="ax-resources"><div class="ax-empty">Select a group on the left.</div></div>
         </div>
       </details>
@@ -1299,7 +1347,6 @@
   let resourceFilter = "";
   // Which scope the Access list is showing: everything grantable, or only
   // what this group already holds.
-  let accessScope = "all";
 
   /* The selector. The retired list page's table lived here in two lines a
      row; what is new is the SPLIT: `Admin` and `Everyone` sit under their
@@ -1474,8 +1521,6 @@
     if (q && !groups.some((g) => g.id === selectedGroup)) {
       selectedGroup = groups[0].id;
       resourceFilter = nameHit(groups[0]) ? "" : groupFilter.trim();
-      const rf = el("ax-rfind");
-      if (rf) rf.value = resourceFilter;
     }
 
     const row = (g) => {
@@ -1646,21 +1691,16 @@
     const nameHit = !!(g && `${titleOf(g)} ${g.name || ""} ${g.description || ""} ${g.mapped_email || ""}`
       .toLowerCase().includes(q.toLowerCase()));
     resourceFilter = (!q || nameHit) ? "" : q;
-    const rf = el("ax-rfind");
-    if (rf) rf.value = resourceFilter;
   }
 
   function renderResources() {
     renderIdentity();
     const host = el("ax-resources");
-    const findWrap = el("ax-rfind-wrap");
     if (!selectedGroup) {
-      host.innerHTML = `<div class="ax-empty">Select a group on the left.</div>`;
-      findWrap.hidden = true;
+      host.innerHTML = `<div class="ax-empty">Open a group to see what it can use.</div>`;
       setAccessHead("");
       return;
     }
-    findWrap.hidden = false;
 
     // Nothing grantable on the instance at all — a different problem from
     // "this group has nothing", and it has a different next step.
@@ -1683,8 +1723,6 @@
       (n, t) => n + (t.blocks || []).reduce((m, b) => m + (b.items || []).length, 0), 0);
     const held = grantsFor(selectedGroup).length;
     setAccessHead(`${held} of ${totalItems} granted`);
-    el("ax-scope-all").textContent = totalItems;
-    el("ax-scope-granted").textContent = held;
 
     const types = (overview.resources || []).slice().sort((a, b) => {
       const al = a.type_key === LEAD_TYPE ? 0 : 1;
@@ -1701,199 +1739,15 @@
         .toLowerCase().includes(fq);
     // "What does this group actually HAVE?" — the question that otherwise
     // means opening every type in turn to find the two that hold anything.
-    const onlyGranted = accessScope === "granted";
-    const narrowed = fq || onlyGranted;
+    const narrowed = !!fq;
 
-    /* Every type arrives from the API already grouped into BLOCKS — buckets
-       for tables, marketplaces for plugins — and this editor used to flatten
-       them into one list with the block name as a suffix on each row. At six
-       tables that is tidy; at six hundred it is the reason nobody can find
-       `in.c-revenue_core`, and granting a whole bucket means ticking every
-       row in it.
-
-       So a type with real blocks renders its blocks, COLLAPSED, each with a
-       tri-state checkbox that grants or revokes the whole bucket at once.
-       A type whose blocks are decorative — one block, named after the type
-       itself, which is how single-level types arrive — renders flat, because
-       a disclosure holding the only thing under it is pure ceremony. */
-    const isNested = (t) => {
-      const blocks = t.blocks || [];
-      return blocks.length > 1 || blocks.some((b) => b.name && b.name !== t.type_display);
-    };
-
-    // The page whose job is "who gets WHAT" must be able to answer "what IS
-    // that?" without a six-step detour through Data. Kinds with an
-    // id-addressable page get a link on the row name; the rest stay text —
-    // a link that needs a slug this projection doesn't carry would 404.
-    const ENTITY_HREF = {
-      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`,
-      table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
-    };
-
-    // Collection-only, spec §13.2: a collection with NO group granted at
-    // all (independent of which group is currently selected in this pane)
-    // is indexed but reachable by nobody — the worst silent state, since a
-    // collection that granted no group at share-time looks identical to one
-    // still mid-setup. `grant_count` is computed server-side, once, in
-    // `_collection_blocks()` (app/resource_types.py) — the single source
-    // every list built from that projection reads, so this pane and any
-    // future one agree without recomputing the grant scan client-side.
-    // Grants across ALL groups, derived from the same payload the checkboxes
-    // read — so the badge can never disagree with them. A resource with no
-    // row here reaches nobody, whichever group is selected. Collections keep
-    // their server-computed grant_count; marketplace plugins (TCRD-221 — an
-    // ungranted plugin looked identical to a missing one) derive purely from
-    // the grants payload.
-    const grantedAnywhere = new Set((overview.grants || []).map((g) => `${g.resource_type}:${g.resource_id}`));
-    const NOBODY_TYPES = new Set(["collection", "marketplace_plugin"]);
-    const nobodyBadge = (t, i) =>
-      NOBODY_TYPES.has(t.type_key) && !(i.grant_count > 0) && !grantedAnywhere.has(`${t.type_key}:${i.resource_id}`)
-        ? ` <span class="ax-chip warn" style="padding:1px 8px;font-size:11px;" title="No group can see this — indexed but invisible.">&#9888; nobody</span>`
-        : "";
-
-    const itemRow = (t, i) => {
-      const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
-      const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
-      const hrefFn = ENTITY_HREF[t.type_key];
-      const nameHtml = hrefFn
-        ? `<a class="ax-name__link" href="${hrefFn(i.resource_id)}">${esc(i.name || i.resource_id)}</a>`
-        : esc(i.name || i.resource_id);
-      return `
-      <tr data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant ? ' class="is-granted"' : ""}>
-        <td class="ax-chk"><input type="checkbox" ${grant ? "checked" : ""} aria-label="Grant ${esc(i.name || i.resource_id)}"></td>
-        <td class="ax-name">
-          <b>${nameHtml}</b>${!isNested(t) && i._block && i._block !== t.type_display ? `<span class="blk"> · ${esc(i._block)}</span>` : ""}${nobodyBadge(t, i)}
-          ${i.description ? `<br><span class="desc">${esc(String(i.description).slice(0, 90))}</span>` : ""}
-          ${grant && whoGranted(grant) ? `<br><span class="ax-by-who">granted by ${esc(whoGranted(grant))}</span>` : ""}
-        </td>
-        <td class="ax-acc">${tierControl(tier, !!grant)}</td>
-        <td class="ax-reads">${readsFor(t.type_key, tier)}</td>
-      </tr>`;
-    };
-
-    const itemTable = (t, items) => `
-      <table class="data-table data-table--compact">
-        <thead><tr><th class="ax-chk" aria-label="Granted"></th><th>Item</th><th class="ax-acc">Admin control</th><th class="ax-reads">What the person reads</th></tr></thead>
-        <tbody>${items.map((i) => itemRow(t, i)).join("")}</tbody>
-      </table>`;
-
-    /* The default view carries two things: the bundles an admin hands out
-       as a unit, and everything this group actually HOLDS whatever its kind.
-       Everything else — the ungranted long tail, six hundred tables among
-       it — moves behind Advanced.
-
-       Nothing is migrated and nothing is revoked by this: a grant written
-       one resource at a time still works, still shows (it is held), and is
-       still editable. What changes is that browsing the whole grantable
-       surface stops being the first thing the page does. */
-    const BUNDLE = new Set(["data_package", "memory_domain", "semantic_model", "marketplace_plugin"]);
-    const isHeld = (t, i) => !!grantOf(selectedGroup, t.type_key, i.resource_id);
-    const inHalf = (half, t, i) => half === "primary"
-      ? (BUNDLE.has(t.type_key) || isHeld(t, i))
-      : (!BUNDLE.has(t.type_key) && !isHeld(t, i));
-
-    const typeHtml = (t, half) => {
-      if (half === "advanced" && BUNDLE.has(t.type_key)) return "";
-      const nested = isNested(t);
-      const blocks = (t.blocks || []).map((b) => {
-        const bItems = (b.items || []).map((i) => ({ ...i, _block: b.name }));
-        return {
-          name: b.name,
-          all: bItems,
-          shown: bItems.filter((i) =>
-            hits(t, i) && inHalf(half, t, i)
-            && (!onlyGranted || grantOf(selectedGroup, t.type_key, i.resource_id))),
-          granted: bItems.filter((i) => grantOf(selectedGroup, t.type_key, i.resource_id)).length,
-        };
-      });
-      const all = blocks.flatMap((b) => b.all);
-      const items = blocks.flatMap((b) => b.shown);
-      // A narrowed view shows what MATCHES: a type with no hit is dropped
-      // rather than shown empty, so the tree collapses to the answer.
-      if (narrowed && !items.length) return "";
-      const granted = blocks.reduce((n, b) => n + b.granted, 0);
-      const lead = t.type_key === LEAD_TYPE;
-      const head = (cnt) => `
-        <summary title="${esc(t.type_description || "")}"><span class="car">▶</span> <span class="ax-tag ${lead ? "ax-tag--data" : ""}">${esc(t.type_display)}</span>
-          <span class="cnt">${cnt}</span></summary>
-        ${t.type_description ? `<p class="ax-type-desc">${esc(t.type_description)}</p>` : ""}`;
-      if (!items.length) {
-        // In Advanced, "nothing left" means the group holds all of them —
-        // not that the kind is missing. Say nothing rather than say that.
-        if (half === "advanced") return "";
-        if (all.length) return "";
-        // "No recipes exist yet" is not news to anyone reading a group's
-        // access. For the four kinds an admin actually hands out it IS news
-        // — you cannot grant a package that nobody has made — so those, and
-        // only those, say so.
-        if (!BUNDLE.has(t.type_key)) return "";
-        return `<details class="ax-sec">${head("none registered")}
-          <div class="ax-empty" style="padding-left:22px;">Nothing of this kind exists on the instance yet.</div>
-        </details>`;
-      }
-      // Filtering OPENS what it matched — a hit hidden inside a collapsed
-      // section reads as "no such thing", which is the opposite of the
-      // answer. The count says which set it is counting, so a narrowed
-      // section never claims to be the whole one.
-      const count = fq
-        ? `${items.length} match${items.length === 1 ? "" : "es"} of ${all.length}`
-        : `${granted} of ${all.length} granted`;
-
-      const body = nested
-        ? blocks.map((b) => {
-            if (!b.shown.length) return "";   // nothing here under this filter
-            // Three states, and the middle one is the point: a bucket that is
-            // PARTLY granted must not read as "off", or the box would be an
-            // instruction to grant what is already granted. `indeterminate`
-            // cannot be set from markup — `paintBucketBoxes()` applies it
-            // after render.
-            const state = b.granted === 0 ? "none" : (b.granted === b.all.length ? "all" : "some");
-            return `
-            <details class="ax-blk" data-blk="${esc(t.type_key)}|${esc(b.name)}" ${fq ? "open" : ""}>
-              <summary>
-                <span class="ax-blk__chk">
-                  <input type="checkbox" data-bucket="${esc(t.type_key)}|${esc(b.name)}"
-                         ${state === "all" ? "checked" : ""}
-                         data-state="${state}"
-                         aria-label="Grant everything in ${esc(b.name)}">
-                </span>
-                <span class="car">▶</span>
-                <span class="ax-blk__name">${esc(b.name)}</span>
-                <span class="cnt">${fq && b.shown.length !== b.all.length
-                  ? `${b.shown.length} of ${b.all.length} shown · ${b.granted} granted`
-                  : `${b.granted} of ${b.all.length} granted`}</span>
-              </summary>
-              <div class="ax-blk__body">${itemTable(t, b.shown)}</div>
-            </details>`;
-          }).join("")
-        : itemTable(t, items);
-
-      return `
-      <details class="ax-sec" ${lead || narrowed ? "open" : ""}>${head(count)}
-        <div class="ax-sec__body${nested ? " ax-sec__body--nested" : ""}">${body}</div>
-      </details>`;
-    };
-
-    /* Types render under the family they declare — Knowledge and
-       Capabilities are the Library's own two tabs, so an admin granting a
-       thing and the person receiving it are looking at the same taxonomy.
-       Surfaces is the third: a chat and a Slack channel are where a group
-       MEETS Agnes, not something it holds, and filing them under either
-       Library tab would be a lie about what they are.
-
-       The mapping is server-side (`ResourceTypeSpec.family`); this reads it
-       rather than keeping a second copy that drifts the first time someone
-       registers a resource type. `overview.families` carries the section
-       copy, in render order, so a family whose types are all filtered away
-       still says so instead of vanishing. */
-    /* The default view is FLAT. It used to be family → type accordion →
-       block accordion → table, seven levels of chrome deep with the column
-       headers repeated once per type; the type is one word, and one word
-       does not need a container. It rides the row as a chip, which is what
-       the design draws, and the reader gets three levels: family, header,
-       row. Advanced keeps the accordions — browsing six hundred tables by
-       bucket is exactly what a tree is for. */
+    //: Kinds an owner can share from the Library (app/services/library_sharing.py).
+    //: Here they are OVERSIGHT — revoke, and a way to where they are owned —
+    //: because the item's own page is the other editor and two editors for
+    //: one row is how vocabularies and states drift apart.
     const OWNER_SHARED = new Set(["collection", "agent", "corpus_file", "data_app"]);
+
+    //: Where a row's thing actually lives, when it has a page of its own.
     const ENTITY_PAGE = {
       collection: (id) => `/library/d/${encodeURIComponent(id)}`,
       corpus_file: (id) => `/library/d/${encodeURIComponent(id)}`,
@@ -1905,20 +1759,17 @@
 
     /* ONE row shape, and the open group shows only what the group HAS.
        Ungranted rows with a dead control and the words "not granted" were
-       noise the design never had — they are what made the page unreadable,
-       because every row looked like a control and most of them were not one.
-       Granting is Advanced (or + Grant a bundle); this is the holding.
-
-       No checkbox either: with only held rows on screen there is nothing to
-       tick, and a checkbox beside a tier switch asks "where do I click"
-       twice on one row. The control column IS the affordance. */
+       noise: every row looked like a control and most were not one, which is
+       what made the page unreadable. Adding is an explicit act now (+ Add),
+       so there is nothing on screen to tick and no checkbox column — the
+       control column IS the affordance. */
     const grantedRow = (t, i, blockName, grant) => {
       const tier = grant.requirement === "required" ? "required" : "available";
       const owned = OWNER_SHARED.has(t.type_key);
       const tiered = TIERED.has(t.type_key);
       const hrefFn = ENTITY_PAGE[t.type_key];
       const name = esc(i.name || i.resource_id);
-      const nameHtml = hrefFn ? `<a class="ax-name__link" href="${hrefFn(i.resource_id)}">${name}</a>` : name;
+      const nameHtml = hrefFn ? `<a href="${hrefFn(i.resource_id)}">${name}</a>` : name;
       const who = whoGranted(grant);
       const control = owned
         ? `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button>
@@ -1937,7 +1788,6 @@
         <span class="ax-r__rd">${readsLabelled(t.type_key, tier)}</span>
       </div>`;
     };
-
 
     const byFamily = new Map();
     for (const t of types) {
@@ -1974,6 +1824,14 @@
       </div>`;
     }).join("");
 
+    // One way in, at the foot of the list it adds to.
+    const addRow = `
+      <button type="button" class="ax-add" data-add-grant>
+        <span class="ax-add__plus" aria-hidden="true">+</span>
+        <span>Add to this group</span>
+        <span class="ax-add__hint">packages, memory, plugins, tables — anything grantable</span>
+      </button>`;
+
     // The column header belongs to the GROUP, not to each family. Repeated
     // per family it was three copies of four words, and it made each family
     // read as its own table rather than a band of one list.
@@ -1983,26 +1841,15 @@
         <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
       </div>` : "";
 
-    /* Advanced. The per-resource matrix is not deleted and not migrated —
-       an instance that curated grants one row at a time for a year wakes up
-       to the same authorization result. It stops being the FIRST thing the
-       page shows, which is the whole of the change. */
-    const advParts = types.map((t) => typeHtml(t, "advanced")).filter(Boolean);
-    const advCount = types.reduce((n, t) => n + (BUNDLE.has(t.type_key) ? 0 :
-      (t.blocks || []).reduce((m, b) => m + (b.items || []).filter((i) => !isHeld(t, i)).length, 0)), 0);
-    const advanced = advParts.length ? `
-      <details class="ax-adv" ${fq ? "open" : ""}>
-        <summary>
-          <b>Advanced</b>
-          <span class="ax-adv__what">${advCount} more ${advCount === 1 ? "resource" : "resources"} can be granted one at a time — tables among them.</span>
-          <span class="ax-adv__more">Show</span>
-        </summary>
-        <div class="ax-adv__body">${advParts.join("")}</div>
-      </details>` : "";
+    /* Advanced is gone too. It was the same browsing tree one disclosure
+       deeper, and it made "where do I grant something" have two answers.
+       Granting is one act now: + Add, a picker, Apply. Grants written one
+       resource at a time still work and still show — they are held, so they
+       are rows here like anything else. */
 
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const painted = (colhd + sections + advanced) || (fq
+    const painted = (colhd + sections + addRow) || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
       : `<div class="dsec-empty"><strong>This group has nothing granted yet</strong>
@@ -2566,11 +2413,17 @@
             <span class="ax-bb__fam">${esc(famName.get(r.t.family) || "")}</span></span>
         </div>
         ${nobody
-          ? `<div class="ax-empty" style="padding-left:22px;">Authored, then never handed to anyone. Open it in the group view to grant it.</div>`
+          ? `<div class="ax-empty" style="padding-left:22px;">Authored, then never handed to anyone.</div>`
           : `<table class="data-table data-table--compact">
                <thead><tr><th class="ax-chk" aria-label="Granted"></th><th>Group</th><th class="ax-acc">Admin control</th><th class="ax-reads">What the person reads</th></tr></thead>
                <tbody>${r.held.map((grant) => groupRow(r, grant)).join("")}</tbody>
              </table>`}
+        <button type="button" class="ax-add ax-add--bb" data-share-bundle
+                data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
+                data-blabel="${esc(r.i.name || r.i.resource_id)}">
+          <span class="ax-add__plus" aria-hidden="true">+</span>
+          <span>${nobody ? "Share it with a group" : "Share with another group"}</span>
+        </button>
       </section>`;
     };
 
@@ -2638,25 +2491,12 @@
   const WORKSET_KEY = "agnes.admin.access.workset";
   function rememberWorkset() {
     try {
-      sessionStorage.setItem(WORKSET_KEY, JSON.stringify({ f: resourceFilter, s: accessScope }));
+      sessionStorage.setItem(WORKSET_KEY, JSON.stringify({ f: resourceFilter }));
     } catch (e) { /* private mode */ }
   }
-  el("ax-rfind").addEventListener("input", (e) => {
-    resourceFilter = e.target.value;
-    rememberWorkset();
-    renderResources();
-  });
-  /* The scope segments. `.fbar-seg` is the app's segmented control, so this
-     is the same object the Library and the package pages filter with. */
-  el("ax-scope").addEventListener("click", (e) => {
-    const btn = e.target.closest("[data-scope]");
-    if (!btn || btn.dataset.scope === accessScope) return;
-    accessScope = btn.dataset.scope;
-    el("ax-scope").querySelectorAll("[data-scope]").forEach((b) =>
-      b.classList.toggle("is-active", b.dataset.scope === accessScope));
-    rememberWorkset();
-    renderResources();
-  });
+  /* The per-group search input and the All/Granted segment were removed
+     with the catalogue they filtered: the header search narrows the list,
+     and the list is the holding. Nothing left here to bind. */
 
   /* The tier key needs no handler: it is a CSS hover/focus tooltip now.
      It was a permanent accent panel between the two sections (where it read
@@ -2743,14 +2583,26 @@
 
   function clearResourceFilter() {
     resourceFilter = "";
-    const input = el("ax-rfind");
+    const input = el("ax-group-find");
     if (input) input.value = "";
+    groupFilter = "";
     renderPick();
     renderResources();
   }
 
   document.addEventListener("click", async (e) => {
     if (e.target.closest("[data-clear-rfind]")) { clearResourceFilter(); return; }
+
+    const share = e.target.closest("[data-share-bundle]");
+    if (share) {
+      openBundlePicker(share.dataset.btype, share.dataset.brid, share.dataset.blabel);
+      return;
+    }
+
+    if (e.target.closest("[data-add-grant]")) {
+      if (selectedGroup) openPicker(selectedGroup);
+      return;
+    }
 
     const byBtn = e.target.closest("[data-by]");
     if (byBtn) {
@@ -2904,6 +2756,257 @@
       repaintView();
     }
   });
+
+
+  /* ── + Add: the one way to grant ──────────────────────────────────────
+     Everything the group does NOT have, in one overlay, chosen and applied
+     in a single act. This replaces two browsing surfaces (the All/Granted
+     scope and the Advanced tree) that answered the same question in two
+     places — and it means the group's own list can stay what it is, the
+     holding, with nothing on it that is not held.
+
+     Uses `.ds-drawer`, the app's own overlay chrome (see
+     `js/components/group_drawer.js`), rather than a modal invented here. */
+  let pickerEls = null;
+  /* Two directions, one act. `mode:"resources"` picks things for a group
+     (opened from a group's + Add); `mode:"bundle"` picks GROUPS for one
+     bundle (opened from a bundle's + Add in the By bundle view). The same
+     overlay, the same Apply, the same grant rows written either way — a
+     grant has no direction, only the question you arrived with does. */
+  let pickerState = { mode: "resources", group: null, bundle: null, chosen: new Set(), q: "" };
+
+  function buildPicker() {
+    if (pickerEls) return pickerEls;
+    const root = document.createElement("div");
+    root.className = "ds-drawer ax-picker";
+    root.hidden = true;
+    root.dataset.noEscClose = "1";
+    root.innerHTML =
+      '<div class="ds-drawer__backdrop" data-pk-close></div>' +
+      '<div class="ds-drawer__panel" role="dialog" aria-modal="true" aria-labelledby="pk-title">' +
+      '  <div class="ds-drawer__head">' +
+      '    <div class="ds-drawer__head-main">' +
+      '      <h2 class="ds-drawer__title" id="pk-title">Add to this group</h2>' +
+      '      <p class="ds-drawer__sub" data-pk="sub"></p>' +
+      '    </div>' +
+      '    <button type="button" class="ds-drawer__x" data-pk-close aria-label="Close">&times;</button>' +
+      '  </div>' +
+      '  <div class="ds-drawer__body">' +
+      '    <div class="fbar__search ax-picker__find">' +
+      '      <input type="search" data-pk="q" placeholder="Search everything grantable…" aria-label="Search what to add">' +
+      '    </div>' +
+      '    <div class="ax-picker__list" data-pk="list"></div>' +
+      '  </div>' +
+      '  <div class="ds-drawer__foot">' +
+      '    <span class="ax-picker__count" data-pk="count">Nothing selected</span>' +
+      '    <button type="button" class="btn" data-pk-close>Cancel</button>' +
+      '    <button type="button" class="btn btn--primary" data-pk-apply disabled>Apply</button>' +
+      '  </div>' +
+      '</div>';
+    document.body.appendChild(root);
+    pickerEls = {
+      root,
+      sub: root.querySelector('[data-pk="sub"]'),
+      q: root.querySelector('[data-pk="q"]'),
+      list: root.querySelector('[data-pk="list"]'),
+      count: root.querySelector('[data-pk="count"]'),
+      apply: root.querySelector("[data-pk-apply]"),
+    };
+
+    root.addEventListener("click", async (e) => {
+      if (e.target.closest("[data-pk-close]")) { closePicker(); return; }
+      if (e.target.closest("[data-pk-apply]")) { await applyPicker(); return; }
+      const row = e.target.closest("[data-pk-item]");
+      if (row) {
+        const key = row.dataset.pkItem;
+        if (pickerState.chosen.has(key)) pickerState.chosen.delete(key);
+        else pickerState.chosen.add(key);
+        paintPicker();
+      }
+    });
+    pickerEls.q.addEventListener("input", (e) => { pickerState.q = e.target.value; paintPicker(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !root.hidden) closePicker();
+    });
+    return pickerEls;
+  }
+
+  //: The groups that do NOT already hold this bundle.
+  function pickerGroupCandidates() {
+    const q = pickerState.q.trim().toLowerCase();
+    const b = pickerState.bundle;
+    return (overview.groups || []).filter((g) => {
+      if (grantOf(g.id, b.type, b.id)) return false;
+      const hay = `${titleOf(g)} ${g.name || ""} ${g.description || ""} ${g.mapped_email || ""}`.toLowerCase();
+      return !q || hay.includes(q);
+    });
+  }
+
+  //: Everything grantable the group does not already hold, by family.
+  function pickerCandidates() {
+    const q = pickerState.q.trim().toLowerCase();
+    const out = new Map();
+    for (const t of (overview.resources || [])) {
+      for (const b of (t.blocks || [])) {
+        for (const i of (b.items || [])) {
+          if (grantOf(pickerState.group, t.type_key, i.resource_id)) continue;
+          const hay = `${i.name || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
+          if (q && !hay.includes(q)) continue;
+          const fam = t.family || "knowledge";
+          if (!out.has(fam)) out.set(fam, []);
+          out.get(fam).push({ t, i, block: (b.name && b.name !== t.type_display) ? b.name : "" });
+        }
+      }
+    }
+    return out;
+  }
+
+  function paintPicker() {
+    const els = buildPicker();
+    if (pickerState.mode === "bundle") return paintGroupPicker(els);
+    const cands = pickerCandidates();
+    const families = overview.families || [];
+    const total = [...cands.values()].reduce((n, a) => n + a.length, 0);
+    if (!total) {
+      els.list.innerHTML = pickerState.q
+        ? `<div class="ax-empty">Nothing left matches “${esc(pickerState.q)}”.</div>`
+        : `<div class="ax-empty">This group already has everything on the instance.</div>`;
+    } else {
+      els.list.innerHTML = families.map((f) => {
+        const rows = cands.get(f.key) || [];
+        if (!rows.length) return "";
+        return `
+        <div class="ax-picker__fam">
+          <div class="ax-fam__hd">
+            <span class="ax-fam__nm">${esc(f.display_name)}</span>
+            <span class="ax-fam__n">${rows.length}</span>
+          </div>
+          ${rows.map(({ t, i, block }) => {
+            const key = `${t.type_key}:${i.resource_id}`;
+            const on = pickerState.chosen.has(key);
+            return `
+            <button type="button" class="ax-pk-r ${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
+              <span class="ax-pk-r__box" aria-hidden="true">${on ? "✓" : ""}</span>
+              <span class="ax-r__kd">${esc(kindWord(t))}</span>
+              <span class="ax-pk-r__nm">${esc(i.name || i.resource_id)}${block ? `<span class="ax-r__blk"> · ${esc(block)}</span>` : ""}
+                ${i.description ? `<span class="ax-r__d">${esc(String(i.description).slice(0, 100))}</span>` : ""}
+              </span>
+            </button>`;
+          }).join("")}
+        </div>`;
+      }).join("");
+    }
+    const n = pickerState.chosen.size;
+    els.count.textContent = n ? `${n} selected` : "Nothing selected";
+    els.apply.disabled = !n;
+    els.apply.textContent = n ? `Add ${n} to the group` : "Apply";
+  }
+
+  /* Picking groups reuses the row shape, minus the kind chip: what varies
+     here is the audience, and a group's own line already says how many
+     people that is — the number that decides whether this share is small or
+     not. */
+  function paintGroupPicker(els) {
+    const rows = pickerGroupCandidates();
+    if (!rows.length) {
+      els.list.innerHTML = pickerState.q
+        ? `<div class="ax-empty">No group matches “${esc(pickerState.q)}”.</div>`
+        : `<div class="ax-empty">Every group already has this.</div>`;
+    } else {
+      els.list.innerHTML = rows.map((g) => {
+        const key = g.id;
+        const on = pickerState.chosen.has(key);
+        const n = g.member_count ?? 0;
+        return `
+        <button type="button" class="ax-pk-r ax-pk-r--g ${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
+          <span class="ax-pk-r__box" aria-hidden="true">${on ? "✓" : ""}</span>
+          <span class="ax-pk-r__nm">${esc(titleOf(g))}
+            <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${g.description ? ` · ${esc(g.description)}` : ""}</span>
+          </span>
+        </button>`;
+      }).join("");
+    }
+    const n = pickerState.chosen.size;
+    const reach = [...pickerState.chosen].reduce((sum, id) =>
+      sum + ((overview.groups || []).find((g) => g.id === id)?.member_count ?? 0), 0);
+    // The count says PEOPLE, not groups. "3 groups" hides whether this is a
+    // share with four people or four hundred, which is the thing worth
+    // knowing before pressing Apply.
+    els.count.textContent = n
+      ? `${n} ${n === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`
+      : "No group selected";
+    els.apply.disabled = !n;
+    els.apply.textContent = n ? `Share with ${n} ${n === 1 ? "group" : "groups"}` : "Apply";
+  }
+
+  function openBundlePicker(typeKey, resourceId, label) {
+    const els = buildPicker();
+    pickerState = { mode: "bundle", group: null, bundle: { type: typeKey, id: resourceId }, chosen: new Set(), q: "" };
+    els.q.value = "";
+    els.q.placeholder = "Search groups…";
+    els.root.querySelector("#pk-title").textContent = `Share ${label}`;
+    els.sub.textContent = "Groups that do not have it yet. Added as Available — each person chooses whether to keep a local copy.";
+    paintPicker();
+    els.root.hidden = false;
+    els.root.classList.add("is-open");
+    els.q.focus();
+  }
+
+  function openPicker(groupId) {
+    const els = buildPicker();
+    const g = (overview.groups || []).find((x) => x.id === groupId);
+    pickerState = { mode: "resources", group: groupId, bundle: null, chosen: new Set(), q: "" };
+    els.q.value = "";
+    els.q.placeholder = "Search everything grantable…";
+    els.root.querySelector("#pk-title").textContent = "Add to this group";
+    els.sub.textContent = g
+      ? `Everything ${titleOf(g)} does not have yet. Added as Available — each person chooses whether to keep a local copy.`
+      : "";
+    paintPicker();
+    // `.ds-drawer` is display:none until `.is-open` — the same two-step the
+    // group drawer uses (`group_drawer.js`), because the overlay animates in
+    // and `hidden` alone would skip the transition. Setting one without the
+    // other opens a drawer nobody can see.
+    els.root.hidden = false;
+    els.root.classList.add("is-open");
+    els.q.focus();
+  }
+
+  function closePicker() {
+    if (!pickerEls) return;
+    pickerEls.root.classList.remove("is-open");
+    pickerEls.root.hidden = true;
+  }
+
+  /* Apply writes every choice, then says what happened — including what did
+     NOT happen. A partial failure that reports success is worse than the
+     failure, because the admin walks away believing a grant exists. */
+  async function applyPicker() {
+    const els = buildPicker();
+    const chosen = [...pickerState.chosen];
+    const bundleMode = pickerState.mode === "bundle";
+    els.apply.disabled = true;
+    let ok = 0;
+    const failed = [];
+    for (const key of chosen) {
+      const type = bundleMode ? pickerState.bundle.type : key.slice(0, key.indexOf(":"));
+      const rid = bundleMode ? pickerState.bundle.id : key.slice(key.indexOf(":") + 1);
+      const gid = bundleMode ? key : pickerState.group;
+      try {
+        await writeGrant(type, rid, "available", gid);
+        ok++;
+      } catch (err) {
+        failed.push(bundleMode ? (titleOf((overview.groups || []).find((g) => g.id === key) || {}) || key) : rid);
+      }
+    }
+    closePicker();
+    toast(failed.length
+      ? `${ok} ${bundleMode ? "shared" : "added"}, ${failed.length} failed — ${esc(String(failed[0]))}${failed.length > 1 ? " and others" : ""}`
+      : bundleMode
+        ? `Shared with ${ok} ${ok === 1 ? "group" : "groups"}`
+        : `${ok} added — available to everyone in the group`, !failed.length);
+    await repaint();
+  }
 
   /* ── Simulate ── */
 
@@ -3280,20 +3383,17 @@
     // suggested, so the row is on screen before anything is clicked.
     if (PICK) {
       resourceFilter = PICK.id;
-      el("ax-rfind").value = PICK.id;
     } else {
-      // Restore this sitting's working set (filter + scope). A ?resource=
-      // arrival outranks it — that caller asked for a specific narrowing.
+      // Restore this sitting's filter. A ?resource= arrival outranks it —
+      // that caller asked for a specific narrowing. The scope half of this
+      // went with the All/Granted segment.
       try {
         const ws = JSON.parse(sessionStorage.getItem(WORKSET_KEY) || "null");
-        if (ws) {
-          resourceFilter = ws.f || "";
-          el("ax-rfind").value = resourceFilter;
-          if (ws.s === "granted" || ws.s === "all") {
-            accessScope = ws.s;
-            el("ax-scope").querySelectorAll("[data-scope]").forEach((b) =>
-              b.classList.toggle("is-active", b.dataset.scope === accessScope));
-          }
+        if (ws && ws.f) {
+          resourceFilter = ws.f;
+          groupFilter = ws.f;
+          const gf = el("ax-group-find");
+          if (gf) gf.value = ws.f;
         }
       } catch (e) { /* corrupt store → default view */ }
     }

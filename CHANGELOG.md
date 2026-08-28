@@ -177,6 +177,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **Granting is one act: + Add, choose, Apply.** The All/Granted segment and
+  the *Advanced* tree are both gone — they were two browsing surfaces
+  answering the same question in two places, and the segment named a
+  distinction that stopped existing when the list became the group's holding
+  rather than the instance's catalogue. Each open group ends with **+ Add to
+  this group**, opening a picker of everything it does not have, grouped by
+  family, searchable, applied together. **By bundle gets the same act in
+  reverse**: each bundle carries *Share with another group*, opening the same
+  overlay listing the groups that do not have it — a grant has no direction,
+  only the question you arrived with does. The picker counts what it is about
+  to do in **people, not groups** ("3 groups · 41 people"), since that is what
+  decides whether a share is small. A partial failure reports what did not
+  land, by name. Both use `.ds-drawer`, the app's own overlay, not a modal
+  invented here. **Deliberately dropped with the tree:** the tri-state bucket
+  checkbox that granted a whole bucket in one click; the picker takes many
+  selections but has no select-all-in-bucket. ~280 lines of dead renderer
+  (`typeHtml`, `itemRow`, `itemTable`, the block accordions) deleted with it.
 - **An open group shows what the group HAS, not the whole catalogue.** The
   page listed every grantable resource with a dead control and the words *not
   granted* beside most of them — so every row looked like a control and most

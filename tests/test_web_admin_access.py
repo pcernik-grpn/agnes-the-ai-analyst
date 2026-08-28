@@ -346,38 +346,45 @@ class TestTheGroupItself:
         for label in ("added by admin", "synced from Google", "system-managed"):
             assert label in body, f"roster lost the {label!r} origin"
 
-    def test_the_grant_tree_is_nested_by_block(self, seeded_app):
-        """A type arrives from the API already grouped into blocks — buckets
-        for tables, marketplaces for plugins — and the editor used to flatten
-        them into one list with the block name as a row suffix. At six tables
-        that is tidy; at six hundred it is why nobody can find one bucket,
-        and granting a whole bucket means ticking every row in it."""
-        body = self._body(seeded_app)
-        # The bucket level, its bulk control, and the three states that
-        # control has to be able to show.
-        assert "ax-blk" in body
-        assert "data-bucket=" in body
-        assert "paintBucketBoxes" in body
-        assert "indeterminate" in body
-        # A type whose blocks are decorative (one block named after the type)
-        # must NOT grow a disclosure holding the only thing under it.
-        assert "isNested" in body
+    def test_adding_is_one_act_not_a_tree_to_browse(self, seeded_app):
+        """Replaces `test_the_grant_tree_is_nested_by_block`.
 
-    def test_a_bucket_grants_through_the_same_endpoints(self, seeded_app):
-        """There is no bulk grant API, and inventing one for this control
-        would put a second write path behind the page. The bucket loops the
-        per-item endpoints the single rows already use."""
-        body = self._body(seeded_app)
-        assert "writeGrant" in body and "deleteGrant" in body
-        assert "/api/admin/grants" in body
+        The nested bucket tree (and the Advanced tree it later became) was
+        the page's way to grant: browse every grantable resource, tick rows
+        in place. The open group now shows only what the group HAS, and
+        adding is one deliberate act — a + Add row opening a picker of
+        everything it does not have, chosen and applied together.
 
-    def test_the_grant_tree_can_be_filtered(self, seeded_app):
-        """The detail page had this and the workspace did not — the one place
-        the collapse would have cost a capability, since "give Finance the
-        revenue package" means finding one row among hundreds."""
+        Capability deliberately dropped with the tree: the tri-state bucket
+        checkbox that granted a whole bucket in one click. The picker takes
+        many selections at once, but there is no select-all-in-bucket. If
+        that is missed, it belongs in the picker, not in a second tree.
+        """
         body = self._body(seeded_app)
-        assert 'id="ax-rfind"' in body
-        assert "Filter by name, marketplace, category" in body
+        assert "data-add-grant" in body          # the one way in, per group
+        assert "openPicker" in body              # …opens the picker
+        assert "data-share-bundle" in body       # and the same act by bundle
+        assert "openBundlePicker" in body
+        # The tree and its bulk control are gone, not hidden.
+        assert "data-bucket=" not in body
+        assert 'class="ax-blk"' not in body
+
+    def test_finding_one_row_among_hundreds_still_works(self, seeded_app):
+        """Replaces `test_the_grant_tree_can_be_filtered`.
+
+        "Give Finance the revenue package" still has to mean finding one row
+        among hundreds — the capability the per-group filter existed for.
+        Two controls carry it now, and neither is a second search box beside
+        the first: the header search narrows the group list *and* what an
+        open group shows, and the picker has its own search over everything
+        not yet granted.
+        """
+        body = self._body(seeded_app)
+        assert 'id="ax-group-find"' in body       # the one page-level search
+        assert "Search everything grantable" in body   # the picker's own
+        # The per-group input is gone: two search boxes on one surface, one
+        # of them hidden, was the ambiguity this collapse removed.
+        assert 'id="ax-rfind"' not in body
 
     def test_the_resource_deep_link_still_lands(self, seeded_app):
         """/admin/tables' per-row Manage-access sent `#table:<id>` to the

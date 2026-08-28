@@ -116,9 +116,10 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         assert src.count('data-tier="required"') == 1
         assert src.count("const tierControl") == 1
         # The definition is `const tierControl = (…) =>`, so it does not
-        # match `tierControl(` — this counts call sites only: the group
-        # rows, the bundle rows, and Advanced.
-        assert src.count("tierControl(") == 3
+        # match `tierControl(` — this counts call sites only. Two now: the
+        # group's own rows and the bundle view's. Advanced was the third and
+        # was removed with the browsing tree.
+        assert src.count("tierControl(") == 2
 
     def test_simulate_speaks_the_person_s_words(self):
         src = self._source()
