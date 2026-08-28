@@ -7382,9 +7382,9 @@ def _source_inventory(user: dict | None = None) -> dict:
             # unallowlisted name, in which case Import would 400 even though
             # the card looks ready. Gate the button on this too rather than
             # advertise a one-click path that dead-ends for that config.
-            from src.orchestrator_security import is_token_env_allowed
+            from src.orchestrator_security import is_config_secret_env_allowed
 
-            row["token_env_allowlisted"] = is_token_env_allowed(row["token_env"])
+            row["token_env_allowlisted"] = is_config_secret_env_allowed(row["token_env"])
         derived.append(row)
 
     try:

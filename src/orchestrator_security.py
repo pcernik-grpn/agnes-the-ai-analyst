@@ -5,6 +5,13 @@ The orchestrator reads `_remote_attach` rows that connectors write into their
 values. Treating the connector as adversarial (compromised image, supply-chain,
 malicious fork) means the orchestrator picks **what** can be installed and
 **which** env vars can be referenced — not the connector.
+
+A second allowlist lives here because its consumers share the structural
+checks, but it gates a DIFFERENT consumer class and must never share
+membership with the ATTACH set by accident: `_CONFIG_SECRET_ONLY_ENVS` /
+`is_config_secret_env_allowed` — outbound config-driven secret resolution
+(settings resolvers reading an env-var NAME from admin-writable connection
+config). See that set's comment for the trust-boundary argument.
 """
 
 from __future__ import annotations
@@ -41,6 +48,12 @@ _COMMUNITY_EXTENSIONS: frozenset[str] = frozenset(
 # default is intentionally tight — every name in the runtime env that is not
 # on this list cannot be exfiltrated to a connector-controlled URL.
 # Operators add deployment-specific names via AGNES_REMOTE_ATTACH_TOKEN_ENVS.
+#
+# DATA-SOURCE ATTACH TOKENS ONLY. A secret that is resolved by name from
+# admin-writable config but never travels as an `ATTACH ... TOKEN` belongs in
+# `_CONFIG_SECRET_ONLY_ENVS` below, NOT here — membership here makes a name a
+# legal `token_env` on a connector-written `_remote_attach` row, i.e.
+# exfiltratable to a connector-chosen host.
 _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
     {
         "KBC_TOKEN",
@@ -50,20 +63,44 @@ _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
         "DATABRICKS_TOKEN",  # workspace PAT for the Unity Catalog ATTACH
         "SNOWFLAKE_PASSWORD",  # Snowflake user password for the snowflake extension ATTACH
         "SNOWFLAKE_PRIVATE_KEY",  # Snowflake key-pair private key (may contain passphrase JSON)
-        # Decrypts SNOWFLAKE_PRIVATE_KEY locally before the ATTACH — never sent
-        # as the TOKEN itself, but resolved by the same name-selected lookup
-        # (connectors.snowflake.settings._resolve_secret) as the two names
-        # above, so it needs the same allowlist membership or the module's
-        # own default key-pair passphrase path breaks for every deploy that
-        # relies on it (RBAC review second round, 2026-08-26).
-        "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
-        # PEM private key for a SharePoint app registration's certificate.
+    }
+)
+
+# Env var names resolvable ONLY through config-driven secret resolution —
+# the settings resolvers (connectors/{sharepoint,snowflake}/settings.py,
+# connectors/{databricks,keboola}/semantic_layer.py,
+# app/api/admin_source_connections.py) where the NAME sits in admin-writable
+# connection config and the value goes to that source's own client.
+#
+# Deliberately NOT part of `_DEFAULT_TOKEN_ENVS` above, and this set must
+# NEVER be merged into it. `_DEFAULT_TOKEN_ENVS` feeds `get_allowed_token_
+# envs()` / `is_token_env_allowed()`, which gate a SECOND, unrelated
+# consumer: `token_env` on a connector-written `_remote_attach` row
+# (src/orchestrator.py, src/db.py) — a value a CONNECTOR chooses, resolved
+# and sent as an `ATTACH ... TOKEN` to a connector-chosen `url`
+# (`is_attach_host_allowed` is default-open with no
+# `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST` configured). Listing a name here AND
+# there would let a malicious/compromised connector's extract.duckdb declare
+# a `_remote_attach` row with e.g. `token_env=SHAREPOINT_CERT_PRIVATE_KEY`
+# and have the orchestrator exfiltrate the certificate private key to an
+# attacker-controlled host on every query. Same consumer-class split the
+# anonymization HMAC key got in PR #1715 (`_PRODUCER_KEY_ENVS`); ratchet:
+# tests/test_config_secret_env_security.py.
+#
+# Operators add deployment-specific names via AGNES_CONFIG_SECRET_ENVS
+# (REPLACES this set, same semantics as the other overrides). Data-source
+# tokens that legitimately serve BOTH classes (KBC_*/SNOWFLAKE_PASSWORD/...)
+# stay in `_DEFAULT_TOKEN_ENVS`; `get_allowed_config_secret_envs()` unions
+# them in, so they are never listed twice.
+_CONFIG_SECRET_ONLY_ENVS: frozenset[str] = frozenset(
+    {
+        # PEM private key for a SharePoint app registration's certificate —
         # Microsoft Graph refuses client secrets for app-only access, so the
-        # certificate IS the credential. Resolved by name through
-        # connectors.sharepoint.settings, which funnels every lookup through
-        # is_token_env_allowed() for the same reason the Snowflake names above
-        # do: the variable name lives in admin-writable connection config.
+        # certificate IS the credential (connectors.sharepoint.settings).
         "SHAREPOINT_CERT_PRIVATE_KEY",
+        # Decrypts SNOWFLAKE_PRIVATE_KEY locally before the ATTACH — never
+        # sent as the TOKEN itself (connectors.snowflake.settings).
+        "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
     }
 )
 
@@ -131,6 +168,37 @@ def is_token_env_allowed(token_env: str) -> bool:
     return token_env in get_allowed_token_envs()
 
 
+def get_allowed_config_secret_envs() -> set[str]:
+    """Return the effective config-resolution secret allowlist.
+
+    The union of the config-only names (AGNES_CONFIG_SECRET_ENVS override, or
+    :data:`_CONFIG_SECRET_ONLY_ENVS`) and the effective connector-ATTACH set
+    (:func:`get_allowed_token_envs`, override and all) — the settings
+    resolvers legitimately read the same data-source tokens the ATTACH
+    boundary allows. The union is one-directional by construction: nothing
+    here ever feeds back into :func:`get_allowed_token_envs`.
+    """
+    override = _parse_csv_env("AGNES_CONFIG_SECRET_ENVS")
+    config_only = override if override else set(_CONFIG_SECRET_ONLY_ENVS)
+    return config_only | get_allowed_token_envs()
+
+
+def is_config_secret_env_allowed(name: str) -> bool:
+    """Return True if ``name`` may be resolved by a config-driven settings
+    resolver (an env-var NAME taken from admin-writable connection config /
+    instance yaml, value handed to that source's own client).
+
+    Same two checks as :func:`is_token_env_allowed` (structural regex, then
+    membership) but against :func:`get_allowed_config_secret_envs`. Do not
+    use this function for the connector-ATTACH ``token_env`` gate — that
+    boundary must stay on :func:`is_token_env_allowed`, which can never see
+    the config-only secrets; see :data:`_CONFIG_SECRET_ONLY_ENVS` for why.
+    """
+    if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+        return False
+    return name in get_allowed_config_secret_envs()
+
+
 def log_effective_policy() -> None:
     """Log the effective extension + token-env allowlists at INFO once.
 
@@ -142,16 +210,21 @@ def log_effective_policy() -> None:
     """
     ext = get_allowed_extensions()
     envs = get_allowed_token_envs()
+    config_envs = get_allowed_config_secret_envs()
     has_ext_override = bool(_parse_csv_env("AGNES_REMOTE_ATTACH_EXTENSIONS"))
     has_env_override = bool(_parse_csv_env("AGNES_REMOTE_ATTACH_TOKEN_ENVS"))
+    has_config_override = bool(_parse_csv_env("AGNES_CONFIG_SECRET_ENVS"))
     logger.info(
-        "remote_attach policy: extensions=%s (override=%s), token_envs=%s (override=%s). "
+        "remote_attach policy: extensions=%s (override=%s), token_envs=%s (override=%s), "
+        "config_secret_envs=%s (override=%s). "
         "Note: env-var overrides REPLACE the default — set both yours and the "
         "defaults if you want to add to them.",
         sorted(ext["community"] | ext["builtin"]),
         has_ext_override,
         sorted(envs),
         has_env_override,
+        sorted(config_envs),
+        has_config_override,
     )
 
 

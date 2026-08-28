@@ -708,6 +708,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **Security: config-resolution secrets are no longer valid connector-ATTACH
+  `token_env`s.** The single token-env allowlist fed two independent trust
+  boundaries: the settings resolvers that read a secret named in admin-written
+  connection config (SharePoint certificate private key, Snowflake key-pair
+  passphrase), and the `_remote_attach` gate that resolves a token_env a
+  *connector* wrote into its extract.duckdb and sends the value as
+  `ATTACH … TOKEN` to the row's own URL. Sharing the list meant a
+  malicious/compromised connector could name `SHAREPOINT_CERT_PRIVATE_KEY` (or
+  `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`) as its `token_env` and have the
+  orchestrator ship that secret to a connector-chosen host on every query. The
+  allowlist is now split per consumer class: the ATTACH gate accepts
+  data-source attach tokens only, config-driven resolvers check the new union
+  gate (`is_config_secret_env_allowed`), and a ratchet test keeps every
+  config-only secret out of the ATTACH set for good. Operators extend the
+  config-resolution side with `AGNES_CONFIG_SECRET_ENVS` (replaces the
+  config-only defaults; `AGNES_REMOTE_ATTACH_TOKEN_ENVS` keeps governing the
+  ATTACH side and still flows into the union, so existing overrides keep
+  working).
 - **MCP foundation-tool errors now carry the server's remedy, and the chat
   approval card says what it is approving.** Every foundation tool used a bare
   `raise_for_status()`, so a 4xx surfaced to the model as a generic
