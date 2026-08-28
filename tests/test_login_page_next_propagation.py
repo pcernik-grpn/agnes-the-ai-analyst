@@ -92,19 +92,16 @@ def test_login_page_app_origin_next_blanked_when_data_apps_disabled(web_client, 
 # --- /login/password: hidden form field carries `next` ----------------------
 
 
-def test_login_password_page_renders_app_origin_next_but_the_post_still_drops_it(web_client, apps_on):
-    """Pins RENDERING only — the password journey is NOT fixed end to end.
+def test_login_password_page_renders_app_origin_next(web_client, apps_on):
+    """Pins RENDERING — the first half of the password journey.
 
-    The form this renders POSTs to the password provider's web handler, which
-    keeps its own copy of the pre-widening rule and replaces any non-`/` target
-    with the home route. So a green assertion here does not mean a visitor
-    signing in with a password lands back in the app: they do not.
-
-    Named for what it proves rather than for what it looks like it proves,
-    because that gap is precisely how this bug shipped — the previous test
-    asserted the guard accepts the shape and was read as proof the route used
-    the guard. Do not rename this to something reassuring without also fixing
-    the POST handler.
+    This was named ``..._but_the_post_still_drops_it`` and its docstring said
+    not to rename it to anything reassuring without also fixing the POST
+    handler, because a green assertion on the rendered form was exactly what
+    would otherwise read as proof the journey worked. The handler is fixed in
+    this PR (``test_password_form_post_returns_the_visitor_to_the_app_origin``
+    below drives the real POST), so the warning has been earned out and the
+    name no longer has to carry it.
     """
     resp = web_client.get("/login/password", params={"next": APP_ORIGIN})
     assert resp.status_code == 200

@@ -135,7 +135,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
   operator alert now surfaces too.
 
-- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+- **Signing in dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app — on every provider, password included.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
   The password provider's web-form POST handler — the terminal consumer of the
   form `/login/password` renders, and the reason a *password* sign-in still
   landed on the home route while OAuth and magic-link returned you to the app —
