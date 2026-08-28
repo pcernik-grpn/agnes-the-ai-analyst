@@ -510,6 +510,25 @@ async def delete_marketplace(
     if not existing:
         raise HTTPException(status_code=404, detail="marketplace not found")
 
+    # A built-in row is not an admin-registered pointer that can be dropped and
+    # re-added: `agnes-builtin` is re-seeded from the wheel on every boot (so the
+    # delete is a no-op the next restart undoes), and the contributed
+    # marketplace has NO re-seed at all — with `purge=true` its locally written
+    # skills are gone for good, which is the same content-destroying shape as
+    # the sync bug this release fixes. Retiring built-in content is what the
+    # per-plugin disable is for; it drops a plugin from every served surface
+    # without touching the row or the disk.
+    if existing.get("is_builtin"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"marketplace {marketplace_id!r} is built-in and cannot be deleted — its content "
+                "ships with the instance (or is written locally) and has no registered remote. "
+                "To retire its content, disable the individual plugins instead "
+                "(POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable)."
+            ),
+        )
+
     # Also clear any overlay token binding so a re-created marketplace of the
     # same slug doesn't accidentally inherit the old PAT.
     if existing.get("token_env"):
