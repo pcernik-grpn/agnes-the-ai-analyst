@@ -4149,6 +4149,7 @@
         "type": "object"
       },
       "FactsCorrectionRequest": {
+        "additionalProperties": false,
         "properties": {
           "reason": {
             "maxLength": 2000,
@@ -4256,6 +4257,7 @@
         "type": "object"
       },
       "FactsNeighborsRequest": {
+        "additionalProperties": false,
         "properties": {
           "depth": {
             "default": 1,
@@ -4304,6 +4306,7 @@
         "type": "object"
       },
       "FactsSearchRequest": {
+        "additionalProperties": false,
         "properties": {
           "filters": {
             "anyOf": [
@@ -4323,6 +4326,18 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "q": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Q"
           },
           "type": {
             "anyOf": [
@@ -38770,7 +38785,7 @@
     },
     "/api/facts/search": {
       "post": {
-        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). Response:\n``{\"subjects\": [{\"id\", \"type\", \"aliases\", \"attrs\", \"claim_count\",\n\"quote_count\", \"revealed\"}], \"limit_applied\"}`` \u2014 `limit_applied` is\nTrue only when the CALLER'S OWN readable result set exceeds `limit`,\nnever a signal that grants hid additional matches.",
+        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). ``q`` is an\nOPTIONAL free-text name lookup matched against alias natural keys ONLY\n(never claim text) \u2014 see :meth:`FactsPgRepository.search` for the\nnormalization and ranking rules. Response: ``{\"subjects\": [{\"id\",\n\"type\", \"aliases\", \"attrs\", \"claim_count\", \"quote_count\", \"revealed\"}],\n\"limit_applied\"}`` \u2014 `limit_applied` is True only when the CALLER'S OWN\nreadable result set exceeds `limit`, never a signal that grants hid\nadditional matches.",
         "operationId": "facts_search_api_facts_search_post",
         "parameters": [
           {

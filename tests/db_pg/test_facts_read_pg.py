@@ -614,6 +614,197 @@ def test_s6_limit_applied_true_when_the_callers_own_visible_set_is_truncated(pg_
 
 
 # ---------------------------------------------------------------------------
+# Q — free-text name lookup against fact_aliases.natural_key (TCRD follow-up:
+# the search API had no free-text parameter at all, so an unknown `q` field
+# was silently swallowed by pydantic's default extra='ignore' and the call
+# degenerated to an unfiltered, id-ordered dump).
+# ---------------------------------------------------------------------------
+
+
+def test_q_ranks_the_matching_subject_first(pg_env, repo):
+    """Ordering-sensitive: three subjects, three distinct `q` values — each
+    query must return ITS planted subject first, not merely somewhere in an
+    id-ordered dump. This is the test that fails against the pre-`q` code
+    (which ignores `q` entirely and orders by `v.subject_id`, a random hex
+    id with no relation to any query)."""
+    _seed_full_fixture()
+
+    parts_authority = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=parts_authority, type="organization", natural_key="organization:parts-authority")
+    repo.add_claim(
+        fact_id=parts_authority,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Parts Authority is a client.",
+    )
+
+    alpha_logistics = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=alpha_logistics, type="organization", natural_key="organization:alpha-logistics")
+    repo.add_claim(
+        fact_id=alpha_logistics,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Alpha Logistics is a client.",
+    )
+
+    beta_industries = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=beta_industries, type="organization", natural_key="organization:beta-industries")
+    repo.add_claim(
+        fact_id=beta_industries,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Beta Industries is a client.",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    # Natural-language queries (spaces, mixed case) must normalize
+    # (casefold + spaces->hyphens) to match the `<type>:<kebab-slug>` alias.
+    for query, expected_first in (
+        ("Parts Authority", parts_authority),
+        ("Alpha Logistics", alpha_logistics),
+        ("Beta Industries", beta_industries),
+    ):
+        result = repo.search(_dict_user("alice"), type="organization", q=query)
+        assert result["subjects"], f"q={query!r} returned nothing"
+        assert result["subjects"][0]["id"] == expected_first, (
+            f"q={query!r} did not rank its planted subject first: got {result['subjects']}"
+        )
+
+    # `q` is optional -- the unfiltered call still returns every visible
+    # subject (order-independent check; ordering is q's job, not the
+    # default's).
+    unfiltered = repo.search(_dict_user("alice"), type="organization")
+    assert {s["id"] for s in unfiltered["subjects"]} == {parts_authority, alpha_logistics, beta_industries}
+
+
+def test_q_filters_out_non_matching_subjects(pg_env, repo):
+    """`q` is a filter, not merely a sort key: a subject with no alias
+    matching `q` must not appear at all, even though it is otherwise fully
+    visible (S6 shortfall rule: filtering happens PRE-limit in SQL)."""
+    _seed_full_fixture()
+
+    matching = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=matching, type="organization", natural_key="organization:parts-authority")
+    repo.add_claim(
+        fact_id=matching, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Parts Authority."
+    )
+
+    other = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=other, type="organization", natural_key="organization:zephyr-corp")
+    repo.add_claim(fact_id=other, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Zephyr Corp.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="organization", q="parts")
+    assert [s["id"] for s in result["subjects"]] == [matching]
+
+
+def test_q_never_matches_claim_text_only_aliases(pg_env, repo):
+    """`q` matches `fact_aliases.natural_key` ONLY -- never claim quotes or
+    attrs -- so it can never reopen the S2 attribute oracle. A word that
+    appears solely in a claim's quote must not surface the subject."""
+    _seed_full_fixture()
+
+    fact_id = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=fact_id, type="organization", natural_key="organization:generic-co")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="This company handles unobtainium logistics exclusively.",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="organization", q="unobtainium")
+    assert result["subjects"] == []
+
+
+def test_q_exact_match_ranks_above_prefix_and_substring_matches(pg_env, repo):
+    """Deterministic non-extension ranking tiers: an exact slug match beats
+    a prefix match, which beats a plain substring match."""
+    _seed_full_fixture()
+
+    exact = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=exact, type="organization", natural_key="organization:acme")
+    repo.add_claim(fact_id=exact, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
+
+    prefix = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=prefix, type="organization", natural_key="organization:acme-holdings")
+    repo.add_claim(
+        fact_id=prefix, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme Holdings."
+    )
+
+    substring = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=substring, type="organization", natural_key="organization:new-acme-ventures")
+    repo.add_claim(
+        fact_id=substring, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="New Acme Ventures."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="organization", q="acme")
+    ids = [s["id"] for s in result["subjects"]]
+    assert ids == [exact, prefix, substring]
+
+
+def test_q_empty_string_is_treated_as_absent(pg_env, repo):
+    """A blank/whitespace-only `q` degrades to "no free-text filter" rather
+    than matching everything or nothing surprising."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=fact_id, type="organization", natural_key="organization:solo-co")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Solo Co.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="organization", q="   ")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+
+
+def test_q_escapes_like_metacharacters(pg_env, repo):
+    """A literal `%`/`_` in `q` must be treated as a literal character, not
+    a LIKE wildcard -- an unescaped `_` would match any single character."""
+    _seed_full_fixture()
+
+    literal = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=literal, type="organization", natural_key="organization:100%-co")
+    repo.add_claim(fact_id=literal, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="100%-Co.")
+
+    decoy = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=decoy, type="organization", natural_key="organization:100xco")
+    repo.add_claim(fact_id=decoy, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="100xCo.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-a", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="organization", q="100%-co")
+    assert [s["id"] for s in result["subjects"]] == [literal]
+
+
+# ---------------------------------------------------------------------------
 # S8 (read side) — corrections enforced at read time.
 # ---------------------------------------------------------------------------
 

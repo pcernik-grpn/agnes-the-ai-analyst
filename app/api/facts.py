@@ -56,7 +56,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth.access import require_admin, require_facts_enabled
 from app.auth.dependencies import get_current_user
@@ -78,12 +78,23 @@ router = APIRouter(
 
 
 class FactsSearchRequest(BaseModel):
+    # extra='forbid' (TCRD follow-up from a live finding): this endpoint had
+    # no free-text parameter at all, so an unknown field like the `q` a
+    # caller might guess at was silently swallowed by pydantic's default
+    # extra='ignore' — the call degenerated to an unfiltered, id-ordered
+    # dump instead of erroring. An unknown field on ANY facts request model
+    # must 422, never be swallowed into a convincing wrong answer.
+    model_config = ConfigDict(extra="forbid")
+
     type: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
+    q: Optional[str] = Field(default=None, max_length=200)
     limit: int = Field(default=20, ge=1, le=100)
 
 
 class FactsNeighborsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     subject_id: str
     edge_types: Optional[List[str]] = None
     depth: int = Field(default=1, ge=1, le=2)
@@ -102,14 +113,17 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     from readable claims only, per-key latest-document_date-wins with a
     `conflicted` marker on a genuine tie — the projection runs in SQL so
     `filters` evaluate against it BEFORE the `limit` is applied (never a
-    Python post-filter, which would leak a shortfall signal). Response:
-    ``{"subjects": [{"id", "type", "aliases", "attrs", "claim_count",
-    "quote_count", "revealed"}], "limit_applied"}`` — `limit_applied` is
-    True only when the CALLER'S OWN readable result set exceeds `limit`,
-    never a signal that grants hid additional matches.
+    Python post-filter, which would leak a shortfall signal). ``q`` is an
+    OPTIONAL free-text name lookup matched against alias natural keys ONLY
+    (never claim text) — see :meth:`FactsPgRepository.search` for the
+    normalization and ranking rules. Response: ``{"subjects": [{"id",
+    "type", "aliases", "attrs", "claim_count", "quote_count", "revealed"}],
+    "limit_applied"}`` — `limit_applied` is True only when the CALLER'S OWN
+    readable result set exceeds `limit`, never a signal that grants hid
+    additional matches.
     """
     try:
-        return facts_repo().search(user, type=body.type, filters=body.filters or {}, limit=body.limit)
+        return facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -290,6 +304,8 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
 
 
 class FactsCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     verdict: str = Field(pattern="^(wrong|restricted|revealed)$")
     reason: str = Field(min_length=1, max_length=2000)
 

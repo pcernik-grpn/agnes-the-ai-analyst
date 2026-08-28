@@ -1622,12 +1622,21 @@ admin gate; visibility is enforced entirely server-side, per caller, from
 readable collection grants (§4/§5). `search` and `neighbors` project
 attributes and traverse edges from readable claims only; `claims` returns
 the caller's readable evidence for one subject, `404` (never `403`) when it
-does not exist or has no readable claim. Triple-surface: `agnes facts
-search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/
-`fact_claims` (MCP foundation tools) call the same repository directly —
-facts have no local scope, so every result is labeled `[server]` on the
-CLI's stderr, a deliberate deviation from the `--scope auto|local|server`
-convention (spec §12).
+does not exist or has no readable claim. `search` also accepts an OPTIONAL
+`q` — a free-text name lookup matched against `fact_aliases.natural_key`
+ONLY (never a claim's quote or attrs, so it cannot reopen the §5 attribute
+oracle): the query is normalized (casefolded, spaces -> hyphens) and matched
+as a substring, filtering candidates before `limit` applies, then ranked —
+an exact match on the alias's slug first, a prefix match second, any other
+substring match last (no `pg_trgm`/extension similarity ranking; this
+schema does not enable one). All three request models are `extra="forbid"`
+— an unrecognized field `422`s rather than being silently ignored. Triple-
+surface: `agnes facts search|neighbors|claims` (CLI; `search` takes an
+optional second positional `[query]` for `q`) and `fact_search`/
+`fact_neighbors`/`fact_claims` (MCP foundation tools) call the same
+repository directly — facts have no local scope, so every result is labeled
+`[server]` on the CLI's stderr, a deliberate deviation from the `--scope
+auto|local|server` convention (spec §12).
 
 **Write surface** (build order step 4) — scheduler token or admin PAT, no
 CLI/MCP by design (a producer contract, not an analyst command). `ingest`
