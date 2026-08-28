@@ -277,3 +277,112 @@ class TestATurnCanRunWithoutWriting:
         assert after["status"] == before["status"] == "draft"
         assert after["is_default"] == before["is_default"]
         assert after["slug"] == before["slug"]
+
+
+class TestAPartialSurfacesPatchDoesNotSwitchTheOthersOff:
+    """`surfaces` is one opaque JSON column and both writers replace it whole.
+
+    `update_agent` `json.dumps`es whatever the patch holds, and the page does
+    `a[k] = patch[k]` into its working copy before Save sends it. Meanwhile the
+    prompt asks the model for "only the fields you are changing this turn", and
+    the schema lets it answer `{"surfaces": {"mcp": true}}` — the honest answer
+    for a turn about one surface. Read literally, that turns Slack and Telegram
+    OFF as a side effect of turning MCP on, and the reply says only that MCP was
+    enabled.
+
+    Fixed at the sanitizer because it is the one place both writers pass
+    through: the patch it returns always carries the complete map, so the
+    server-applied path and the page's own merge are both correct.
+
+    Found by a review bot on PR #1679.
+    """
+
+    def test_the_surfaces_the_patch_is_silent_about_survive(self):
+        patch = _sanitize_patch(
+            {"surfaces": {"mcp": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": True, "slack": True, "telegram": True, "cli": False, "mcp": False},
+        )
+        assert patch["surfaces"] == {
+            "web": True,
+            "slack": True,
+            "telegram": True,
+            "cli": False,
+            "mcp": True,
+        }
+
+    def test_the_patch_still_wins_where_it_speaks(self):
+        """Merging must not become "never turns anything off" — an owner who
+        asks for Slack to be switched off has to get that."""
+        patch = _sanitize_patch(
+            {"surfaces": {"slack": False}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": True, "slack": True},
+        )
+        assert patch["surfaces"]["slack"] is False
+
+    def test_web_stays_on_even_when_the_stored_row_had_it_off(self):
+        patch = _sanitize_patch(
+            {"surfaces": {"slack": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": False},
+        )
+        assert patch["surfaces"]["web"] is True
+
+    def test_a_stored_surface_the_product_no_longer_has_is_not_carried_forward(self):
+        """The merge base is stored JSON, so it is as untrusted as the model's
+        half — an unknown key must not ride back in through it."""
+        patch = _sanitize_patch(
+            {"surfaces": {"mcp": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": True, "carrier_pigeon": True},
+        )
+        assert "carrier_pigeon" not in patch["surfaces"]
+
+    def test_no_stored_surfaces_at_all_is_survivable(self):
+        patch = _sanitize_patch(
+            {"surfaces": {"slack": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+        )
+        assert patch["surfaces"] == {"web": True, "slack": True}
+
+    def test_end_to_end_a_turn_about_one_surface_leaves_the_rest_alone(self, builder, monkeypatch):
+        """The behaviour through the endpoint: the agent's stored row keeps the
+        surfaces the conversation never mentioned."""
+        import app.api.agent_builder as ab
+
+        client, agent_id, owner = builder["client"], builder["agent_id"], builder["owner"]
+        # The owner has Slack and Telegram on before the conversation starts.
+        r = client.put(
+            f"/api/v1/agents/{agent_id}",
+            json={"surfaces": {"web": True, "slack": True, "telegram": True, "cli": False, "mcp": False}},
+            headers=_auth(owner),
+        )
+        assert r.status_code == 200, r.text
+
+        # A model that answers the way the prompt asks it to: only what changed.
+        monkeypatch.setattr(ab, "stub_enabled", lambda: False)
+        monkeypatch.setattr(
+            ab,
+            "_llm_turn",
+            lambda prompt: {"reply": "Turned MCP on.", "patch": {"surfaces": {"mcp": True}}},
+        )
+        r = _turn(builder, "expose it over MCP too")
+        assert r.status_code == 200, r.text
+        assert r.json()["patch"]["surfaces"] == {
+            "web": True,
+            "slack": True,
+            "telegram": True,
+            "cli": False,
+            "mcp": True,
+        }
+
+        stored = client.get(f"/api/v1/agents/{agent_id}", headers=_auth(owner)).json()["surfaces"]
+        assert stored["slack"] is True, "the turn switched Slack off without saying so"
+        assert stored["telegram"] is True
+        assert stored["mcp"] is True

@@ -216,6 +216,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving an admin to know that rule by heart. Groups get the same treatment in
   a follow-up — that pool carries a three-state tier per row and a grant diff on
   save.
+- **A partial `surfaces` patch from the agent builder no longer switches the
+  other surfaces off.** `surfaces` is one opaque JSON column and both writers
+  replace it wholesale — `update_agent` `json.dumps`es the patch, and the
+  `/agents` page assigns `a[k] = patch[k]` into its working copy — while the
+  builder prompt asks the model for "only the fields you are changing this
+  turn", whose honest answer for a turn about one surface is `{"mcp": true}`.
+  Read literally, that turned an owner's Slack and Telegram off as a side
+  effect of turning MCP on, and the reply said only that MCP was enabled.
+  `_sanitize_patch` now merges the proposal over the effective configuration
+  (the saved row overlaid with the page's unsaved copy) — at the sanitizer
+  because that is the one place both writers pass through, so the patch the
+  page merges is complete too. A patch that explicitly turns a surface off
+  still does, and web chat is still forced on.
 - **A group the package builder proposed never reached the panel.** `applyPatch`
   ticked group rows by querying `[data-pdw-group]`, an attribute nothing in the
   product emits — a row is `[data-group-id]` wrapping an unlabelled checkbox — and

@@ -319,6 +319,7 @@ def _sanitize_patch(
     *,
     knowledge_ids: set,
     plugin_ids: set,
+    current_surfaces: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Reduce a model-proposed patch to what it is allowed to change.
 
@@ -349,15 +350,29 @@ def _sanitize_patch(
         elif key == "surfaces":
             if isinstance(value, dict):
                 clean = {k: bool(v) for k, v in value.items() if k in SURFACES and isinstance(v, bool)}
-                # Web chat is the base surface the builder itself previews on;
-                # an assistant turning it off would silently break Preview.
                 if clean:
-                    clean["web"] = True
-                    patch[key] = clean
+                    # MERGED over what the agent already runs on, never
+                    # substituted for it. `surfaces` is one opaque JSON column
+                    # and both writers replace it wholesale — `update_agent`
+                    # json.dumps the patch, and the page assigns
+                    # `a[k] = patch[k]` into its working copy — while the
+                    # prompt asks the model for "only the fields you are
+                    # changing", whose honest answer for one surface is
+                    # `{"mcp": true}`. Taking that literally would switch an
+                    # owner's Slack and Telegram off as a side effect of
+                    # turning MCP on, and the reply would say only that MCP was
+                    # enabled. Merging HERE rather than at either writer means
+                    # the patch the page merges is complete too, so both paths
+                    # are fixed at the boundary that already exists for this.
+                    merged = {k: bool(v) for k, v in (current_surfaces or {}).items() if k in SURFACES}
+                    merged.update(clean)
+                    # Web chat is the base surface the builder itself previews
+                    # on; an assistant turning it off would silently break
+                    # Preview.
+                    merged["web"] = True
+                    patch[key] = merged
     if not patch:
         return {}
-    # Second gate: the column-length constraints, enforced by the same model
-    # the hand-edit PATCH validates against.
     # Second gate: the column-length constraints. The deleted `AgentUpdate`
     # carried these as pydantic max_lengths; v1's `UpdateAgentRequest` does
     # not constrain them at all, so validating through it alone would let a
@@ -534,6 +549,10 @@ async def builder_turn(
         result.get("patch"),
         knowledge_ids=knowledge_ids,
         plugin_ids=plugin_ids,
+        # `config` is the effective state — the saved row overlaid with the
+        # page's unsaved copy — which is what a partial surfaces patch has to
+        # merge over.
+        current_surfaces=config.get("surfaces") if isinstance(config.get("surfaces"), dict) else None,
     )
     agent: Optional[Dict[str, Any]] = None
     if patch and payload.apply:
