@@ -2878,6 +2878,24 @@ KNOWN_UNTESTED = {
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
+    # Ontology builder (spec §13.2) — the admin builder-shell page and its
+    # draft CRUD + state-machine actions + dry-run are covered directly by
+    # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and
+    # tests/db_pg/test_ontology_admin_pg.py (auth matrix, flag gate, DuckDB
+    # typed-501, Save-only-write, mocked-LLM dry-run); not duplicated here.
+    "GET /admin/ontology",
+    "GET /api/admin/ontology/drafts",
+    "POST /api/admin/ontology/drafts",
+    "GET /api/admin/ontology/drafts/{draft_id}",
+    "PUT /api/admin/ontology/drafts/{draft_id}",
+    "DELETE /api/admin/ontology/drafts/{draft_id}",
+    "POST /api/admin/ontology/drafts/{draft_id}/import",
+    "POST /api/admin/ontology/drafts/{draft_id}/save",
+    "POST /api/admin/ontology/dry-run",
+    # Persisted ingest-run reports for the source card (spec §7.2/§13.2) —
+    # covered by tests/db_pg/test_facts_ingest_runs_pg.py + the source-card
+    # PG test; the write happens post-ingest in tests/db_pg/test_facts_ingest_pg.py.
+    "GET /api/facts/ingest-runs",
 }
 
 
