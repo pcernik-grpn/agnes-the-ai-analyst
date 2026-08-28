@@ -227,10 +227,20 @@ Every projected row is stamped with the model's `source` and `source_ref`, and a
 sync prunes only within its own `(source, source_ref)`. Two sources can never
 delete each other's rows.
 
-One documented exception: `column_metadata` has no `source_ref` column, so column
-descriptions prune at `(table_id, source)` granularity. Two sources sharing a
-`source` value *and* describing the same physical table can prune each other's
-column descriptions. Metrics and glossary terms are unaffected.
+One documented exception: column descriptions prune at `(table_id, source)`
+granularity, so two writers sharing a `source` value *and* describing the same
+physical table prune each other's column descriptions. Metrics and glossary terms
+are unaffected.
+
+This is not hypothetical, and it does not need an exotic setup: `source` is the
+source *kind*, not the source. Two registered semantic sources of the same kind
+(both `ossie_git`) or two Keboola connections (both `keboola_metastore`) already
+share one `source` value, so whichever syncs last wins for any table both
+describe. `column_metadata.source_ref` exists on Postgres and the projector
+records it; the prune does not read it yet, because the frozen DuckDB app-state
+schema has no such column and cannot gain one — closing the gap means accepting
+a per-backend difference in what a sync deletes, which is a decision, not a
+detail.
 
 ## Export
 
