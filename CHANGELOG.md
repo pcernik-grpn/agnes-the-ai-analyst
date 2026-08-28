@@ -749,6 +749,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   shows the tenant (shortened GUID) and a scope summary, e.g. `a1b2c3d4… ·
   2 scopes · Communication site`, or `N sites` when the selected scopes span
   more than one site.
+- **Security: direct `kbc."bucket"."table"` paths are now registry-, grant- and
+  policy-gated (#1492).** Every Keboola sync writes a `_remote_attach` row that
+  re-ATTACHes the `kbc` catalog onto the read-only analytics connection with
+  the *instance* storage token, so a qualified path used to read whatever that
+  token could see — no registration check, no `resource_grants` consultation,
+  no access-policy substitution — while `bq`/`sf`/`dbx` each had all three. A
+  new `_kbc_guardrail_inputs` (mirroring the Snowflake guard, the closer
+  precedent: extension-resolved, not a shipped-to engine) now refuses an
+  unregistered path (`kbc_path_not_registered`, admins included), an
+  ungranted one (`kbc_path_access_denied`), and a path naming the physical
+  source of a policied row (`kbc_path_policied`) on both `/api/query` and the
+  snapshot `--from-query` path; matching normalizes pre-fix wizard rows that
+  stored the full `<bucket>.<table>` id in `source_table`, so legitimately
+  registered tables keep working. Mixed internal + `kbc.*` statements get the
+  same explicit refusal `bq.*`/`sf.*` already had. **Operator note:** any
+  analyst workflow that queried `kbc.*` directly against an unregistered
+  table now gets a 403 with a register-or-use-catalog-name hint — that read
+  was riding the instance token, which is what this closes.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written

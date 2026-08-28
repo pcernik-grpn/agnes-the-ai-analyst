@@ -350,6 +350,13 @@ BQ_PATH = re.compile(
 # the master-view RBAC layer and must be registry-gated like `bq.*`.
 SF_PATH = qualified_path_re("sf")
 
+# Keboola direct path guard (#1492). Every Keboola sync writes a
+# `_remote_attach` row aliased `kbc`, re-ATTACHed onto the read-only analytics
+# connection with the *instance* storage token — so an ungated
+# `kbc."bucket"."table"` read reaches whatever that token can see, which is
+# typically wider than any single analyst's grants.
+KBC_PATH = qualified_path_re("kbc")
+
 
 # Issue #201 — full backtick BQ path `<project>.<dataset>.<table>` in user
 # SQL. Used by the registry-gating pass and (via `_mask_backticks`) to keep
@@ -373,18 +380,11 @@ def _local_extract_catalogs(conn) -> set[str]:
     set.
 
     That exclusion is only safe for a prefix that has a gate of its own, and
-    the two are not equal. ``bq`` does (``_bq_guardrail_inputs``), as do ``sf``
-    (``_sf_guardrail_inputs``) and ``dbx``
-    (``connectors.databricks.remote.guardrail_inputs``). **``kbc`` does not** —
-    ``_bq_guardrail_inputs`` scans ``BQ_PATH`` only, Keboola is not registered
-    in ``src.remote_engines._ENGINES``, and no ``_kbc_guardrail_inputs``
-    exists. An earlier version of this docstring asserted the opposite. So on
-    an instance whose Keboola extract wrote a ``_remote_attach`` row (every
-    Keboola sync does — ``connectors/keboola/extractor.py``), a
-    ``kbc."bucket"."table"`` path is gated by neither this catalog check nor a
-    registry/grant/policy one. Pre-existing and tracked separately from the
-    engine-path policy gates; recorded here so the next reader does not infer
-    coverage from the exclusion.
+    every remote-extension prefix now has one: ``bq`` (``_bq_guardrail_inputs``),
+    ``sf`` (``_sf_guardrail_inputs``), ``dbx``
+    (``connectors.databricks.remote.guardrail_inputs``) and ``kbc``
+    (``_kbc_guardrail_inputs``, #1492 — an earlier version of this docstring
+    recorded the kbc gap; it is closed now).
     """
     try:
         default = conn.execute("SELECT current_database()").fetchone()[0]
@@ -1661,11 +1661,12 @@ def execute_query(
         if (
             BQ_PATH.search(_mask_backticks(request.sql))
             or SF_PATH.search(_mask_backticks(request.sql))
+            or KBC_PATH.search(_mask_backticks(request.sql))
             or _BACKTICK_FULL_PATH.search(request.sql)
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Internal tables can't be combined with `bq.*` or `sf.*` paths in a single SELECT (v1 limitation).",
+                detail="Internal tables can't be combined with `bq.*`, `sf.*` or `kbc.*` paths in a single SELECT (v1 limitation).",
             )
         # Reject if user SQL also references any non-internal registry id —
         # that would be a mixed query against analytics.duckdb views. Matched
@@ -1785,6 +1786,19 @@ def execute_query(
         )
         if blocked_sf_path is not None:
             raise HTTPException(status_code=403, detail=blocked_sf_path)
+
+        # Keboola direct-path guard (#1492) — same shape as sf: the extension
+        # resolves locally, but `kbc."bucket"."table"` rides the instance
+        # storage token and bypasses master-view RBAC.
+        blocked_kbc_path = _kbc_guardrail_inputs(
+            request.sql,
+            sql_lower,
+            conn,
+            user,
+            allowed,
+        )
+        if blocked_kbc_path is not None:
+            raise HTTPException(status_code=403, detail=blocked_kbc_path)
 
         # Issue #160 §4.3.3 — concurrent-slot guard MUST wrap the actual
         # `analytics.execute(request.sql)` call (which is what triggers the
@@ -2676,6 +2690,80 @@ def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> O
                         "This Snowflake table carries an access policy, which is "
                         f"enforced under its registered name. Query {policied['name']!r} "
                         "instead of the direct sf.* path."
+                    ),
+                }
+    return None
+
+
+def _kbc_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> Optional[dict]:
+    """Registry + RBAC gate for direct ``kbc."bucket"."table"`` paths (#1492).
+
+    The Keboola DuckDB extension resolves locally (like Snowflake's), but the
+    ``kbc`` catalog is ATTACHed with the *instance* storage token, so a
+    qualified path bypasses the master-view RBAC layer with credentials wider
+    than the caller's own grants. The same registration/admin/RBAC rules as
+    ``sf.*`` apply. Returns ``None`` when the statement contains no ``kbc.*``
+    path or every path is registered and accessible.
+
+    Matching normalizes ``source_table`` through ``normalize_source_table``:
+    rows registered by the pre-fix Data-sources wizard stored the full
+    ``<bucket>.<table>`` id while the live extension exposes the bare in-bucket
+    name (#1189), and a gate that missed those rows would refuse legitimately
+    registered tables as unregistered.
+    """
+    from connectors.keboola.storage_api import normalize_source_table
+    from src.repositories import table_registry_repo
+
+    if not KBC_PATH.search(sql):
+        return None
+
+    repo = table_registry_repo()
+    is_admin = _caller_is_unrestricted_admin(user, sys_conn)
+    accessible_set = set(allowed) if allowed is not None else None
+    rows = repo.list_by_source("keboola")
+
+    def _matches(row: dict, bucket_l: str, table_l: str) -> bool:
+        row_bucket = (row.get("bucket") or "").lower()
+        if row_bucket != bucket_l:
+            return False
+        bare = normalize_source_table(row_bucket, (row.get("source_table") or "").lower())
+        return bare == table_l
+
+    for m in KBC_PATH.finditer(sql):
+        bucket_raw = m.group(1).strip('"')
+        table_raw = m.group(2).strip('"')
+        bucket_l, table_l = bucket_raw.lower(), table_raw.lower()
+        path = f"kbc.{quote_ident(bucket_raw)}.{quote_ident(table_raw)}"
+        row = next((r for r in rows if _matches(r, bucket_l, table_l)), None)
+        if row is None:
+            return {
+                "reason": "kbc_path_not_registered",
+                "path": path,
+                "hint": (
+                    "Direct Keboola paths must point to a registered table. "
+                    "Register via `agnes admin register-table` or use the registered name from `agnes catalog`."
+                ),
+            }
+        if not is_admin:
+            if accessible_set is None or row["id"] not in accessible_set:
+                return {
+                    "reason": "kbc_path_access_denied",
+                    "path": path,
+                    "registered_as": row["name"],
+                }
+            policied = next(
+                (r for r in rows if r.get("access_policy_sql") and _matches(r, bucket_l, table_l)),
+                None,
+            )
+            if policied is not None:
+                return {
+                    "reason": "kbc_path_policied",
+                    "path": path,
+                    "registered_as": policied["name"],
+                    "hint": (
+                        "This Keboola table carries an access policy, which is "
+                        f"enforced under its registered name. Query {policied['name']!r} "
+                        "instead of the direct kbc.* path."
                     ),
                 }
     return None
@@ -4299,6 +4387,13 @@ def run_remote_select_to_arrow(conn, user, sql, bq, quota, *, policy_info: dict 
         blocked_sf_path = _sf_guardrail_inputs(sql, sql_lower, conn, user, allowed)
         if blocked_sf_path is not None:
             raise HTTPException(status_code=403, detail=blocked_sf_path)
+
+        # Keboola direct-path guard (#1492) — the `kbc` catalog is re-ATTACHed
+        # on the same read-only analytics connection, for the same reason as
+        # `sf` above, and `resolve_single_engine` does not know Keboola either.
+        blocked_kbc_path = _kbc_guardrail_inputs(sql, sql_lower, conn, user, allowed)
+        if blocked_kbc_path is not None:
+            raise HTTPException(status_code=403, detail=blocked_kbc_path)
 
         # See _identity_for_audit — a restricted principal has no ".get".
         _audit_uid, _audit_email = _identity_for_audit(user)
