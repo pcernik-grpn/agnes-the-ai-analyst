@@ -1624,6 +1624,57 @@
      it keeps its quiet, and loses the row chrome. */
   .ax-gs__body .ax-gh { padding: 8px 0 2px; }
   .ax-gs__body .ax-gh:hover { background: none; }
+  /* ══ States, edges and headers ═════════════════════════════════════════ */
+
+  /* An OPEN row is a third state, not the hover again. Default white →
+     hover `--ds-surface-dim` → open `--ds-surface-sunken`: three steps of one
+     scale, so "the row I am pointing at" and "the row I am inside" can never
+     be confused, and the open row stays distinct while the pointer moves
+     over its contents. */
+  .ax-gs[open] > .ax-gs__hd,
+  .ax-gs[open] > .ax-gs__hd:hover { background: var(--ds-surface-sunken); }
+
+  /* Bands are inset blocks, so they get the inset's edges: room at the left
+     (KIND was sitting against the surface's own border) and corners that
+     match the surface they sit in. */
+  .ax-table .ax-colhd,
+  .ax-table .ax-fam__hd,
+  .ax-gs__body .dsec-head { padding-left: 10px; padding-right: 10px; }
+  .ax-table .ax-fam__hd { border-radius: 4px; }
+  .ax-glist__label { padding-left: 12px; }
+
+  /* TWO stacked grey bands read as two headers of equal rank — the column
+     header and the category band. Only one of them is structure: the band
+     names a group of rows and repeats; the column header is chrome and
+     appears once. So the chrome loses its fill and keeps only a rule, and
+     the band keeps the fill. */
+  [data-theme] .ax-table .ax-colhd {
+    background: none;
+    border-bottom: 1px solid var(--ds-border);
+    color: var(--ds-text-muted);
+  }
+  .ax-table .ax-fam__hd { background: var(--ds-surface-dim); }
+
+  /* The People / Access heads are section rows, not bands: no fill either,
+     for the same reason. */
+  .ax-gs__body .dsec-head { background: none; }
+
+  /* ── A bundle's row says what the thing is ─────────────────────────────
+     The description was the first line INSIDE the opened bundle, which is
+     the one place it is least needed — by then you have already decided to
+     open it. On the row, a closed list of bundles is readable. */
+  .ax-gs__id--bb { display: block; min-width: 0; }
+  /* The row is two lines now, so its chrome aligns to the NAME's line rather
+     than floating in the row's middle — same rule the item rows follow. */
+  .ax-gs--bb > .ax-gs__hd { align-items: start; }
+  .ax-gs--bb > .ax-gs__hd > .ax-gs__car,
+  .ax-gs--bb > .ax-gs__hd > .ax-r__kd { margin-top: 2px; }
+  .ax-gs--bb > .ax-gs__hd > .ax-gs__counts { margin-top: 3px; }
+  .ax-gs__line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .ax-gs__desc {
+    display: block; margin-top: 1px; font-size: 12px; color: var(--ds-text-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62ch;
+  }
 </style>
 {% endblock %}
 
@@ -3210,16 +3261,20 @@
         <summary class="ax-gs__hd">
           <span class="ax-gs__car" aria-hidden="true">›</span>
           <span class="ax-r__kd" data-kind="${esc(kindToken(r.t))}">${esc(kindWord(r.t))}</span>
-          <span class="ax-gs__id">
-            <span class="ax-g__name">${esc(r.i.name || r.i.resource_id)}</span>
-            <span class="ax-gs__reach">${meta}</span>
+          <span class="ax-gs__id ax-gs__id--bb">
+            <span class="ax-gs__line">
+              <span class="ax-g__name">${esc(r.i.name || r.i.resource_id)}</span>
+              <span class="ax-gs__reach">${meta}</span>
+            </span>
+            ${r.i.description
+              ? `<span class="ax-gs__desc">${esc(String(r.i.description).slice(0, 150))}</span>`
+              : ""}
           </span>
           <span class="ax-gs__counts">
             <span class="ax-gs__cnt${nobody ? "" : " is-held"}">${esc(famName.get(r.t.family) || "")}</span>
           </span>
         </summary>
         <div class="ax-gs__body">
-          ${r.i.description ? `<p class="ax-bb__lede">${esc(String(r.i.description).slice(0, 160))}</p>` : ""}
           <button type="button" class="ax-add" data-share-bundle
                   data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
                   data-blabel="${esc(r.i.name || r.i.resource_id)}">

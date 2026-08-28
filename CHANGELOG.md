@@ -201,6 +201,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **Access rows get a third state, and the headers stop competing.** An open
+  row wore the hover's own grey, so "the row I am pointing at" and "the row I
+  am inside" were the same colour: default white → hover `--ds-surface-dim` →
+  open `--ds-surface-sunken` is one scale in three steps, and the open row
+  stays distinct while the pointer moves over its contents. Two stacked grey
+  bands read as two headers of equal rank — the column header and the category
+  band — so the chrome (the header, once per table) drops its fill and keeps a
+  rule, while the structure (the band, once per category, repeating) keeps the
+  fill and gains rounded corners. Bands also gained the inset's left padding:
+  *KIND* had been sitting against the surface's own border. **In By bundle the
+  description moved onto the bundle's row**, where a closed list of bundles is
+  readable — it had been the first line *inside* the opened bundle, which is
+  the one place it is least needed.
 - **The whole access list is one table, four levels deep.** A group row, a
   People / Access row and an item row are rows at different depths, and they
   were drawn as three separate objects — the group on the page ground, the
