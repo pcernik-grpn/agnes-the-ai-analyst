@@ -567,14 +567,19 @@ def _mint_service_token(slug: str, owner: dict) -> tuple[str, str]:
     """Mint a PAT for this app's owner, store it via `access_token_repo().create`,
     and return the new token id.
 
-    The `scope: "data-app:<slug>"` claim is a label for `agnes admin token
-    list`/audit purposes only — no code path enforces it, so this is
-    functionally a full-privilege PAT for `owner`, not one actually confined
-    to this app's API surface. Any code running inside the hosted container
-    (including an externally-cloned, less-trusted repo) can use it against
-    the whole Agnes REST API. This mirrors the documented trade-off in
-    docs/DEPLOYMENT.md ("granting access to view/open an app is an act of
-    publication") — narrowing it to a real per-app scope is a follow-up.
+    The `scope: "data-app:<slug>"` claim is ENFORCED: `app/auth/pat_resolver.py`
+    admits it only on the data surface an app actually uses (see
+    `_DATA_APP_ALLOWED_EXACT` / `_DATA_APP_ALLOWED_SUBTREES` there) and
+    fail-closed refuses it everywhere else. Before that gate existed, code
+    running in the container — including an externally-cloned, less-trusted
+    repo — reached `/api/admin/*` whenever the owner was an Admin, and could
+    call `POST /cli/auth/rescope-surface` to trade this token (minted WITHOUT
+    expiry, see `omit_exp` below) for a fresh 90-day full-surface PAT.
+
+    What the gate does NOT change: within that surface the app still reads
+    with the OWNER's grants, evaluated live per request. That is the
+    documented trade-off in docs/DEPLOYMENT.md ("granting access to view/open
+    an app is an act of publication"), not something a scope can narrow.
 
     Mirrors `app/api/tokens.py::create_token`'s minting lines exactly (JWT +
     sha256 hash + prefix) — the raw JWT is only handed to `build_config_json`

@@ -253,6 +253,24 @@ def test_the_say_where_it_came_from_section_does_not_drift():
     )
 
 
+def test_the_dashboard_figure_section_does_not_drift():
+    """Same pairing and same reason as
+    ``test_the_say_where_it_came_from_section_does_not_drift``: the bundled
+    file is only the chat sandbox's fallback, and ``WorkdirManager.run_init``
+    overwrites it with this template's render on the common path — so a rule
+    that lives in the bundled file alone never reaches the agent at all. This
+    section carries no sandbox-specific claim (both surfaces reach the same
+    ``agnes app`` / ``agnes catalog`` CLI), so pin it equal verbatim against
+    the template's raw source rather than a render."""
+    heading = "Numbers that come from a dashboard or an app"
+    bundled = _section(_read(WORKSPACE_CLAUDE_MD), heading)
+    server_default = _section(_read(SERVER_DEFAULT_TEMPLATE), heading)
+    assert bundled == server_default, (
+        f"the {heading!r} section text differs between {WORKSPACE_CLAUDE_MD} and "
+        f"{SERVER_DEFAULT_TEMPLATE} — keep them byte-identical or this guard will always fail"
+    )
+
+
 def test_the_charts_sandbox_wording_does_not_drift():
     """The bundled ``CLAUDE.md`` is chat-sandbox-only (never written to a
     laptop workspace), so its 'Charts' section is no longer meant to be
