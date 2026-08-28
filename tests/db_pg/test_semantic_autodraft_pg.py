@@ -42,7 +42,13 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _apply(client, token):
+def _apply(client, token, monkeypatch):
+    """Studio is OFF by default since the admin cleanup retired it, which
+    403s the non-admin ``apply`` branch this helper exercises (see the
+    ``studio_on`` fixture in ``tests/test_semantic_apply.py``). Only the two
+    callers here go through the HTTP suggestion-queue path, so it's turned
+    on per-call rather than as a file-wide autouse fixture."""
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
     return client.post(
         "/api/semantic-models/apply",
         headers=_auth(token),
@@ -114,7 +120,7 @@ def test_leaves_other_tables_pending_flag_untouched(registry):
     assert registry.get("untouched")["semantic_draft_pending_at"] is not None
 
 
-def test_approve_clears_semantic_draft_pending_flag_on_pg(state_backend, seeded_app_both):
+def test_approve_clears_semantic_draft_pending_flag_on_pg(state_backend, seeded_app_both, monkeypatch):
     if state_backend != "pg":
         pytest.skip("PG-only")
 
@@ -125,7 +131,7 @@ def test_approve_clears_semantic_draft_pending_flag_on_pg(state_backend, seeded_
     registry.mark_semantic_draft_pending("db.public.tickets")
 
     c = seeded_app_both["client"]
-    sid = _apply(c, seeded_app_both["analyst_token"]).json()["suggestion_id"]
+    sid = _apply(c, seeded_app_both["analyst_token"], monkeypatch).json()["suggestion_id"]
     r = c.post(
         f"/api/admin/authoring-suggestions/{sid}/approve",
         headers=_auth(seeded_app_both["admin_token"]),
@@ -137,7 +143,7 @@ def test_approve_clears_semantic_draft_pending_flag_on_pg(state_backend, seeded_
     assert row["semantic_draft_pending_at"] is None
 
 
-def test_reject_also_clears_semantic_draft_pending_flag_on_pg(state_backend, seeded_app_both):
+def test_reject_also_clears_semantic_draft_pending_flag_on_pg(state_backend, seeded_app_both, monkeypatch):
     if state_backend != "pg":
         pytest.skip("PG-only")
 
@@ -148,7 +154,7 @@ def test_reject_also_clears_semantic_draft_pending_flag_on_pg(state_backend, see
     registry.mark_semantic_draft_pending("db.public.tickets")
 
     c = seeded_app_both["client"]
-    sid = _apply(c, seeded_app_both["analyst_token"]).json()["suggestion_id"]
+    sid = _apply(c, seeded_app_both["analyst_token"], monkeypatch).json()["suggestion_id"]
     r = c.post(
         f"/api/admin/authoring-suggestions/{sid}/reject",
         headers=_auth(seeded_app_both["admin_token"]),
