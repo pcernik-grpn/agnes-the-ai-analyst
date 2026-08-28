@@ -436,6 +436,11 @@ class TestAuthWhoami:
         assert "admin@example.com" in result.output
         assert "brokered session identity" in result.output
         assert "Admin: yes" in result.output
+        # The address itself is NOT verified by this call — effective-access
+        # answers is_admin + grants, never an identity — so the line must not
+        # present it as confirmed. This command exists because the sandbox was
+        # misinforming the agent about who it is.
+        assert "(from sandbox environment)" in result.output
 
     def test_whoami_sandbox_non_admin(self, monkeypatch):
         monkeypatch.setenv("AGNES_SESSION_ID", "sess-123")

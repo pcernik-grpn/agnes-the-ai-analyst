@@ -36,6 +36,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sandbox laptop-only advice (`agnes pull`/`push`/`init`/`login`, Private
   sessions, Corporate Memory, laptop Directory Structure); the bundled
   fallback `app/initial_workspace_default/CLAUDE.md` carries the same truths.
+  The brokered read surface leans on the repo-wide "never mutate on GET"
+  invariant as its read/write boundary, so the one admin route that broke it
+  was fixed rather than special-cased: **`/admin/chat/{chat_id}/tail-ticket`
+  is a `POST`** (it mints a live one-shot credential for the admin tail
+  WebSocket, so as a `GET` it would have been brokered — handing a chat
+  sandbox a ticket to read any other user's live session). A new guard,
+  `tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential`,
+  fails on any future admin `GET`/`HEAD` route that mints one.
 - **A question about a figure on a dashboard now starts from the data app.** The workspace prompt tells Agnes to find the app the user means
   (`agnes app list`, `agnes app show <slug>`) and read its description for
   context before hunting for a definition — both are registry-only reads, so a
