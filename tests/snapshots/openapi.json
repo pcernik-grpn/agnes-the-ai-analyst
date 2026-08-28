@@ -34604,6 +34604,7 @@
     },
     "/api/data-apps/{slug}/git-credential": {
       "post": {
+        "description": "Mint the app owner's 24-hour `data-app-git:<slug>` push credential.\n\nDeliberately gated by `get_current_user`, NOT `require_session_token`:\n`agnes app git-credential` authenticates with the PAT `agnes login` wrote\n(`cli/config.py::get_token`), and the same is true of this route's MCP\ntool over the PAT-authenticated SSE transport. Refusing a PAT here would\nbreak a shipped command while changing nothing an attacker can do \u2014 the\ngit surface admits a plain PAT for a push directly\n(`app/api/data_apps_git.py`: `allowed = is_owner or admin`, pinned by\n`tests/test_data_apps_git.py::test_push_allowed_for_owner`), so a PAT\nholder reaches the same repo one `git push` away with no mint call at all.\nThe mint is a convenience wrapper over authority the caller already holds,\nnot the gate that grants it.\n\nWhat the mint DID add was persistence: the credential is its own\n`personal_access_tokens` row, so revoking the PAT that produced it left it\npushing for the rest of its 24 hours. `revocable_credential_id` closes\nthat \u2014 when the caller holds a PAT, the successor is stamped with its id\nand dies with it.",
         "operationId": "mint_git_credential_api_data_apps__slug__git_credential_post",
         "parameters": [
           {

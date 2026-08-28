@@ -192,6 +192,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
+- **Revoking a PAT now revokes the data-app git push credentials it minted.**
+  `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
+  hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
+  `personal_access_tokens` row: revoking the PAT that asked for it left it
+  pushing for the rest of its life, on every data app that user owned, with
+  nothing in the token UI to say so — so the one incident-response move that
+  matters ("that PAT leaked, revoke it") did not close the door. Reachable from
+  every surface that can call the mint: `agnes app git-credential`, the
+  `data_app_git_credential` / `data_app_create_draft` MCP tools over both HTTP
+  transports, and the chat broker. A credential minted by a PAT-authenticated
+  caller now carries that PAT's id and is refused once the parent is revoked or
+  gone, checked in `resolve_token_to_user` so every surface that accepts such a
+  token inherits the binding. No behavior change for a credential with no
+  parent — the container's clone token, the broker's per-request token, one
+  minted from an interactive session, and every credential minted before this
+  release. The mint itself stays open to a PAT on purpose: the git surface
+  admits a plain PAT for a push directly, so gating the mint behind
+  `require_session_token` would have broken `agnes app git-credential` for a
+  boundary that does not exist.
 - **Dark theme: several light-hex backgrounds that never flipped now use
   `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
   `.news-content` renderer, `.btn-danger`, several `.group-chip` variants),
