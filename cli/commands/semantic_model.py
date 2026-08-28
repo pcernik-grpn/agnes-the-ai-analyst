@@ -138,17 +138,26 @@ def show(
         _fail(resp)
 
     needle = slug.casefold()
+    models = resp.json().get("models") or []
     row = next(
         (
             m
-            for m in (resp.json().get("models") or [])
+            for m in models
             if str(m.get("slug") or "").casefold() == needle or str(m.get("id") or "").casefold() == needle
         ),
         None,
     )
     if row is None:
         typer.echo(f"No semantic model {slug!r} you can read.", err=True)
-        typer.echo(f"  Look for it: agnes semantic-model search {slug}", err=True)
+        if len(models) >= _SEARCH_LIMIT_MAX:
+            # The lookup rides a capped substring search, so "not found" and
+            # "past the cap" are not the same thing and must not read the same.
+            typer.echo(
+                f"  {len(models)} models contain that text — the server caps this search at "
+                f"{_SEARCH_LIMIT_MAX}, so an exact match may be past the cap. Narrow it:",
+                err=True,
+            )
+        typer.echo(f"  agnes semantic-model search {slug}", err=True)
         raise typer.Exit(1)
 
     if as_json:

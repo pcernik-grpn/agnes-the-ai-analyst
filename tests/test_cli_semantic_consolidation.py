@@ -156,6 +156,20 @@ class TestSemanticModelShow:
             result = runner.invoke(app, ["semantic-model", "show", "nope"])
         assert result.exit_code == 1
         assert "agnes semantic-model search" in result.output
+        assert "cap" not in result.output
+
+    def test_a_miss_past_the_server_cap_does_not_read_as_not_found(self):
+        """`show` rides a capped substring search. "No such model" and "your
+        model is past page one" are different facts and must not print the
+        same sentence."""
+        rows = [dict(_MODEL_ROW, id=f"m{i}", slug=f"retail-{i}") for i in range(100)]
+        with patch(
+            "cli.commands.semantic_model.api_get",
+            return_value=_resp(200, {"query": "retail", "models": rows, "count": 100}),
+        ):
+            result = runner.invoke(app, ["semantic-model", "show", "retail"])
+        assert result.exit_code == 1
+        assert "cap" in result.output
 
 
 # ---------------------------------------------------------------------------
