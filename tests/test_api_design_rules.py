@@ -100,6 +100,15 @@ _VERB_PATH_ALLOWLIST = frozenset(
         # state-machine (approve also replays the payload into the real resource).
         "/api/admin/authoring-suggestions/{sid}/approve",
         "/api/admin/authoring-suggestions/{sid}/reject",
+        # Share-request lifecycle (C6) — the third instance of the same
+        # pending → approved/rejected shape, and allowlisted for the same
+        # reason as the two above rather than by analogy: approve is not a
+        # field flip. It writes the real `resource_grants` row through the
+        # same `ensure_grant` an admin-curated /admin/access write uses, so
+        # the decision and the grant land together or not at all. A PATCH on
+        # `status` would model the transition and hide the write.
+        "/api/admin/share-requests/{request_id}/approve",
+        "/api/admin/share-requests/{request_id}/reject",
         # Corporate-memory mining — fire-and-forget admin batch trigger (v81).
         "/api/admin/memory-mining/run",
         # User lifecycle — activate/deactivate map to a boolean field (acceptable PATCH candidate)
