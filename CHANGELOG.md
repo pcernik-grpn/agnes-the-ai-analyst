@@ -16,6 +16,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
 
 ### Changed
+- **The chat Files drawer got a layout fix and a visual pass.** The file
+  list now flexes across the panel's full remaining height (a fixed `46vh`
+  box left most of the drawer an empty framed rectangle), rows are
+  self-bordered cards with an extension tile, a single-line ellipsized
+  `path · size` hint and compact icon actions (download / save-to-Library /
+  saved-check) instead of two text buttons squeezing the filename; Refresh
+  moved into the header as an icon matching the close button, and the
+  header neutralizes the page-level `header` tag styling that painted a
+  stray divider with a double gap under the title. Engine-backed listings
+  additionally sort `outputs/` deliverables first (they carry no mtime to
+  sort by).
 
 ### Fixed
 
