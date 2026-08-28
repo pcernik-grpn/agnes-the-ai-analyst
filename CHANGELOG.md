@@ -656,6 +656,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- The generic (non-Keboola) semantic-layer table resolver
+  (`src/semantic/projection.py::_generic_table_lookup`/
+  `_resolve_generic_table_row`) now case-folds both sides of the
+  `(bucket, source_table)` comparison. A Snowflake document composes its
+  dataset identifiers from information-schema names, which come back
+  UPPERCASE unless the underlying object was created quoted; a table
+  registered with a different case (an admin's own convention, or Keboola's
+  lowercase norm) silently failed to bind, leaving `agnes semantic-model
+  coverage`/`/admin/semantic-layer` reporting the table uncovered and its
+  metrics unbound even after a correctly-shaped identifier matched in every
+  other respect.
+
 - Semantic-layer health's `orphaned_models` check no longer flags every
   Keboola- and legacy-Databricks-sourced model as disconnected. It compared
   every non-manual model's `source_ref` against `semantic_sources.id`, but
