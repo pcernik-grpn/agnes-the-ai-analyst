@@ -1968,6 +1968,27 @@ class TestPrivacyPageSmoke:
         assert "Where your data goes" in r.text
 
 
+class TestUpgradeFreezeSmoke:
+    """Behavioral depth (marker file, bounds, audit, host-script contract) is
+    in tests/test_upgrade_freeze.py; this is the parameter-free cross-backend
+    smoke check the route-coverage guard requires."""
+
+    COVERED_ROUTES = {
+        "GET /api/admin/upgrade-freeze",
+        "POST /api/admin/upgrade-freeze",
+        "DELETE /api/admin/upgrade-freeze",
+    }
+
+    def test_freeze_lifecycle(self, seeded_app_both):
+        c = seeded_app_both["client"]
+        h = {"Authorization": f"Bearer {seeded_app_both['admin_token']}"}
+        assert c.get("/api/admin/upgrade-freeze", headers=h).json()["active"] is False
+        r = c.post("/api/admin/upgrade-freeze", headers=h, json={"hours": 1})
+        assert r.status_code == 200 and r.json()["active"] is True
+        r = c.delete("/api/admin/upgrade-freeze", headers=h)
+        assert r.status_code == 200 and r.json()["active"] is False
+
+
 # ---------------------------------------------------------------------------
 # Route-coverage guard
 # ---------------------------------------------------------------------------
