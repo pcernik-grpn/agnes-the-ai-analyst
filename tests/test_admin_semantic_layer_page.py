@@ -29,9 +29,12 @@ def _auth(token: str) -> dict:
 
 @pytest.fixture(autouse=True)
 def _reset_refresh_state():
-    """`_refresh_state` is a module-level dict shared with the refresh
-    endpoint tests — reset it around every test in this file too."""
-    from app.api import keboola_semantic_layer_refresh as endpoint_module
+    """Both refresh modules keep a module-level `_refresh_state` dict shared
+    with their own endpoint tests — reset them around every test in this file
+    too. The page's strip reads the sweep's; the Keboola one still backs the
+    login-triggered sync."""
+    from app.api import keboola_semantic_layer_refresh as keboola_module
+    from app.api import semantic_sources_refresh as sweep_module
 
     reset = {
         "run_id": None,
@@ -40,9 +43,11 @@ def _reset_refresh_state():
         "last_status": None,
         "last_result": None,
     }
-    endpoint_module._refresh_state.update(reset)
+    for module in (keboola_module, sweep_module):
+        module._refresh_state.update(reset)
     yield
-    endpoint_module._refresh_state.update(reset)
+    for module in (keboola_module, sweep_module):
+        module._refresh_state.update(reset)
 
 
 class TestSemanticLayerPageAuth:
@@ -401,21 +406,27 @@ class TestTheRetiredKeboolaSpecificSections:
 
 
 class TestTheSyncStrip:
-    def test_the_keboola_sync_status_strip_survives(self, seeded_app):
-        """The page is no longer Keboola-shaped, but "when did the Keboola
-        semantic-layer sync last run, and did it fail" is still the one action
-        this page owns — and `Sync now` is still here."""
+    def test_the_sync_status_strip_survives(self, seeded_app):
+        """The page is no longer Keboola-shaped, but "when did the semantic
+        sync last run, and did it fail" is still the one action this page
+        owns — and `Sync now` is still here. Since #1707 Block 3 step 4 it
+        reports the whole-sweep run, not one connector's."""
         body = seeded_app["client"].get("/admin/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
+        assert "Semantic sources sync" in body
         assert "Never synced yet" in body
         assert "sl-refresh-btn" in body
+        # And the button posts to the sweep, not to a retired per-connector
+        # endpoint — the whole point of the migration.
+        assert "/api/admin/run-semantic-sources-refresh" in body
+        assert "run-keboola-semantic-layer-refresh" not in body
 
     def test_a_failed_sync_is_reported(self, seeded_app):
-        from app.api.keboola_semantic_layer_refresh import _record_completion
+        from app.api.semantic_sources_refresh import _record_completion
 
-        _record_completion("error", {"status": "error", "error": "Metastore fetch failed: boom"})
+        _record_completion("error", "semantic sources sweep exploded: boom")
 
         body = seeded_app["client"].get("/admin/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
-        assert "failed" in body.lower()
+        assert "semantic sources sweep exploded: boom" in body
 
 
 def test_the_data_sources_page_shows_both_mismatch_codes():

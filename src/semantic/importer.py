@@ -36,11 +36,22 @@ Pipeline, per call:
 Steps 3-5 run as one unit with no early return in between: a prune that
 lands while projection then raises would leave the instance with rows
 deleted and nothing written back to replace them.
+
+``source["safe_prune"]`` (set from a source's ``config.safe_prune``, see
+``src/semantic/transports.py``) opts a source into the full-wipe guard: a
+run that produced NO valid documents at all, while rows for this scope
+already exist, prunes nothing — neither the stored documents here nor, via
+``project_document(safe_prune=...)``, their flat projection. An upstream
+that answers with nothing usable is indistinguishable from one whose content
+was genuinely deleted, and only the sources whose upstream can do the former
+(the migrated Keboola Metastore sync) ask for the guard. Off by default: for
+a git or upload source, emptying a model IS the delete signal.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -48,6 +59,8 @@ from typing import Any, Dict, List, Optional
 from src.repositories import semantic_model_repo
 from src.semantic.projection import ProjectionReport, project_document
 from src.semantic.document_validation import validate_document
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,6 +95,7 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
     repo = semantic_model_repo()
     src_name = source["source"]
     src_ref = source.get("source_ref")
+    safe_prune = bool(source.get("safe_prune"))
 
     # One scoped read for the whole batch rather than a per-document lookup:
     # `semantic_model_repo().get_by_slug` is not scoped by source, so two
@@ -209,7 +223,21 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
         else:
             repo.mark_source_missing(existing["id"])
 
-    report.models_pruned = repo.delete_missing(source=src_name, source_ref=src_ref, keep_slugs=keep_slugs)
+    if safe_prune and not keep_slugs and existing_rows:
+        # Full-wipe guard, the document-level twin of ``project_document``'s
+        # own (see the module docstring): this run carried no valid document
+        # at all while rows for this scope exist. Deleting them here would
+        # also strand their projection — with nothing to project, the
+        # projection pass below never runs and never prunes.
+        logger.warning(
+            "Semantic import (%s/%s): no valid documents this run while %d stored model(s) exist; "
+            "skipping the prune to avoid a full wipe. Existing models retained.",
+            src_name,
+            src_ref,
+            len(existing_rows),
+        )
+    else:
+        report.models_pruned = repo.delete_missing(source=src_name, source_ref=src_ref, keep_slugs=keep_slugs)
 
     if valid_documents:
         merged = {"semantic_model": [m for doc in valid_documents for m in (doc.get("semantic_model") or [])]}
@@ -224,6 +252,7 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
             # for a detached model, precisely the locally-edited projection
             # this sync just took care not to overwrite.
             partial=bool(report.invalid) or detached_excluded,
+            safe_prune=safe_prune,
         )
 
     return report

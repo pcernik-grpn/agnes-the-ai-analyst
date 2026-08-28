@@ -206,15 +206,26 @@ def resolve_databricks_settings(connection: dict[str, Any] | None = None) -> dic
     return _resolve_databricks_from_instance_config()
 
 
-def ensure_semantic_source() -> str:
-    """Idempotently register the Databricks connection as a ``connection``-kind
-    semantic source (``adapter='databricks_metric_views'``), returning its id.
+def ensure_semantic_source() -> str | None:
+    """Idempotently register the Databricks workspace as a ``connection``-kind
+    semantic source (``adapter='databricks_metric_views'``), returning its id —
+    or ``None`` when no workspace is configured.
 
-    Called from the refresh endpoint before every sync — cheap (a single
-    keyed lookup) and self-healing: an admin who deletes the row gets it back
-    on the next scheduled run rather than a permanently broken cadence. The id
-    is fixed (:data:`DATABRICKS_SEMANTIC_SOURCE_ID`) for the same reason it is
-    fixed everywhere else in this module — one workspace, one row.
+    Called from the generic semantic-sources sweep's auto-migration
+    (``src/semantic/legacy_migration.py``) before every run — cheap (a settings
+    read plus one keyed lookup) and self-healing: an admin who deletes the row
+    gets it back on the next scheduled run rather than a permanently broken
+    cadence. The id is fixed (:data:`DATABRICKS_SEMANTIC_SOURCE_ID`) for the
+    same reason it is fixed everywhere else in this module — one workspace,
+    one row.
+
+    The "only when configured" gate matters now that this runs on EVERY
+    instance's sweep rather than behind a Databricks-specific endpoint: an
+    unconfigured instance would otherwise carry a semantic source that fails
+    on every run, forever, for a warehouse it does not have.
+
+    Never a get-or-*replace*: an existing row keeps whatever an admin did to
+    it (rename, disable, narrower ``config.catalogs``).
     """
     from src.repositories import semantic_source_repo
 
@@ -222,6 +233,8 @@ def ensure_semantic_source() -> str:
     existing = repo.get(DATABRICKS_SEMANTIC_SOURCE_ID)
     if existing is not None:
         return DATABRICKS_SEMANTIC_SOURCE_ID
+    if resolve_databricks_settings() is None:
+        return None
     repo.create(
         id=DATABRICKS_SEMANTIC_SOURCE_ID,
         kind="connection",

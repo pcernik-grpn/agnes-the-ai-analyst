@@ -2734,23 +2734,12 @@ KNOWN_UNTESTED = {
     "POST /api/admin/run-corporate-memory",
     "POST /api/admin/run-jira-consistency-check",
     "POST /api/admin/run-jira-sla-poll",
-    # Keboola semantic layer (Metastore) sync — scheduler-driven admin
-    # maintenance op, mirrors run-bq-metadata-refresh. No dual-backend
-    # contract test needed (no new repo methods/migration). Behaviour
-    # covered in tests/test_keboola_semantic_layer_refresh_endpoint.py.
-    "POST /api/admin/run-keboola-semantic-layer-refresh",
-    # Databricks semantic layer (Unity Catalog metric views) sync — same
-    # shape as the Keboola sibling above: scheduler-driven admin maintenance
-    # op, no new repo methods/migration. Behaviour covered in
-    # tests/test_databricks_semantic_layer_refresh_endpoint.py.
-    # The handler never touches the backend switch itself; the repo calls its
-    # sync drives (metric_repo().create/find_by_name/list/delete, incl. the
-    # source_ref kwarg) are already parity-proven on both backends by
-    # tests/db_pg/test_config_pg.py::test_metric_source_ref_roundtrip and
-    # tests/db_pg/test_ported_methods_contract.py::test_metrics_yaml_reconcile_prunes_on_both_backends
-    # — cited here so this exclusion is self-verifying rather than resting on
-    # "nothing new here".
-    "POST /api/admin/run-databricks-semantic-layer-refresh",
+    # (The per-connector Keboola/Databricks semantic-refresh triggers that
+    # used to be excluded here are gone — #1707 Block 3 step 4. Their
+    # replacement, POST /api/admin/run-semantic-sources-refresh, is
+    # deliberately NOT excluded: it is parameter-free, takes no upstream call
+    # on an instance with no sources registered, and is exactly the sweep
+    # whose backend-independence is worth smoking on both backends.)
     # K3 local knowledge packaging (#798) — scheduler-driven admin maintenance
     # op, mirrors run-corporate-memory. No dual-backend contract test needed
     # (no new repo methods/migration; state.json lives on disk). Behaviour

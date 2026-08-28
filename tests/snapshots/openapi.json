@@ -27068,57 +27068,6 @@
         ]
       }
     },
-    "/api/admin/run-databricks-semantic-layer-refresh": {
-      "post": {
-        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto the semantic layer. See connectors/databricks/semantic_ossie.py for\nthe composition logic and connectors/databricks/semantic_layer.py for\nconnection resolution + the legacy-provenance cutover.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 when the upstream is unreachable, answers\n5xx, or the sync fails for any other reason.",
-        "operationId": "run_databricks_semantic_layer_refresh_api_admin_run_databricks_semantic_layer_refresh_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Run Databricks Semantic Layer Refresh"
-      }
-    },
     "/api/admin/run-jira-consistency-check": {
       "post": {
         "description": "Validate Jira parquet against the Jira API and backfill small gaps.\n\nCompares three sources: Jira API (ground truth), raw JSON, and\nparquet. Auto-fixes small webhook-loss gaps (\u226410 issues); larger\ngaps are reported and require manual review.\n\nCadence: every 30 min by default (SCHEDULER_JIRA_CONSISTENCY_INTERVAL).\nDefault ``max_age_days=30`` keeps the routine cost bounded; an\noperator triggering a deeper validation passes a larger value.",
@@ -27245,57 +27194,6 @@
         "tags": [
           "admin"
         ]
-      }
-    },
-    "/api/admin/run-keboola-semantic-layer-refresh": {
-      "post": {
-        "description": "Sync the configured Keboola project's semantic layer into\nmetric_definitions. See connectors/keboola/semantic_layer.py for the\nmapping/prune logic.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 no Keboola credentials configured, or a token the\nStorage/Metastore API refuses (4xx). 502 only when the upstream is\nunreachable or answers 5xx.",
-        "operationId": "run_keboola_semantic_layer_refresh_api_admin_run_keboola_semantic_layer_refresh_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Run Keboola Semantic Layer Refresh"
       }
     },
     "/api/admin/run-knowledge-digests": {

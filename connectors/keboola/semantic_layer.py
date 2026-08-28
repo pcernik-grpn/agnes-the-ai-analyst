@@ -649,7 +649,7 @@ def _sync_one_source(
 
     from connectors.keboola.metastore_client import MetastoreApiError, MetastoreClient
     from connectors.keboola.storage_api import KeboolaStorageClient, StorageApiError
-    from src.repositories import glossary_repo, metric_repo, table_registry_repo
+    from src.repositories import table_registry_repo
 
     scope_refs: set = set(prune_scope_refs) if prune_scope_refs is not None else {source_ref}
 
@@ -848,11 +848,7 @@ def _sync_one_source(
     # finds none.
     purged_legacy = 0
     if report.metrics_written and not partial_composition:
-        legacy_repo = metric_repo()
-        for m in legacy_repo.list():
-            if (m.get("source") or "") == "keboola_semantic_layer" and _in_scope(m, scope_refs, adopt_null):
-                legacy_repo.delete(m["id"])
-                purged_legacy += 1
+        purged_legacy = purge_legacy_metric_rows(scope_refs=scope_refs, adopt_null=adopt_null)
 
     # Symmetric one-time retirement for glossary rows — the metric-side purge
     # above has always run this pass, but the glossary side was never added,
@@ -864,13 +860,7 @@ def _sync_one_source(
     # the metric purge above, for the same reason.
     purged_legacy_glossary = 0
     if report.glossary_written and not partial_composition:
-        legacy_glossary_repo = glossary_repo()
-        for g in legacy_glossary_repo.list(limit=100_000):
-            if (g.get("source") or "") == "keboola_semantic_layer" and _in_scope(g, scope_refs, adopt_null):
-                legacy_glossary_repo.delete(g["id"])
-                purged_legacy_glossary += 1
-        if purged_legacy_glossary:
-            legacy_glossary_repo.refresh_search_index()
+        purged_legacy_glossary = purge_legacy_glossary_rows(scope_refs=scope_refs, adopt_null=adopt_null)
 
     return {
         "status": "ok",
@@ -1053,6 +1043,330 @@ def sync_semantic_layer(
         expected_project=expected_project,
     )
     return _aggregate_sources([_as_source_entry(default_id, default_conn["name"] if default_conn else None, result)])
+
+
+# ---------------------------------------------------------------------------
+# Semantic-source migration (#1707 Block 3 steps 3-4)
+#
+# The scheduled trigger for this sync moved off its own endpoint onto the ONE
+# generic sweep over `semantic_sources` (app/api/semantic_sources_refresh.py).
+# The sync logic above did NOT move: the adapter still composes the documents
+# and the central projector still writes them. What changed is who calls it —
+# a registered `connection`-kind source per Keboola project, carrying a
+# provenance override so every row stays owned by the exact
+# (source='keboola_metastore', source_ref=<connection id>) pair this module
+# has always stamped. See src/semantic/transports.py for the override and why
+# the prune scope must not move.
+# ---------------------------------------------------------------------------
+
+#: The ``semantic_models``/``metric_definitions``/``glossary_terms`` provenance
+#: label this connector owns, and the adapter that reads its upstream.
+SEMANTIC_PROVENANCE_SOURCE = "keboola_metastore"
+SEMANTIC_ADAPTER = "keboola_metastore"
+
+#: The pre-cutover flat writer's ``source`` value. Retired but not forgotten:
+#: :func:`purge_legacy_metric_rows` reconciles rows still carrying it.
+LEGACY_METRIC_SOURCE = "keboola_semantic_layer"
+
+#: Fixed id for the source that carries the legacy env-credential fallback
+#: (``KEBOOLA_STACK_URL`` + ``KEBOOLA_STORAGE_TOKEN``, no per-connection master
+#: token). One instance can have at most one such pair, so one row.
+LEGACY_CREDENTIALS_SOURCE_ID = "keboola_legacy_credentials"
+
+
+def semantic_source_id(connection_id: str) -> str:
+    """Deterministic ``semantic_sources.id`` for one Keboola connection —
+    derived, not random, so the migration is idempotent across restarts and
+    across both app-state backends."""
+    return f"keboola_{connection_id}"
+
+
+def _semantic_source_config(*, connection_id: Optional[str], source_ref: Optional[str]) -> dict:
+    """The config a migrated source carries: scope and provenance, never a
+    credential. The token stays where it already is (this connection's vault
+    slot / the legacy env pair) and is resolved per sync by
+    :func:`resolve_semantic_source_credentials` — a semantic source row must
+    never become a second place a Storage token is stored."""
+    config: dict[str, Any] = {
+        # `safe_prune`: the Metastore can answer 200 with nothing usable, and
+        # that is indistinguishable from "every metric was deleted upstream".
+        # The legacy sync passed this to `project_document` on every call;
+        # dropping it here would turn one bad upstream reply into a wiped
+        # metric registry.
+        "safe_prune": True,
+        "provenance": {"source": SEMANTIC_PROVENANCE_SOURCE, "source_ref": source_ref},
+    }
+    if connection_id:
+        config["connection_id"] = connection_id
+    else:
+        config["legacy_credentials"] = True
+    return config
+
+
+def _connection_master_credentials(connection_id: str) -> tuple[str, str, Optional[tuple[Any, str]]]:
+    """``(stack_url, master token, expected project)`` for one connection.
+
+    Same three reads :func:`_enumerate_master_sources` does for the whole
+    loop, for a single connection — the vault's master slot, the row's
+    ``stack_url``, and the ``(project_id, project_name)`` the connection is
+    bound to.
+    """
+    from app.api.admin_source_connections import master_secret_key
+    from src.repositories import connection_secrets_repo, source_connections_repo
+
+    conn = source_connections_repo().get(connection_id)
+    if conn is None:
+        raise RuntimeError(
+            f"Keboola semantic source points at connection {connection_id!r}, which no longer exists; "
+            "re-point or delete the source."
+        )
+    if (conn.get("source_type") or "") != "keboola":
+        raise RuntimeError(
+            f"connection {connection_id!r} is a {conn.get('source_type') or 'unknown'} connection, "
+            "not a Keboola one; refusing to read its Metastore."
+        )
+    stack_url = (conn.get("config") or {}).get("stack_url") or ""
+    try:
+        token = connection_secrets_repo().get(master_secret_key(connection_id)) or ""
+    except Exception:  # noqa: BLE001 - a vault read failure is "no token", logged
+        logger.warning("Could not read master token for connection %s", connection_id)
+        token = ""
+    if not (stack_url and token):
+        raise RuntimeError(
+            f"Keboola connection {connection_id!r} has no stack_url and/or master (owner) token; "
+            "the semantic layer cannot be read without both."
+        )
+    config = conn.get("config") or {}
+    expected = (config.get("project_id"), config.get("project_name") or "") if config.get("project_id") else None
+    return stack_url, token, expected
+
+
+def _semantic_preflight(url: str, token: str, expected_project: Optional[tuple[Any, str]]) -> None:
+    """The two checks the legacy sync ran before touching a row, preserved
+    verbatim in meaning: the token must be a MASTER token (the Metastore
+    rejects anything else with an opaque error), and it must open the project
+    its connection is bound to.
+
+    Both raise. A raised error is recorded on the semantic source row by
+    ``import_source`` and nothing is imported — the same "abort before any
+    write" outcome the legacy structured-error return produced. Importing
+    project B's semantic layer under connection A's provenance would put B's
+    metrics inside A's prune scope, so the next correct sync deletes them.
+    """
+    from connectors.keboola.storage_api import KeboolaStorageClient
+
+    info = KeboolaStorageClient(url=url, token=token).verify_token()
+    check_master_token(info)
+    if expected_project is None:
+        return
+    expected_id, expected_name = expected_project
+    actual_id = (info.get("owner") or {}).get("id")
+    if expected_id is None or actual_id is None or str(actual_id) == str(expected_id):
+        return
+    actual_name = (info.get("owner") or {}).get("name") or "unnamed"
+    raise RuntimeError(
+        f"Master token belongs to Keboola project {actual_id} ({actual_name}), but this connection is "
+        f"bound to project {expected_id} ({expected_name or 'unnamed'}). Replace the master token with "
+        "one from the bound project, or connect the other project as its own data source."
+    )
+
+
+def resolve_semantic_source_credentials(config: dict) -> tuple[str, str]:
+    """``(stack_url, token)`` for a ``connection``-kind Keboola semantic
+    source, preflighted.
+
+    Two shapes, mirroring the two the legacy orchestrator resolved:
+    ``config.connection_id`` (a connection's own master token, the normal
+    case) and ``config.legacy_credentials`` (the ``KEBOOLA_STACK_URL`` /
+    ``KEBOOLA_STORAGE_TOKEN`` pair, kept so an instance that never registered
+    a per-connection master token keeps syncing).
+    """
+    connection_id = str(config.get("connection_id") or "").strip()
+    if connection_id:
+        url, token, expected = _connection_master_credentials(connection_id)
+    elif config.get("legacy_credentials"):
+        url, token = _resolve_keboola_credentials(None, None)
+        expected = None
+        if not (url and token):
+            raise RuntimeError(
+                "Keboola credentials not configured (KEBOOLA_STACK_URL + KEBOOLA_STORAGE_TOKEN, or a "
+                "connection holding a master token); nothing to sync."
+            )
+    else:
+        raise ValueError(
+            "Keboola semantic source config must carry connection_id (a registered Keboola connection) "
+            "or legacy_credentials: true"
+        )
+    _semantic_preflight(url, token, expected)
+    return url, token
+
+
+def _claims_provenance(row: dict, *, connection_id: Optional[str], source_ref: Optional[str]) -> bool:
+    """True when an existing ``semantic_sources`` row already owns this
+    project's scope — matched on the adapter plus either the connection it
+    pins or the provenance it stamps.
+
+    Both halves matter. The connection check keeps the migration from
+    duplicating a row an admin registered by hand; the provenance check keeps
+    it from registering a second writer for a scope that is already claimed
+    (the legacy-credentials row and a later master-token row for the same
+    default connection would otherwise both import the same project).
+    """
+    if (row.get("adapter") or "") != SEMANTIC_ADAPTER:
+        return False
+    config = row.get("config") or {}
+    if connection_id and str(config.get("connection_id") or "") == connection_id:
+        return True
+    provenance = config.get("provenance")
+    if isinstance(provenance, dict) and provenance.get("source") == SEMANTIC_PROVENANCE_SOURCE:
+        return provenance.get("source_ref") == source_ref
+    return False
+
+
+def ensure_semantic_sources() -> list[dict]:
+    """Register a ``connection``-kind semantic source for every Keboola
+    project the legacy scheduled refresh would have synced. Returns only the
+    rows this call created.
+
+    Source selection is :func:`sync_semantic_layer`'s own, so the sweep covers
+    exactly what the retired endpoint covered: every connection holding a
+    master token, or — when none does — the legacy env-credential pair.
+
+    Idempotent by construction and deliberately never a get-or-*replace*: a
+    row an admin renamed, re-scoped or disabled survives untouched, and a
+    scope already claimed by any existing row is skipped rather than
+    duplicated.
+    """
+    from src.repositories import semantic_source_repo
+
+    repo = semantic_source_repo()
+    existing = repo.list_all()
+    created: list[dict] = []
+
+    master_sources = _enumerate_master_sources()
+    if master_sources:
+        for source in master_sources:
+            connection_id = source["connection_id"]
+            if any(_claims_provenance(r, connection_id=connection_id, source_ref=connection_id) for r in existing):
+                continue
+            row = repo.create(
+                id=semantic_source_id(connection_id),
+                kind="connection",
+                name=f"Keboola semantic layer — {source['name']}",
+                adapter=SEMANTIC_ADAPTER,
+                config=_semantic_source_config(connection_id=connection_id, source_ref=connection_id),
+                enabled=True,
+            )
+            existing.append(row)
+            created.append(row)
+        _supersede_legacy_credentials_source(repo, existing)
+        return created
+
+    url, token, slot = _resolve_keboola_credentials_slot(None, None)
+    if not (url and token):
+        return created
+    default_conn = _default_keboola_connection()
+    default_id = default_conn["id"] if default_conn else None
+    # Stamp the default connection's id only when the credentials actually came
+    # from that connection — the same rule `sync_semantic_layer`'s fallback
+    # branch applies, for the same reason: a legacy env pair may point at a
+    # different project, and mislabeling it hands those rows to a connection
+    # that never wrote them.
+    source_ref = default_id if slot == "connection" else None
+    if any(_claims_provenance(r, connection_id=None, source_ref=source_ref) for r in existing):
+        return created
+    created.append(
+        repo.create(
+            id=LEGACY_CREDENTIALS_SOURCE_ID,
+            kind="connection",
+            name="Keboola semantic layer",
+            adapter=SEMANTIC_ADAPTER,
+            config=_semantic_source_config(connection_id=None, source_ref=source_ref),
+            enabled=True,
+        )
+    )
+    return created
+
+
+def _supersede_legacy_credentials_source(repo: Any, existing: list[dict]) -> None:
+    """Disable the legacy-credentials row once any connection holds a master
+    token.
+
+    ``sync_semantic_layer`` ignores the legacy env pair entirely the moment a
+    master token exists ("when at least one master token exists these are the
+    ONLY sources"). Left enabled here, that row would keep importing the same
+    project a second time under NULL provenance — duplicate metrics under two
+    scopes, the exact outcome this migration is sequenced to avoid. Scoped to
+    the row THIS migration created (its fixed id), never an admin's own.
+    """
+    row = next((r for r in existing if r["id"] == LEGACY_CREDENTIALS_SOURCE_ID), None)
+    if row is None or row.get("enabled") is False:
+        return
+    logger.info(
+        "Keboola semantic layer: a connection now holds a master token; disabling the "
+        "legacy-credentials semantic source %s so the same project is not imported twice.",
+        LEGACY_CREDENTIALS_SOURCE_ID,
+    )
+    repo.update(LEGACY_CREDENTIALS_SOURCE_ID, enabled=False)
+
+
+def legacy_credentials_prune_scope() -> set:
+    """The ``source_ref``s the legacy env-credential path owns: NULL, or the
+    default connection's id — whichever of the two it ended up stamping.
+
+    ``sync_semantic_layer``'s fallback branch prunes across both on purpose:
+    it stamps the default connection's id only when the credentials actually
+    came from that connection, but a downgrade (the last master token removed)
+    still has to clean up the rows it previously owned under either label.
+    """
+    conn = _default_keboola_connection()
+    return {None, conn["id"] if conn else None}
+
+
+def purge_legacy_metric_rows(*, scope_refs: set, adopt_null: bool) -> int:
+    """One-time reconciliation of the metric rows the retired pre-cutover flat
+    writer left behind, scoped to one project's own rows.
+
+    That writer stamped ``source='keboola_semantic_layer'``; everything since
+    the cutover is written by the projector under
+    ``source='keboola_metastore'`` — a different scope, which the projector's
+    own prune can never reach, so the old rows would linger as permanent
+    duplicates of their freshly-projected twins.
+
+    Extracted from ``_sync_one_source`` — which still calls it, so the
+    Keboola-login-triggered sync and the migrated scheduled path share ONE
+    implementation rather than two copies free to drift. The caller owns the
+    gate: purge only when this pass actually WROTE metrics and was not partial,
+    because a pass that never rewrote a model's rows must not delete that
+    model's legacy rows either. Idempotent — a later run finds none.
+    """
+    from src.repositories import metric_repo
+
+    repo = metric_repo()
+    purged = 0
+    for row in repo.list():
+        if (row.get("source") or "") == LEGACY_METRIC_SOURCE and _in_scope(row, scope_refs, adopt_null):
+            repo.delete(row["id"])
+            purged += 1
+    return purged
+
+
+def purge_legacy_glossary_rows(*, scope_refs: set, adopt_null: bool) -> int:
+    """The glossary twin of :func:`purge_legacy_metric_rows`, gated
+    independently by the caller on ``glossary_written``: a project that writes
+    metrics but no glossary terms this pass must not wipe glossary rows it
+    never rewrote."""
+    from src.repositories import glossary_repo
+
+    repo = glossary_repo()
+    purged = 0
+    for row in repo.list(limit=100_000):
+        if (row.get("source") or "") == LEGACY_METRIC_SOURCE and _in_scope(row, scope_refs, adopt_null):
+            repo.delete(row["id"])
+            purged += 1
+    if purged:
+        repo.refresh_search_index()
+    return purged
 
 
 def relationship_lookup_by_dataset(relationship_items: list[dict]) -> dict[str, list[dict]]:

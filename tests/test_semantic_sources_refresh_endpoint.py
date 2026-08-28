@@ -1,15 +1,18 @@
 """End-to-end tests for POST /api/admin/run-semantic-sources-refresh.
 
-This is the ONE generic scheduled refresh over every registered
-``semantic_sources`` row (git / upload / connection kinds) — Block 3 step 2
-of issue #1707. It walks ``semantic_sources``, skips ``enabled=False`` rows
-(counted, never synced), and calls ``src.semantic.transports.import_source``
-on the rest, one failing source never aborting the sweep over the others.
+This is the ONE scheduled refresh over every registered ``semantic_sources``
+row (git / upload / connection kinds) — issue #1707 Block 3. It walks
+``semantic_sources``, skips ``enabled=False`` rows (counted, never synced),
+and calls ``src.semantic.transports.import_source`` on the rest, one failing
+source never aborting the sweep over the others.
 
-Out of scope here (steps 3-4 of #1707, a separate follow-up): the legacy
-Keboola (``run-keboola-semantic-layer-refresh``) and Databricks
-(``run-databricks-semantic-layer-refresh``) refresh endpoints, which keep
-their own schedules and provenance labels untouched.
+Since step 4 it is also the only one: the per-connector Keboola and
+Databricks refresh endpoints are gone, and every sweep starts by
+auto-registering the sources they implied
+(``src.semantic.legacy_migration``). The equivalence of old and new output
+is pinned in ``tests/test_semantic_legacy_refresh_migration.py``; what this
+file adds is that the sweep actually runs the migration and the post-import
+reconciliation, and survives either of them failing.
 """
 
 from __future__ import annotations
@@ -17,6 +20,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+
+from src.semantic.importer import ImportReport
 
 DOC = (
     "version: '0.2.0.dev0'\n"
@@ -49,13 +54,26 @@ def _create_source(c, token, *, kind, name, adapter="native", config=None, enabl
     return r.json()["id"]
 
 
+_RESET_STATE = {
+    "run_id": None,
+    "started_at": None,
+    "last_completed_at": None,
+    "last_status": None,
+    "last_result": None,
+}
+
+#: What a patched ``import_source`` returns when the test does not care about
+#: the import itself, only about the sweep's bookkeeping around it.
+_FAKE_REPORT = ImportReport()
+
+
 @pytest.fixture(autouse=True)
 def _reset_refresh_state():
     from app.api import semantic_sources_refresh as endpoint_module
 
-    endpoint_module._refresh_state.update({"run_id": None, "started_at": None})
+    endpoint_module._refresh_state.update(_RESET_STATE)
     yield
-    endpoint_module._refresh_state.update({"run_id": None, "started_at": None})
+    endpoint_module._refresh_state.update(_RESET_STATE)
 
 
 def test_run_refresh_syncs_enabled_sources(seeded_app):
@@ -207,3 +225,98 @@ class TestManualSyncOnDisabledSource:
 
         r = c.post(f"/api/admin/semantic-sources/{source_id}/sync", headers=_auth(token))
         assert r.status_code == 200, r.text
+
+
+class TestLegacyAutoMigration:
+    """Every sweep first registers the sources the retired per-connector
+    refreshes implied, then syncs them in the same pass."""
+
+    def test_sweep_registers_and_syncs_a_migrated_source_in_one_pass(self, seeded_app, monkeypatch):
+        from src.repositories import semantic_source_repo
+
+        migrated = {
+            "id": "keboola_conn-a",
+            "kind": "connection",
+            "name": "Keboola semantic layer — Project A",
+            "adapter": "keboola_metastore",
+            "config": {"connection_id": "conn-a"},
+        }
+
+        def fake_ensure():
+            semantic_source_repo().create(**migrated, enabled=True)
+            return [semantic_source_repo().get(migrated["id"])]
+
+        import app.api.semantic_sources_refresh as endpoint_module
+
+        monkeypatch.setattr(endpoint_module, "ensure_legacy_semantic_sources", fake_ensure)
+        monkeypatch.setattr(endpoint_module, "import_source", lambda source_id: _FAKE_REPORT)
+
+        c = seeded_app["client"]
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Registered AND swept in the same run — a row that had to wait for
+        # the next tick would leave a 6 h hole on the upgrade run.
+        assert body["migrated"] == [migrated["id"]]
+        assert [s["id"] for s in body["sources"]] == [migrated["id"]]
+        assert body["synced"] == 1
+
+    def test_a_failing_connector_migration_never_aborts_the_sweep(self, seeded_app, monkeypatch):
+        """An unreadable vault or an unreachable connection registry must not
+        cost the instance its sync of everything already registered — nor
+        stop the OTHER connector from being migrated."""
+        import src.semantic.legacy_migration as migration
+
+        def boom():
+            raise RuntimeError("connection registry unavailable")
+
+        monkeypatch.setattr(migration, "_ensure_keboola_sources", boom)
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        source_id = _create_source(c, token, kind="upload", name="Bundle A", config={"documents": [DOC]})
+
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["migrated"] == []
+        assert [s["id"] for s in body["sources"]] == [source_id]
+        assert body["synced"] == 1
+
+    def test_reconciliation_result_rides_along_but_a_failure_does_not_fail_the_sync(
+        self, seeded_app, monkeypatch
+    ):
+        import app.api.semantic_sources_refresh as endpoint_module
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        source_id = _create_source(c, token, kind="upload", name="Bundle A", config={"documents": [DOC]})
+
+        monkeypatch.setattr(
+            endpoint_module, "reconcile_after_import", lambda source, report: {"metrics": 3}
+        )
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        entry = {s["id"]: s for s in r.json()["sources"]}[source_id]
+        assert entry["status"] == "ok"
+        assert entry["reconciled_legacy"] == {"metrics": 3}
+
+
+class TestSweepSummary:
+    """The /admin/semantic-layer status strip reads this — the whole-sweep
+    view, since the per-connector endpoint that used to feed it is gone."""
+
+    def test_a_completed_sweep_is_recorded(self, seeded_app):
+        from app.api.semantic_sources_refresh import get_last_refresh_summary
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        _create_source(c, token, kind="upload", name="Bundle A", config={"documents": [DOC]})
+
+        assert get_last_refresh_summary()["last_status"] is None
+        c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+
+        summary = get_last_refresh_summary()
+        assert summary["last_status"] == "ok"
+        assert summary["last_completed_at"]
+        assert summary["last_result"]["synced"] == 1
