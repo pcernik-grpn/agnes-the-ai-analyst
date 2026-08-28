@@ -1920,6 +1920,68 @@
   .ax-fam__hd .fbar-grouptoggle { padding: 8px 12px; cursor: default; }
   .ax-fam__hd .fbar-grouptoggle:hover { background: none; }
   .ax-fam__hd .fbar-group__title { font-size: 13px; font-weight: 600; }
+  /* The kind run is the shared group header, so its type comes from
+     `.fbar-group__title` (13.5px/600, sentence case) — not from the
+     uppercase, letter-spaced treatment this page had invented, which made a
+     sub-level shout louder than the family band above it. */
+  .ax-kindrun {
+    padding: 8px 12px 8px 26px;
+    text-transform: none; letter-spacing: normal; font-size: inherit;
+    color: var(--ds-text-primary);
+  }
+  .ax-kindrun .fbar-group__title { font-weight: 600; }
+  .ax-kindrun[aria-expanded="false"] .fbar-group__caret { transform: rotate(-90deg); }
+
+  /* No primary in the bar: creation is the list's first row. */
+  .ax-onebar .fbar__search { flex: 1 1 26rem; min-width: 0; max-width: none; }
+  /* ── The Library's own calibration of the shared controls ─────────────
+     `.fbar` is shared, but the Library scopes a calibration onto it — 32px
+     controls, a tinted-not-bordered search, a filter button that is text
+     until it is on — and that calibration is most of what "looks like the
+     Library" means. Copied verbatim from `.library-page`'s block, scoped
+     here, so the two bars are the same bar.
+
+     Not extracted into the shared sheet in this pass: that is the
+     platform-wide table/toolbar unification, and it should move both pages
+     at once rather than leave a third calibration behind. */
+  .ax-onebar .fbar__search { flex: 0 1 300px; }
+  .ax-onebar .fbar__search input {
+    height: 32px; font-size: 13px; padding: 0 10px 0 30px;
+    background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
+    border-color: transparent;
+  }
+  .ax-onebar .fbar__search input:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
+  .ax-onebar .fbar__search input:focus { background: var(--ds-surface); border-color: var(--ds-primary); }
+  .ax-onebar .fbar__search svg { left: 9px; width: 15px; height: 15px; }
+
+  .ax-onebar .fbar-filter__btn {
+    height: 32px; padding: 0 9px; font-size: 12.5px; font-weight: 500;
+    color: var(--ds-text-secondary); background: transparent; border-color: transparent;
+  }
+  .ax-onebar .fbar-filter__btn:hover {
+    color: var(--ds-text-primary);
+    background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent);
+    border-color: transparent;
+  }
+  .ax-onebar .fbar-filter__btn.is-on {
+    color: var(--ds-primary); background: var(--ds-primary-light); border-color: transparent;
+  }
+  .ax-onebar .fbar-filter__btn svg { width: 14px; height: 14px; }
+  .ax-onebar .fbar-filter__n { min-width: 16px; height: 16px; font-size: 10.5px; }
+
+  /* Band and column header to the Library's measurements: a 41px band, and a
+     header that is filled, 10.5px/700, on the same 16px gutter as its rows. */
+  .ax-fam__hd .fbar-grouptoggle { padding: 10px 16px; }
+  .ax-fam__hd .fbar-group__title { font-size: 13.5px; }
+  [data-theme] .ax-table .ax-colhd {
+    background: var(--ds-surface-dim);
+    font-size: 10.5px; font-weight: 700; letter-spacing: .07em;
+    color: var(--ds-text-muted);
+    padding: 12px 16px;
+  }
+  .ax-table .ax-r { padding-left: 16px; padding-right: 16px; }
+  .ax-table .ax-fam__hd { padding-left: 0; }
+  .ax-table .ax-add { padding-left: 16px; padding-right: 16px; }
 </style>
 {% endblock %}
 
@@ -1998,13 +2060,7 @@
         </button>
         <div class="fbar-menu fbar-menu--cats" id="ax-filter-menu" role="menu" aria-label="Filter by kind" hidden></div>
       </div>
-      {# The primary creation action, on the toolbar's right — where the
-         Library keeps "+ Add". It had been the list's first row; the Library
-         pattern wins here because the whole point of this pass is that the
-         two toolbars read as one component. #}
-      <button type="button" class="btn btn-primary ax-newbtn" data-new-group>
-        <span aria-hidden="true">+</span> New group
-      </button>
+
       {# The audience that does not exist yet. "Grant this to the finance
          team" is one thought, and it used to break in half here: no Finance
          group meant leaving for the group list, creating it there, coming
@@ -2602,7 +2658,18 @@
        change the membership of. The groups they actually work on come
        first; the two fixed ones sit at the foot, where a list you have read
        to the end ends. */
-    host.innerHTML = ((custom.length && system.length)
+    /* The action that makes a group is the first row of the list of groups.
+       (The Library keeps creation in its toolbar; here the list is the thing
+       being added to, and a row on its own geometry says that better than a
+       button above it.) Delegated, because this markup is rewritten on every
+       repaint. */
+    const newGroupRow = `
+      <button type="button" class="ax-newrow" data-new-group>
+        <span class="ax-newrow__plus" aria-hidden="true">+</span>
+        <span class="ax-newrow__label">New group</span>
+        <span class="ax-newrow__hint">an audience to write grants against</span>
+      </button>`;
+    host.innerHTML = newGroupRow + ((custom.length && system.length)
       ? label("Groups") + custom.map(row).join("") + label("System") + system.map(row).join("")
       : groups.map(row).join(""));
     homeWork(selectedGroup);
@@ -3766,11 +3833,11 @@
       const body = mine.map((r) => {
         const shut = shutKinds.has(r.t.type_key);
         const head = r.t.type_key !== lastKind
-          ? `<button type="button" class="ax-kindrun" data-kindrun="${esc(r.t.type_key)}"
+          ? `<button type="button" class="fbar-grouptoggle ax-kindrun" data-kindrun="${esc(r.t.type_key)}"
                      aria-expanded="${shut ? "false" : "true"}">
                <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-               <span class="ax-kindrun__n">${esc(r.t.type_display)}</span>
-               <span class="ax-kindrun__c">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>
+               <span class="fbar-group__title">${esc(r.t.type_display)}</span>
+               <span class="fbar-group__n">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>
              </button>`
           : "";
         lastKind = r.t.type_key;

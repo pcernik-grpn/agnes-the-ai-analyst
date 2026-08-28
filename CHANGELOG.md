@@ -201,6 +201,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The access toolbar and tables take the Library's own calibration.**
+  Measured against `ek/library-redesign` rather than matched by eye: `.fbar`
+  is shared, but the Library *scopes a calibration onto it* — 32px controls, a
+  search that is a tint rather than a bordered field, a filter button that is
+  plain text until it is on — and that calibration is most of what "looks like
+  the Library" means. The access page had 38px controls, a white bordered
+  search and a bold filter button. Those measurements now match, along with
+  the band (42px, title 13.5px/600) and the column header (10.5px/700, filled,
+  on the same 16px gutter as its rows). Category runs stop shouting: they wear
+  `.fbar-group__title` like every other group header instead of the uppercase,
+  letter-spaced treatment this page had invented, which made a sub-level louder
+  than the family band above it. **New group returns to the list's first row.**
 - **`/admin/access` and the redesigned Library share one toolbar and one band.**
   The toolbar is `.fbar` itself — the same component the Library's browsing
   block uses — so the row, its 10px gap, the search field and the filter button
