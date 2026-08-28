@@ -13,6 +13,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Added
 
 ### Changed
+- **The chat Files drawer got a layout fix and a visual pass.** The file
+  list now flexes across the panel's full remaining height (a fixed `46vh`
+  box left most of the drawer an empty framed rectangle), rows are
+  self-bordered cards with an extension tile, a single-line ellipsized
+  `path · size` hint and compact icon actions (download / save-to-Library /
+  saved-check) instead of two text buttons squeezing the filename; Refresh
+  moved into the header as an icon matching the close button, and the
+  header neutralizes the page-level `header` tag styling that painted a
+  stray divider with a double gap under the title. Engine-backed listings
+  additionally sort `outputs/` deliverables first (they carry no mtime to
+  sort by).
 
 ### Fixed
 
@@ -231,17 +242,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   engine walk now skips the same top-level template entries, derived from the
   same `WORKSPACE_LINK_ENTRIES` source of truth as the host side, and no
   longer even requests those subdirectories.
-- **The chat Files drawer got a layout fix and a visual pass.** The file
-  list now flexes across the panel's full remaining height (a fixed `46vh`
-  box left most of the drawer an empty framed rectangle), rows are
-  self-bordered cards with an extension tile, a single-line ellipsized
-  `path · size` hint and compact icon actions (download / save-to-Library /
-  saved-check) instead of two text buttons squeezing the filename; Refresh
-  moved into the header as an icon matching the close button, and the
-  header neutralizes the page-level `header` tag styling that painted a
-  stray divider with a double gap under the title. Engine-backed listings
-  additionally sort `outputs/` deliverables first (they carry no mtime to
-  sort by).
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
