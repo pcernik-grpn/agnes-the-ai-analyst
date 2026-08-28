@@ -1888,6 +1888,38 @@
   .ax-chiprow[hidden] { display: none; }
   .ax-chiprow__n { font-size: 13px; color: var(--ds-text-muted); font-variant-numeric: tabular-nums; }
   .ax-chiprow .fbar-chips { margin: 0; }
+  /* ── Toolbar: the Library's, part for part ────────────────────────────
+     `.fbar` owns the row; this page adds only where its content differs.
+     The search does not stretch to the full width here because the row also
+     carries a primary action, exactly as the Library's does. */
+  .ax-onebar { margin: 0; }
+  .ax-onebar .fbar__search { flex: 1 1 26rem; min-width: 0; max-width: 34rem; }
+  .ax-filter { margin-right: 0; position: relative; }
+  .ax-newbtn { margin-left: auto; flex: 0 0 auto; white-space: nowrap; }
+
+  /* The state line under the bar — `.lib-browse__state`'s metrics exactly. */
+  .ax-browse__state {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+    min-height: 22px; margin-top: 10px;
+  }
+  .ax-count { font-size: 12.5px; color: var(--ds-text-muted); font-variant-numeric: tabular-nums; }
+  .ax-browse__state .fbar-chips { margin: 0; }
+  .ax-browse__state .fbar-chips[hidden] { display: none; }
+  /* The band is `.fbar-groupband` now — the component brings its own fill and
+     rule, so the page-local band styling is retired to avoid two sources for
+     one look. The leading accent stays: it is what tells one band from the
+     next inside a single list. */
+  .ax-table .ax-fam__hd,
+  .ax-fam__hd {
+    display: block; padding: 0; margin: 0;
+    background: var(--ds-surface-dim);
+    border-bottom: 1px solid var(--ds-border);
+    box-shadow: inset 3px 0 0 var(--ds-text-muted);
+    border-radius: 0;
+  }
+  .ax-fam__hd .fbar-grouptoggle { padding: 8px 12px; cursor: default; }
+  .ax-fam__hd .fbar-grouptoggle:hover { background: none; }
+  .ax-fam__hd .fbar-group__title { font-size: 13px; font-weight: 600; }
 </style>
 {% endblock %}
 
@@ -1932,7 +1964,11 @@
       By person <span class="ax-by__n" data-by-n="person"></span>
     </button>
   </nav>
-  <div class="ax-onebar">
+  {# The shared toolbar component, the same one the Library's browsing block
+     uses: `.fbar` owns the row (flex, 10px gap), `.fbar__search` the field,
+     `.fbar-filter` the button and its menu. Page-local rules here set only
+     what is genuinely this page's — never the spacing or the parts. #}
+  <div class="fbar ax-onebar" role="group" aria-label="Search and filter access">
       {# The shared search input. Present from the start rather than appearing
          past some group count: a control that materializes when a list grows
          is a control nobody knows exists until the day they need it.
@@ -1942,7 +1978,7 @@
          directly beneath it, and the button was cross-navigation the page
          subtitle already carries — together they were a toolbar with no
          toolbar job, sitting between the reader and the two cards. #}
-      <div class="fbar__search ax-glist__find">
+      <div class="fbar__search ax-glist__find" role="search">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16.5 16.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <input type="search" id="ax-group-find" placeholder="Search groups, bundles or people…" autocomplete="off" aria-label="Search groups, bundles or people">
       </div>
@@ -1962,6 +1998,13 @@
         </button>
         <div class="fbar-menu fbar-menu--cats" id="ax-filter-menu" role="menu" aria-label="Filter by kind" hidden></div>
       </div>
+      {# The primary creation action, on the toolbar's right — where the
+         Library keeps "+ Add". It had been the list's first row; the Library
+         pattern wins here because the whole point of this pass is that the
+         two toolbars read as one component. #}
+      <button type="button" class="btn btn-primary ax-newbtn" data-new-group>
+        <span aria-hidden="true">+</span> New group
+      </button>
       {# The audience that does not exist yet. "Grant this to the finance
          team" is one thought, and it used to break in half here: no Finance
          group meant leaving for the group list, creating it there, coming
@@ -1991,9 +2034,12 @@
     {# The Library's chip row: what is showing, then the filters doing the
        showing, then the way out of them. The count leads because a filtered
        list that does not say it is filtered is a list that is simply wrong. #}
-    <div class="ax-chiprow" id="ax-chiprow" hidden>
-      <span class="ax-chiprow__n" id="ax-count"></span>
-      <div class="fbar-chips ax-chips" id="ax-chips"></div>
+    {# `.lib-browse__state`'s shape: the count, then the chips that produced
+       it. Same metrics (10px above, 8/12 gaps, 22px floor) so the two pages'
+       toolbars end the same way. #}
+    <div class="ax-browse__state" id="ax-chiprow">
+      <span class="ax-count" id="ax-count"></span>
+      <div class="fbar-chips ax-chips" id="ax-chips" hidden></div>
     </div>
     <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
 
@@ -2556,17 +2602,7 @@
        change the membership of. The groups they actually work on come
        first; the two fixed ones sit at the foot, where a list you have read
        to the end ends. */
-    /* The action that makes a group is the first row of the list of groups,
-       on that list's own geometry — the marker where each row's avatar sits,
-       the label where each row's name sits. Bound by delegation, not by id:
-       this markup is replaced on every repaint. */
-    const newGroupRow = `
-      <button type="button" class="ax-newrow" data-new-group>
-        <span class="ax-newrow__plus" aria-hidden="true">+</span>
-        <span class="ax-newrow__label">New group</span>
-        <span class="ax-newrow__hint">an audience to write grants against</span>
-      </button>`;
-    host.innerHTML = newGroupRow + ((custom.length && system.length)
+    host.innerHTML = ((custom.length && system.length)
       ? label("Groups") + custom.map(row).join("") + label("System") + system.map(row).join("")
       : groups.map(row).join(""));
     homeWork(selectedGroup);
@@ -2803,12 +2839,17 @@
     const sections = families.map((f) => {
       const parts = byFamily.get(f.key) || [];
       if (!parts.length) return "";
+      /* The Library's group header, part for part: a band carrying a caret,
+         the label, a live count and one line of hint. Same component, so a
+         band here and a band there cannot drift apart. */
       return `
       <div class="ax-fam">
-        <div class="ax-fam__hd">
-          <span class="ax-fam__nm">${esc(f.display_name)}</span>
-          ${f.blurb ? `<span class="ax-fam__sub">${esc(f.blurb)}</span>` : ""}
-          <span class="ax-fam__n">${parts.length} granted</span>
+        <div class="fbar-groupband ax-fam__hd">
+          <div class="fbar-grouptoggle" role="presentation">
+            <span class="fbar-group__title">${esc(f.display_name)}</span>
+            <span class="fbar-group__n">${parts.length}</span>
+            ${f.blurb ? `<span class="fbar-group__hint">${esc(f.blurb)}</span>` : ""}
+          </div>
         </div>
         ${parts.join("")}
       </div>`;
@@ -3737,10 +3778,12 @@
       }).join("");
       return `
       <div class="ax-fam">
-        <div class="ax-fam__hd">
-          <span class="ax-fam__nm">${esc(f.display_name)}</span>
-          ${f.blurb ? `<span class="ax-fam__sub">${esc(f.blurb)}</span>` : ""}
-          <span class="ax-fam__n">${mine.length}</span>
+        <div class="fbar-groupband ax-fam__hd">
+          <div class="fbar-grouptoggle" role="presentation">
+            <span class="fbar-group__title">${esc(f.display_name)}</span>
+            <span class="fbar-group__n">${mine.length}</span>
+            ${f.blurb ? `<span class="fbar-group__hint">${esc(f.blurb)}</span>` : ""}
+          </div>
         </div>
         ${body}
       </div>`;

@@ -201,6 +201,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **`/admin/access` and the redesigned Library share one toolbar and one band.**
+  The toolbar is `.fbar` itself — the same component the Library's browsing
+  block uses — so the row, its 10px gap, the search field and the filter button
+  come from `filter_toolbar.css` rather than from rules written twice. The
+  primary creation action sits at its right, where the Library keeps *+ Add*
+  (this reverses the earlier move of *New group* into the list: the point of
+  the pass is that the two toolbars read as one component). Under the bar, the
+  state line takes `.lib-browse__state`'s exact metrics — the count, then the
+  chips that produced it. Family bands are `.fbar-groupband` +
+  `.fbar-grouptoggle`, the Library's own group header, carrying a label, a live
+  count and one line of hint; the page keeps only the leading accent, which is
+  what separates one band from the next inside a single list.
 - **The toolbar follows the Library's, in order and in parts.** Tabs above;
   then one row with the search and the **Filter** button grouped at the left
   (it had drifted to the far right, where it read as a page control rather
