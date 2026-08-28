@@ -196,6 +196,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use and the
+  client usually redirects into a custom scheme, so the tab left behind reloaded
+  a consumed link and reported an expiry on a connection that had in fact
+  succeeded; a finished consent now leaves a short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do. Allow is also double-submit guarded client-side.
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own

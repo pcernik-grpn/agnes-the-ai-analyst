@@ -133,6 +133,30 @@ _REFRESH_TOKEN_TTL = 3600 * 24 * 30  # 30 days
 # login-redirect round-trip.
 _SESSION_PENDING_AUTH_KEY = "mcp_oauth_pending"
 
+# A finished consent leaves a short-lived outcome marker behind under this
+# prefix so a REPLAY of the consent page — a double-clicked Allow, or a reload
+# of the tab the client leaves behind after taking the redirect — can say what
+# actually happened, instead of reading as "Authorization request expired" on a
+# connection that in fact succeeded. The marker carries no subject, so it can
+# never be exchanged for a token.
+_CONSENT_OUTCOME_PREFIX = "consent_outcome_"
+_CONSENT_OUTCOME_TTL = 600  # 10 minutes
+
+# What the connection can actually do, in the user's language. The only OAuth
+# scope Agnes issues is the coarse "read" (see
+# _oauth_client_registration_options in app/api/mcp_streamable.py), but the MCP
+# surface behind it is the caller's whole authority — write and delete tools
+# included — narrowed only by their own RBAC. Listing the raw scope token was
+# therefore misleading: the consent screen said "read" and the client then
+# offered dozens of write/delete tools.
+_SCOPE_DESCRIPTIONS = {
+    "read": "Read what you can already see in Agnes — catalog, tables, query results, documents, memory",
+}
+_WRITE_CAPABILITY = (
+    "Act on your behalf through Agnes tools that create, update and delete — this connection is not read-only"
+)
+_RBAC_CAPABILITY = "Never do more than your own Agnes permissions allow"
+
 
 class AgnesMCPOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     """Agnes implementation of the MCP SDK OAuth provider protocol.
@@ -491,7 +515,7 @@ async def _consent_page(request: Request) -> Response:
     # Validate that the pending code exists and hasn't expired.
     pending_row = oauth_clients_repo().get_auth_code(pending)
     if pending_row is None or pending_row["expires_at"] < time.time():
-        return HTMLResponse("<h2>Authorization request expired. Please try again.</h2>", status_code=400)
+        return _finished_or_expired_response(pending)
 
     # Check if the user is logged in (Agnes session cookie / header).
     user = _get_session_user(request)
@@ -529,15 +553,19 @@ async def _consent_submit(request: Request) -> Response:
 
     pending_row = oauth_clients_repo().get_auth_code(pending)
     if pending_row is None or pending_row["expires_at"] < time.time():
-        return HTMLResponse("<h2>Authorization request expired.</h2>", status_code=400)
+        return _finished_or_expired_response(pending)
 
     redirect_uri = pending_row["redirect_uri"]
     # Authoritative state is the value persisted at authorize() time, never the
     # form body — so a forged/tampered form cannot swap the client's CSRF state.
     state = pending_row.get("state") or ""
 
+    client_name = _client_display_name(pending_row["client_id"])
+
     if action != "allow":
         # User denied — redirect with error.
+        _record_consent_outcome(pending, action="deny", client_name=client_name)
+        oauth_clients_repo().delete_auth_code(pending)
         sep = "&" if "?" in redirect_uri else "?"
         deny_url = f"{redirect_uri}{sep}error=access_denied"
         if state:
@@ -561,6 +589,7 @@ async def _consent_submit(request: Request) -> Response:
         subject=user["id"],
         resource=pending_row.get("resource"),
     )
+    _record_consent_outcome(pending, action="allow", client_name=client_name)
     oauth_clients_repo().delete_auth_code(pending)
 
     sep = "&" if "?" in redirect_uri else "?"
@@ -745,33 +774,108 @@ def _row_to_client_info(row: dict) -> OAuthClientInformationFull:
     )
 
 
-def _render_consent_page(
-    user_email: str,
-    client_name: str,
-    scopes: list[str],
-    pending: str,
-) -> str:
-    """Return the HTML consent page as a self-contained HTML document.
+def _client_display_name(client_id: str) -> str:
+    """Human name of a registered client, falling back to its id."""
+    from src.repositories import oauth_clients_repo
 
-    SECURITY: every interpolated value is HTML-escaped. ``client_name`` comes
-    from RFC 7591 dynamic client registration (unauthenticated on the streamable
-    MCP endpoint), so it is fully attacker-controlled; rendered unescaped it was
-    a stored-XSS sink executing on the Agnes origin in a logged-in victim's
-    session, and there is no app-wide CSP to fall back on — escaping here is the
-    control.
+    row = oauth_clients_repo().get_client(client_id)
+    return (row or {}).get("client_name") or client_id
+
+
+def _record_consent_outcome(pending: str, *, action: str, client_name: str) -> None:
+    """Remember how a consent ended, so a replay of the page can explain itself.
+
+    Stored as an ordinary auth-code row under the ``consent_outcome_`` prefix
+    with ``subject=None``: ``exchange_authorization_code`` refuses a subject-less
+    code, so the marker is inert as a credential even if its key is guessed.
+    The decision lives in ``state`` and the client's name in ``redirect_uri`` —
+    both plain text columns — because this row is never used as a grant.
     """
+    from src.repositories import oauth_clients_repo
+
+    try:
+        oauth_clients_repo().save_auth_code(
+            code=_CONSENT_OUTCOME_PREFIX + pending,
+            client_id="",
+            scopes=[],
+            code_challenge="",
+            redirect_uri=client_name,
+            redirect_uri_provided_explicitly=False,
+            expires_at=time.time() + _CONSENT_OUTCOME_TTL,
+            subject=None,
+            resource=None,
+            state=action,
+        )
+    except Exception:  # pragma: no cover - a marker is never worth failing consent over
+        logger.warning("failed to record MCP consent outcome", exc_info=True)
+
+
+def _finished_or_expired_response(pending: str) -> Response:
+    """Response for a pending token that is no longer live.
+
+    A consent link is single-use, and the browser keeps offering it after the
+    flow is over: the client takes the redirect (often into a custom scheme, so
+    the tab never navigates), the user reloads or clicks Allow twice, and the
+    second request finds the row gone. Reporting that as "Authorization request
+    expired" told users their connection had failed when it had just succeeded.
+    """
+    from src.repositories import oauth_clients_repo
+
+    outcome = None
+    if pending:
+        row = oauth_clients_repo().get_auth_code(_CONSENT_OUTCOME_PREFIX + pending)
+        if row is not None and row["expires_at"] >= time.time():
+            outcome = row
+
+    if outcome is not None and (outcome.get("state") or "") == "allow":
+        client_name = outcome.get("redirect_uri") or "the application"
+        return HTMLResponse(
+            _render_notice_page(
+                title="Connected to Agnes",
+                body=(
+                    f"Access to Agnes was granted to <span class='app-name'>{_esc(client_name)}</span>. "
+                    "You can close this window and continue in the app."
+                ),
+            )
+        )
+    if outcome is not None:
+        client_name = outcome.get("redirect_uri") or "the application"
+        return HTMLResponse(
+            _render_notice_page(
+                title="Access denied",
+                body=(
+                    f"<span class='app-name'>{_esc(client_name)}</span> was not given access to Agnes. "
+                    "You can close this window."
+                ),
+            )
+        )
+    return HTMLResponse(
+        _render_notice_page(
+            title="This authorization link is no longer valid",
+            body=(
+                "It was already used, or it sat unused for more than five minutes. "
+                "If the app is already connected, nothing is wrong — just close this window. "
+                "Otherwise start the connection again from the app."
+            ),
+        ),
+        status_code=400,
+    )
+
+
+def _esc(value: str) -> str:
     import html
 
-    esc_client = html.escape(client_name or "")
-    esc_email = html.escape(user_email or "")
-    esc_pending = html.escape(pending or "", quote=True)
-    scope_list = "".join(f"<li>{html.escape(s)}</li>" for s in scopes) if scopes else "<li>read access</li>"
+    return html.escape(value or "")
+
+
+def _page_shell(title: str, inner_html: str) -> str:
+    """Return a self-contained HTML document sharing the consent-card styling."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authorize {esc_client} — Agnes</title>
+  <title>{_esc(title)}</title>
   <style>
     :root {{
       --ds-primary: #6366f1;
@@ -805,7 +909,7 @@ def _render_consent_page(
     h1 {{ font-size: 1.25rem; font-weight: 600; margin-bottom: .5rem; }}
     .sub {{ color: var(--ds-muted); font-size: .875rem; margin-bottom: 1.5rem; }}
     .app-name {{ font-weight: 600; color: var(--ds-text); }}
-    .scope-list {{ list-style: none; margin-bottom: 1.5rem; }}
+    .scope-list {{ list-style: none; margin-bottom: 1rem; }}
     .scope-list li {{
       padding: .375rem .75rem;
       background: var(--ds-bg);
@@ -814,6 +918,7 @@ def _render_consent_page(
       margin-bottom: .375rem;
       border: 1px solid var(--ds-border);
     }}
+    .note {{ color: var(--ds-muted); font-size: .8rem; margin-bottom: 1.5rem; }}
     .actions {{ display: flex; gap: .75rem; justify-content: flex-end; }}
     button {{
       cursor: pointer;
@@ -823,6 +928,7 @@ def _render_consent_page(
       font-size: .9rem;
       font-weight: 500;
     }}
+    button[disabled] {{ opacity: .6; cursor: default; }}
     .btn-allow {{
       background: var(--ds-primary);
       color: #fff;
@@ -837,22 +943,76 @@ def _render_consent_page(
 </head>
 <body>
   <div class="card">
-    <h1>Authorize access</h1>
+{inner_html}
+  </div>
+</body>
+</html>"""
+
+
+def _render_notice_page(title: str, body: str) -> str:
+    """Terminal-state page (already connected / denied / link no longer valid).
+
+    ``body`` may contain markup produced here; every caller-supplied value in it
+    is escaped by the caller.
+    """
+    return _page_shell(
+        f"{title} — Agnes",
+        f"""    <h1>{_esc(title)}</h1>
+    <p class="sub">{body}</p>""",
+    )
+
+
+def _access_summary(scopes: list[str]) -> list[str]:
+    """Plain-language capability lines for the consent screen."""
+    lines = [_SCOPE_DESCRIPTIONS[s] for s in scopes if s in _SCOPE_DESCRIPTIONS]
+    if not lines:
+        lines.append(_SCOPE_DESCRIPTIONS["read"])
+    lines.append(_WRITE_CAPABILITY)
+    lines.append(_RBAC_CAPABILITY)
+    return lines
+
+
+def _render_consent_page(
+    user_email: str,
+    client_name: str,
+    scopes: list[str],
+    pending: str,
+) -> str:
+    """Return the HTML consent page as a self-contained HTML document.
+
+    SECURITY: every interpolated value is HTML-escaped. ``client_name`` comes
+    from RFC 7591 dynamic client registration (unauthenticated on the streamable
+    MCP endpoint), so it is fully attacker-controlled; rendered unescaped it was
+    a stored-XSS sink executing on the Agnes origin in a logged-in victim's
+    session, and there is no app-wide CSP to fall back on — escaping here is the
+    control.
+    """
+    import html
+
+    esc_client = html.escape(client_name or "")
+    esc_email = html.escape(user_email or "")
+    esc_pending = html.escape(pending or "", quote=True)
+    capability_items = "".join(f"<li>{html.escape(line)}</li>" for line in _access_summary(list(scopes or [])))
+    return _page_shell(
+        f"Authorize {esc_client} — Agnes",
+        f"""    <h1>Authorize access</h1>
     <p class="sub">
       <span class="app-name">{esc_client}</span>
-      is requesting permission to access Agnes on your behalf.
+      is asking to connect to Agnes as you. If you allow it, it will be able to:
     </p>
     <ul class="scope-list">
-      {scope_list}
+      {capability_items}
     </ul>
-    <form method="post" action="/api/mcp/oauth/consent">
+    <p class="note">
+      Agnes issues one connection for the whole MCP toolset, so the app sees both
+      read and write tools. Access ends when you disconnect the app.
+    </p>
+    <form method="post" action="/api/mcp/oauth/consent" onsubmit="this.dataset.sent && event.preventDefault(); this.dataset.sent = 1;">
       <input type="hidden" name="pending" value="{esc_pending}">
       <div class="actions">
         <button type="submit" name="action" value="deny" class="btn-deny">Deny</button>
         <button type="submit" name="action" value="allow" class="btn-allow">Allow</button>
       </div>
     </form>
-    <p class="user">Signed in as {esc_email}</p>
-  </div>
-</body>
-</html>"""
+    <p class="user">Signed in as {esc_email}</p>""",
+    )

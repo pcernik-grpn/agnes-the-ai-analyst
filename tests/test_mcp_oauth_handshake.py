@@ -570,6 +570,130 @@ def test_consent_post_still_accepts_browser_cookie_session(seeded_app):
     assert "code=" in r.headers["location"], "the real browser consent flow must keep working"
 
 
+def test_consent_page_describes_write_access_not_the_raw_scope(seeded_app):
+    """The only scope Agnes issues is the coarse ``read``, but the connection
+    exposes the write/delete MCP tools too. Listing the raw scope token made the
+    consent screen claim read-only access the client immediately contradicted."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    r = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "not read-only" in body, "consent must say the connection can write, not just 'read'"
+    assert "create, update and delete" in body
+    assert "your own Agnes permissions allow" in body
+    assert "<li>read</li>" not in body, "the raw scope token must not be the whole story"
+
+
+def test_consent_replay_after_allow_reports_success_not_expiry(seeded_app):
+    """A consent link is single-use and the browser keeps offering it after the
+    client has taken the redirect (custom-scheme handoff, reload, double-click).
+    That replay must explain the connection succeeded instead of reporting
+    "Authorization request expired" on a connection that actually worked."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    first = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert first.status_code in (302, 307), first.text
+
+    replay = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert replay.status_code == 200, f"a replayed consent must not read as an error (got {replay.status_code})"
+    assert "Connected to Agnes" in replay.text
+    assert "expired" not in replay.text.lower()
+
+    reload_get = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+    assert reload_get.status_code == 200
+    assert "Connected to Agnes" in reload_get.text
+
+
+def test_consent_replay_after_deny_reports_denial(seeded_app):
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    first = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "deny"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert first.status_code in (302, 307)
+    assert "error=access_denied" in first.headers["location"]
+
+    replay = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+    assert replay.status_code == 200
+    assert "Access denied" in replay.text
+
+
+def test_unknown_pending_token_still_reports_an_invalid_link(seeded_app):
+    """No outcome marker → the link really is unusable: keep the 4xx, but say
+    what to do about it."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+
+    r = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": "pending_never-existed"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 400
+    assert "no longer valid" in r.text
+    assert "start the connection again" in r.text
+
+
+def test_consent_outcome_marker_cannot_be_exchanged_for_a_token(seeded_app):
+    """The replay marker is stored as an auth-code row; it must be inert as a
+    grant — no subject, so ``exchange_authorization_code`` refuses it."""
+    from app.auth.mcp_oauth import _CONSENT_OUTCOME_PREFIX
+    from src.repositories import oauth_clients_repo
+
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+    client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    marker = oauth_clients_repo().get_auth_code(_CONSENT_OUTCOME_PREFIX + pending)
+    assert marker is not None, "the allow outcome must be remembered for the replay page"
+    assert marker.get("subject") is None, "a subject on the marker would make it exchangeable for a token"
+    assert marker.get("client_id") == ""
+
+
 def test_provider_rejects_unknown_token(seeded_app):
     """A token that was never issued must not verify."""
     import asyncio
