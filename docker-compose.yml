@@ -202,7 +202,7 @@ services:
   #
   # Built from the `worker` Dockerfile target — see that stage's comment for
   # the EXTRACTION_PRODUCER_INSTALL build-arg extension point; this repo does
-  # NOT vendor the producer (keboola/cuesta-star-graph, adopted per spec
+  # NOT vendor the producer (a separate project of the operator's, adopted per spec
   # §7.1). Off by default (`extraction.enabled: false`,
   # config/instance.yaml.example) AND behind its own compose profile — a
   # deployment that wants it running does BOTH: flips the config block and

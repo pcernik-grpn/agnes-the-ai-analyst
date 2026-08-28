@@ -115,7 +115,7 @@ distribution mirror, and the api-role write conversions) map onto:
   credentials and the corpus id are forwarded — see
   ``_EXTRACTION_PRODUCER_ENV_ALLOWLIST``. No other instance secret ever
   reaches this subprocess. The producer itself
-  (``keboola/cuesta-star-graph``) is adopted, not
+  is a separate project the operator supplies, adopted rather than
   ported into this repo (spec §1 "Out of scope") — see
   ``_run_corpus_extraction`` below for exactly where that boundary is.
   Registered UNCONDITIONALLY (its own no-op guard on
@@ -1208,7 +1208,7 @@ def _run_corpus_extraction(payload: dict) -> dict:
     ITSELF — it resolves credentials, builds a command line, runs one
     subprocess, and reports what happened. The crawl -> convert ->
     anonymize -> extract -> ingest pipeline behind that subprocess is the
-    external producer (``keboola/cuesta-star-graph``, adopted per spec
+    external producer (a separate project of the operator's, adopted per spec
     §7.1); porting its internals into this repo is explicitly out of scope
     (spec §1 "Out of scope") — this handler is the seam a future producer
     integration plugs into, not a place to grow pipeline logic.

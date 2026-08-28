@@ -159,7 +159,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-
 # ---------------------------------------------------------------------------
 # Same image as `base`/`app` above, plus an EXTENSION POINT for bundling an
 # extraction producer's runtime deps (crawl/convert/anonymize/extract —
-# adopted from keboola/cuesta-star-graph per spec §7.1, NEVER vendored into
+# adopted from the operator's own producer repository per spec §7.1, NEVER vendored into
 # this repo). The entrypoint is IDENTICAL to `app` — one-image,
 # one-entrypoint still holds; `AGNES_ROLE=worker` + `AGNES_WORKER_LANES
 # =extraction` (set by the `extraction-worker` compose service, not baked
@@ -171,7 +171,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-
 # exist bakes it in, via:
 #
 #   docker build --target worker \
-#     --build-arg EXTRACTION_PRODUCER_INSTALL="uv pip install --system git+https://github.com/keboola/cuesta-star-graph@<ref>" \
+#     --build-arg EXTRACTION_PRODUCER_INSTALL="uv pip install --system git+https://github.com/<org>/<producer-repo>@<ref>" \
 #     -t agnes-extraction-worker .
 #
 # Left empty by default — building this target with no build-arg produces a

@@ -1134,7 +1134,7 @@ facts:
 #
 # Agnes does NOT ship the producer (crawl/convert/anonymize/extract) — this
 # block only configures HOW to invoke whatever producer command the
-# deployment provides. The producer is keboola/cuesta-star-graph, adopted
+# deployment provides. The producer is a separate project of your own, adopted
 # per spec §7.1; it is never vendored into this repo. A plain `docker
 # compose up` (no `--target worker` build, no EXTRACTION_PRODUCER_INSTALL
 # build-arg) has nothing to invoke here — `corpus-extraction` fails clean
@@ -1150,10 +1150,10 @@ extraction:
   enabled: false
   producer:
     # Full command line for the producer entrypoint, e.g.:
-    #   command: "python -m cuesta_star_graph.run"
+    #   command: "python -m your_producer.run"
     # OR, when the worker image installed it as a package (see the
     # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
-    #   module: cuesta_star_graph.run
+    #   module: your_producer.run
     # `command` wins when both are set. Either form MAY be a YAML list
     # instead of a string, taken verbatim (no shell-splitting needed then).
     command: ""

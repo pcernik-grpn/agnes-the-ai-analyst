@@ -738,7 +738,7 @@ any operator-opted-in `extraction.producer.env_passthrough`, plus the
 three named SharePoint credentials and the corpus id — never the full
 parent environment, so no other instance secret (vault key, LLM API key,
 DB DSN, ...) reaches an external, admin-configurable binary. The producer
-itself (`keboola/cuesta-star-graph`, adopted per spec §7.1) is not
+itself (the operator's own producer, adopted per spec §7.1) is not
 vendored into this repo. Off by default and additive: an instance that
 never sets `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
 
