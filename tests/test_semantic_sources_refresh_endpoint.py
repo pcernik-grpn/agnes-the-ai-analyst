@@ -301,6 +301,93 @@ class TestLegacyAutoMigration:
         assert entry["status"] == "ok"
         assert entry["reconciled_legacy"] == {"metrics": 3}
 
+    def test_a_raising_reconciler_leaves_the_sync_successful_and_the_sweep_running(self, seeded_app, monkeypatch):
+        """Reconciliation is best-effort by contract: it runs AFTER the import
+        already wrote and recorded. A reconciler that raises must therefore
+        neither turn that success into a failure nor abort the sources behind
+        it — which it did while the call sat outside the per-source guard."""
+        import app.api.semantic_sources_refresh as endpoint_module
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first = _create_source(c, token, kind="upload", name="A bundle", config={"documents": [DOC]})
+        second = _create_source(c, token, kind="upload", name="B bundle", config={"documents": [DOC]})
+
+        def boom(source, report):
+            raise RuntimeError("reconciliation exploded")
+
+        monkeypatch.setattr(endpoint_module, "reconcile_after_import", boom)
+
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["synced"] == 2
+        assert body["failed"] == 0
+        statuses = {s["id"]: s["status"] for s in body["sources"]}
+        assert statuses[first] == "ok"
+        assert statuses[second] == "ok"
+
+
+class TestSharedSingleFlightWithTheLoginTriggeredSync:
+    """The Keboola login-triggered sync (`run_semantic_layer_refresh_background`)
+    and this sweep write the SAME
+    ``(source='keboola_metastore', source_ref=<connection id>)`` rows. Two
+    locks in two modules made them overlappable; one shared guard makes that
+    impossible."""
+
+    @pytest.fixture(autouse=True)
+    def _no_legacy_env(self, monkeypatch):
+        monkeypatch.delenv("KEBOOLA_STACK_URL", raising=False)
+        monkeypatch.delenv("KEBOOLA_STORAGE_TOKEN", raising=False)
+
+    def test_a_keboola_source_is_skipped_while_the_login_sync_holds_the_guard(self, seeded_app):
+        from src.semantic.refresh_guard import KEBOOLA_SEMANTIC_REFRESH
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        keboola_id = _create_source(
+            c,
+            token,
+            kind="connection",
+            name="A Keboola project",
+            adapter="keboola_metastore",
+            config={"connection_id": "conn-a"},
+        )
+        other_id = _create_source(c, token, kind="upload", name="Z bundle", config={"documents": [DOC]})
+
+        with KEBOOLA_SEMANTIC_REFRESH.try_claim("login:test") as claimed:
+            assert claimed
+            r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        statuses = {s["id"]: s["status"] for s in body["sources"]}
+        assert statuses[keboola_id] == "skipped_running"
+        assert statuses[other_id] == "ok"
+        assert body["skipped_running"] == 1
+        # Skipped, not failed — the next sweep picks it up, and the row keeps
+        # whatever its last real sync said.
+        assert body["failed"] == 0
+        row = c.get(f"/api/admin/semantic-sources/{keboola_id}", headers=_auth(token))
+        assert row.json()["last_sync_status"] is None
+
+    def test_the_guard_is_released_again_once_the_sweep_returns(self, seeded_app):
+        from src.semantic.refresh_guard import KEBOOLA_SEMANTIC_REFRESH
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        _create_source(
+            c,
+            token,
+            kind="connection",
+            name="A Keboola project",
+            adapter="keboola_metastore",
+            config={"connection_id": "conn-a"},
+        )
+
+        c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+        assert KEBOOLA_SEMANTIC_REFRESH.busy is False
+
 
 class TestSweepSummary:
     """The /admin/semantic-layer status strip reads this — the whole-sweep

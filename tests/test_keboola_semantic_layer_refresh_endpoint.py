@@ -211,4 +211,21 @@ class TestBackgroundRefreshSingleFlight:
         asyncio.run(kslr.run_semantic_layer_refresh_background(trigger="first"))
         asyncio.run(kslr.run_semantic_layer_refresh_background(trigger="second"))
         assert len(calls) == 2
-        assert kslr._refresh_claimed is False
+        assert kslr.KEBOOLA_SEMANTIC_REFRESH.busy is False
+
+    def test_the_login_sync_skips_while_the_scheduled_sweep_holds_the_guard(self, monkeypatch):
+        """The other half of the single flight: the generic sweep claims the
+        SAME guard while importing a keboola-provenance source, so a login
+        landing mid-sweep skips instead of racing a second upsert+prune pass
+        over one connection's rows."""
+        import app.api.keboola_semantic_layer_refresh as kslr
+
+        calls = []
+        monkeypatch.setattr(kslr, "sync_semantic_layer", lambda: calls.append(1) or {"status": "ok"})
+
+        with kslr.KEBOOLA_SEMANTIC_REFRESH.try_claim("sweep:keboola_conn-a") as claimed:
+            assert claimed
+            asyncio.run(kslr.run_semantic_layer_refresh_background(trigger="keboola-login"))
+
+        assert calls == []
+        assert kslr.KEBOOLA_SEMANTIC_REFRESH.busy is False

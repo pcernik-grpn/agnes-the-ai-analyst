@@ -1171,9 +1171,9 @@ def _semantic_preflight(url: str, token: str, expected_project: Optional[tuple[A
     )
 
 
-def resolve_semantic_source_credentials(config: dict) -> tuple[str, str]:
-    """``(stack_url, token)`` for a ``connection``-kind Keboola semantic
-    source, preflighted.
+def _semantic_source_credentials(config: dict) -> tuple[str, str, Optional[tuple[Any, str]]]:
+    """``(stack_url, token, expected project)`` for a ``connection``-kind
+    Keboola semantic source, WITHOUT the preflight.
 
     Two shapes, mirroring the two the legacy orchestrator resolved:
     ``config.connection_id`` (a connection's own master token, the normal
@@ -1183,22 +1183,51 @@ def resolve_semantic_source_credentials(config: dict) -> tuple[str, str]:
     """
     connection_id = str(config.get("connection_id") or "").strip()
     if connection_id:
-        url, token, expected = _connection_master_credentials(connection_id)
-    elif config.get("legacy_credentials"):
+        return _connection_master_credentials(connection_id)
+    if config.get("legacy_credentials"):
         url, token = _resolve_keboola_credentials(None, None)
-        expected = None
         if not (url and token):
             raise RuntimeError(
                 "Keboola credentials not configured (KEBOOLA_STACK_URL + KEBOOLA_STORAGE_TOKEN, or a "
                 "connection holding a master token); nothing to sync."
             )
-    else:
-        raise ValueError(
-            "Keboola semantic source config must carry connection_id (a registered Keboola connection) "
-            "or legacy_credentials: true"
-        )
+        return url, token, None
+    raise ValueError(
+        "Keboola semantic source config must carry connection_id (a registered Keboola connection) "
+        "or legacy_credentials: true"
+    )
+
+
+def resolve_semantic_source_credentials(config: dict) -> tuple[str, str]:
+    """``(stack_url, token)`` for a ``connection``-kind Keboola semantic
+    source, preflighted (master token + project binding)."""
+    url, token, expected = _semantic_source_credentials(config)
     _semantic_preflight(url, token, expected)
     return url, token
+
+
+def sweep_project_identity(config: dict) -> Optional[tuple[str, Any]]:
+    """The upstream project ``config`` resolves to, as ``_project_key``'s
+    ``(stack host, token owner id)`` — the identity the legacy multi-source
+    loop deduped on, for the migrated one-row-per-connection path.
+
+    Nothing stops an admin registering ONE Keboola project under two
+    connections (uniqueness is on connection name). The legacy loop threaded
+    ``seen_project_keys`` across its sources for that case; per-source imports
+    have to re-derive it, and the only honest way to know which project a
+    source opens is to ask the stack.
+
+    Deliberately NOT preflighted: a source whose token is not a master token,
+    or which opens a project its connection is not bound to, must fail inside
+    its own import — where ``import_source`` records the error on the row —
+    not inside a dedupe pre-check. Returns ``None`` when there is no reliable
+    identity (``_project_key``'s own missing-owner-id rule), which callers
+    must read as "not dedupable, sync it normally".
+    """
+    from connectors.keboola.storage_api import KeboolaStorageClient
+
+    url, token, _expected = _semantic_source_credentials(config)
+    return _project_key(url, KeboolaStorageClient(url=url, token=token).verify_token())
 
 
 def _claims_provenance(row: dict, *, connection_id: Optional[str], source_ref: Optional[str]) -> bool:
@@ -1249,14 +1278,28 @@ def ensure_semantic_sources() -> list[dict]:
             connection_id = source["connection_id"]
             if any(_claims_provenance(r, connection_id=connection_id, source_ref=connection_id) for r in existing):
                 continue
-            row = repo.create(
-                id=semantic_source_id(connection_id),
-                kind="connection",
-                name=f"Keboola semantic layer — {source['name']}",
-                adapter=SEMANTIC_ADAPTER,
-                config=_semantic_source_config(connection_id=connection_id, source_ref=connection_id),
-                enabled=True,
-            )
+            try:
+                row = repo.create(
+                    id=semantic_source_id(connection_id),
+                    kind="connection",
+                    name=f"Keboola semantic layer — {source['name']}",
+                    adapter=SEMANTIC_ADAPTER,
+                    config=_semantic_source_config(connection_id=connection_id, source_ref=connection_id),
+                    enabled=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - one row must not cost the rest
+                # Reachable without a bug: the id is derived from the
+                # connection id, so anything already sitting on it (an
+                # admin's own row for a different scope) makes this INSERT
+                # fail its primary key. Skipping that connection leaves it
+                # unmigrated and logged; aborting the loop would silently
+                # leave every connection after it unmigrated too.
+                logger.warning(
+                    "Keboola semantic layer: could not register a semantic source for connection %s: %s",
+                    connection_id,
+                    exc,
+                )
+                continue
             existing.append(row)
             created.append(row)
         _supersede_legacy_credentials_source(repo, existing)
@@ -1310,6 +1353,16 @@ def _supersede_legacy_credentials_source(repo: Any, existing: list[dict]) -> Non
     repo.update(LEGACY_CREDENTIALS_SOURCE_ID, enabled=False)
 
 
+def default_connection_id() -> Optional[str]:
+    """The connection ``sync_semantic_layer`` treats as "the default one", by
+    id — published because the migrated sweep needs the same answer the legacy
+    loop computed inline (``adopt_null=connection_id == default_id``): only
+    the default connection may adopt the unstamped rows written before
+    provenance existed."""
+    conn = _default_keboola_connection()
+    return conn["id"] if conn else None
+
+
 def legacy_credentials_prune_scope() -> set:
     """The ``source_ref``s the legacy env-credential path owns: NULL, or the
     default connection's id — whichever of the two it ended up stamping.
@@ -1319,8 +1372,7 @@ def legacy_credentials_prune_scope() -> set:
     came from that connection, but a downgrade (the last master token removed)
     still has to clean up the rows it previously owned under either label.
     """
-    conn = _default_keboola_connection()
-    return {None, conn["id"] if conn else None}
+    return {None, default_connection_id()}
 
 
 def purge_legacy_metric_rows(*, scope_refs: set, adopt_null: bool) -> int:

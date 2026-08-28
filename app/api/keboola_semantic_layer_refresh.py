@@ -17,9 +17,13 @@ What stayed here, because neither is a scheduled trigger:
   duplicate what the sweep writes.
 * ``GET /api/admin/semantic-layer/coverage`` — a read-only report.
 
-Single-flight guarded: the background sync claims the slot before it starts,
-so two logins landing together cannot race a second Metastore fetch +
-upsert/prune pass against the same rows.
+Single-flight guarded, and guarded against the SWEEP as well as against
+itself: the background sync claims ``KEBOOLA_SEMANTIC_REFRESH``
+(``src/semantic/refresh_guard.py``) before it starts, and the sweep claims the
+same slot while importing a ``keboola_metastore``-adapter source. Two logins
+landing together, or a login landing inside a sweep, therefore skip instead of
+racing a second Metastore fetch + upsert/prune pass against the same rows —
+which two locks in two modules could not prevent.
 """
 
 from __future__ import annotations
@@ -34,19 +38,10 @@ from fastapi import APIRouter, Depends
 
 from app.auth.access import require_admin
 from connectors.keboola.semantic_layer import sync_semantic_layer
+from src.semantic.refresh_guard import KEBOOLA_SEMANTIC_REFRESH
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-_refresh_lock = asyncio.Lock()
-# Claimed SYNCHRONOUSLY (no await between check and set) before either caller
-# touches the lock. `_refresh_lock.locked()` alone leaves the skip decision
-# and the acquisition as two steps; the uncontended asyncio.Lock.acquire fast
-# path happens not to yield between them on CPython, but that is an
-# implementation detail, and a second caller passing the check would QUEUE a
-# full duplicate sync instead of skipping (Devin Review on PR #1328). The
-# flag flip is atomic on the single event loop by construction.
-_refresh_claimed = False
 # In-flight tracking (`run_id`/`started_at`, cleared once a run finishes) plus
 # the LAST COMPLETED run's summary (`last_completed_at`/`last_status`/
 # `last_result`), so an admin who hasn't synced yet — or whose last sync
@@ -84,49 +79,50 @@ def _record_completion(status: str, result: Any) -> None:
 
 
 async def run_semantic_layer_refresh_background(*, trigger: str) -> None:
-    """Fire the same guarded sync the admin endpoint owns, for background
-    callers (the Keboola multi-project login provisions master tokens and
-    wants the metrics live without an admin click). Shares the single-flight
-    lock and the status dict, so the admin UI shows these runs too. Skips
-    silently when a run is already in flight — the next login or the
-    scheduler catches up — and never raises. The skip decision and the slot
-    acquisition are one atomic step (see ``_refresh_claimed``)."""
-    global _refresh_claimed
-    if _refresh_claimed or _refresh_lock.locked():
-        logger.info("keboola semantic layer refresh (%s): already running, skipped", trigger)
-        return
-    _refresh_claimed = True
-    try:
-        async with _refresh_lock:
-            run_id = uuid.uuid4().hex[:8]
-            _refresh_state["run_id"] = run_id
-            _refresh_state["started_at"] = datetime.now(timezone.utc).isoformat()
-            try:
-                result = await asyncio.to_thread(sync_semantic_layer)
-            except Exception as e:  # noqa: BLE001 — background: record, never raise
-                _record_completion("error", str(e))
-                logger.warning("keboola semantic layer refresh (%s) failed: %s", trigger, e)
-                return
-            finally:
-                _refresh_state["run_id"] = None
-                _refresh_state["started_at"] = None
-            if result.get("status") == "error":
-                _record_completion("error", result.get("error", "Keboola semantic layer sync failed"))
-                logger.warning(
-                    "keboola semantic layer refresh (%s) reported an error: %s", trigger, result.get("error")
-                )
-                return
-            _record_completion("ok", result)
+    """Fire the guarded Keboola sync for background callers (the multi-project
+    login provisions master tokens and wants the metrics live without an admin
+    click). Skips silently when the shared slot is taken — by another login OR
+    by the scheduled sweep importing the same rows — and never raises; the
+    next login or the next sweep catches up.
+
+    The claim is one atomic, non-blocking step (``SingleFlight.try_claim``):
+    a check followed by a separate acquisition would let a second caller pass
+    the check and then QUEUE a full duplicate sync instead of skipping (Devin
+    Review on PR #1328).
+    """
+    with KEBOOLA_SEMANTIC_REFRESH.try_claim(f"login:{trigger}") as claimed:
+        if not claimed:
             logger.info(
-                "keboola semantic layer refresh (%s): run_id=%s created_or_updated=%s pruned=%s sources=%s",
+                "keboola semantic layer refresh (%s): already running (%s), skipped",
                 trigger,
-                run_id,
-                result.get("created_or_updated"),
-                result.get("pruned"),
-                len(result.get("sources") or []),
+                KEBOOLA_SEMANTIC_REFRESH.holder,
             )
-    finally:
-        _refresh_claimed = False
+            return
+        run_id = uuid.uuid4().hex[:8]
+        _refresh_state["run_id"] = run_id
+        _refresh_state["started_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            result = await asyncio.to_thread(sync_semantic_layer)
+        except Exception as e:  # noqa: BLE001 — background: record, never raise
+            _record_completion("error", str(e))
+            logger.warning("keboola semantic layer refresh (%s) failed: %s", trigger, e)
+            return
+        finally:
+            _refresh_state["run_id"] = None
+            _refresh_state["started_at"] = None
+        if result.get("status") == "error":
+            _record_completion("error", result.get("error", "Keboola semantic layer sync failed"))
+            logger.warning("keboola semantic layer refresh (%s) reported an error: %s", trigger, result.get("error"))
+            return
+        _record_completion("ok", result)
+        logger.info(
+            "keboola semantic layer refresh (%s): run_id=%s created_or_updated=%s pruned=%s sources=%s",
+            trigger,
+            run_id,
+            result.get("created_or_updated"),
+            result.get("pruned"),
+            len(result.get("sources") or []),
+        )
 
 
 @router.get("/api/admin/semantic-layer/coverage")

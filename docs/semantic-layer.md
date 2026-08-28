@@ -134,6 +134,24 @@ nothing usable must not delete an installation's whole metric registry.
 Registration is idempotent and never a get-or-*replace*: a source an admin
 renamed, re-scoped or disabled stays exactly as they left it.
 
+**`config.provenance` is Agnes-managed and not admin-writable.** It names the
+`(source, source_ref)` pair a source's rows are written *and pruned* under, so
+a source allowed to claim an arbitrary one could delete another connection's
+models, metrics, glossary terms and column descriptions. `POST`/`PUT
+/api/admin/semantic-sources` refuse a config carrying it (`400
+provenance_not_settable`), and a stored override is validated on every sync:
+the label must be a migrated legacy one, the source must run that label's
+adapter, and the `source_ref` must be the source's own connection (or, for the
+legacy env-credential row, the pair that path has ever stamped).
+
+Two things the sweep skips rather than syncs, both carried over from guards
+the retired triggers had built in:
+
+| Skip | When | Where it shows |
+|---|---|---|
+| `skipped_running` | a Keboola source whose rows the login-triggered sync (`run_semantic_layer_refresh_background`) is writing right now — the two share one single-flight guard, so they can never overlap | the sweep's response only; the row keeps its last real sync state and the next sweep picks it up |
+| `skipped_duplicate_project` | a second source resolving to the SAME upstream Keboola project as one already imported this sweep (two connections may point at one project) — importing both would write one project's rows under two refs that then delete each other's | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
+
 ## Adapters — adding a source format
 
 An adapter turns one source's payload into Ossie documents and does nothing

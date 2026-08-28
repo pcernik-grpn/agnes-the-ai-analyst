@@ -32,11 +32,26 @@ under a *new* label would therefore neither update nor prune the existing rows
 orphaned forever, exactly the silent duplication the migration sequencing
 exists to avoid. Continuity of the prune scope is the whole point.
 
-The override is restricted to :data:`_LEGACY_PROVENANCE_SOURCES`. ``config``
-is admin-writable through ``POST /api/admin/semantic-sources``, and an
-unconstrained override would let any source claim any other writer's scope —
-``source='manual'`` would put a sync's prune pass over hand-authored rows.
-Adding a label here is a deliberate act with a migration behind it.
+The override is restricted three ways, because ``config`` reaches the
+database from more than one writer and a claim is a licence to DELETE:
+
+1. the LABEL must be one of :data:`_LEGACY_PROVENANCE_ADAPTERS` — one entry
+   per legacy writer whose scheduled trigger moved onto the generic sweep;
+2. the source must RUN that label's adapter — an ``upload``/``native`` source
+   has no upstream a legacy label could describe, so it may never carry one;
+3. the ``source_ref`` must be one the row can justify from its OWN config —
+   its ``connection_id``, or (for the legacy env-credential row) the pair
+   that path has ever stamped. The label alone is not the boundary: the ref
+   is what selects whose rows a prune reaches, so checking only the label
+   would let any source name connection A's ref and wipe A's models,
+   metrics, glossary terms and column descriptions on its next sync.
+
+``POST``/``PUT /api/admin/semantic-sources`` refuses ``config.provenance``
+outright (``app/api/semantic_models.py``), so today the only writer is the
+auto-migration itself, through the repository. These checks are the second
+half of that story rather than a duplicate of it: they hold for a row written
+by any future path, and they are what makes the CRUD refusal a defence in
+depth instead of the only wall.
 
 ``config.safe_prune`` is the second knob the same migration needs: the
 full-wipe guard the Keboola sync has always passed to ``project_document``
@@ -60,10 +75,11 @@ from src.semantic.importer import ImportReport, import_documents
 
 _DEFAULT_GLOB = "**/*.yaml"
 
-#: Provenance labels a source may claim through ``config.provenance`` — one
-#: per legacy writer whose scheduled trigger moved onto the generic sweep.
-#: See the module docstring for why this is an allowlist and not a free field.
-_LEGACY_PROVENANCE_SOURCES = frozenset({"keboola_metastore"})
+#: Provenance labels a source may claim through ``config.provenance``, mapped
+#: to the adapter a claiming source MUST run — one entry per legacy writer
+#: whose scheduled trigger moved onto the generic sweep. See the module
+#: docstring for why this is an allowlist and not a free field.
+_LEGACY_PROVENANCE_ADAPTERS = {"keboola_metastore": "keboola_metastore"}
 
 
 def resolve_provenance(source: Dict[str, Any]) -> tuple[str, Optional[str]]:
@@ -92,22 +108,75 @@ def resolve_provenance(source: Dict[str, Any]) -> tuple[str, Optional[str]]:
     if not isinstance(label, str) or not label.strip():
         raise ValueError(f"semantic source {source_id!r}: config.provenance.source must be a non-empty string")
     label = label.strip()
-    if label not in _LEGACY_PROVENANCE_SOURCES:
+    if label not in _LEGACY_PROVENANCE_ADAPTERS:
         raise ValueError(
             f"semantic source {source_id!r}: config.provenance.source {label!r} is not a migrated legacy "
-            f"provenance label (allowed: {', '.join(sorted(_LEGACY_PROVENANCE_SOURCES))}). A source may not "
+            f"provenance label (allowed: {', '.join(sorted(_LEGACY_PROVENANCE_ADAPTERS))}). A source may not "
             "claim another writer's prune scope."
+        )
+
+    required_adapter = _LEGACY_PROVENANCE_ADAPTERS[label]
+    adapter = (source.get("adapter") or "").strip()
+    if adapter != required_adapter:
+        raise ValueError(
+            f"semantic source {source_id!r}: config.provenance.source {label!r} may only be claimed by a "
+            f"source running the {required_adapter!r} adapter, not {adapter or 'native'!r}. A source that "
+            "does not read that upstream cannot own — or prune — the rows it writes."
         )
 
     # An explicit `"source_ref": null` is meaningful — it is what the legacy
     # Keboola env-credential path stamps — so "absent" and "present but None"
     # must not collapse into the same branch.
-    if "source_ref" not in override:
-        return label, source_id
-    ref = override["source_ref"]
-    if ref is not None and not isinstance(ref, str):
-        raise ValueError(f"semantic source {source_id!r}: config.provenance.source_ref must be a string or null")
+    if "source_ref" in override:
+        ref = override["source_ref"]
+        if ref is not None and not isinstance(ref, str):
+            raise ValueError(f"semantic source {source_id!r}: config.provenance.source_ref must be a string or null")
+    else:
+        ref = source_id
+    _assert_ref_is_the_sources_own(source_id=source_id, label=label, config=source.get("config") or {}, ref=ref)
     return label, ref
+
+
+def _assert_ref_is_the_sources_own(*, source_id: str, label: str, config: Dict[str, Any], ref: Optional[str]) -> None:
+    """Refuse a ``source_ref`` this row cannot justify from its own config.
+
+    Connector knowledge in an otherwise generic module, deliberately and
+    minimally: the label allowlist above already names one connector, and the
+    question "is this ref yours?" can only be answered by the writer that owns
+    the scope. Imported lazily, like every other connector reach-in on this
+    path (``src/semantic/legacy_migration.py`` does the same).
+    """
+    if label != "keboola_metastore":  # pragma: no cover - the mapping above is the gate
+        raise ValueError(f"semantic source {source_id!r}: no ownership rule for provenance label {label!r}")
+
+    connection_id = str(config.get("connection_id") or "").strip()
+    if connection_id:
+        if ref != connection_id:
+            raise ValueError(
+                f"semantic source {source_id!r}: config.provenance.source_ref {ref!r} is not this source's "
+                f"own connection ({connection_id!r}). A source may only own — and prune — the scope of the "
+                "connection it reads."
+            )
+        return
+
+    if config.get("legacy_credentials"):
+        # The env-credential path stamps NULL, or the default connection's id
+        # when the credentials actually resolved from that connection; both,
+        # and nothing else, are its own scope.
+        from connectors.keboola.semantic_layer import legacy_credentials_prune_scope
+
+        allowed = legacy_credentials_prune_scope()
+        if ref not in allowed:
+            raise ValueError(
+                f"semantic source {source_id!r}: config.provenance.source_ref {ref!r} is outside the legacy "
+                "Keboola credential path's own scope (null, or the default connection's id)."
+            )
+        return
+
+    raise ValueError(
+        f"semantic source {source_id!r}: a source claiming the {label!r} provenance must pin the connection "
+        "it reads (config.connection_id) or declare config.legacy_credentials."
+    )
 
 
 def _clone(*, repo_url: str, ref: Optional[str], token_env: Optional[str], dest: Path) -> Path:

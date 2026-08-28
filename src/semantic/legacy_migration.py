@@ -23,6 +23,13 @@ existing metric orphaned and write a duplicate beside it. Databricks needs no
 override — its own Track D6 cutover already moved it onto the generic
 ``ossie_connection`` provenance.
 
+``claim_source_for_import`` / ``duplicate_upstream_reason`` — the two guards
+the retired triggers had built in and a row-by-row sweep would otherwise
+lose: the single-flight one a migrated Keboola source shares with the
+login-triggered sync that still writes the same rows, and the per-run
+"one upstream project, one importer" check the legacy multi-source loop
+threaded through ``seen_project_keys``.
+
 ``reconcile_after_import`` — the post-sync legacy-row reconciliation each
 connector used to run inside its own refresh: deleting the rows its
 pre-cutover direct writer left behind under a provenance the current pipeline
@@ -38,7 +45,8 @@ Keboola or Databricks.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
 from src.semantic.importer import ImportReport
 
@@ -92,6 +100,102 @@ def _ensure_databricks_source() -> List[Dict[str, Any]]:
     return [row] if row else []
 
 
+def _keboola_adapter() -> str:
+    from connectors.keboola.semantic_layer import SEMANTIC_ADAPTER
+
+    return SEMANTIC_ADAPTER
+
+
+def new_sweep_state() -> Dict[str, Any]:
+    """The per-run bookkeeping :func:`duplicate_upstream_reason` accumulates.
+    One dict per sweep, never shared across runs — the legacy loop's
+    ``seen_project_keys`` had exactly this lifetime."""
+    return {"upstream_projects": {}}
+
+
+@contextmanager
+def claim_source_for_import(source: Dict[str, Any]) -> Iterator[bool]:
+    """Claim, for the duration of one source's import, the single-flight slot
+    that source shares with a NON-sweep writer of the same rows. Yields False
+    when the other writer holds it — the caller then SKIPS this source, never
+    queues behind it.
+
+    Only the migrated Keboola path has such a writer:
+    ``run_semantic_layer_refresh_background`` (the Keboola login-triggered
+    sync) still writes the same
+    ``(source='keboola_metastore', source_ref=<connection id>)`` rows through
+    ``sync_semantic_layer``. Before the trigger moved, each guarded itself
+    with its own lock in its own module, which guarded nothing about the
+    other: an upsert+prune pass could land inside another's, pruning a scope
+    against a half-written picture. Every other source yields True — there is
+    no second writer to serialize against.
+    """
+    if (source.get("adapter") or "").strip() != _keboola_adapter():
+        yield True
+        return
+
+    from src.semantic.refresh_guard import KEBOOLA_SEMANTIC_REFRESH
+
+    with KEBOOLA_SEMANTIC_REFRESH.try_claim(f"sweep:{source.get('id')}") as claimed:
+        if not claimed:
+            logger.info(
+                "semantic sources refresh: source %s shares its rows with an in-flight %s run (%s); "
+                "skipping it this sweep",
+                source.get("id"),
+                KEBOOLA_SEMANTIC_REFRESH.name,
+                KEBOOLA_SEMANTIC_REFRESH.holder,
+            )
+        yield claimed
+
+
+def duplicate_upstream_reason(source: Dict[str, Any], state: Dict[str, Any]) -> Optional[str]:
+    """Why this source must NOT import in this sweep — because another row
+    already imported the same upstream — or ``None`` to go ahead.
+
+    The legacy Keboola loop threaded ``seen_project_keys`` across its sources
+    for one reason: nothing stops an admin registering ONE project under two
+    connections (uniqueness is on connection name), and two sources importing
+    it would write one project's metrics under two refs, each prune deleting
+    the other's rows on every run. One row per connection makes that state
+    permanent rather than flapping, which is worse, so the guard has to
+    survive the migration.
+
+    Best-effort by construction: a source whose identity cannot be resolved
+    (unreadable vault, unreachable stack, no owner id upstream) is NOT
+    skipped — it goes on to its own import, which fails there and records the
+    error on the row, exactly as it would have without this check.
+    """
+    if (source.get("adapter") or "").strip() != _keboola_adapter():
+        return None
+
+    try:
+        from connectors.keboola.semantic_layer import sweep_project_identity
+
+        key = sweep_project_identity(source.get("config") or {})
+    except Exception as exc:  # noqa: BLE001 - a pre-check must never be the failure
+        logger.info(
+            "semantic sources refresh: could not resolve the upstream project of source %s for the "
+            "duplicate check (%s); importing it normally",
+            source.get("id"),
+            exc,
+        )
+        return None
+    if key is None:
+        return None
+
+    claims: Dict[Any, str] = state.setdefault("upstream_projects", {})
+    source_id = source.get("id")
+    claimed_by = claims.get(key)
+    if claimed_by is not None and claimed_by != source_id:
+        return (
+            f"semantic source {claimed_by!r} already imported the same upstream Keboola project "
+            f"(owner {key[1]} on {key[0]}) in this sweep; skipping so one project's rows are not "
+            "written under two provenance refs that then delete each other."
+        )
+    claims[key] = source_id
+    return None
+
+
 def reconcile_after_import(source: Dict[str, Any], report: ImportReport) -> Dict[str, int]:
     """Run the connector-specific legacy-row reconciliation for one source
     that just imported successfully. ``{}`` for every source that has none —
@@ -123,11 +227,12 @@ def _reconcile_keboola(source: Dict[str, Any], report: ImportReport) -> Dict[str
 
     Gates, restated because they are load-bearing: metrics only when this pass
     WROTE metrics, glossary only when it wrote glossary terms, neither when
-    the pass was partial (a document failed validation and was dropped, so a
-    model that belongs to this scope was never rewritten this pass and its
-    legacy rows must stay).
+    the pass was partial — a document failed validation and was dropped, OR a
+    detached model was deliberately held back, so a model that belongs to this
+    scope was never rewritten this pass and its legacy rows must stay.
     """
     from connectors.keboola.semantic_layer import (
+        default_connection_id,
         legacy_credentials_prune_scope,
         purge_legacy_glossary_rows,
         purge_legacy_metric_rows,
@@ -138,7 +243,11 @@ def _reconcile_keboola(source: Dict[str, Any], report: ImportReport) -> Dict[str
     if projection is None:
         return {}
     _label, source_ref = resolve_provenance(source)
-    partial = bool(report.invalid)
+    # Both halves of "this pass did not rewrite every model it owns": an
+    # invalid document, and F3's detached hold-back. The projector's own prune
+    # already narrows on both (`src/semantic/importer.py`); this purge reaches
+    # rows that prune cannot, so it has to ask the same question.
+    partial = bool(report.invalid) or bool(report.detached_excluded)
     purged: Dict[str, int] = {}
 
     # Prune scope, carried over verbatim from the orchestrator this replaced:
@@ -153,7 +262,14 @@ def _reconcile_keboola(source: Dict[str, Any], report: ImportReport) -> Dict[str
         adopt_null = True
     else:
         scope_refs = {source_ref}
-        adopt_null = source_ref is None
+        # `sync_semantic_layer`'s master-token loop passes exactly
+        # `adopt_null=connection_id == default_id`. Deriving it from
+        # `source_ref is None` instead — as this did — is never true for a
+        # per-connection source, so the DEFAULT connection's migrated sweep
+        # silently stopped purging the unstamped rows the login-triggered sync
+        # still purges, leaving them as permanent duplicates of their
+        # freshly-projected twins.
+        adopt_null = source_ref is not None and source_ref == default_connection_id()
 
     if projection.metrics_written and not partial:
         count = purge_legacy_metric_rows(scope_refs=scope_refs, adopt_null=adopt_null)

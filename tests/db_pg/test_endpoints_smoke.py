@@ -2737,9 +2737,10 @@ KNOWN_UNTESTED = {
     # (The per-connector Keboola/Databricks semantic-refresh triggers that
     # used to be excluded here are gone — #1707 Block 3 step 4. Their
     # replacement, POST /api/admin/run-semantic-sources-refresh, is
-    # deliberately NOT excluded: it is parameter-free, takes no upstream call
-    # on an instance with no sources registered, and is exactly the sweep
-    # whose backend-independence is worth smoking on both backends.)
+    # deliberately NOT excluded but COVERED: it is parameter-free and needs no
+    # upstream call for an `upload`-kind source, which makes it exactly the
+    # sweep worth smoking on both backends — see
+    # TestSemanticLayerSmoke.test_scheduled_sweep_syncs_a_registered_source.)
     # K3 local knowledge packaging (#798) — scheduler-driven admin maintenance
     # op, mirrors run-corporate-memory. No dual-backend contract test needed
     # (no new repo methods/migration; state.json lives on disk). Behaviour
@@ -3168,6 +3169,7 @@ class TestSemanticLayerSmoke:
         "PUT /api/admin/semantic-sources/{source_id}",
         "DELETE /api/admin/semantic-sources/{source_id}",
         "POST /api/admin/semantic-sources/{source_id}/sync",
+        "POST /api/admin/run-semantic-sources-refresh",
         "GET /api/semantic-models/search",
         "GET /api/semantic-models/{slug}.yaml",
         "POST /api/semantic-models/validate-query",
@@ -3372,4 +3374,35 @@ class TestSemanticLayerSmoke:
         )
 
         assert c.post(f"/api/admin/semantic-sources/{source_id}/sync", headers=h).status_code == 200
+        assert c.delete(f"/api/admin/semantic-sources/{source_id}", headers=h).status_code == 204
+
+    def test_scheduled_sweep_syncs_a_registered_source(self, seeded_app_both):
+        """The ONE scheduled semantic refresh (#1707 Block 3 step 4), which
+        replaced the two per-connector triggers. An `upload`-kind source keeps
+        it network-free, so what this smokes is the part that differs per
+        backend: reading `semantic_sources` and writing `semantic_models`
+        through whichever repo pair is active."""
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+
+        created = c.post(
+            "/api/admin/semantic-sources",
+            json={
+                "kind": "upload",
+                "name": "sweep smoke source",
+                "adapter": "native",
+                "config": {"documents": [_SEMANTIC_DOC]},
+            },
+            headers=h,
+        )
+        assert created.status_code == 201
+        source_id = created.json()["id"]
+
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=h)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "ok"
+        assert {"synced", "failed", "skipped_disabled", "sources", "run_id"} <= set(body)
+        assert {s["id"]: s["status"] for s in body["sources"]}[source_id] == "ok"
+
         assert c.delete(f"/api/admin/semantic-sources/{source_id}", headers=h).status_code == 204

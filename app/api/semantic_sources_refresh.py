@@ -31,6 +31,12 @@ instance:
   would orphan every existing metric and write a duplicate beside it.
 * ``reconcile_after_import()`` runs after each successful import and performs
   the post-sync legacy-row cleanup those endpoints used to do inline.
+* ``claim_source_for_import()`` and ``duplicate_upstream_reason()`` carry over
+  the two guards those triggers had built in: a migrated Keboola source is
+  skipped (``skipped_running``) while the login-triggered sync that writes the
+  same rows is in flight, and the second of two sources resolving to ONE
+  upstream project is skipped (``skipped_duplicate_project``) instead of
+  importing that project a second time under a second prune scope.
 
 Both are failure-isolated: a migration or reconciliation that raises is
 logged and the sweep continues. A sweep that could not migrate is still a
@@ -60,7 +66,13 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth.access import require_admin
 from src.repositories import semantic_source_repo
-from src.semantic.legacy_migration import ensure_legacy_semantic_sources, reconcile_after_import
+from src.semantic.legacy_migration import (
+    claim_source_for_import,
+    duplicate_upstream_reason,
+    ensure_legacy_semantic_sources,
+    new_sweep_state,
+    reconcile_after_import,
+)
 from src.semantic.transports import import_source
 
 logger = logging.getLogger(__name__)
@@ -106,10 +118,13 @@ def _run_sweep() -> dict[str, Any]:
 
     repo = semantic_source_repo()
     sources = repo.list_all()
+    state = new_sweep_state()
 
     synced = 0
     failed = 0
     skipped_disabled = 0
+    skipped_running = 0
+    skipped_duplicate_project = 0
     results: list[dict[str, Any]] = []
 
     for source in sources:
@@ -122,29 +137,70 @@ def _run_sweep() -> dict[str, Any]:
             skipped_disabled += 1
             results.append({"id": source_id, "name": name, "status": "skipped_disabled"})
             continue
-        try:
-            report = import_source(source_id)
-        except Exception as exc:  # noqa: BLE001 - recorded per-source, sweep continues
-            failed += 1
-            results.append({"id": source_id, "name": name, "status": "error", "error": str(exc)})
-            logger.warning("semantic sources refresh: source %s failed: %s", source_id, exc)
-            continue
-        synced += 1
-        entry: dict[str, Any] = {"id": source_id, "name": name, "status": "ok"}
-        # Post-sync cleanup a migrated legacy source still owes (see
-        # src/semantic/legacy_migration.py). Best-effort by contract: a
-        # reconciliation failure never turns a successful sync into a
-        # failed one.
-        reconciled = reconcile_after_import(source, report)
-        if reconciled:
-            entry["reconciled_legacy"] = reconciled
-        results.append(entry)
+
+        # Single-flight against the OTHER writer of this source's rows (the
+        # Keboola login-triggered sync). Held for the whole import, released
+        # however it ends.
+        with claim_source_for_import(source) as claimed:
+            if not claimed:
+                skipped_running += 1
+                results.append(
+                    {
+                        "id": source_id,
+                        "name": name,
+                        "status": "skipped_running",
+                        "hint": "Another writer of this source's rows is in flight; the next sweep picks it up.",
+                    }
+                )
+                continue
+
+            # One upstream, one importer per sweep — two sources resolving to
+            # the same project would write it under two refs that then delete
+            # each other's rows.
+            duplicate = duplicate_upstream_reason(source, state)
+            if duplicate:
+                skipped_duplicate_project += 1
+                results.append(
+                    {"id": source_id, "name": name, "status": "skipped_duplicate_project", "error": duplicate}
+                )
+                logger.warning("semantic sources refresh: %s", duplicate)
+                # Recorded on the row too: an admin looking at the source has
+                # to be able to see why it never syncs.
+                repo.record_sync(source_id, status="skipped", error=duplicate)
+                continue
+
+            try:
+                report = import_source(source_id)
+            except Exception as exc:  # noqa: BLE001 - recorded per-source, sweep continues
+                failed += 1
+                results.append({"id": source_id, "name": name, "status": "error", "error": str(exc)})
+                logger.warning("semantic sources refresh: source %s failed: %s", source_id, exc)
+                continue
+            synced += 1
+            entry: dict[str, Any] = {"id": source_id, "name": name, "status": "ok"}
+            # Post-sync cleanup a migrated legacy source still owes (see
+            # src/semantic/legacy_migration.py). Best-effort by contract, and
+            # guarded here as well as inside: it runs AFTER the import already
+            # wrote and recorded, so a raise must neither turn that success
+            # into a failure nor abort the sources behind it.
+            try:
+                reconciled = reconcile_after_import(source, report)
+            except Exception as exc:  # noqa: BLE001 - the sync stands, the cleanup retries next sweep
+                logger.warning(
+                    "semantic sources refresh: legacy reconciliation for source %s raised: %s", source_id, exc
+                )
+                reconciled = {}
+            if reconciled:
+                entry["reconciled_legacy"] = reconciled
+            results.append(entry)
 
     return {
         "status": "ok",
         "synced": synced,
         "failed": failed,
         "skipped_disabled": skipped_disabled,
+        "skipped_running": skipped_running,
+        "skipped_duplicate_project": skipped_duplicate_project,
         "migrated": migrated,
         "sources": results,
     }
@@ -192,11 +248,14 @@ async def run_semantic_sources_refresh(
             _refresh_state["started_at"] = None
 
     logger.info(
-        "semantic sources refresh: run_id=%s synced=%s failed=%s skipped_disabled=%s migrated=%s",
+        "semantic sources refresh: run_id=%s synced=%s failed=%s skipped_disabled=%s "
+        "skipped_running=%s skipped_duplicate_project=%s migrated=%s",
         run_id,
         result["synced"],
         result["failed"],
         result["skipped_disabled"],
+        result["skipped_running"],
+        result["skipped_duplicate_project"],
         len(result["migrated"]),
     )
     return {**result, "run_id": run_id, "started_at": started_at}

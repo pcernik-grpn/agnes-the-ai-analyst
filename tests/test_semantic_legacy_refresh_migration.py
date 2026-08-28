@@ -40,6 +40,7 @@ _UPLOAD_DOC = (
 )
 
 CONNECTION_ID = "conn-golden"
+LEGACY_ID = "keboola_legacy_credentials"
 STACK_URL = "https://connection.example.com"
 MASTER_TOKEN = "master-tok"
 TABLE_NAME = "crm_orders"
@@ -564,3 +565,264 @@ class TestReconcileAfterImport:
 
         source = {"id": "ss_git", "adapter": "native", "config": {}}
         assert reconcile_after_import(source, ImportReport()) == {}
+
+
+class TestProvenanceOverrideCannotBeForged:
+    """The allowlist checks the LABEL; the ref is what actually selects whose
+    rows get pruned. A source that may claim ``keboola_metastore`` must also
+    prove the ref it claims is its OWN — otherwise a hand-registered
+    ``kind=upload`` source could name connection A's ref and have its (empty)
+    import prune A's models, metrics, glossary terms and column descriptions.
+    """
+
+    def test_an_upload_source_may_not_carry_a_legacy_provenance(self, e2e_env):
+        from src.repositories import semantic_source_repo
+        from src.semantic.transports import import_source
+
+        semantic_source_repo().create(
+            id="ss_forged_adapter",
+            kind="upload",
+            name="Forged",
+            adapter="native",
+            config={"documents": [], "provenance": {"source": "keboola_metastore", "source_ref": CONNECTION_ID}},
+        )
+
+        with pytest.raises(ValueError, match="adapter"):
+            import_source("ss_forged_adapter")
+        assert semantic_source_repo().get("ss_forged_adapter")["last_sync_status"] == "error"
+
+    def test_a_keboola_source_may_not_claim_another_connections_ref(self, e2e_env, vault_key):
+        from src.repositories import semantic_source_repo
+        from src.semantic.transports import import_source
+
+        semantic_source_repo().create(
+            id="ss_forged_ref",
+            kind="connection",
+            name="Forged ref",
+            adapter="keboola_metastore",
+            config={
+                "connection_id": "conn-mine",
+                "provenance": {"source": "keboola_metastore", "source_ref": "conn-somebody-else"},
+            },
+        )
+
+        with pytest.raises(ValueError, match="source_ref"):
+            import_source("ss_forged_ref")
+        assert semantic_source_repo().get("ss_forged_ref")["last_sync_status"] == "error"
+
+    def test_a_legacy_credentials_source_may_only_claim_null_or_the_default_connection(self, e2e_env, vault_key):
+        from src.semantic.transports import resolve_provenance
+
+        _make_master_connection(CONNECTION_ID, stack_url=STACK_URL, token=MASTER_TOKEN, is_default=True)
+
+        def _row(ref):
+            return {
+                "id": LEGACY_ID,
+                "kind": "connection",
+                "adapter": "keboola_metastore",
+                "config": {
+                    "legacy_credentials": True,
+                    "provenance": {"source": "keboola_metastore", "source_ref": ref},
+                },
+            }
+
+        # The two refs that path has ever stamped.
+        assert resolve_provenance(_row(None)) == ("keboola_metastore", None)
+        assert resolve_provenance(_row(CONNECTION_ID)) == ("keboola_metastore", CONNECTION_ID)
+        # Anything else is another connection's scope.
+        with pytest.raises(ValueError, match="source_ref"):
+            resolve_provenance(_row("conn-somebody-else"))
+
+    def test_the_migrated_rows_the_migration_itself_writes_still_resolve(self, e2e_env, vault_key):
+        """The guard must not break what it protects: every row
+        ``ensure_legacy_semantic_sources`` creates resolves its own scope."""
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources
+        from src.semantic.transports import resolve_provenance
+
+        _make_master_connection("conn-a", stack_url="https://a.example.com", token="tok-a", is_default=True)
+        _make_master_connection("conn-b", stack_url="https://b.example.com", token="tok-b")
+
+        for row in ensure_legacy_semantic_sources():
+            assert resolve_provenance(row) == ("keboola_metastore", row["config"]["connection_id"])
+
+
+class TestOneUpstreamProjectPerSweep:
+    """Two connections may point at ONE upstream project (uniqueness is on
+    connection NAME). The legacy multi-source loop threaded
+    ``seen_project_keys`` across them for exactly that reason: both syncing
+    would write one project's metrics under two refs and cross-wipe each
+    other every run. The per-source sweep has to keep that guard."""
+
+    def test_the_second_connection_on_one_project_is_skipped(self, e2e_env, vault_key):
+        from app.api.semantic_sources_refresh import _run_sweep
+        from src.repositories import metric_repo, semantic_source_repo
+
+        _register_keboola_table("in.c-example_source", "orders", TABLE_NAME)
+        _make_master_connection("conn-a", stack_url=STACK_URL, token="tok-a", is_default=True)
+        _make_master_connection("conn-b", stack_url=STACK_URL, token="tok-b")
+        # One upstream project (same stack host, same token owner) behind both.
+        projects = {
+            "tok-a": {**PROJECTS[MASTER_TOKEN]},
+            "tok-b": {**PROJECTS[MASTER_TOKEN]},
+        }
+
+        storage_factory, metastore_factory = _fake_clients(projects)
+        with (
+            patch("connectors.keboola.storage_api.KeboolaStorageClient", side_effect=storage_factory),
+            patch("connectors.keboola.metastore_client.MetastoreClient", side_effect=metastore_factory),
+        ):
+            result = _run_sweep()
+
+        statuses = {s["id"]: s["status"] for s in result["sources"]}
+        assert statuses["keboola_conn-a"] == "ok"
+        assert statuses["keboola_conn-b"] == "skipped_duplicate_project"
+        assert result["synced"] == 1
+        assert result["skipped_duplicate_project"] == 1
+
+        # One project's metrics, under ONE ref — never a duplicate set.
+        refs = {m["source_ref"] for m in metric_repo().list()}
+        assert refs == {"conn-a"}
+        # And the skip is visible on the row, not only in this response.
+        skipped = semantic_source_repo().get("keboola_conn-b")
+        assert skipped["last_sync_status"] == "skipped"
+        assert "conn-a" in (skipped["last_sync_error"] or "") or "keboola_conn-a" in (
+            skipped["last_sync_error"] or ""
+        )
+
+    def test_two_distinct_projects_both_import(self, e2e_env, vault_key):
+        """The guard keys on the resolved upstream identity, not on "two
+        Keboola sources exist" — the normal multi-project instance must be
+        unaffected."""
+        from app.api.semantic_sources_refresh import _run_sweep
+        from src.repositories import metric_repo
+
+        _register_keboola_table("in.c-example_source", "orders", TABLE_NAME)
+        _make_master_connection("conn-a", stack_url=STACK_URL, token="tok-a", is_default=True)
+        _make_master_connection("conn-b", stack_url="https://other.example.com", token="tok-b")
+        projects = {
+            "tok-a": {**PROJECTS[MASTER_TOKEN]},
+            "tok-b": {**PROJECTS[MASTER_TOKEN], "owner_id": 9999},
+        }
+
+        storage_factory, metastore_factory = _fake_clients(projects)
+        with (
+            patch("connectors.keboola.storage_api.KeboolaStorageClient", side_effect=storage_factory),
+            patch("connectors.keboola.metastore_client.MetastoreClient", side_effect=metastore_factory),
+        ):
+            result = _run_sweep()
+
+        assert result["synced"] == 2, result
+        assert result["skipped_duplicate_project"] == 0
+        assert {m["source_ref"] for m in metric_repo().list()} == {"conn-a", "conn-b"}
+
+
+class TestUnstampedLegacyRowAdoption:
+    """Rows written before provenance existed carry ``source_ref IS NULL``.
+    The legacy loop let ONLY the default connection claim them
+    (``adopt_null=connection_id == default_id``); the migrated sweep must
+    apply the same rule, or those rows survive every sweep as permanent
+    duplicates of their freshly-projected twins."""
+
+    def _legacy_null_metric(self) -> str:
+        from src.repositories import metric_repo
+
+        metric_repo().create(
+            id="keboola_semantic_layer/pre_provenance",
+            name="pre_provenance",
+            display_name="pre_provenance",
+            category="keboola",
+            sql="SELECT 1",
+            source="keboola_semantic_layer",
+            source_ref=None,
+        )
+        return "keboola_semantic_layer/pre_provenance"
+
+    def test_the_default_connections_sweep_adopts_them(self, e2e_env, vault_key):
+        from src.repositories import metric_repo
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources, reconcile_after_import
+
+        _seed_instance()  # CONNECTION_ID is the default connection
+        metric_id = self._legacy_null_metric()
+
+        source = ensure_legacy_semantic_sources()[0]
+        report = _import_migrated_source(PROJECTS, source["id"])
+
+        assert reconcile_after_import(source, report) == {"metrics": 1}
+        assert metric_repo().get(metric_id) is None
+
+    def test_a_non_default_connections_sweep_leaves_them_alone(self, e2e_env, vault_key):
+        from src.repositories import metric_repo
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources, reconcile_after_import
+
+        _register_keboola_table("in.c-example_source", "orders", TABLE_NAME)
+        _make_master_connection("conn-default", stack_url=STACK_URL, token="tok-default", is_default=True)
+        _make_master_connection(CONNECTION_ID, stack_url=STACK_URL, token=MASTER_TOKEN)
+        metric_id = self._legacy_null_metric()
+
+        sources = {r["config"]["connection_id"]: r for r in ensure_legacy_semantic_sources()}
+        source = sources[CONNECTION_ID]
+        report = _import_migrated_source(PROJECTS, source["id"])
+
+        assert reconcile_after_import(source, report) == {}
+        assert metric_repo().get(metric_id) is not None
+
+
+class TestReconcileGatesOnADetachedHoldBack:
+    def test_a_held_back_detached_model_blocks_the_purge_like_an_invalid_one(self, e2e_env, vault_key):
+        """``partial`` is what keeps a pass that did not rewrite every model
+        in its scope from deleting that model's legacy rows. A detached model
+        held back by the importer is exactly that case — the pass wrote
+        metrics, but not the detached model's — so it must gate the purge the
+        same way an invalid document does."""
+        from src.repositories import metric_repo
+        from src.semantic.importer import ImportReport
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources, reconcile_after_import
+        from src.semantic.projection import ProjectionReport
+
+        _seed_instance()
+        metric_repo().create(
+            id="keboola_semantic_layer/legacy_revenue",
+            name="legacy_revenue",
+            display_name="legacy_revenue",
+            category="keboola",
+            sql="SELECT 1",
+            source="keboola_semantic_layer",
+            source_ref=CONNECTION_ID,
+        )
+        source = ensure_legacy_semantic_sources()[0]
+        report = ImportReport(
+            projection=ProjectionReport(metrics_written=1, glossary_written=1),
+            detached_excluded=True,
+        )
+
+        assert reconcile_after_import(source, report) == {}
+        assert metric_repo().get("keboola_semantic_layer/legacy_revenue") is not None
+
+
+class TestMigrationLoopIsolation:
+    def test_one_connections_registration_failure_does_not_skip_the_others(self, e2e_env, vault_key):
+        """The loop registers one row per connection. A row already sitting on
+        the deterministic id (an admin's own, under a different scope) makes
+        that one ``create`` raise — which must cost that connection, not every
+        connection after it."""
+        from connectors.keboola.semantic_layer import semantic_source_id
+        from src.repositories import semantic_source_repo
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources
+
+        _make_master_connection("conn-a", stack_url="https://a.example.com", token="tok-a", is_default=True)
+        _make_master_connection("conn-b", stack_url="https://b.example.com", token="tok-b")
+        repo = semantic_source_repo()
+        # Same id, different adapter — so `_claims_provenance` does not treat
+        # it as already owning conn-a's scope and the create is reached.
+        repo.create(
+            id=semantic_source_id("conn-a"),
+            kind="upload",
+            name="Squatter",
+            adapter="native",
+            config={},
+        )
+
+        created = ensure_legacy_semantic_sources()
+
+        assert [r["config"]["connection_id"] for r in created] == ["conn-b"]
+        assert repo.get(semantic_source_id("conn-a"))["adapter"] == "native"
