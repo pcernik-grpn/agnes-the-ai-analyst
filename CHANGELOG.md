@@ -10,6 +10,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **`agnes semantic-model search <term>` — the non-admin way to find a semantic
+  model.** `GET /api/semantic-models/search` is public and RBAC-filtered, and
+  had an MCP tool and a web page but no CLI: the only listing was `agnes admin
+  semantic-model list`, which an analyst cannot run. Follows the command-UX
+  standard (positional term, `--limit`, `--json`, a "nothing matched" line that
+  names the next step). Its siblings landed with it: **`agnes semantic-model
+  show <slug>`** (provenance, status, content hash — resolved through the same
+  public search response, no new endpoint), **`agnes admin semantic delete
+  <id|slug>`** and **`agnes admin semantic source rm <id>`**, both wrapping
+  `DELETE` endpoints that existed with no CLI at all. `delete` refuses a
+  source-owned model and names `detach` as the way through; `source rm` says
+  out loud that the models it imported are kept.
 - **Agent profiles run on the embedded kai-agent engine — the agent API no longer refuses `chat.provider: kai-agent`.** The three artifacts the native workdir seam materializes for an agent session now ride the engine's workspace tarball (`GET /api/kai/workspace`): the persona `CLAUDE.md` (data-access rails appended, replacing the rendered Workspace Prompt exactly as `WorkdirManager._materialize_profile` does natively — override mode included), the identity skill (minted without the remember-tool recipe, which is uncallable from the engine sandbox), and the active memories at `.claude/agent-memory.md`, rendered by the same helper the native seam writes through (`agent_profile.render_memories`) so the two sandboxes cannot drift. A scope-limited agent's tool calls are no longer refused (`403 mcp_not_available_to_scoped_agent` is gone): `/api/kai/mcp` mints and registers the same `agent_session` token the native broker replay uses, so `resolve_token_to_user` rebuilds owner-grants ∩ agent-scope live per request (`AgentPrincipal`) — narrowing an agent or revoking a grant takes effect on the next tool call, and the mint's token cache now keys on the identity *shape* so flipping an agent to `'selected'` mid-conversation can never keep serving the owner token. The same narrowed path covers an all-'all' agent whose session user is not its owner (Slack channel binding), and the flattened marketplace overlay in the tarball is intersection-filtered for restricted sessions — a scoped agent's `AgentPrincipal`, a co-session's live participant `SessionPrincipal` — rather than shipping the caller's (or stored owner's) whole stack. An agent session without a persona now gets the session user's rendered Workspace Prompt (native parity) instead of the unfiltered bundled text. With both halves in place, `POST /api/v1/agents/{slug}/sessions` drops its `503 agent_sessions_unavailable_on_provider` guard — the agent API, `agnes chat <slug>`, one-shot `/responses`, schedules, webhooks and Slack agent bindings all run on the engine provider with the right persona and the right authority. Still engine-side gaps, documented in docs/cloud-chat.md: co-drive keeps failing closed (`mcp_not_available_to_co_session`), and agent memory *writes* have no engine channel (`memory_write_mode` is effectively read-only there).
 - **Connecting an MCP source is a builder, and so is linking external apps.**
   Both were the least builder-shaped surfaces in the product, and both are now
@@ -312,6 +324,47 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. This ships the Agnes-side seam only — the producer itself is a separate project the operator supplies, adopted rather than vendored into this repo.
 
 ### Changed
+- **The semantic layer is two CLI groups instead of five.** `agnes
+  semantic-model`, `agnes admin semantic-model`, `agnes admin semantic-source`,
+  `agnes admin semantic-layer` and `agnes admin data-semantics` all read as
+  "the semantic layer" and were divided by which endpoint family they happened
+  to call — not by anything a reader could predict. They collapse into
+  **`agnes semantic-model`** (anything any signed-in caller may do) and
+  **`agnes admin semantic`** (anything that needs an admin), with the
+  documents, their `source` sub-group, and the health reports as three nouns
+  under the latter.
+  - `export` and `validate` moved OUT of the admin tier to `agnes
+    semantic-model export|validate`. Neither was ever an admin operation:
+    `export` reads the public, resource-gated endpoint, and `validate`
+    schema-checks a local file with no server and no token at all. Both helps
+    now say, prominently, that `validate` (a document) is not `validate-query`
+    (a SQL statement).
+  - `coverage`, `health`, `mute`, `mutes` and `unmute` moved the other way, to
+    `agnes admin semantic …`: every endpoint behind them is `require_admin`,
+    so sitting in the any-user group advertised authority the caller did not
+    have.
+  - `agnes admin semantic-layer coverage` is now **`agnes admin semantic
+    keboola-import`**. Three commands called themselves coverage while
+    answering three different questions; this one predicts what a live Keboola
+    project *would* import, which is neither of the other two. All three helps
+    now name their question and their endpoint.
+  - **Every old invocation still works this release**, as a hidden alias that
+    prints one line on stderr naming its new path and then delegates to the
+    same function the new path runs — so a script keeps working, `--help`
+    stops teaching two names for one thing, and an alias cannot drift from
+    what it replaces. The notice goes to stderr so `… --json | jq` is
+    unaffected. The aliases will be removed in a later release.
+- **`agnes mcp` is hidden: the stdio MCP server is internal, not an end-user
+  surface.** Wiring it into a client by hand was an experiment. It stays fully
+  functional — the hosted chat sandbox spawns one per session and `agnes global
+  enable` registers it with Claude Code — but it is no longer advertised in
+  `agnes --help` or documented as something to set up, and its tool set is now
+  pinned by an exact-set test so it does not grow. An external MCP client
+  should use the server's HTTP transports, which carry the full RBAC-filtered
+  foundation tool set. The group's other commands (`agnes mcp connect` /
+  `disconnect` / `my-secret …`) are unchanged and still supported; they are
+  listed by `agnes mcp --help` and documented in `docs/api-reference.md`, just
+  no longer surfaced at the top level.
 - **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
   The endpoint dials a connection the admin has typed but not saved — with a
   credential attached, or on `stdio` by launching a subprocess with a
@@ -1085,6 +1138,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   / `agnes admin list-tables` reported it as merely "never synced" with no
   indication why.
 ### Removed
+- **`agnes admin data-semantics generate` is gone, with no alias.** It
+  scaffolded a pre-Ossie "data-semantics pack" (`<slug>/tables/*.yml`,
+  `metrics/*.yml`, `_brief.md`) into a workspace directory that nothing reads:
+  the semantic layer has been the Ossie document in `semantic_models` since,
+  and an agent's read path is `agnes semantic-model context` / the semantic
+  cache `agnes pull` renders. Removed rather than aliased — an alias would
+  keep teaching a path that leads nowhere. Its engine
+  (`src/data_semantics_scaffold.py`) now has no caller and is queued for
+  deletion.
 
 - **The old page's Keboola-specific "orphaned rows" count, "also connected
   but not syncing" list, and "legacy / unattributed" bucket are gone.** All

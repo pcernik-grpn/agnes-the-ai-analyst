@@ -424,27 +424,24 @@ report was filed.
 
 ## Commands
 
+Two groups, split by who may run them — not by which endpoint family they
+happen to call.
+
+**`agnes semantic-model` — anyone signed in.** RBAC is per model (a Data
+Package grant or a direct model grant), so these show exactly what the caller
+can already read.
+
 ```bash
-agnes admin semantic-model list [--json] [--limit N]
-agnes admin semantic-model show <slug>
-agnes admin semantic-model import <file>
-agnes admin semantic-model export <slug>
-agnes admin semantic-model validate <file>   # offline: no server, no token
+agnes semantic-model search <term> [--limit N] [--json]   # find models you can read
+agnes semantic-model show <slug> [--json]                 # provenance, status, content hash
+agnes semantic-model export <slug> [-o FILE]              # the document, byte for byte
 
-agnes admin semantic-source add ... | list | sync <id>
+agnes semantic-model validate <file>          # offline: no server, no token
+agnes semantic-model validate-query "<SQL>"   # see "Query validation" above
+agnes semantic-model apply <file> [--description ...] [--expect-hash <hash>]
 
-agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
-
-agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
-agnes semantic-model coverage tag <type> <resource-id> <source-id>
-agnes semantic-model coverage untag <tag-id>
-agnes semantic-model coverage tables [--limit N] [--json]   # source-agnostic: tables with NO model at all
-
-agnes semantic-model health [--json]   # admin, see "Health" above
-
-agnes semantic-model mute <scope> [--reason "..."] [--expires <ISO8601>]  # admin
-agnes semantic-model unmute <mute-id>                                    # admin
-agnes semantic-model mutes [--include-expired] [--json]                  # admin
+agnes semantic-model context dataset|metric|relationship [--id ...] [--model ...]
+agnes semantic-model schema dataset metric relationship
 
 agnes semantic-model feedback submit "<question>" [--sql ...] [--metric ...] [--comment ...]
 agnes semantic-model feedback list [--status open] [--json]   # admin
@@ -452,4 +449,67 @@ agnes semantic-model feedback resolve <id> [--note "..."]     # admin
 ```
 
 `validate` deliberately needs neither a server nor a token — someone fixing a
-document should not need an instance to check their work.
+document should not need an instance to check their work. It is **not**
+`validate-query`: `validate` checks whether a *document file* is well-formed;
+`validate-query` checks whether a *SQL statement* obeys the models you can
+read, and needs a server.
+
+`apply` is the write path for everyone: an admin's document goes live, anyone
+else's is queued for admin moderation (the command labels which happened).
+
+**`agnes admin semantic` — admin only.** Everything that changes what the
+layer is, or reports on how healthy it is.
+
+```bash
+agnes admin semantic list [<term>] [--limit N] [--json]   # every model, any status
+agnes admin semantic show <id|slug> [--json]
+agnes admin semantic import <file>
+agnes admin semantic delete <id|slug> [--yes]
+agnes admin semantic detach|reattach <id|slug> [--yes]
+agnes admin semantic link-package|unlink-package <slug> <package-id>
+
+agnes admin semantic source add --kind git|upload|connection --name "..." [...]
+agnes admin semantic source list [--enabled-only] [--json]
+agnes admin semantic source sync <id>
+agnes admin semantic source rm <id> [--yes]     # unregisters the source; keeps its models
+
+agnes admin semantic coverage [--source <id>] [--json]   # PER SOURCE × domain grid
+agnes admin semantic coverage tag <type> <resource-id> <source-id>
+agnes admin semantic coverage untag <tag-id>
+agnes admin semantic coverage tables [--limit N] [--json]  # PER TABLE: no model at all
+agnes admin semantic keboola-import [--json] [--limit N]   # PER KEBOOLA PROJECT: what would import
+
+agnes admin semantic health [--json]
+agnes admin semantic mute <scope> [--reason "..."] [--expires <ISO8601>]
+agnes admin semantic unmute <mute-id>
+agnes admin semantic mutes [--include-expired] [--json]
+```
+
+The three reports are three different questions, which is why
+`keboola-import` no longer calls itself coverage:
+
+| Command | Question | Endpoint |
+|---|---|---|
+| `coverage` | Per SOURCE: which of six domains is still empty? | `/api/admin/semantic-model/coverage` |
+| `coverage tables` | Per TABLE: which registered tables no valid model describes | `/api/admin/semantic-coverage` |
+| `keboola-import` | Per KEBOOLA PROJECT: how much of its published layer *would* import | `/api/admin/semantic-layer/coverage` |
+
+Business terms projected out of a document are read through the glossary
+surface: `agnes glossary search <term>` / `agnes glossary show <id>`.
+
+### Renamed in this release
+
+Five groups that all read as "the semantic layer" became the two above. Every
+old spelling still runs for one release as a hidden alias that prints its new
+path on stderr, then delegates:
+
+| Old | New |
+|---|---|
+| `agnes admin semantic-model <cmd>` | `agnes admin semantic <cmd>` |
+| `agnes admin semantic-model export\|validate` | `agnes semantic-model export\|validate` |
+| `agnes admin semantic-source <cmd>` | `agnes admin semantic source <cmd>` |
+| `agnes admin semantic-layer coverage` | `agnes admin semantic keboola-import` |
+| `agnes semantic-model coverage\|health\|mute\|mutes\|unmute` | `agnes admin semantic <same>` |
+
+`agnes admin data-semantics` was removed outright with no alias — it scaffolded
+a pre-Ossie workspace pack that nothing reads.

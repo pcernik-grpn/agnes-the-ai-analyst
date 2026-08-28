@@ -15,6 +15,13 @@ Idempotently converges five user-scope artifacts:
 |---|---|---|
 | Stack plugins | `claude plugin install <p>@agnes --scope user` | skills/commands from your stack load in every repo |
 | MCP server | `claude mcp add --scope user agnes -- <agnes> mcp` | catalog/schema/query/query_local tools everywhere (first tools appear a few seconds into a fresh session — the stdio server has a short cold start) |
+
+> The stdio server (`agnes mcp`) is internal wiring: `agnes global enable`
+> registers it for you, and the hosted chat sandbox spawns its own. It is not
+> a supported end-user command — do not add it to a client by hand. A machine
+> without the CLI should use the remote HTTP transport below, which carries the
+> full server-side tool set.
+
 | Rails block | `~/.claude/CLAUDE.md` (marker-fenced) | the data-querying protocol in every session |
 | SessionStart hook | `~/.claude/settings.json` | a detached `agnes update --quiet` keeps data + plugins fresh from any repo (skip with `--no-hook`) |
 | Config flag | `global_scope` in the CLI config | `agnes update` re-converges the layer on every run |

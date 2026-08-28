@@ -1218,7 +1218,7 @@ ontology (the producer's YAML) into the draft, reporting the leftovers the
 translator could not place structurally (mirrors the allowlisted
 `/api/admin/metrics/import`). `POST …/save` validates the frozen draft against
 the vendored Ossie schema and materializes it into a semantic model through
-the same path `agnes admin semantic-model import` uses. `POST /dry-run` runs
+the same path `agnes admin semantic import` uses. `POST /dry-run` runs
 the draft's current types over one selected document through the server-side
 LLM and returns proposed facts/edges plus a **not-captured** block; it is a
 typed `501` when no LLM provider is configured. Admin-only authoring with no
@@ -1295,7 +1295,9 @@ publishes metrics but none bind to a registered table). Datasets with no
 registered table are reported as a plain count, never as pending work — a
 semantic layer routinely describes more of a project than an instance registers.
 
-CLI: `agnes admin semantic-layer coverage [--json]`. MCP:
+CLI: `agnes admin semantic keboola-import [--json] [--limit N]` (renamed from
+`agnes admin semantic-layer coverage`, which called itself coverage while
+answering a third question — see the two neighbours below). MCP:
 `admin_semantic_layer_coverage`.
 
 ### `/api/admin/semantic-coverage` — source-agnostic semantic-layer coverage
@@ -1312,7 +1314,7 @@ ANY valid model's dataset resolves to it, whether that dataset is bound via
 a Keboola tableId or a plain `dataset.source`/`.name` match against
 `table_registry.id`/`.name`.
 
-CLI: `agnes semantic-model coverage tables [--limit N] [--json]`. MCP:
+CLI: `agnes admin semantic coverage tables [--limit N] [--json]`. MCP:
 `admin_semantic_coverage`.
 
 ### `/api/admin/semantic-auto-draft-sweep` — auto-draft uncovered tables
@@ -1387,7 +1389,7 @@ on Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on
 an instance still running the frozen DuckDB app-state backend they answer
 `501` with `error: "requires_postgres_backend"`.
 
-CLI: `agnes semantic-model coverage [--source <id>] [--json]`,
+CLI: `agnes admin semantic coverage [--source <id>] [--json]`,
 `… coverage tag <type> <resource-id> <source-id>`, `… coverage untag <tag-id>`.
 MCP: `semantic_model_coverage`, `semantic_model_coverage_tag`,
 `semantic_model_coverage_untag`.
@@ -1417,7 +1419,7 @@ FIRST, before any other check runs, so a DuckDB-backed instance answers a
 clean `501 requires_postgres_backend` for the whole report rather than one
 silently missing the one field F4.3 exists to keep visible.
 
-CLI: `agnes semantic-model health [--json]`. MCP: `semantic_layer_health`.
+CLI: `agnes admin semantic health [--json]`. MCP: `semantic_layer_health`.
 
 ### `/api/admin/semantic-layer/mutes` — silencing a check, on the record
 
@@ -1460,8 +1462,8 @@ on Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on a
 instance still running the frozen DuckDB app-state backend they answer `501`
 with `error: "requires_postgres_backend"`.
 
-CLI: `agnes semantic-model mute <scope> [--reason …] [--expires <ISO8601>]`,
-`agnes semantic-model unmute <mute-id>`, `agnes semantic-model mutes
+CLI: `agnes admin semantic mute <scope> [--reason …] [--expires <ISO8601>]`,
+`agnes admin semantic unmute <mute-id>`, `agnes admin semantic mutes
 [--include-expired] [--json]`. MCP: `mute_semantic_check`,
 `unmute_semantic_check`, `semantic_mutes_list`. UI:
 `/admin/semantic-layer?tab=mute`.
@@ -1557,7 +1559,7 @@ staleness preview (`source_changed_since_detach`, `detached_at`) instead of
 acting, and it is `409 source_gone` when the source no longer has the slug
 at all. Both are Postgres-only (the DuckDB app-state ladder is frozen) and
 answer `501 requires_postgres_backend` on a DuckDB-backed instance. CLI:
-`agnes admin semantic-model detach|reattach <id>`.
+`agnes admin semantic detach|reattach <id>`.
 
 `GET /api/semantic-models/{slug}.yaml` (export) and `GET
 /api/semantic-models/search` are any-authenticated-user, gated instead on
@@ -1566,10 +1568,12 @@ rides the same visibility as the package(s) it belongs to; admins always
 see everything. A model with no linked package is admin-only until an
 admin links it.
 
-CLI: `agnes admin semantic-model list/show/import/export/validate` (the
-last runs entirely offline — no server, no token) and `agnes admin
-semantic-source add/list/sync`. MCP: `semantic_model_search`,
-`semantic_model_get`.
+CLI: `agnes semantic-model search <term>` and `agnes semantic-model
+show|export <slug>` are the any-user reads against these two public
+endpoints; `agnes semantic-model validate <file>` schema-checks a document
+entirely offline (no server, no token, no admin). The admin corpus is
+`agnes admin semantic list/show/import/delete` and `agnes admin semantic
+source add/list/sync/rm`. MCP: `semantic_model_search`, `semantic_model_get`.
 
 `POST /api/admin/semantic-models/{slug}/packages` (body `{"package_id":
 ...}`) and `DELETE .../packages/{package_id}` link/unlink a model to/from a
@@ -1578,7 +1582,7 @@ Both 404 if the model slug or the package id doesn't exist, are idempotent
 on a repeat call, and return the model's current `package_ids`. Not gated
 by the ownership rule (the junction is outside the document a re-sync would
 rewrite), so a source-owned model can be linked the same as a hand-authored
-one. CLI: `agnes admin semantic-model link-package/unlink-package`.
+one. CLI: `agnes admin semantic link-package/unlink-package`.
 
 `POST /api/semantic-models/apply` is the one non-admin-reachable write
 surface (chat-first authoring): any authenticated caller submits an Ossie
@@ -1606,8 +1610,8 @@ engine sets `locally_executable: false`. With zero accessible valid models
 the response is `{"available": false, "error": "no_semantic_model", ...}`
 rather than a misleading all-clear. CLI: `agnes semantic-model
 validate-query "<SQL>" [--expect JSON] [--target-engine duckdb] [--json]`
-(distinct from `agnes admin semantic-model validate`, which schema-checks a
-document, not a query). MCP: `validate_semantic_query`.
+(distinct from its sibling `agnes semantic-model validate`, which
+schema-checks a document, not a query). MCP: `validate_semantic_query`.
 
 `GET /api/semantic-models/context` and `GET /api/semantic-models/schema` are
 the agent read-parity tools. `context` uses the same RBAC tier as
@@ -2001,6 +2005,12 @@ Relevance-ranked search uses DuckDB FTS BM25 with an ILIKE fallback.
 - /api/glossary
 - /api/glossary/search
 - /api/glossary/{glossary_id}
+
+CLI: `agnes glossary search <term> [--limit N] [--json]` and `agnes glossary
+show <id> [--json]`. MCP: `glossary_search` — search is the agent-facing path;
+`/api/glossary` (the unfiltered list) and `/api/glossary/{id}` have no MCP
+analogue by design, an agent looking a term up is searching rather than
+paginating a table.
 
 ### `/api/health` — Health checks
 
