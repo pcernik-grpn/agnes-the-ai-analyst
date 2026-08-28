@@ -48,6 +48,9 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Markdown-first skill publish (studio Skill Builder direct-publish flow,
     # issue #688). CLI: `store publish-md`. MCP: `store_publish_markdown`.
     "/api/store/entities/from-markdown": ("store publish-md", "store_publish_markdown"),
+    # The composed sibling of from-markdown: same JSON-create shape, so it takes
+    # the same three surfaces. The .zip upload path stays _EXEMPT (binary).
+    "/api/store/entities/from-components": ("store compose", "store_compose_plugin"),
     # Full agent/skill lifecycle parity — an agent can discover, inspect,
     # install/remove marketplace items and edit/delete its own store entities
     # over any of the three surfaces. Binary siblings (ZIP upload/replace,
@@ -550,6 +553,71 @@ _LIBRARY_MOVE_REASON = (
     "into the intended collection, which already has surfaces."
 )
 
+_MCP_BUILDER_TURN_REASON = (
+    "one turn of the /admin/mcp-sources/new builder's CONVERSATION — web-UI"
+    "-only for the same reason as its three siblings. It writes nothing, its "
+    "inputs are the page's own transient state (the transcript and the unsaved "
+    "connection panel), and its output is a patch for the admin to review, not "
+    "a resource. The source it helps produce is created through POST "
+    "/api/admin/mcp-sources, which has its own coverage."
+)
+_MCP_PREVIEW_INTROSPECT_REASON = (
+    "pre-flight for the builder: dials a connection the admin has TYPED and "
+    "returns its tool list, writing nothing — the same relationship to POST "
+    "/mcp-sources that /entities/preview has to POST /entities, and exempt for "
+    "the same reason. A CLI or MCP caller registering a source has the "
+    "registered {source_id}/introspect available to it, which is the analogue "
+    "that exists; this one is only useful to a surface holding an unsaved form."
+)
+_PACKAGE_BUILDER_TURN_REASON = (
+    "one turn of the data-package drawer's CONVERSATION — web-UI-only, same "
+    "shape as the two builder-turn endpoints above. It writes NOTHING and has "
+    "no `apply` flag at all: creating a package writes GRANTS, so a turn only "
+    "ever proposes into the open drawer and the admin presses Create having "
+    "seen the access matrix. Its inputs are the drawer's transient state; its "
+    "output is a proposal, not a resource. The package itself is created "
+    "through POST /api/admin/data-packages, which is grandfathered above."
+)
+
+_ENTITY_PREVIEW_AGENT_REASON = (
+    "points the caller's single scratch agent at the agent TEMPLATE they are "
+    "drafting on /skills and returns its slug, so the builder's Preview tab "
+    "can open a normal chat session against it. Web-UI-only: it exists to "
+    "back an in-page tab, it creates no resource anyone can address (the row "
+    "is `status='scratch'` and filtered out of every list — see "
+    "src/repositories/agents.py::list_for_user), and it is idempotent per "
+    "user rather than a thing you can have many of. The CLI/MCP way to try a "
+    "template is to install it and run the resulting agent, which "
+    "/api/v1/agents/{slug}/responses already covers."
+)
+
+_ENTITY_BUILDER_TURN_REASON = (
+    "one turn of the /skills builder's CONVERSATION — web-UI-only for the "
+    "same reason as its /agents sibling above. It is not an operation on a "
+    "Library entity: it writes NOTHING (there is no row yet — the draft lives "
+    "in the author's browser until Save to Library), and it returns a patch "
+    "the page merges into that draft for the author to review. Its inputs are "
+    "the page's own transient state — the transcript so far and the unsaved "
+    "draft — which a CLI invocation would have to invent, and its output is "
+    "not a resource. The thing it helps produce is created through "
+    "POST /api/store/entities, which has its own coverage."
+)
+
+_AGENTS_BUILDER_TURN_REASON = (
+    "one turn of the /agents builder's CONVERSATION — web-UI-only by nature. "
+    "It is not an operation on an agent; it is the page asking a model to "
+    "translate a sentence into a patch for the panel the owner is looking at, "
+    "and it only makes sense with that panel in front of you. Its inputs are "
+    "the page's own transient state (the transcript so far, the candidate "
+    "lists the picker is offering, the unsaved working copy), which a CLI "
+    "invocation would have to invent, and its output is a patch the caller is "
+    "expected to review before saving — `apply=false` is what the page sends. "
+    "Everything it can write is already writable through "
+    "`PATCH /api/agents/{id}`, which carries the same exemption above, so no "
+    "capability is reachable here and nowhere else. Retired with the rest of "
+    "`/api/agents` by the agent-core consolidation (remediation Track C)."
+)
+
 _LIBRARY_SHARING_REASON = (
     "Owner-initiated sharing of Library items — a web affordance on /library "
     "(share dialog). The equivalent grant writing already has analyst-facing "
@@ -647,6 +715,11 @@ _EXEMPT: dict[str, str] = {
         "as the caller (`oid`/`tid`) — auth-linkage reconnaissance a "
         "prompt-injected chat session has no analyst-tooling reason to hold"
     ),
+    # `/api/agents/{agent_id}/builder/turn` is NOT here: it sits with the other
+    # four builder-turn routes further down, as `_AGENTS_BUILDER_TURN_REASON`.
+    # It used to be in both places — an inline prose entry here and the
+    # constant there — and a dict keeps the LAST value, so this one was dead
+    # text that read like the live justification.
     "/api/admin/users/{user_id}/library-preview": (
         "feeds the Simulate lens's Library-shaped preview on /admin/access — "
         "a projection of another person's /library page, meaningful only "
@@ -714,6 +787,12 @@ _EXEMPT: dict[str, str] = {
         "/profile; a one-field personal profile edit with no CLI/MCP analogue"
     ),
     "/api/collections/{collection_id}/files/{file_id}/move": _LIBRARY_MOVE_REASON,
+    "/api/agents/{agent_id}/builder/turn": _AGENTS_BUILDER_TURN_REASON,
+    "/api/store/entities/builder/turn": _ENTITY_BUILDER_TURN_REASON,
+    "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,
+    "/api/admin/data-packages/builder/turn": _PACKAGE_BUILDER_TURN_REASON,
+    "/api/admin/mcp-sources/builder/turn": _MCP_BUILDER_TURN_REASON,
+    "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (

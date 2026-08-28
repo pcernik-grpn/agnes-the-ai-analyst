@@ -813,6 +813,46 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "instance.experience: redesign preset defaults this ON."
             ),
         },
+        # The three surfaces the admin cleanup retired. Declared here so the
+        # panel renders each as a toggle rather than a text box — see
+        # `app/switches.py` for why all three live under `features` instead of
+        # a top-level section each.
+        "news_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "news_enabled", False),
+            "hint": (
+                "In-product news: the /admin/news editor, the /news reader, the "
+                '/home "What\'s new" strip, and their nav + command-palette '
+                "entries. OFF by default since the admin cleanup. Hides UI only "
+                "— /api/admin/news/* keeps serving and a published version stays "
+                "in the table, so turning this back on restores the surface with "
+                "its content intact."
+            ),
+        },
+        "knowledge_digests_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "knowledge_digests_enabled", False),
+            "hint": (
+                "The /admin/knowledge-digests admin PAGE and its nav row. OFF by "
+                "default since the admin cleanup. Deliberately narrow — it gates "
+                "the page, not the feature: /api/admin/knowledge-digests/*, "
+                "`agnes admin digest`, the digest scheduler job and `agnes pull`'s "
+                "digest delivery all keep working, so an instance already running "
+                "digests keeps running them headlessly."
+            ),
+        },
+        "contribute_skill_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "contribute_skill_enabled", False),
+            "hint": (
+                "The paste-a-SKILL.md publish page (/admin/contribute-skill), the "
+                'landing target for an external "Load skill to Agnes" button. '
+                "OFF by default since the admin cleanup — the Library's skill "
+                "builder is the supported path. Both POST handlers carry the gate "
+                "too, so a stale external button gets a redirect home rather than "
+                "a silent publish."
+            ),
+        },
     },
     "mcp": {
         "allow_query_param_token": {

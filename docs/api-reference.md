@@ -741,7 +741,19 @@ checks against.
 
 ### `/api/admin/data-packages` — Data packages
 
+`POST /api/admin/data-packages/builder/turn` (admin) runs one turn of the
+package drawer's conversation and returns `{reply, patch, suggestions}`. It
+**writes nothing, and has no `apply` flag at all** — creating a package writes
+grants, so a turn only ever proposes into the open drawer and the admin
+presses Create having seen the access matrix they are about to write. Unlike
+the two builder-turn endpoints under `/api/store` and `/api/agents`, the
+candidate lists are fetched server-side rather than accepted from the caller:
+the worst case here is a group, so the set of grantable groups is the
+server's answer. Proposed table and group ids are validated against it, and a
+fabricated one is dropped rather than corrected.
+
 - /api/admin/data-packages
+- /api/admin/data-packages/builder/turn
 - /api/admin/data-packages/{pkg_id}
 - /api/admin/data-packages/{pkg_id}/restore
 - /api/admin/data-packages/{pkg_id}/tables
@@ -840,6 +852,8 @@ section for the full operator flow. CLI: `agnes admin analytics migrate
 ### `/api/admin/mcp-sources` — MCP source management
 
 - /api/admin/mcp-sources
+- /api/admin/mcp-sources/builder/turn
+- /api/admin/mcp-sources/preview-introspect
 - /api/admin/mcp-sources/{source_id}
 - /api/admin/mcp-sources/{source_id}/classify
 - /api/admin/mcp-sources/{source_id}/introspect
@@ -900,6 +914,10 @@ marketplace / corporate-memory). Non-admins submit a proposed create payload fro
 the `/admin/studio/{domain}` builder; admins approve/reject (guarded state
 transitions — turning an approved suggestion into the real resource is a deferred
 follow-up that must re-validate through the domain endpoint, never replay).
+
+The Studio is **hidden by default** since the admin cleanup (`studio.enabled` /
+`AGNES_STUDIO_ENABLED`), and these endpoints answer `403` while it is off. See
+[feature-flags.md](feature-flags.md).
 
 - /api/studio/suggestions
 - /api/studio/suggestions/mine
@@ -1211,6 +1229,8 @@ has its own surface).
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.
 
+These endpoints are NOT gated by `features.contribute_skill_enabled` — that flag hides the `/admin/contribute-skill` WEB PAGE only (off by default since the admin cleanup; the Library's skill builder is the supported path). The API, CLI and MCP surfaces keep working, so automation that publishes contributed skills is unaffected.
+
 - /api/admin/contributed-skills
 - /api/admin/contributed-skills/{name}
 
@@ -1448,6 +1468,34 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/{session_id}/leave
 - /api/chat/{session_id}/messages
 
+### `/api/agents/{agent_id}/builder/turn` — Agent-builder assistant
+
+The `/api/agents` CRUD this section used to document is gone: `/api/v1/agents*`
+absorbed every operation it served and the router was deleted (remediation
+Track C, Task C1.2). One route survives under this prefix — the builder's
+conversational turn.
+
+`POST /api/agents/{agent_id}/builder/turn` (owner only) runs one turn of the
+builder's assistant: it takes the owner's message plus the transcript so far
+and the caller's own plugin candidates, and asks the configured LLM for a
+configuration patch. When the patch is applied it goes through the same
+`PUT /api/v1/agents/{agent_id}` path a hand edit uses — so the
+builder-declaration → enforced-scope derivation is identical either way.
+
+The model's proposal is filtered before anything is written: unknown fields,
+knowledge/plugin ids outside the caller's own candidate lists, and tones
+outside the four the UI offers are dropped, and neither `status` nor the
+`*_mode` scope columns are writable from a conversation.
+
+Returns `{reply, patch, agent, suggestions}`. Two optional request fields
+serve the builder page's unsaved working copy: `apply` (default `true`) writes
+the patch as described above — pass `false` to get the sanitized patch back
+**without** writing, in which case `agent` is `null`; and `config`, the
+caller's unsaved copy, narrowed to the patchable keys and used only to build
+the prompt. With no AI credential configured the endpoint answers
+`503 builder_llm_unavailable` and the form stays fully usable by hand.
+
+- /api/agents/{agent_id}/builder/turn
 ### `/api/sharing` — Owner-initiated sharing of Library items
 
 The owner-scoped counterpart to `/api/access` (which is admin-only): the creator
@@ -1972,10 +2020,102 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 
 ### `/api/store` — Marketplace flea-market store
 
+`POST /api/store/entities/builder/turn` runs one turn of the `/skills`
+builder's conversation. It takes `{type, message, history, draft}` and returns
+`{reply, patch, suggestions}` — and it writes **nothing**: a Library entity has
+no row until the author saves it, so the draft lives in their browser and the
+patch is merged there for them to review. The model's output is untrusted:
+only the fields that type allows survive (a `plugin` patch can never carry a
+`body` — its contents are an uploaded archive), a category must be one the
+server actually offers, and everything is length-capped. With no AI credential
+configured it answers `503 builder_llm_unavailable` and the form stays fully
+usable by hand.
+
+`POST /api/chat/sessions` accepts an optional `preview_skill` (`{name, body}`)
+that backs the `/skills` builder's Preview for SKILLS. The skills catalog
+reports what is on disk in a session's project scope, so previewing a skill
+that exists nowhere but the author's browser means writing it there: the draft
+is materialized into that one session's own `.claude/skills/`, which is forced
+to be a copy so it can never reach the author's shared workspace. Both fields
+are untrusted — the name becomes a directory name and is *replaced* rather
+than sanitized, and the body is length-capped. Nothing is persisted beyond the
+session. Both delivery paths carry it: native providers mount the session
+directory, and the kai-agent provider packs the same bytes into its workspace
+tarball, so the preview cannot work on one provider and silently do nothing on
+the other.
+
+`POST /api/store/entities/builder/preview-agent` backs that builder's Preview
+tab for agent TEMPLATES. A template is a system prompt, so trying one means
+running an agent with it — which needs a row, because a chat session runs as
+an agent id. This points the caller's single scratch agent (fixed slug
+`template-preview`, `status='scratch'`) at the draft and returns its slug.
+Those rows are filtered out of every agent listing, so the author never sees
+machinery they did not create; fetch-by-slug still resolves, which is how the
+session binds. Idempotent per user — one row however many templates they try
+— so a browser that dies mid-preview leaves at most one invisible row behind.
+The scratch agent inherits none of the author's own knowledge or plugins: a
+template carries no data access, and a preview that quietly ran with theirs
+would flatter it.
+
+`POST /api/store/entities/from-components` composes a **plugin** out of store
+entities the caller can already see, instead of out of an uploaded `.zip`.
+Every entity is baked into a one-plugin tree on save, so a published skill is
+already served to Claude Code as a single-skill plugin — this endpoint exists
+for the case that shape cannot express: one install handing someone several
+skills and agent templates at once.
+
+Body: `{name, description?, category?, components: [entity_id, …], access?,
+publisher_kind?, dry_run?}`. Each component's baked subtree is merged (minus
+its own `.claude-plugin/`, since the composite gets one synthesized manifest),
+zipped in memory, and handed to the same `POST /entities` path — so a composed
+plugin is indistinguishable downstream from an uploaded one and pays the same
+guardrail review. Component directory names keep their `-by-<username>`
+suffix: it is what the component's own frontmatter says, and it is what lets
+two owners' same-named skills coexist in one composite.
+
+`dry_run: true` returns the `PreviewResponse` shape (200) that the `.zip`
+route's `POST /entities/preview` returns, and writes nothing.
+
+Refusals, all typed under `detail.code`: `no_components`,
+`too_many_components` (cap: `MAX_COMPONENTS`), `duplicate_component`,
+`component_not_found` (**404 for an entity the caller cannot see, never 403** —
+a composite must not be a probe for someone's private item),
+`component_type_unsupported` (a plugin cannot contain a plugin — that would
+mean merging two manifests), `component_bundle_missing`,
+`component_path_conflict`, `components_too_large`.
+
+`POST /api/admin/mcp-sources/builder/turn` is the fourth builder-turn
+endpoint (after the agent, entity and package builders) and backs
+`/admin/mcp-sources/new`. It proposes into the panel and writes nothing.
+
+Two refusals in its sanitizer are specific to what it configures. A `url` the
+admin has not already typed is dropped — the model may not choose which host
+the instance dials, and "correcting" a URL is the same act as choosing one. An
+`auth_secret_env` that is not shaped like an environment-variable name is
+dropped, which is what stops a pasted token being written into a field that is
+stored and displayed.
+
+`POST /api/admin/mcp-sources/preview-introspect` dials a connection the admin
+has typed and returns its tool list, writing nothing — the same relationship to
+`POST /mcp-sources` that `/entities/preview` has to `POST /entities`. The
+builder needs it because you cannot sensibly choose which tools to grant, or
+name the source, without seeing what it exposes; the alternative was registering
+a disabled row first and introspecting that, which puts a source in the list the
+admin never agreed to create. It builds a row-shaped dict and runs the SAME url
+guard (`_check_source_url_or_400`) and the SAME introspection the registered
+path does, because a probe dials with a credential attached whether or not a row
+exists. The secret is never in the payload: `auth_secret_env` names a variable
+and the credential resolves out of the vault exactly as it does for a registered
+source, so a connection whose secret is not stored yet fails here with that
+reason.
+
 - /api/store/bundle.zip
 - /api/store/categories
 - /api/store/entities
+- /api/store/entities/builder/turn
+- /api/store/entities/builder/preview-agent
 - /api/store/entities/dryrun
+- /api/store/entities/from-components
 - /api/store/entities/from-markdown
 - /api/store/entities/preview
 - /api/store/entities/{entity_id}

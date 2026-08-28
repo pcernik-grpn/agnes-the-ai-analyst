@@ -639,8 +639,8 @@ const SECTION_META = {
     help: "Analyst Library display options. show_unverified_trust surfaces the 'Community' marker beside the name of a user-authored Store item your organization hasn't verified — on by default, so every row states its provenance (Organization / Verified / Community) and none is left unlabelled. Turn it off for the older reading, where an unverified item is marked only by the absence of a marker.",
   },
   features: {
-    title: "Stack membership",
-    help: "Stack membership mode. Off (default): the subscribe model — required plus subscribed grants only. On: auto-membership — every granted resource lands in the stack immediately.",
+    title: "Features",
+    help: "Stack membership mode — off (default): the subscribe model, required plus subscribed grants only; on: auto-membership, every granted resource lands in the stack immediately. The three *_enabled keys re-expose surfaces the admin cleanup hid, all off by default: news_enabled (the /admin/news editor, the /news reader and the /home \"What's new\" strip), knowledge_digests_enabled (the /admin/knowledge-digests page only — the API, CLI and scheduler job keep running either way), contribute_skill_enabled (the paste-a-SKILL.md publish page; the Library's skill builder is the supported path).",
   },
   access_policies: {
     title: "Access policies",
@@ -656,7 +656,7 @@ const SECTION_META = {
   },
   studio: {
     title: "Studio",
-    help: "Expose the authoring Studio (/admin/studio, the moderation queue, and the public suggestion API). Off hides the nav entries and 403s the suggestion API immediately.",
+    help: "Expose the authoring Studio (/admin/studio, its per-domain builders, the moderation queue, and the public suggestion API). OFF by default since the admin cleanup — the Library builders (/library, '+ New') do the same authoring jobs. Off hides the nav and palette entries, redirects /admin/studio* home, and 403s the suggestion API immediately; the pages are intact, so turning it on restores the whole surface.",
   },
   chat: {
     title: "Chat access",
