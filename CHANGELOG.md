@@ -753,6 +753,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **Removed a committed `data` symlink pointing into a contributor's home
+  directory.** `data -> /Users/<contributor>/Documents/.../data` reached
+  `integration` as a tracked mode-120000 blob. It is broken for everyone
+  else, it can shadow the runtime `data/` directory, and it puts a personal
+  filesystem path into a source-available repo, which the vendor-neutrality
+  rule rules out. `.gitignore` had `data/` — the trailing-slash form matches
+  a **directory** only, so a symlink named `data` slipped straight past it;
+  `/data` is now listed too so the same file cannot come back.
 - **The fact-graph search API silently ignored an unrecognized request field instead of rejecting it.** `POST /api/facts/search` and `POST /api/facts/neighbors` now reject an unknown field with `422` (`extra="forbid"` on both request models) rather than pydantic's default of silently dropping it — a caller that (reasonably) guessed at an undocumented `q` parameter previously got back an unfiltered, id-ordered dump with no error, which is exactly the shape of a convincing wrong answer.
 - **The SharePoint source card no longer shows "(no connection URL)".** The
   generic card subtitle rendered a connection's `stack_url`/host, which a
