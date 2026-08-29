@@ -2815,11 +2815,11 @@ async def library_page(
     ) -> None:
         """Append one access-granted row (never owner-shareable).
 
-        ``droppable``: the membership is the caller's own subscription
-        (classic mode, optional tier) — render the REMOVE control, exactly
-        as /catalog offers for the same membership. Callers whose
-        membership is the grant itself (auto-membership, recipes, plugins)
-        leave it False and get the locked pill."""
+        ``droppable``: the membership is the caller's own subscription, which
+        only exists under CLASSIC membership — there, subscribing is what makes
+        a granted resource queryable, so the control is real and the caller may
+        undo it. Under auto-membership (the default) the grant IS the
+        membership and callers leave this False."""
         items.append(
             _library_row_base(
                 item_id=item_id,
@@ -2844,58 +2844,49 @@ async def library_page(
                 owner_key=owner_key or "workspace",
             )
         )
-        # Membership is the caller's mode-resolved reality, not the grant
-        # (Devin Review on #1199): under auto-membership every granted row IS
-        # in the Stack (``in_stack`` arrives True, rendering exactly as
-        # before); under the classic default a granted-but-unsubscribed
-        # ``available`` resource is NOT a member — claiming "In stack" there
-        # would label rows the agent cannot actually query (membership also
-        # drives ``get_accessible_tables``). Callers whose membership
-        # genuinely is the grant (recipes, plugins) omit the argument.
+        # What this column can offer depends on which membership mode the
+        # instance runs, because the two modes disagree about what a
+        # subscription DOES.
+        #
+        # Auto-membership (the default since Wave 0): the grant already put the
+        # resource in reach — StackResolver.stack returns required ∪ available
+        # regardless of any subscription — so there is nothing here for the
+        # caller to add. The only thing a subscription still decides is whether
+        # `agnes pull` writes a local copy, which changes how fast THEIR
+        # queries run and nothing about what their agents can do; that is a
+        # workspace question and it lives on the package's own page
+        # (/catalog/p/<slug>, sourced from `entry.materialized`) and in
+        # `agnes stack add`. An "Add to my agents" control here would claim to
+        # grant access the admin's grant already gave.
+        #
+        # Classic membership: subscribing is exactly what makes the resource
+        # queryable (membership drives get_accessible_tables), so the control
+        # is real, the verb is true, and a self-subscription is the caller's to
+        # drop — rendering it as a locked admin mandate is what Devin Review
+        # #1199 was about.
         if in_stack and droppable:
-            # Classic self-subscription: the caller added it, the caller can
-            # remove it — HERE, not just on /catalog. This row used to render
-            # the locked pill ("only an admin can remove it"), which was
-            # false for a self-subscription and read as a required mandate;
-            # /catalog offered Remove for the very same membership. The lock
-            # is driven by droppability, and this membership IS droppable.
             import json as _json
 
             items[-1]["stack_state"] = "in_stack"
-            # Not a membership: auto-membership (default since Wave 0) means the
-            # GRANT already put this in the stack. All that is left to the caller
-            # is whether `agnes pull` keeps a copy on disk — which is exactly what
-            # `StackResolver.browse()` calls the Download / Remove-local-copy
-            # affordance.
-            items[-1]["stack_pill"] = "Local copy"
-            items[-1]["stack_action"] = "Keep a local copy"
-            items[-1]["stack_undo"] = "Remove local copy"
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
-            # Remove is a path-param DELETE; re-add (after a remove, without
-            # a reload) POSTs the generic subscribe endpoint with a body —
-            # the row carries both so the click handler can cycle.
+            # Remove is a path-param DELETE; re-add (after a remove, without a
+            # reload) POSTs the generic subscribe endpoint with a body — the
+            # row carries both so the click handler can cycle.
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Added by you — click to remove it from your stack"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
         elif in_stack:
             items[-1]["stack_state"] = "in_stack"
-            # Every non-droppable member row says the same thing about
-            # membership — "In stack" — and is LOCKED: there is no per-user
-            # membership to drop, only a grant an admin can revoke (required
-            # tier, or auto-membership where the grant IS the membership).
-            # The lock is driven by *droppability*, not by the grant tier:
-            # keying it on ``requirement == 'required'`` (as this once did)
-            # left an optional grant rendering the success-tinted check that
-            # a REMOVABLE row wears at rest. The tier stays legible in the
-            # tooltip and the Optional/Required facet.
-            # Granted, therefore already queryable: the pill states the tier
-            # rather than claiming a membership the caller could add.
-            # ONE pill for both tiers, because the caller can do exactly the
-            # same thing with either: query it, and not remove it. The tiers
-            # differed only in WHY, which is what the tooltip is for — two
+            # ONE pill for both grant tiers, because the caller can do exactly
+            # the same thing with either: query it, and not remove it. The
+            # tiers differ only in WHY, which is what the tooltip is for — two
             # pills promising two different things about removal is what made
-            # a single state read as two.
+            # a single state read as two. The tier stays legible in the tooltip
+            # and in the Access facet.
             items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
             if requirement == "required":
@@ -2915,12 +2906,12 @@ async def library_page(
 
             items[-1]["stack_state"] = "available"
             items[-1]["stack_addable"] = True
-            items[-1]["stack_action"] = "Keep a local copy"
-            items[-1]["stack_undo"] = "Remove local copy"
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Granted to you, but not in your stack — add it to make it queryable"
+            items[-1]["stack_title"] = _AGENT_ADD_TOOLTIP
 
     # Governed data packages + memory domains — StackResolver.browse() is
     # exactly "required ∪ available for my groups" for these two types.
@@ -2950,9 +2941,7 @@ async def library_page(
     except Exception as e:
         logger.warning("/library: could not count memory-domain items: %s", e)
         dom_counts = None
-    # Membership mode decides droppability below: classic optional members
-    # are the caller's own subscriptions (removable here, as on /catalog);
-    # under auto-membership the grant IS the membership, nothing to drop.
+    # Only classic membership has a subscription to drop; see _add_shared_row.
     from app.instance_config import get_stack_auto_membership
 
     _auto_membership = get_stack_auto_membership()

@@ -494,9 +494,15 @@ def test_library_available_grant_classic_is_not_claimed_in_stack(seeded_app, mon
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Classic Offered Package")
     assert 'data-stack="in_stack"' in row
-    # Classic (opt-in) mode: the caller subscribed, so this is a real local copy
-    # they can drop again.
-    assert "Local copy" in row
+    # Classic (opt-in) mode: the caller subscribed, and under classic that is
+    # what makes the package queryable — membership drives
+    # get_accessible_tables — so the row states the OUTCOME in the same
+    # vocabulary every other row uses, and offers the undo. It used to read
+    # "Local copy", which described the side effect (`agnes pull` keeps a copy)
+    # rather than the thing the caller changed, in a word the page no longer
+    # speaks anywhere else.
+    assert "Agents can query this" in row
+    assert 'data-remove-from-stack="' in row
 
 
 def test_library_lists_granted_curated_plugins(seeded_app):
