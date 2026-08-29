@@ -766,6 +766,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
   stdout `json.dumps` now uses the same `default=str` handler as the
   parent-side profile writer.
+- **Security: `AGNES_REMOTE_ATTACH_TOKEN_ENVS` could resurrect a
+  config-resolution-only secret as a connector-ATTACH `token_env`.** The
+  override replaced the default allowlist wholesale with no scrub, so an
+  operator listing `SHAREPOINT_CERT_PRIVATE_KEY` (or the anonymization
+  producer key) there re-opened the exact hole the consumer-class split
+  above closes; `get_allowed_token_envs()` now always subtracts both other
+  boundaries back out, even from the override.
 - The group picker on `/admin/users/{id}` ("Add to group") showed only its
   first option under themes that render the custom dropdown: the section
   card's `overflow: hidden` clipped the popover at the card's bottom edge,
