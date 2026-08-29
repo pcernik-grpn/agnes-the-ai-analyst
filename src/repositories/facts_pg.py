@@ -47,6 +47,7 @@ import json
 import secrets
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -1875,6 +1876,13 @@ class FactsPgRepository:
         doc_id_resolution: Dict[Tuple[str, str], str] = {}
         doc_declared_pairs: Set[Tuple[str, str]] = set()  # {(corpus_id, doc_id)} this batch's documents[] touched
         doc_dates: Dict[str, date] = {}
+        # O7 follow-up: a `source_url` the validator dropped — itemized so a
+        # non-zero count on the run report tells the operator "your producer
+        # is sending urls Agnes won't store" instead of a citation silently
+        # never getting a link. Only appended when the producer actually
+        # SENT a value (see `_validate_source_url`'s reason contract) — an
+        # absent `source_url` is the normal case, never counted here.
+        source_urls_rejected: List[Dict[str, Any]] = []
         with self._engine.connect() as doc_conn:
             for raw_doc in documents:
                 doc = {k: v for k, v in raw_doc.items() if not k.startswith("_")}
@@ -1896,12 +1904,16 @@ class FactsPgRepository:
                 if existing is not None:
                     file_id = existing["id"]
                     if stable_id:
+                        validated_url, url_reject_reason = _validate_source_url(doc.get("source_url"))
+                        if url_reject_reason:
+                            source_urls_rejected.append({"doc_id": doc_id, "reason": url_reject_reason})
                         sources_repo.upsert(
                             corpus_file_id=file_id,
                             corpus_id=corpus_id,
                             source_stable_id=stable_id,
                             source_doc_id=doc_id,
                             source_sha256=doc.get("sha256") or None,
+                            source_url=validated_url,
                         )
                     # A path-only match (no `stable_id`) never gets a
                     # `corpus_file_sources` row above — this direct write is
@@ -2371,6 +2383,7 @@ class FactsPgRepository:
         return {
             "claims_written": claims_written,
             "claims_rejected": claims_rejected,
+            "source_urls_rejected": source_urls_rejected,
             "deferred": deferred,
             "subjects_created": subjects_created,
             "subjects_deleted": subjects_deleted,
@@ -2569,6 +2582,48 @@ class FactsPgRepository:
             },
         )
         return new_id
+
+
+# O7 (spec §8/§8.1): a citation deep link the caller renders as a clickable
+# href — never dialed by Agnes itself (the canonical-source contract). This
+# is display-safety validation, not a reachability check: https-only blocks
+# `javascript:`/`data:`/plain `http:` outright, and a length cap bounds an
+# otherwise-unbounded producer string before it reaches storage.
+_MAX_SOURCE_URL_LEN = 2048
+
+
+def _validate_source_url(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort validation of a producer-supplied ``source_url`` (spec
+    §8, O7). Returns ``(validated_url, rejection_reason)`` — same
+    tolerant-input contract as :func:`_parse_document_date`: an invalid
+    value is dropped from storage (the first element is ``None``) and the
+    surrounding document/claims still ingest, never raises.
+
+    The second element distinguishes "nothing sent" from "something sent
+    but rejected" — both leave ``validated_url`` ``None``, but only the
+    latter is worth surfacing on the ingest run report
+    (``source_urls_rejected``, O7 follow-up): a producer that never sends
+    ``source_url`` is not an anomaly, a producer whose values Agnes keeps
+    refusing is. ``reason`` is ``None`` whenever ``value`` is absent/blank
+    OR the url validated successfully; otherwise one of ``too_long`` /
+    ``unparseable`` / ``not_https`` / ``no_host``.
+    """
+    if not value:
+        return None, None
+    s = str(value).strip()
+    if not s:
+        return None, None
+    if len(s) > _MAX_SOURCE_URL_LEN:
+        return None, "too_long"
+    try:
+        parsed = urlsplit(s)
+    except ValueError:
+        return None, "unparseable"
+    if parsed.scheme.lower() != "https":
+        return None, "not_https"
+    if not parsed.netloc:
+        return None, "no_host"
+    return s, None
 
 
 def _parse_document_date(value: Any) -> Optional[date]:

@@ -224,7 +224,9 @@ corpus_file_sources                        -- NEW PG-only table; the anchor (§6
              source_doc_id TEXT                -- crawler's citation key, sha256[:16] (§7.2);
                                                --   rewritten when a provisional id is replaced
              source_sha256 TEXT
-             source_url TEXT NULL              -- when it lands (open item O7)
+             source_url TEXT NULL              -- citation deep link (O7, resolved) — optional
+                                               --   `documents[]` field, https-only validated
+                                               --   at ingest, NULL when absent/rejected
              UNIQUE (corpus_id, source_stable_id) · INDEX (corpus_id, source_doc_id)
 
 corrections  subject_kind TEXT NOT NULL    -- 'fact' | 'edge'
@@ -646,11 +648,20 @@ narrower than it sounds. Four limits, stated for customer material:
    document, English claim → no substring). Open (O6); blocks any
    multilingual corpus.
 
-**Citation to the source system is new work**: `source_url` lives in
-`corpus_file_sources` when the crawler supplies it (O7); until then a
-citation names the document, not a clickable original. The original itself is
-never served by Agnes — it opens in the source under the caller's own
-identity (the TCRD-178 "resolve to the source" decision).
+**Citation to the source system (O7, resolved 2026-08-29)**: `source_url`
+lives in `corpus_file_sources`, populated when an ingest `documents[]` entry
+carries it (an additive, optional wire field — the crawler's Graph `webUrl`).
+Validated at ingest — https-only, no `javascript:`/`data:`, length-capped —
+so a hostile producer value is dropped (stored `NULL`) rather than reaching
+a rendered link; the claim itself still ingests. A citation with no
+`source_url` names the document only, same as before. The drop is never
+silent: the ingest run report (and its persisted `facts_ingest_runs` copy)
+itemizes it in `source_urls_rejected: [{doc_id, reason}]`, same shape as
+`claims_rejected`, surfaced as its own badge on the `/admin/data-sources`
+source card — a producer whose values Agnes keeps refusing shows up as a
+non-zero count, not a citation that quietly never got a link. The original
+itself is never served by Agnes — it opens in the source under the caller's
+own identity (the TCRD-178 "resolve to the source" decision).
 
 ### 8.1 The canonical-source contract (ratified 2026-08-28)
 
@@ -1442,8 +1453,11 @@ overclaim).
 - **O5 — reconcile the two anonymization designs** (§9.2 vs the 2026-08-24
   corpus-intake spec).
 - **O6 — cross-language extraction vs the verbatim gate** (§8).
-- **O7 — `source_url`**: who extends the crawler rows and
-  `corpus_file_sources` so citations link to the source system.
+- **O7 — `source_url`** (RESOLVED 2026-08-29): an ingest `documents[]` entry
+  may carry an optional `source_url`; validated (https-only, length-capped)
+  and persisted onto `corpus_file_sources`, surfaced in the claims read
+  shape (REST/MCP/CLI), rendered as an "Open in source" link in chat and
+  the facts UI when present (§8.1).
 - **O8 — plugin raw-file access** (§8.1 rule 3): the proposal plugin needs
   live reads of template files from the source drive — same credential
   story as the crawler, designed with the plugin owner; blocked on the

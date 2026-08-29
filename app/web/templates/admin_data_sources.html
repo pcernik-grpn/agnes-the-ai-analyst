@@ -2202,6 +2202,7 @@ function _sharepointFactsHtml(row) {
     ["rejected_quotes", "Rejected quotes"],
     ["deferred", "Deferred"],
     ["protocol_errors", "Protocol errors"],
+    ["source_urls_rejected", "Citation links rejected"],
   ];
   const badgesHtml = lastRun
     ? badgeDefs.map(([key, label]) => {
@@ -2269,6 +2270,14 @@ const SP_REJECTION_REASON_TEXT = {
     "The cited document isn't registered in any collection — upload it or fix the producer's corpus map.",
   ambiguous_cross_collection_doc_id:
     "The document exists in multiple collections and the batch didn't say which — rejected rather than guessed.",
+  not_https:
+    "The producer sent a source_url that isn't https — dropped rather than stored, so the claim wrote but has no citation link. Fix the producer to send an https deep link.",
+  no_host:
+    "The producer sent a source_url with no host — dropped rather than stored, so the claim wrote but has no citation link.",
+  too_long:
+    "The producer sent a source_url over the length cap — dropped rather than stored, so the claim wrote but has no citation link.",
+  unparseable:
+    "The producer sent a source_url Agnes couldn't parse — dropped rather than stored, so the claim wrote but has no citation link.",
 };
 function _spRejectionReasonText(reason) {
   return SP_REJECTION_REASON_TEXT[reason] || reason || "";

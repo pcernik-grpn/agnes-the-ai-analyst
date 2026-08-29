@@ -1590,6 +1590,9 @@ class TestSharePointSourceCardRendering:
                 {"row": 2, "reason": "unresolved_doc_id", "doc_id": "doc-c"},
                 {"row": 3, "reason": "malformed_edge"},
             ],
+            # O7 follow-up: a dropped documents[].source_url — the claim
+            # itself still wrote, only its citation link is missing.
+            "source_urls_rejected": [{"doc_id": "doc-d", "reason": "not_https"}],
         },
     }
 
@@ -1675,6 +1678,7 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "Rejected quotes 1" in html
         assert "Deferred 1" in html
         assert "Protocol errors 2" in html
+        assert "Citation links rejected 1" in html
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
         result = self._run(
@@ -1708,6 +1712,21 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         # verbatim — never hidden, per spec.
         assert "malformed_edge" in after_switch["innerHTML"]
         assert "doc-a" not in after_switch["innerHTML"]
+
+    def test_source_urls_rejected_drawer_shows_the_reason_not_the_slug(self):
+        """O7 follow-up: the new badge category drives the SAME generic
+        drawer/reason machinery as every other category — proven here by a
+        reason (`not_https`) none of the pre-existing categories use."""
+        result = self._run(
+            """
+            toggleFileSourceDrawer("sp-conn-1", "source_urls_rejected");
+            console.log(JSON.stringify({ ..._elements["ds-fs-drawer-sp-conn-1"] }));
+            """
+        )
+        assert result["hidden"] is False
+        assert "doc-d" in result["innerHTML"]
+        assert "isn't https" in result["innerHTML"]
+        assert "not_https" not in result["innerHTML"]
 
     def test_drawer_reports_empty_category_honestly(self):
         fs = dict(self._FILE_SOURCE)
