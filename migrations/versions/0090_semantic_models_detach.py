@@ -19,16 +19,21 @@ Six plain additive columns, no backfill:
 - ``source_missing_since`` — when the source first stopped sending this slug
   while the row was detached; NULL means the source still has it.
 
-Revision ID: 0077_semantic_models_detach
-Revises: 0075_semantic_health_mutes
+Revision ID: 0090_semantic_models_detach
+Revises: 0089_semantic_health_mutes
 Create Date: 2026-08-27
 
-Chained onto ``0075_semantic_health_mutes`` — the tip of the semantic chain
-after this branch merged its base. Written against ``0076_semantic_draft_
-pending``, which was that tip at the time; the base branch has since
-extended it (``0073_resource_source_tags`` -> ``0074_semantic_feedback`` ->
-``0075_semantic_health_mutes``), so pointing at the old parent would fork
-the chain into two Alembic heads and make ``upgrade head`` refuse.
+Chained onto ``0089_semantic_health_mutes`` — the tip of the semantic chain
+after this branch merged its base. Written against what was then
+``0076_semantic_draft_pending``, the tip at the time; the base branch had
+since extended it, so pointing at the old parent would have forked the chain
+into two Alembic heads and made ``upgrade head`` refuse.
+
+Renumbered ``0077_semantic_models_detach`` -> ``0090_semantic_models_detach``
+in the ``integration`` merge (landing-plan step 0), when the whole semantic
+chain was moved to ``0085``..``0090`` behind ``integration``'s
+``0079``..``0084``. This file is the chain HEAD. See the chain root
+``0085_column_meta_source_ref`` for the full account.
 """
 
 from __future__ import annotations
@@ -38,8 +43,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0077_semantic_models_detach"
-down_revision: Union[str, None] = "0075_semantic_health_mutes"
+revision: str = "0090_semantic_models_detach"
+down_revision: Union[str, None] = "0089_semantic_health_mutes"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

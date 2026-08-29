@@ -73,10 +73,20 @@ def _run_explore_local(table: str, as_json: bool):
     if `table` doesn't resolve to a table or view. Callers decide how to
     present each case (scope=local prints today's guidance and exits;
     scope=auto falls back to the server).
+
+    Every attempt that actually reaches DuckDB (success or table-miss)
+    records one `explore.local_offline` client-reported audit event to the
+    local spool (`cli.lib.audit_spool`) — this command never talks to the
+    server, so without this the offline-explore surface would be invisible
+    to `audit_log` (F3 — audit-full-coverage plan, Task 9).
     """
+    import time
+
     from src.duckdb_conn import _open_duckdb
 
+    from cli.lib.audit_spool import record_local_event
     from cli.lib.workspace_resolve import resolve_data_workspace
+    from src.audit_helpers import hash_args
 
     local_dir = resolve_data_workspace() or Path.cwd().resolve()
     db_path = local_dir / "user" / "duckdb" / "analytics.duckdb"
@@ -84,6 +94,7 @@ def _run_explore_local(table: str, as_json: bool):
         raise _LocalDbMissing()
 
     conn = _open_duckdb(str(db_path), read_only=True)
+    t0 = time.perf_counter()
     try:
         # Check table exists
         tables = [
@@ -106,6 +117,15 @@ def _run_explore_local(table: str, as_json: bool):
                 r[0]
                 for r in conn.execute("SELECT table_name FROM information_schema.tables ORDER BY table_name").fetchall()
             ]
+            record_local_event(
+                "explore.local_offline",
+                {
+                    "tables": [table],
+                    "sql_hash": hash_args(f"DESCRIBE {table}"),
+                    "rows": 0,
+                    "duration_ms": int((time.perf_counter() - t0) * 1000),
+                },
+            )
             raise _LocalTableMiss(table, available)
 
         # Row count
@@ -118,6 +138,16 @@ def _run_explore_local(table: str, as_json: bool):
         # Sample rows
         sample = conn.execute(f"SELECT * FROM {quote_ident(table)} LIMIT 5").fetchall()
         sample_cols = [desc[0] for desc in conn.description]
+
+        record_local_event(
+            "explore.local_offline",
+            {
+                "tables": [table],
+                "sql_hash": hash_args(f"DESCRIBE {table}"),
+                "rows": count,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
 
         info = {
             "table": table,

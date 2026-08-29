@@ -361,7 +361,7 @@ def test_prompt_unknown_slug_404_hints_list(client_with_admin):
     assert resp.status_code == 404
     detail = resp.json()["detail"]
     assert detail["kind"] == "unknown_connector"
-    assert "agnes connectors list" in detail["hint"]
+    assert "agnes tools list" in detail["hint"]
 
 
 def test_prompt_manifest_equality_is_the_gate(client_with_admin, monkeypatch):

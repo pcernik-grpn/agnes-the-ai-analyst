@@ -209,6 +209,16 @@ class _AuthMiddleware:
 
         tok = _current_token.set(raw_token)
         uid = _current_user_id.set(str(user.get("id") or ""))
+        # F2c (audit-full-coverage plan, Task 5): stamp the session's client
+        # kind here — the SSE session's own auth-resolution point — so any
+        # audit row logged for the rest of this request's context (not only
+        # the tool-call wrapper's own row) is attributed to MCP rather than
+        # defaulting to "web". No reset on the way out: each real SSE
+        # connection runs in its own ASGI task with a fresh contextvar copy,
+        # matching every other surface-specific stamp in this plan.
+        from src.audit_context import set_client_kind
+
+        set_client_kind("mcp")
         try:
             await self.app(scope, receive, send)
         finally:
@@ -249,6 +259,7 @@ def _register_dynamic_tools() -> None:
     try:
         from app.api.mcp.tools_generator import (
             install_grant_filtered_list_tools,
+            install_tool_call_audit,
             register_passthrough_tools,
         )
     except Exception:  # pragma: no cover - import-time defensive
@@ -270,6 +281,12 @@ def _register_dynamic_tools() -> None:
         install_grant_filtered_list_tools(mcp, caller_id_fn=_caller_id, passthrough_names=names)
     except Exception:
         logger.exception("MCP HTTP: grant-filtered tools/list install failed")
+    # F2c (audit-full-coverage plan, Task 5): one audit row per tool/call,
+    # foundation or passthrough alike — see the wrapper's own docstring.
+    try:
+        install_tool_call_audit(mcp, caller_id_fn=_caller_id)
+    except Exception:
+        logger.exception("MCP HTTP: tool-call audit install failed")
 
 
 # ── factory ────────────────────────────────────────────────────────────────────

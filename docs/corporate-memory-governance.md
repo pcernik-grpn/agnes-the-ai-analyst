@@ -32,13 +32,20 @@ features in future versions.
 
 ## Three Governance Modes (configurable)
 
-> **Status (#1573):** `distribution_mode` is exposed at `/admin/server-config`
-> and persists to `instance.yaml`, but `GET /api/memory/bundle` does not yet
-> branch on it — every mode currently ships every approved item to every
-> user, same as today's de-facto behavior. Wiring this up touches the JSON
-> bundle route, the per-domain markdown route `agnes pull` writes, and the
-> sync-manifest md5 those two must agree with — tracked as open work, not
-> done in the #1573 fix.
+> **Status (#1573):** `distribution_mode` is enforced at the sync layer.
+> `GET /api/memory/bundle` (both the JSON shape and the per-domain markdown
+> `agnes pull` writes), plus the matching `memory_domains[].md5` in `GET
+> /api/sync/manifest`, all filter through one shared rule
+> (`app/api/memory.py::select_distributable_items`): required items always
+> reach their target audience in every mode; approved (non-required) items
+> are distributed only in `"hybrid"` mode, and then only to a caller who has
+> personally upvoted them. `"mandatory_only"` and `"admin_curated"` ship
+> required items only through this channel — matching "distribution is
+> always admin-driven" below. What's still unimplemented is the *catalog
+> UI* reacting to the mode (e.g. `mandatory_only` hiding the vote buttons
+> entirely) — the browsing/voting experience described per-mode below is
+> currently the same for every mode; only what actually gets *distributed*
+> is mode-aware today.
 
 ### Mode 1: "mandatory_only"
 

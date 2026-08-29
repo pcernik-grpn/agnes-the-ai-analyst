@@ -27,6 +27,7 @@ from connectors.keboola.semantic_layer import (
     MasterTokenRequiredError,
     sync_semantic_layer,
 )
+from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -216,6 +217,18 @@ async def run_keboola_semantic_layer_refresh(
         result.get("skipped_foreign_alias"),
         result.get("skipped_embedded_comment"),
         len(result.get("sources") or []),
+    )
+    log_safe(
+        user_id=user.get("id"),
+        action="run_keboola_semantic_layer_refresh",
+        resource="job:keboola-semantic-layer-refresh",
+        params={
+            "run_id": run_id,
+            "status": result.get("status"),
+            "created_or_updated": result.get("created_or_updated"),
+            "pruned": result.get("pruned"),
+            "sources": len(result.get("sources") or []),
+        },
     )
     return {**result, "run_id": run_id, "started_at": started_at}
 

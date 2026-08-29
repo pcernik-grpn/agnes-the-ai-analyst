@@ -231,7 +231,7 @@ class SemanticModelsPgRepository:
     def detach(self, model_id: str, *, by: str, base_hash: str) -> Dict[str, Any]:
         """F3: flip a source-owned row to ``sync_mode='detached'`` in place
         (same id, same source/source_ref — provenance is preserved). PG-only
-        (A3 ratchet, migrations/versions/0077_semantic_models_detach.py)."""
+        (A3 ratchet, migrations/versions/0090_semantic_models_detach.py)."""
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text(

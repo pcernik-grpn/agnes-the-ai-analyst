@@ -70,7 +70,7 @@ async function killSession(id) {
 // browsers on upgrade, so we mint a short-TTL one-shot ticket over the
 // normal admin auth flow first and pass it as a query parameter.
 async function tailSession(id) {
-  const tr = await fetch(`/admin/chat/${id}/tail-ticket`, { credentials: "same-origin" });
+  const tr = await fetch(`/admin/chat/${id}/tail-ticket`, { method: "POST", credentials: "same-origin" });
   if (!tr.ok) { alert("tail-ticket failed: " + tr.status); return; }
   const { ws_url } = await tr.json();
   const proto = location.protocol === "https:" ? "wss:" : "ws:";

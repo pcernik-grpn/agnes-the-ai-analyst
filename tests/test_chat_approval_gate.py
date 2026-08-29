@@ -593,3 +593,275 @@ def test_request_ids_are_unique_across_gate_instances(tmp_path):
     asyncio.run(drive())
     assert len(seen) == 6, seen
     assert len(set(seen)) == 6, f"request ids collided across gate instances: {seen}"
+
+
+# ── MCP tools: approval routed by the tool's own annotations ──────────────
+#
+# The gate used to match `Bash` only, so every mutating MCP tool
+# (`data_app_delete_draft`, `data_app_deploy`, `pull`, …) executed without
+# the confirmation round-trip its own contract asks for. Routing is by
+# `readOnlyHint`, never by tool name: a tool nobody has classified counts as
+# mutating (security finding llm-agency-mcp-approval-2).
+
+
+def _mcp(tool: str, tool_input: dict | None = None) -> dict:
+    return {"tool_name": tool, "tool_input": tool_input or {}}
+
+
+def _await_request(emitted: list) -> dict:
+    return [f for f in emitted if f["type"] == "approval_request"][0]
+
+
+def test_read_only_mcp_tool_runs_without_approval(tmp_path):
+    """A `readOnlyHint=True` tool must not cost the user a click."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        for tool in ("mcp__agnes__catalog", "mcp__agnes__query", "mcp__agnes__schema"):
+            assert await gate.check(_mcp(tool, {"sql": "SELECT 1"}), None, {}) == {}
+        assert emitted == []
+
+    asyncio.run(_run())
+
+
+def test_mutating_mcp_tool_requires_approval(tmp_path):
+    """A non-read-only MCP tool takes the same round-trip as an ask-flagged
+    Bash command — emit, suspend, resolve on the user's decision."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(
+            gate.check(_mcp("mcp__agnes__data_app_delete_draft", {"slug": "demo"}), None, {})
+        )
+        for _ in range(100):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        req = _await_request(emitted)
+        assert req["tool"] == "mcp__agnes__data_app_delete_draft"
+        # The card renders `command` and nothing else names the call, so it
+        # must carry both the tool and the arguments the user is judging.
+        assert "data_app_delete_draft" in req["command"] and "demo" in req["command"]
+        assert "data_app_delete_draft" in req["reason"]
+        assert gate.awaiting_approval() is True
+        gate.resolve(req["request_id"], "allow")
+        assert _decision_of(await task) == "allow"
+
+    asyncio.run(_run())
+
+
+def test_user_deny_denies_a_mutating_mcp_tool(tmp_path):
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "d"}), None, {}))
+        for _ in range(100):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        gate.resolve(_await_request(emitted)["request_id"], "deny")
+        out = await task
+        assert _decision_of(out) == "deny"
+        assert "denied" in out["hookSpecificOutput"]["permissionDecisionReason"].lower()
+
+    asyncio.run(_run())
+
+
+def test_unknown_mcp_tool_is_treated_as_mutating(tmp_path):
+    """No annotation found = mutating. A tool added after this runner was
+    built (or a per-caller passthrough tool, which carries no annotation at
+    all) must fail closed, never silently pass."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(gate.check(_mcp("mcp__agnes__tool_from_the_future"), None, {}))
+        for _ in range(100):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        assert _await_request(emitted)["tool"] == "mcp__agnes__tool_from_the_future"
+        gate.resolve(_await_request(emitted)["request_id"], "deny")
+        assert _decision_of(await task) == "deny"
+
+    asyncio.run(_run())
+
+
+def test_a_foreign_mcp_server_cannot_borrow_an_agnes_read_only_name(tmp_path):
+    """The allowlist is keyed on (server, tool), not the bare tool name.
+
+    A workspace-configured MCP server is outside Agnes' control — and the
+    agent can write the workspace's own `.mcp.json` — so a server that names
+    its write tool `catalog` must not inherit Agnes' read-only verdict.
+    """
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(gate.check(_mcp("mcp__notagnes__catalog"), None, {}))
+        for _ in range(100):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        req = _await_request(emitted)
+        assert req["tool"] == "mcp__notagnes__catalog"
+        # …and the card says which server, so `catalog` cannot read as Agnes'.
+        assert "notagnes.catalog" in req["command"]
+        gate.resolve(_await_request(emitted)["request_id"], "deny")
+        assert _decision_of(await task) == "deny"
+
+    asyncio.run(_run())
+
+
+def test_disabled_gate_denies_a_mutating_mcp_tool_without_prompting(tmp_path):
+    """The SDK-fallback path (HookMatcher without `timeout`) disables the
+    gate. A disabled gate cannot block safely, so mutating MCP tools are
+    DENIED — never silently allowed — exactly as ask-flagged Bash is."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), enabled=False)
+        gate.disable_unsupported("SDK too old")
+        out = await gate.check(_mcp("mcp__agnes__data_app_delete_draft", {"slug": "d"}), None, {})
+        assert _decision_of(out) == "deny"
+        assert "SDK too old" in out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert emitted == []
+        # …and a read-only tool still runs: a disabled gate is not a kill
+        # switch for reads.
+        assert await gate.check(_mcp("mcp__agnes__catalog"), None, {}) == {}
+
+    asyncio.run(_run())
+
+
+def test_allow_session_for_an_mcp_tool_does_not_leak_across_arguments(tmp_path):
+    """`allow_session` keys on tool + arguments, mirroring the Bash path's
+    exact-command key: approving one delete must not pre-approve the next
+    one with a different slug."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "a"}), None, {}))
+        for _ in range(100):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        gate.resolve(_await_request(emitted)["request_id"], "allow_session")
+        assert _decision_of(await task) == "allow"
+        # identical call → no second card
+        out2 = await gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "a"}), None, {})
+        assert _decision_of(out2) == "allow"
+        assert len([f for f in emitted if f["type"] == "approval_request"]) == 1
+        # different arguments → a fresh card
+        task3 = asyncio.create_task(gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "b"}), None, {}))
+        for _ in range(100):
+            if len([f for f in emitted if f["type"] == "approval_request"]) == 2:
+                break
+            await asyncio.sleep(0.01)
+        reqs = [f for f in emitted if f["type"] == "approval_request"]
+        assert len(reqs) == 2
+        gate.resolve(reqs[1]["request_id"], "deny")
+        assert _decision_of(await task3) == "deny"
+
+    asyncio.run(_run())
+
+
+def test_non_bash_builtin_tools_stay_out_of_the_file_hook(tmp_path):
+    """Widening the matcher must not put a per-call subprocess in front of
+    every Read/Grep: the file hook allows every non-Bash tool anyway."""
+
+    async def _run():
+        hook = tmp_path / "always_ask.py"
+        hook.write_text(
+            "import json\nprint(json.dumps({'permissionDecision': 'ask', 'permissionDecisionReason': 'r'}))\n"
+        )
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, hook, timeout_seconds=5)
+        assert await gate.check({"tool_name": "Read", "tool_input": {"file_path": "/x"}}, None, {}) == {}
+        assert emitted == []
+
+    asyncio.run(_run())
+
+
+def test_read_only_allowlist_matches_the_stdio_mcp_server():
+    """The allowlist is a copy of `readOnlyHint=True` in the stdio MCP
+    server; drift in either direction is a bug.
+
+    A new read-only tool missing here only costs a needless approval card,
+    but a tool that FLIPS to mutating and stays listed would keep passing
+    unasked — so pin equality, not containment.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+
+    import app.chat.runner as runner
+    from cli.mcp import server as stdio_server
+
+    tools = asyncio.run(stdio_server.mcp.list_tools())
+    read_only = {t.name for t in tools if getattr(t.annotations, "readOnlyHint", None) is True}
+    assert read_only == set(runner._READ_ONLY_AGNES_MCP_TOOLS), (
+        "app/chat/runner.py::_READ_ONLY_AGNES_MCP_TOOLS drifted from cli/mcp/server.py's "
+        "readOnlyHint annotations — the sandbox's approval gate reads the copy"
+    )
+
+
+def test_the_allowlist_is_keyed_on_the_server_name_the_runner_registers():
+    """`mcp__<server>__<tool>` — the `<server>` half must be the name
+    `_agnes_mcp_servers()` registers, or every Agnes tool reads as foreign
+    and the gate asks for approval on every catalog call."""
+    import app.chat.runner as runner
+
+    monkey = os.environ.get("AGNES_SERVER")
+    os.environ["AGNES_SERVER"] = "http://127.0.0.1:1/agnes-api"
+    try:
+        servers = runner._agnes_mcp_servers()
+    finally:
+        if monkey is None:
+            os.environ.pop("AGNES_SERVER", None)
+        else:
+            os.environ["AGNES_SERVER"] = monkey
+    assert list(servers) == [runner._AGNES_MCP_SERVER_NAME]
+
+
+def test_pretool_matchers_cover_both_bash_and_mcp_tools():
+    """The gate is wired to see MCP tool calls at all.
+
+    Two disjoint matchers on purpose: `Bash` stays the exact, proven
+    matcher, and MCP tools ride their own. One combined alternation would
+    put Bash's coverage at the mercy of the MCP pattern.
+    """
+    import app.chat.runner as runner
+    from claude_agent_sdk import HookMatcher
+
+    gate = runner.ApprovalGate.__new__(runner.ApprovalGate)
+    gate.timeout_seconds = 300.0
+    matchers = runner._build_pretool_matchers(gate, HookMatcher)
+    patterns = [m.matcher for m in matchers]
+    assert "Bash" in patterns
+    assert any(p and p.startswith("mcp__") for p in patterns), patterns
+    for m in matchers:
+        assert m.hooks, "a matcher with no callback gates nothing"
+        assert m.timeout and m.timeout > gate.timeout_seconds
+
+
+def test_mcp_matcher_is_still_registered_when_hookmatcher_takes_no_timeout():
+    """The fail-closed fallback covers MCP too: the gate is disabled, but
+    both matchers stay registered so a mutating MCP tool is DENIED rather
+    than run unasked."""
+    import app.chat.runner as runner
+
+    class _NoTimeoutHookMatcher:
+        def __init__(self, matcher=None, hooks=None):
+            self.matcher = matcher
+            self.hooks = hooks or []
+            self.timeout = None
+
+    gate = runner.ApprovalGate.__new__(runner.ApprovalGate)
+    gate.timeout_seconds = 300.0
+    gate._enabled = True
+    gate._disabled_reason = ""
+    matchers = runner._build_pretool_matchers(gate, _NoTimeoutHookMatcher)
+    assert gate._enabled is False, "the gate must fail closed when it cannot block safely"
+    patterns = [m.matcher for m in matchers]
+    assert "Bash" in patterns and any(p and p.startswith("mcp__") for p in patterns), patterns

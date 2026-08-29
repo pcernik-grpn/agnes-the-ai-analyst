@@ -44,6 +44,7 @@ _AUTH_DETAIL_BY_REASON = {
     "agent_pat_wrong_surface": "Agent token not valid on this surface",
     "agent_pat_agent_deleted": "Agent deleted",
     "pat_parent_revoked": "Token revoked",
+    "session_revoked": "Session revoked — please sign in again",
 }
 
 # X-StorageApi-Token header rejections → 401 detail. Reasons come from
@@ -222,6 +223,17 @@ def _stash_user(request: Optional[Request], user: dict) -> dict:
     and the 500 handler) so they can identify the actor without re-running
     the auth dependency. Tolerant of ``None`` requests (background paths
     that call this helper from non-HTTP contexts).
+
+    Also the single funnel every dict-shaped authenticated user passes
+    through on its way out of ``get_current_user`` (local-dev, the scheduler
+    shared secret, the X-StorageApi-Token header path, and the normal
+    Authorization/cookie token path all return through here) — so this is
+    "the shared get_current_user return path" the F0 audit-context contract
+    means by "stamp audit identity after user resolution, one place, every
+    authenticated request" (a restricted principal — SessionPrincipal /
+    AgentPrincipal — returns directly from ``get_current_user`` without
+    going through here, since it's a frozen dataclass this function's
+    ``request.state.user = user`` assignment would reject anyway).
     """
     # Tell the elevation gate whose pause this request carries: the
     # middleware stamps the flag before authentication and cannot know the
@@ -231,6 +243,19 @@ def _stash_user(request: Optional[Request], user: dict) -> dict:
         from app.auth.elevation import set_caller_for_request
 
         set_caller_for_request(str(user.get("id")) if user else None)
+    except Exception:
+        pass
+    try:
+        from src.audit_context import auto_client_kind, set_audit_identity, set_client_kind
+        from src.audit_helpers import client_kind_from_user, identity_for_audit
+
+        set_audit_identity(*identity_for_audit(user))
+        # Never downgrade an already-stamped non-web kind (mcp/slack/
+        # telegram/...) — a surface-specific stamp made before auth ran
+        # (e.g. an MCP session's own context setup) must survive the
+        # generic web/cli/scheduler classification below.
+        if auto_client_kind() in (None, "web"):
+            set_client_kind(client_kind_from_user(user))
     except Exception:
         pass
     if request is not None:

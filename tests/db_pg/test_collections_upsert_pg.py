@@ -58,7 +58,7 @@ def test_new_file_with_stable_id_creates_row_and_mapping(pg_repos):
     from app.api.collections import _upsert_corpus_file
 
     sources_repo = pg_repos.corpus_file_sources_repo()
-    file_id, needs_processing = _upsert_corpus_file(
+    file_id, needs_processing, _ = _upsert_corpus_file(
         CORPUS_ID,
         path=None,
         stable_id="graph:abc123",
@@ -88,7 +88,7 @@ def test_resync_same_stable_id_unchanged_content_short_circuits(pg_repos):
     sources_repo = pg_repos.corpus_file_sources_repo()
     cf_repo = pg_repos.corpus_files_repo()
 
-    file_id, _ = _upsert_corpus_file(
+    file_id, _, _ = _upsert_corpus_file(
         CORPUS_ID,
         path=None,
         stable_id="graph:abc123",
@@ -103,7 +103,7 @@ def test_resync_same_stable_id_unchanged_content_short_circuits(pg_repos):
     )
     cf_repo.set_status(file_id, status="indexed", detail={"chunk_count": 5})
 
-    file_id2, needs_processing = _upsert_corpus_file(
+    file_id2, needs_processing, _ = _upsert_corpus_file(
         CORPUS_ID,
         path=None,
         stable_id="graph:abc123",
@@ -151,10 +151,10 @@ def test_resync_same_stable_id_unchanged_content_retries_a_failed_row(pg_repos):
             sources_repo=sources_repo,
         )
 
-    file_id, _ = _sync()
+    file_id, _, _ = _sync()
     for failed_status in ("rejected", "needs_review", "pending"):
         cf_repo.set_status(file_id, status=failed_status, detail={"reason": "ingest_error: boom"})
-        file_id2, needs_processing = _sync()
+        file_id2, needs_processing, _ = _sync()
         assert file_id2 == file_id, failed_status
         assert needs_processing is True, f"{failed_status} row must be retried by an unchanged re-sync"
         assert cf_repo.get(file_id)["processing_status"] == "pending", failed_status
@@ -171,7 +171,7 @@ def test_resync_same_stable_id_rename_only_updates_path(pg_repos):
     sources_repo = pg_repos.corpus_file_sources_repo()
     cf_repo = pg_repos.corpus_files_repo()
 
-    file_id, _ = _upsert_corpus_file(
+    file_id, _, _ = _upsert_corpus_file(
         CORPUS_ID,
         path="old/name.md",
         stable_id="graph:abc123",
@@ -186,7 +186,7 @@ def test_resync_same_stable_id_rename_only_updates_path(pg_repos):
     )
     cf_repo.set_status(file_id, status="indexed")
 
-    file_id2, needs_processing = _upsert_corpus_file(
+    file_id2, needs_processing, _ = _upsert_corpus_file(
         CORPUS_ID,
         path="new/name.md",
         stable_id="graph:abc123",
@@ -224,7 +224,7 @@ def test_extension_only_rename_cleans_up_the_old_blob(pg_repos, tmp_path):
     old_blob.write_text("same content")
     new_blob.write_text("same content")
 
-    file_id, _ = _upsert_corpus_file(
+    file_id, _, _ = _upsert_corpus_file(
         CORPUS_ID,
         path="site/page.htm",
         stable_id="graph:ext-rename",
@@ -243,7 +243,7 @@ def test_extension_only_rename_cleans_up_the_old_blob(pg_repos, tmp_path):
     # would make `needs_processing is False` below assert nothing.
     cf_repo.set_status(file_id, status="indexed", detail={"chunk_count": 1})
 
-    file_id2, needs_processing = _upsert_corpus_file(
+    file_id2, needs_processing, _ = _upsert_corpus_file(
         CORPUS_ID,
         path="site/page.html",
         stable_id="graph:ext-rename",
@@ -274,7 +274,7 @@ def test_resync_same_stable_id_content_changed_resets_and_purges(pg_repos):
     cf_repo = pg_repos.corpus_files_repo()
     chunks_repo = corpus_chunks_repo()
 
-    file_id, _ = _upsert_corpus_file(
+    file_id, _, _ = _upsert_corpus_file(
         CORPUS_ID,
         path=None,
         stable_id="graph:abc123",
@@ -290,7 +290,7 @@ def test_resync_same_stable_id_content_changed_resets_and_purges(pg_repos):
     cf_repo.set_status(file_id, status="indexed")
     chunks_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": file_id, "ordinal": 0, "text": "old chunk"}])
 
-    file_id2, needs_processing = _upsert_corpus_file(
+    file_id2, needs_processing, _ = _upsert_corpus_file(
         CORPUS_ID,
         path=None,
         stable_id="graph:abc123",
@@ -374,8 +374,8 @@ def test_content_changed_replace_purges_that_documents_claims(pg_repos_facts, pg
     sources_repo = pg_repos_facts.corpus_file_sources_repo()
     repo = FactsPgRepository(pg_engine)
 
-    def _upsert(sha: str) -> str:
-        fid, _ = _upsert_corpus_file(
+    def _upsert(sha: str) -> tuple[str, int]:
+        fid, _, claims_purged = _upsert_corpus_file(
             CORPUS_ID,
             path="docs/a.md",
             stable_id="graph:claims1",
@@ -388,9 +388,10 @@ def test_content_changed_replace_purges_that_documents_claims(pg_repos_facts, pg
             storage_path=f"/blobs/{sha}.md",
             sources_repo=sources_repo,
         )
-        return fid
+        return fid, claims_purged
 
-    file_id = _upsert("v1-sha")
+    file_id, first_purged = _upsert("v1-sha")
+    assert first_purged == 0, "a brand-new row has nothing to purge"
     doomed = _seed_claim_on(
         repo, file_id=file_id, natural_key="engagement:old", sha="v1-sha", quote="The old sentence."
     )
@@ -416,8 +417,9 @@ def test_content_changed_replace_purges_that_documents_claims(pg_repos_facts, pg
 
     assert _claim_count(pg_engine, file_id) == 1
 
-    file_id2 = _upsert("v2-sha")
+    file_id2, second_purged = _upsert("v2-sha")
     assert file_id2 == file_id, "the row id is still preserved — that is the point of §6"
+    assert second_purged == 1, "the upload response's purge signal must count the claim just dropped"
 
     assert _claim_count(pg_engine, file_id) == 0, "claims quoting replaced bytes must not survive the replace"
     assert not _fact_exists(pg_engine, doomed), "a subject left with zero claims must be swept"
@@ -436,8 +438,8 @@ def test_unchanged_content_resync_keeps_claims(pg_repos_facts, pg_engine):
     sources_repo = pg_repos_facts.corpus_file_sources_repo()
     repo = FactsPgRepository(pg_engine)
 
-    def _upsert(filename: str, path: str) -> str:
-        fid, _ = _upsert_corpus_file(
+    def _upsert(filename: str, path: str) -> tuple[str, int]:
+        fid, _, claims_purged = _upsert_corpus_file(
             CORPUS_ID,
             path=path,
             stable_id="graph:keepclaims",
@@ -450,12 +452,14 @@ def test_unchanged_content_resync_keeps_claims(pg_repos_facts, pg_engine):
             storage_path="/blobs/stable-sha.md",
             sources_repo=sources_repo,
         )
-        return fid
+        return fid, claims_purged
 
-    file_id = _upsert("a.md", "docs/a.md")
+    file_id, _ = _upsert("a.md", "docs/a.md")
     fact_id = _seed_claim_on(repo, file_id=file_id, natural_key="engagement:kept", sha="stable-sha", quote="Unchanged.")
 
-    assert _upsert("renamed.md", "docs/renamed.md") == file_id
+    renamed_id, renamed_purged = _upsert("renamed.md", "docs/renamed.md")
+    assert renamed_id == file_id
+    assert renamed_purged == 0, "a rename purges nothing — the purge signal must not false-positive"
     assert _claim_count(pg_engine, file_id) == 1, "a rename must not destroy claims"
     assert _fact_exists(pg_engine, fact_id)
 
@@ -470,7 +474,7 @@ def test_manual_path_reupload_of_crawler_anchored_file_preserves_id(pg_repos):
     sources_repo = pg_repos.corpus_file_sources_repo()
     cf_repo = pg_repos.corpus_files_repo()
 
-    file_id, _ = _upsert_corpus_file(
+    file_id, _, _ = _upsert_corpus_file(
         CORPUS_ID,
         path="shared/doc.md",
         stable_id="graph:abc123",
@@ -485,7 +489,7 @@ def test_manual_path_reupload_of_crawler_anchored_file_preserves_id(pg_repos):
     )
 
     # Manual re-upload: no stable_id this time, but the SAME path.
-    file_id2, needs_processing = _upsert_corpus_file(
+    file_id2, needs_processing, _ = _upsert_corpus_file(
         CORPUS_ID,
         path="shared/doc.md",
         stable_id=None,
@@ -516,7 +520,7 @@ def test_unreferenced_old_blob_is_cleaned_up_after_content_change(pg_repos, tmp_
     new_blob = tmp_path / "new.md"
     new_blob.write_text("new content")
 
-    file_id, _ = _upsert_corpus_file(
+    file_id, _, _ = _upsert_corpus_file(
         CORPUS_ID,
         path=None,
         stable_id="graph:blob-test",
@@ -768,3 +772,59 @@ def test_content_changed_reupload_on_api_plane_uses_one_ordered_job(pg_engine, m
     listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
     row = next(r for r in listing.json()["files"] if r["file_id"] == file_id)
     assert row["processing_status"] == "pending", "ingest must be left to the worker plane's ordered job"
+
+
+def test_upload_response_signals_a_content_change_purge(pg_engine, monkeypatch, tmp_path):
+    """Coupled bug (spec §8, live-verified): the producer's ingest idempotence
+    has no signal that an upload purged a file's claims, so it reports
+    "already shipped" and the claims stay missing until a forced run. The
+    upload response must say so — additive, always present, 0 when nothing
+    was purged."""
+    import io
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"version one"), "text/markdown")},
+        data={"paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    file_id = first.json()[0]["file_id"]
+    assert first.json()[0]["claims_purged"] == 0, "a brand-new file has nothing to purge"
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    repo = FactsPgRepository(pg_engine)
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:purge-e2e")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256="whatever",
+        quote="Version one text.",
+    )
+
+    # A second, unrelated file — brand new, nothing to purge either.
+    unrelated = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("b.md", io.BytesIO(b"unrelated"), "text/markdown")},
+        data={"paths": "docs/b.md"},
+        headers=auth,
+    )
+    assert unrelated.status_code == 201, unrelated.text
+    assert unrelated.json()[0]["claims_purged"] == 0
+
+    # Content-changed re-upload at the SAME path purges the claim just seeded.
+    replaced = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"version TWO, different bytes"), "text/markdown")},
+        data={"paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert replaced.status_code == 201, replaced.text
+    assert replaced.json()[0]["file_id"] == file_id, "the row id is preserved — §6"
+    assert replaced.json()[0]["claims_purged"] == 1

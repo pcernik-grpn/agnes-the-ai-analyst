@@ -55,6 +55,7 @@ from app.auth.dependencies import get_current_user
 from app.services.journey import mark_journey
 from src.corpus_allowlist import classify
 from src.file_storage import delete_corpus_file, store_corpus_file
+from src.ingest.member_identity import is_reserved_member_stable_id
 from src.sql_ident import quote_ident
 from src.repositories import (
     corpus_chunks_repo,
@@ -699,11 +700,43 @@ def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
         return 0
 
 
-def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> None:
-    """Purge a matched row's zip-bundle children (fully — they are
-    regenerated on the next ingest) plus the row's OWN chunks, derived
-    tables and fact claims, ahead of an in-place content update that reuses
-    ``row``'s id.
+def _purge_children_and_content(
+    collection_id: str, row: dict, *, new_filename: str, defer_row_purge: bool = False
+) -> int:
+    """Purge the row's OWN chunks, derived tables and fact claims ahead of an
+    in-place content update that reuses ``row``'s id — plus, for a row that
+    is NOT staying a bundle across this update, its (non-existent in
+    practice for a plain document, but walked defensively) children.
+
+    A row that IS a bundle both BEFORE (``row``'s OLD filename) and AFTER
+    (``new_filename``, the incoming upload's own name) this update is the
+    deliberate exception: its zip-bundle children are left ALONE here.
+    Reconciling them is ``ingest_bundle``'s own job — it matches each member
+    to its existing row by ``(filename, sha256)`` and purges only the ones
+    that actually changed or disappeared (``src/ingest/bundle.py``, "Prune
+    children from a prior run"), which is what lets a routine re-upload of
+    an N-member zip with one changed member keep the other N-1 members'
+    rows, anchors and claims intact. Purging every child here unconditionally
+    was the previous behavior, and it defeated that: the archive's OWN
+    content-changed branch always fires on ANY member change (the zip's
+    bytes differ), so every re-sync re-minted every member's id and
+    cascaded every member's claims, not just the changed one's. The
+    needs_processing reschedule below still runs ``ingest_bundle`` right
+    after, so the members ARE reconciled — just narrowly, not by nuking the
+    lot first.
+
+    Deciding this from ``row``'s OLD filename ALONE (dropped after review) was
+    its own bug: a zip re-uploaded, same identity, as a NON-zip (e.g.
+    ``report.zip`` -> ``report.pdf``) skipped the children-walk (old name
+    said bundle) while ``runner.ingest_file`` dispatches on the row's NEW
+    ``file_type``/filename after ``update_in_place`` — so it never routes to
+    ``ingest_bundle`` either (new name says pdf). The old members' rows,
+    chunks, claims and anchors then survived FOREVER, attached to a row that
+    is now a PDF — a visibility bug (a deleted document's content still
+    readable), not untidiness. Requiring BOTH sides to still classify as
+    ``bundle`` closes that: a type change away from ``bundle`` always takes
+    the full children-purge path below, exactly like today's regular
+    (non-bundle) row does.
 
     ``row`` itself, and its own blob, are left for the caller
     (``_upsert_corpus_file``): ``row`` still carries its OLD ``storage_path``
@@ -714,20 +747,29 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
 
     ``defer_row_purge`` withholds ONLY the row's own derived-table purge, for
     a caller that is going to re-ingest this same row and must therefore run
-    purge-then-ingest as one ordered unit (see ``upload_files``). The
-    bundle-children purges above are unaffected: those child rows are
+    purge-then-ingest as one ordered unit (see ``upload_files``). For a row
+    with (real or defensively-walked) children, those child rows are still
     hard-deleted here, so the next ingest mints fresh child ids and fresh
     ``table_id``s — there is nothing for a later purge to collide with.
+
+    Returns the number of fact claims purged for ``row`` itself (0 when the
+    ``facts`` flag is off, which is the default) — the caller threads this
+    into the upload response's purge signal (spec §8 coupled bug: a
+    producer's ingest idempotence has no way to tell a purge happened
+    without it).
     """
     cf_repo = corpus_files_repo()
     chunks_repo = corpus_chunks_repo()
 
+    stays_bundle = classify(row.get("filename") or "") == "bundle" and classify(new_filename) == "bundle"
+
     children: list[dict] = []
-    stack = [row["id"]]
-    while stack:
-        for child in cf_repo.list_children(stack.pop()):
-            children.append(child)
-            stack.append(child["id"])
+    if not stays_bundle:
+        stack = [row["id"]]
+        while stack:
+            for child in cf_repo.list_children(stack.pop()):
+                children.append(child)
+                stack.append(child["id"])
 
     child_blob_paths = {c.get("storage_path") for c in children if c.get("storage_path")}
     for child in children:
@@ -759,6 +801,7 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
             row["id"],
             purged,
         )
+    return purged
 
 
 def _ingest_incomplete(row: dict) -> bool:
@@ -799,7 +842,7 @@ def _upsert_corpus_file(
     storage_path: str | None,
     sources_repo: Any,
     defer_row_purge: bool = False,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int]:
     """Match-then-insert-or-update-in-place for one uploaded file.
 
     Match order (fact-graph-over-Collections design §6, "Prerequisite change
@@ -826,9 +869,14 @@ def _upsert_corpus_file(
     DuckDB-backed instance fails clean with a 501 before any file is
     touched, never partway through a batch).
 
-    Returns ``(file_id, needs_processing)`` — ``needs_processing`` is False
-    only for the unchanged-content short-circuit on an already-``indexed``
-    row, so the caller knows whether to (re)schedule ingestion.
+    Returns ``(file_id, needs_processing, claims_purged)`` — ``needs_processing``
+    is False only for the unchanged-content short-circuit on an already-
+    ``indexed`` row, so the caller knows whether to (re)schedule ingestion.
+    ``claims_purged`` is the count `_purge_children_and_content` dropped for
+    THIS row on a content change (0 otherwise, incl. when the ``facts`` flag
+    is off) — the caller surfaces it in the upload response so a producer's
+    ingest idempotence knows a re-ingest is genuinely needed, not merely
+    "already shipped" (spec §8 coupled bug).
     """
     cf_repo = corpus_files_repo()
 
@@ -840,12 +888,15 @@ def _upsert_corpus_file(
     if existing is None and path:
         existing = cf_repo.get_by_path(collection_id, path)
 
+    claims_purged = 0
     if existing is not None:
         file_id = existing["id"]
         content_changed = existing.get("sha256") != sha256
         old_blob = existing.get("storage_path")
         if content_changed:
-            _purge_children_and_content(collection_id, existing, defer_row_purge=defer_row_purge)
+            claims_purged = _purge_children_and_content(
+                collection_id, existing, new_filename=filename, defer_row_purge=defer_row_purge
+            )
         cf_repo.update_in_place(
             file_id,
             filename=filename,
@@ -892,7 +943,7 @@ def _upsert_corpus_file(
             source_sha256=source_sha256_meta,
         )
 
-    return file_id, needs_processing
+    return file_id, needs_processing, claims_purged
 
 
 def _nth_field(values: Optional[List[str]], idx: int) -> str | None:
@@ -1054,8 +1105,16 @@ async def upload_files(
     compatibility with the doc-sync wire format but is not yet persisted
     here — it belongs to a claim, written by the (future) fact-ingest API.
 
-    Returns a list of ``{file_id, filename, path, processing_status, …}`` for
-    every uploaded file (in upload order).
+    Returns a list of ``{file_id, filename, path, processing_status, …,
+    claims_purged}`` for every uploaded file (in upload order).
+    ``claims_purged`` (spec §8 coupled bug) is the count of fact-graph claims
+    dropped for THIS file because its content changed in place (§6) — 0 for
+    a brand-new file, an unchanged-content resync/rename, or when the
+    ``facts`` feature flag is off. A producer that ingested claims for this
+    file should treat a non-zero count as "re-ingest is needed", not
+    "already shipped" — the purge and the producer's own idempotence
+    otherwise disagree silently (live-verified: a rename recomputing a
+    provenance header purged claims that were never re-sent).
     """
     # Verify the collection exists (grant check already done by the dependency).
     corpus = file_corpora_repo().get(collection_id)
@@ -1103,6 +1162,27 @@ async def upload_files(
         non_blank_ids = [s.strip() for s in source_stable_ids if s and s.strip()]
         if len(non_blank_ids) != len(set(non_blank_ids)):
             raise HTTPException(status_code=400, detail="duplicate_source_stable_id_in_batch")
+
+        # RESERVED SHAPE (security, not a format quirk): `cf_<hex>!<member
+        # path>` is the shape ONLY `src.ingest.bundle._member_stable_id`
+        # may mint. A caller-supplied `source_stable_id` on this shape would
+        # resolve through the exact same stable-id-first match `_upsert_
+        # corpus_file` uses for a real member (§6) — an unrelated file
+        # re-uploaded under a member's own stable_id would silently replace
+        # that member's content IN PLACE, bypassing `ingest_bundle` entirely,
+        # while the archive's own children list and zip bytes on disk stay
+        # unaware. The shape is visible to anyone with mere collection READ
+        # access (`_file_out` returns both `corpus_files.id` and `filename`
+        # for every listed row), so this is reachable by any caller who can
+        # already see the archive plus WRITE to this endpoint — refused up
+        # front, before any file is stored, same style as the duplicate
+        # check above.
+        reserved = sorted({s for s in non_blank_ids if is_reserved_member_stable_id(s)})
+        if reserved:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "reserved_source_stable_id", "source_stable_ids": reserved},
+            )
 
     # Resolve the (PG-only) source-mapping repo ONCE, up front, when this
     # request actually uses it — so a DuckDB-backed instance fails clean
@@ -1175,7 +1255,7 @@ async def upload_files(
             # path/source anchor.
             effective_path = path if storage_path is not None else None
             effective_stable_id = stable_id if storage_path is not None else None
-            file_id, _ = _upsert_corpus_file(
+            file_id, _, claims_purged = _upsert_corpus_file(
                 collection_id,
                 path=effective_path,
                 stable_id=effective_stable_id,
@@ -1194,7 +1274,7 @@ async def upload_files(
                 detail={"reason": "unsupported_type", "filename": fname},
             )
             row = cf_repo.get(file_id)
-            results.append(_file_out(row))
+            results.append({**_file_out(row), "claims_purged": claims_purged})
             any_rejected = True
 
         else:
@@ -1218,14 +1298,14 @@ async def upload_files(
                     detail={"reason": f"storage_error:{exc.detail}"},
                 )
                 row = cf_repo.get(file_id)
-                results.append(_file_out(row))
+                results.append({**_file_out(row), "claims_purged": 0})
                 any_rejected = True
                 continue
 
             # Match-then-insert-or-update-in-place. `needs_processing` is
             # False only for the unchanged-content short-circuit (rename/
             # move) — that row keeps whatever chunks/status it already had.
-            file_id, needs_processing = _upsert_corpus_file(
+            file_id, needs_processing, claims_purged = _upsert_corpus_file(
                 collection_id,
                 path=path,
                 stable_id=stable_id,
@@ -1240,7 +1320,7 @@ async def upload_files(
                 defer_row_purge=_defer_purge_to_ordered_job,
             )
             row = cf_repo.get(file_id)
-            results.append(_file_out(row))
+            results.append({**_file_out(row), "claims_purged": claims_purged})
             if needs_processing:
                 _to_ingest.append(file_id)
             logger.info(

@@ -182,6 +182,26 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="store_moderation",
+        config_keys=("features", "store_moderation_enabled"),
+        env_var="AGNES_STORE_MODERATION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The Moderation & Trust hub (/admin/store) and its nav + command-palette "
+            "entries. Off by default: its three zones each have a better door — "
+            "submission review is its own nav row (/admin/store/submissions), "
+            "marketplace curation is /admin/marketplaces, and entity verification "
+            "already has its own switch (store.verification_enabled), so the hub was "
+            "a landing page for links the column already carries. Hides UI only: "
+            "/api/admin/share-requests* and the store APIs keep serving, so an admin "
+            "can still decide a queued agent share by API while the page is hidden."
+        ),
+    ),
+    Switch(
         name="guardrails",
         config_keys=("guardrails", "enabled"),
         env_var="AGNES_GUARDRAILS_ENABLED",
@@ -262,6 +282,25 @@ SWITCHES: tuple[Switch, ...] = (
             "whose backing is absent, loudly, at the restart the save already requires. Pin "
             "it in infrastructure via the customer-instance module's per-VM `chat_provider` "
             "(AGNES_CHAT_PROVIDER) so a fresh data disk boots into the right engine."
+        ),
+    ),
+    Switch(
+        name="chat_broker_admin_reads",
+        config_keys=("chat", "broker_admin_reads"),
+        env_var="AGNES_CHAT_BROKER_ADMIN_READS",
+        kind="bool",
+        default=True,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Replay read-only (GET/HEAD) admin API routes through the chat secret broker "
+            "(`agnes admin list-users`/`list-tables`/… inside a chat sandbox). The replay "
+            "runs under the session user's own identity and the route's live `require_admin` "
+            "still decides — non-admin users and agent principals get 403 regardless. Admin "
+            "MUTATIONS are always refused from sandboxes, independent of this switch. Read "
+            "live per request by `app/api/broker.py` (no restart needed), unlike the other "
+            "chat.* switches that resolve through `load_chat_config` at boot."
         ),
     ),
     Switch(
@@ -518,6 +557,32 @@ SWITCHES: tuple[Switch, ...] = (
             "user of the stack regardless of allowed_roles (which narrows projects, not "
             "organizations) — reserve the wildcard for dedicated single-organization stacks "
             "and pin a concrete project_id on shared ones."
+        ),
+    ),
+    Switch(
+        name="microsoft_group_sync",
+        config_keys=("auth", "microsoft", "group_sync_enabled"),
+        env_var="AGNES_MICROSOFT_GROUP_SYNC_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="operations",
+        editable=True,
+        description=(
+            "Mirror the signed-in user's Entra ID group memberships (Microsoft Graph "
+            "GET /me/memberOf) into user_group_members (source='microsoft_sync') on every "
+            "Microsoft sign-in — the same mechanism auth.keboola.* uses for Keboola, and "
+            "google_sync uses for Google Workspace. Off by default: turning it on for the "
+            "first time also widens the OAuth consent scope requested at "
+            "/auth/microsoft/login to include the delegated Graph permission "
+            "GroupMember.Read.All, which needs its own admin consent grant in the Entra "
+            "app registration (see docs/auth-microsoft-oauth.md) — the scope change only "
+            "takes effect after a restart, so flip this AND grant consent AND restart "
+            "before relying on it; the sync gate itself (whether apply_user_groups makes "
+            "the Graph call at all) is read live, so a stale token scope degrades to a "
+            "logged, fail-soft no-op rather than a login failure. AGNES_MICROSOFT_GROUP_PREFIX "
+            "(env-only, no instance.yaml key — mirrors AGNES_GOOGLE_GROUP_PREFIX) narrows "
+            "which fetched groups are mirrored/allowed to sign in."
         ),
     ),
     Switch(

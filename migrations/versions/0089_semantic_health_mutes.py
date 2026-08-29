@@ -15,8 +15,8 @@ verbatim, renamed to the repo's sequential revision-id convention.
 ``downgrade()`` is the true inverse — the table is new, so dropping it restores
 the previous schema exactly.
 
-Revision ID: 0075_semantic_health_mutes
-Revises: 0074_semantic_feedback
+Revision ID: 0089_semantic_health_mutes
+Revises: 0088_semantic_feedback
 Create Date: 2026-08-26
 """
 
@@ -27,8 +27,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0075_semantic_health_mutes"
-down_revision: Union[str, None] = "0074_semantic_feedback"
+revision: str = "0089_semantic_health_mutes"
+down_revision: Union[str, None] = "0088_semantic_feedback"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

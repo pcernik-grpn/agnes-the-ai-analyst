@@ -70,6 +70,7 @@ from app.instance_config import (
     get_guardrails_review_model,
 )
 from app.utils import get_store_dir
+from src.audit_helpers import log_safe
 from src.db import get_system_db
 from src.store_categories import STORE_CATEGORIES, normalize_category
 from src.store_guardrails import InlineResult, run_inline_checks, run_llm_review
@@ -3837,6 +3838,49 @@ def _notify_author(entity: dict, payload: dict) -> None:
         logger.warning("verification notification dropped for entity %s", entity.get("id"))
 
 
+def _notify_submitter(sub: dict, *, decision: str, note: Optional[str] = None) -> None:
+    """Tell a submitter their flea-market submission reached a terminal
+    decision (approved / overridden / blocked / deleted).
+
+    Only called for decisions the submitter otherwise has no way to learn
+    about — the synchronous "approved" path inside the upload/edit request
+    handlers is deliberately NOT wired here, since that submitter already
+    holds the API response. This covers the async LLM verdict and admin
+    override/delete actions, which land after the submitter's request has
+    already returned.
+
+    Best-effort, same as ``_notify_author`` above: a dropped notification
+    must never fail the admin action or background review task that
+    reached the decision, so every failure is caught and logged, never
+    raised.
+    """
+    submitter_id = sub.get("submitter_id")
+    if not submitter_id:
+        return
+    try:
+        from app.notifications import publish_notification
+
+        publish_notification(
+            submitter_id,
+            {
+                "kind": "store_submission",
+                "submission_id": sub.get("id"),
+                "entity_id": sub.get("entity_id"),
+                "name": sub.get("name"),
+                "type": sub.get("type"),
+                "version": sub.get("version"),
+                "decision": decision,
+                "note": note,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "store submission notification dropped for submitter %s (submission %s)",
+            submitter_id,
+            sub.get("id"),
+        )
+
+
 @router.put("/entities/{entity_id}/publisher", response_model=StoreEntityResponse)
 async def set_entity_publisher(
     entity_id: str,
@@ -4567,6 +4611,12 @@ async def export_bundle(
         skip += page
 
     payload = _build_bundle_zip(conn, items)
+    log_safe(
+        user_id=user["id"],
+        action="store.bundle_download",
+        resource="store:bundle.zip",
+        params={"count": len(items), "type": type, "owner": owner},
+    )
     return Response(
         content=payload,
         media_type="application/zip",

@@ -240,11 +240,73 @@ def logout():
     typer.echo("Logged out.")
 
 
+def _fetch_external_identity():
+    """The caller's linked external identity from the server, or ``None``
+    when it cannot be answered (offline, DuckDB-backed instance's typed 501,
+    older server). whoami stays useful offline, so this is best-effort."""
+    try:
+        from cli.client import api_get
+
+        resp = api_get("/api/me/external-identity", timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+def _whoami_sandbox() -> None:
+    """`agnes auth whoami` inside a chat sandbox (AGNES_SESSION_ID set, no token).
+
+    The sandbox deliberately holds no credential — the loopback relay attaches
+    a broker ticket per request and the server replays the call under the
+    session user's identity (see app/chat/relay.py + app/api/broker.py). So
+    "no local token" is the HEALTHY state here, and the old "Not logged in"
+    answer misled the in-sandbox agent into thinking auth was broken. Verify
+    the brokered identity with a live self-service call instead.
+    """
+    import os
+
+    from cli.client import api_get
+
+    email = os.environ.get("AGNES_USER_EMAIL", "unknown")
+    try:
+        resp = api_get("/api/me/effective-access")
+    except Exception as exc:
+        typer.echo(f"Email: {email} (from sandbox environment, unverified)")
+        typer.echo(f"Server: {get_server_url()}")
+        typer.echo("Auth: brokered session identity (chat sandbox) — no local token by design")
+        typer.echo(f"Warning: could not verify with the server: {exc}", err=True)
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        typer.echo(f"Email: {email} (from sandbox environment, unverified)")
+        typer.echo(f"Server: {get_server_url()}")
+        typer.echo("Auth: brokered session identity (chat sandbox) — no local token by design")
+        typer.echo(f"Warning: server verification returned HTTP {resp.status_code}", err=True)
+        raise typer.Exit(1)
+    payload = resp.json()
+    # Still the environment's value: /api/me/effective-access answers is_admin
+    # + grants, not an identity, so nothing here confirmed the ADDRESS. Say so
+    # — this command exists because the sandbox was misinforming the agent
+    # about its own identity, and an unqualified line would be the same fault
+    # one level down.
+    typer.echo(f"Email: {email} (from sandbox environment)")
+    typer.echo(f"Server: {get_server_url()}")
+    typer.echo("Auth: brokered session identity (chat sandbox) — per-request credential, no local token")
+    if payload.get("is_admin"):
+        typer.echo("Admin: yes — read-only admin commands work here; admin mutations need the /admin web UI")
+    else:
+        typer.echo("Admin: no")
+
+
 @auth_app.command()
-def whoami():
+def whoami(as_json: bool = typer.Option(False, "--json", help="Machine-readable output")):
     """Show current user info."""
+    import os
+
     token = get_token()
     if not token:
+        if os.environ.get("AGNES_SESSION_ID"):
+            _whoami_sandbox()
+            return
         typer.echo("Not logged in. Run: agnes login")
         raise typer.Exit(1)
 
@@ -252,11 +314,33 @@ def whoami():
 
     try:
         payload = jwt.decode(token, options={"verify_signature": False})
-        typer.echo(f"Email: {payload.get('email', 'unknown')}")
-        typer.echo(f"Server: {get_server_url()}")
         from cli.token_status import format_status_line
 
+        identity = _fetch_external_identity()
+        if as_json:
+            import json as _json
+
+            typer.echo(
+                _json.dumps(
+                    {
+                        "email": payload.get("email"),
+                        "server": get_server_url(),
+                        "token": format_status_line(token),
+                        "external_identity": identity,
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
+            return
+        typer.echo(f"Email: {payload.get('email', 'unknown')}")
+        typer.echo(f"Server: {get_server_url()}")
         typer.echo(f"Token: {format_status_line(token)}")
+        if identity is not None:
+            if identity.get("linked"):
+                typer.echo(f"Linked identity: {identity['subject']} (Entra tenant {identity['tenant_id']})")
+            else:
+                typer.echo("Linked identity: none")
     except Exception:
         typer.echo("Invalid token. Run: agnes login")
         raise typer.Exit(1)

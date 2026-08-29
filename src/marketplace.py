@@ -996,6 +996,12 @@ def seed_builtin_marketplace() -> None:
         curator_name="Agnes",
         is_builtin=True,
     )
+    # TCRD-219: a pre-guard "Sync now" click stamped a last_error nothing
+    # else can clear (the nightly sync skips built-in rows). The content is
+    # re-baked from the bundle right below, so any previous sync error is
+    # stale by construction — clear it here rather than leaving a permanent
+    # red "failed" in the admin table.
+    reg_repo.clear_sync_error(slug)
     logger.info("built-in marketplace: registry row seeded (slug=%s)", slug)
 
     # 2. Copy bundled content to the data directory so read_plugins() finds it.

@@ -1539,3 +1539,28 @@ def test_native_dialog_detector_fires_on_bare_and_window_prefixed_calls() -> Non
     assert _native_dialog_offenders("<script>if (!confirm('Sure?')) return;</script>") == ["confirm("]
     assert _native_dialog_offenders("<script>var n = prompt('Name?');</script>") == ["prompt("]
     assert _native_dialog_offenders("<script>window.confirm('Sure?');</script>") == ["window.confirm("]
+
+
+def test_dsec_clip_yields_to_open_dropdown_menu() -> None:
+    """`.dsec { overflow: hidden }` (section_card.css) clips descendants to
+    the card's rounded corners — including a ds-dropdown popover, which opens
+    BELOW its trigger (ds_dropdown.css) and, from a row near the bottom of
+    the card body, extends past the card's edge. Under a theme that renders
+    the custom menu (the native `<select>` popup it replaces is OS-drawn and
+    immune), the /admin/users/{id} "Add to group" picker rendered exactly one
+    visible option: every item past the card boundary was clipped away with
+    no scroll or affordance. The clip must yield while a menu is open."""
+    css = (STATIC / "css" / "section_card.css").read_text(encoding="utf-8")
+    dsec_block = re.search(r"(?m)^\.dsec \{[^}]*\}", css)
+    assert dsec_block, "section_card.css lost its `.dsec {` block — update this guard"
+    if "overflow: hidden" not in dsec_block.group(0):
+        return  # the clip itself is gone; there is nothing to yield for
+    assert re.search(
+        r"\.dsec:has\(\.ds-dropdown-menu:not\(\[hidden\]\)\)\s*\{[^}]*overflow:\s*visible",
+        css,
+    ), (
+        ".dsec clips descendants (overflow: hidden) but never yields for an open "
+        "ds-dropdown menu, so a popover near the card's bottom edge renders cut "
+        "off after its first item. Pair the clip with "
+        "`.dsec:has(.ds-dropdown-menu:not([hidden])) { overflow: visible; }`."
+    )
