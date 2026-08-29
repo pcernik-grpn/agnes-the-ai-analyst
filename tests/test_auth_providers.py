@@ -1581,6 +1581,90 @@ class TestSsoClaimEvaluation:
         assert error == "domain_not_allowed"
 
 
+class TestSsoForcedForEmail:
+    """Truth table for ``sso_forced_for_email`` — the single predicate every
+    password / magic-link door consults before opening (force-SSO hardening
+    on top of the 2026-08-28 design). Pure: ``_config_state`` is stubbed, no
+    DB. The PG-backed per-door tests live in
+    ``tests/db_pg/test_sso_forced_login_doors.py``."""
+
+    def _sso(self, monkeypatch, cfg, secret="s3cret"):
+        from app.auth.providers import sso
+
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        monkeypatch.setattr(sso, "_config_state", lambda: (cfg, secret))
+        return sso
+
+    def _cfg(self, **overrides):
+        cfg = {
+            "tenant_id": "11111111-2222-3333-4444-555555555555",
+            "client_id": "app-client-id",
+            "display_name": "Fabrikam",
+            "allowed_email_domains": ["fabrikam.com"],
+            "enabled": True,
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_forced_when_domain_in_enabled_allowlist(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("user@fabrikam.com") is True
+
+    def test_case_and_whitespace_variants_are_forced(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("User@FABRIKAM.COM") is True
+        assert sso.sso_forced_for_email("  user@fabrikam.com  ") is True
+
+    def test_domain_after_the_last_at_sign_decides(self, monkeypatch):
+        # evaluate_claims splits on the LAST "@" — this predicate must agree,
+        # or an address would be forced by one and refused by the other.
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email('"a@b"@fabrikam.com') is True
+
+    def test_other_domain_not_forced(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("user@partner.example") is False
+
+    def test_subdomain_does_not_match(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("user@sub.fabrikam.com") is False
+
+    def test_not_an_email_never_forced(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("fabrikam.com") is False
+        assert sso.sso_forced_for_email("") is False
+
+    def test_disabled_config_lifts_the_forcing(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg(enabled=False))
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_missing_config_never_forces(self, monkeypatch):
+        sso = self._sso(monkeypatch, None, secret=None)
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_missing_secret_never_forces(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg(), secret=None)
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_empty_allowlist_never_forces(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg(allowed_email_domains=[]))
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_sso_excluded_from_auth_providers_lifts_the_forcing(self, monkeypatch):
+        # An operator who 404s the sso door via auth.providers must not leave
+        # forced domains with NO door at all — forcing applies only while the
+        # sso door is actually offered (same predicate pair the admin API's
+        # last-login-door guard uses for "sso is a usable door").
+        sso = self._sso(monkeypatch, self._cfg())
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "password")
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_allowlist_naming_sso_keeps_the_forcing(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "sso,password")
+        assert sso.sso_forced_for_email("user@fabrikam.com") is True
+
+
 class TestSsoAvailabilityOnDuckDB:
     """The PG-only repos must read as unavailable — never raise — on a
     DuckDB-backed instance (the registry lockout rescue depends on it)."""
@@ -1595,6 +1679,9 @@ class TestSsoAvailabilityOnDuckDB:
         assert sso.is_configured() is False
         assert sso.startup_warnings() == []
         assert sso.login_offering() is None
+        # Every sso_forced_for_email call site is on the unauthenticated
+        # login path — on DuckDB it must answer False, never raise.
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
 
     def test_registry_probe_reports_not_raised(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
