@@ -52,6 +52,9 @@ from urllib.parse import urlsplit
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from src.ingest.member_identity import is_reserved_member_stable_id
+
+
 # Query-surface caps (spec §12) — the repository enforces these itself
 # (defense in depth) even though the REST layer's Pydantic models already
 # cap the request shape; a future CLI/MCP caller reaches the same floor.
@@ -120,6 +123,24 @@ class IngestUnresolvedDocIds(RuntimeError):
     def __init__(self, unresolved: List[str]) -> None:
         self.unresolved = unresolved
         super().__init__(f"unresolved doc_ids: {unresolved}")
+
+
+class IngestReservedStableId(RuntimeError):
+    """A ``documents[].stable_id`` matched the reserved bundle-member anchor
+    shape (``src.ingest.member_identity.is_reserved_member_stable_id`` —
+    ``cf_<hex>!<member path>``, minted only by ``ingest_bundle``). Refused
+    up front, before ANY document in this batch is resolved or upserted: the
+    identical stable-id-first resolve this method's own ``documents[]`` loop
+    performs would otherwise let a caller overwrite a real member's
+    ``corpus_file_sources`` row via ``sources_repo.upsert``'s
+    ``corpus_file_id``-keyed conflict target — hijacking the member's
+    ``source_doc_id`` citation key so a FUTURE claim resolves as if grounded
+    in a different, trusted document. Translated to a `400`, whole batch
+    rejected (no partial write), the offending stable_ids itemized."""
+
+    def __init__(self, stable_ids: List[str]) -> None:
+        self.stable_ids = stable_ids
+        super().__init__(f"reserved stable_ids in documents[]: {stable_ids}")
 
 
 def _decode_jsonb(value: Any) -> Any:
@@ -579,7 +600,7 @@ class FactsPgRepository:
         return bool(status["revealed"] or status["has_claim_visibility"])
 
     @staticmethod
-    def _projection_cte_sql(*, with_aliases: bool, is_admin: bool = True) -> str:
+    def _projection_cte_sql(*, with_aliases: bool, is_admin: bool) -> str:
         """The per-key latest-document_date-wins attrs projection (spec
         §12), factored out of ``search()`` so ``neighbors()`` can serve
         the SAME projected shape on its nodes/edges without duplicating
@@ -2077,6 +2098,23 @@ class FactsPgRepository:
                 {"reason": "too_many_documents", "count": len(documents), "cap": MAX_INGEST_DOCUMENTS}
             )
 
+        # RESERVED SHAPE (security, not a format quirk) — checked BEFORE any
+        # document in this batch is resolved or upserted, same reasoning as
+        # the upload endpoint's identical guard
+        # (`app.api.collections.upload_files`): a `stable_id` on the bundle-
+        # member anchor shape must never reach the `documents[]` resolve/
+        # upsert loop below, which would otherwise let it overwrite a real
+        # member's `corpus_file_sources` row (see `IngestReservedStableId`).
+        _reserved_stable_ids = sorted(
+            {
+                doc["stable_id"]
+                for doc in documents
+                if isinstance(doc.get("stable_id"), str) and is_reserved_member_stable_id(doc["stable_id"])
+            }
+        )
+        if _reserved_stable_ids:
+            raise IngestReservedStableId(_reserved_stable_ids)
+
         per_doc_claims: Dict[str, int] = {}
         for node in nodes:
             for ev in node.get("evidence") or []:
@@ -2446,17 +2484,26 @@ class FactsPgRepository:
             evidence: List[Dict[str, Any]],
             row_ref: str,
             row_attrs: Optional[Dict[str, Any]] = None,
-            alias_type: Optional[str] = None,
-            alias_natural_key: Optional[str] = None,
+            alias_targets: Optional[List[Tuple[str, str]]] = None,
         ) -> None:
-            """``alias_type``/``alias_natural_key`` (fact rows only — edges
-            carry no aliases) name the ONE alias this node's evidence is
-            establishing/reinforcing: security hardening (module docstring's
-            alias-visibility rule) records each evidence item's corpus as
-            provenance for THAT alias specifically, never for every alias
-            the fact happens to carry — the exact distinction that closes
-            the bug (a fact's OTHER, unrelated readable claim must never
-            grant visibility to a name minted from a different corpus)."""
+            """``alias_targets`` — ``[(type, natural_key), ...]`` — names
+            the alias(es) THIS evidence is establishing/reinforcing:
+            security hardening (module docstring's alias-visibility rule)
+            records each evidence item's corpus as provenance for exactly
+            those aliases, never for every alias a fact happens to carry —
+            the distinction that closes the bug (a fact's OTHER, unrelated
+            readable claim must never grant visibility to a name minted
+            from a different corpus).
+
+            A node's own evidence (``kind="fact"``) targets its OWN single
+            alias. An edge's evidence (``kind="edge"``) targets BOTH
+            endpoint aliases — an edge's claim evidences its endpoints too
+            (module docstring, "Endpoint evidence"), so a node that exists
+            ONLY as an edge anchor (zero claims of its own — the common
+            `works_in_industry`/`sponsored_by`/`staffed_by`-style ontology
+            shape) still gets its alias's provenance from the edge that
+            names it, never staying permanently admin-only. The edge
+            itself carries no alias of its own (edges have none)."""
             nonlocal claims_written, claims_accepted_via_identity
             with self._engine.connect() as conn:
                 for ev_idx, ev in enumerate(evidence):
@@ -2543,11 +2590,15 @@ class FactsPgRepository:
                         # silently NULL.
                         document_date=doc_dates.get(doc_id),
                     )
-                    if kind == "fact" and alias_type and alias_natural_key:
+                    for alias_type, alias_natural_key in alias_targets or []:
                         # Recorded regardless of `written_id` (a replayed,
                         # already-existing claim still means this corpus
                         # genuinely evidences the alias — the provenance
-                        # set only grows, see `add_alias_source`).
+                        # set only grows, see `add_alias_source`). A no-op
+                        # if the alias row hasn't been minted yet (it
+                        # always has by this point — `_resolve_alias` runs
+                        # before any evidence write, for both nodes and
+                        # edge endpoints).
                         self.add_alias_source(
                             type=alias_type, natural_key=alias_natural_key, corpus_id=frow["corpus_id"]
                         )
@@ -2560,6 +2611,13 @@ class FactsPgRepository:
 
         # ---- nodes: alias resolution + evidence.
         node_fact_ids: Dict[str, str] = {}
+        # Parallel to `node_fact_ids` — the alias's own `type` (spec §3:
+        # denormalized onto `fact_aliases`, not always the node id's own
+        # `<type>:` prefix, since a producer-declared `type` can override
+        # it in `_resolve_alias`). `_endpoint()`'s already-resolved-this-
+        # batch fast path below needs it for `alias_targets`, same as the
+        # freshly-resolved path already gets from `_resolve_alias`.
+        node_types: Dict[str, str] = {}
         for idx, node in enumerate(nodes):
             node_id = node.get("id")
             row_ref = f"nodes[{idx}]"
@@ -2576,14 +2634,14 @@ class FactsPgRepository:
                 if resolution.get("reattached"):
                     corrections_active.append(resolution["reattached"])
             node_fact_ids[node_id] = resolution["fact_id"]
+            node_types[node_id] = resolution["type"]
             _write_evidence(
                 kind="fact",
                 subject_id=resolution["fact_id"],
                 evidence=node.get("evidence") or [],
                 row_ref=row_ref,
                 row_attrs=node.get("attrs") or {},
-                alias_type=resolution["type"],
-                alias_natural_key=node_id,
+                alias_targets=[(resolution["type"], node_id)],
             )
 
         # ---- edges: endpoints resolve via the SAME alias mechanism (an
@@ -2593,7 +2651,13 @@ class FactsPgRepository:
         # item (§7.2) regardless of whether it carries any.
         def _endpoint(node_id: str, conn) -> Dict[str, Any]:
             if node_id in node_fact_ids:
-                return {"fact_id": node_fact_ids[node_id], "created": False, "error": None, "reattached": None}
+                return {
+                    "fact_id": node_fact_ids[node_id],
+                    "type": node_types[node_id],
+                    "created": False,
+                    "error": None,
+                    "reattached": None,
+                }
             return self._resolve_alias(conn, node_id, None)
 
         for idx, edge in enumerate(edges):
@@ -2633,6 +2697,14 @@ class FactsPgRepository:
                 evidence=edge.get("evidence") or [],
                 row_ref=row_ref,
                 row_attrs=edge.get("attrs") or {},
+                # An edge's claim evidences BOTH endpoints too (module
+                # docstring, "Endpoint evidence") — a node with zero
+                # claims of its own, reachable only as an edge anchor
+                # (the common works_in_industry/sponsored_by/staffed_by
+                # ontology shape), must still get its alias's provenance
+                # from here, or it stays permanently admin-only despite
+                # being visible and findable by existence.
+                alias_targets=[(src_res["type"], src_id), (dst_res["type"], dst_id)],
             )
 
         # ---- functionally single-valued edges (spec §7.3): a (src, type)

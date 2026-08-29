@@ -387,6 +387,25 @@ class ChatRepository:
         ).fetchall()
         return [_row_to_session(r) for r in rows]
 
+    def list_recently_active(self, *, limit: int = 200) -> list[ChatSession]:
+        """Sessions with at least one message, most-recently-active first,
+        capped at *limit*. Cross-user (no owner filter) — same shape as
+        ``list_paused_sessions`` above, just ordered/capped instead of
+        filtered on the pause marker.
+
+        Used by the session-pipeline chat-export sweep
+        (``services/session_pipeline/runner.py``, F4 — audit-full-coverage
+        plan) to find export candidates without an O(users) fan-out over
+        every registered user.
+        """
+        if self._sessions_pg is not None:
+            return self._sessions_pg.list_recently_active(limit=limit)
+        rows = self._conn.execute(
+            _SESSION_SELECT + _SESSION_GROUP + " HAVING COUNT(m.id) > 0 ORDER BY last_message_at DESC LIMIT ?",
+            [limit],
+        ).fetchall()
+        return [_row_to_session(r) for r in rows]
+
     def get_first_user_message(self, chat_id: str) -> Optional[str]:
         """First user-role message content in a session (oldest by
         ``created_at``), or ``None`` if the session has no user turns yet.

@@ -1034,6 +1034,43 @@ def _seed_admin(pg_engine) -> None:
 CORPUS_RESTRICTED = "col_restricted"
 
 
+def _seed_ingest_ready_doc(*, corpus_id: str, file_id: str, doc_id: str, text: str) -> str:
+    """Minimal indexed ``corpus_file`` + chunk + ``doc_id`` mapping so
+    ``ingest_batch`` can resolve evidence against it (mirrors
+    ``test_facts_ingest_pg.py``'s ``_seed_ready_doc``). Needed only by the
+    S9 tests below that exercise the REAL write path
+    (``repo.ingest_batch``) rather than the low-level ``add_claim``/
+    ``add_alias`` primitives every other S9 fixture uses — the edge-anchor
+    provenance bug lives in ``_write_evidence``'s ``alias_targets``
+    wiring, which the low-level primitives never touch at all."""
+    import secrets
+
+    import sqlalchemy as sa
+
+    from src.db_pg import get_engine
+    from src.repositories import corpus_file_sources_repo
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_files (id, corpus_id, filename, sha256, processing_status) "
+                "VALUES (:id, :corpus_id, :filename, :sha256, 'indexed')"
+            ),
+            {"id": file_id, "corpus_id": corpus_id, "filename": f"{file_id}.md", "sha256": f"sha_{file_id}"},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_chunks (id, corpus_id, file_id, ordinal, text) "
+                "VALUES (:id, :corpus_id, :file_id, 0, :text)"
+            ),
+            {"id": "ck_" + secrets.token_hex(8), "corpus_id": corpus_id, "file_id": file_id, "text": text},
+        )
+    corpus_file_sources_repo().upsert(
+        corpus_file_id=file_id, corpus_id=corpus_id, source_stable_id=file_id, source_doc_id=doc_id
+    )
+    return doc_id
+
+
 def _seed_alias_oracle_fixture(repo):
     """One fact (``engagement:halyard-erp-rollout`` — the alias minted from
     the RESTRICTED collection's claim, which names the client), one claim
@@ -1090,6 +1127,219 @@ def test_s9_alias_oracle_is_closed(pg_env, repo):
     subject = result["subjects"][0]
     assert subject["aliases"] == []
     assert "halyard" not in str(subject).lower()
+
+
+def test_s9_backfill_makes_a_legacy_alias_and_q_search_work_for_a_non_admin(pg_engine, monkeypatch, tmp_path):
+    """Adversarial-review finding: ``0084_fact_alias_sources`` creates the
+    table EMPTY. Without a backfill, ``_alias_readable_sql`` treats a
+    zero-provenance-row alias as unreadable for every non-admin — i.e.
+    every alias minted BEFORE this deploy — and ``search()``'s
+    ``candidates`` CTE requires a readable alias match whenever ``q`` is
+    given, so `q` would return ZERO results for every pre-existing subject
+    on any instance with real fact data (an operator would have to
+    re-ingest to get working search back).
+
+    This test steps the Alembic chain itself — upgrade to
+    ``0083_ingest_runs_source_urls`` (``fact_alias_sources`` doesn't exist
+    yet), seed a fact/alias/claim through the SAME repo methods
+    pre-deploy code used (``create_fact``/``add_claim`` with no
+    ``corpus_id`` — the table isn't there to write to), THEN upgrade to
+    head — so it actually exercises the migration's backfill INSERT, not
+    merely the read-path filter (every other S9 test seeds provenance
+    explicitly via ``add_alias(..., corpus_id=...)`` and would pass even
+    if the backfill were deleted). Fails on the pre-backfill migration:
+    with no backfill, both assertions below see an empty result."""
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "0083_ingest_runs_source_urls")
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    from tests.db_pg._parity_sweep_util import _seed_pg_system_groups
+
+    _seed_pg_system_groups(pg_engine)
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    repo = FactsPgRepository(db_pg.get_engine())
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    # Legacy data: an alias with NO fact_alias_sources row, because the
+    # table doesn't exist at this revision yet — exactly the shape every
+    # subject minted before this PR is in.
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:legacy-rollout")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The legacy engagement is underway.",
+    )
+
+    command.upgrade(cfg, "head")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="lena", email="lena@test.com", name="Lena")
+    _make_group_with_grant(pg_engine, group_name="group-lena-s9", collection_id=CORPUS_A, member_user_id="lena")
+
+    result = repo.search(_dict_user("lena"), type="engagement")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+    assert result["subjects"][0]["aliases"] == ["engagement:legacy-rollout"]
+
+    q_result = repo.search(_dict_user("lena"), type="engagement", q="legacy-rollout")
+    assert [s["id"] for s in q_result["subjects"]] == [fact_id]
+
+
+def test_s9_edge_anchor_alias_gets_provenance_from_the_evidencing_edge(pg_env, repo):
+    """Live-path finding (adversarial review round 2, live-data run):
+    ``industry:saas-anchor`` below is never listed in ``nodes[]`` — it
+    exists ONLY as an edge's ``dst`` (the ordinary
+    ``works_in_industry``/``sponsored_by``/``staffed_by``-shaped ontology
+    row where the evidence sits on the edge, never the node — spec §7.0,
+    "nodes without evidence are warnings, every edge carries >=1
+    evidence"). It carries ZERO claims of its own, so its ONLY possible
+    provenance is the edge's claim. Priti can read the edge's evidencing
+    corpus, so she must see BOTH the display name and match it via `q` —
+    this exercises the REAL ``ingest_batch`` write path (not the
+    low-level ``add_claim``/``add_alias`` primitives every other S9
+    fixture uses), because the bug lives in ``_write_evidence``'s
+    ``alias_targets`` wiring for the edge-evidence loop specifically.
+    Fails on the unfixed edge loop: `_write_evidence(kind="edge", ...)`
+    passed no alias target at all, so this endpoint's alias NEVER gets a
+    ``fact_alias_sources`` row -- permanently admin-only regardless of
+    which corpus evidences it."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    doc_id = _seed_ingest_ready_doc(
+        corpus_id=CORPUS_A,
+        file_id="cf_anchor1",
+        doc_id="doc_anchor1",
+        text="Acme Corp operates in the SaaS industry.",
+    )
+
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:acme-anchor",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "Acme Corp operates in the SaaS industry."}],
+            }
+        ],
+        edges=[
+            {
+                "src": "engagement:acme-anchor",
+                "type": "works_in_industry",
+                "dst": "industry:saas-anchor",
+                "evidence": [{"doc_id": doc_id, "quote": "Acme Corp operates in the SaaS industry."}],
+            }
+        ],
+    )
+    assert report["claims_written"] == 2  # 1 node claim + 1 edge claim
+    assert report["claims_rejected"] == []
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="priti", email="priti@test.com", name="Priti")
+    _make_group_with_grant(pg_env, group_name="group-priti-s9", collection_id=CORPUS_A, member_user_id="priti")
+
+    result = repo.search(_dict_user("priti"), type="industry")
+    assert len(result["subjects"]) == 1
+    subject = result["subjects"][0]
+    assert subject["aliases"] == ["industry:saas-anchor"]
+    assert subject["claim_count"] == 0  # own-claims-only projection, S2 — it has none
+
+    q_result = repo.search(_dict_user("priti"), type="industry", q="saas-anchor")
+    assert [s["id"] for s in q_result["subjects"]] == [subject["id"]]
+
+
+def test_s9_backfill_covers_an_edge_anchor_alias_for_a_non_admin(pg_engine, monkeypatch, tmp_path):
+    """The 0084 backfill's edge-anchor half (adversarial review round 2):
+    steps the Alembic chain to ``0083_ingest_runs_source_urls`` (before
+    ``fact_alias_sources`` exists), seeds the pre-existing
+    ``facts``/``fact_aliases``/``edges``/``claims`` rows through the
+    low-level primitives (``create_fact``/``create_edge``/``add_claim``,
+    no ``corpus_id`` kwarg — the CURRENT ``ingest_batch`` unconditionally
+    writes to ``fact_alias_sources`` now, so it cannot run against a
+    schema that doesn't have the table yet; these primitives are the ones
+    that don't touch it, exactly matching what pre-deploy code would have
+    left behind), THEN upgrades to head. The backfill must credit the
+    anchor's alias from its incident edge's claim, not just claims on its
+    own ``fact_id`` (which it has none of) — the exact gap the live-data
+    run on agnes-dev surfaced (20 of 81 aliases, all zero-own-claim edge
+    anchors). Fails on a backfill that only joins
+    ``claims ON claims.fact_id = fact_aliases.fact_id``."""
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "0083_ingest_runs_source_urls")
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    from tests.db_pg._parity_sweep_util import _seed_pg_system_groups
+
+    _seed_pg_system_groups(pg_engine)
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    repo = FactsPgRepository(db_pg.get_engine())
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_legacy_anchor1")
+
+    # Legacy shape: a src fact WITH its own claim, an edge to a dst fact
+    # that NEVER gets a claim of its own (zero own claims — the
+    # edge-anchor shape), the edge's own claim in the readable corpus.
+    src = repo.create_fact(type="engagement", natural_key="engagement:acme-legacy-anchor")
+    dst = repo.create_fact(type="industry", natural_key="industry:legacy-saas-anchor")
+    repo.add_claim(
+        fact_id=src, corpus_file_id="cf_legacy_anchor1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme exists."
+    )
+    edge_id = repo.create_edge(src=src, type="works_in_industry", dst=dst)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_legacy_anchor1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme operates in the legacy SaaS industry.",
+    )
+
+    command.upgrade(cfg, "head")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="omar", email="omar@test.com", name="Omar")
+    _make_group_with_grant(pg_engine, group_name="group-omar-s9", collection_id=CORPUS_A, member_user_id="omar")
+
+    result = repo.search(_dict_user("omar"), type="industry")
+    assert len(result["subjects"]) == 1
+    subject = result["subjects"][0]
+    assert subject["aliases"] == ["industry:legacy-saas-anchor"]
+
+    q_result = repo.search(_dict_user("omar"), type="industry", q="legacy-saas-anchor")
+    assert [s["id"] for s in q_result["subjects"]] == [subject["id"]]
 
 
 def test_s9_admin_sees_the_restricted_alias_regardless(pg_env, repo):

@@ -7,7 +7,13 @@ from typing import Any, Optional, List, Dict
 
 import duckdb
 
-from src.audit_context import auto_duration_ms
+from src.audit_context import (
+    auto_client_ip,
+    auto_client_kind,
+    auto_correlation_id,
+    auto_duration_ms,
+    mark_audit_written,
+)
 from src.audit_helpers import (
     AUDIT_SOURCE_CASE_SQL,
     RESULT_CLASS_CASE_SQL,
@@ -108,11 +114,24 @@ class AuditRepository:
         positional args or the original kwargs are unaffected. `params_before`
         is only used for mutating actions where rollback / diff is meaningful;
         leave None for reads, ticks, queries.
+
+        `client_ip` / `correlation_id` / `client_kind` autofill from the
+        `src.audit_context` contextvars (F0 — audit-full-coverage plan, Task
+        1) when the caller passes `None` — an explicit kwarg always wins.
+        Outside a request scope (scheduler internals, services with no
+        request context) the autofill functions return `None` too, so
+        behavior is unchanged for those callers.
         """
         entry_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         if duration_ms is None:
             duration_ms = auto_duration_ms()
+        if client_ip is None:
+            client_ip = auto_client_ip()
+        if correlation_id is None:
+            correlation_id = auto_correlation_id()
+        if client_kind is None:
+            client_kind = auto_client_kind()
         self.conn.execute(
             """INSERT INTO audit_log
                (id, timestamp, user_id, action, resource, params, result, duration_ms,
@@ -133,6 +152,7 @@ class AuditRepository:
                 correlation_id,
             ],
         )
+        mark_audit_written()
         return entry_id
 
     # -----------------------------------------------------------------

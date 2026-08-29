@@ -66,13 +66,48 @@ def _help_body() -> str:
     )
 
 
+def _audit_slash_command(app, cmd: dict[str, Any], command: str) -> None:
+    """F2d (audit-full-coverage plan, Task 6): one row per dispatched slash
+    command. Runs in a detached background task (ack-then-async, same as
+    events.py) so client_kind is stamped explicitly. Identity resolves
+    through the same binding lookup as the handlers below; an unbound
+    caller has no email to fall back to, so a searchable
+    ``slack:<user_id>`` string stands in — mirrors
+    ``app.chat.audit._resolve_user_id``'s "never drop the row" convention.
+    """
+    from src.audit_helpers import log_safe
+    from src.repositories import users_repo
+
+    slack_user_id = cmd.get("user_id", "")
+    email = lookup_user_email(app.state.chat_repo, slack_user_id)
+    if email:
+        row = users_repo().get_by_email(email)
+        user_id = row["id"] if row else email
+    else:
+        user_id = f"slack:{slack_user_id}"
+    log_safe(
+        user_id=user_id,
+        action="slack.command",
+        resource=command or "unknown",
+        params={"command": command},
+        client_kind="slack",
+    )
+
+
 async def dispatch_command(app, cmd: dict[str, Any]) -> None:
     command = (cmd.get("command") or "").strip()
+    # Audited only for a command this dispatcher actually acts on — an
+    # unrecognized command never touches `app` at all (see
+    # test_dispatch_command_routes_unknown_to_noop, which passes a bare
+    # `object()` for `app` on that path).
     if command == "/agnes":
+        _audit_slash_command(app, cmd, command)
         await _cmd_agnes(app, cmd)
     elif command == "/agnes-new":
+        _audit_slash_command(app, cmd, command)
         await _cmd_new(app, cmd)
     elif command == "/agnes-status":
+        _audit_slash_command(app, cmd, command)
         await _cmd_status(app, cmd)
     else:
         logger.info("unknown slash command: %s", command)
