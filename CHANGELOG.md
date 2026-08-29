@@ -758,6 +758,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Fixed
 - **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote that is a substring of the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The run report now distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
 - **Removed a committed `data` symlink pointing into a contributor's home
+- **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home
   directory.** `data -> /Users/<contributor>/Documents/.../data` reached
   `integration` as a tracked mode-120000 blob. It is broken for everyone
   else, it can shadow the runtime `data/` directory, and it puts a personal
@@ -765,6 +766,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rule rules out. `.gitignore` had `data/` — the trailing-slash form matches
   a **directory** only, so a symlink named `data` slipped straight past it;
   `/data` is now listed too so the same file cannot come back.
+  The sibling `user -> /Users/<contributor>/.../user` came from the same
+  commit and slipped through the same way (`user/` in `.gitignore` matches a
+  directory only); `/user` is listed too.
 - **The fact-graph search API silently ignored an unrecognized request field instead of rejecting it.** `POST /api/facts/search` and `POST /api/facts/neighbors` now reject an unknown field with `422` (`extra="forbid"` on both request models) rather than pydantic's default of silently dropping it — a caller that (reasonably) guessed at an undocumented `q` parameter previously got back an unfiltered, id-ordered dump with no error, which is exactly the shape of a convincing wrong answer.
 - **The SharePoint source card no longer shows "(no connection URL)".** The
   generic card subtitle rendered a connection's `stack_url`/host, which a
