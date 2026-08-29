@@ -60,6 +60,12 @@ MAX_NEIGHBORS_DEPTH = 2
 MAX_NEIGHBORS_FANOUT = 100
 MAX_NEIGHBORS_RESULT = 500
 MAX_SEARCH_FILTERS = 20
+# P2 review finding: a 1-char `q` drives a full-scan ILIKE over every
+# fact_aliases row with no useful selectivity. Enforced here (repo layer),
+# not only in the REST Pydantic model, so an MCP/CLI caller reaching
+# `search()` directly cannot bypass it. A blank/whitespace `q` is exempt —
+# that already degrades to "no filter" (pre-existing contract).
+MIN_SEARCH_Q_LENGTH = 2
 
 # Ingest batch caps (spec §7.2): "≤500 documents, ≤5000 claims per request".
 # A single document's evidence count over MAX_INGEST_CLAIMS is a protocol
@@ -672,7 +678,12 @@ class FactsPgRepository:
         extension) similarity ranking: this schema does not enable one, and
         this repo intentionally does not add the operational dependency —
         this deterministic CASE-based tiering needs nothing beyond stock
-        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"."""
+        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"; a
+        non-blank ``q`` shorter than ``MIN_SEARCH_Q_LENGTH`` raises
+        ``ValueError`` (P2 review finding — a 1-char query has no useful
+        selectivity against a full ILIKE scan). The query itself runs under
+        a bounded Postgres statement timeout, same mechanism as
+        ``neighbors()``."""
         filters = filters or {}
         if len(filters) > MAX_SEARCH_FILTERS:
             raise ValueError(f"too many filters (max {MAX_SEARCH_FILTERS})")
@@ -685,6 +696,8 @@ class FactsPgRepository:
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
 
         q_clean = (q or "").strip()
+        if q_clean and len(q_clean) < MIN_SEARCH_Q_LENGTH:
+            raise ValueError(f"q must be at least {MIN_SEARCH_Q_LENGTH} characters")
         q_norm = q_clean.casefold().replace(" ", "-") if q_clean else None
         q_substr: Optional[str] = None
         q_prefix: Optional[str] = None
@@ -821,7 +834,13 @@ class FactsPgRepository:
             LIMIT :limit_plus_one
             """
         )
-        with self._engine.connect() as conn:
+        # P2 review finding: bound this statement the same way `neighbors()`
+        # is bounded (spec §12) — an ILIKE-driven candidate scan with no cap
+        # could stall a connection out of the pool. `.begin()` (not
+        # `.connect()`) so `SET LOCAL` applies to the query that follows in
+        # the same transaction.
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             rows = conn.execute(sql, params).mappings().all()
 
         limit_applied = len(rows) > limit
