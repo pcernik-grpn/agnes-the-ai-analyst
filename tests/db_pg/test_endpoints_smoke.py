@@ -2977,6 +2977,21 @@ KNOWN_UNTESTED = {
     # duplicated in this PG smoke sweep.
     "POST /api/v1/agents/{slug}/responses",
     "GET /api/v1/jobs/{job_id}",
+    # @delegation between shared agents (Track C7 MVP) — sandbox-internal
+    # RPC, reachable only through the secret broker under a live turn's own
+    # session-scoped ticket (see app/api/agent_delegation.py's module
+    # docstring) — never parameter-free from an ordinary credential, same
+    # shape as the broker routes above. Behaviour (depth-1 guard, one-per-
+    # turn guard, RBAC denial, budget-exhausted degrade, output visible,
+    # the HTTP seam driven by a real AgentPrincipal, and the fail-closed
+    # guard against an unresolved caller) covered by
+    # tests/test_agent_delegation.py; not duplicated in this PG smoke
+    # sweep. The mandatory caller-bound-row laundering guard specifically
+    # ALSO runs against a real Postgres backend — see
+    # tests/db_pg/test_agent_delegation_pg.py — rather than being exempted
+    # here, since it is the one assertion this exemption cannot silently
+    # cover for both backends.
+    "POST /api/v1/agents/{slug}/delegate",
     # Agent-as-API multi-turn sessions (V1b Task 4) — SSE turn streaming,
     # cancel, history, delete. Auth chain (owner/agent-PAT 404 matrix),
     # SSE framing (RUN_STARTED once/turn, id: lines), turn-in-flight 409,

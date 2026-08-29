@@ -3768,6 +3768,19 @@
         "title": "DatasourceSecretBody",
         "type": "object"
       },
+      "DelegateRequest": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "DelegateRequest",
+        "type": "object"
+      },
       "DeployRequest": {
         "properties": {
           "mode": {
@@ -52640,6 +52653,83 @@
         "summary": "Create Agent Token",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/api/v1/agents/{slug}/delegate": {
+      "post": {
+        "description": "Delegate the current turn's ``message`` to agent ``slug``.\n\nReturns ``ChatManager.handle_delegation``'s result dict verbatim \u2014\n``{\"status\": \"ok\"|\"denied\"|\"degraded\", \"reason\": str | None,\n\"agent_slug\": str, \"answer\": str | None, \"message\": str | None}``. A\ndenial or degrade is a normal `200` response body, not an HTTP error:\nthe caller (agent A's own delegation tool) is expected to read\n``status``/``reason`` and continue the turn on its own judgment \u2014 see\nthe module docstring.",
+        "operationId": "delegate_to_agent_api_v1_agents__slug__delegate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delegate To Agent Api V1 Agents  Slug  Delegate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delegate To Agent",
+        "tags": [
+          "agent-runtime"
         ]
       }
     },
