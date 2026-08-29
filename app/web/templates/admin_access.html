@@ -2099,6 +2099,16 @@
      uses for a resting row, so it marks without competing with the band. */
   .ax-table .ax-r[data-kind] { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--kind) 42%, transparent); }
   .ax-table .ax-r[data-kind]:hover { box-shadow: inset 2px 0 0 var(--kind); }
+
+  /* ── The faces, on the header row ────────────────────────────────────
+     Beside the word they answer, so a closed section still says who is in
+     the group. Smaller than they were in the body: on a header they sit
+     against a 15px heading, not against a paragraph. */
+  .ax-people__hdrow { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .ax-people__hdrow h3 { margin: 0; }
+  #ax-people-faces:empty { display: none; }
+  .ax-people__hdrow .ax-av { width: 22px; height: 22px; font-size: 9px; }
+  .ax-pstrip { margin: 2px 0 10px; }
 </style>
 {% endblock %}
 
@@ -2260,7 +2270,14 @@
           <div class="dsec-head">
             <span class="dsec-ico">{{ ico.icon('users', 14) }}</span>
             <div class="dsec-grow">
-              <h3>People</h3>
+              {# The faces sit ON the header row, beside the word they are the
+                 answer to. They were below it, inside the body, which meant
+                 the one thing you can read at a glance was the one thing you
+                 had to open the section to see. #}
+              <div class="ax-people__hdrow">
+                <h3>People</h3>
+                <span class="ax-avs" id="ax-people-faces" aria-hidden="true"></span>
+              </div>
               <div class="dsec-sub" id="ax-people-sub">Who this group reaches.</div>
             </div>
             <span class="dsec-sum" id="ax-people-sum"></span>
@@ -3170,11 +3187,16 @@
     system_seed: "system-managed",
   };
 
-  function setPeopleHead(text, sub) {
+  function setPeopleHead(text, sub, faces) {
     const sum = el("ax-people-sum");
     if (sum) sum.textContent = text || "";
     const s = el("ax-people-sub");
     if (s && sub) s.textContent = sub;
+    // Every caller passes the faces it knows about — including the ones that
+    // know there are none (no group open, `Everyone`, still loading), which is
+    // what keeps a previous group's faces from lingering on the next one.
+    const f = el("ax-people-faces");
+    if (f) f.innerHTML = faces || "";
   }
 
   async function renderMembers() {
@@ -3223,7 +3245,7 @@
     const active = members.length - inactive;
     setPeopleHead(
       members.length ? `${members.length} ${members.length === 1 ? "member" : "members"}` : "Nobody",
-      "Who this group reaches.");
+      "Who this group reaches.", peopleFaces(members));
 
     // The find box comes FIRST in the body: at any real group size, "is
     // Maria in here?" is asked more often than the whole list is read, and
@@ -3272,16 +3294,22 @@
     return String(m.email || m.user_id || "?").replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase();
   }
 
-  const AVATARS_SHOWN = 6;
+  const AVATARS_SHOWN = 5;
 
-  function peopleStrip(members) {
+  /* The faces, for the section header. Five, then a count — past five the
+     initials stop being recognisable one by one and start being a texture,
+     and the texture is what "+9" says in less room. */
+  function peopleFaces(members) {
     if (!members.length) return "";
     const shown = members.slice(0, AVATARS_SHOWN);
     const rest = members.length - shown.length;
-    const avatars = shown.map((m) =>
+    return shown.map((m) =>
       `<span class="ax-av" title="${esc(m.email || m.user_id || "")}">${esc(initialsOf(m))}</span>`
     ).join("") + (rest > 0 ? `<span class="ax-av ax-av--more">+${rest}</span>` : "");
+  }
 
+  function peopleStrip(members) {
+    if (!members.length) return "";
     // Provenance in the order it matters: what an admin put here, what
     // Google puts here, what the instance puts here. A source with nobody in
     // it is left out rather than printed as a zero.
@@ -3301,10 +3329,7 @@
     const off = members.filter((m) => m.active === false).length;
     if (off) facts.push(`<b>${off}</b> deactivated`);
 
-    return `<div class="ax-pstrip">
-      <div class="ax-avs" aria-hidden="true">${avatars}</div>
-      <div class="ax-pstrip__f">${facts.join(" · ")}</div>
-    </div>`;
+    return `<div class="ax-pstrip"><div class="ax-pstrip__f">${facts.join(" · ")}</div></div>`;
   }
 
   /* The roster: the retired detail page's member table, columns and all —

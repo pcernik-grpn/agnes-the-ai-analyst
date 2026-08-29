@@ -272,12 +272,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   resource type inherits it without being named here). The family above it
   becomes an eyebrow — no fill, no rule, small and lettered — because two
   identical strips one inside the other say the two levels are peers.
-- **A group's People opens with who is in it, not just how many.** Faces and
-  provenance in one line above the roster — up to six initials, then the
-  split by source ("11 added by an admin · 3 synced from Google", plus any
-  deactivated). A count of 14 and fourteen initials are not the same fact,
-  and "3 of these are Google's" is what decides whether the group is yours
-  to edit at all.
+- **A group says who is in it before you open it.** The faces sit on the
+  People section's own header row, beside the word they answer — five
+  initials then a `+N`, because past five the initials stop being
+  recognisable one by one and start being a texture, which is what the count
+  says in less room. A count of 14 and fourteen initials are not the same
+  fact, and the header is where a fact you read at a glance belongs; the
+  provenance split ("11 added by an admin · 3 synced from Google", plus any
+  deactivated) stays inside the section, since "3 of these are Google's"
+  matters at the moment you go to edit.
 - **Admin pages are a white sheet, like every index page.** `base_index.html`
   surfaces (Library, Agents, Chats) paint their whole shell `--ds-surface` —
   `.idx`'s own comment gives the reason: the header zone should read as part
