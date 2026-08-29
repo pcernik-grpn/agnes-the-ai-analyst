@@ -27,6 +27,7 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -626,10 +627,12 @@ class TestCorpusExtractionHandler:
         with pytest.raises(RuntimeError, match="certificate not configured"):
             handler({"connection_id": "conn1"})
 
-    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material"):
+    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material", config=None):
         monkeypatch.setattr(
             "src.repositories.source_connections_repo",
-            lambda: _FakeSourceConnectionsRepo(row={"id": "conn1", "source_type": "sharepoint", "config": {}}),
+            lambda: _FakeSourceConnectionsRepo(
+                row={"id": "conn1", "source_type": "sharepoint", "config": config if config is not None else {}}
+            ),
         )
         from connectors.sharepoint.settings import SharePointSettings
 
@@ -656,8 +659,8 @@ class TestCorpusExtractionHandler:
             stdout = ""
             stderr = ""
 
-        def _fake_run(argv, env=None, timeout=None, capture_output=None, text=None, check=None):
-            calls.append({"argv": list(argv), "env": dict(env or {}), "timeout": timeout})
+        def _fake_run(argv, env=None, timeout=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {}), "timeout": timeout, "kwargs": kwargs})
             return _FakeCompleted()
 
         monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
@@ -819,6 +822,315 @@ class TestCorpusExtractionHandler:
 
         with pytest.raises(RuntimeError, match="exited 3"):
             handler({"connection_id": "conn1"})
+
+    # -- anonymize-in-front handoff (spec §9/§9.2) --------------------------
+
+    _ANON_CONFIG = {
+        "scopes": [
+            {
+                "source_scope_id": "scope-anon-1",
+                "display_path": "Contracts",
+                "anonymize": True,
+                "collection_id": "col_anon_1",
+            },
+            {
+                "source_scope_id": "scope-plain-1",
+                "display_path": "Public docs",
+                "anonymize": False,
+                "collection_id": "col_plain_1",
+            },
+        ]
+    }
+
+    def _fake_run_capturing(self, monkeypatch, calls):
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+
+    def test_anonymize_marked_scopes_land_in_child_env_as_json(self, monkeypatch):
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "instance-hmac-secret")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert len(calls) == 1
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"]) == {"scope-anon-1": "col_anon_1"}
+        assert env["AGNES_ANONYMIZATION_HMAC_KEY"] == "instance-hmac-secret"
+        # Never on argv.
+        argv_joined = " ".join(calls[0]["argv"])
+        assert "instance-hmac-secret" not in argv_joined
+        assert "col_anon_1" not in argv_joined
+
+    def test_no_anonymize_scopes_omits_both_vars(self, monkeypatch):
+        """No scope marked anonymize -> neither the scopes map NOR the HMAC
+        key is resolved or forwarded, even if a key happens to be set in the
+        environment — an instance that never anonymizes should never touch
+        the key."""
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unused-secret")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        plain_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-plain-1",
+                    "display_path": "Public docs",
+                    "anonymize": False,
+                    "collection_id": "col_plain_1",
+                }
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=plain_config)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert "AGNES_EXTRACTION_ANONYMIZE_SCOPES" not in env
+        assert "AGNES_ANONYMIZATION_HMAC_KEY" not in env
+
+    def test_no_scopes_at_all_omits_both_vars(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert "AGNES_EXTRACTION_ANONYMIZE_SCOPES" not in env
+        assert "AGNES_ANONYMIZATION_HMAC_KEY" not in env
+
+    def test_anonymize_scope_without_a_resolvable_key_raises(self, monkeypatch):
+        """An anonymize-marked scope with no HMAC key configured must fail
+        the job clean rather than silently run the producer without a
+        per-instance key."""
+        monkeypatch.delenv("AGNES_ANONYMIZATION_HMAC_KEY", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="AGNES_ANONYMIZATION_HMAC_KEY"):
+            handler({"connection_id": "conn1"})
+        # Never invoked the producer at all — the key resolution failure
+        # happens before subprocess.run.
+        assert calls == []
+
+    def test_anonymize_key_env_name_must_be_allowlisted(self, monkeypatch):
+        monkeypatch.setenv("SOME_UNRELATED_SECRET", "leaked-if-not-gated")
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value(
+                {
+                    "extraction": {
+                        "enabled": True,
+                        "producer": {"command": "python -m fake_producer"},
+                        "timeout_s": 60,
+                        "anonymization": {"hmac_key_env": "SOME_UNRELATED_SECRET"},
+                    }
+                }
+            ),
+        )
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="not an allowed anonymization key variable"):
+            handler({"connection_id": "conn1"})
+        assert calls == []
+
+    def test_anonymize_key_env_cannot_reuse_the_attach_token_allowlist(self, monkeypatch):
+        """RBAC review, 2026-08-28: a name that IS on the connector-ATTACH
+        token-env allowlist (e.g. the SharePoint certificate's own name)
+        must NOT thereby be usable as the anonymization key env — the two
+        allowlists are deliberately disjoint (see
+        src/orchestrator_security.py's ``_PRODUCER_KEY_ENVS`` docstring)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "leaked-if-not-gated")
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value(
+                {
+                    "extraction": {
+                        "enabled": True,
+                        "producer": {"command": "python -m fake_producer"},
+                        "timeout_s": 60,
+                        "anonymization": {"hmac_key_env": "SHAREPOINT_CERT_PRIVATE_KEY"},
+                    }
+                }
+            ),
+        )
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="not an allowed anonymization key variable"):
+            handler({"connection_id": "conn1"})
+        assert calls == []
+
+    def test_producer_output_is_not_buffered_in_this_process(self, monkeypatch):
+        """The producer may run for `extraction.timeout_s` (an hour by
+        default) and is an external binary nobody here controls the verbosity
+        of. `capture_output=True` would hold every byte of that in the
+        worker's own memory for the whole run, to serve one DEBUG line on
+        failure — enough to OOM a worker whose container limit is 4g by
+        default (Devin Review on this PR). stdout is discarded outright (this
+        handler never reads it: the producer reports through the ingest API),
+        and stderr streams to a file object, not a pipe."""
+        import subprocess as _sp
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+
+        seen = {}
+
+        class _FakeCompleted:
+            returncode = 0
+
+        def _fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert not seen.get("capture_output"), "capture_output buffers the whole run in this process"
+        assert seen.get("stdout") is _sp.DEVNULL
+        stderr = seen.get("stderr")
+        assert stderr is not _sp.PIPE and hasattr(stderr, "write"), stderr
+
+    def test_failed_producer_logs_only_the_tail_of_its_stderr(self, monkeypatch, caplog):
+        """A bounded tail is the point of the temp file — a producer that
+        wrote a gigabyte before dying must cost a bounded amount of memory to
+        report on."""
+        import logging
+
+        from app.worker import kinds as _kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        monkeypatch.setattr(_kinds, "_PRODUCER_STDERR_TAIL_BYTES", 32)
+
+        class _FakeCompleted:
+            returncode = 3
+
+        def _fake_run(argv, **kwargs):
+            kwargs["stderr"].write(b"A" * 5000 + b"THE-ONLY-PART-THAT-MATTERS")
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        with caplog.at_level(logging.DEBUG, logger="app.worker.kinds"):
+            with pytest.raises(RuntimeError, match="exited 3"):
+                handler({"connection_id": "conn1"})
+
+        tails = [r.getMessage() for r in caplog.records if "producer stderr tail" in r.getMessage()]
+        assert tails, caplog.text
+        assert "THE-ONLY-PART-THAT-MATTERS" in tails[0]
+        assert "A" * 100 not in tails[0], "the whole 5 KB was logged, not a 32-byte tail"
+
+    # -- producer callback credential (TCRD-226) -----------------------------
+    # The producer calls back into Agnes's own REST API (corpus-map, scopes,
+    # POST /api/facts/ingest) to do its actual work — until this wiring it had
+    # no credential to do so at all. The scheduler shared-secret token is the
+    # natural fit (the only existing credential class a headless subprocess
+    # can already present); see the module docstring for the honest over-grant
+    # note (it resolves to a synthetic Admin-group user, far more than the
+    # producer actually needs).
+
+    def _run_capturing_env(self, monkeypatch):
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        return calls
+
+    def test_agnes_api_url_always_forwarded(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SCHEDULER_API_TOKEN", raising=False)
+        monkeypatch.setenv("SERVER_URL", "https://agnes.example.com")
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls[0]["env"]["AGNES_API_URL"] == "https://agnes.example.com"
+
+    def test_agnes_api_token_forwarded_when_scheduler_secret_configured(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setenv("SCHEDULER_API_TOKEN", "s" * 40)
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert env["AGNES_API_TOKEN"] == "s" * 40
+        # Never on argv — same F7 rule as every other secret this handler
+        # resolves.
+        assert "s" * 40 not in " ".join(calls[0]["argv"])
+
+    def test_agnes_api_token_absent_when_no_scheduler_secret_configured(self, monkeypatch):
+        """No scheduler shared secret configured (e.g. LOCAL_DEV_MODE) →
+        no token to forward — never a placeholder/empty credential."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SCHEDULER_API_TOKEN", raising=False)
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert "AGNES_API_TOKEN" not in calls[0]["env"]
+
+    def test_agnes_api_token_never_logged(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setenv("SCHEDULER_API_TOKEN", "t" * 40)
+        self._stub_connection_and_settings(monkeypatch)
+        self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        with caplog.at_level(logging.DEBUG):
+            handler({"connection_id": "conn1"})
+
+        assert "t" * 40 not in caplog.text
 
 
 class TestJiraWebhookEnqueues:

@@ -28,7 +28,7 @@ from connectors.snowflake.settings import (
     SF_PRIVATE_KEY_PASSPHRASE_ENV,
     SF_TOKEN_ENV,
 )
-from src.audit_helpers import client_kind_from_user
+from src.audit_helpers import client_kind_from_user, log_safe
 from src.identifier_validation import (
     is_safe_identifier as _is_safe_identifier,
 )
@@ -388,6 +388,15 @@ def _validate_auth_providers_in_patch(sections: Dict[str, Dict[str, Any]]) -> No
                 "GOOGLE_CLIENT_SECRET environment variables at process start — a Google "
                 "OAuth client configured only in instance.yaml is not detected."
             )
+        if "sso" in known:
+            # SSO is configured on its own admin panel, not in instance.yaml —
+            # without this note a refused [sso] allowlist gives the operator
+            # no pointer to where the provider actually gets configured.
+            detail += (
+                " Note: the external SSO provider is configured at runtime on the SSO admin "
+                "panel (/api/admin/sso/config) — it reads available only once its config is "
+                "saved with a stored client secret and enabled=true."
+            )
         if "microsoft" in known:
             # Same env-capture property as Google, and the base detail names
             # neither Microsoft nor its variables — so a Microsoft-only save
@@ -451,6 +460,15 @@ def _provider_available_after_save(name: str, auth_patch: Dict[str, Any], sectio
         from app.auth.providers.microsoft import is_available as microsoft_available
 
         return microsoft_available()
+    if name == "sso":
+        # DB-configured (the /api/admin/sso panel), not instance.yaml — this
+        # patch cannot change it, so current availability == availability
+        # after save (the same argument the env-var branches make). Without
+        # this branch an `auth.providers: [sso]` allowlist would always be
+        # refused as "no usable sign-in method".
+        from app.auth.providers.sso import is_available as sso_available
+
+        return sso_available()
     return False
 
 
@@ -723,6 +741,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Resolved from the same overlay-only source as chat.enabled."
             ),
         },
+        "broker_admin_reads": {
+            "kind": "bool",
+            "default": _flag_default("chat", "broker_admin_reads", True),
+            "hint": (
+                "ON by default: read-only (GET/HEAD) admin API routes are replayed "
+                "through the chat secret broker under the session user's own "
+                "identity, so `agnes admin list-users`/`list-tables` work for an "
+                "actual admin inside a chat sandbox — the route's live "
+                "require_admin still refuses everyone else, and admin MUTATIONS "
+                "are always refused from sandboxes regardless of this switch. "
+                "Read live per request by the broker; no restart needed."
+            ),
+        },
     },
     "studio": {
         "enabled": {
@@ -833,6 +864,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "builder is the supported path. Both POST handlers carry the gate "
                 "too, so a stale external button gets a redirect home rather than "
                 "a silent publish."
+            ),
+        },
+        "store_moderation_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "store_moderation_enabled", False),
+            "hint": (
+                "The Moderation & Trust hub (/admin/store), its nav row, its "
+                "command-palette row and the `g v` shortcut. OFF by default: each "
+                "of its three zones has a nearer door — Submissions is its own nav "
+                "row, curation is /admin/marketplaces, and verification has its own "
+                "store.verification_enabled — so the hub was a landing page for "
+                "links the column already carries. Hides UI only: the store APIs "
+                "and /api/admin/share-requests* keep serving, so a queued agent "
+                "share stays decidable by API."
             ),
         },
     },
@@ -1414,6 +1459,32 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "chat tools, kbc-<project>-<role> membership sync, semantic "
                         "layer for master tokens). Needs AGNES_VAULT_KEY. See "
                         "docs/feature-flags.md."
+                    ),
+                },
+            },
+        },
+        # Microsoft Entra ID group sync. Declared so `group_sync_enabled`
+        # renders as a toggle rather than a free-text box — same rationale
+        # as `keboola.allow_token_header` above (Devin Review on PR #1288).
+        # Read by app/auth/microsoft_group_sync.py.
+        "microsoft": {
+            "kind": "object",
+            "hint": (
+                "Mirror the signed-in user's Entra ID group memberships into "
+                "user_group_members (source='microsoft_sync') on every Microsoft "
+                "sign-in. See docs/auth-microsoft-oauth.md before enabling — it "
+                "needs its own Entra admin-consent grant."
+            ),
+            "fields": {
+                "group_sync_enabled": {
+                    "kind": "bool",
+                    "default": _flag_default_path(("auth", "microsoft", "group_sync_enabled"), False),
+                    "hint": (
+                        "Off by default: enabling it also widens the OAuth consent "
+                        "scope requested at /auth/microsoft/login to the delegated "
+                        "Graph permission GroupMember.Read.All, which needs admin "
+                        "consent in the Entra app registration and a restart to take "
+                        "effect. See docs/feature-flags.md."
                     ),
                 },
             },
@@ -2702,6 +2773,12 @@ async def get_server_config(
     # Always surface the optional BQ knobs so the operator sees them in the
     # UI's JSON editor instead of having to know they exist (Phase J).
     _ensure_bq_optional_fields(sections)
+    log_safe(
+        user_id=user.get("id"),
+        action="server_config.read",
+        resource="instance.yaml",
+        params={"view": "redacted"},
+    )
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
@@ -2781,6 +2858,12 @@ async def get_server_config_overlay(
         for section in _EDITABLE_SECTIONS
         if isinstance(raw.get(section), dict)
     }
+    log_safe(
+        user_id=user.get("id"),
+        action="server_config.read",
+        resource="instance.yaml",
+        params={"view": "overlay"},
+    )
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
@@ -7004,6 +7087,10 @@ async def configure_instance(
 
     config_path = _state_dir() / "instance.yaml"
 
+    # Changed top-level overlay KEY NAMES only (never values) — the audit
+    # row `instance.configure` reports at the end of this handler.
+    changed_keys: set = set()
+
     # Same serialization + corrupt-overlay handling as POST /server-config.
     with _overlay_write_lock:
         overlay: dict = {}
@@ -7050,9 +7137,11 @@ async def configure_instance(
         # env-resolved merged config.
         if request.instance_name:
             overlay.setdefault("instance", {})["name"] = request.instance_name
+            changed_keys.add("instance")
 
         if request.allowed_domain:
             overlay.setdefault("auth", {})["allowed_domain"] = request.allowed_domain
+            changed_keys.add("auth")
 
         # data_source.type is fully owned by this endpoint, but the REST of
         # the data_source block is not — an instance can already carry
@@ -7065,6 +7154,7 @@ async def configure_instance(
             existing_data_source = {}
         existing_data_source["type"] = request.data_source
         overlay["data_source"] = existing_data_source
+        changed_keys.add("data_source")
         if request.data_source == "keboola":
             overlay["data_source"]["keboola"] = {
                 "stack_url": request.keboola_url,
@@ -7091,6 +7181,7 @@ async def configure_instance(
                     "model": "claude-haiku-4-5-20251001",
                     "structured_output": "auto",
                 }
+                changed_keys.add("ai")
             elif llm_key:
                 overlay["ai"] = {
                     "provider": "anthropic",
@@ -7098,6 +7189,7 @@ async def configure_instance(
                     "model": "claude-haiku-4-5-20251001",
                     "structured_output": "auto",
                 }
+                changed_keys.add("ai")
 
         # Atomic write to writable data volume — same tmp + os.replace pattern
         # as the server-config editor so a concurrent save can't tear the file.
@@ -7117,6 +7209,7 @@ async def configure_instance(
         secrets_to_persist["KEBOOLA_STACK_URL"] = request.keboola_url
 
     if secrets_to_persist:
+        changed_keys.add("secrets")
         # SECURITY (#12): this path writes KEBOOLA_STORAGE_TOKEN to the plaintext
         # .env_overlay even when the Fernet vault is configured, bypassing
         # encryption-at-rest. Warn so it's visible; full fix (route datasource
@@ -7168,6 +7261,15 @@ async def configure_instance(
     from app.instance_config import reset_cache
 
     reset_cache()
+
+    # Changed key NAMES only — never values (secret-bearing keys/config
+    # content never enters an audit record).
+    log_safe(
+        user_id=user.get("id"),
+        action="instance.configure",
+        resource="instance.yaml",
+        params={"keys": sorted(changed_keys)},
+    )
 
     return {
         "status": "ok",
@@ -7736,6 +7838,7 @@ def run_corporate_memory(
     audit_params: dict = {
         "items_new": stats.get("items_new", 0),
         "items_filtered": stats.get("items_filtered", 0),
+        "items_duplicate_skipped": stats.get("items_duplicate_skipped", 0),
         "items_db_inserted": stats.get("items_db_inserted", 0),
         "items_db_updated": stats.get("items_db_updated", 0),
         "items_db_errors": stats.get("items_db_errors", 0),
@@ -8286,6 +8389,10 @@ async def admin_override_store_submission(
         },
         result="success",
     )
+
+    from app.api.store import _notify_submitter
+
+    _notify_submitter(sub, decision="overridden", note=body.reason)
     return {"ok": True, "submission_id": submission_id, "entity_id": entity_id}
 
 
@@ -8536,7 +8643,7 @@ async def admin_delete_store_submission(
     wrong call. The audit_log row preserves what was deleted in case
     triage needs the evidence trail later.
     """
-    from app.api.store import _entity_dir
+    from app.api.store import _entity_dir, _notify_submitter
 
     subs = store_submissions_repo()
     sub = subs.get(submission_id)
@@ -8561,6 +8668,8 @@ async def admin_delete_store_submission(
             "status": sub.get("status"),
         },
     )
+
+    _notify_submitter(sub, decision="deleted")
 
 
 # ---------------------------------------------------------------------------

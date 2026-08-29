@@ -899,6 +899,11 @@ async function loadSidebar() {
   }
   const empty = $("cloud-chat-empty-state");
   if (empty) empty.hidden = list.length > 0;
+  // A successful load clears a FAILED state left over from an earlier
+  // attempt (TCRD-207/DES-153) — reaching this line means the fetch above
+  // resolved, so whatever was wrong before no longer is.
+  const failed = $("cloud-chat-failed-state");
+  if (failed) failed.hidden = true;
   // The rail's section chrome (reveal Pinned once it has rows, stand Chats down
   // when everything is pinned, re-apply each section's persisted open state) has
   // ONE owner — rail_history.js, loaded on every rail page including this one.
@@ -3054,6 +3059,14 @@ const _TOOL_LABELS = {
   fact_search: "Searched the knowledge graph",
   fact_neighbors: "Walked related facts",
   fact_claims: "Read the evidence",
+  // Track C7 (@delegation MVP) — the in-sandbox SDK tool
+  // `app/chat/runner.py::_delegation_mcp_server` exposes as
+  // `mcp__agnes-delegation__delegate_to_agent`; `_plainToolName` strips
+  // the `mcp__<server>__` prefix down to `delegate_to_agent`. No new
+  // frame types were introduced (delegation rides the existing generic
+  // tool_call/tool_result pair, already AG-UI-mapped) — this label is
+  // the whole of the "agent badge" for this MVP.
+  delegate_to_agent: "Delegating to another agent",
 };
 
 const _BASH_COMMAND_LABELS = [
@@ -3112,7 +3125,13 @@ function renderApprovalRequest(frame) {
   head.appendChild(icon);
   const name = document.createElement("span");
   name.className = "cloud-chat-tool-name";
-  name.textContent = "Approval required";
+  // Name the tool being approved — the frame carries it ("tool" is the
+  // engine provider's nothing-known fallback, not a name worth showing).
+  const approvalTool = typeof frame.tool === "string" && frame.tool !== "tool" ? frame.tool : "";
+  name.textContent = approvalTool
+    ? `Approval required · ${_toolLabel(approvalTool, { command: frame.command })}`
+    : "Approval required";
+  name.title = approvalTool;
   head.appendChild(name);
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
@@ -3120,13 +3139,36 @@ function renderApprovalRequest(frame) {
   head.appendChild(summary);
   wrap.appendChild(head);
 
-  if (frame.command) {
+  // The engine provider sends tool args as a JSON string; a no-args call
+  // used to arrive as "{}" and render as a code block saying nothing.
+  let cmdText = typeof frame.command === "string" ? frame.command.trim() : "";
+  if (cmdText === "{}") cmdText = "";
+  if (cmdText) {
+    try {
+      // One-line JSON args (older frames replayed from a reconnect) →
+      // pretty-printed. Anything unparsable — a shell command from the
+      // native runner, a truncated payload — renders verbatim.
+      const parsed = JSON.parse(cmdText);
+      if (parsed && typeof parsed === "object") cmdText = JSON.stringify(parsed, null, 2);
+    } catch {
+      /* not JSON — keep as-is */
+    }
     const pre = document.createElement("pre");
     pre.className = "cloud-chat-approval-cmd";
     const code = document.createElement("code");
-    code.textContent = frame.command;
+    code.textContent = cmdText;
     pre.appendChild(code);
     wrap.appendChild(pre);
+  }
+
+  // The engine's approval request_id IS the toolCallId, so when the tool
+  // card for this call is already on screen it claims "running…" while the
+  // tool is actually parked on this decision — say so. (Native-runner ids
+  // are unrelated to tool ids; the lookup just misses there.)
+  const inflightCard = inFlightToolCalls.get(frame.request_id);
+  if (inflightCard) {
+    const meta = inflightCard.querySelector(".cloud-chat-tool-meta");
+    if (meta) meta.textContent = "waiting for approval";
   }
 
   const actions = document.createElement("div");
@@ -3168,6 +3210,14 @@ function resolveApprovalCard(frame) {
   if (frame.request_id) {
     pendingApprovalFrames.delete(frame.request_id);
     answeredApprovalIds.add(frame.request_id);
+  }
+  // Undo renderApprovalRequest's "waiting for approval" on the matching
+  // tool card: the call either resumes (allow) or is about to land its
+  // error result, which overwrites the meta anyway.
+  const inflightCard = frame.request_id ? inFlightToolCalls.get(frame.request_id) : null;
+  if (inflightCard) {
+    const meta = inflightCard.querySelector(".cloud-chat-tool-meta");
+    if (meta) meta.textContent = "running…";
   }
   const el = frame.request_id
     ? document.querySelector(`[data-approval-id="${CSS.escape(frame.request_id)}"]`)
@@ -6238,16 +6288,25 @@ function renderCoPresence(host, participants) {
     _composer.focus();
   }
   // Sidebar list — a failed fetch must not break the page: the history list
-  // shows its empty state, the dashboard renders its suggestions without
-  // the personalized resume row (partial data), and boot continues (deep
-  // links + onboarding still work).
+  // shows its FAILED state (never the empty one — TCRD-207/DES-153), the
+  // dashboard renders its suggestions without the personalized resume row
+  // (partial data), and boot continues (deep links + onboarding still work).
   let _sidebarOk = true;
   try {
     await loadSidebar();
   } catch (_) {
     _sidebarOk = false;
     const empty = $("cloud-chat-empty-state");
-    if (empty) empty.hidden = false;
+    if (empty) empty.hidden = true;
+    const failed = $("cloud-chat-failed-state");
+    if (failed) {
+      failed.hidden = false;
+      const retryBtn = failed.querySelector("[data-state-retry]");
+      if (retryBtn && !retryBtn._wired) {
+        retryBtn._wired = true;
+        retryBtn.addEventListener("click", () => loadSidebar().catch(() => {}));
+      }
+    }
   }
   updateDashboardSuggestions(_sidebarOk ? _sessionsCache : null);
   // Sidebar cache (_sessionsCache) is now populated so openSession can

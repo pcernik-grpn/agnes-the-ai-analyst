@@ -63,7 +63,10 @@ def main() -> int:
 
     table_info = TableInfo(name=table_name, table_id=table_id)
     profile = profile_table(table_info, parquet_path, [], {}, {})
-    print(json.dumps(profile))
+    # default=str matches the parent-side profile writer (src/profiler.py) —
+    # DECIMAL/NUMERIC columns yield decimal.Decimal stats that json.dumps
+    # cannot serialize natively.
+    print(json.dumps(profile, default=str))
     return 0
 
 

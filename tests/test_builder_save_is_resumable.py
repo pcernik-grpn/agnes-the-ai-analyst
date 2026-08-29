@@ -56,6 +56,11 @@ def _node(script: str) -> dict:
 # per-url queue, so "what did Save actually send, in order" is observable.
 _HARNESS = r"""
 const CALLS = [];
+// Request bodies, keyed the same way as CALLS ("METHOD url") and appended in
+// order. CALLS answers "what did Save send, in what order"; BODIES answers
+// "and with what" — needed once a step's PAYLOAD is the point of the test
+// (which tools got registered, in what mode) rather than just its existence.
+const BODIES = {};
 function el(extra) {
   return Object.assign({
     innerHTML: '', textContent: '', value: '', disabled: false, style: {},
@@ -112,8 +117,13 @@ function fire(kind, attrs) {
 function installFetch(responses) {
   global.fetch = (url, opts) => {
     const method = ((opts || {}).method || 'GET').toUpperCase();
-    CALLS.push(method + ' ' + url);
-    const entry = responses[method + ' ' + url];
+    const key = method + ' ' + url;
+    CALLS.push(key);
+    if ((opts || {}).body) {
+      try { (BODIES[key] = BODIES[key] || []).push(JSON.parse(opts.body)); }
+      catch (_) { (BODIES[key] = BODIES[key] || []).push(opts.body); }
+    }
+    const entry = responses[key];
     let queued = null;
     if (Array.isArray(entry)) queued = entry.length ? entry.shift() : null;
     else if (entry) queued = entry;
@@ -335,4 +345,286 @@ def test_linked_apps_retry_only_repeats_what_is_still_missing():
     assert res["hrefAfterPartial"] == "", "a partial failure navigated away, so the admin never saw which pairs failed"
     assert res["href"] == "/library?kind=data_app", (
         f"the retry could not finish: href={res['href']!r}, calls={res['all']}"
+    )
+
+
+# ── MCP source: the tool toggles have to reach the registry ──────────────────
+#
+# A source with no `tool_registry` rows exposes NOTHING — the MCP server builds
+# its list from `list_by_mode('passthrough', enabled_only=True)`
+# (app/api/mcp/tools_generator.py) — and the builder's Save registered the
+# source, the secret and the grants, but never a tool. So it handed back a
+# registered, granted source with zero callable tools, while the Tools panel
+# invited the admin to "turn off anything agents should not call" and counted
+# "N of M" on. The toggles described an outcome Save did not produce, in both
+# directions: the ones left on were not callable, and the ones turned off were
+# no less callable than the rest.
+#
+# Raised by a review bot on PR #1679 — reported as "every introspected tool
+# stays callable regardless", which is the inverse of what was happening. The
+# tests below pin the behaviour rather than that description.
+
+
+def _mcp_script(responses_js: str, drive_js: str) -> str:
+    """Open the MCP builder, introspect two tools, then run `drive_js`."""
+    return (
+        _HARNESS
+        + _load(SHELL, MCP)
+        + "installFetch("
+        + responses_js
+        + """);
+window.AgnesMcpBuilder.open({ mount });
+(async () => {
+  await flush();
+  fire('input', { 'data-mcp-field': 'name', value: 'CRM' });
+  fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  // Introspect, so there are tools to toggle at all.
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+"""
+        + drive_js
+        + """
+})();
+"""
+    )
+
+
+_TWO_TOOLS = """{
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200,
+    body: { tools: [
+      { name: 'search_crm', description: 'Search', input_schema: { type: 'object' } },
+      { name: 'delete_account', description: 'Danger' },
+    ] },
+  },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-t' } }],
+}"""
+
+
+def test_the_tools_left_on_are_registered_so_an_agent_can_call_them():
+    res = _node(
+        _mcp_script(
+            _TWO_TOOLS,
+            r"""
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    all: CALLS,
+    tools: CALLS.filter((c) => c === 'POST /api/admin/mcp-tools').length,
+    bodies: BODIES['POST /api/admin/mcp-tools'] || [],
+    href: window.location.href,
+  }));
+""",
+        )
+    )
+    assert res["tools"] == 2, f"Save registered no tools — the source is callable by nobody: {res['all']}"
+    names = sorted(b["original_name"] for b in res["bodies"])
+    assert names == ["delete_account", "search_crm"]
+    for body in res["bodies"]:
+        assert body["mode"] == "passthrough", "the toggle is about being callable by an agent"
+        assert body["enabled"] is True
+        assert body["source_id"] == "src-t"
+        assert body["tool_id"] == "src-t__" + body["original_name"], (
+            "tool_id must be the deterministic composite, or a second Save duplicates the row"
+        )
+    schema = [b for b in res["bodies"] if b["original_name"] == "search_crm"][0]["input_schema"]
+    assert schema == {"type": "object"}, (
+        "the introspected input schema must survive to the registry — it is how an agent knows the tool's arguments"
+    )
+    assert res["href"] == "/admin/mcp-sources/src-t"
+
+
+def test_a_tool_toggled_off_is_never_registered():
+    res = _node(
+        _mcp_script(
+            _TWO_TOOLS,
+            r"""
+  fire('click', { 'data-mcp-tool': 'delete_account' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    all: CALLS,
+    bodies: BODIES['POST /api/admin/mcp-tools'] || [],
+  }));
+""",
+        )
+    )
+    names = [b["original_name"] for b in res["bodies"]]
+    assert names == ["search_crm"], (
+        f"a tool the admin switched off was registered anyway (or the on one was not): {names}"
+    )
+
+
+def test_the_tools_are_registered_before_the_groups_are_granted():
+    """Order matters for what the admin is told they did: a group pointed at a
+    source with no callable tools has been given nothing."""
+    res = _node(
+        _mcp_script(
+            _TWO_TOOLS,
+            r"""
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+""",
+        )
+    )
+    calls = res["all"]
+    assert "POST /api/admin/mcp-tools" in calls, f"no tool was registered at all: {calls}"
+    assert any(c.endswith("/grants") for c in calls), f"no grant was made: {calls}"
+    first_tool = calls.index("POST /api/admin/mcp-tools")
+    first_grant = next(i for i, c in enumerate(calls) if c.endswith("/grants"))
+    assert first_tool < first_grant, f"granted access before there was anything to call: {calls}"
+
+
+def test_a_second_save_does_not_duplicate_the_tool_rows():
+    """The 409 an existing tool_id answers is the end state Save wanted, not a
+    failure — the same rule the grant step follows. A retry after a later step
+    failed must finish, not stall on the tools it already registered."""
+    res = _node(
+        _mcp_script(
+            """{
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+  },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-r' } }],
+  // The tool registers fine; the GRANT fails once, so Save is retried with
+  // the tool already in place — the retry's re-register answers 409.
+  'POST /api/admin/mcp-tools': [{ status: 201, body: {} }, { status: 409, body: { detail: 'tool_id_exists' } }],
+  'POST /api/admin/mcp-sources/src-r/grants': [{ status: 500, body: { detail: 'boom' } }],
+}""",
+            r"""
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    all: CALLS,
+    creates: CALLS.filter((c) => c === 'POST /api/admin/mcp-sources').length,
+    tools: CALLS.filter((c) => c === 'POST /api/admin/mcp-tools').length,
+    href: window.location.href,
+  }));
+""",
+        )
+    )
+    assert res["creates"] == 1, f"the retry re-registered the source: {res['all']}"
+    # Two attempts, one tool: registered on the first pass, re-offered on the
+    # retry and answered 409. Asserted so this test cannot pass against a Save
+    # that registers no tools at all — the state it was written for.
+    assert res["tools"] == 2, f"the tool was not registered on both passes: {res['all']}"
+    assert res["href"] == "/admin/mcp-sources/src-r", (
+        f"the resumed save stalled on a 409 from a tool it had already registered: {res['all']}"
+    )
+
+
+# ── MCP source: a 409 is not one thing ───────────────────────────────────────
+#
+# `POST /api/admin/mcp-sources/{id}/grants` answers 409 `no_tools_registered`
+# when the source has no ENABLED tool row — nothing was granted, the group has
+# no access, and re-enabling the tools later does not go back and grant anyone.
+# Already-granted is NOT a 409 on that endpoint at all: it answers 200 with an
+# `already` count.
+#
+# So the blanket "409 means already granted" in `grantGroup` reported a failed
+# access change as success, and the builder can cause exactly that state: turn
+# every introspected tool off, pick a group, Save. Raised by a review bot on
+# PR #1679 against the tool-registration fix.
+#
+# Sibling checked: the linked-apps builder's `grantPair` swallows 409 against
+# `/api/admin/grants`, whose single 409 genuinely is "grant already exists"
+# (app/api/access.py). That one is correct and stays.
+
+
+def test_a_no_tools_registered_409_is_a_failure_not_a_shrug():
+    """Every tool off, a group picked: the grant cannot succeed, and Save must
+    say so rather than redirecting as if access had been granted."""
+    res = _node(
+        _mcp_script(
+            """{
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+  },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-n' } }],
+  'POST /api/admin/mcp-sources/src-n/grants': {
+    status: 409,
+    body: { detail: { error: 'no_tools_registered', message: "Source 'src-n' has no enabled tools to grant. Register them first, then grant." } },
+  },
+}""",
+            r"""
+  // Turn the only tool OFF, then pick a group anyway.
+  fire('click', { 'data-mcp-tool': 'search_crm' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    all: CALLS,
+    tools: CALLS.filter((c) => c === 'POST /api/admin/mcp-tools').length,
+    href: window.location.href,
+    err: (mount.innerHTML.match(/no enabled tools to grant/) || [''])[0],
+  }));
+""",
+        )
+    )
+    assert res["tools"] == 0, "a tool the admin switched off was registered anyway"
+    assert res["href"] == "", (
+        f"Save redirected as though the group had been granted access it does not have: {res['all']}"
+    )
+    assert res["err"] == "no enabled tools to grant", (
+        "the server's own sentence — which names the fix — never reached the admin"
+    )
+
+
+def test_an_ordinary_409_is_still_read_as_already_granted():
+    """The narrowing must not undo the earlier fix: a 409 that is NOT
+    `no_tools_registered` still counts as the end state Save wanted, so a
+    resumed Save cannot stall on a grant it already made."""
+    res = _node(
+        _mcp_script(
+            """{
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+  },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-a' } }],
+  'POST /api/admin/mcp-sources/src-a/grants': {
+    status: 409, body: { detail: 'Grant already exists for this group/resource_type/resource_id' },
+  },
+}""",
+            r"""
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS, href: window.location.href }));
+""",
+        )
+    )
+    assert res["href"] == "/admin/mcp-sources/src-a", f"an already-granted 409 broke the save again: {res['all']}"
+
+
+def test_the_structured_detail_survives_to_the_caller():
+    """`grantGroup` decides on `detail.error`, so readJson must carry the
+    object rather than flattening it to a sentence — matching on message text
+    is what breaks the day the wording changes."""
+    src = MCP.read_text(encoding="utf-8")
+    assert "e.detail = d;" in src
+    assert "kind !== 'no_tools_registered'" in src, (
+        "the 409 swallow must exclude no_tools_registered by its stable error code"
     )

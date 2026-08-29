@@ -1,4 +1,4 @@
-"""Alembic 0077 — ``semantic_models`` detach/override columns (F3, PG-only).
+"""Alembic 0090 — ``semantic_models`` detach/override columns (F3, PG-only).
 
 Mirrors ``tests/db_pg/test_alembic_0073_agent_scope_granted_by.py``'s shape:
 drive the chain up to the revision immediately before this one, insert a row
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_PREV = "0075_semantic_health_mutes"
-_THIS = "0077_semantic_models_detach"
+_PREV = "0089_semantic_health_mutes"
+_THIS = "0090_semantic_models_detach"
 
 _NEW_COLS = {
     "sync_mode",

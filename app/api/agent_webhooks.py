@@ -36,6 +36,7 @@ from pydantic import BaseModel, field_validator
 from app.auth.access import require_agent_profiles_enabled
 from app.auth.dependencies import _get_db, require_session_token
 from app.chat.webhook_delivery import validate_and_resolve
+from src.audit_helpers import log_safe
 from src.repositories import agent_webhooks_repo, agents_repo
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,12 @@ async def create_webhook(
     )
     row = agent_webhooks_repo().get(webhook_id)
     assert row is not None  # just created above, same transaction/connection
+    log_safe(
+        user_id=user["id"],
+        action="agent.webhook.create",
+        resource=f"agent_webhook:{webhook_id}",
+        params={"agent_id": agent["id"], "events": events},
+    )
     return _serialize(row, include_secret=True)
 
 
@@ -150,3 +157,9 @@ async def delete_webhook(
     if row is None or row["agent_id"] != agent["id"]:
         raise _err(404, "webhook_not_found", "Webhook not found")
     agent_webhooks_repo().delete(webhook_id)
+    log_safe(
+        user_id=user["id"],
+        action="agent.webhook.delete",
+        resource=f"agent_webhook:{webhook_id}",
+        params={"agent_id": agent["id"]},
+    )

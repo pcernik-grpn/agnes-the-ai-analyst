@@ -19,6 +19,7 @@ from typing import Any, Optional
 import duckdb
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+from app.api.activity import _audit_read
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
 
@@ -97,6 +98,26 @@ def facets(
     # labels here, reproducing the old COALESCE(email, user_id).
     emails = users_repo().get_by_ids([u["id"] for u in data["users"]])
 
+    # Reuse the Activity Center's own self-read mechanism (action=
+    # 'activity.read', deduped) so this row is covered by the exact same
+    # `include_self_reads` exclusion the timeline already relies on —
+    # a fresh, uncataloged action name here would count itself in its own
+    # future facets.
+    _audit_read(
+        _user,
+        "facets",
+        {
+            "since_minutes": since_minutes,
+            "user_id": user_id,
+            "action_prefix": action_prefix,
+            "resource_prefix": resource_prefix,
+            "result_pattern": result_pattern,
+            "result_class": result_class,
+            "source": source,
+            "trail": trail,
+            "q": q,
+        },
+    )
     return {
         "window_minutes": since_minutes,
         "users": [{"id": u["id"], "label": emails.get(u["id"]) or u["id"], "count": u["count"]} for u in data["users"]],
@@ -160,6 +181,22 @@ def kpis(
     p95 = k["p95"]
 
     rate = (errors / total) if total else 0.0
+    # Same self-read reuse as facets() above.
+    _audit_read(
+        _user,
+        "kpis",
+        {
+            "since_minutes": since_minutes,
+            "user_id": user_id,
+            "action_prefix": action_prefix,
+            "resource_prefix": resource_prefix,
+            "result_pattern": result_pattern,
+            "result_class": result_class,
+            "source": source,
+            "trail": trail,
+            "q": q,
+        },
+    )
     return {
         "window_minutes": since_minutes,
         "events_total": int(total or 0),

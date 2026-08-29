@@ -401,9 +401,17 @@ class TestAdminNavActiveState:
             assert actives == [expected], (path, actives)
 
         # A legacy disclosure GROUP still lights its own item row.
+        #
+        # Matched on the class TOKEN, not the whole attribute: a row carrying a
+        # one-line gloss renders `admin-nav__link admin-nav__link--glossed
+        # is-active`, so an exact-string compare would read "not active" for
+        # every glossed row and fail on the styling rather than the behavior.
         resp = c.get("/admin/mcp-sources", headers=_auth(token))
         nav = resp.text.split('<aside class="admin-nav"', 1)[1].split("</aside>", 1)[0]
-        assert 'class="admin-nav__link is-active"' in nav
+        active_rows = [
+            cls for cls in re.findall(r'<a class="(admin-nav__link[^"]*)"', nav) if "is-active" in cls.split()
+        ]
+        assert len(active_rows) == 1, active_rows
         assert ">MCP sources<" in nav
 
 
@@ -415,7 +423,10 @@ class TestAdminNavActiveSection:
         assert resolve_active_section_key("/admin/users") == "people"
         assert resolve_active_section_key("/admin/access") == "access"
         assert resolve_active_section_key("/admin/tables") == "data"
-        assert resolve_active_section_key("/admin/mcp-sources") == "instance"
+        # Content (key "library"), not Instance: an MCP source is a source of
+        # things analysts reach, like a marketplace — not instance plumbing.
+        assert resolve_active_section_key("/admin/mcp-sources") == "library"
+        assert resolve_active_section_key("/admin/linked-apps") == "library"
         assert resolve_active_section_key("/admin/store/lint") == "library"
         assert resolve_active_section_key("/admin/news") == "library"
         assert resolve_active_section_key("/admin/server-config") == "instance"
@@ -455,7 +466,15 @@ class TestAdminNavActiveSection:
             assert by_key[key] == "false", key
 
         # A page inside a group does expand that one, and only it.
-        resp2 = c.get("/admin/mcp-sources", headers={"Authorization": f"Bearer {token}"})
+        #
+        # The expected key is RESOLVED from the inventory rather than written
+        # here: this test is about the expand-one-group rule, not about which
+        # section owns /admin/mcp-sources, and hard-coding the pair meant a
+        # row moving between sections failed this test for the wrong reason.
+        probe_path = "/admin/mcp-sources"
+        probe_key = resolve_active_section_key(probe_path)
+        assert probe_key is not None, probe_path
+        resp2 = c.get(probe_path, headers={"Authorization": f"Bearer {token}"})
         groups2 = dict(
             re.findall(
                 r'data-admin-nav-group="([\w-]+)">\s*'
@@ -464,9 +483,9 @@ class TestAdminNavActiveSection:
                 resp2.text,
             )
         )
-        assert groups2["instance"] == "true"
+        assert groups2[probe_key] == "true"
         for key in [s["key"] for s in group_sections] + ["docs"]:
-            if key != "instance":
+            if key != probe_key:
                 assert groups2[key] == "false", key
 
         # The active section's body has no `hidden`; the rest do.

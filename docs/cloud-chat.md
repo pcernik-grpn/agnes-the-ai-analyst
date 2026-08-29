@@ -775,6 +775,19 @@ How it works:
 - **kai-agent provider:** needs no change — the engine keeps speaking the
   first-party Messages format and the broker rewrites those calls into the
   Vertex shape (model moves from body to URL, `anthropic_version` injected).
+- **Agent-as-API runtime:** `POST /api/v1/agents/{slug}/responses` needs no
+  separate Vertex support either — it spawns a headless chat session through
+  `app/chat/headless.py` → the same `ChatManager`/broker path above, so the
+  per-agent model allowlist and monthly token budget
+  (`app/api/broker_agent_policy.py`) already enforce against a Vertex-shaped
+  model path (`vertex_target.model`, not the request body).
+- **`anthropic-beta` filtering:** Vertex validates that header and refuses
+  the whole request on any value it does not recognize, while first-party
+  clients (the engine's SDK included) freely send first-party-only betas.
+  The broker filters the header in vertex mode to the values Vertex accepts
+  (renaming where its spelling differs), logs what it drops, and omits the
+  header when nothing survives — an unknown future beta degrades one
+  optional feature instead of 400-ing every turn.
 
 Operator prerequisites:
 

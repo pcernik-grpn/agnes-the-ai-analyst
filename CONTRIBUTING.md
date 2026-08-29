@@ -31,6 +31,17 @@ reviewer a finding. The step-by-step loop (which guards to run for which diff,
 how to treat WARN findings, when to add a new check) is
 `.claude/skills/verify-agnes-change/SKILL.md`.
 
+**A PR that gets no CI is not reviewable, whatever it targets.** `ci.yml`'s
+`pull_request` trigger therefore carries no `branches:` filter — a PR into a
+stack base (`mf/semantic-layer-v0`, a `claude/*` branch, anything) runs the
+same suite as one into `main`. This is worth stating because the failure mode
+is silent: with a filter, GitHub fires no workflow at all and the PR shows a
+**green rollup that asserted nothing**, which reads exactly like a passing run.
+When you check a PR's status, confirm the check NAMES are present
+(`test-shard (1..8)`, `test-pg (1..4)`) — "no red" is not the same as "tested".
+Stack bases are also unprotected, so `gh pr merge --auto` on one merges
+immediately rather than waiting for anything.
+
 ## Sync-map
 
 Surfaces that must change together — and that CI does **not** fully guard. When
@@ -49,6 +60,7 @@ mirror is missing.
 | New `ResourceType` enum value | `ResourceTypeSpec` in `app/resource_types.py` `RESOURCE_TYPES` | BLOCKING | `scripts/verify_syncmap.py` (full sweep) |
 | New entity-scoped endpoint | `Depends(require_admin)` or `require_resource_access(...)` from `app/auth/access.py` | BLOCKING | `tests/test_route_auth_guard.py` (proves *some* auth) + `scripts/verify_syncmap.py` (WARN on authn-only entity routes) |
 | New REST `/api/*` endpoint | a CLI command + an MCP tool that reach it (see "API coverage" below) | BLOCKING | `tests/test_documentation_api_triple_surface.py` (triple-surface ratchet) + `tests/test_api_docs_coverage.py` (docs) |
+| New `POST`/`PUT`/`PATCH`/`DELETE` HTTP route | declare its audit posture in `src/audit_posture.py`'s `POSTURE` dict — a real cataloged action (`src/audit_events.py`), `"fallback"` (the generic `AuditFallbackMiddleware` row is its only coverage), or `"exempt:<reason>"` | BLOCKING | `tests/test_audit_route_posture.py` (ratchet: every mutating route must appear, every stale entry must be pruned) |
 | User-visible behavior change | `## [Unreleased]` bullet in `CHANGELOG.md` — never a version bump; that is the dedicated cut PR's job, see `docs/RELEASING.md` | BLOCKING | `scripts/verify_syncmap.py` (skipped on a release-cut) |
 | New connector extractor | `_meta` table contract (`table_name, description, rows, size_bytes, extracted_at, query_mode`); see `connectors/keboola/extractor.py` as canonical example | BLOCKING | partial |
 | `query_mode='remote'` table | `_remote_attach` row in `extract.duckdb` | BLOCKING | `scripts/verify_syncmap.py` (connector must mention `_remote_attach`) |
