@@ -2463,7 +2463,7 @@
     semantic_model: "semantic", recipe: "recipe", collection: "collection",
     corpus_file: "file", knowledge_digest: "digest", data_app: "app",
     table: "table", marketplace_plugin: "plugin", store_entity: "skill",
-    agent: "agent", chat: "chat", slack_channel: "slack",
+    agent: "agent", chat: "chat", slack_channel: "slack", mcp_source: "mcp",
   };
   const kindWord = (t) => KIND_WORD[t.type_key] || t.type_display;
 
@@ -2478,6 +2478,7 @@
     recipe: "recipe", collection: "library", corpus_file: "file",
     knowledge_digest: "file", data_app: "app",
     marketplace_plugin: "plugin", store_entity: "skill", agent: "agent",
+    mcp_source: "plugin",   //: tools an agent calls — the plugin accent
   };
   const kindToken = (t) => KIND_TOKEN[t.type_key] || "";
 

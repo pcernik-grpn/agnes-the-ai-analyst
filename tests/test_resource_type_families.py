@@ -39,6 +39,7 @@ EXPECTED: dict[ResourceType, ResourceFamily] = {
     ResourceType.MARKETPLACE_PLUGIN: ResourceFamily.CAPABILITY,
     ResourceType.STORE_ENTITY: ResourceFamily.CAPABILITY,
     ResourceType.AGENT: ResourceFamily.CAPABILITY,
+    ResourceType.MCP_SOURCE: ResourceFamily.CAPABILITY,
     ResourceType.CHAT: ResourceFamily.SURFACE,
     ResourceType.SLACK_CHANNEL: ResourceFamily.SURFACE,
 }

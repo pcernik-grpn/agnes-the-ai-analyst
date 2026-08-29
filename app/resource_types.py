@@ -1033,6 +1033,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.MCP_SOURCE: ResourceTypeSpec(
         key=ResourceType.MCP_SOURCE,
+        family=ResourceFamily.CAPABILITY,
         display_name="MCP servers",
         description=(
             "An admin-registered MCP server. Controls whether a group can see "
