@@ -427,8 +427,9 @@ with content). Metadata-only rows carry a *provisional* doc_id
     id** — including a manual path re-upload of a crawler-anchored file, so
     a hand upload can no longer cascade a document's claims away. Unchanged
     sha → skip re-chunking entirely; changed → purge chunks + reset
-    `processing_status` on the same row. In-place update purges zip-bundle
-    children exactly as today's purge walk does;
+    `processing_status` on the same row. **In-place update on a bundle
+    (zip archive) row leaves its zip-bundle children ALONE** — reconciling
+    them is `ingest_bundle`'s own job (below), not this purge's;
   – **frozen-pair obligation**: the update-in-place methods land in
     `corpus_files.py` AND `corpus_files_pg.py` with the contract test
     extended — this PR touches a maintained pair, unlike the facts PR;
@@ -436,6 +437,17 @@ with content). Metadata-only rows carry a *provisional* doc_id
     (the mapping table is PG-only); omitting it keeps today's flow intact.
 - Ingest (§7) refuses a claim whose `doc` reference cannot be resolved
   through this mapping.
+- **RESOLVED (zip-member citability follow-up):** each member `ingest_bundle`
+  unpacks from an archive gets its OWN `corpus_file_sources` anchor —
+  `source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>` — written (best-effort, no-op on
+  DuckDB) once the member's own row is matched/created, so a claim can cite
+  the exact member instead of only the archive, and the member's id (hence
+  its claims) survives a re-sync of the archive exactly like a top-level
+  file's does. The `!` separator cannot collide with a real
+  producer-supplied top-level `source_stable_id` (`graph:…`/`local:…` never
+  start with `cf_`, the fixed `corpus_files.id` prefix). See
+  `src/ingest/bundle.py::_member_stable_id`.
 
 Lifecycle:
 
@@ -450,7 +462,9 @@ The orphan-subject sweep runs as its own step **after any batch of
 `corpus_files` deletions** — ingest-driven or UI-driven (an admin deleting a
 file from a collection cascades claims exactly the same way) — and equally
 after a **content replace**, which deletes claims without deleting the row
-(and hard-deletes the row's zip-bundle children, whose claims cascade). Never
+(a replaced BUNDLE row's own zip-bundle children are left for
+`ingest_bundle`'s own narrower reconciliation to sweep — only the members
+that actually changed or disappeared, never the whole set). Never
 inside the deleting transaction. Its counts land in the run report or, for UI
 deletions, on the source card, attributed to the operation that triggered
 them. Edges sweep first, so by the time the fact sweep runs every surviving
@@ -576,7 +590,14 @@ when a provisional metadata-only id is replaced by the content id). Evidence
 `doc_id` resolves `→ corpus_file_sources.source_doc_id → corpus_file_id`.
 The `documents` array may be omitted **only** when every referenced `doc_id`
 already resolves; otherwise the batch is rejected with the unresolved ids
-itemized.
+itemized. **RESOLVED (zip-member citability follow-up):** this resolution is
+identity-agnostic — a zip-bundle member's `corpus_file_sources` row (written
+by `ingest_bundle` at unpack time, §6) resolves exactly like a top-level
+file's; a producer citing a member's own content `doc_id`
+(`sha256[:16]`) needs no `documents[]` entry at all once the archive has
+been ingested once, and MAY additionally send one (`stable_id =
+"<archive corpus_files.id>!<member path>"`) to refresh the anchor, exactly
+like a top-level document.
 
 **Timing:** a claim referencing a file whose `processing_status` is not yet
 `indexed` is **deferred, not rejected** — the response lists it under
