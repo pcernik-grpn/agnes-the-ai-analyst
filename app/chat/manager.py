@@ -3247,6 +3247,16 @@ class ChatManager:
             content=text,
             sender_email=sender_email or live.user_email,
         )
+        # F2d (audit-full-coverage plan, Task 6): the manager's single user_msg
+        # ingress point — every surface (web WS, Slack, agent runtime, headless)
+        # funnels through send_user_message, so one write here covers them all.
+        # Metadata only, per the plan's content-never-metadata-always rule: the
+        # message length, never the text itself.
+        write_audit(
+            user_email=sender,
+            action="chat.user_message",
+            details={"session_id": chat_id, "chars": len(text)},
+        )
         self._emit_chat_message_event(chat_id=chat_id, surface=live.surface, sender=sender)
         await self._deliver_local_user_message(live, text)
 
@@ -4439,6 +4449,15 @@ async def produce_inbound_user_message(
         role="user",
         content=text,
         sender_email=sender,
+    )
+    # F2d (audit-full-coverage plan, Task 6): the thin-producer twin of
+    # ChatManager.send_user_message's ingress write below — an api-role
+    # replica with no local ChatManager (or a cross-gateway forward) reaches
+    # here instead, never both for the same message.
+    write_audit(
+        user_email=sender,
+        action="chat.user_message",
+        details={"session_id": chat_id, "chars": len(text)},
     )
     emit_chat_message_event(
         chat_id=chat_id,
