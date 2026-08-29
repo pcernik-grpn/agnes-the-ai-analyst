@@ -115,7 +115,7 @@ itself pre-registers the uncomfortable answer as a legitimate outcome.
     the file's chunks AND claims for what is really a no-op rename — five
     subjects 404'd after one rename in a live run, reappearing with NEW ids
     on re-ingest. Fixed at the root: the gate now also accepts a quote that
-    is a substring of the document's own SERVER-STORED `filename`/`path`
+    EQUALS a whole unit of the document's own SERVER-STORED `filename`/`path`
     (§8.2, never a producer-supplied identity string, which would let a
     producer self-certify an invented quote) — the header workaround is no
     longer needed. Counted honestly (`claims_accepted_via_identity` in the
@@ -656,13 +656,19 @@ HEAVY (concurrency 1) would block every table sync.
 
 ## 8. What "verbatim" actually means
 
-The gate: a claim's quote must be a substring of **either** (a) one chunk of
-the document's extracted text (`corpus_chunks.text`; `corpus_files` holds no
-text), **or** (b) the document's own **server-stored identity strings** —
-`corpus_files.filename` / `corpus_files.path`, exactly as Agnes holds them,
-never a producer-supplied name/path read off the wire (that would let a
-producer self-certify an invented quote by declaring whatever string it
-likes — see §8.3). Rejected at write, mechanical, the single most valuable
+The gate: a claim's quote must be a substring of one chunk of the document's
+extracted text (`corpus_chunks.text`; `corpus_files` holds no text), **or**
+it must EQUAL a whole unit of the document's own **server-stored identity
+strings** — `corpus_files.filename` / `corpus_files.path`, exactly as Agnes
+holds them, never a producer-supplied name/path read off the wire (that
+would let a producer self-certify an invented quote by declaring whatever
+string it likes — see §8.3). The identity half is equality, not substring
+(P0 review finding, 2026-08-29, hardened same-day as §8.2's widening below):
+a whole path component (a folder name, or the filename with or without its
+extension), the full stored path, or a contiguous run of whole components
+(e.g. `"folder/filename.ext"`) — never an arbitrary fragment, or a bare
+`.pptx`/`/`/short slice would self-certify as a cited quote via the
+document's own name. Rejected at write, mechanical, the single most valuable
 check — and narrower than it sounds. Four limits, stated for customer
 material:
 
@@ -680,10 +686,10 @@ material:
    the same strings a caller sees in the Library UI — but shares the next
    two.
 3. **A quote cannot cross a boundary** — the substring test is per chunk for
-   (a), and `filename`/`path` are checked as two SEPARATE strings for (b),
-   never concatenated: a quote spanning "the folder name / the file name" in
-   a way that isn't literally contiguous in either string still fails, even
-   though a human reading the two together would recognize it.
+   (a); for (b) the quote must equal one of the whole-unit candidates
+   (§8.2) derived from `filename`/`path` — a quote spanning "the folder name
+   / the file name" in a way that isn't one of those candidates still fails,
+   even though a human reading the two together would recognize it.
 4. **Cross-language extraction fails the gate by construction** (Czech
    document, English claim → no substring) — for both halves: a folder path
    in one language and a claim in another still produces no match. Open
@@ -737,7 +743,7 @@ place.
 Conversion fidelity is therefore a **correctness dependency**, gated by test
 EQ8 (§15.3).
 
-### 8.2 The identity haystack (ratified 2026-08-29, live regression fix)
+### 8.2 The identity haystack (ratified 2026-08-29, hardened same-day)
 
 **Why identity strings count as evidence at all.** The extraction ontology
 legitimately treats a document's own identity — folder path + filename — as
@@ -757,6 +763,20 @@ that declared an invented `path` on the wire cannot use it to manufacture a
 match: the gate only ever sees the identity Agnes itself assigned at upload
 time (`app/api/collections.py::_upsert_corpus_file`), so self-certification
 is refused by construction, not by a runtime check that could be forgotten.
+
+**The predicate is a whole unit, never a substring** (same-day review
+finding: an initial `quote in path` shape admitted a bare `.pptx`, a stray
+`/`, or any short fragment — enough to attach a fabricated attribute to a
+real document and have it render as a confidently-cited quote, which is
+worse than a rejected claim). The candidate set for `(filename, path)`:
+the full stored `path`; `filename` with and without its extension; every
+single whole path component (a folder name, or the filename); and every
+CONTIGUOUS run of whole path components (e.g. `"Project Kemp/Parts
+Authority — Overview.pptx"`, the folder+filename shape the example above
+cites), the run ending at the filename also getting an extension-stripped
+variant. The quote must equal one member of that set exactly — no
+normalization, matching the chunk-text comparison (an NFC/NFD mismatch
+fails identically on both sides).
 
 **The count.** Every ingest response reports `claims_accepted_via_identity`
 — the subset of `claims_written` whose quote matched ONLY the identity

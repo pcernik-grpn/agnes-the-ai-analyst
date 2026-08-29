@@ -150,6 +150,46 @@ def _readable_ids(caller) -> Optional[frozenset]:
     return frozenset(ids)
 
 
+def _identity_candidates(filename: Optional[str], path: Optional[str]) -> Set[str]:
+    """Whole-unit identity-evidence candidates for the verbatim gate (spec
+    §8, P0 review finding). A quote counts as identity-grounded evidence
+    only when it EQUALS one of these — never merely CONTAINS one as a
+    substring, which let a fabricated quote self-certify on any fragment of
+    the document's own name (a bare ``".pptx"``, a stray ``"/"``, a 2-char
+    slice). Candidates: the full stored ``path``; the ``filename`` with and
+    without its extension; every single whole path component (a folder
+    name, or the filename); and every CONTIGUOUS run of whole path
+    components (e.g. ``"folder/filename.ext"``, the folder+filename shape
+    a `part_of` edge legitimately cites) — the run ending at the filename
+    also gets an extension-stripped variant. No normalization anywhere:
+    matches the chunk-text comparison exactly (an NFC/NFD quote fails
+    identically on both sides)."""
+    candidates: Set[str] = set()
+
+    def _with_stem(name: str) -> None:
+        candidates.add(name)
+        dot = name.rfind(".")
+        if dot > 0:
+            candidates.add(name[:dot])
+
+    if filename:
+        _with_stem(filename)
+    if path:
+        candidates.add(path)
+        parts = [p for p in path.split("/") if p]
+        n = len(parts)
+        for i in range(n):
+            for j in range(i + 1, n + 1):
+                candidates.add("/".join(parts[i:j]))
+                if j == n:  # this run ends at the filename component
+                    last = parts[j - 1]
+                    dot = last.rfind(".")
+                    if dot > 0:
+                        candidates.add("/".join(parts[i : j - 1] + [last[:dot]]))
+    candidates.discard("")
+    return candidates
+
+
 def _single_valued_edge_types() -> frozenset:
     """Edge types a src fact should carry exactly one LIVE dst for (spec
     §7.3) — a second distinct dst is a reconciliation problem, not a fact.
@@ -2204,11 +2244,15 @@ class FactsPgRepository:
                         # RESOLVE which row this evidence is about, never as
                         # evidence itself, or a producer could self-certify
                         # an invented quote by declaring whatever string it
-                        # likes. No normalization is applied here, matching
-                        # the chunk-text check above exactly — an NFC/NFD
-                        # form mismatch fails identically on both sides.
-                        identity_haystack = [s for s in (frow.get("filename"), frow.get("path")) if s]
-                        if any(quote in s for s in identity_haystack):
+                        # likes. P0 review finding: the quote must EQUAL a
+                        # whole identity unit (`_identity_candidates`) —
+                        # never merely a substring of one, which admitted a
+                        # bare ".pptx" or "/" and let a fabricated attribute
+                        # ride in as a confidently-cited quote. No
+                        # normalization is applied here, matching the
+                        # chunk-text check above exactly — an NFC/NFD form
+                        # mismatch fails identically on both sides.
+                        if quote in _identity_candidates(frow.get("filename"), frow.get("path")):
                             accepted_via_identity = True
                         else:
                             claims_rejected.append(

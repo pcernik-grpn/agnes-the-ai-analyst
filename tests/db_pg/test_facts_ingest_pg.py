@@ -216,6 +216,9 @@ def test_verbatim_gate_accepts_a_real_substring(pg_env, repo):
 
 
 def test_verbatim_gate_accepts_a_quote_grounded_in_the_stored_filename(pg_env, repo):
+    """A `part_of` edge citing the document's FULL folder + filename (a
+    contiguous run of whole path components) counts as verbatim evidence —
+    the exact scenario PR #1767 widened the gate for."""
     file_id = "cf_identity1"
     doc_id = "doc_identity1"
     _seed_collection(collection_id=CORPUS_A)
@@ -234,12 +237,106 @@ def test_verbatim_gate_accepts_a_quote_grounded_in_the_stored_filename(pg_env, r
                 "type": "part_of",
                 "src": "engagement:kemp",
                 "dst": "project:kemp",
-                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp/Parts Authority"}],
+                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp/Parts Authority — Overview.pptx"}],
             }
         ],
     )
     assert report["claims_written"] == 1
     assert report["claims_rejected"] == []
+    assert report["claims_accepted_via_identity"] == 1
+
+
+# ---------------------------------------------------------------------------
+# P0 review finding: the identity gate must match a WHOLE unit (a folder
+# name, the filename with/without its extension, or a contiguous run of
+# whole path components) — never an arbitrary substring. `quote in path`
+# admitted `.pptx`, `/`, or any fragment, letting a fabricated attribute
+# self-certify as a cited quote via the document's own identity.
+# ---------------------------------------------------------------------------
+
+
+def _seed_identity_doc(file_id: str = "cf_identity_unit", doc_id: str = "doc_identity_unit") -> str:
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(
+        file_id=file_id,
+        filename="Parts Authority — Overview.pptx",
+        path="Project Kemp/Parts Authority — Overview.pptx",
+    )
+    _seed_chunk(file_id=file_id, text="Nothing about the filename appears in the extracted text.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+    return doc_id
+
+
+def _identity_edge_report(repo, doc_id: str, quote: str) -> dict:
+    return repo.ingest_batch(
+        nodes=[{"id": "engagement:kemp2", "type": "engagement", "attrs": {}, "evidence": []}],
+        edges=[
+            {
+                "type": "part_of",
+                "src": "engagement:kemp2",
+                "dst": "project:kemp2",
+                "evidence": [{"doc_id": doc_id, "quote": quote}],
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "Parts Authority — Overview.pptx",  # full filename, with extension
+        "Parts Authority — Overview",  # full filename, without extension
+        "Project Kemp",  # a whole folder name
+        "Project Kemp/Parts Authority — Overview.pptx",  # folder + filename
+    ],
+)
+def test_verbatim_gate_accepts_whole_identity_units(pg_env, repo, quote):
+    doc_id = _seed_identity_doc()
+    report = _identity_edge_report(repo, doc_id, quote)
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+    assert report["claims_accepted_via_identity"] == 1
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        ".pptx",  # bare extension — a substring of the filename, not a unit
+        "/",  # bare path separator
+        "ho",  # 2-char fragment (from "Authority"), absent from the chunk text
+        "rts Authority — Overvi",  # mid-word slice of the filename
+    ],
+)
+def test_verbatim_gate_rejects_partial_identity_fragments(pg_env, repo, quote):
+    doc_id = _seed_identity_doc()
+    report = _identity_edge_report(repo, doc_id, quote)
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+    assert report["claims_accepted_via_identity"] == 0
+
+
+def test_verbatim_gate_counter_only_counts_identity_accepted_claims(pg_env, repo):
+    """A batch mixing a chunk-grounded claim, an identity-grounded claim,
+    and a fabricated one: `claims_accepted_via_identity` must count ONLY
+    the identity one."""
+    doc_id = _seed_identity_doc(file_id="cf_identity_mixed", doc_id="doc_identity_mixed")
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:mixed",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [
+                    {"doc_id": doc_id, "quote": "Nothing about the filename appears"},  # chunk-grounded
+                    {"doc_id": doc_id, "quote": "Parts Authority — Overview.pptx"},  # identity-grounded
+                    {"doc_id": doc_id, "quote": ".pptx"},  # fabricated fragment
+                ],
+            }
+        ],
+    )
+    assert report["claims_written"] == 2
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
     assert report["claims_accepted_via_identity"] == 1
 
 
