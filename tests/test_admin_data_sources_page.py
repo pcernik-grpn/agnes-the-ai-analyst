@@ -2170,7 +2170,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
 {fns}
 
 const SP_CONN_API = "/api/admin/source-connections";
-let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches;
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms;
 function spSetCertChoice(c) {{}}
 function spGoStep(n) {{}}
 function _syncDropdownRebuild(sel) {{}}
@@ -2256,6 +2256,11 @@ const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
 const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
 let spPendingGroups = {{}};
 let spGroups = [];
+// `spRenderShare` reads `spUniquePerms[source_scope_id]` for its advisory
+// summary line — an empty map here means "nothing flagged", which is
+// exactly right for this class: it is not exercising that summary, only
+// the anonymize badge ladder.
+let spUniquePerms = {{}};
 const items = {json.dumps(items)};
 
 spRenderShare(items);
