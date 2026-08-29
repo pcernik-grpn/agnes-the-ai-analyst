@@ -481,6 +481,13 @@ CATALOG: dict[str, AuditEvent] = {
     "run_store_lint_audit": AuditEvent(
         "run_store_lint_audit", "system", "The scheduled marketplace-store skill-lint audit ran."
     ),
+    # Task 3 (F2a — auth remainder: token reads, project import, posture flips)
+    "token.list": AuditEvent("token.list", "read", "A personal access token list/detail was read (own/one/admin_all)."),
+    "keboola.projects_import": AuditEvent(
+        "keboola.projects_import",
+        "mutation",
+        "Selected discovered Keboola projects were connected (select-mode multi-project login).",
+    ),
 }
 
 
