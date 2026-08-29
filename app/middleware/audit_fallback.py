@@ -1,6 +1,7 @@
-"""ASGI safety net: log any authenticated mutating request whose handler
-wrote no audit row of its own (F1 — audit-full-coverage plan, Task 2;
-declarative-action contract rewritten by Wave 2 — Task 1).
+"""ASGI safety net: log any authenticated mutating OR declared-read request
+whose handler wrote no audit row of its own (F1 — audit-full-coverage plan,
+Task 2; declarative-action contract rewritten by Wave 2 — Task 1; read/
+WebSocket routes joined by Wave 2 — Task 2).
 
 Every handler that already calls ``log_safe`` (directly, or through an
 intra-module ``_audit`` wrapper) increments
@@ -63,6 +64,27 @@ Deliberately NOT a ``BaseHTTPMiddleware`` — same SSE-streaming rationale as
 and ``app/auth/dependencies.py`` during the SAME request, and this
 middleware reads them only after ``await self.app(...)`` returns, by which
 point every inner layer (including the endpoint) has already run.
+
+**The GET/HEAD (read) branch — Wave 2, Task 2 — is deliberately cheaper than
+the mutating branch above.** The read path is far hotter than the mutating
+one, so it skips the correlation-id tie-break query entirely: a
+``audit_written_count() == 0`` reading is trusted outright, UNLESS the route
+is in ``src.audit_posture.READ_SELF_AUDITING`` — a static allow-list (no DB
+query) of the handful of GET routes verified (by walking every declared-
+action read route's handler, transitively through its own module's helpers)
+to be a plain ``def`` that already writes its declared action itself. Those
+routes are skipped unconditionally, without even reading the counter — the
+counter is not ambiguous for them, it is KNOWN wrong (the write happened on
+a thread this async context can't see; see the module docstring above). No
+other declared-action read route is thread-offloaded-and-self-auditing, so
+nothing else needs the same treatment; a new one appearing is caught by
+extending ``READ_SELF_AUDITING`` (see its docstring in ``audit_posture.py``),
+not by adding a query back to this hot path.
+
+WebSocket connections (``scope["type"] == "websocket"``) are NOT intercepted
+by this middleware at all — ``src.audit_posture.WS_POSTURE`` exists purely
+for the route-declaration ratchet (``tests/test_audit_read_posture.py``);
+see its module docstring for why and what that leaves unaudited.
 """
 
 from __future__ import annotations
@@ -71,7 +93,7 @@ from starlette.requests import Request
 
 from src.audit_context import audit_written_count, auto_audit_identity, auto_correlation_id
 from src.audit_helpers import identity_for_audit, log_safe
-from src.audit_posture import MUTATING, declared_action
+from src.audit_posture import MUTATING, READ_SELF_AUDITING, declared_action, declared_read_action
 
 
 def resource_from_scope(scope) -> str:
@@ -99,10 +121,21 @@ class AuditFallbackMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["method"] not in MUTATING:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        method = scope["method"]
+        if method in MUTATING:
+            await self._handle_mutation(scope, receive, send)
+            return
+        if method in ("GET", "HEAD"):
+            await self._handle_read(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+    async def _handle_mutation(self, scope, receive, send) -> None:
         status_holder: dict = {}
 
         async def send_wrapper(message):
@@ -117,12 +150,7 @@ class AuditFallbackMiddleware:
         if self._already_covered_by_correlation_id():
             return
 
-        request = Request(scope)
-        state_user = getattr(request.state, "user", None)
-        if state_user is not None:
-            user_id, _email = identity_for_audit(state_user)
-        else:
-            user_id, _email = auto_audit_identity()
+        user_id = self._resolve_user_id(scope)
         if user_id is None:
             # Unauthenticated (or a request that never reached auth
             # resolution, e.g. it 404'd before routing) — not an audit_log
@@ -144,6 +172,60 @@ class AuditFallbackMiddleware:
             resource=resource_from_scope(scope),
             params={"status": status_holder.get("status")},
         )
+
+    async def _handle_read(self, scope, receive, send) -> None:
+        """GET/HEAD sibling of ``_handle_mutation`` — Wave 2, Task 2.
+
+        No correlation-id tie-break query (see module docstring): a read
+        route either isn't in ``READ_SELF_AUDITING`` (in which case the
+        counter is trusted outright) or IS in it (in which case the counter
+        is skipped entirely, not queried around). Either way, zero DB
+        round-trips beyond whatever the handler itself does.
+        """
+        status_holder: dict = {}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status_holder["status"] = message["status"]
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+        route = scope.get("route")
+        template = getattr(route, "path", None) or scope.get("path", "?")
+        key = f"{scope['method']} {template}"
+        if key in READ_SELF_AUDITING:
+            return
+        if audit_written_count() > 0:
+            return
+
+        action = declared_read_action(scope["method"], template)
+        if action is None:
+            # Exempt, or an undeclared route — the latter is caught by the
+            # route-posture ratchet (tests/test_audit_read_posture.py), not
+            # a runtime concern here.
+            return
+
+        user_id = self._resolve_user_id(scope)
+        if user_id is None:
+            return
+
+        log_safe(
+            user_id=user_id,
+            action=action,
+            resource=resource_from_scope(scope),
+            params={"status": status_holder.get("status")},
+        )
+
+    @staticmethod
+    def _resolve_user_id(scope):
+        request = Request(scope)
+        state_user = getattr(request.state, "user", None)
+        if state_user is not None:
+            user_id, _email = identity_for_audit(state_user)
+        else:
+            user_id, _email = auto_audit_identity()
+        return user_id
 
     @staticmethod
     def _already_covered_by_correlation_id() -> bool:

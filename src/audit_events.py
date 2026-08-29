@@ -547,16 +547,22 @@ CATALOG: dict[str, AuditEvent] = {
         "table_registry.docs_update", "mutation", "A registered table's admin-authored docs were updated."
     ),
     "table_registry.discover_and_register": AuditEvent(
-        "table_registry.discover_and_register", "mutation", "Auto-discovery registered a batch of matching tables at once."
+        "table_registry.discover_and_register",
+        "mutation",
+        "Auto-discovery registered a batch of matching tables at once.",
     ),
     "table_registry.register_precheck": AuditEvent(
-        "table_registry.register_precheck", "read", "An admin dry-ran the register-table validation without registering anything."
+        "table_registry.register_precheck",
+        "read",
+        "An admin dry-ran the register-table validation without registering anything.",
     ),
     "access_policy.compile": AuditEvent(
         "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
     ),
     "data_source.bigquery_connection_test": AuditEvent(
-        "data_source.bigquery_connection_test", "read", "An admin ran the configured BigQuery connection's health probe."
+        "data_source.bigquery_connection_test",
+        "read",
+        "An admin ran the configured BigQuery connection's health probe.",
     ),
     "chat.session.admin_kill": AuditEvent(
         "chat.session.admin_kill", "mutation", "An admin force-terminated another user's live chat session."
@@ -565,16 +571,22 @@ CATALOG: dict[str, AuditEvent] = {
         "chat.secrets.test", "read", "An admin tested the configured chat-engine secrets' connectivity."
     ),
     "chat.session.tail_ticket_issue": AuditEvent(
-        "chat.session.tail_ticket_issue", "mutation", "An admin issued a short-lived ticket to tail a live chat session's debug stream."
+        "chat.session.tail_ticket_issue",
+        "mutation",
+        "An admin issued a short-lived ticket to tail a live chat session's debug stream.",
     ),
     "contributed_skill.delete": AuditEvent(
-        "contributed_skill.delete", "mutation", "A contributed-skill plugin was removed from the contributed marketplace."
+        "contributed_skill.delete",
+        "mutation",
+        "A contributed-skill plugin was removed from the contributed marketplace.",
     ),
     "contributed_skill.create": AuditEvent(
         "contributed_skill.create", "mutation", "A skill was published to the contributed marketplace."
     ),
     "datasource.gws_credentials_validate": AuditEvent(
-        "datasource.gws_credentials_validate", "read", "An admin validated a Google Workspace service-account credential before saving it."
+        "datasource.gws_credentials_validate",
+        "read",
+        "An admin validated a Google Workspace service-account credential before saving it.",
     ),
     "diagnostics.new_instance_check": AuditEvent(
         "diagnostics.new_instance_check", "system", "An admin ran the new-instance deployment-gate doctor checks."
@@ -583,22 +595,32 @@ CATALOG: dict[str, AuditEvent] = {
         "data_source.keboola_connection_test", "read", "An admin ran the configured Keboola connection's health probe."
     ),
     "mcp_source.oauth_register": AuditEvent(
-        "mcp_source.oauth_register", "mutation", "An MCP source's OAuth client was dynamically registered with its authorization server."
+        "mcp_source.oauth_register",
+        "mutation",
+        "An MCP source's OAuth client was dynamically registered with its authorization server.",
     ),
     "mcp_source.oauth_client_update": AuditEvent(
         "mcp_source.oauth_client_update", "mutation", "An MCP source's OAuth client credentials were updated."
     ),
     "sharepoint_connection.scope_remove": AuditEvent(
-        "sharepoint_connection.scope_remove", "mutation", "A confirmed SharePoint scope (site/library/folder) was removed from a connection."
+        "sharepoint_connection.scope_remove",
+        "mutation",
+        "A confirmed SharePoint scope (site/library/folder) was removed from a connection.",
     ),
     "sharepoint_connection.scope_confirm": AuditEvent(
-        "sharepoint_connection.scope_confirm", "mutation", "An admin confirmed a SharePoint site/library/folder as an ingested scope."
+        "sharepoint_connection.scope_confirm",
+        "mutation",
+        "An admin confirmed a SharePoint site/library/folder as an ingested scope.",
     ),
     "source_connection.chat_tools_disable": AuditEvent(
-        "source_connection.chat_tools_disable", "mutation", "A source connection's derived chat tools were disabled and removed."
+        "source_connection.chat_tools_disable",
+        "mutation",
+        "A source connection's derived chat tools were disabled and removed.",
     ),
     "source_connection.chat_tools_enable": AuditEvent(
-        "source_connection.chat_tools_enable", "mutation", "A source connection's tables were registered as derived chat tools."
+        "source_connection.chat_tools_enable",
+        "mutation",
+        "A source connection's tables were registered as derived chat tools.",
     ),
     "sso.client_secret_clear": AuditEvent("sso.client_secret_clear", "mutation", "The SSO client secret was cleared."),
     "sso.config_delete": AuditEvent("sso.config_delete", "mutation", "The SSO configuration was deleted."),
@@ -630,7 +652,9 @@ CATALOG: dict[str, AuditEvent] = {
         "agent.scope_update", "mutation", "An agent profile's authority scope was updated."
     ),
     "metadata_cache.refresh_table": AuditEvent(
-        "metadata_cache.refresh_table", "mutation", "A single remote table's metadata cache entry was refreshed on demand."
+        "metadata_cache.refresh_table",
+        "mutation",
+        "A single remote table's metadata cache entry was refreshed on demand.",
     ),
     "cache_warmup.run": AuditEvent("cache_warmup.run", "mutation", "An admin triggered a catalog cache-warmup run."),
     "catalog.profile_refresh": AuditEvent(
@@ -639,9 +663,7 @@ CATALOG: dict[str, AuditEvent] = {
     "chat.journey_update": AuditEvent(
         "chat.journey_update", "mutation", "A caller's onboarding/journey progress was updated."
     ),
-    "chat.session.pin_set": AuditEvent(
-        "chat.session.pin_set", "mutation", "A chat session's pinned flag was changed."
-    ),
+    "chat.session.pin_set": AuditEvent("chat.session.pin_set", "mutation", "A chat session's pinned flag was changed."),
     "chat.session.title_update": AuditEvent(
         "chat.session.title_update", "mutation", "A chat session's title was changed."
     ),
@@ -649,16 +671,22 @@ CATALOG: dict[str, AuditEvent] = {
         "chat.copresence.fork", "mutation", "A shared chat session was forked into the caller's own copy."
     ),
     "chat.session_file.save_artefact": AuditEvent(
-        "chat.session_file.save_artefact", "mutation", "A chat session's engine-side file was saved as a permanent chat artefact."
+        "chat.session_file.save_artefact",
+        "mutation",
+        "A chat session's engine-side file was saved as a permanent chat artefact.",
     ),
     "chat.upload": AuditEvent(
         "chat.upload", "mutation", "A file was uploaded to chat and registered as a workspace table."
     ),
     "workspace_prompt_template.reset": AuditEvent(
-        "workspace_prompt_template.reset", "mutation", "The analyst-workspace CLAUDE.md prompt template was reset to its default."
+        "workspace_prompt_template.reset",
+        "mutation",
+        "The analyst-workspace CLAUDE.md prompt template was reset to its default.",
     ),
     "workspace_prompt_template.preview": AuditEvent(
-        "workspace_prompt_template.preview", "read", "An admin previewed the rendered analyst-workspace CLAUDE.md prompt template."
+        "workspace_prompt_template.preview",
+        "read",
+        "An admin previewed the rendered analyst-workspace CLAUDE.md prompt template.",
     ),
     "workspace_prompt_template.update": AuditEvent(
         "workspace_prompt_template.update", "mutation", "The analyst-workspace CLAUDE.md prompt template was updated."
@@ -684,13 +712,17 @@ CATALOG: dict[str, AuditEvent] = {
         "setup_token.exchange", "auth", "A self-service Cowork setup token was exchanged for a session."
     ),
     "cowork_bundle.generate": AuditEvent(
-        "cowork_bundle.generate", "mutation", "A personal Cowork onboarding bundle (credentials + skills) was generated."
+        "cowork_bundle.generate",
+        "mutation",
+        "A personal Cowork onboarding bundle (credentials + skills) was generated.",
     ),
     "data_app.git_fetch": AuditEvent(
         "data_app.git_fetch", "read", "A data app's own git repo was fetched (clone/pull) over smart-HTTP."
     ),
     "data_app.proxy_mutation": AuditEvent(
-        "data_app.proxy_mutation", "mutation", "A non-GET request was proxied into a running data app's own container via the legacy path-based proxy."
+        "data_app.proxy_mutation",
+        "mutation",
+        "A non-GET request was proxied into a running data app's own container via the legacy path-based proxy.",
     ),
     "db_migration.cancel": AuditEvent(
         "db_migration.cancel", "mutation", "An admin cancelled an in-progress app-state database migration job."
@@ -699,7 +731,9 @@ CATALOG: dict[str, AuditEvent] = {
         "db_migration.start", "mutation", "An admin started an app-state database migration job."
     ),
     "store.entity_builder_preview_agent": AuditEvent(
-        "store.entity_builder_preview_agent", "mutation", "An admin previewed the review-agent's response while building a store entity."
+        "store.entity_builder_preview_agent",
+        "mutation",
+        "An admin previewed the review-agent's response while building a store entity.",
     ),
     "store.entity_builder_turn": AuditEvent(
         "store.entity_builder_turn", "mutation", "An admin exchanged one turn with the store-entity builder assistant."
@@ -728,7 +762,9 @@ CATALOG: dict[str, AuditEvent] = {
         "corporate_memory.create", "mutation", "A corporate-memory knowledge item was submitted."
     ),
     "corporate_memory.contradiction_create": AuditEvent(
-        "corporate_memory.contradiction_create", "mutation", "An admin manually recorded a corporate-memory contradiction."
+        "corporate_memory.contradiction_create",
+        "mutation",
+        "An admin manually recorded a corporate-memory contradiction.",
     ),
     "corporate_memory.dismiss": AuditEvent(
         "corporate_memory.dismiss", "mutation", "A caller dismissed a corporate-memory item from their own feed."
@@ -761,11 +797,11 @@ CATALOG: dict[str, AuditEvent] = {
         "metric_definition.import", "mutation", "Business metric definitions were bulk-imported from a directory."
     ),
     "my_stack.curated_toggle": AuditEvent(
-        "my_stack.curated_toggle", "mutation", "A caller enabled or disabled a curated-marketplace plugin in their own stack."
+        "my_stack.curated_toggle",
+        "mutation",
+        "A caller enabled or disabled a curated-marketplace plugin in their own stack.",
     ),
-    "news_previewed": AuditEvent(
-        "news_previewed", "read", "An admin previewed a news banner draft's rendered output."
-    ),
+    "news_previewed": AuditEvent("news_previewed", "read", "An admin previewed a news banner draft's rendered output."),
     "observability_view.delete": AuditEvent(
         "observability_view.delete", "mutation", "A saved observability view was deleted."
     ),
@@ -806,7 +842,9 @@ CATALOG: dict[str, AuditEvent] = {
         "semantic_source.sync", "mutation", "A semantic-layer source was manually synced."
     ),
     "semantic_model.validate_query": AuditEvent(
-        "semantic_model.validate_query", "read", "A SQL query was validated against a semantic model's constraints without executing it."
+        "semantic_model.validate_query",
+        "read",
+        "A SQL query was validated against a semantic model's constraints without executing it.",
     ),
     "semantic_model.update": AuditEvent("semantic_model.update", "mutation", "A semantic model document was updated."),
     "semantic_source.update": AuditEvent(
@@ -870,6 +908,87 @@ CATALOG: dict[str, AuditEvent] = {
     "auth.magic_link_sent": AuditEvent("auth.magic_link_sent", "auth", "A sign-in magic link was minted and mailed."),
     "password_reset_requested": AuditEvent("password_reset_requested", "auth", "A password-reset link was requested."),
     "logout": AuditEvent("logout", "auth", "A user signed out."),
+    # -- Wave 2 -- Task 2: reads and WebSocket routes join the ratchet --------
+    # New actions for sensitive GET routes that were still completely
+    # unaudited (READ_POSTURE, src/audit_posture.py) -- everything else
+    # sensitive reuses an action already cataloged above. Two of these
+    # (adoption.kpis, adoption.user_kpis) plus mcp_oauth.connect were ALREADY
+    # being written by live code before this task (via a positional `action`
+    # argument the catalog literal-scan can't see), just never registered
+    # here -- a pre-existing catalog gap this task closes in passing rather
+    # than filing a follow-up for a one-line fix.
+    "adoption.kpis": AuditEvent(
+        "adoption.kpis", "read", "An admin viewed the adoption dashboard's global KPI summary."
+    ),
+    "adoption.user_kpis": AuditEvent("adoption.user_kpis", "read", "An admin viewed one user's adoption KPI summary."),
+    "admin.sessions_browse": AuditEvent(
+        "admin.sessions_browse", "read", "An admin browsed the cross-user session browser's data grid."
+    ),
+    "admin.user_sessions_read": AuditEvent(
+        "admin.user_sessions_read", "read", "An admin read a specific user's session list."
+    ),
+    "agent.session.artifact_download": AuditEvent(
+        "agent.session.artifact_download", "read", "An agent-API session's harvested artifact was downloaded."
+    ),
+    "chat.session.admin_list": AuditEvent(
+        "chat.session.admin_list", "read", "An admin listed every currently-live chat session across all users."
+    ),
+    "chat.session_file.download": AuditEvent(
+        "chat.session_file.download", "read", "A file inside a chat sandbox session was downloaded."
+    ),
+    "collection.file_download": AuditEvent(
+        "collection.file_download", "read", "A collection file's raw bytes were downloaded."
+    ),
+    "collection.file_preview": AuditEvent("collection.file_preview", "read", "A collection file was previewed."),
+    "collection.search": AuditEvent("collection.search", "read", "The caller's accessible collections were searched."),
+    "knowledge.search": AuditEvent(
+        "knowledge.search",
+        "read",
+        "A combined search ran across documents, the knowledge base, and the table catalog.",
+    ),
+    "mcp_oauth.connect": AuditEvent(
+        "mcp_oauth.connect", "auth", "A user completed an MCP source's OAuth authorization-code exchange."
+    ),
+    "memory.admin_audit_read": AuditEvent(
+        "memory.admin_audit_read", "read", "An admin read the corporate-memory governance audit trail."
+    ),
+    "sharepoint_connection.certificate_read": AuditEvent(
+        "sharepoint_connection.certificate_read",
+        "read",
+        "An admin read a SharePoint connection's certificate metadata (never the private key).",
+    ),
+    "sharepoint_connection.corpus_map_read": AuditEvent(
+        "sharepoint_connection.corpus_map_read",
+        "read",
+        "The SharePoint connection's scope-to-collection corpus map was read.",
+    ),
+    "sharepoint_connection.scopes_read": AuditEvent(
+        "sharepoint_connection.scopes_read", "read", "An admin read a SharePoint connection's configured scopes."
+    ),
+    "sharepoint_connection.tree_browse": AuditEvent(
+        "sharepoint_connection.tree_browse",
+        "read",
+        "An admin browsed a SharePoint connection's site/drive/folder tree.",
+    ),
+    "sharepoint_connection.tree_search": AuditEvent(
+        "sharepoint_connection.tree_search", "read", "An admin searched a SharePoint connection's folder tree."
+    ),
+    "source_connection.tables_discover": AuditEvent(
+        "source_connection.tables_discover",
+        "read",
+        "An admin browsed a connected source's discoverable tables before registering any.",
+    ),
+    "sso.config_read": AuditEvent(
+        "sso.config_read", "read", "An admin read the SSO configuration's status (never the client secret)."
+    ),
+    "sso.identities_list": AuditEvent(
+        "sso.identities_list", "read", "An admin listed every linked external identity across all users."
+    ),
+    "table_registry.discover_preview": AuditEvent(
+        "table_registry.discover_preview",
+        "read",
+        "An admin previewed auto-discoverable tables without registering any.",
+    ),
 }
 
 

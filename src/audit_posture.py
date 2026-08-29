@@ -564,3 +564,652 @@ def declared_action(method: str, path_template: str) -> str | None:
     if value is None or value.startswith("exempt:"):
         return None
     return value
+
+
+# ---------------------------------------------------------------------------
+# READ_POSTURE / WS_POSTURE -- Wave 2, Task 2: reads and WebSocket routes join
+# the same declare-or-fail ratchet as MUTATING routes above. Same two-value
+# vocabulary (a cataloged action, or "exempt:<reason>"), but the exempt reason
+# must come from the CLOSED EXEMPT_REASONS vocabulary below -- this is what
+# keeps "exempt" from becoming a junk drawer for "didn't think about it".
+#
+# Policy (decide once, apply mechanically): a read gets a real action when it
+# returns data content (query results, samples, downloads, exports, bundles),
+# secrets or tokens, another user's data (admin cross-user reads), or the audit
+# trail itself. Everything else is exempt with a reason. Sensitive reads wave 1
+# already audits reuse their EXISTING action; sensitive reads that were still
+# unaudited get a new action in the "Wave 2 -- Task 2" CATALOG block.
+# ---------------------------------------------------------------------------
+
+EXEMPT_REASONS: frozenset[str] = frozenset(
+    {
+        "health",  # health/readiness/diagnostic probes -- no user data
+        "self",  # caller reading their own data
+        "ui_support",  # list/lookup backing a page, no sensitive content
+        "static",  # bundled/served assets, docs, discovery documents
+        "noise",  # high-frequency polling / transport plumbing, no security value
+    }
+)
+
+READ_POSTURE: dict[str, str] = {
+    # -- app.api.access --
+    "GET /api/admin/access-overview": "exempt:ui_support",
+    "GET /api/admin/grants": "exempt:ui_support",
+    "GET /api/admin/groups": "exempt:ui_support",
+    "GET /api/admin/groups/{group_id}": "exempt:ui_support",
+    "GET /api/admin/groups/{group_id}/members": "exempt:ui_support",
+    "GET /api/admin/resource-types": "exempt:ui_support",
+    "GET /api/admin/users/{user_id}/effective-access": "exempt:ui_support",
+    "GET /api/admin/users/{user_id}/library-preview": "exempt:ui_support",
+    "GET /api/admin/users/{user_id}/memberships": "exempt:ui_support",
+    "GET /api/me/effective-access": "exempt:self",
+    # -- app.api.activity --
+    "GET /api/admin/activity": "activity.read",
+    "GET /api/admin/activity/health": "activity.read",
+    "GET /api/admin/activity/sync": "activity.read",
+    # -- app.api.admin --
+    "GET /api/admin/discover-tables": "table_registry.discover_preview",
+    "GET /api/admin/registry": "exempt:ui_support",
+    "GET /api/admin/registry/{table_id}/policy/columns": "exempt:ui_support",
+    "GET /api/admin/server-config": "server_config.read",
+    "GET /api/admin/server-config/overlay": "server_config.read",
+    "GET /api/admin/store/submissions": "exempt:ui_support",
+    "GET /api/admin/store/submissions/{submission_id}": "exempt:ui_support",
+    "GET /api/admin/store/submissions/{submission_id}/bundle.zip": "store.submission.bundle_downloaded",
+    # -- app.api.admin_adoption --
+    "GET /api/admin/adoption/kpis": "adoption.kpis",
+    "GET /api/admin/adoption/series": "exempt:ui_support",
+    "GET /api/admin/adoption/top-skills": "exempt:ui_support",
+    "GET /api/admin/adoption/top-users": "exempt:ui_support",
+    "GET /api/admin/adoption/users/{user_id}/kpis": "adoption.user_kpis",
+    "GET /api/admin/adoption/users/{user_id}/series": "exempt:ui_support",
+    "GET /api/admin/adoption/users/{user_id}/top-skills": "exempt:ui_support",
+    "GET /api/admin/adoption/users/{user_id}/top-tools": "exempt:ui_support",
+    # -- app.api.admin_chat --
+    "GET /admin/chat": "chat.session.admin_list",
+    "GET /admin/chat/readiness": "exempt:health",
+    "GET /admin/chat/{chat_id}/debug": "exempt:noise",
+    # -- app.api.admin_contributed_skills --
+    "GET /api/admin/contributed-skills": "exempt:ui_support",
+    # -- app.api.admin_dashboard --
+    "GET /api/admin/dashboard/signals": "exempt:ui_support",
+    # -- app.api.admin_datasource_secrets --
+    "GET /api/admin/datasource-secrets": "datasource.secret.read",
+    # -- app.api.admin_doctor --
+    "GET /api/admin/doctor/support": "exempt:health",
+    # -- app.api.admin_mcp --
+    "GET /api/admin/mcp-sources": "exempt:ui_support",
+    "GET /api/admin/mcp-sources/{source_id}": "exempt:ui_support",
+    "GET /api/admin/mcp-tools": "exempt:ui_support",
+    "GET /api/admin/mcp-tools/{tool_id}": "exempt:ui_support",
+    # -- app.api.admin_reports --
+    "GET /api/admin/reports/marketplace-digest": "reports.marketplace_digest",
+    # -- app.api.admin_sessions --
+    "GET /api/admin/sessions/facets": "exempt:ui_support",
+    "GET /api/admin/sessions/kpis": "exempt:ui_support",
+    "GET /api/admin/sessions/list": "admin.sessions_browse",
+    "GET /api/admin/sessions/{username}/{session_file}/download": "session_download",
+    "GET /api/admin/sessions/{username}/{session_file}/transcript": "session.transcript_view",
+    # -- app.api.admin_sharepoint --
+    "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
+    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map": "sharepoint_connection.corpus_map_read",
+    "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree/search": "sharepoint_connection.tree_search",
+    # -- app.api.admin_slack_secrets --
+    "GET /api/admin/slack-secrets": "slack.secret.read",
+    # -- app.api.admin_source_connections --
+    "GET /api/admin/source-connections": "exempt:ui_support",
+    "GET /api/admin/source-connections/{connection_id}": "exempt:ui_support",
+    "GET /api/admin/source-connections/{connection_id}/tables": "source_connection.tables_discover",
+    # -- app.api.admin_source_discovery --
+    "GET /api/admin/data-sources/{source_type}/tables": "source_connection.tables_discover",
+    # -- app.api.admin_sso --
+    "GET /api/admin/sso/config": "sso.config_read",
+    "GET /api/admin/sso/identities": "sso.identities_list",
+    # -- app.api.admin_upgrade_freeze --
+    "GET /api/admin/upgrade-freeze": "exempt:ui_support",
+    # -- app.api.admin_usage --
+    "GET /api/admin/telemetry/export": "usage.export",
+    # -- app.api.admin_usage_summary --
+    "GET /api/admin/telemetry/facets": "exempt:ui_support",
+    "GET /api/admin/telemetry/kpis": "exempt:ui_support",
+    "GET /api/admin/telemetry/query": "exempt:ui_support",
+    "GET /api/admin/telemetry/summary": "usage.summary",
+    # -- app.api.admin_user_sessions --
+    "GET /api/admin/users/{user_id}/activity": "admin.user_activity_read",
+    "GET /api/admin/users/{user_id}/sessions": "admin.user_sessions_read",
+    "GET /api/admin/users/{user_id}/sessions/download-all": "session_bulk_download",
+    "GET /api/admin/users/{user_id}/sessions/{session_file:path}/download": "session_download",
+    # -- app.api.agent_runtime --
+    "GET /api/v1/agents/{slug}/usage": "exempt:self",
+    "GET /api/v1/jobs/{job_id}": "exempt:noise",
+    # -- app.api.agent_schedules --
+    "GET /api/v1/agents/{slug}/schedules": "exempt:self",
+    # -- app.api.agent_sessions --
+    "GET /api/v1/sessions/{session_id}": "exempt:self",
+    "GET /api/v1/sessions/{session_id}/artifacts": "exempt:self",
+    "GET /api/v1/sessions/{session_id}/artifacts/{artifact_id}": "agent.session.artifact_download",
+    # -- app.api.agent_webhooks --
+    "GET /api/v1/agents/{slug}/webhooks": "exempt:self",
+    # -- app.api.agents_admin --
+    "GET /api/v1/agents": "exempt:self",
+    "GET /api/v1/agents/{agent_id}": "exempt:self",
+    "GET /api/v1/agents/{agent_id}/memories": "exempt:self",
+    # -- app.api.attachments --
+    "GET /api/attachments/{source}/{attachment_id}/download": "attachment.download",
+    # -- app.api.authoring_suggestions --
+    "GET /api/admin/authoring-suggestions": "exempt:ui_support",
+    "GET /api/studio/suggestions/mine": "exempt:self",
+    # -- app.api.bq_metadata_refresh --
+    "GET /api/v2/metadata-cache/status": "exempt:noise",
+    # -- app.api.broker --
+    "GET /api/broker/data-apps.git/{slug}/{path:path}": "data_app.git_fetch",
+    # -- app.api.cache_warmup --
+    "GET /api/admin/cache-warmup/status": "exempt:noise",
+    "GET /api/admin/cache-warmup/stream": "exempt:noise",
+    # -- app.api.catalog --
+    "GET /api/catalog/metrics/{metric_path:path}": "exempt:ui_support",
+    "GET /api/catalog/profile/{table_name}": "exempt:ui_support",
+    "GET /api/catalog/tables": "exempt:ui_support",
+    # -- app.api.chat --
+    "GET /api/chat/journey": "exempt:self",
+    "GET /api/chat/sessions": "exempt:self",
+    "GET /api/chat/sessions/{chat_id}/messages": "exempt:self",
+    "GET /api/chat/skills": "exempt:ui_support",
+    # -- app.api.chat_copresence --
+    "GET /api/chat/{session_id}/messages": "exempt:self",
+    # -- app.api.chat_session_files --
+    "GET /api/chat/sessions/{chat_id}/files": "exempt:self",
+    "GET /api/chat/sessions/{chat_id}/files/download": "chat.session_file.download",
+    # -- app.api.claude_md --
+    "GET /api/admin/workspace-prompt-template": "exempt:ui_support",
+    "GET /api/welcome": "exempt:ui_support",
+    # -- app.api.cli_artifacts --
+    "GET /cli/download": "exempt:static",
+    "GET /cli/install.sh": "exempt:static",
+    "GET /cli/latest": "exempt:static",
+    "GET /cli/wheel/{wheel_name}": "exempt:static",
+    # -- app.api.cli_auth --
+    "GET /cli/auth/start": "exempt:ui_support",
+    # -- app.api.collections --
+    "GET /api/collections": "exempt:ui_support",
+    "GET /api/collections/search": "collection.search",
+    "GET /api/collections/{collection_id}": "exempt:ui_support",
+    "GET /api/collections/{collection_id}/files": "exempt:ui_support",
+    "GET /api/collections/{collection_id}/files/{file_id}/preview": "collection.file_preview",
+    "GET /api/collections/{collection_id}/files/{file_id}/raw": "collection.file_download",
+    # -- app.api.config_surface --
+    "GET /api/admin/config-surface": "exempt:ui_support",
+    # -- app.api.connectors --
+    "GET /api/connectors/manifest": "exempt:ui_support",
+    "GET /api/connectors/params": "exempt:ui_support",
+    "GET /api/connectors/{slug}/prompt": "exempt:ui_support",
+    # -- app.api.cowork_bundle --
+    "GET /api/user/setup-tokens": "exempt:self",
+    # -- app.api.data --
+    "GET /api/data/{table_id}/check-access": "data.access_check",
+    "GET /api/data/{table_id}/download": "data.download",
+    # -- app.api.data_apps --
+    "GET /api/data-apps": "exempt:ui_support",
+    "GET /api/data-apps/{slug}": "exempt:ui_support",
+    "GET /api/data-apps/{slug}/logs": "data_app.logs_read",
+    "GET /api/data-apps/{slug}/readiness": "exempt:health",
+    # -- app.api.data_apps_git --
+    "GET /data-apps.git/{slug}/{path:path}": "data_app.git_fetch",
+    # -- app.api.data_apps_proxy --
+    "GET /api/data-apps-tls-check": "exempt:health",
+    "GET /apps/{slug}": "exempt:ui_support",
+    "GET /apps/{slug}/{path:path}": "exempt:noise",
+    # -- app.api.data_packages --
+    "GET /api/admin/data-packages": "exempt:ui_support",
+    "GET /api/admin/data-packages/{pkg_id}": "exempt:ui_support",
+    # -- app.api.db_state --
+    "GET /api/admin/db/job/{job_id}": "exempt:noise",
+    "GET /api/admin/db/state": "exempt:noise",
+    # -- app.api.facts --
+    "GET /api/facts/corrections": "exempt:ui_support",
+    "GET /api/facts/ingest-runs": "exempt:ui_support",
+    "GET /api/facts/{subject_id}/claims": "facts.claims",
+    # -- app.api.glossary --
+    "GET /api/glossary": "exempt:ui_support",
+    "GET /api/glossary/search": "exempt:ui_support",
+    "GET /api/glossary/{glossary_id:path}": "exempt:ui_support",
+    # -- app.api.health --
+    "GET /api/debug/throw": "exempt:noise",
+    "GET /api/health": "exempt:health",
+    "GET /api/health/detailed": "exempt:health",
+    "GET /api/version": "exempt:static",
+    # -- app.api.health_probes --
+    "GET /healthz": "exempt:health",
+    "GET /readyz": "exempt:health",
+    # -- app.api.initial_workspace --
+    "GET /api/admin/initial-workspace": "exempt:ui_support",
+    "GET /api/initial-workspace": "exempt:ui_support",
+    "GET /api/initial-workspace.zip": "initial_workspace.fetch_started",
+    # -- app.api.jira_webhooks --
+    "GET /webhooks/jira/health": "exempt:health",
+    # -- app.api.jobs --
+    "GET /api/jobs": "exempt:noise",
+    "GET /api/jobs/{job_id}": "exempt:noise",
+    # -- app.api.kai --
+    "GET /api/kai/workspace": "exempt:self",
+    # -- app.api.keboola_login_projects --
+    "GET /api/auth/keboola/projects": "exempt:self",
+    # -- app.api.keboola_semantic_layer_refresh --
+    "GET /api/admin/semantic-layer/coverage": "exempt:ui_support",
+    # -- app.api.knowledge_digests --
+    "GET /api/admin/knowledge-digests": "exempt:ui_support",
+    "GET /api/admin/knowledge-digests/{digest_id}": "exempt:ui_support",
+    # -- app.api.knowledge_search --
+    "GET /api/knowledge/artifacts/{corpus_id}/download": "knowledge.artifact_download",
+    "GET /api/knowledge/digests/{digest_id}/content": "knowledge.digest_download",
+    "GET /api/knowledge/search": "knowledge.search",
+    # -- app.api.marketplace --
+    "GET /api/marketplace/categories": "exempt:ui_support",
+    "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}": "exempt:static",
+    "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}/agent/{agent_name}": "exempt:static",
+    "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}/asset/{path:path}": "exempt:static",
+    "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}/doc/{path:path}": "exempt:static",
+    "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}/mirrored/{key:path}": "exempt:static",
+    "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}/skill/{skill_name}": "exempt:static",
+    "GET /api/marketplace/flea/{entity_id}/agent/{agent_name}": "exempt:static",
+    "GET /api/marketplace/flea/{entity_id}/detail": "exempt:ui_support",
+    "GET /api/marketplace/flea/{entity_id}/skill/{skill_name}": "exempt:static",
+    "GET /api/marketplace/items": "exempt:ui_support",
+    # -- app.api.marketplaces --
+    "GET /api/marketplaces": "exempt:ui_support",
+    "GET /api/marketplaces/{marketplace_id}/plugins": "exempt:ui_support",
+    # -- app.api.mcp_oauth_connect --
+    "GET /api/mcp/oauth-client/callback": "mcp_oauth.connect",
+    "GET /api/mcp/sources/{source_id}/oauth/authorize": "exempt:ui_support",
+    # -- app.api.mcp_passthrough --
+    "GET /api/mcp/passthrough/tools": "exempt:ui_support",
+    # -- app.api.mcp_streamable --
+    "GET /.well-known/oauth-authorization-server": "exempt:static",
+    "GET /.well-known/oauth-authorization-server/api/mcp/http": "exempt:static",
+    "GET /.well-known/oauth-protected-resource/api/mcp/http": "exempt:static",
+    "GET /.well-known/openid-configuration": "exempt:static",
+    "GET /.well-known/openid-configuration/api/mcp/http": "exempt:static",
+    "GET /api/mcp/http": "exempt:noise",
+    # -- app.api.mcp_user_secrets --
+    "GET /api/mcp/sources/{source_id}/my-secret": "mcp_user_secret.read",
+    # -- app.api.me --
+    "GET /api/me/external-identity": "exempt:self",
+    "GET /api/me/home-stats": "exempt:self",
+    # -- app.api.me_stats --
+    "GET /api/me/stats/queries": "exempt:self",
+    "GET /api/me/stats/sessions": "exempt:self",
+    "GET /api/me/stats/sync": "exempt:self",
+    "GET /api/me/stats/tokens": "exempt:self",
+    # -- app.api.memory --
+    "GET /api/memory": "exempt:ui_support",
+    "GET /api/memory/admin/audit": "memory.admin_audit_read",
+    "GET /api/memory/admin/contradictions": "exempt:ui_support",
+    "GET /api/memory/admin/duplicate-candidates": "exempt:ui_support",
+    "GET /api/memory/admin/pending": "exempt:ui_support",
+    "GET /api/memory/admin/{item_id}": "exempt:ui_support",
+    "GET /api/memory/bundle": "memory.bundle_download",
+    "GET /api/memory/domains": "exempt:ui_support",
+    "GET /api/memory/my-contributions": "exempt:self",
+    "GET /api/memory/my-votes": "exempt:self",
+    "GET /api/memory/stats": "exempt:ui_support",
+    "GET /api/memory/tree": "exempt:ui_support",
+    "GET /api/memory/{item_id}/provenance": "exempt:ui_support",
+    # -- app.api.memory_domain_suggestions --
+    "GET /api/admin/memory-domain-suggestions": "exempt:ui_support",
+    "GET /api/admin/memory-domain-suggestions/count-pending": "exempt:ui_support",
+    "GET /api/memory-domain-suggestions/mine": "exempt:self",
+    # -- app.api.memory_domains --
+    "GET /api/admin/memory-domains": "exempt:ui_support",
+    "GET /api/admin/memory-domains/{domain_id}": "exempt:ui_support",
+    # -- app.api.memory_mining --
+    "GET /api/studio/memory-mining/consent": "exempt:self",
+    # -- app.api.metadata --
+    "GET /api/admin/metadata/{table_id}": "exempt:ui_support",
+    # -- app.api.metrics --
+    "GET /api/metrics": "exempt:ui_support",
+    "GET /api/metrics/{metric_id:path}": "exempt:ui_support",
+    # -- app.api.my_stack --
+    "GET /api/my-stack": "exempt:self",
+    # -- app.api.news --
+    "GET /api/admin/news/current": "exempt:ui_support",
+    "GET /api/admin/news/draft": "exempt:ui_support",
+    "GET /api/admin/news/versions": "exempt:ui_support",
+    "GET /api/admin/news/versions/{version}": "exempt:ui_support",
+    # -- app.api.observability --
+    "GET /api/admin/observability/facets": "exempt:ui_support",
+    "GET /api/admin/observability/kpis": "exempt:ui_support",
+    "GET /api/admin/observability/views": "exempt:ui_support",
+    # -- app.api.ontology --
+    "GET /api/admin/ontology/drafts": "exempt:ui_support",
+    "GET /api/admin/ontology/drafts/{draft_id}": "exempt:ui_support",
+    # -- app.api.prompts --
+    "GET /api/admin/prompts/iwt-files": "exempt:ui_support",
+    "GET /api/admin/prompts/{kind}": "exempt:ui_support",
+    # -- app.api.recipes --
+    "GET /api/admin/recipes": "exempt:ui_support",
+    "GET /api/admin/recipes/{recipe_id}": "exempt:ui_support",
+    "GET /api/recipes": "exempt:ui_support",
+    "GET /api/recipes/{slug}": "exempt:ui_support",
+    # -- app.api.scripts --
+    "GET /api/scripts": "exempt:ui_support",
+    # -- app.api.semantic_models --
+    "GET /api/admin/semantic-models": "exempt:ui_support",
+    "GET /api/admin/semantic-models/{model_id:path}": "exempt:ui_support",
+    "GET /api/admin/semantic-sources": "exempt:ui_support",
+    "GET /api/admin/semantic-sources/{source_id}": "exempt:ui_support",
+    "GET /api/semantic-models/context": "exempt:ui_support",
+    "GET /api/semantic-models/schema": "exempt:ui_support",
+    "GET /api/semantic-models/search": "exempt:ui_support",
+    "GET /api/semantic-models/{slug}.yaml": "exempt:ui_support",
+    # -- app.api.settings --
+    "GET /api/settings": "exempt:self",
+    # -- app.api.share_requests_admin --
+    "GET /api/admin/share-requests": "exempt:ui_support",
+    # -- app.api.sharing --
+    "GET /api/sharing/groups": "exempt:ui_support",
+    "GET /api/sharing/{resource_type}/{resource_id}": "exempt:ui_support",
+    # -- app.api.stack --
+    "GET /api/stack": "exempt:self",
+    "GET /api/stack/artefacts/candidates": "exempt:self",
+    "GET /api/stack/browse": "exempt:self",
+    # -- app.api.stack_views --
+    "GET /api/data-packages/{slug}": "exempt:ui_support",
+    "GET /api/memory/domains/{slug}": "exempt:ui_support",
+    # -- app.api.store --
+    "GET /api/store/bundle.zip": "store.bundle_download",
+    "GET /api/store/categories": "exempt:ui_support",
+    "GET /api/store/entities": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}/docs/{filename}": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}/files": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}/photo": "exempt:static",
+    "GET /api/store/entities/{entity_id}/status": "exempt:ui_support",
+    "GET /api/store/owners": "exempt:ui_support",
+    # -- app.api.store_lint_admin --
+    "GET /api/admin/store/lint-findings": "exempt:ui_support",
+    # -- app.api.sync --
+    "GET /api/sync/manifest": "manifest.fetch",
+    "GET /api/sync/settings": "exempt:ui_support",
+    "GET /api/sync/status": "exempt:noise",
+    "GET /api/sync/table-subscriptions": "exempt:ui_support",
+    # -- app.api.telegram --
+    "GET /api/telegram/status": "exempt:self",
+    # -- app.api.tokens --
+    "GET /auth/admin/tokens": "token.list",
+    "GET /auth/tokens": "token.list",
+    "GET /auth/tokens/{token_id}": "token.list",
+    # -- app.api.users --
+    "GET /api/users": "exempt:ui_support",
+    "GET /api/users/{user_id}": "exempt:ui_support",
+    # -- app.api.v2_catalog --
+    "GET /api/v2/catalog": "catalog.list",
+    # -- app.api.v2_marketplace --
+    "GET /api/v2/marketplace/skills": "exempt:ui_support",
+    # -- app.api.v2_sample --
+    "GET /api/v2/sample/{table_id}": "catalog.sample",
+    # -- app.api.v2_schema --
+    "GET /api/v2/schema/{table_id}": "catalog.schema",
+    # -- app.api.welcome --
+    "GET /api/admin/welcome-template": "exempt:ui_support",
+    # -- app.auth.mcp_oauth --
+    "GET /api/mcp/oauth/consent": "exempt:ui_support",
+    # -- app.auth.providers.email --
+    "GET /auth/email/verify": "exempt:ui_support",
+    # -- app.auth.providers.google --
+    "GET /auth/google/callback": "exempt:ui_support",
+    "GET /auth/google/login": "exempt:ui_support",
+    # -- app.auth.providers.keboola --
+    "GET /auth/keboola/callback": "exempt:ui_support",
+    "GET /auth/keboola/login": "exempt:ui_support",
+    # -- app.auth.providers.microsoft --
+    "GET /auth/microsoft/callback": "exempt:ui_support",
+    "GET /auth/microsoft/login": "exempt:ui_support",
+    # -- app.auth.providers.password --
+    "GET /auth/password/change": "exempt:ui_support",
+    "GET /auth/password/reset": "exempt:ui_support",
+    "GET /auth/password/setup": "exempt:ui_support",
+    # -- app.auth.providers.sso --
+    "GET /auth/sso/callback": "exempt:ui_support",
+    "GET /auth/sso/login": "exempt:ui_support",
+    # -- app.main --
+    "GET /docs": "exempt:static",
+    "GET /openapi.json": "exempt:static",
+    "GET /redoc": "exempt:static",
+    # -- app.marketplace_server.git_router --
+    "GET /marketplace.git/{path:path}": "marketplace.git_fetch",
+    # -- app.marketplace_server.router --
+    "GET /marketplace.zip": "marketplace.bundle_download",
+    "GET /marketplace/cowork/{prefixed_name}.zip": "marketplace.bundle_download",
+    "GET /marketplace/info": "exempt:ui_support",
+    # -- app.observability.metrics --
+    "GET /metrics": "exempt:health",
+    # -- app.web.router --
+    "GET /": "exempt:ui_support",
+    "GET /_debug/throw/exc": "exempt:noise",
+    "GET /_debug/throw/http/{code:int}": "exempt:noise",
+    "GET /activity-center": "exempt:ui_support",
+    "GET /admin": "exempt:ui_support",
+    "GET /admin/access": "exempt:ui_support",
+    "GET /admin/activity": "exempt:ui_support",
+    "GET /admin/adoption": "exempt:ui_support",
+    "GET /admin/adoption/users/{user_id}": "exempt:ui_support",
+    "GET /admin/agent-prompt": "exempt:ui_support",
+    "GET /admin/contribute-skill": "exempt:ui_support",
+    "GET /admin/corporate-memory": "exempt:ui_support",
+    "GET /admin/data-packages": "exempt:ui_support",
+    "GET /admin/data-packages/new": "exempt:ui_support",
+    "GET /admin/data-packages/{package_id}": "exempt:ui_support",
+    "GET /admin/data-sources": "exempt:ui_support",
+    "GET /admin/database": "exempt:ui_support",
+    "GET /admin/datasource-credentials": "exempt:ui_support",
+    "GET /admin/grants": "exempt:ui_support",
+    "GET /admin/groups": "exempt:ui_support",
+    "GET /admin/groups/{group_id}": "exempt:ui_support",
+    "GET /admin/initial-workspace": "exempt:ui_support",
+    "GET /admin/knowledge-digests": "exempt:ui_support",
+    "GET /admin/linked-apps": "exempt:ui_support",
+    "GET /admin/linked-apps/new": "exempt:ui_support",
+    "GET /admin/marketplaces": "exempt:ui_support",
+    "GET /admin/mcp-sources": "exempt:ui_support",
+    "GET /admin/mcp-sources/new": "exempt:ui_support",
+    "GET /admin/mcp-sources/{source_id}": "exempt:ui_support",
+    "GET /admin/mcp-tools/{tool_id}/grants": "exempt:ui_support",
+    "GET /admin/news": "exempt:ui_support",
+    "GET /admin/ontology": "exempt:ui_support",
+    "GET /admin/prompts": "exempt:ui_support",
+    "GET /admin/scheduler-runs": "exempt:ui_support",
+    "GET /admin/semantic-layer": "exempt:ui_support",
+    "GET /admin/server-config": "exempt:ui_support",
+    "GET /admin/sessions": "exempt:ui_support",
+    "GET /admin/sessions/{username}/{session_file}": "exempt:ui_support",
+    "GET /admin/store": "exempt:ui_support",
+    "GET /admin/store/lint": "exempt:ui_support",
+    "GET /admin/store/submissions": "exempt:ui_support",
+    "GET /admin/store/submissions/{submission_id}": "exempt:ui_support",
+    "GET /admin/studio": "exempt:ui_support",
+    "GET /admin/studio/suggestions": "exempt:ui_support",
+    "GET /admin/studio/{domain}": "exempt:ui_support",
+    "GET /admin/sync": "exempt:ui_support",
+    "GET /admin/tables": "exempt:ui_support",
+    "GET /admin/telemetry": "exempt:ui_support",
+    "GET /admin/tokens": "exempt:ui_support",
+    "GET /admin/usage": "exempt:ui_support",
+    "GET /admin/users": "exempt:ui_support",
+    "GET /admin/users/{user_id}": "exempt:ui_support",
+    "GET /admin/workspace-prompt": "exempt:ui_support",
+    "GET /agents": "exempt:ui_support",
+    "GET /apps": "exempt:ui_support",
+    "GET /apps/detail/{slug}": "exempt:ui_support",
+    "GET /artefacts": "exempt:ui_support",
+    "GET /ask": "exempt:ui_support",
+    "GET /auth/logout": "exempt:ui_support",
+    "GET /catalog": "exempt:ui_support",
+    "GET /catalog/p/{slug}": "exempt:ui_support",
+    "GET /catalog/r/{slug}": "exempt:ui_support",
+    "GET /catalog/semantics": "exempt:ui_support",
+    "GET /catalog/t/{table_id}": "exempt:ui_support",
+    "GET /chat": "exempt:ui_support",
+    "GET /chats": "exempt:ui_support",
+    "GET /corporate-memory": "exempt:ui_support",
+    "GET /dashboard": "exempt:ui_support",
+    "GET /documentation/api": "exempt:ui_support",
+    "GET /first-time-setup": "exempt:ui_support",
+    "GET /home": "exempt:ui_support",
+    "GET /how-it-works": "exempt:ui_support",
+    "GET /install": "exempt:ui_support",
+    "GET /library": "exempt:ui_support",
+    "GET /library/{slug}": "exempt:ui_support",
+    "GET /library/{slug}/f/{file_id}": "exempt:ui_support",
+    "GET /login": "exempt:ui_support",
+    "GET /login/email": "exempt:ui_support",
+    "GET /login/password": "exempt:ui_support",
+    "GET /marketplace": "exempt:ui_support",
+    "GET /marketplace/curated/{marketplace_id}/{plugin_name}": "exempt:ui_support",
+    "GET /marketplace/curated/{marketplace_id}/{plugin_name}/agent/{agent_name}": "exempt:ui_support",
+    "GET /marketplace/curated/{marketplace_id}/{plugin_name}/skill/{skill_name}": "exempt:ui_support",
+    "GET /marketplace/flea/{entity_id}": "exempt:ui_support",
+    "GET /marketplace/flea/{entity_id}/agent/{agent_name}": "exempt:ui_support",
+    "GET /marketplace/flea/{entity_id}/edit": "exempt:ui_support",
+    "GET /marketplace/flea/{entity_id}/skill/{skill_name}": "exempt:ui_support",
+    "GET /marketplace/format-guide": "exempt:ui_support",
+    "GET /marketplace/guide/curated": "exempt:ui_support",
+    "GET /marketplace/guide/flea": "exempt:ui_support",
+    "GET /mcp-connect": "exempt:ui_support",
+    "GET /me/activity": "exempt:ui_support",
+    "GET /me/ai-connector": "exempt:ui_support",
+    "GET /me/connections": "exempt:ui_support",
+    "GET /me/cowork": "exempt:ui_support",
+    "GET /me/mcp": "exempt:ui_support",
+    "GET /me/memory-mining": "exempt:ui_support",
+    "GET /me/profile": "exempt:ui_support",
+    "GET /me/stats": "exempt:ui_support",
+    "GET /memory/d/{slug}": "exempt:ui_support",
+    "GET /news": "exempt:ui_support",
+    "GET /privacy": "exempt:ui_support",
+    "GET /profile/sessions": "exempt:ui_support",
+    "GET /profile/sessions/{filename}": "session_download",
+    "GET /semantic-layer": "exempt:ui_support",
+    "GET /semantic-layer/{slug}": "exempt:ui_support",
+    "GET /semantic-layer/{slug}/{object_id:path}": "exempt:ui_support",
+    "GET /setup": "exempt:ui_support",
+    "GET /setup-advanced": "exempt:ui_support",
+    "GET /skills": "exempt:ui_support",
+    "GET /slack/bind": "exempt:ui_support",
+    "GET /stack": "exempt:ui_support",
+    "GET /store/examples": "exempt:ui_support",
+    "GET /store/new": "exempt:ui_support",
+    "GET /{full_path:path}": "exempt:ui_support",
+}
+
+
+# ---------------------------------------------------------------------------
+# READ_SELF_AUDITING -- GET routes whose handler is a plain `def` (thread-
+# offloaded by FastAPI/Starlette to the anyio worker pool) AND already writes
+# its OWN row under the SAME action READ_POSTURE declares for it. Verified by
+# grepping every declared-action read route's handler (and its intra-module
+# helpers, transitively) for an audit write; see audit_fallback.py's module
+# docstring for why a sync handler's write is invisible to this middleware's
+# ContextVar counter. AuditFallbackMiddleware skips these routes UNCONDITIONALLY
+# on the read path -- never checks the counter for them -- because the counter
+# reading `0` is not ambiguous-but-possibly-wrong here, it is KNOWN wrong: the
+# handler always writes, just on a thread this process can't see from the
+# async side. Unlike the mutating path's `_already_covered_by_correlation_id`
+# tie-break, this is a static allow-list, not a runtime DB query -- the read path
+# must never pay a query per request (see module docstring, Task 2).
+# ---------------------------------------------------------------------------
+READ_SELF_AUDITING: frozenset[str] = frozenset(
+    {
+        "GET /api/admin/activity",
+        "GET /api/admin/activity/health",
+        "GET /api/admin/activity/sync",
+        "GET /api/admin/adoption/kpis",
+        "GET /api/admin/adoption/users/{user_id}/kpis",
+        "GET /api/admin/reports/marketplace-digest",
+        "GET /api/admin/sessions/{username}/{session_file}/download",
+        "GET /api/admin/sessions/{username}/{session_file}/transcript",
+        "GET /api/admin/telemetry/export",
+        "GET /api/admin/telemetry/summary",
+        "GET /api/admin/users/{user_id}/activity",
+        "GET /api/admin/users/{user_id}/sessions/download-all",
+        "GET /api/admin/users/{user_id}/sessions/{session_file:path}/download",
+        "GET /api/attachments/{source}/{attachment_id}/download",
+        "GET /api/facts/{subject_id}/claims",
+        "GET /api/sync/manifest",
+        "GET /api/v2/catalog",
+        "GET /api/v2/sample/{table_id}",
+        "GET /api/v2/schema/{table_id}",
+        "GET /marketplace.zip",
+        "GET /marketplace/cowork/{prefixed_name}.zip",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# WS_POSTURE -- the WebSocket surface. Keyed "WS /path/template" using the SAME
+# route-enumeration the ratchet test uses (`tests/test_audit_read_posture.py`):
+# any route Starlette exposes with no `.methods` attribute, which is every true
+# `WebSocketRoute` AND every plain ASGI `Mount` (StaticFiles, the MCP transport
+# sub-apps) -- the two are indistinguishable from `app.routes` alone, so both
+# kinds get a "WS ..." key here for the ratchet's sake.
+#
+# IMPORTANT -- declarative only, no emission wired up in this task. Unlike the
+# GET branch, `AuditFallbackMiddleware` does not (yet) intercept ASGI
+# `scope["type"] == "websocket"` connections -- this task's Files list is
+# `audit_fallback.py` + `audit_posture.py` only, and actually auditing a live
+# WebSocket would mean either wiring generic ASGI interception here (risky to
+# get right for 5 disparate handlers sight-unseen) or editing each handler
+# directly (out of this task's file list; Task 3 does exactly this for
+# `notifications.ws_connect`/`ws_rejected` on `app/api/notifications_ws.py`).
+# So every entry below is `exempt:<reason>` even where the underlying traffic
+# would, by the policy above, deserve a real action -- most notably
+# `/admin/chat/{chat_id}/tail`, which streams ANOTHER user's live chat debug
+# log to an admin and currently writes nothing for the content-viewing event
+# itself (only the ticket ISSUANCE, a separate POST, is audited, as
+# `chat.session.tail_ticket_issue`). Flagged here rather than silently folded
+# into "noise" -- a real follow-up (generic WS-aware middleware, or a bespoke
+# `log_safe` call in `admin_tail`, mirroring Task 3's notifications-WS work)
+# should close it.
+# ---------------------------------------------------------------------------
+WS_POSTURE: dict[str, str] = {
+    # -- app.api.admin_chat -----------------------------------------------------
+    # TODO(follow-up): another user's live chat content, currently unaudited --
+    # see the module-docstring note above.
+    "WS /admin/chat/{chat_id}/tail": "exempt:noise",
+    # -- app.api.chat / app.api.chat_copresence ----------------------------------
+    # Deliberately not auditing chat message CONTENT (policy, not a gap -- see the
+    # wave 2 plan's self-review notes); both streams are owner/participant-scoped.
+    "WS /api/chat/sessions/{chat_id}/stream": "exempt:self",
+    "WS /api/chat/sessions/{session_id}/join": "exempt:self",
+    # -- app.api.mcp_streamable / app.api.mcp_sse --------------------------------
+    # Transport-level mounts; the actual tool invocations they carry are audited
+    # per-call elsewhere (`mcp.tool_call`, `mcp.passthrough_call`).
+    "WS /api/mcp": "exempt:noise",
+    "WS /api/mcp/http": "exempt:noise",
+    # -- app.api.notifications_ws -------------------------------------------------
+    # Caller's own notification channel; Task 3 adds real connect/reject actions.
+    "WS /api/notifications/ws": "exempt:self",
+    # -- app.api.data_apps_proxy --------------------------------------------------
+    # Proxied data-app traffic bridge. Task 3's throttled `data_app.access` at the
+    # SUBDOMAIN ingress (`app/data_apps_subdomain.py`) is the intended
+    # instrumentation point for "who used which data app" -- auditing every frame
+    # of this raw bridge too would both double-count and flood (no throttle here).
+    "WS /apps/{slug}/{path:path}": "exempt:noise",
+    # -- static asset mounts --------------------------------------------------------
+    "WS /static": "exempt:static",
+    "WS /uploads": "exempt:static",
+}
+
+
+def declared_read_action(method: str, path_template: str, *, posture: dict[str, str] | None = None) -> str | None:
+    """The read-side sibling of `declared_action()`: the cataloged action a GET
+    or WebSocket route declares, or `None` (exempt, or undeclared).
+
+    Defaults to `READ_POSTURE`; pass `posture=WS_POSTURE` for a WebSocket lookup.
+    """
+    table = READ_POSTURE if posture is None else posture
+    value = table.get(f"{method} {path_template}")
+    if value is None or value.startswith("exempt:"):
+        return None
+    return value
