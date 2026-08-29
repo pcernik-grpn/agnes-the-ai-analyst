@@ -136,7 +136,9 @@ POSTURE: dict[str, str] = {
     "PUT /api/admin/mcp-tools/{tool_id}/projection-map": "mcp_tool.projection_map",
     # -- app.api.admin_sharepoint ----------------------------------------------
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "fallback",
+    "POST /api/admin/sharepoint/connections/{connection_id}/extract": "fallback",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "fallback",
+    "POST /api/admin/sharepoint/extraction/run-due": "fallback",
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
