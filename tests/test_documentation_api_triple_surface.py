@@ -684,6 +684,19 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/knowledge/digests": (
+        "enumerating maintained digests for a WEB surface (TCRD-250). Both "
+        "other surfaces already RECEIVE digests by a better route than a "
+        "list call: `agnes pull` writes every granted digest to "
+        "`.claude/rules/ka_<slug>.md` from the manifest "
+        "(app/api/sync.py::_digest_entries), and a chat agent therefore "
+        "reads them as files already in its sandbox rather than by calling "
+        "a tool. This route exists only because a browser cannot read that "
+        "directory — it is the enumeration a page needs, not an analyst "
+        "query. Same reasoning as the grandfathered GET "
+        "/api/facts/ingest-runs. The digest CONTENT endpoint it pairs with "
+        "is itself grandfathered, and is what `agnes pull` calls"
+    ),
     "/api/v1/agents/{slug}/delegate": (
         "Track C7 (@delegation MVP) — sandbox-internal RPC, reachable only "
         "by a live agent turn's own in-process delegation tool "

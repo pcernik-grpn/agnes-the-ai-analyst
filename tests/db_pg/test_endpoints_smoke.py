@@ -3157,6 +3157,12 @@ KNOWN_UNTESTED = {
     # caller cannot see is absent, agreement with search()); not duplicated
     # here.
     "GET /api/facts/type-map",
+    # The maintained digests a caller can read (TCRD-250) — covered by
+    # tests/test_api_knowledge_digests_distribution.py::TestAnalystDigestList
+    # (401, RBAC both ways, never-generated omitted, staleness, no markdown
+    # in the list, and agreement with the sync manifest for the same
+    # caller); not duplicated here.
+    "GET /api/knowledge/digests",
 }
 
 

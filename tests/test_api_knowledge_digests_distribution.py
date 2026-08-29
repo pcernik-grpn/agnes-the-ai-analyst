@@ -290,3 +290,91 @@ class TestDigestContentEndpoint:
         resp = c.get(f"/api/knowledge/digests/{did}/content", headers=_auth(analyst))
         assert resp.status_code == 200, resp.text
         assert resp.json()["id"] == did
+
+
+class TestAnalystDigestList:
+    """``GET /api/knowledge/digests`` — the enumeration a web surface needs
+    (TCRD-250).
+
+    The content endpoint and the pulled `.claude/rules/ka_<slug>.md` files
+    have existed since K4; what was missing was any way to LIST what a caller
+    can read, so a page could not show which digests exist without already
+    knowing an id.
+
+    The contract that matters: this list and the sync manifest share one
+    predicate, so a caller can never be offered a digest in the browser that
+    `agnes pull` would refuse them (or the reverse).
+    """
+
+    def test_unauthenticated_is_401(self, seeded_app):
+        assert seeded_app["client"].get("/api/knowledge/digests").status_code == 401
+
+    def test_admin_sees_a_generated_digest(self, seeded_app):
+        c, admin = seeded_app["client"], seeded_app["admin_token"]
+        did = _create_digest()
+        _generate(did)
+        r = c.get("/api/knowledge/digests", headers=_auth(admin))
+        assert r.status_code == 200, r.text
+        assert [d["slug"] for d in r.json()["digests"]] == ["arch-overview"]
+
+    def test_a_never_generated_digest_is_never_listed(self, seeded_app):
+        """Listing it would promise a page that 404s — the content endpoint
+        returns 404 for an empty `output_md`. Same rule as the manifest."""
+        c, admin = seeded_app["client"], seeded_app["admin_token"]
+        _create_digest(slug="pending-one", title="Not yet run")
+        r = c.get("/api/knowledge/digests", headers=_auth(admin))
+        assert r.json()["digests"] == []
+
+    def test_an_ungranted_analyst_sees_nothing(self, seeded_app):
+        c = seeded_app["client"]
+        did = _create_digest()
+        _generate(did)
+        r = c.get("/api/knowledge/digests", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 200, r.text
+        assert r.json()["digests"] == []
+
+    def test_a_granted_analyst_sees_it(self, seeded_app):
+        c = seeded_app["client"]
+        did = _create_digest()
+        _generate(did)
+        _grant_analyst(did)
+        r = c.get("/api/knowledge/digests", headers=_auth(seeded_app["analyst_token"]))
+        assert [d["slug"] for d in r.json()["digests"]] == ["arch-overview"]
+
+    def test_the_list_agrees_with_the_manifest_for_the_same_caller(self, seeded_app):
+        """The contract this endpoint exists to keep. Both sides filter with
+        `_caller_can_read_digest`; if they ever diverge, a reader is offered
+        something `agnes pull` will not give them."""
+        c = seeded_app["client"]
+        granted = _create_digest(slug="granted-one", title="Granted")
+        _generate(granted)
+        _grant_analyst(granted)
+        withheld = _create_digest(slug="withheld-one", title="Withheld")
+        _generate(withheld)
+
+        headers = _auth(seeded_app["analyst_token"])
+        listed = {d["slug"] for d in c.get("/api/knowledge/digests", headers=headers).json()["digests"]}
+        manifest = c.get("/api/sync/manifest", headers=headers).json()
+        in_manifest = {
+            e["slug"] for e in manifest.get("knowledge_artifacts", []) if e.get("kind") == "digest"
+        }
+        assert listed == in_manifest == {"granted-one"}
+
+    def test_staleness_travels_so_a_stale_digest_is_visibly_stale(self, seeded_app):
+        c, admin = seeded_app["client"], seeded_app["admin_token"]
+        did = _create_digest()
+        _generate(did)
+        _mark_stale(did, reason="LLM timeout")
+        (row,) = c.get("/api/knowledge/digests", headers=_auth(admin)).json()["digests"]
+        assert row["status"] == "stale"
+        assert row["status_reason"] == "LLM timeout"
+
+    def test_the_markdown_itself_is_not_in_the_list(self, seeded_app):
+        """A list is a list. The body stays behind the per-digest content
+        endpoint, which audits each read."""
+        c, admin = seeded_app["client"], seeded_app["admin_token"]
+        did = _create_digest()
+        _generate(did, output_md="# Secret heading\n\nBody.")
+        body = c.get("/api/knowledge/digests", headers=_auth(admin)).text
+        assert "output_md" not in body
+        assert "Secret heading" not in body
