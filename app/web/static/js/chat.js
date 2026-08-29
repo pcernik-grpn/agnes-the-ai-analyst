@@ -261,6 +261,115 @@ function showToast(text, kind = "ok", { durationMs = 2400 } = {}) {
   setTimeout(dismiss, durationMs);
 }
 
+/** Instant, styled tooltips for icon-only controls (`data-tip="..."`).
+ *
+ *  Replaces the native `title` attribute on the session-files drawer's
+ *  actions. `title` has a ~1s browser delay, cannot be styled, and cannot be
+ *  shown on keyboard focus — so the one sentence explaining what an icon
+ *  does was, in practice, unreachable. That mattered most AFTER saving a
+ *  file, where "open in Library" lived only in a `title` nobody saw.
+ *
+ *  The tooltip node is a single element on `document.body`, positioned
+ *  `fixed`. It has to be: `.cloud-chat-files-list` is `overflow-y: auto`, so
+ *  a tooltip rendered inside a row would be clipped by its own scroll
+ *  container. Listeners are delegated from `document` because the file list
+ *  is re-rendered on every refresh — per-node binding would leak and would
+ *  miss rows added later.
+ *
+ *  Accessibility: the trigger keeps its own `aria-label` as its accessible
+ *  name; while visible the tooltip is also wired up via `aria-describedby`,
+ *  and it appears on `:focus-visible`, so a keyboard user gets what a mouse
+ *  user gets. */
+/** Where a tooltip bubble goes, as pure geometry — no DOM, so the flip and
+ *  clamp rules are testable without jsdom.
+ *
+ *  `rect` is the trigger's viewport rect, `tip` the bubble's measured size,
+ *  `view` the viewport. Returns `{top, left, below}`. Above is preferred; it
+ *  flips below only when the bubble would not clear the top margin, and the
+ *  horizontal centre is clamped so a control near either edge still shows a
+ *  fully on-screen bubble. */
+function _tipPosition(rect, tip, view, { offset = 8, margin = 8 } = {}) {
+  const below = rect.top - tip.height - offset < margin;
+  const top = below ? rect.bottom + offset : rect.top - tip.height - offset;
+  const centred = rect.left + rect.width / 2 - tip.width / 2;
+  const left = Math.max(margin, Math.min(centred, view.width - tip.width - margin));
+  return { top: Math.round(top), left: Math.round(left), below };
+}
+
+const Tip = (() => {
+  let node = null;
+  let trigger = null;
+
+  function ensure() {
+    if (node) return node;
+    node = document.createElement("div");
+    node.className = "ds-tip";
+    node.id = "ds-tip";
+    node.setAttribute("role", "tooltip");
+    node.hidden = true;
+    document.body.appendChild(node);
+    return node;
+  }
+
+  function place(el) {
+    const { top, left, below } = _tipPosition(
+      el.getBoundingClientRect(),
+      node.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight }
+    );
+    node.style.top = `${top}px`;
+    node.style.left = `${left}px`;
+    node.classList.toggle("is-below", below);
+  }
+
+  function show(el) {
+    const text = el.getAttribute("data-tip");
+    if (!text) return;
+    ensure();
+    trigger = el;
+    node.textContent = text;
+    node.hidden = false;
+    el.setAttribute("aria-describedby", "ds-tip");
+    place(el);
+  }
+
+  function hide() {
+    if (!node || node.hidden) return;
+    node.hidden = true;
+    if (trigger) trigger.removeAttribute("aria-describedby");
+    trigger = null;
+  }
+
+  function bind() {
+    document.addEventListener("mouseover", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (!el || el === trigger) return;
+      show(el);
+    });
+    document.addEventListener("mouseout", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el && el === trigger) hide();
+    });
+    document.addEventListener("focusin", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el) show(el);
+    });
+    document.addEventListener("focusout", hide);
+    // A tooltip anchored to a rect that has since moved is worse than none,
+    // so any scroll or resize retires it rather than trying to re-follow.
+    document.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    document.addEventListener("click", hide, true);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") hide();
+    });
+  }
+
+  return { bind, hide };
+})();
+
+Tip.bind();
+
 /** Set the title strip above the messages area. Pass ``null`` to
  *  hide it (empty-state / new-chat shell), pass a string to show it.
  *  Long titles ellipsis via CSS. */
@@ -5810,7 +5919,7 @@ function renderCoPresence(host, participants) {
     const name = document.createElement("span");
     name.className = "cloud-chat-files-name";
     name.textContent = f.name;
-    name.title = f.path;
+    name.setAttribute("data-tip", f.name);
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
     // Engine listings carry no mtime (modified_at is null) — skip the segment
@@ -5840,7 +5949,7 @@ function renderCoPresence(host, participants) {
     const dl = document.createElement("a");
     dl.className = "cloud-chat-files-btn";
     dl.innerHTML = ICON_DOWNLOAD;
-    dl.title = "Download";
+    dl.setAttribute("data-tip", "Download a copy");
     dl.setAttribute("aria-label", "Download " + f.name);
     dl.href =
       "/api/chat/sessions/" + encodeURIComponent(chatId) +
@@ -5851,7 +5960,7 @@ function renderCoPresence(host, participants) {
     save.type = "button";
     save.className = "cloud-chat-files-btn";
     save.innerHTML = ICON_SAVE;
-    save.title = "Save to Library — it outlives this session";
+    save.setAttribute("data-tip", "Save to Library — it outlives this session");
     save.setAttribute("aria-label", "Save " + f.name + " to Library");
     save.addEventListener("click", async () => {
       save.disabled = true;
@@ -5871,12 +5980,21 @@ function renderCoPresence(host, participants) {
           const link = document.createElement("a");
           link.className = "cloud-chat-files-btn";
           link.innerHTML = ICON_IN_LIBRARY;
-          link.title = "Saved — open in Library";
+          link.setAttribute("data-tip", "Open in your Library");
           link.setAttribute("aria-label", "Saved to Library — open");
           link.href = data.library_url || "/library";
           link.target = "_blank";
           link.rel = "noopener";
           save.replaceWith(link);
+          // Record the outcome IN THE ROW, not only in a toast that expires
+          // and an icon that explains itself only on hover. This is the
+          // "co se stalo a kam" half of TCRD-212: a reader returning to the
+          // drawer a minute later can still see which files they kept.
+          const saved = document.createElement("span");
+          saved.className = "cloud-chat-files-saved";
+          saved.textContent = "Saved to Library";
+          meta.appendChild(saved);
+          li.classList.add("is-saved");
           showToast("Saved to your Library", "ok");
         } else {
           let msg = "Could not save to Library.";

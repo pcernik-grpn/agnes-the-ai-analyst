@@ -4301,3 +4301,70 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   font-size: var(--text-xs);
   color: var(--ds-text-secondary);
 }
+
+/* ── Instant tooltips for icon-only controls (TCRD-212) ──────────────────────
+   Driven by `data-tip` and the `Tip` helper in chat.js. Lives on document.body
+   at `position: fixed` because `.cloud-chat-files-list` scrolls, and anything
+   drawn inside a row would be clipped by that scroll container.
+
+   Colour is an INVERSION of the page's own text/surface pair rather than a
+   picked value: `--ds-text-primary` is by definition legible against
+   `--ds-surface`, so using one as the other's background is contrast-correct
+   in the paper, blue, navy and dark themes alike, and cannot repeat the
+   white-on-white failure of DES-134. Compact and arrow-less so it reads as a
+   tooltip rather than a popover — the second half of that finding. */
+.ds-tip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 260px;
+  padding: 0.3rem 0.5rem;
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-text-primary);
+  color: var(--ds-surface);
+  font-family: var(--ds-font);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  text-align: center;
+  box-shadow: var(--ds-shadow-md);
+  pointer-events: none;
+  animation: ds-tip-in 90ms var(--ds-ease-enter);
+}
+
+.ds-tip[hidden] {
+  display: none;
+}
+
+@keyframes ds-tip-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.ds-tip.is-below {
+  animation-name: ds-tip-in-below;
+}
+
+@keyframes ds-tip-in-below {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-tip { animation: none; }
+}
+
+/* A saved file says so in the row itself, permanently — a toast expires and a
+   swapped icon only explains itself on hover (TCRD-212). */
+.cloud-chat-files-saved {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  margin-top: 0.2rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--ds-accent-success-line);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-accent-success-bg);
+  color: var(--ds-accent-success-ink);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  line-height: 1.5;
+}
