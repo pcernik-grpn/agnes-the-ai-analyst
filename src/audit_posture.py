@@ -1181,19 +1181,18 @@ READ_SELF_AUDITING: frozenset[str] = frozenset(
 # that entry below carries the real action since the handler emits it itself,
 # independent of this map). Every OTHER entry is `exempt:<reason>` even where
 # the underlying traffic would, by the policy above, deserve a real action --
-# most notably `/admin/chat/{chat_id}/tail`, which streams ANOTHER user's live
-# chat debug log to an admin and currently writes nothing for the content-viewing event
-# itself (only the ticket ISSUANCE, a separate POST, is audited, as
-# `chat.session.tail_ticket_issue`). Flagged here rather than silently folded
-# into "noise" -- a real follow-up (generic WS-aware middleware, or a bespoke
-# `log_safe` call in `admin_tail`, mirroring Task 3's notifications-WS work)
-# should close it.
+# `/admin/chat/{chat_id}/tail` -- which streams ANOTHER user's live chat debug
+# log to an admin -- carries a real action for the same reason: its handler
+# emits `chat.session.tail_view` on accept and `chat.session.tail_rejected` on
+# a refused ticket. The ticket ISSUANCE (a separate POST) is audited too, but
+# it only proves permission was granted; these rows prove it was used.
 # ---------------------------------------------------------------------------
 WS_POSTURE: dict[str, str] = {
     # -- app.api.admin_chat -----------------------------------------------------
-    # TODO(follow-up): another user's live chat content, currently unaudited --
-    # see the module-docstring note above.
-    "WS /admin/chat/{chat_id}/tail": "exempt:noise",
+    # Another user's live chat content: the handler emits this itself (plus
+    # `chat.session.tail_rejected` on a refused ticket), independent of this
+    # map -- the middleware never intercepts websocket scopes.
+    "WS /admin/chat/{chat_id}/tail": "chat.session.tail_view",
     # -- app.api.chat / app.api.chat_copresence ----------------------------------
     # Deliberately not auditing chat message CONTENT (policy, not a gap -- see the
     # wave 2 plan's self-review notes); both streams are owner/participant-scoped.

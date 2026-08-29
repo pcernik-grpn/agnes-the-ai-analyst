@@ -1029,6 +1029,20 @@ CATALOG: dict[str, AuditEvent] = {
         "A notifications WebSocket connection attempt was refused "
         "(bad/expired token, malformed handshake, or over the per-user cap).",
     ),
+    # -- Wave 2 — admin chat tail (the WS gap Task 2 flagged rather than
+    # folding into "noise"; closed here) --------------------------------------
+    "chat.session.tail_view": AuditEvent(
+        "chat.session.tail_view",
+        "read",
+        "An admin started streaming another user's live chat log. Distinct "
+        "from chat.session.tail_ticket_issue, which records only that "
+        "permission was granted — this row records that it was used.",
+    ),
+    "chat.session.tail_rejected": AuditEvent(
+        "chat.session.tail_rejected",
+        "system",
+        "A live-chat-log stream was refused (invalid or expired ticket).",
+    ),
 }
 
 
