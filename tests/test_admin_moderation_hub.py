@@ -138,6 +138,21 @@ def test_empty_state_when_nothing_awaiting(web_client, monkeypatch):
     assert "No verification requests waiting." in r.text
 
 
+def test_empty_queue_uses_the_shared_empty_state(web_client, monkeypatch):
+    """TCRD-207: an empty moderation queue is EMPTY on the shared vocabulary
+    (macros/_state.html) — distinct from the feature-disabled banner above it,
+    which is a config gate, not one of the four states, and keeps its own
+    plain `.empty-state` copy (see the Postgres-backend assertion elsewhere
+    in this file)."""
+    _enable_verification(monkeypatch)
+    _, admin_cookies = _create_admin(web_client)
+    r = web_client.get("/admin/store", cookies=admin_cookies)
+    body = r.text
+    block = body[body.index("No verification requests waiting.") - 600 :]
+    assert 'data-state-kind="empty"' in block
+    assert "state-panel--neutral" in block
+
+
 def test_agent_share_requests_zone_disabled_on_duckdb_backend(web_client):
     """Track C6's approval queue is PG-only (A3 ratchet) — on this DuckDB-
     backed fixture the zone must say so rather than 501ing the whole page

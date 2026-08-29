@@ -899,6 +899,11 @@ async function loadSidebar() {
   }
   const empty = $("cloud-chat-empty-state");
   if (empty) empty.hidden = list.length > 0;
+  // A successful load clears a FAILED state left over from an earlier
+  // attempt (TCRD-207/DES-153) — reaching this line means the fetch above
+  // resolved, so whatever was wrong before no longer is.
+  const failed = $("cloud-chat-failed-state");
+  if (failed) failed.hidden = true;
   // The rail's section chrome (reveal Pinned once it has rows, stand Chats down
   // when everything is pinned, re-apply each section's persisted open state) has
   // ONE owner — rail_history.js, loaded on every rail page including this one.
@@ -6283,16 +6288,25 @@ function renderCoPresence(host, participants) {
     _composer.focus();
   }
   // Sidebar list — a failed fetch must not break the page: the history list
-  // shows its empty state, the dashboard renders its suggestions without
-  // the personalized resume row (partial data), and boot continues (deep
-  // links + onboarding still work).
+  // shows its FAILED state (never the empty one — TCRD-207/DES-153), the
+  // dashboard renders its suggestions without the personalized resume row
+  // (partial data), and boot continues (deep links + onboarding still work).
   let _sidebarOk = true;
   try {
     await loadSidebar();
   } catch (_) {
     _sidebarOk = false;
     const empty = $("cloud-chat-empty-state");
-    if (empty) empty.hidden = false;
+    if (empty) empty.hidden = true;
+    const failed = $("cloud-chat-failed-state");
+    if (failed) {
+      failed.hidden = false;
+      const retryBtn = failed.querySelector("[data-state-retry]");
+      if (retryBtn && !retryBtn._wired) {
+        retryBtn._wired = true;
+        retryBtn.addEventListener("click", () => loadSidebar().catch(() => {}));
+      }
+    }
   }
   updateDashboardSuggestions(_sidebarOk ? _sessionsCache : null);
   // Sidebar cache (_sessionsCache) is now populated so openSession can

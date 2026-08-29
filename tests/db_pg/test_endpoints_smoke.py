@@ -3098,6 +3098,16 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestCertificateMetadata; not
     # duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate",
+    # Extraction enqueue wiring (TCRD-226) — enqueues into the EXISTING
+    # `jobs` table (both backends) via the existing `jobs_repo()`/
+    # `source_connections_repo()` factories; no new schema surface to
+    # verify per-backend. Auth matrix, 404-before-work, the feature-usable
+    # gate, duplicate-run dedup, exact payload shape, and the sweep's
+    # due-check/no-op paths are all covered by
+    # tests/test_admin_sharepoint.py::TestExtractionTrigger /
+    # TestExtractionRunDue; not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extract",
+    "POST /api/admin/sharepoint/extraction/run-due",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

@@ -1,0 +1,76 @@
+{# ─────────────────────────────────────────────────────────────────────
+   Shared "nothing to show" vocabulary — one component for the four states
+   a list/detail surface can be in, per
+   docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md:
+
+     nothing_found  a query/filter ran and matched zero rows
+     empty          the collection itself has zero rows (no query involved)
+     blocked        the DISCLOSED case only — the caller already knows this
+                     resource exists and cannot see it. The default,
+                     UNDISCLOSED case (an access denial nobody should be able
+                     to distinguish from absence) renders as `nothing_found`,
+                     never `blocked` — see the spec's security call before
+                     reaching for this kind on a new surface.
+     failed         the request did not complete (network/5xx/timeout).
+                     Never let a caught exception fall through into `empty`
+                     or `nothing_found` — that is the exact collapse this
+                     component exists to end.
+
+   CSS is global (like `_components.html`'s `ds.*`) — `state_panel.css` is
+   loaded from `base_ds.html` on every page, so a caller only imports this
+   file for the markup; there is no `styles()` macro to remember to call.
+
+   Usage:
+
+     {% import "macros/_state.html" as state %}
+
+     {{ state.panel('empty', 'Your library is empty',
+                    body='Use + Add to upload a file.',
+                    cta_label='Upload a file', cta_attrs='data-new-upload') }}
+
+     {{ state.panel('failed', "Couldn't load your conversations",
+                    body='The request did not complete.',
+                    cta_label='Retry', cta_attrs='data-state-retry',
+                    compact=True, id='cloud-chat-failed-state', hidden=True) }}
+
+   `cta_href` renders an <a>; `cta_attrs` (a raw string of extra attributes,
+   e.g. a `data-*` hook for a click handler) renders a <button type="button">
+   instead. Supply at most one. #}
+
+{% macro _icon(kind) %}
+{%- if kind == 'nothing_found' -%}
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3" stroke-linecap="round"/></svg>
+{%- elif kind == 'blocked' -%}
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 018 0v4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+{%- elif kind == 'failed' -%}
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3.5l9.5 16.5H2.5L12 3.5Z" stroke-linejoin="round"/><path d="M12 10v4M12 17.2h.01" stroke-linecap="round"/></svg>
+{%- else -%}
+{#- 'empty' (default): an inbox tray — the neutral "nothing here yet" glyph. -#}
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 12h4l1.5 3h5L16 12h4" stroke-linecap="round" stroke-linejoin="round"/><path d="M5.5 6h13L20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6L5.5 6Z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+{%- endif -%}
+{% endmacro %}
+
+{% macro panel(kind, title, body=None, cta_label=None, cta_href=None, cta_attrs=None, id=None, hidden=False, compact=False, icon=None) %}
+{%- set tone = 'warn' if kind == 'blocked' else ('danger' if kind == 'failed' else 'neutral') -%}
+<div class="state-panel state-panel--{{ tone }}{% if compact %} state-panel--compact{% endif %}"
+     data-state-kind="{{ kind }}"
+     {% if id %}id="{{ id }}"{% endif %}
+     {% if hidden %}hidden{% endif %}>
+  <span class="state-panel__icon" aria-hidden="true">{{ _icon(icon or kind) }}</span>
+  <div class="state-panel__body">
+    <p class="state-panel__title">{{ title }}</p>
+    {% if body %}<p class="state-panel__text">{{ body }}</p>{% endif %}
+  </div>
+  {% if cta_label %}
+    {% if cta_href %}
+    <a class="state-panel__cta cc-btn" href="{{ cta_href }}">{{ cta_label }}</a>
+    {% else %}
+    <button type="button" class="state-panel__cta cc-btn" {{ (cta_attrs or '') | safe }}>{{ cta_label }}</button>
+    {% endif %}
+  {% endif %}
+</div>
+{% endmacro %}
+
+{# CSS lives in app/web/static/css/state_panel.css, loaded globally from
+   base_ds.html — see that file for the tone rules (three tones, not four
+   states — `blocked` is the disclosed exception only). #}

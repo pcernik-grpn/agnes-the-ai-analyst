@@ -133,3 +133,30 @@ def test_db_endpoint_triggers_record_query(app_with_toolbar, monkeypatch):
     assert counter["calls"] > 0, (
         "record_query was not invoked; src/db.py is not handing out an InstrumentedConnection under DEBUG=1"
     )
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, False),
+        # TCRD-247: LOCAL_DEV_MODE alone must NOT arm the toolbar. It used to
+        # imply DEBUG, so every local-dev server profiled every request and
+        # /library — the heaviest template in the product — took minutes while
+        # /api/version stayed instant, which reads as a DB or template problem
+        # rather than a middleware one.
+        ({"LOCAL_DEV_MODE": "1"}, False),
+        ({"DEBUG": "1"}, True),
+        ({"DEBUG": "1", "LOCAL_DEV_MODE": "1"}, True),
+        ({"DEBUG": "0", "LOCAL_DEV_MODE": "1"}, False),
+    ],
+)
+def test_toolbar_requires_explicit_debug_opt_in(monkeypatch, env, expected):
+    """The toolbar is opt-in via DEBUG only — never implied by another flag."""
+    import app.main as main_mod
+
+    for name in ("DEBUG", "LOCAL_DEV_MODE"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert main_mod._debug_enabled() is expected

@@ -217,6 +217,13 @@ fact_aliases fact_id TEXT NOT NULL FK→facts ON DELETE CASCADE
              natural_key TEXT NOT NULL     -- producer slug, e.g. 'myers-emergency-power-systems'
              UNIQUE (type, natural_key)
 
+fact_alias_sources                         -- NEW PG-only table (§4/§5, S9, 2026-08-29):
+             type TEXT NOT NULL FK→fact_aliases(type, natural_key)   -- per-corpus provenance
+             natural_key TEXT NOT NULL         ON DELETE CASCADE     -- for the SAME alias string
+             corpus_id TEXT NOT NULL
+             PK (type, natural_key, corpus_id) -- insert-only; grows as more corpora
+                                                -- independently re-derive the same string
+
 edges        id TEXT PK                    -- 'e_' + token_hex(8)
              src TEXT NOT NULL FK→facts ON DELETE CASCADE
              dst TEXT NOT NULL FK→facts ON DELETE CASCADE
@@ -311,6 +318,8 @@ attrs(subject)   := per-key projection over the subject's OWN readable claims on
                     – equal dates with differing values → the key is returned as
                       conflicted: {values: [...], claims: [...]} — never silently picked;
                     – a dated claim beats an undated one; two undated ones conflict.
+aliases(fact)    := { alias ∈ fact.aliases | ∃ corpus ∈ alias.provenance : corpus ∈ readable }
+                    (fact carries an active `revealed` correction ⇒ every alias, see below)
 ```
 
 Nothing a caller receives is ever computed from a claim they cannot read —
@@ -323,6 +332,26 @@ only a FACT's EXISTENCE gate, never its projections: an endpoint-only fact
 unchanged — an edge's own claims only, never inferred from its endpoints
 (§5 rule 3 / S3). `all_evidence` hides strictly more **within one grant
 snapshot**; it is not a general monotonic guarantee (grant drift, §13).
+
+**Alias visibility (review tightening, 2026-08-29 — S9).** A fact's
+EXISTENCE gate is the union above — own claims OR an incident edge's claim
+— so a fact can be visible to a caller purely on the strength of ONE
+readable claim while carrying other, unrelated claims from collections the
+caller cannot read. `fact_aliases.natural_key` is a producer-minted string
+— it can name the fact (client, person, engagement) using content the
+caller never sees. Showing it unconditionally once the fact is visible at
+all reopens exactly the oracle S2 closes for `attrs`, just for the display
+name instead of a key/value. Each alias therefore carries its OWN
+provenance — the corpus(es) whose evidence actually established that exact
+string (`fact_alias_sources`, distinct from "any corpus with a claim on
+the fact") — and is shown only when the caller can read at least one of
+them, or the fact carries an active `revealed` correction (same
+instance-wide bypass `attrs` already gets). A fact visible with zero
+readable aliases still serves its opaque subject id as a usable identity —
+never a 404, same as an endpoint-only fact's empty `attrs`. `q` free-text
+matching (§12) is bound by the SAME rule: a query string may only match an
+alias the caller can see, otherwise the match itself becomes an oracle for
+a restricted name's existence via hit count or rank position.
 
 **Admin corrections** (each with reason → `audit_log`):
 
@@ -427,8 +456,9 @@ with content). Metadata-only rows carry a *provisional* doc_id
     id** — including a manual path re-upload of a crawler-anchored file, so
     a hand upload can no longer cascade a document's claims away. Unchanged
     sha → skip re-chunking entirely; changed → purge chunks + reset
-    `processing_status` on the same row. In-place update purges zip-bundle
-    children exactly as today's purge walk does;
+    `processing_status` on the same row. **In-place update on a bundle
+    (zip archive) row leaves its zip-bundle children ALONE** — reconciling
+    them is `ingest_bundle`'s own job (below), not this purge's;
   – **frozen-pair obligation**: the update-in-place methods land in
     `corpus_files.py` AND `corpus_files_pg.py` with the contract test
     extended — this PR touches a maintained pair, unlike the facts PR;
@@ -436,6 +466,17 @@ with content). Metadata-only rows carry a *provisional* doc_id
     (the mapping table is PG-only); omitting it keeps today's flow intact.
 - Ingest (§7) refuses a claim whose `doc` reference cannot be resolved
   through this mapping.
+- **RESOLVED (zip-member citability follow-up):** each member `ingest_bundle`
+  unpacks from an archive gets its OWN `corpus_file_sources` anchor —
+  `source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>` — written (best-effort, no-op on
+  DuckDB) once the member's own row is matched/created, so a claim can cite
+  the exact member instead of only the archive, and the member's id (hence
+  its claims) survives a re-sync of the archive exactly like a top-level
+  file's does. The `!` separator cannot collide with a real
+  producer-supplied top-level `source_stable_id` (`graph:…`/`local:…` never
+  start with `cf_`, the fixed `corpus_files.id` prefix). See
+  `src/ingest/bundle.py::_member_stable_id`.
 
 Lifecycle:
 
@@ -450,7 +491,9 @@ The orphan-subject sweep runs as its own step **after any batch of
 `corpus_files` deletions** — ingest-driven or UI-driven (an admin deleting a
 file from a collection cascades claims exactly the same way) — and equally
 after a **content replace**, which deletes claims without deleting the row
-(and hard-deletes the row's zip-bundle children, whose claims cascade). Never
+(a replaced BUNDLE row's own zip-bundle children are left for
+`ingest_bundle`'s own narrower reconciliation to sweep — only the members
+that actually changed or disappeared, never the whole set). Never
 inside the deleting transaction. Its counts land in the run report or, for UI
 deletions, on the source card, attributed to the operation that triggered
 them. Edges sweep first, so by the time the fact sweep runs every surviving
@@ -576,7 +619,14 @@ when a provisional metadata-only id is replaced by the content id). Evidence
 `doc_id` resolves `→ corpus_file_sources.source_doc_id → corpus_file_id`.
 The `documents` array may be omitted **only** when every referenced `doc_id`
 already resolves; otherwise the batch is rejected with the unresolved ids
-itemized.
+itemized. **RESOLVED (zip-member citability follow-up):** this resolution is
+identity-agnostic — a zip-bundle member's `corpus_file_sources` row (written
+by `ingest_bundle` at unpack time, §6) resolves exactly like a top-level
+file's; a producer citing a member's own content `doc_id`
+(`sha256[:16]`) needs no `documents[]` entry at all once the archive has
+been ingested once, and MAY additionally send one (`stable_id =
+"<archive corpus_files.id>!<member path>"`) to refresh the anchor, exactly
+like a top-level document.
 
 **Timing:** a claim referencing a file whose `processing_status` is not yet
 `indexed` is **deferred, not rejected** — the response lists it under
@@ -1356,6 +1406,18 @@ cover, Agnes will not tell me.* Fixtures uploaded by an account that is
 - **S8** — `revealed` correction serves the fact without quotes
   instance-wide; `restricted` hides it from a caller with full grants;
   `wrong` survives a re-ingest of the same batch.
+- **S9** — the alias oracle: one fact, two claims in two collections —
+  Alice's grant covers only the collection whose claim does not name the
+  fact (e.g. "the lead consultant on the engagement"); the OTHER,
+  unreadable collection's claim is what a producer minted the fact's
+  `fact_aliases.natural_key` from (e.g. the client's name). Alice sees the
+  fact (existence via the readable claim) but its alias/display name must
+  NOT be the one minted from the collection she cannot read — `fact_search`
+  and `fact_neighbors` fall back to the opaque subject id, and `q` matching
+  that restricted alias string returns no hit (no count-oracle). *Fails if*
+  a subject's own claims being partly readable is treated as making every
+  one of its aliases readable — the same distinction S2 draws for `attrs`,
+  extended to names.
 
 **Phase ACL (after Entra derivation — §13.1).** Source-layer S1 (sharing set
 in SharePoint, not in Agnes), source-revocation S7, and C9. Until then these

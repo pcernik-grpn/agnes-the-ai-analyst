@@ -245,10 +245,12 @@ def test_fact_search_q_reaches_the_repository(pg_env, repo, mcp_call):
     owner_id, owner_email = _seed_two_collection_fixture()
 
     parts_authority = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=parts_authority, type="organization", natural_key="organization:parts-authority")
+    repo.add_alias(
+        fact_id=parts_authority, type="organization", natural_key="organization:parts-authority", corpus_id=CORPUS_A
+    )
     repo.add_claim(fact_id=parts_authority, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="PA.")
     other = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=other, type="organization", natural_key="organization:zephyr-corp")
+    repo.add_alias(fact_id=other, type="organization", natural_key="organization:zephyr-corp", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=other, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Zephyr.")
 
     token = create_access_token(user_id=owner_id, email=owner_email)

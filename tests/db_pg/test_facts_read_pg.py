@@ -381,10 +381,13 @@ def _seed_endpoint_only_fixture(repo, *, readable_edge_claim: bool):
     src = repo.create_fact(type="engagement")
     repo.add_claim(fact_id=src, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
     dst = repo.create_fact(type="industry")
-    repo.add_alias(fact_id=dst, type="industry", natural_key="industry:saas")
-    edge_id = repo.create_edge(src=src, type="works_in_industry", dst=dst)
     corpus_id = CORPUS_A if readable_edge_claim else CORPUS_B
     file_id = "cf_a1" if readable_edge_claim else "cf_b1"
+    # The alias's only justification is the SAME evidence that names the
+    # industry ("Acme is a SaaS company.", below) — its provenance corpus
+    # must match the anchoring edge's claim, not be unconditional.
+    repo.add_alias(fact_id=dst, type="industry", natural_key="industry:saas", corpus_id=corpus_id)
+    edge_id = repo.create_edge(src=src, type="works_in_industry", dst=dst)
     repo.add_claim(
         edge_id=edge_id,
         corpus_file_id=file_id,
@@ -630,7 +633,9 @@ def test_q_ranks_the_matching_subject_first(pg_env, repo):
     _seed_full_fixture()
 
     parts_authority = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=parts_authority, type="organization", natural_key="organization:parts-authority")
+    repo.add_alias(
+        fact_id=parts_authority, type="organization", natural_key="organization:parts-authority", corpus_id=CORPUS_A
+    )
     repo.add_claim(
         fact_id=parts_authority,
         corpus_file_id="cf_a1",
@@ -640,7 +645,9 @@ def test_q_ranks_the_matching_subject_first(pg_env, repo):
     )
 
     alpha_logistics = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=alpha_logistics, type="organization", natural_key="organization:alpha-logistics")
+    repo.add_alias(
+        fact_id=alpha_logistics, type="organization", natural_key="organization:alpha-logistics", corpus_id=CORPUS_A
+    )
     repo.add_claim(
         fact_id=alpha_logistics,
         corpus_file_id="cf_a1",
@@ -650,7 +657,9 @@ def test_q_ranks_the_matching_subject_first(pg_env, repo):
     )
 
     beta_industries = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=beta_industries, type="organization", natural_key="organization:beta-industries")
+    repo.add_alias(
+        fact_id=beta_industries, type="organization", natural_key="organization:beta-industries", corpus_id=CORPUS_A
+    )
     repo.add_claim(
         fact_id=beta_industries,
         corpus_file_id="cf_a1",
@@ -691,13 +700,15 @@ def test_q_filters_out_non_matching_subjects(pg_env, repo):
     _seed_full_fixture()
 
     matching = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=matching, type="organization", natural_key="organization:parts-authority")
+    repo.add_alias(
+        fact_id=matching, type="organization", natural_key="organization:parts-authority", corpus_id=CORPUS_A
+    )
     repo.add_claim(
         fact_id=matching, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Parts Authority."
     )
 
     other = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=other, type="organization", natural_key="organization:zephyr-corp")
+    repo.add_alias(fact_id=other, type="organization", natural_key="organization:zephyr-corp", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=other, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Zephyr Corp.")
 
     from src.repositories import users_repo
@@ -740,17 +751,19 @@ def test_q_exact_match_ranks_above_prefix_and_substring_matches(pg_env, repo):
     _seed_full_fixture()
 
     exact = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=exact, type="organization", natural_key="organization:acme")
+    repo.add_alias(fact_id=exact, type="organization", natural_key="organization:acme", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=exact, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
 
     prefix = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=prefix, type="organization", natural_key="organization:acme-holdings")
+    repo.add_alias(fact_id=prefix, type="organization", natural_key="organization:acme-holdings", corpus_id=CORPUS_A)
     repo.add_claim(
         fact_id=prefix, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme Holdings."
     )
 
     substring = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=substring, type="organization", natural_key="organization:new-acme-ventures")
+    repo.add_alias(
+        fact_id=substring, type="organization", natural_key="organization:new-acme-ventures", corpus_id=CORPUS_A
+    )
     repo.add_claim(
         fact_id=substring, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="New Acme Ventures."
     )
@@ -788,11 +801,11 @@ def test_q_escapes_like_metacharacters(pg_env, repo):
     _seed_full_fixture()
 
     literal = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=literal, type="organization", natural_key="organization:100%-co")
+    repo.add_alias(fact_id=literal, type="organization", natural_key="organization:100%-co", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=literal, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="100%-Co.")
 
     decoy = repo.create_fact(type="organization")
-    repo.add_alias(fact_id=decoy, type="organization", natural_key="organization:100xco")
+    repo.add_alias(fact_id=decoy, type="organization", natural_key="organization:100xco", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=decoy, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="100xCo.")
 
     from src.repositories import users_repo
@@ -982,6 +995,250 @@ def test_s8_wrong_hides_at_read_time(pg_env, repo):
     assert fact_id not in {s["id"] for s in result["subjects"]}
     with pytest.raises(FactNotFound):
         repo.claims(_dict_user("carol"), fact_id)
+
+
+def _admin() -> dict:
+    """The caller shape returned by :func:`_seed_admin` below — a bare
+    ``{"id": "admin1"}`` with no membership row would resolve as an
+    ORDINARY ungranted user (``accessible_collection_ids`` checks a real DB
+    membership, src.rbac.get_accessible_ids), so every S9 test using this
+    must call :func:`_seed_admin` first."""
+    return {"id": "admin1", "email": "admin@test.com"}
+
+
+def _seed_admin(pg_engine) -> None:
+    """Seed ``admin1`` as a REAL Admin-group member (mirrors
+    ``test_facts_ingest_pg.py``'s ``pg_env`` fixture) — this file's own
+    ``pg_env`` only seeds the ``user_groups`` rows via
+    ``_seed_pg_system_groups``, not the membership itself."""
+    import sqlalchemy as sa
+
+    from src.repositories import user_group_members_repo, users_repo
+
+    users_repo().create(id="admin1", email="admin@test.com", name="Admin")
+    with pg_engine.connect() as conn:
+        admin_gid = conn.execute(sa.text("SELECT id FROM user_groups WHERE name = 'Admin'")).scalar()
+    user_group_members_repo().add_member("admin1", admin_gid, source="system_seed")
+
+
+# ---------------------------------------------------------------------------
+# S9 — the alias oracle (security hardening, 2026-08-29): a fact's own
+# claims being PARTLY readable does not make every one of its aliases
+# readable. The reproduction below plants the exact shape a live eval found:
+# one fact, one claim in a readable collection that does NOT name it, one
+# claim in an unreadable collection that DOES (the alias was minted from
+# it). See docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
+# design.md §4/§5, §15.1 S9.
+# ---------------------------------------------------------------------------
+
+CORPUS_RESTRICTED = "col_restricted"
+
+
+def _seed_alias_oracle_fixture(repo):
+    """One fact (``engagement:halyard-erp-rollout`` — the alias minted from
+    the RESTRICTED collection's claim, which names the client), one claim
+    in CORPUS_A (readable to Alice, does not name the client) and one claim
+    in CORPUS_RESTRICTED (unreadable to Alice, the one that actually named
+    it — same shape as ``add_alias_source`` would be populated by a real
+    ``ingest_batch`` node whose evidence spans two collections)."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_RESTRICTED, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_RESTRICTED, file_id="cf_r1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(
+        fact_id=fact_id,
+        type="engagement",
+        natural_key="engagement:halyard-erp-rollout",
+        corpus_id=CORPUS_RESTRICTED,
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Dax Okonkwo-Reyes is the lead consultant on the engagement.",
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_r1",
+        corpus_id=CORPUS_RESTRICTED,
+        file_sha256="sha1",
+        quote="The Halyard Precision Manufacturing ERP Rollout kicked off March 1.",
+    )
+    return fact_id
+
+
+def test_s9_alias_oracle_is_closed(pg_env, repo):
+    """S9 (the reproduction). Alice is granted CORPUS_A only — she can read
+    the claim naming the lead consultant (so the fact is visible at all)
+    but NOT the claim the alias was minted from. ``fact_search`` must not
+    show the restricted alias; the fact still carries a usable identity
+    (the opaque subject id). Fails on pre-hardening code (aliases were
+    joined with no grant filter at all)."""
+    fact_id = _seed_alias_oracle_fixture(repo)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(pg_env, group_name="group-alice-s9", collection_id=CORPUS_A, member_user_id="alice")
+
+    result = repo.search(_dict_user("alice"), type="engagement")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+    subject = result["subjects"][0]
+    assert subject["aliases"] == []
+    assert "halyard" not in str(subject).lower()
+
+
+def test_s9_admin_sees_the_restricted_alias_regardless(pg_env, repo):
+    """God-mode: an Admin-group caller sees every alias unconditionally —
+    never gated on ``fact_alias_sources`` having a row for it either
+    (an admin-visible alias must not depend on backfilled provenance
+    data)."""
+    _seed_admin(pg_env)
+    fact_id = _seed_alias_oracle_fixture(repo)
+
+    result = repo.search(_admin(), type="engagement")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+    assert result["subjects"][0]["aliases"] == ["engagement:halyard-erp-rollout"]
+
+
+def test_s9_revealed_serves_the_restricted_alias_regardless_of_grants(pg_env, repo):
+    """`revealed` bypasses grants entirely (spec §4) — the SAME rule
+    already applies to `attrs`/quotes; this asserts it holds for the
+    alias/display name too. A caller with ZERO grants on either collection
+    still sees the fact's alias once it is revealed."""
+    fact_id = _seed_alias_oracle_fixture(repo)
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": ["engagement:halyard-erp-rollout"]},
+        verdict="revealed",
+        reason="publicly announced",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="zack", email="zack@test.com", name="Zack")
+    # Zack has NO grants at all.
+
+    result = repo.search(_dict_user("zack"), type="engagement")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+    assert result["subjects"][0]["aliases"] == ["engagement:halyard-erp-rollout"]
+
+
+def test_s9_q_never_matches_a_restricted_only_alias(pg_env, repo):
+    """Search-matching oracle: `q` matching an alias the caller cannot see
+    must return NOTHING for that caller — a hit (or its absence) must not
+    reveal whether a restricted name exists. The same query DOES match for
+    a caller who can read the minting collection."""
+    _seed_alias_oracle_fixture(repo)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice2", email="alice2@test.com", name="Alice2")
+    _make_group_with_grant(pg_env, group_name="group-alice2-s9", collection_id=CORPUS_A, member_user_id="alice2")
+    users_repo().create(id="rita", email="rita@test.com", name="Rita")
+    _make_group_with_grant(pg_env, group_name="group-rita-s9", collection_id=CORPUS_RESTRICTED, member_user_id="rita")
+
+    alice_result = repo.search(_dict_user("alice2"), type="engagement", q="Halyard")
+    assert alice_result["subjects"] == []
+
+    rita_result = repo.search(_dict_user("rita"), type="engagement", q="Halyard")
+    assert len(rita_result["subjects"]) == 1
+    assert rita_result["subjects"][0]["aliases"] == ["engagement:halyard-erp-rollout"]
+
+
+def test_s9_neighbors_hides_the_restricted_alias_per_hop(pg_env, repo):
+    """`fact_neighbors` re-evaluates the SAME alias-visibility rule at
+    every hop (spec §12's shared projection) — walking the graph must not
+    be a side channel back to a name `fact_search` already hides."""
+    fact_id = _seed_alias_oracle_fixture(repo)
+    other = repo.create_fact(type="person")
+    repo.add_claim(fact_id=other, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Dax exists.")
+    edge_id = repo.create_edge(src=fact_id, type="staffed_by", dst=other)
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Staffed by Dax."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="petra2", email="petra2@test.com", name="Petra2")
+    _make_group_with_grant(pg_env, group_name="group-petra2-s9", collection_id=CORPUS_A, member_user_id="petra2")
+
+    result = repo.neighbors(_dict_user("petra2"), fact_id)
+    node = next(n for n in result["nodes"] if n["id"] == fact_id)
+    assert node["aliases"] == []
+
+
+def test_s9_merge_facts_preserves_alias_provenance_then_split_reverses_it(pg_env, repo):
+    """Merge/split (spec §3, EQ7) are audit-logged alias-repoint operations
+    over ``fact_aliases.fact_id`` — they must not disturb each alias's OWN
+    provenance row (keyed on the alias's stable ``(type, natural_key)``,
+    untouched by either operation). A caller who can read the canonical's
+    minting collection but not the merged-in duplicate's still sees only
+    the readable alias after merge, and the split correctly separates them
+    back onto two facts with their original provenance intact."""
+    _seed_admin(pg_env)
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_RESTRICTED, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_RESTRICTED, file_id="cf_r1")
+
+    canonical_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=canonical_id, type="engagement", natural_key="engagement:acme-rollout", corpus_id=CORPUS_A)
+    repo.add_claim(fact_id=canonical_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
+
+    duplicate_id = repo.create_fact(type="engagement")
+    repo.add_alias(
+        fact_id=duplicate_id,
+        type="engagement",
+        natural_key="engagement:acme-rollout-restricted-name",
+        corpus_id=CORPUS_RESTRICTED,
+    )
+    # A SECOND, readable claim (unrelated to the alias) so the split-off
+    # fact stays independently VISIBLE to Mo below — the point under test
+    # is that its ALIAS stays hidden despite the fact itself being
+    # visible, not that the whole fact disappears (that's S1/S6's job).
+    repo.add_claim(
+        fact_id=duplicate_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme continued."
+    )
+    repo.add_claim(
+        fact_id=duplicate_id,
+        corpus_file_id="cf_r1",
+        corpus_id=CORPUS_RESTRICTED,
+        file_sha256="sha1",
+        quote="Acme restricted alias.",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="mo", email="mo@test.com", name="Mo")
+    _make_group_with_grant(pg_env, group_name="group-mo-s9", collection_id=CORPUS_A, member_user_id="mo")
+
+    snapshot = repo.merge_facts(canonical_id=canonical_id, merged_id=duplicate_id, merged_by="admin1")
+    merged_for_mo = repo.search(_dict_user("mo"), type="engagement")["subjects"][0]
+    assert merged_for_mo["id"] == canonical_id
+    assert merged_for_mo["aliases"] == ["engagement:acme-rollout"]
+    merged_for_admin = repo.search(_admin(), type="engagement")["subjects"][0]
+    assert set(merged_for_admin["aliases"]) == {
+        "engagement:acme-rollout",
+        "engagement:acme-rollout-restricted-name",
+    }
+
+    new_id = repo.split_fact(canonical_id=canonical_id, snapshot=snapshot, split_by="admin1")
+    after_split = {s["id"]: s for s in repo.search(_admin(), type="engagement")["subjects"]}
+    assert set(after_split) == {canonical_id, new_id}
+    assert after_split[canonical_id]["aliases"] == ["engagement:acme-rollout"]
+    assert after_split[new_id]["aliases"] == ["engagement:acme-rollout-restricted-name"]
+    # Mo still can't read the split-off restricted-provenance fact's alias.
+    mo_after_split = {s["id"]: s for s in repo.search(_dict_user("mo"), type="engagement")["subjects"]}
+    assert mo_after_split[canonical_id]["aliases"] == ["engagement:acme-rollout"]
+    assert mo_after_split[new_id]["aliases"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +1510,7 @@ def test_neighbors_node_carries_the_full_subject_shape(pg_env, repo):
     own attributes."""
     _seed_full_fixture()
     fact_a = repo.create_fact(type="person")
-    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:alice-doe")
+    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:alice-doe", corpus_id=CORPUS_A)
     repo.add_claim(
         fact_id=fact_a,
         corpus_file_id="cf_a1",
@@ -1549,7 +1806,7 @@ def test_collection_facts_summary_type_counts_and_paged_facts(pg_env, repo):
     _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
 
     fact_id = repo.create_fact(type="engagement")
-    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:acme-renewal")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:acme-renewal", corpus_id=CORPUS_A)
     repo.add_claim(
         fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Renewal signed."
     )
@@ -1684,10 +1941,10 @@ def test_collection_facts_summary_review_items_possible_duplicate_of(pg_env, rep
     _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
 
     fact_a = repo.create_fact(type="person")
-    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:jane-doe")
+    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:jane-doe", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Jane Doe.")
     fact_b = repo.create_fact(type="person")
-    repo.add_alias(fact_id=fact_b, type="person", natural_key="person:j-doe")
+    repo.add_alias(fact_id=fact_b, type="person", natural_key="person:j-doe", corpus_id=CORPUS_A)
     repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="J. Doe.")
     edge_id = repo.create_edge(src=fact_a, type="possible_duplicate_of", dst=fact_b)
     repo.add_claim(
