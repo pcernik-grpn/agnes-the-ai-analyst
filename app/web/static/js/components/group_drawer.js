@@ -17,13 +17,22 @@
  * just a name) is now the pane you land in, which opens on an empty
  * audience and an empty grant list saying exactly that.
  *
+ * One thing did come back, deliberately narrowed: a NEW group can be
+ * given its first people here. That is not the member editor returning —
+ * there is no roster, no remove, no source column, and the field is gone
+ * the moment the group exists. It is seeding, which is the half of "a
+ * group is not just a name" that only has a natural moment at creation;
+ * everything after that moment is still /admin/access's job.
+ *
  *   window.AgnesGroupDrawer.open({ onSaved: (group) => … })   // create
  *   window.AgnesGroupDrawer.open({ group: row, onSaved: … })  // rename
  *
  * `onSaved` fires on close, with the group, only if something was
  * written. Storage is the existing admin API — no endpoint is new here:
- *   POST /api/admin/groups            (create)
- *   PATCH /api/admin/groups/{id}      (rename / describe)
+ *   POST /api/admin/groups                    (create)
+ *   PATCH /api/admin/groups/{id}              (rename / describe)
+ *   GET  /api/users?search=                   (find someone to seed)
+ *   POST /api/admin/groups/{id}/members       (seed them)
  *
  * Chrome: css/drawer.css (shared) + css/group_drawer.css. Every control
  * inside is a shared component — `.btn`, the drawer's own field rows.
@@ -32,6 +41,8 @@
   'use strict';
 
   var GROUPS_API = '/api/admin/groups';
+  var USERS_API = '/api/users';
+  var FIND_LIMIT = 8;
 
   var els = null;          // built lazily on first open
   var st = null;           // per-open state
@@ -85,6 +96,16 @@
       '        <label for="gdw-desc">Description <span class="gdw-optional">(optional)</span></label>' +
       '        <textarea id="gdw-desc" autocomplete="off" placeholder="Who is in here, and why they exist as a group."></textarea>' +
       '      </div>' +
+      '      <div class="ds-drawer__field gdw-people" data-gdw="people">' +
+      '        <label for="gdw-find">People <span class="gdw-optional">(optional)</span></label>' +
+      '        <p class="gdw-people__lede">Who is in it. You can add the rest later —' +
+      '          this is here so a new group does not start out reaching nobody.</p>' +
+      '        <div class="gdw-chips" data-gdw="chips"></div>' +
+      '        <input type="text" id="gdw-find" autocomplete="off" role="combobox"' +
+      '               aria-expanded="false" aria-controls="gdw-found" aria-autocomplete="list"' +
+      '               placeholder="Search people by name or address…">' +
+      '        <div class="gdw-found" id="gdw-found" role="listbox" hidden></div>' +
+      '      </div>' +
       '      <p class="gdw-locked" data-gdw="locked" hidden></p>' +
       '      <div class="ds-drawer__err" data-gdw="err1" hidden></div>' +
       '    </section>' +
@@ -106,6 +127,10 @@
       desc: root.querySelector('#gdw-desc'),
       err1: root.querySelector('[data-gdw="err1"]'),
       locked: root.querySelector('[data-gdw="locked"]'),
+      people: root.querySelector('[data-gdw="people"]'),
+      chips: root.querySelector('[data-gdw="chips"]'),
+      find: root.querySelector('#gdw-find'),
+      found: root.querySelector('#gdw-found'),
       finish: root.querySelector('[data-gdw="finish"]'),
       next: root.querySelector('[data-gdw="next"]'),
     };
@@ -121,6 +146,7 @@
       if (e.key === 'Enter') { e.preventDefault(); els.next.click(); }
     });
     els.next.addEventListener('click', onNext);
+    bindFind();
     els.finish.addEventListener('click', function () { close(); });
     return els;
   }
@@ -141,6 +167,14 @@
     els.name.value = g ? (g.name || '') : '';
     els.desc.value = g ? (g.description || '') : '';
     els.err1.hidden = true;
+    // Seeding is a creation-time affordance only. On an existing group the
+    // editor behind this drawer is the one that owns membership, and on a
+    // Google-synced group nothing here owns it at all.
+    st.picked = [];
+    els.find.value = '';
+    closeFound();
+    renderChips();
+    els.people.hidden = !!g;
     // A system group's name is fixed and a Google-synced group's fields are
     // Workspace's — the API rejects both edits, so the controls say so
     // rather than collecting a change whose save will 409.
@@ -179,7 +213,22 @@
   }
 
   function onClick(e) {
-    if (e.target.closest('[data-gdw-close]')) close();
+    if (e.target.closest('[data-gdw-close]')) { close(); return; }
+    var pick = e.target.closest('[data-gdw-pick]');
+    if (pick) {
+      st.picked.push({ email: pick.dataset.email, name: pick.dataset.name });
+      renderChips();
+      els.find.value = '';
+      closeFound();
+      els.find.focus();
+      return;
+    }
+    var drop = e.target.closest('[data-gdw-unpick]');
+    if (drop) {
+      var mail = drop.getAttribute('data-gdw-unpick');
+      st.picked = st.picked.filter(function (m) { return m.email !== mail; });
+      renderChips();
+    }
   }
 
   /* ── Chrome ───────────────────────────────────────────────────────── */
@@ -199,7 +248,115 @@
   }
 
   function onNext() {
-    saveNameThen(close);
+    saveNameThen(function () { seedMembers(close); });
+  }
+
+  /* ── Seeding the new group ─────────────────────────────────────────
+     Runs once, after the group exists, against the same endpoint the
+     Access page uses. Failures are reported and the drawer STAYS OPEN
+     with the ones that failed still in the field: the group itself was
+     created either way, so closing on a partial result would hide the
+     half that did not happen behind a success. */
+  function seedMembers(done) {
+    var picked = (st && st.picked) || [];
+    var g = st && st.group;
+    if (!picked.length || !g || !g.id) { done(); return; }
+    els.next.disabled = true;
+    var base = GROUPS_API + '/' + encodeURIComponent(g.id) + '/members';
+    var failed = [];
+    var chain = picked.reduce(function (acc, person) {
+      return acc.then(function () {
+        return api(base, { method: 'POST', body: JSON.stringify({ email: person.email }) })
+          .catch(function () { failed.push(person); });
+      });
+    }, Promise.resolve());
+    chain.then(function () {
+      els.next.disabled = false;
+      if (!failed.length) { done(); return; }
+      st.picked = failed;
+      renderChips();
+      els.err1.textContent = failed.length === picked.length
+        ? 'The group was created, but nobody could be added to it. Try again, or add them on the Access page.'
+        : 'The group was created. ' + failed.length + ' of these could not be added — they are still listed above.';
+      els.err1.hidden = false;
+    });
+  }
+
+  /* ── Finding someone to seed ───────────────────────────────────────
+     The query goes to the server, like the Access page's own person
+     search, for the same reason: a prefetched copy of the org silently
+     stops finding people at whatever limit it was given, which reads as
+     "that person has no account". */
+  var findTimer = null;
+  var findSeq = 0;
+
+  function closeFound() {
+    if (!els) return;
+    els.found.hidden = true;
+    els.found.innerHTML = '';
+    els.find.setAttribute('aria-expanded', 'false');
+  }
+
+  function bindFind() {
+    els.find.addEventListener('input', function () {
+      clearTimeout(findTimer);
+      var q = els.find.value;
+      findTimer = setTimeout(function () { runFind(q); }, 200);
+    });
+    els.find.addEventListener('keydown', function (e) {
+      // Enter inside the search must not reach the panel's Enter-to-create.
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        var first = els.found.querySelector('[data-gdw-pick]');
+        if (first) first.click();
+        return;
+      }
+      if (e.key === 'Escape' && !els.found.hidden) { e.stopPropagation(); closeFound(); }
+    });
+  }
+
+  function runFind(raw) {
+    var q = String(raw || '').trim();
+    if (!q) { closeFound(); return; }
+    var seq = ++findSeq;
+    api(USERS_API + '?search=' + encodeURIComponent(q) + '&limit=' + FIND_LIMIT)
+      .catch(function () { return []; })
+      .then(function (people) {
+        if (seq !== findSeq || !st) return;
+        if (!Array.isArray(people)) people = (people && people.users) || [];
+        var taken = {};
+        (st.picked || []).forEach(function (m) { taken[m.email] = true; });
+        var rows = people.filter(function (u) { return !taken[u.email]; }).map(function (u) {
+          return '<button type="button" class="gdw-found__row" role="option"' +
+                 ' data-gdw-pick data-email="' + esc(u.email || '') + '"' +
+                 ' data-name="' + esc(u.name || '') + '">' +
+                 '<span class="gdw-found__who">' + esc(u.name || u.email || '') + '</span>' +
+                 (u.name ? '<span class="gdw-found__mail">' + esc(u.email || '') + '</span>' : '') +
+                 '</button>';
+        }).join('');
+        els.found.innerHTML = rows ||
+          '<p class="gdw-found__none">No account matches that. People without an account' +
+          ' are invited on the Access page once this group exists.</p>';
+        els.found.hidden = false;
+        els.find.setAttribute('aria-expanded', 'true');
+      });
+  }
+
+  function renderChips() {
+    var picked = (st && st.picked) || [];
+    els.chips.innerHTML = picked.map(function (m) {
+      return '<span class="gdw-chip">' + esc(m.name || m.email) +
+             '<button type="button" class="gdw-chip__x" data-gdw-unpick="' + esc(m.email) + '"' +
+             ' aria-label="Remove ' + esc(m.email) + '">&times;</button></span>';
+    }).join('');
+    els.chips.hidden = !picked.length;
+  }
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
   }
 
   /* ── Step 1: the group itself ─────────────────────────────────────── */

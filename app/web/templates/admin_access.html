@@ -1986,6 +1986,122 @@
   .ax-table .ax-r { padding-left: 16px; padding-right: 16px; }
   .ax-table .ax-fam__hd { padding-left: 0; }
   .ax-table .ax-add { padding-left: 16px; padding-right: 16px; }
+
+  /* ── The three ways to add, one look ─────────────────────────────────
+     "New group", "Add to this group" and "Share with another group" are the
+     same gesture at three levels of the tree, so they get one treatment with
+     three labels rather than three near-misses of each other.
+
+     They were also nearly invisible at rest: a ghost row on a white sheet
+     reads as a divider, not as an offer, and the thing a first-time admin
+     most needs to find on this page is exactly how to add. So the row is
+     filled — the empty-slot vocabulary this product already uses for "there
+     could be one more of these here": a light tint of the page's primary
+     inside a dashed border of the same hue. The tint is MIXED against
+     `--ds-surface` rather than hard-coded, so it follows every theme its
+     ink follows instead of staying light-blue under a dark one. */
+  .ax-add, .ax-newrow, .ax-table > .ax-add:first-child {
+    background: color-mix(in srgb, var(--ds-primary) 7%, var(--ds-surface));
+    border: 1px dashed color-mix(in srgb, var(--ds-primary) 40%, var(--ds-surface));
+    border-radius: var(--ds-radius-btn);
+  }
+  .ax-add:hover, .ax-newrow:hover, .ax-table > .ax-add:first-child:hover {
+    background: color-mix(in srgb, var(--ds-primary) 13%, var(--ds-surface));
+    border-color: var(--ds-primary);
+  }
+  /* Filled and bordered, the action is a tile rather than a row, so it stops
+     riding the table's column grid — there is nothing left to align to, and
+     a marker sitting in the Kind column of a tinted box just reads as an
+     indent. Marker, label, hint, in a line, at every width. */
+  .ax-add, .ax-table .ax-add, .ax-newrow {
+    display: flex; align-items: center; gap: 10px;
+    width: auto; margin: 8px 10px; padding: 10px 14px;
+  }
+  .ax-add__plus, .ax-newrow__plus {
+    flex: none; justify-self: start; margin-left: 0;
+    width: 20px; height: 20px; line-height: 18px; text-align: center;
+    background: var(--ds-surface);
+    border: 1px solid color-mix(in srgb, var(--ds-primary) 45%, var(--ds-surface));
+    border-radius: 50%;
+    color: var(--ds-text-link); font-size: 14px; font-weight: 600;
+  }
+  .ax-add:hover .ax-add__plus, .ax-newrow:hover .ax-newrow__plus {
+    border-style: solid; border-color: var(--ds-primary);
+  }
+  .ax-add__label, .ax-newrow__label { font-size: 13.5px; font-weight: 600; color: var(--ds-text-link); }
+  .ax-add__hint, .ax-newrow__hint { font-size: 12px; font-weight: 400; color: var(--ds-text-muted); }
+
+  /* ── Which level wears the band ──────────────────────────────────────
+     A kind — Data packages, Plugins, Skills — is the level that FOLDS, and
+     folding is what the Library's group band is for: a filled strip with a
+     caret, a name and a count, that stays put while its contents come and
+     go. It was the quieter of the two levels here, which left the page's
+     one collapsible control looking like a caption.
+
+     The family above it (Knowledge, Capabilities) keeps its own look, and
+     now it has to be a different one — two identical strips one inside the
+     other say the two levels are peers. It becomes an eyebrow: no fill, no
+     rule, small and lettered, the way a section is titled rather than the
+     way a row is banded. Fill = folds, eyebrow = names. */
+  .ax-kindrun {
+    padding: 11px 16px 11px 26px;
+    background: var(--ds-surface-dim);
+    border-top: 1px solid var(--ds-border);
+    border-bottom: 1px solid var(--ds-border);
+  }
+  .ax-kindrun:hover { background: color-mix(in srgb, var(--ds-text-primary) 4%, var(--ds-surface-dim)); }
+  /* The leading accent is how the Library tells one band from the next when
+     several are stacked in one list — the kind's own colour, in the kind's
+     own variable, so a new resource type inherits it by being registered
+     rather than by being added here. */
+  .ax-kindrun { box-shadow: inset 3px 0 0 var(--kind, var(--ds-border)); }
+  .ax-kindrun[data-kind="data"]    { --kind: var(--ds-kind-data); }
+  .ax-kindrun[data-kind="memory"]  { --kind: var(--ds-kind-memory); }
+  .ax-kindrun[data-kind="recipe"]  { --kind: var(--ds-kind-recipe); }
+  .ax-kindrun[data-kind="library"] { --kind: var(--ds-kind-library); }
+  .ax-kindrun[data-kind="file"]    { --kind: var(--ds-kind-file); }
+  .ax-kindrun[data-kind="app"]     { --kind: var(--ds-kind-app); }
+  .ax-kindrun[data-kind="plugin"]  { --kind: var(--ds-kind-plugin); }
+  .ax-kindrun[data-kind="skill"]   { --kind: var(--ds-kind-skill); }
+  .ax-kindrun[data-kind="agent"]   { --kind: var(--ds-kind-agent); }
+  .ax-kindrun .fbar-group__caret { width: 16px; height: 16px; }
+  .ax-kindrun .fbar-group__title { font-size: 13.5px; font-weight: 600; color: var(--ds-text-primary); }
+  .ax-kindrun .fbar-group__n { font-size: 12.5px; color: var(--ds-text-muted); }
+
+  .ax-fam__hd, .ax-table .ax-fam__hd {
+    background: none; border-bottom: 0; box-shadow: none; padding: 0;
+  }
+  .ax-fam__hd .fbar-grouptoggle { padding: 18px 16px 6px; gap: 8px; }
+  .ax-fam__hd .fbar-group__title {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+  }
+  .ax-fam__hd .fbar-group__n { font-size: 11px; }
+  .ax-fam:first-child .ax-fam__hd .fbar-grouptoggle { padding-top: 8px; }
+
+  /* ── Who is in here, before the list of who is in here ────────────────
+     The roster answers "who exactly"; this answers "who, roughly, and how
+     did they get here" — which is the question an admin opening a group
+     actually has, and it is answerable in one line. Faces first because a
+     count of 14 and fourteen initials are not the same fact, then the
+     provenance split, because "3 of these are Google's" is what decides
+     whether this group is yours to edit at all. */
+  .ax-pstrip {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    margin: 2px 0 10px;
+  }
+  .ax-avs { display: flex; align-items: center; flex: none; }
+  .ax-av {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; margin-left: -6px;
+    border: 1px solid var(--ds-border); border-radius: 50%;
+    background: var(--ds-surface); color: var(--ds-text-secondary);
+    font-size: 10px; font-weight: 700; letter-spacing: .02em;
+  }
+  .ax-avs .ax-av:first-child { margin-left: 0; }
+  .ax-av--more { color: var(--ds-text-muted); font-weight: 600; }
+  .ax-pstrip__f { font-size: 12.5px; color: var(--ds-text-muted); min-width: 0; }
+  .ax-pstrip__f b { font-weight: 600; color: var(--ds-text-secondary); }
 </style>
 {% endblock %}
 
@@ -3131,7 +3247,56 @@
          deactivated and ${inactive === 1 ? "gets" : "get"} nothing.</div>`
       : "";
 
-    host.innerHTML = find + warn + rosterHtml(members);
+    host.innerHTML = peopleStrip(members) + find + warn + rosterHtml(members);
+  }
+
+  /* ── The audience, at a glance ────────────────────────────────────────
+     Faces and provenance in one line, above the roster. `initialsOf` reads
+     a name when there is one and falls back to the address — never to a
+     question mark, which is what an empty avatar looks like it means. */
+  function initialsOf(m) {
+    const name = String(m.name || "").trim();
+    if (name) {
+      const parts = name.split(/\s+/).filter(Boolean);
+      return (parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : parts[0].slice(0, 2))
+        .toUpperCase();
+    }
+    return String(m.email || m.user_id || "?").replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase();
+  }
+
+  const AVATARS_SHOWN = 6;
+
+  function peopleStrip(members) {
+    if (!members.length) return "";
+    const shown = members.slice(0, AVATARS_SHOWN);
+    const rest = members.length - shown.length;
+    const avatars = shown.map((m) =>
+      `<span class="ax-av" title="${esc(m.email || m.user_id || "")}">${esc(initialsOf(m))}</span>`
+    ).join("") + (rest > 0 ? `<span class="ax-av ax-av--more">+${rest}</span>` : "");
+
+    // Provenance in the order it matters: what an admin put here, what
+    // Google puts here, what the instance puts here. A source with nobody in
+    // it is left out rather than printed as a zero.
+    const PHRASE = {
+      admin: (n) => `<b>${n}</b> added by an admin`,
+      google_sync: (n) => `<b>${n}</b> synced from Google`,
+      system_seed: (n) => `<b>${n}</b> system-managed`,
+    };
+    const tally = new Map();
+    for (const m of members) tally.set(m.source, (tally.get(m.source) || 0) + 1);
+    const facts = Object.keys(PHRASE)
+      .filter((k) => tally.get(k))
+      .map((k) => PHRASE[k](tally.get(k)));
+    for (const [src, n] of tally) {
+      if (!PHRASE[src]) facts.push(`<b>${n}</b> from ${esc(src || "an unknown source")}`);
+    }
+    const off = members.filter((m) => m.active === false).length;
+    if (off) facts.push(`<b>${off}</b> deactivated`);
+
+    return `<div class="ax-pstrip">
+      <div class="ax-avs" aria-hidden="true">${avatars}</div>
+      <div class="ax-pstrip__f">${facts.join(" · ")}</div>
+    </div>`;
   }
 
   /* The roster: the retired detail page's member table, columns and all —
@@ -3839,7 +4004,7 @@
         const shut = shutKinds.has(r.t.type_key);
         const head = r.t.type_key !== lastKind
           ? `<button type="button" class="fbar-grouptoggle ax-kindrun" data-kindrun="${esc(r.t.type_key)}"
-                     aria-expanded="${shut ? "false" : "true"}">
+                     data-kind="${esc(kindToken(r.t))}" aria-expanded="${shut ? "false" : "true"}">
                <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
                <span class="fbar-group__title">${esc(r.t.type_display)}</span>
                <span class="fbar-group__n">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>

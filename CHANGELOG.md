@@ -216,6 +216,40 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+- **The three ways to add on the access page are one control with three
+  labels.** "New group", "Add to this group" and "Share with another group"
+  were three near-misses of each other, and all three were ghost rows — on a
+  white sheet a borderless row reads as a divider, not as an offer, which
+  hid the thing a first-time admin most needs to find. They now share the
+  empty-slot vocabulary this product already uses for "there could be one
+  more of these here": a light tint of the primary inside a dashed border of
+  the same hue, mixed against `--ds-surface` rather than hard-coded so it
+  follows every theme its ink follows.
+- **A new group can be given its people while it is being created.** The
+  group drawer takes an optional people field — search (`GET /api/users`),
+  pick, chips — and seeds the memberships (`POST /api/admin/groups/{id}/members`)
+  once the group exists. Deliberately narrow, and creation-only: no roster,
+  no remove, no source column, and the field is gone the moment the group
+  does exist. That is what keeps it from becoming the third copy of the
+  member editor the drawer's steps 2-4 were deleted for — /admin/access
+  still owns membership; this owns only the moment before there is any. A
+  partial failure keeps the drawer open with the people who failed still in
+  the field, since the group itself was created either way.
+- **The level that folds is the level that wears the band.** A kind — Data
+  packages, Marketplace plugins, Agents — is what collapses on the access
+  page, and collapsing is what the Library's group band is for; it was the
+  quieter of the two levels, which left the page's one collapsible control
+  looking like a caption. It takes the Library's band verbatim now, leading
+  kind-colour accent included (from `--ds-kind-*`, so a newly registered
+  resource type inherits it without being named here). The family above it
+  becomes an eyebrow — no fill, no rule, small and lettered — because two
+  identical strips one inside the other say the two levels are peers.
+- **A group's People opens with who is in it, not just how many.** Faces and
+  provenance in one line above the roster — up to six initials, then the
+  split by source ("11 added by an admin · 3 synced from Google", plus any
+  deactivated). A count of 14 and fourteen initials are not the same fact,
+  and "3 of these are Google's" is what decides whether the group is yours
+  to edit at all.
 - **Admin pages are a white sheet, like every index page.** `base_index.html`
   surfaces (Library, Agents, Chats) paint their whole shell `--ds-surface` —
   `.idx`'s own comment gives the reason: the header zone should read as part
