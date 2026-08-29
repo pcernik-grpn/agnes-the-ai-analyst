@@ -4149,6 +4149,7 @@
         "type": "object"
       },
       "FactsCorrectionRequest": {
+        "additionalProperties": false,
         "properties": {
           "reason": {
             "maxLength": 2000,
@@ -4256,6 +4257,7 @@
         "type": "object"
       },
       "FactsNeighborsRequest": {
+        "additionalProperties": false,
         "properties": {
           "depth": {
             "default": 1,
@@ -4304,6 +4306,7 @@
         "type": "object"
       },
       "FactsSearchRequest": {
+        "additionalProperties": false,
         "properties": {
           "filters": {
             "anyOf": [
@@ -4323,6 +4326,18 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "q": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Q"
           },
           "type": {
             "anyOf": [
@@ -14771,7 +14786,7 @@
     },
     "/admin/store": {
       "get": {
-        "description": "Moderation & Trust \u2014 one admin surface for entity verification,\nsubmission review, and marketplace curation.\n\nLists Store entities awaiting verification (``verification_state='requested'``)\nwith a direct link to each entity's detail page, where the Verify /\nRequest changes / Archive / Override actions live. The pre-publish\nsubmission queue and marketplace curation are surfaced as links (count +\njump-off), not rebuilt here. ``/admin/store`` is the natural parent of the\n``/admin/store/submissions`` review queue.",
+        "description": "Moderation & Trust \u2014 one admin surface for entity verification,\nsubmission review, and marketplace curation.\n\nLists Store entities awaiting verification (``verification_state='requested'``)\nwith a direct link to each entity's detail page, where the Verify /\nRequest changes / Archive / Override actions live. The pre-publish\nsubmission queue and marketplace curation are surfaced as links (count +\njump-off), not rebuilt here. ``/admin/store`` is the natural parent of the\n``/admin/store/submissions`` review queue.\n\nHidden by default (``features.store_moderation_enabled``): the two links\nit surfaces are their own nav rows, and verification has its own switch,\nso the page was a landing spot for doors already in the column. Redirect\nrather than 404 \u2014 its entry points were a sidebar row and a palette shortcut,\nand a bookmark from before the flip should land somewhere useful.\n\nNOTE: this page is the only UI that renders the queued agent-share\napprovals (Track C6). While it is hidden they are decided through\n``GET/PATCH /api/admin/share-requests`` only, which is deliberate \u2014 owner-\ninitiated agent sharing is itself V2-deferred in the agent-profiles spec,\nso on a default instance the queue this page would show is empty.",
         "operationId": "admin_moderation_hub_page_admin_store_get",
         "parameters": [
           {
@@ -38770,7 +38785,7 @@
     },
     "/api/facts/search": {
       "post": {
-        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). Response:\n``{\"subjects\": [{\"id\", \"type\", \"aliases\", \"attrs\", \"claim_count\",\n\"quote_count\", \"revealed\"}], \"limit_applied\"}`` \u2014 `limit_applied` is\nTrue only when the CALLER'S OWN readable result set exceeds `limit`,\nnever a signal that grants hid additional matches.",
+        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). ``q`` is an\nOPTIONAL free-text name lookup matched against alias natural keys ONLY\n(never claim text) \u2014 see :meth:`FactsPgRepository.search` for the\nnormalization and ranking rules. Response: ``{\"subjects\": [{\"id\",\n\"type\", \"aliases\", \"attrs\", \"claim_count\", \"quote_count\", \"revealed\"}],\n\"limit_applied\"}`` \u2014 `limit_applied` is True only when the CALLER'S OWN\nreadable result set exceeds `limit`, never a signal that grants hid\nadditional matches.",
         "operationId": "facts_search_api_facts_search_post",
         "parameters": [
           {
@@ -44891,7 +44906,7 @@
     },
     "/api/memory/bundle": {
       "get": {
-        "description": "Token-budgeted bundle of knowledge items for AI agent injection.\n\nMandatory items are always included regardless of the token budget.\nApproved items are confidence\u00d7recency-ranked and included until the budget\nis exhausted. Audience-filtered by the caller's group memberships (admins\nsee everything).\n\nv49: when ``?domain=<slug>`` is supplied the response shape switches\nto ``text/markdown`` containing a deterministic per-domain bundle \u2014\nthat's what ``agnes pull`` writes to ``~/.claude/memory/<slug>/bundle.md``.\nRBAC: the caller must have a ``MEMORY_DOMAIN`` grant on the domain\n(admins bypass per ``can_access``). The markdown body sorts items\nalphabetically by title and includes both required and approved\nitems (required first, with a marker) so the bundle md5 in the\nmanifest matches what the CLI re-renders.",
+        "description": "Token-budgeted bundle of knowledge items for AI agent injection.\n\nMandatory items are always included regardless of the token budget.\nApproved items are first narrowed to whichever ones\n``corporate_memory.distribution_mode`` grants this caller\n(``select_distributable_items``, #1573 \u2014 the same predicate the\nper-domain markdown and manifest md5 use), then confidence\u00d7recency-ranked\nand included until the budget is exhausted. Audience-filtered by the\ncaller's group memberships (admins see everything RBAC-wise; distribution\nmode narrows on top of that for everyone, admins included).\n\nv49: when ``?domain=<slug>`` is supplied the response shape switches\nto ``text/markdown`` containing a deterministic per-domain bundle \u2014\nthat's what ``agnes pull`` writes to ``~/.claude/memory/<slug>/bundle.md``.\nRBAC: the caller must have a ``MEMORY_DOMAIN`` grant on the domain\n(admins bypass per ``can_access``). The markdown body sorts items\nalphabetically by title and includes both required and approved\nitems (required first, with a marker) so the bundle md5 in the\nmanifest matches what the CLI re-renders.",
         "operationId": "get_bundle_api_memory_bundle_get",
         "parameters": [
           {
@@ -55173,7 +55188,7 @@
     },
     "/auth/password/change": {
       "get": {
-        "description": "Self-serve change-password page, linked from the account menu.",
+        "description": "Self-serve change-password page, linked from the account menu.\n\nA forced-to-SSO account renders the same single-sign-on state a\nhash-less account gets, even when it still holds a hash \u2014 the password\ndoor is shut for it, so offering the change form would be a lie.",
         "operationId": "password_change_page_auth_password_change_get",
         "parameters": [
           {

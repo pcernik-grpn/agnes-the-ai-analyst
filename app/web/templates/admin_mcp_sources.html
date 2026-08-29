@@ -1,5 +1,5 @@
 {% extends "base_admin.html" %}
-{% block title %}MCP Sources — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}MCP sources — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 {# Design-system component macros — toolbar "+ Add MCP source" + modal
@@ -122,7 +122,7 @@
 {% block admin_content %}
 <div class="mcp-sources-page">
   {% set page_hero_eyebrow = "Agent Experience" %}
-  {% set page_hero_title = "MCP Sources" %}
+  {% set page_hero_title = "MCP sources" %}
   {% set page_hero_plain = True %}
   {% set page_hero_subtitle = "Inbound Model Context Protocol servers " ~ (instance_brand or 'Agnes') ~ " connects to. Discovered tools can be materialized into the table registry or exposed as passthrough lookups." %}
   {% include "_page_hero.html" %}

@@ -88,9 +88,11 @@ active.
    BADGE language: category tags, status chips, counters, avatars, dots,
    and circular icon-only buttons. Never on a labelled button, never on
    an input. Dense per-row actions keep tight ~8px corners. One carve-out:
-   the two connect-banner CTAs (`.cbn-cta`, `.klb-cta`) are fully round
-   under every theme — the pill is what marks the product-model banner as
-   marketing surface rather than page chrome. Don't extend it further.
+   the connect-banner CTA (`.cbn-cta`) is fully round under every theme —
+   the pill is what marks the product-model banner as marketing surface
+   rather than page chrome. Don't extend it further. (It was two CTAs until
+   the Knowledge Layer hero and its `.klb-cta` were retired; the carve-out
+   did not grow to replace it.)
 
    **Corollary — "you can change this" is a FORM signal, not a hue.** Where a
    control and a read-out sit in the same strip, the container separates them:

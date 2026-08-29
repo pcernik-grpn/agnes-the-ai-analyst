@@ -86,7 +86,13 @@ jobs:
           git add CHANGELOG.md pyproject.toml
           if [ -f server.json ]; then git add server.json; fi
           git commit -m "release: ${VERSION}"
-          git push origin "$BRANCH"
+          # Force push: the branch name is deterministic (release-cut/vX.Y.Z)
+          # and the branch is workflow-owned — nobody else ever commits to it.
+          # The documented stale-cut recovery (docs/RELEASING.md § Recovery:
+          # close the stale cut PR, re-dispatch this workflow) leaves the old
+          # branch on the remote at a divergent commit; a plain push would
+          # then fail non-fast-forward on every re-dispatch, forever.
+          git push --force origin "$BRANCH"
 
           # Idempotent: the label may already exist from a previous run.
           gh label create release-cut --color 0e8a16 \
