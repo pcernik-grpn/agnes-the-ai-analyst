@@ -10,13 +10,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
-### Fixed
-- The profiler worker subprocess crashed with `TypeError: Object of type
-  Decimal is not JSON serializable` when a profiled table had DECIMAL/NUMERIC
-  columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
-  stdout `json.dumps` now uses the same `default=str` handler as the
-  parent-side profile writer.
-
 ### Added
 - **The fact graph now says what is in it (TCRD-250).** `GET /api/facts/type-map` (plus `agnes facts type-map` and the `fact_type_map` MCP tool) returns every node type with a live count of the subjects the caller can actually see — the head of the Library's Knowledge tab, where each type is a way in, and an agent's way to learn which types exist before spending a `fact_search` call. Counts run through the SAME visibility gate as `search()` with no `type`, shared rather than restated: `_visible_facts_for_corpus_cte` gained an `all_collections` switch that changes only which facts are candidates, never the rule that decides visibility. A naive `GROUP BY type` would have been the fact graph's existence oracle in aggregate form — a reader counting subjects whose every claim sits in a collection they cannot read — so a type with no visible subjects is OMITTED rather than reported as `0`, leaving "nothing you can see" deliberately indistinguishable from "no such type".
 - **Connecting an outside AI tool is a conversation now, not a page of instructions (TCRD-206).** A new bundled `connect-this-tool` skill reaches the chat agent in every session: it asks which tool you are connecting rather than assuming Claude, hands over the two things any MCP client actually needs (the `/api/mcp/sse` endpoint and an `Authorization: Bearer` header), names where Claude Code, Cursor and VS Code each keep that config, and translates the same shape for a client it does not know rather than inventing a file path. It confirms the connection landed by reading the token's own `last_used_at` through `agnes tokens list` instead of assuming a written config means a connected client, and it refuses to let a token into the transcript — if one is pasted it says so and tells you to regenerate, which revokes it. The instructions page stays for reading ahead and copying a config. Gated on `mcp.connector_ui_enabled`, so an instance with the connector UI switched off never offers a path that dead-ends.
