@@ -861,7 +861,10 @@ async def update_connection(
     (which renders neither field) silently erase every confirmed scope's
     ``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or
     reset the extraction schedule's clock. An explicit ``scopes: []`` (or
-    ``extraction: null``) in the request still clears it deliberately.
+    ``extraction: null``) in the request still clears it deliberately. The
+    full set of keys is ``app.api.admin_sharepoint.
+    SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by
+    ``tests/test_sharepoint_config_carry_forward_ratchet.py``.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -926,32 +929,36 @@ async def update_connection(
                     **{k: v for k, v in old_config.items() if k in ("project_id", "project_name")},
                     **config,
                 }
-            # SharePoint's `scopes` is the same shape of problem, one source
-            # type over: it is server-written via the dedicated connect-wizard
-            # scope endpoints (`app/api/admin_sharepoint.py`'s POST/DELETE
-            # `.../scopes`, `src.connection_specs._validate_sharepoint`'s
-            # docstring), never typed by hand — the generic editor's form does
-            # not even render it. Because this endpoint REPLACES `config`
-            # wholesale, an ordinary edit through that form (a rename, a
-            # certificate env change, re-saving the same fields) silently
-            # wiped every confirmed scope's `anonymize` flag, which is the
-            # ONLY place the anonymize-in-front pipeline's opt-in lives
-            # (`app/worker/kinds.py::_anonymize_marked_scope_map`) — the
-            # anonymize-fail-closed report, 2026-08-29. Carried forward
-            # unless the caller explicitly supplies the key, same "explicit
-            # wins" contract as `project_id`/`project_name` above: an
-            # explicit `scopes: []` (or the wizard's own DELETE endpoint)
-            # still empties it.
+            # SharePoint has a WHOLE SET of server-written config keys, same
+            # shape of problem as `project_id`/`project_name` above, one
+            # source type over: each is written by a dedicated
+            # `app/api/admin_sharepoint.py` endpoint/job, never typed by
+            # hand, never rendered by this generic editor's form. Because
+            # this endpoint REPLACES `config` wholesale, an ordinary edit
+            # through that form (a rename, a certificate change) silently
+            # wiped whichever of them wasn't carried forward — first
+            # `scopes` (which is the ONLY place the anonymize-in-front
+            # pipeline's opt-in lives, see
+            # `app/worker/kinds.py::_anonymize_marked_scope_map` — the
+            # anonymize-fail-closed report, 2026-08-29), then `extraction`
+            # (TCRD-226, merged hours later the SAME day — the identical bug,
+            # one key over, with no test to catch it).
             #
-            # `extraction` (TCRD-226, merged same day) is a second
-            # server-written SharePoint key landing in this exact same
-            # `config` column — the in-Agnes extraction schedule's own
-            # `last_run_at`/`last_job_id` bookkeeping
-            # (`app/api/admin_sharepoint.py::_record_extraction_dispatch`),
-            # also never rendered by this generic editor's form. Same bug,
-            # same fix: an ordinary edit must not silently reset that clock.
+            # The list itself is NOT restated here: it is imported from
+            # `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`
+            # (`app/api/admin_sharepoint.py`, next to the functions that
+            # actually write these keys) and ratcheted by
+            # `tests/test_sharepoint_config_carry_forward_ratchet.py`, which
+            # statically scans that file's writers and fails if a THIRD key
+            # ever lands there without a matching entry — so this carry-
+            # forward cannot silently go stale the way a third hand-copied
+            # tuple here would. Same "explicit wins" contract as
+            # `project_id`/`project_name` above: an explicit `scopes: []`
+            # (or the wizard's own DELETE endpoint) still empties it.
             elif existing_row.get("source_type") == "sharepoint":
-                for _sp_key in ("scopes", "extraction"):
+                from app.api.admin_sharepoint import SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _sp_key in SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS:
                     if _sp_key not in config and old_config.get(_sp_key) is not None:
                         config = {**config, _sp_key: old_config[_sp_key]}
     if body.is_default is not None:
