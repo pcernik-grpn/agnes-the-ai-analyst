@@ -55,7 +55,7 @@ class FactAlias(Base):
 
 class FactAliasSource(Base):
     """Per-corpus provenance for a ``fact_aliases`` row (security hardening
-    — see ``migrations/versions/0083_fact_alias_sources.py``): the set of
+    — see ``migrations/versions/0084_fact_alias_sources.py``): the set of
     corpora whose evidence actually contributed to minting this EXACT
     ``(type, natural_key)`` string, distinct from "any corpus with a claim
     on the same fact". ``src/repositories/facts_pg.py``'s alias-visibility
