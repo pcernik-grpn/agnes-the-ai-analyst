@@ -2293,6 +2293,8 @@ function _copySharepointThumbprint(btn) {
 const SP_REJECTION_REASON_TEXT = {
   verbatim_gate_failed:
     "Quote not found in the document's text — the claim was rejected, nothing was stored. Usually the producer cited text outside the uploaded content (e.g. a filename).",
+  quote_not_meaningful:
+    "Quote was too short or not a real word/phrase (e.g. a bare file extension or punctuation) — rejected as evidence, even though it was found in the document.",
   unresolved_doc_id:
     "The cited document isn't registered in any collection — upload it or fix the producer's corpus map.",
   ambiguous_cross_collection_doc_id:

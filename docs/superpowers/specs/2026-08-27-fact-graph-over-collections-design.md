@@ -843,6 +843,51 @@ the loop the two systems previously ran past each other on. (Consuming the
 signal on the producer side is a separate, later change; this section
 defines the contract it will read.)
 
+### 8.4 The meaningfulness floor (ratified 2026-08-29)
+
+A plain substring test has no notion of "meaningful": any character
+sequence that occurs literally in the text, OR (for a quote the content
+check misses) in the document's own identity strings (§8.2), satisfies it —
+including a bare file-extension fragment (`.pdf`) or a lone path separator
+(`/`). Live finding: both were accepted as claims, `claims_accepted_via_
+identity == 0` (i.e. via the content half, not identity), rendering as
+verified evidence for a claim quoting nothing at all.
+
+**The rule.** Before either half of the gate is tried, a quote must be at
+least 2 characters (trimmed) and must START with a word character (letter,
+digit, or underscore, Unicode-aware). Applied once, ahead of both checks, so
+a degenerate quote cannot fail the content half and then be self-certified
+by the identity half instead — one check closes the hole on both paths.
+
+**Why not a length floor alone.** `.pdf` and `ARR` (a real metric name) are
+the same length once `.pdf`'s leading punctuation is set aside — a raw
+character count, or a floor on word-character count, cannot tell them
+apart. What distinguishes them is shape: `.pdf`'s leading `.` can never be a
+complete word's own left edge — a real sentence never begins mid-token —
+while `ARR` is not attached to anything.
+
+**Why only the START, not the end.** A quote citing a whole sentence or
+clause routinely — and legitimately — ends in terminal punctuation ("Acme
+Corp is the client."). Sentence-final punctuation is a closing delimiter of
+the unit actually quoted; leading punctuation with nothing before it in the
+quote is not. An earlier draft of this rule checked both edges and broke
+this common, legitimate shape outright.
+
+**Why a constant, not `facts.single_valued_edges`-style config.** This
+guards evidence integrity — can a fabricated or degenerate extraction get
+past the gate — not a per-instance ontology choice; an operator should not
+be able to loosen it, the way `facts.single_valued_edges` legitimately can
+be (it encodes which edge types an instance's own ontology treats as
+functionally single-valued, a modeling decision, not a security floor). A
+future length floor guarding a *query* (cost/quality) would be a different
+problem and belongs in its own constant, never shared with this one.
+
+**The reason.** A rejected degenerate quote gets `quote_not_meaningful` in
+`claims_rejected`, distinct from `verbatim_gate_failed`: the quote WAS
+present verbatim (or trivially would be), it just isn't evidence of
+anything — a different failure than "cited text absent from the document,"
+which calls for a different fix on the producer side.
+
 ---
 
 ## 9. Anonymization and conversion — services in front of ingestion

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -68,6 +69,23 @@ MAX_SEARCH_FILTERS = 20
 # `full_documents`-listed document's COMPLETE claim set to arrive together.
 MAX_INGEST_DOCUMENTS = 500
 MAX_INGEST_CLAIMS = 5000
+
+# Meaningfulness floor for a verbatim quote (spec §8): a plain substring test
+# alone accepts ANY fragment that happens to occur literally in the text or
+# the document's own identity strings, including one with no evidentiary
+# value — a bare file-extension fragment (".pdf") or a lone path separator
+# ("/") both pass whenever the document mentions a filename or a date/
+# fraction/URL anywhere. A raw length floor alone cannot separate these from
+# a legitimate short quote: ".pdf" and "ARR" (a real metric name) are the
+# same length once ".pdf"'s leading punctuation is set aside. What
+# distinguishes them is not length but SHAPE — ".pdf" is a punctuation-
+# fringed fragment, dependent on characters outside the quote, never a
+# complete token on its own; "ARR" is not. A constant, not a
+# `facts.single_valued_edges`-style `get_value` knob: this guards evidence
+# INTEGRITY (can a fabricated/degenerate LLM extraction get past the gate),
+# not a per-instance ontology choice, so it is not something an operator
+# should be able to loosen. See `_is_meaningful_quote`.
+MIN_MEANINGFUL_QUOTE_LENGTH = 2
 
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
@@ -148,6 +166,49 @@ def _readable_ids(caller) -> Optional[frozenset]:
     if ids is None:
         return None
     return frozenset(ids)
+
+
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
+
+
+def _is_meaningful_quote(quote: str) -> bool:
+    """Verbatim-gate meaningfulness floor (spec §8; see
+    ``MIN_MEANINGFUL_QUOTE_LENGTH`` for the design rationale). Two
+    independent conditions, each closing a different degenerate shape:
+
+    1. **Length** — the trimmed quote must be at least
+       ``MIN_MEANINGFUL_QUOTE_LENGTH`` characters. Closes a bare single
+       character — trivially "starts with a word character" per condition 2
+       below, but still not specific enough to be evidence of anything — and
+       a run of whitespace, which strips to zero.
+    2. **Shape** — the trimmed quote must START with a word character
+       (``\\w``: letter, digit, or underscore, Unicode-aware). Closes a
+       quote that is entirely punctuation (``/``) AND one that is a
+       punctuation-fringed fragment of a longer token (``.pdf`` — the
+       leading "." can never be a complete word's own left edge; a real
+       sentence never begins mid-token) — both shapes a raw length or
+       word-character-count floor cannot tell apart from a short legitimate
+       quote of the same length (an acronym, a ticker, a year, a product
+       name: ".pdf" and "ARR" are the same length once ".pdf"'s leading
+       punctuation is set aside).
+
+       Deliberately checks only the START, not the end: a quote's trailing
+       character is routinely punctuation for an entirely ordinary reason —
+       it is citing a whole sentence or clause ("Acme Corp is the client.",
+       "the engagement is on schedule;") — and requiring a clean end as well
+       rejected that common, legitimate shape outright. A quote beginning
+       mid-token has no such innocent reading; sentence-final punctuation is
+       a closing delimiter of the unit actually quoted, leading punctuation
+       with nothing before it in the quote is not.
+
+    Deliberately does NOT require a minimum number of word characters, or
+    forbid internal/trailing punctuation — "N/A", "3.14", and "Acme Corp is
+    the client." all read fine as evidence.
+    """
+    stripped = quote.strip()
+    if len(stripped) < MIN_MEANINGFUL_QUOTE_LENGTH:
+        return False
+    return bool(_WORD_CHAR_RE.match(stripped[0]))
 
 
 def _single_valued_edge_types() -> frozenset:
@@ -2351,6 +2412,21 @@ class FactsPgRepository:
                     item_ref = f"{row_ref}.evidence[{ev_idx}]"
                     if not quote:
                         claims_rejected.append({"row": item_ref, "reason": "empty_quote", "doc_id": doc_id})
+                        continue
+                    if not _is_meaningful_quote(quote):
+                        # Applied BEFORE either half of the gate below, so a
+                        # degenerate quote (a bare file-extension fragment, a
+                        # lone separator) cannot fall through the content
+                        # check and be self-certified by the identity
+                        # haystack instead — one check closes the hole on
+                        # both paths. Distinct reason from
+                        # `verbatim_gate_failed`: the quote WAS present
+                        # verbatim (or would be, trivially), it just isn't
+                        # evidence of anything — a different failure an
+                        # operator should be able to tell apart (a producer
+                        # citing junk vs. a producer citing text absent from
+                        # the document).
+                        claims_rejected.append({"row": item_ref, "reason": "quote_not_meaningful", "doc_id": doc_id})
                         continue
                     file_id = _resolve_doc(doc_id, conn)
                     frow = _file_row(file_id) if file_id else None
