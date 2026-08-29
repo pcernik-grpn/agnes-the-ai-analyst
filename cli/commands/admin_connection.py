@@ -209,5 +209,10 @@ def test_connection(
         project = body.get("project_name", "")
         typer.echo(f"OK — project: {project}" if project else "OK")
     else:
-        typer.echo(f"FAILED — {body.get('error', 'unknown error')}", err=True)
+        # `detail` is the fallback the "unsupported source type" answer uses
+        # (the endpoint has no `error` to give for a probe it never ran) —
+        # same precedence the admin page's own renderer applies, so the two
+        # surfaces print the same sentence.
+        reason = body.get("error") or body.get("detail") or "unknown error"
+        typer.echo(f"FAILED — {reason}", err=True)
         raise typer.Exit(1)

@@ -1241,15 +1241,16 @@ _EXEMPT: dict[str, str] = {
         "credential (not user auth); the analyst-facing equivalent is the "
         "existing /api/initial-workspace.zip flow"
     ),
-    "/api/admin/run-keboola-semantic-layer-refresh": (
-        "scheduler-driven Keboola semantic layer (Metastore) sync trigger — "
-        "admin/scheduler maintenance op, mirrors the run-bq-metadata-refresh / "
-        "run-knowledge-digests exemptions; no analyst CLI/MCP analogue"
-    ),
-    "/api/admin/run-databricks-semantic-layer-refresh": (
-        "scheduler-driven Databricks semantic layer (Unity Catalog metric "
-        "views) sync trigger — admin/scheduler maintenance op, mirrors the "
-        "run-keboola-semantic-layer-refresh exemption; no analyst CLI/MCP analogue"
+    "/api/admin/run-semantic-sources-refresh": (
+        "scheduler-driven refresh over registered semantic_sources rows "
+        "(#1707 Block 3) — admin/scheduler maintenance op, mirrors the "
+        "run-bq-metadata-refresh / run-knowledge-digests exemptions; no "
+        "analyst CLI/MCP analogue (the per-source `agnes admin "
+        "semantic-source sync <id>` manual command already exists and is "
+        "unrelated to this scheduled sweep). It replaced the retired "
+        "run-keboola-semantic-layer-refresh / "
+        "run-databricks-semantic-layer-refresh triggers, which carried the "
+        "same exemption"
     ),
     "/api/admin/run-audit-prune": (
         "scheduler-driven audit_log retention pruning trigger (B8 audit-trail "
@@ -1388,7 +1389,7 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/semantic-auto-draft-sweep": (
         "scheduler-driven semantic-layer auto-draft sweep trigger "
         "(semantic-phase5 wave 2) — admin/scheduler maintenance op, mirrors "
-        "the run-keboola-semantic-layer-refresh / run-audit-prune "
+        "the run-semantic-sources-refresh / run-audit-prune "
         "exemptions; no analyst CLI/MCP analogue"
     ),
     # Build order step 4 (write path). Unlike the read routes (which live

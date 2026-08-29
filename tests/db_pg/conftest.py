@@ -555,6 +555,11 @@ def cli_client_both(seeded_app_both, monkeypatch):
     monkeypatch.setattr(_cli_client, "_get_shared_client", lambda: _make_client())
     _cli_client._SHARED_CLIENT = None
     monkeypatch.setenv("AGNES_SERVER_URL", "http://testserver")
+    # `cli.config.get_server_url` reads AGNES_SERVER (no _URL suffix); set it
+    # too so any HTTP path this fixture fails to patch resolves to the
+    # unroutable in-process host instead of a developer's real `agnes` config
+    # or a stray localhost server.
+    monkeypatch.setenv("AGNES_SERVER", "http://testserver")
 
     # v2_client uses httpx.get/post/etc. directly — patch each helper to
     # route through the in-process TestClient so CLI commands that call
@@ -590,6 +595,23 @@ def cli_client_both(seeded_app_both, monkeypatch):
             raise V2ClientError(status_code=r.status_code, body=_v2_parse_error(r))
         return r.json()
 
+    # Capture the ORIGINALS before patching — the per-module rebinding loop
+    # below must compare each command module's local binding against these.
+    # It used to compare against `getattr(_v2_client, _attr)` AFTER the
+    # setattrs, i.e. against the replacement itself — a condition that can
+    # never be true, so a command module imported before this fixture kept
+    # its httpx-based binding and made a REAL TCP call to the configured
+    # server (CI: localhost:8000 → ECONNREFUSED; a dev laptop: whatever
+    # `agnes` config points at). That was the my-stack/catalog/schema CLI
+    # smoke "flake": deterministic once any earlier test imported
+    # cli.commands.* first.
+    _v2_originals = {
+        "api_get_json": _v2_client.api_get_json,
+        "api_post_json": _v2_client.api_post_json,
+        "api_delete": _v2_client.api_delete,
+        "api_put_json": _v2_client.api_put_json,
+    }
+
     monkeypatch.setattr(_v2_client, "api_get_json", _v2_get)
     monkeypatch.setattr(_v2_client, "api_post_json", _v2_post)
     monkeypatch.setattr(_v2_client, "api_delete", _v2_delete)
@@ -617,7 +639,7 @@ def cli_client_both(seeded_app_both, monkeypatch):
     for _mod_name, _mod in list(_sys.modules.items()):
         if _mod_name.startswith("cli.commands.") and _mod is not None:
             for _attr, _replacement in _cmd_patches.items():
-                if getattr(_mod, _attr, None) is getattr(_v2_client, _attr, None):
+                if getattr(_mod, _attr, None) is _v2_originals[_attr]:
                     monkeypatch.setattr(_mod, _attr, _replacement)
 
     runner = CliRunner()

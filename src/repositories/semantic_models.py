@@ -159,6 +159,26 @@ class SemanticModelsRepository:
         sql += " ORDER BY name"
         return [self._decode(r) for r in self.conn.execute(sql, params).fetchall()]
 
+    def count_valid(self) -> int:
+        """How many rows are usable as a semantic model — ``status='valid'``
+        with a parsed ``document_json``.
+
+        The cheap existence gate for the hot path: ``POST /api/query`` asks
+        "does this instance have a semantic layer at all?" on every single
+        statement, and ``list_all()`` would drag every row's ``document`` +
+        ``document_json`` across for an answer that is one integer.
+
+        Deliberately a *superset* of what ``_accessible_valid_documents``
+        will actually load — an empty-object ``document_json`` counts here
+        and yields nothing there. Over-counting only costs the load that
+        then returns nothing; under-counting would switch the advisory off
+        silently, which is why the predicate is not narrowed further.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_models WHERE status = 'valid' AND document_json IS NOT NULL"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def delete(self, model_id: str) -> bool:
         existed = self.get(model_id) is not None
         self.conn.execute("DELETE FROM data_package_semantic_models WHERE model_id = ?", [model_id])

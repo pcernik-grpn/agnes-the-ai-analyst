@@ -6,6 +6,8 @@ one-time cutover away from the retired direct writer's provenance).
 
 from __future__ import annotations
 
+import pytest
+
 from connectors.databricks.semantic_layer import (
     DATABRICKS_SEMANTIC_SOURCE_ID,
     LEGACY_METRIC_SOURCE,
@@ -14,8 +16,35 @@ from connectors.databricks.semantic_layer import (
 )
 
 
+_SETTINGS = {
+    "host": "example.cloud.databricks.com",
+    "warehouse_id": "w1",
+    "catalog": "main",
+    "catalogs": ["main"],
+    "token": "t",
+}
+
+
+@pytest.fixture
+def configured_workspace(monkeypatch):
+    """A configured Databricks workspace. Since #1707 Block 3 step 4 this
+    helper runs on EVERY instance's semantic sweep, so it registers the row
+    only when a workspace actually exists — an unconfigured instance would
+    otherwise carry a source that fails on every run, forever."""
+    monkeypatch.setattr(
+        "connectors.databricks.semantic_layer.resolve_databricks_settings",
+        lambda connection=None: _SETTINGS,
+    )
+
+
 class TestEnsureSemanticSource:
-    def test_creates_a_connection_kind_source_on_first_call(self, e2e_env):
+    def test_registers_nothing_when_no_workspace_is_configured(self, e2e_env):
+        from src.repositories import semantic_source_repo
+
+        assert ensure_semantic_source() is None
+        assert semantic_source_repo().get(DATABRICKS_SEMANTIC_SOURCE_ID) is None
+
+    def test_creates_a_connection_kind_source_on_first_call(self, e2e_env, configured_workspace):
         from src.repositories import semantic_source_repo
 
         source_id = ensure_semantic_source()
@@ -26,7 +55,7 @@ class TestEnsureSemanticSource:
         assert row["kind"] == "connection"
         assert row["adapter"] == "databricks_metric_views"
 
-    def test_is_idempotent_and_does_not_overwrite_an_existing_row(self, e2e_env):
+    def test_is_idempotent_and_does_not_overwrite_an_existing_row(self, e2e_env, configured_workspace):
         from src.repositories import semantic_source_repo
 
         first = ensure_semantic_source()
