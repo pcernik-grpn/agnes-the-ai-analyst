@@ -2319,6 +2319,29 @@ async def library_page(
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
 
+    # ── What could not be read ────────────────────────────────────────────
+    # Every content block below is wrapped so one broken source cannot take the
+    # page down — the right instinct, wrongly finished: a band that raised is
+    # simply ABSENT, and every count on the page is derived from what survived,
+    # so a library whose data packages failed to load looks exactly like a
+    # library that has none. Bad enough and it renders "Your library is empty"
+    # to someone whose library is not. Recorded here so the page can say so.
+    #
+    # Only CONTENT losses are recorded. A failed fact count, grant lookup or
+    # item count degrades a detail on rows that are still there; a notice for
+    # those would cry wolf and teach people to ignore the one that matters.
+    _load_errors: list[str] = []
+
+    #: What a lost content group is CALLED to the person reading the page —
+    #: the internal type name means nothing to them.
+    _ETYPE_LABELS = {"skill": "skills", "plugin": "plugins", "agent": "agent templates"}
+    _RT_LABELS = {"data_package": "data packages", "memory_domain": "memory"}
+
+    def _lost(label: str, exc: Exception) -> None:
+        logger.warning("/library: could not resolve %s: %s", label, exc)
+        if label not in _load_errors:
+            _load_errors.append(label)
+
     # The onboarding step is literally "Explore your Library" — so looking at it
     # completes it. It used to need a click on the checklist row instead, which
     # made the row a box to tick rather than a thing to do: someone who had spent
@@ -2368,14 +2391,25 @@ async def library_page(
     items: list = []
 
     # ── Artefacts (file_corpora) ──────────────────────────────────────────
-    fc_repo = file_corpora_repo()
-    cf_repo = corpus_files_repo()
+    # Resolving the repos and listing the collections sits INSIDE the guard
+    # below, not above it: outside, a backend that cannot answer took the whole
+    # page down with a 500, which is the one outcome this block's try/except
+    # exists to prevent. The guard only ever protected the loop, so it covered
+    # every failure except the one most likely to happen.
+    fc_repo = None
+    cf_repo = None
     # Resolved ONCE, not per collection: the flag/backend check is the same
     # for every row, and a fresh count query per row is only worth paying
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
-    _all_cols = fc_repo.list()
+    _all_cols: list = []
+    try:
+        fc_repo = file_corpora_repo()
+        cf_repo = corpus_files_repo()
+        _all_cols = fc_repo.list()
+    except Exception as e:
+        _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
     # count re-resolved the caller's readable-collection set (a grants query
     # plus a full owned-collections scan), so the page cost grew with the
@@ -2585,7 +2619,7 @@ async def library_page(
                     row["children"].append(child)
             items.append(row)
     except Exception as e:
-        logger.warning("/library: could not enumerate artefacts: %s", e)
+        _lost("files and collections", e)
 
     # ── Store entities the caller may see: SKILLS and PLUGINS ─────────────
     # The Library is the single source of truth for what a user can reach, so it
@@ -2612,7 +2646,7 @@ async def library_page(
         for inst in user_store_installs_repo().list_for_user(uid):
             installed_store[inst["id"]] = inst
     except Exception as e:
-        logger.warning("/library: could not resolve store installs: %s", e)
+        _lost("skills, plugins and agent templates", e)
 
     for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
         try:
@@ -2623,7 +2657,7 @@ async def library_page(
                 limit=1000,
             )
         except Exception as e:
-            logger.warning("/library: could not enumerate %ss: %s", _etype, e)
+            _lost(_ETYPE_LABELS.get(_etype, _etype + "s"), e)
             continue
         for s in _entities:
             status = s.get("visibility_status") or "pending"
@@ -2979,7 +3013,7 @@ async def library_page(
                     droppable=(not _auto_membership and e.in_stack and e.requirement != "required"),
                 )
         except Exception as e:
-            logger.warning("/library: could not resolve %s: %s", rt.value, e)
+            _lost(_RT_LABELS.get(rt.value, rt.value), e)
 
     # Recipes — granted, resolved straight off the repo (no _fetch_entries
     # support for this type in StackResolver).
@@ -3004,7 +3038,7 @@ async def library_page(
                     owner_label="Your workspace",
                 )
     except Exception as e:
-        logger.warning("/library: could not resolve recipes: %s", e)
+        _lost("recipes", e)
 
     # Curated marketplace plugins — grant resource_id is the canonical
     # "<marketplace_slug>/<plugin_name>" path, so match on that.
@@ -3116,7 +3150,7 @@ async def library_page(
                     row["stack_addable"] = True
                     row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve marketplace plugins: %s", e)
+        _lost("plugins from your organization", e)
 
     # Installed AGENTS. Skills and plugins are already covered by the store sweep
     # above — whether installed or not — so listing them here again would double
@@ -3152,7 +3186,7 @@ async def library_page(
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
             items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve installed agents: %s", e)
+        _lost("agent templates", e)
 
     # ── Hosted data apps ───────────────────────────────────────────────
     # Same visibility set as the /apps page (data_apps_list_page): the
@@ -3275,7 +3309,7 @@ async def library_page(
                     )
                 )
         except Exception as e:
-            logger.warning("/library: could not list data apps: %s", e)
+            _lost("apps", e)
 
     # ── Definitions — the semantic layer, as a page FOOTER ────────────────
     # Deliberately NOT rows in the list above. Metrics and glossary terms are
@@ -3682,6 +3716,7 @@ async def library_page(
         #: already and filterable by nothing until now.
         library_formats=_present_multi("format_keys"),
         library_ownerships=library_ownerships,
+        library_load_errors=_load_errors,
         library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",

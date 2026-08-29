@@ -594,6 +594,16 @@
      list a third of the way down the page. */
   .lib-head__bar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   .lib-head__titles { min-width: 0; }
+  .lib-loaderr {
+    display: flex; align-items: flex-start; gap: 9px;
+    margin: 0 0 12px; padding: 9px 13px;
+    font-size: 13px; line-height: 1.45;
+    color: var(--ds-warn-ink);
+    background: var(--ds-warn-bg);
+    border: 1px solid var(--ds-warn-line);
+    border-radius: 9px;
+  }
+  .lib-loaderr svg { width: 16px; height: 16px; flex: none; margin-top: 1px; }
   .lib-lede { margin: 3px 0 0; max-width: 68ch; font-size: 13px; line-height: 1.45; color: var(--ds-text-muted); }
   /* The controls left the title row for the browsing block above the list —
      `.lib-head__controls` is kept as their class so the page-scoped `.fbar`
@@ -2545,16 +2555,40 @@
      the reader to look for a control that would not have helped. The engine
      owns the first; the second is chosen by `syncEmptyState` below, which knows
      whether the active tab holds any rows at all. #}
+  {% if library_load_errors %}
+  {# Not an error page: everything that DID load is below, and is usable. This
+     exists so the list is never read as complete when it isn't — the counts,
+     the band totals and the empty state are all derived from what survived, so
+     silence here would make a partial library indistinguishable from a small
+     one. #}
+  <div class="lib-loaderr" role="status">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 8v5" stroke-linecap="round"/><circle cx="12" cy="16.5" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="9"/></svg>
+    <span>Some of your library couldn’t be loaded just now —
+      {% for label in library_load_errors %}{% if not loop.first %}{% if loop.last %} and {% else %}, {% endif %}{% endif %}<b>{{ label }}</b>{% endfor %}.
+      Everything below is up to date; reload to try again.</span>
+  </div>
+  {% endif %}
   <div class="lib-empty" id="lib-noresults" hidden>
     <h3 data-empty-title>Nothing matches these filters</h3>
     <p data-empty-body>Try a different search term or filter.</p>
+    <button type="button" class="cc-btn cc-btn--primary" data-empty-jump hidden>Show the other tab</button>
     <button type="button" class="cc-btn" data-fbar-reset data-empty-reset>Clear filters</button>
   </div>
   {% else %}
   <div class="lib-empty">
+    {# "Empty" is a claim about the world; with a failed read it is only a claim
+       about this request. Saying it anyway is how a total outage reads as a
+       fresh account — the one failure mode a user cannot tell apart or report
+       accurately. #}
+    {% if library_load_errors %}
+    <h3>Your library couldn’t be loaded</h3>
+    <p>Nothing could be read just now, so this list is empty — but your library may not be. Reload to try again; if it keeps happening, tell an admin.</p>
+    <button type="button" class="cc-btn cc-btn--primary" onclick="window.location.reload()">Reload</button>
+    {% else %}
     <h3>Your library is empty</h3>
     <p>Use <b>+ Add</b> to upload a file — keep it on its own, or group several into a collection — or to build a skill or a plugin. Everything you make lands here, ready to share.</p>
     <button type="button" class="cc-btn cc-btn--primary" data-new-upload>Upload a file</button>
+    {% endif %}
   </div>
   {% endif %}
 
@@ -3321,6 +3355,14 @@
   // count pass reads the SAME list the engine filters by — an option whose
   // badge disagreed with its filter is the bug this fixes, and two copies of
   // this array is how it would come back.
+  //: Declared ABOVE the init call, with LIB_FACETS, for the reason this file
+  //: already learned once: the engine's first apply() runs during init and
+  //: calls onApply(), so a `const` further down is still in its temporal dead
+  //: zone — and the engine SWALLOWS hook errors, so the whole first pass
+  //: silently did nothing and the counts stayed at their server-rendered
+  //: values until the user touched something.
+  const LIB_ROWS_SEL = '[data-lib-sec] tr[data-item-id]:not([data-parent-id])';
+
   const LIB_FACETS = [
     // "In stack only" — a binary condition worth seeing at rest, so it
     // rides the bar as the #lib-stack-toggle button (`control`) rather
@@ -3382,7 +3424,7 @@
         buttons: '.fbar-view__btn', tableWrap: '.lib-tablewrap',
         grid: '.fbar-grid', storageKey: 'lib-view', card: buildCard,
       },
-      onApply: () => { syncChildren(); markGroupEnd(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
+      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
     });
 
     // The engine's segment value starts at the `all` wildcard, which is not a
@@ -3416,8 +3458,24 @@
     // filter is responsible for the empty list.
     const owned = tab ? document.querySelectorAll('.lib-row[data-tab="' + tab + '"]').length : 1;
     const copy = owned === 0 && EMPTY_TAB_COPY[tab];
+    const elsewhere = copy ? null : otherTabHit();
+    const jump = box.querySelector('[data-empty-jump]');
     if (title) title.textContent = copy ? copy[0] : 'Nothing matches these filters';
-    if (body) body.textContent = copy ? copy[1] : 'Try a different search term or filter.';
+    if (body) {
+      body.textContent = copy ? copy[1]
+        : elsewhere ? 'This tab has no match. ' + elsewhere.label + ' has ' +
+            (elsewhere.n === 1 ? 'one.' : elsewhere.n + '.')
+        : 'Try a different search term or filter.';
+    }
+    // Keeps the query and moves it to where the answer is, rather than making
+    // the user clear what they typed and type it again on the other tab.
+    if (jump) {
+      jump.hidden = !elsewhere;
+      if (elsewhere) {
+        jump.textContent = 'Show ' + elsewhere.label;
+        jump.onclick = () => elsewhere.btn.click();
+      }
+    }
     if (reset) reset.hidden = !!copy;
   }
 
@@ -3492,12 +3550,11 @@
   //    making their counts live is not this change's to make. If a second page
   //    needs it, that is the moment to promote this into the engine — with
   //    that page's tests.
-  const LIB_ROWS_SEL = '[data-lib-sec] tr[data-item-id]:not([data-parent-id])';
 
   //: A facet's own selection is EXCLUDED from its own counts (standard faceted
   //: search): otherwise picking "PDF" would zero every sibling format and you
   //: could never see what switching to "CSV" would give.
-  function libRowsMatching(exceptKey) {
+  function libRowsMatching(exceptKey, ignoreTab) {
     //: `.is-active` is the ONLY trustworthy marker of the current tab: the
     //: engine sets it (and `aria-selected`) in setSegment, while the
     //: server-rendered `aria-checked` is never updated and sits permanently on
@@ -3516,7 +3573,7 @@
       if (on.length) sel[f.key] = on;
     });
     return Array.prototype.filter.call(document.querySelectorAll(LIB_ROWS_SEL), row => {
-      if (tab && row.getAttribute('data-tab') !== tab) return false;
+      if (!ignoreTab && tab && row.getAttribute('data-tab') !== tab) return false;
       if (q && (row.getAttribute('data-search') || '').indexOf(q) === -1) return false;
       for (let i = 0; i < LIB_FACETS.length; i++) {
         const f = LIB_FACETS[i];
@@ -3560,6 +3617,54 @@
         cat.hidden = live === 0;
       }
     });
+  }
+
+  //: The engine writes "N of M items" with M = every row it owns. Here the tab
+  //: IS a partition, not a filter the user applied, so that M made a clean load
+  //: read "10 of 17 items" — which everyone parses as "seven are hidden by
+  //: something I did". The denominator is the tab's own total, and with nothing
+  //: filtering, the line drops the "of" form entirely. Overridden here rather
+  //: than in the engine for the same reason as the option counts: `/chats` has
+  //: an "all" segment where total-is-total is the right answer.
+  function refreshItemCount() {
+    const el = document.getElementById('lib-item-count');
+    if (!el) return;
+    const seg = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
+    const tab = seg && (seg.getAttribute('data-own') || '');
+    const rows = Array.prototype.filter.call(
+      document.querySelectorAll(LIB_ROWS_SEL),
+      r => !tab || r.getAttribute('data-tab') === tab);
+    const total = rows.length;
+    const shown = rows.filter(r => !r.hidden).length;
+    const noun = total === 1 ? 'item' : 'items';
+    el.textContent = shown === total ? total + ' ' + noun : shown + ' of ' + total + ' ' + noun;
+  }
+
+  //: A tab badge was a fixed inventory count — 10 and 7, whatever you typed.
+  //: That made the one place that could say "your word is over here" the one
+  //: place that never moved: searching "cohort" on Knowledge returned nothing
+  //: while a match sat in Capabilities, and the page gave no sign of it. The
+  //: badge now counts matches under everything EXCEPT the tab itself, so with
+  //: nothing narrowing it still reads as the inventory.
+  function refreshTabCounts() {
+    const base = libRowsMatching(null, true);
+    document.querySelectorAll('#lib-tabs [data-seg-count]').forEach(badge => {
+      const key = badge.getAttribute('data-seg-count');
+      badge.textContent = String(base.filter(r => r.getAttribute('data-tab') === key).length);
+    });
+  }
+  //: How many matches the OTHER tab is holding — what the empty state offers
+  //: when this one has none.
+  function otherTabHit() {
+    const seg = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
+    const tab = seg && seg.getAttribute('data-own');
+    if (!tab) return null;
+    const other = Array.prototype.filter.call(
+      document.querySelectorAll('#lib-tabs .fbar-seg__btn'), b => b.getAttribute('data-own') !== tab)[0];
+    if (!other) return null;
+    const key = other.getAttribute('data-own');
+    const n = libRowsMatching(null, true).filter(r => r.getAttribute('data-tab') === key).length;
+    return n ? { key: key, n: n, label: (other.querySelector('span') || {}).textContent || key, btn: other } : null;
   }
 
   function refreshStackCount() {
