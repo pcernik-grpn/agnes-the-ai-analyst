@@ -1154,6 +1154,108 @@ def test_document_typed_edge_endpoints_are_untouched_by_doc_id_file_resolution(p
     assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"])
 
 
+# ---------------------------------------------------------------------------
+# O7 — source_url: an ingest documents[] entry's citation deep link is
+# persisted onto corpus_file_sources so a claim's citation can resolve to
+# the source system (spec §8/§8.1).
+# ---------------------------------------------------------------------------
+
+
+def test_documents_source_url_is_persisted_onto_corpus_file_sources(pg_env, repo):
+    from src.repositories import corpus_file_sources_repo
+
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_url1")
+    _seed_chunk(file_id="cf_url1", text="Acme Corp signed the deal.")
+    _seed_source_mapping(file_id="cf_url1", source_doc_id="docurl1", stable_id="p1")
+
+    url = "https://contoso.sharepoint.com/sites/acme/Shared%20Documents/deal.docx"
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "docurl1", "corpus_id": CORPUS_A, "stable_id": "p1", "source_url": url}],
+        nodes=[_node("engagement:url1", "docurl1", "Acme Corp signed the deal.")],
+    )
+    assert report["claims_written"] == 1
+    assert report["source_urls_rejected"] == []  # a valid url is never itemized as rejected
+
+    row = corpus_file_sources_repo().get("cf_url1")
+    assert row["source_url"] == url
+
+
+def test_documents_without_source_url_leaves_it_null(pg_env, repo):
+    from src.repositories import corpus_file_sources_repo
+
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_url2")
+    _seed_chunk(file_id="cf_url2", text="Acme Corp signed the deal.")
+    _seed_source_mapping(file_id="cf_url2", source_doc_id="docurl2", stable_id="p2")
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "docurl2", "corpus_id": CORPUS_A, "stable_id": "p2"}],
+        nodes=[_node("engagement:url2", "docurl2", "Acme Corp signed the deal.")],
+    )
+    assert report["claims_written"] == 1
+    # An ABSENT source_url is the normal case — never itemized as a
+    # rejection (only a SENT-but-invalid value is, see the hostile-url test
+    # below). A silent NULL here is correct; a silent NULL for a value the
+    # producer actually sent is exactly the bug class this counter fixes.
+    assert report["source_urls_rejected"] == []
+
+    row = corpus_file_sources_repo().get("cf_url2")
+    assert row["source_url"] is None
+
+
+@pytest.mark.parametrize(
+    "hostile_url,expected_reason",
+    [
+        ("javascript:alert(1)", "not_https"),
+        ("data:text/html,<script>alert(1)</script>", "not_https"),
+        ("http://contoso.sharepoint.com/deal.docx", "not_https"),  # https-only
+        ("https:///deal.docx", "no_host"),  # scheme ok, no host
+        ("https://" + "a" * 3000 + ".example.com", "too_long"),  # over the length cap
+    ],
+)
+def test_documents_hostile_source_url_is_dropped_not_stored_claim_still_ingests(
+    pg_env, repo, hostile_url, expected_reason
+):
+    """A hostile/invalid `source_url` must never reach storage (it renders
+    as a link's href), but the surrounding claim ingests normally — an
+    attacker-controlled producer field must not be able to poison an
+    unrelated write (spec §8.1, security playbook). The drop is also no
+    longer SILENT (O7 follow-up): it is itemized on the run report's
+    `source_urls_rejected`, reasoned, so a non-zero count tells an operator
+    their producer is sending urls Agnes won't store."""
+    from src.repositories import corpus_file_sources_repo
+
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_url3")
+    _seed_chunk(file_id="cf_url3", text="Acme Corp signed the deal.")
+    _seed_source_mapping(file_id="cf_url3", source_doc_id="docurl3", stable_id="p3")
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "docurl3", "corpus_id": CORPUS_A, "stable_id": "p3", "source_url": hostile_url}],
+        nodes=[_node("engagement:url3", "docurl3", "Acme Corp signed the deal.")],
+    )
+    assert report["claims_written"] == 1
+    assert report["source_urls_rejected"] == [{"doc_id": "docurl3", "reason": expected_reason}]
+
+    row = corpus_file_sources_repo().get("cf_url3")
+    assert row["source_url"] is None
+
+
+def test_claims_read_shape_carries_source_url_when_present(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, file_id="cf_url4", doc_id="docurl4")
+    url = "https://contoso.sharepoint.com/sites/acme/deal.docx"
+    report = repo.ingest_batch(
+        documents=[{"doc_id": doc_id, "corpus_id": CORPUS_A, "stable_id": "cf_url4", "source_url": url}],
+        nodes=[_node("engagement:url4", doc_id, "The engagement is underway and on schedule.")],
+    )
+    assert report["claims_written"] == 1
+
+    subject = repo.search(_admin(), type="engagement")["subjects"][0]
+    claims = repo.claims(_admin(), subject["id"])["claims"]
+    assert claims[0]["document"]["source_url"] == url
+
+
 # ===========================================================================
 # HTTP round-trips — real Postgres backend via build_seeded_client("pg", ...).
 # ===========================================================================
