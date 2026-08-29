@@ -1310,6 +1310,9 @@
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';
+    coverImg.fetchPriority = 'high';
+    coverImg.width = 480;
+    coverImg.height = 240;
     coverImg.src = d.cover_photo_url;
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');

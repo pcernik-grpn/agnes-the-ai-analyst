@@ -182,7 +182,7 @@
        per-kind sections below. A cover image, when set, overlays the
        glyph and removes itself on load error to reveal it. #}
     {{ cards.kind_glyph(glyph or kind) }}
-    {% if cover_image_url %}<img src="{{ cover_image_url }}" alt="" onerror="this.parentElement.classList.remove('detail-hero__icon--cover'); this.remove();">{% endif %}
+    {% if cover_image_url %}<img src="{{ cover_image_url }}" alt="" fetchpriority="high" width="480" height="240" onerror="this.parentElement.classList.remove('detail-hero__icon--cover'); this.remove();">{% endif %}
   </div>
   <div class="detail-hero__body">
     <div class="detail-hero__title-row">

@@ -168,7 +168,7 @@
             title="Lifecycle status: {{ _status_meta.label }}">{{ _status_meta.label }}</span>
     {% endif %}
     {% if entry.cover_image_url %}
-      <img src="{{ entry.cover_image_url }}" alt=""
+      <img src="{{ entry.cover_image_url }}" alt="" loading="lazy" decoding="async" width="480" height="240"
            onerror="this.parentElement.classList.add('stack-card__photo--failed');
                     this.parentElement.textContent=this.dataset.fallback;"
            data-fallback="{{ _initials }}">

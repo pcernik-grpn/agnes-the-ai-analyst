@@ -1242,6 +1242,9 @@
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';
+    coverImg.fetchPriority = 'high';
+    coverImg.width = 480;
+    coverImg.height = 240;
     coverImg.src = d.cover_photo_url;
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
@@ -1697,7 +1700,7 @@
     const cards = items.map(it => {
       const itInitials = deriveInitials(it.name, type);
       const photoMarkup = it.cover_photo_url
-        ? `<div class="photo"><img src="${esc(it.cover_photo_url)}" alt=""
+        ? `<div class="photo"><img src="${esc(it.cover_photo_url)}" alt="" loading="lazy" decoding="async" width="480" height="240"
               onerror="this.parentElement.classList.add('photo-failed');
                        this.parentElement.textContent='${itInitials.replace(/'/g, "\\'")}';"></div>`
         : `<div class="photo">${itInitials}</div>`;
