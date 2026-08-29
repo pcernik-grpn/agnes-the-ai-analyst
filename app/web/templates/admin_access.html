@@ -1944,7 +1944,11 @@
      Not extracted into the shared sheet in this pass: that is the
      platform-wide table/toolbar unification, and it should move both pages
      at once rather than leave a third calibration behind. */
-  .ax-onebar .fbar__search { flex: 0 1 300px; }
+  /* The Library's bar is 300px of search because four more controls fill
+     the rest of its row; this one carries two, so a 300px field would leave
+     the bar reading as leftovers rather than as a bar. It grows instead,
+     with a ceiling so it never runs the full width of a wide screen. */
+  .ax-onebar .fbar__search { flex: 1 1 auto; max-width: 30rem; }
   .ax-onebar .fbar__search input {
     height: 32px; font-size: 13px; padding: 0 10px 0 30px;
     background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);

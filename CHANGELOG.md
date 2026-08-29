@@ -216,6 +216,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+- **Admin pages are a white sheet, like every index page.** `base_index.html`
+  surfaces (Library, Agents, Chats) paint their whole shell `--ds-surface` —
+  `.idx`'s own comment gives the reason: the header zone should read as part
+  of the page surface, not as a grey band above it. Admin pages extend a
+  different base and so sat on the app background, which is why an admin page
+  and the Library read as two products even where their components already
+  matched. One rule in `admin_page.css` — a sheet loaded by the two admin
+  bases and nothing else, so it can only ever mean an admin shell — moves all
+  forty of them. The access page's search also grows to fill its bar: the
+  Library's is 300px because four more controls fill the rest of its row, and
+  at that width in a two-control bar it read as leftovers rather than a bar.
 - **The access toolbar and tables take the Library's own calibration.**
   Measured against `ek/library-redesign` rather than matched by eye: `.fbar`
   is shared, but the Library *scopes a calibration onto it* — 32px controls, a
