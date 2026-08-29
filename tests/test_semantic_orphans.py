@@ -155,3 +155,19 @@ class TestFindOrphanedTableBindings:
 
         result = find_orphaned_table_bindings()
         assert result["orphaned_columns"] == []
+
+
+def test_hand_authored_metrics_are_never_flagged():
+    """yaml_import / web_upload / manual metrics carry free-text table names
+    that never came from table_registry — a miss there is not a deleted
+    table (mirrors _orphaned_models' source='manual' exclusion)."""
+    from src.semantic.orphans import find_orphaned_metrics
+
+    metrics = [
+        {"id": "m1", "name": "starter", "source": "yaml_import", "table_name": "never_registered"},
+        {"id": "m2", "name": "uploaded", "source": "web_upload", "table_name": "never_registered"},
+        {"id": "m3", "name": "handmade", "source": "manual", "table_name": "never_registered"},
+        {"id": "m4", "name": "projected", "source": "keboola_metastore", "table_name": "never_registered"},
+    ]
+    orphans = find_orphaned_metrics(metrics, known_table_names={"orders"})
+    assert [o["metric_id"] for o in orphans] == ["m4"]

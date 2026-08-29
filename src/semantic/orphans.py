@@ -59,6 +59,12 @@ def _bound_table_names(metric: dict[str, Any]) -> set[str]:
     return names
 
 
+# Metric writers whose table names never came from table_registry — a
+# missing name there is not evidence of a deleted table. Mirrors the
+# source='manual' exclusion in coverage._orphaned_models.
+_HAND_AUTHORED_METRIC_SOURCES = frozenset({"manual", "yaml_import", "web_upload"})
+
+
 def find_orphaned_metrics(
     metrics: list[dict[str, Any]], known_table_names: set[str]
 ) -> list[dict[str, Any]]:
@@ -69,9 +75,20 @@ def find_orphaned_metrics(
     ``tables`` is empty — a constant or dimension-only metric, or one not
     yet projected) is never flagged: it was never bound, so a table delete
     cannot have orphaned it.
+
+    Hand-authored metrics are excluded the same way ``_orphaned_models``
+    excludes ``source='manual'`` models: rows written by ``agnes admin
+    metrics import`` (``yaml_import``), the web YAML upload
+    (``web_upload``) or the manual admin API (``manual``) carry free-text
+    table names that may never have matched a registered table — flagging
+    them would report a starter-pack metric as "bound to a deleted table"
+    though nothing was ever deleted. Only registry-fed provenance can go
+    stale in the sense this finder reports.
     """
     orphans: list[dict[str, Any]] = []
     for metric in metrics:
+        if (metric.get("source") or "manual") in _HAND_AUTHORED_METRIC_SOURCES:
+            continue
         bound = _bound_table_names(metric)
         if not bound:
             continue
