@@ -57,6 +57,21 @@
 }
 .dsec:last-child { margin-bottom: 0; }
 
+/* The clip yields while a ds-dropdown popover inside the card is open. The
+   menu opens BELOW its trigger (ds_dropdown.css), so from a row near the
+   bottom of the body it extends past the card's edge — where the clip cut it
+   to whatever fit inside, with no scroll or affordance: the /admin/users/{id}
+   "Add to group" picker showed exactly one option. Only themes that render
+   the custom menu hit this (the native `<select>` popup it replaces is
+   OS-drawn and clips through nothing), which is why the picker looked fine
+   until such a theme claimed it. Unclipping is safe mid-interaction: the
+   rounded-corner clip exists for the summary's hover wash, which isn't in
+   play while a menu is open. Engines without `:has()` keep today's clip —
+   same degradation the focus-ring rule below already accepts.
+   Guarded by tests/test_design_system_contract.py
+   (test_dsec_clip_yields_to_open_dropdown_menu). */
+.dsec:has(.ds-dropdown-menu:not([hidden])) { overflow: visible; }
+
 /* The disclosure triangle is replaced by `.dsec-chev` on the right, so the
    head's own left edge stays aligned with the body's. `::marker` and the
    WebKit pseudo both need clearing. */

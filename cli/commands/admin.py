@@ -26,6 +26,7 @@ from cli.commands.admin_semantic_model import admin_semantic_model_app
 from cli.commands.admin_semantic_source import admin_semantic_source_app
 from cli.commands.admin_sessions import sessions_app as admin_sessions_app
 from cli.commands.admin_skills import admin_skills_app
+from cli.commands.admin_sso import admin_sso_app
 from cli.commands.admin_store import admin_store_app
 from cli.commands.admin_usage import app as admin_usage_app
 from cli.commands.db import db_app as admin_db_app
@@ -57,6 +58,7 @@ admin_app.add_typer(admin_data_package_app, name="data-package", help="Data Pack
 admin_app.add_typer(admin_memory_domain_app, name="memory-domain", help="Memory Domain CRUD (v49)")
 admin_app.add_typer(admin_digest_app, name="digest", help="Maintained digest CRUD (K4)")
 admin_app.add_typer(admin_db_app, name="db", help="Manage app-state DB backend (DuckDB / Postgres)")
+admin_app.add_typer(admin_sso_app, name="sso", help="External SSO login (Entra ID OIDC) runtime config")
 admin_app.add_typer(
     admin_doctor_app, name="doctor", help="Deployment-gate diagnostics (`agnes admin doctor --new-instance`)"
 )

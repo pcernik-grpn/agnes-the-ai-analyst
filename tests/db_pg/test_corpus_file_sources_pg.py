@@ -185,6 +185,29 @@ def test_unique_constraint_rejects_second_file_same_stable_id(pg_engine, monkeyp
         repo.upsert(corpus_file_id=second, corpus_id=CORPUS_ID, source_stable_id="graph:dup")
 
 
+def test_get_by_source_doc_id_returns_none_when_unmapped(pg_engine, monkeypatch):
+    repo, _cf = _make_repo(pg_engine, monkeypatch)
+    assert repo.get_by_source_doc_id("6a8e0bc93c07c56a") is None
+
+
+def test_get_by_source_doc_id_round_trips(pg_engine, monkeypatch):
+    """The lookup the file-source card's "Last run" drawer uses to resolve
+    a rejection's sha16 `doc_id` to the file it belongs to — global (not
+    scoped by corpus_id), unlike `resolve()`."""
+    repo, cf_repo = _make_repo(pg_engine, monkeypatch)
+    file_id = _add_file(cf_repo)
+    repo.upsert(
+        corpus_file_id=file_id,
+        corpus_id=CORPUS_ID,
+        source_stable_id="graph:abc123",
+        source_doc_id="6a8e0bc93c07c56a",
+    )
+    row = repo.get_by_source_doc_id("6a8e0bc93c07c56a")
+    assert row is not None
+    assert row["corpus_file_id"] == file_id
+    assert row["corpus_id"] == CORPUS_ID
+
+
 def test_cascade_delete_removes_mapping(pg_engine, monkeypatch):
     """corpus_file_id FK ON DELETE CASCADE: deleting the corpus_files row
     removes its source mapping too."""

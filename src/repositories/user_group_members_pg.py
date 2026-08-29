@@ -113,27 +113,48 @@ class UserGroupMembersPgRepository:
                 ).first()
         return row is not None
 
-    def replace_google_sync_groups(
+    def replace_synced_groups(
         self,
         user_id: str,
         group_ids: List[str],
-        added_by: str = "system:google-sync",
+        source: str,
+        added_by: str,
     ) -> None:
+        """Shared bulk-replace primitive behind ``replace_google_sync_groups``
+        / ``replace_microsoft_sync_groups`` — mirrors the DuckDB sibling."""
         with self._engine.begin() as conn:
             conn.execute(
-                sa.text("DELETE FROM user_group_members WHERE user_id = :u AND source = 'google_sync'"),
-                {"u": user_id},
+                sa.text("DELETE FROM user_group_members WHERE user_id = :u AND source = :s"),
+                {"u": user_id, "s": source},
             )
             for group_id in group_ids:
                 conn.execute(
                     sa.text(
                         """INSERT INTO user_group_members
                            (user_id, group_id, source, added_by)
-                           VALUES (:u, :g, 'google_sync', :b)
+                           VALUES (:u, :g, :s, :b)
                            ON CONFLICT (user_id, group_id) DO NOTHING"""
                     ),
-                    {"u": user_id, "g": group_id, "b": added_by},
+                    {"u": user_id, "g": group_id, "s": source, "b": added_by},
                 )
+
+    def replace_google_sync_groups(
+        self,
+        user_id: str,
+        group_ids: List[str],
+        added_by: str = "system:google-sync",
+    ) -> None:
+        """``replace_synced_groups`` pinned to ``source='google_sync'``."""
+        self.replace_synced_groups(user_id, group_ids, source="google_sync", added_by=added_by)
+
+    def replace_microsoft_sync_groups(
+        self,
+        user_id: str,
+        group_ids: List[str],
+        added_by: str = "system:microsoft-sync",
+    ) -> None:
+        """``replace_synced_groups`` pinned to ``source='microsoft_sync'``."""
+        self.replace_synced_groups(user_id, group_ids, source="microsoft_sync", added_by=added_by)
 
     def remove_user_from_all_groups(self, user_id: str) -> int:
         with self._engine.begin() as conn:

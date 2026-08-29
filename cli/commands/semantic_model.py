@@ -217,9 +217,9 @@ def export_model(
 
 @semantic_model_app.command("validate")
 def validate_document(
-    path: str = typer.Argument(..., help="Path to a local Ossie YAML document"),
+    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
 ):
-    """Schema-check a local DOCUMENT against the vendored Ossie spec.
+    """Schema-check a local DOCUMENT against the vendored semantic-model schema.
 
     Runs entirely offline: no server, no token, no admin. An author fixing a
     document should not need a reachable instance to iterate — which is why
@@ -248,7 +248,7 @@ def validate_document(
 
 @semantic_model_app.command("apply")
 def apply(
-    path: str = typer.Argument(..., help="Path to an Ossie document (YAML)"),
+    path: str = typer.Argument(..., help="Path to a semantic-model document (YAML)"),
     description: Optional[str] = typer.Option(None, "--description", help="Listing description for the model"),
     expect_hash: Optional[str] = typer.Option(
         None,

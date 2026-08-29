@@ -413,6 +413,164 @@ class TestLlmReviewRunner:
 
 
 # ---------------------------------------------------------------------------
+# TCRD-235 — submitter notified when the async LLM review lands a
+# terminal verdict (approved / blocked_llm). No signal on intermediate
+# states (review_error), and a broken notification channel must never
+# break the review itself.
+# ---------------------------------------------------------------------------
+
+
+class TestLlmReviewRunnerNotifiesSubmitter:
+    def test_safe_verdict_notifies_submitter_with_approved_decision(self, conn, plugin_dir, monkeypatch):
+        eid, sub_id = _seed_pending_submission(conn, plugin_dir)
+        calls = []
+        monkeypatch.setattr(
+            "app.notifications.publish_notification",
+            lambda user, payload: calls.append((user, payload)),
+        )
+
+        verdict = {
+            "risk_level": "safe",
+            "summary": "OK",
+            "findings": [],
+            "template_placeholders_found": 0,
+            "reviewed_by_model": "claude-haiku-4-5-20251001",
+            "error": None,
+        }
+        with patch(
+            "src.store_guardrails.runner.llm_review.review_bundle",
+            return_value=verdict,
+        ):
+            run_llm_review(
+                sub_id,
+                plugin_dir=plugin_dir,
+                conn_factory=_conn_factory(conn),
+                api_key_loader=lambda: "sk-test",
+                model_loader=lambda: "claude-haiku-4-5-20251001",
+            )
+
+        assert len(calls) == 1
+        user, payload = calls[0]
+        assert user == "u1"  # submitter_id from _seed_pending_submission
+        assert payload["kind"] == "store_submission"
+        assert payload["decision"] == "approved"
+        assert payload["submission_id"] == sub_id
+        assert payload["entity_id"] == eid
+        assert payload["name"] == "probe"
+
+    def test_blocked_verdict_notifies_submitter_with_rejected_decision(self, conn, plugin_dir, monkeypatch):
+        eid, sub_id = _seed_pending_submission(conn, plugin_dir)
+        calls = []
+        monkeypatch.setattr(
+            "app.notifications.publish_notification",
+            lambda user, payload: calls.append((user, payload)),
+        )
+
+        verdict = {
+            "risk_level": "high",
+            "summary": "exfil",
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "exfiltration",
+                    "file": "run.py",
+                    "explanation": "ships token to remote",
+                }
+            ],
+            "template_placeholders_found": 0,
+            "reviewed_by_model": "claude-haiku-4-5-20251001",
+            "error": None,
+        }
+        with patch(
+            "src.store_guardrails.runner.llm_review.review_bundle",
+            return_value=verdict,
+        ):
+            run_llm_review(
+                sub_id,
+                plugin_dir=plugin_dir,
+                conn_factory=_conn_factory(conn),
+                api_key_loader=lambda: "sk-test",
+                model_loader=lambda: "claude-haiku-4-5-20251001",
+            )
+
+        assert len(calls) == 1
+        user, payload = calls[0]
+        assert user == "u1"
+        assert payload["decision"] == "blocked_llm"
+        assert payload["submission_id"] == sub_id
+        assert payload["entity_id"] == eid
+
+    def test_review_error_does_not_notify(self, conn, plugin_dir, monkeypatch):
+        """review_error is inconclusive, not a decision — no notification."""
+        eid, sub_id = _seed_pending_submission(conn, plugin_dir)
+        calls = []
+        monkeypatch.setattr(
+            "app.notifications.publish_notification",
+            lambda user, payload: calls.append((user, payload)),
+        )
+
+        verdict = {
+            "risk_level": None,
+            "summary": None,
+            "findings": [],
+            "template_placeholders_found": 0,
+            "reviewed_by_model": "claude-haiku-4-5-20251001",
+            "error": "LLMTimeoutError: Anthropic connection error",
+        }
+        with patch(
+            "src.store_guardrails.runner.llm_review.review_bundle",
+            return_value=verdict,
+        ):
+            run_llm_review(
+                sub_id,
+                plugin_dir=plugin_dir,
+                conn_factory=_conn_factory(conn),
+                api_key_loader=lambda: "sk-test",
+                model_loader=lambda: "claude-haiku-4-5-20251001",
+            )
+
+        assert calls == []
+
+    def test_notification_channel_failure_does_not_break_review(self, conn, plugin_dir, monkeypatch):
+        """A broken notification channel must never fail the review itself —
+        the submission still lands at 'approved' even though the notify
+        call raised."""
+
+        def boom(user, payload):
+            raise RuntimeError("coordination backend exploded")
+
+        monkeypatch.setattr("app.notifications.publish_notification", boom)
+
+        eid, sub_id = _seed_pending_submission(conn, plugin_dir)
+        verdict = {
+            "risk_level": "safe",
+            "summary": "OK",
+            "findings": [],
+            "template_placeholders_found": 0,
+            "reviewed_by_model": "claude-haiku-4-5-20251001",
+            "error": None,
+        }
+        with patch(
+            "src.store_guardrails.runner.llm_review.review_bundle",
+            return_value=verdict,
+        ):
+            result = run_llm_review(
+                sub_id,
+                plugin_dir=plugin_dir,
+                conn_factory=_conn_factory(conn),
+                api_key_loader=lambda: "sk-test",
+                model_loader=lambda: "claude-haiku-4-5-20251001",
+            )
+
+        assert isinstance(result, LlmResult)
+        assert result.passed
+        sub = StoreSubmissionsRepository(conn).get(sub_id)
+        assert sub["status"] == "approved"
+        ent = StoreEntitiesRepository(conn).get(eid)
+        assert ent["visibility_status"] == "approved"
+
+
+# ---------------------------------------------------------------------------
 # llm_review.review_bundle — single-shot transport-error path
 # ---------------------------------------------------------------------------
 

@@ -154,3 +154,14 @@ class MarketplaceRegistryPgRepository:
                 sa.text(f"UPDATE marketplace_registry SET {', '.join(sets)} WHERE id = :id"),
                 params,
             )
+
+    def clear_sync_error(self, marketplace_id: str) -> None:
+        """Null out ``last_error`` without pretending a sync happened.
+
+        See the DuckDB sibling for the TCRD-219 rationale — boot re-seed of
+        bundled rows clears a stamp nothing else can."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE marketplace_registry SET last_error = NULL WHERE id = :id"),
+                {"id": marketplace_id},
+            )

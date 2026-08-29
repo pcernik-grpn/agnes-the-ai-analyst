@@ -159,3 +159,57 @@ def test_count_tokens_keeps_model_in_body():
 def test_count_tokens_invalid_body_raises():
     with pytest.raises(ValueError):
         bv.count_tokens_to_vertex(json.dumps({"messages": []}).encode(), "p", "global")
+
+
+# ---------------------------------------------------------------------------
+# sanitize_beta_header
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_drops_first_party_only_betas():
+    # The exact value that 400-ed the first real Vertex chat turn: the
+    # kai-agent engine's SDK sends it, Vertex refuses the whole request.
+    kept, dropped = bv.sanitize_beta_header("advisor-tool-2026-03-01")
+    assert kept == ""
+    assert dropped == ("advisor-tool-2026-03-01",)
+
+
+def test_sanitize_keeps_vertex_supported_betas():
+    kept, dropped = bv.sanitize_beta_header("interleaved-thinking-2025-05-14, context-1m-2025-08-07")
+    assert kept == "interleaved-thinking-2025-05-14, context-1m-2025-08-07"
+    assert dropped == ()
+
+
+def test_sanitize_mixed_keeps_supported_drops_rest():
+    kept, dropped = bv.sanitize_beta_header(
+        "advisor-tool-2026-03-01, interleaved-thinking-2025-05-14, oauth-2025-04-20"
+    )
+    assert kept == "interleaved-thinking-2025-05-14"
+    assert dropped == ("advisor-tool-2026-03-01", "oauth-2025-04-20")
+
+
+def test_sanitize_renames_to_vertex_spelling():
+    # Vertex serves the advanced-tool-use beta under its earlier name.
+    kept, dropped = bv.sanitize_beta_header("advanced-tool-use-2025-11-20")
+    assert kept == "tool-search-tool-2025-10-19"
+    assert dropped == ()
+
+
+def test_sanitize_dedupes_after_rename():
+    # Both spellings inbound must not double the outbound value.
+    kept, dropped = bv.sanitize_beta_header("advanced-tool-use-2025-11-20, tool-search-tool-2025-10-19")
+    assert kept == "tool-search-tool-2025-10-19"
+    assert dropped == ()
+
+
+def test_sanitize_default_denies_unknown_future_beta():
+    # A beta that does not exist yet degrades one feature, never 400s a turn.
+    kept, dropped = bv.sanitize_beta_header("shiny-new-thing-2027-01-01")
+    assert kept == ""
+    assert dropped == ("shiny-new-thing-2027-01-01",)
+
+
+def test_sanitize_tolerates_whitespace_and_empty_items():
+    kept, dropped = bv.sanitize_beta_header("  web-search-2025-03-05 , , ")
+    assert kept == "web-search-2025-03-05"
+    assert dropped == ()

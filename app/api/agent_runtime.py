@@ -64,6 +64,7 @@ from app.chat.manager import ConcurrencyCapHit, get_current_chat_manager
 from app.chat.structured_output import schema_directive, validate
 from app.logging_config import request_id_var
 from app.resource_types import ResourceType
+from src.audit_helpers import log_safe
 from src.repositories import agents_repo, idempotency_repo, jobs_repo, llm_usage_repo
 
 logger = logging.getLogger(__name__)
@@ -301,6 +302,44 @@ async def create_agent_response(
     request: Request,
     response: Response,
     principal: AgentRuntimePrincipal = Depends(require_agent_runtime_principal),
+) -> dict:
+    """Audit wrapper around `_create_agent_response_impl` (F2b — audit-
+    full-coverage plan, Task 4): writes one `agent.invoke` row right after
+    auth/scope resolution (`require_agent_runtime_principal` above already
+    ran) and BEFORE the actual run/enqueue starts — so a crash inside
+    `run_one_shot`/the background enqueue still leaves a row behind. A
+    second row, with `result="error:<class>"`, is written only when the
+    call fails (mirrors the `query.remote` error-path precedent,
+    `app/api/query.py`). `client_ip`/`correlation_id`/`client_kind` are
+    left to autofill (`src.audit_context`) — this is a plain HTTP handler.
+    """
+    user = principal.user
+    mode = "job" if body.background else "sync"
+    log_safe(
+        user_id=user["id"],
+        action="agent.invoke",
+        resource=f"agent:{slug}",
+        params={"session": None, "mode": mode},
+    )
+    try:
+        return await _create_agent_response_impl(slug, body, request, response, principal)
+    except Exception as exc:
+        log_safe(
+            user_id=user["id"],
+            action="agent.invoke",
+            resource=f"agent:{slug}",
+            params={"mode": mode},
+            result=f"error:{type(exc).__name__}",
+        )
+        raise
+
+
+async def _create_agent_response_impl(
+    slug: str,
+    body: AgentResponseRequest,
+    request: Request,
+    response: Response,
+    principal: AgentRuntimePrincipal,
 ) -> dict:
     user, agent = principal.user, principal.agent
     # `app.middleware.request_id.RequestIdMiddleware` (mounted globally in

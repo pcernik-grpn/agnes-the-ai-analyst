@@ -211,7 +211,7 @@ def show_model(
 
 @admin_semantic_app.command("import")
 def import_model(
-    path: str = typer.Argument(..., help="Path to a local Ossie YAML document"),
+    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
     description: Optional[str] = typer.Option(None, "--description", help="Optional description to store"),
 ):
     """Upload a local document, bypassing the moderation queue (admin only).

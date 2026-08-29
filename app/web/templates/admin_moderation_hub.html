@@ -1,9 +1,10 @@
 {% extends "base_admin_page.html" %}
-{% block title %}Moderation &amp; Trust — {{ config.INSTANCE_NAME }}{% endblock %}
+{% import "macros/_state.html" as state %}
+{% block title %}Store moderation — {{ config.INSTANCE_NAME }}{% endblock %}
 {% block container_modifier %}container--full{% endblock %}
 
 {% set page_hero_eyebrow = "Moderation" %}
-{% set page_hero_title = "Moderation & Trust" %}
+{% set page_hero_title = "Store moderation" %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = "Verification requests, submission review, and marketplace curation in one place." %}
 
@@ -37,6 +38,8 @@
     color: var(--ds-text-secondary);
     text-transform: capitalize;
   }
+  .mod-share-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+  .mod-share-err { color: var(--ds-accent-danger-ink); font-size: var(--text-13); margin-top: var(--space-2); }
 </style>
 {% endblock %}
 
@@ -52,6 +55,50 @@
     Register marketplace repos, sync them, and mark plugins system / disabled.
   {% endcall %}
 </div>
+
+<h2 class="mod-section-title">Pending agent shares</h2>
+
+{% if not agent_share_requests_enabled %}
+  <div class="empty-state">
+    The agent-sharing approval queue requires a Postgres app-state backend.
+    Not available on this instance.
+  </div>
+{% elif pending_share_requests %}
+  <table class="ds-table" id="mod-share-requests-table">
+    <thead>
+      <tr>
+        <th>Agent</th>
+        <th>Requested by</th>
+        <th>Share with</th>
+        <th>Requested</th>
+        <th class="num">Decision</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for sr in pending_share_requests %}
+      <tr data-share-request-id="{{ sr.id }}">
+        <td>{{ sr.resource_name }}</td>
+        <td class="mod-owner">{{ sr.requested_by_email }}</td>
+        <td>{{ sr.requested_group_name }}</td>
+        <td class="mod-owner">{{ sr.created_at }}</td>
+        <td class="num">
+          <div class="mod-share-actions">
+            <button type="button" class="btn btn-secondary btn-sm" data-share-request-action="approve">Approve</button>
+            <button type="button" class="btn btn-danger btn-sm" data-share-request-action="reject">Reject</button>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="mod-share-err" id="mod-share-requests-err" hidden></div>
+{% else %}
+  {# EMPTY on the shared vocabulary (TCRD-207) — the queue ran, there is
+     genuinely nothing in it, distinct from the "not available on this
+     instance" config gate above (which keeps its own plain copy: that is
+     not one of the four states, it is a feature switch). #}
+  {{ state.panel('empty', 'No agent shares waiting on approval.') }}
+{% endif %}
 
 <h2 class="mod-section-title">Verification requests</h2>
 
@@ -91,7 +138,47 @@
   <p class="mod-more">Showing the first {{ verification_requests|length }} of {{ verification_total }} requests — resolve some to reveal the rest.</p>
   {% endif %}
 {% else %}
-  <div class="empty-state">No verification requests waiting.</div>
+  {{ state.panel('empty', 'No verification requests waiting.') }}
 {% endif %}
+
+<script>
+(function () {
+  var table = document.getElementById('mod-share-requests-table');
+  if (!table) return;
+  var errEl = document.getElementById('mod-share-requests-err');
+
+  table.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('[data-share-request-action]');
+    if (!btn) return;
+    var row = btn.closest('tr[data-share-request-id]');
+    var id = row && row.dataset.shareRequestId;
+    if (!id) return;
+    var action = btn.dataset.shareRequestAction; // 'approve' | 'reject'
+
+    errEl.hidden = true;
+    row.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+
+    fetch('/api/admin/share-requests/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ decision: action }),
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function () {
+      row.remove();
+      if (window.appToast) {
+        window.appToast({ kind: 'success', msg: action === 'approve' ? 'Share approved' : 'Share rejected' });
+      }
+      if (!table.querySelector('tbody tr')) window.location.reload();
+    }).catch(function (e) {
+      errEl.textContent = 'Could not ' + action + ' this share: ' + (e && e.message ? e.message : e);
+      errEl.hidden = false;
+      row.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+    });
+  });
+})();
+</script>
 
 {% endblock %}

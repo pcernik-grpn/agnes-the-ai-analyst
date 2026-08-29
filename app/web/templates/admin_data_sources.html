@@ -1,6 +1,6 @@
 {% extends "base_admin.html" %}
 {% import "macros/_icon.html" as ico %}
-{% block title %}Data sources — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}Connections — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 {# The Add-data flow rides the SHARED right-side drawer (css/drawer.css) —
@@ -194,6 +194,18 @@
   .ds-badge.badge-unset::before { background: var(--ds-text-muted); }
   .ds-badge.badge-default { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
+  /* Certificate expiry status (spec: catch a silently expiring certificate
+     before auth breaks) — reuses the same success/warn/danger accent tokens
+     the health chip and pipeline strip already use. ``badge-warn`` is ALSO
+     "anonymization requested" (a wizard checkbox with nothing declared yet,
+     spec §9.2/§13.2) — same warn tone, distinct from ``badge-env``'s
+     success tone used once a run actually declares it. */
+  .ds-badge.badge-ok     { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .ds-badge.badge-ok::before     { background: var(--ds-accent-success-ink); }
+  .ds-badge.badge-warn   { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+  .ds-badge.badge-warn::before   { background: var(--ds-accent-warn-line); }
+  .ds-badge.badge-danger { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+  .ds-badge.badge-danger::before { background: var(--ds-accent-danger-line); }
   /* The file-source card's error-category badges are BUTTONS (they open the
      filtered drawer, spec §13.2) — normalize away the browser's default
      button chrome so a clickable badge still reads as a badge. */
@@ -242,6 +254,34 @@
     font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
   }
   .ds-rotate-row input:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+  .ds-rotate-row textarea {
+    flex: 1; padding: 7px 10px; resize: vertical;
+    border-radius: 8px; border: 1px solid var(--border, var(--ds-border));
+    background: var(--surface, var(--ds-surface)); color: var(--text-primary, var(--ds-text-primary));
+    font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
+  }
+  .ds-rotate-row textarea:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+
+  /* SharePoint card: "Scope collections" — clickable rows into the connect
+     wizard, bound to this connection (spec follow-up, TCRD-240/241: "make
+     it clickable" rather than wizard-only). */
+  .ds-sp-scopes { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .ds-sp-scope-row {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 6px 10px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); cursor: pointer; text-align: left; font: inherit;
+  }
+  .ds-sp-scope-row:hover { background: var(--ds-surface-sunken); border-color: var(--ds-primary); }
+  .ds-sp-scope-row__path { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* File-source "Last run" drawer rows — each rejection's human subline
+     under its resolved name/collection (or fallback sha16). */
+  .ds-filesource-drawer__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .ds-filesource-drawer__list li {
+    padding: 8px 10px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); font-size: 12.5px; color: var(--ds-text-primary);
+  }
+  .ds-filesource-drawer__reason { margin-top: 4px; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.4; }
 
   /* Table-browse panel (inline, per connection card) */
   .ds-browse-panel {
@@ -864,22 +904,47 @@
   }
   .sp-tree__row:last-child { border-bottom: none; }
   .sp-tree__row:hover { background: var(--ds-surface-sunken); }
+  /* `.sp-tree__row` sets `display: flex` as an author rule, which otherwise
+     always beats the user-agent `[hidden] { display: none }` rule
+     regardless of specificity (UA-origin declarations lose to author-origin
+     ones of ANY specificity) — the client-side filter (#2) relies on
+     toggling `hidden` to actually hide a non-matching row. */
+  .sp-tree__row[hidden] { display: none; }
   .sp-tree__name { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
   .sp-tree__name button { border: none; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--ds-text-primary); cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sp-tree__name button:hover { color: var(--ds-primary); }
   .sp-tree__name span.leaf { font-weight: 600; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-tree__name mark { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); border-radius: 3px; padding: 0 1px; }
   .sp-tree__anon { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 11.5px; color: var(--ds-text-muted); }
+  .sp-search { margin-bottom: 14px; }
+  .sp-search__row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .sp-search__q { flex: 1 1 240px; min-width: 200px; }
+  .sp-search__mode { flex: 0 0 auto; min-width: 160px; }
+  .sp-search__selectall { display: flex; align-items: center; gap: 6px; padding: 9px 12px; font-size: 12.5px; font-weight: 600; border-bottom: 1px solid var(--ds-border-light); }
   .sp-badge {
     flex: 0 0 auto; font-size: 11px; font-weight: 600; padding: 2px 8px;
     border-radius: var(--ds-radius-pill); background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
     white-space: nowrap;
   }
+  /* "anonymization requested" — the checkbox alone, warn tone (a wish, not
+     yet a fact). ".sp-badge--anon-declared" is the earned state: the latest
+     ingest run actually declared this collection anonymized (spec §9.2). */
   .sp-badge--anon { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .sp-badge--anon-declared { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  /* Unique-permissions advisory (Decision #2: Agnes never derives or
+     enforces anything from a SharePoint ACL — this warns, never gates).
+     Same warn tone as the "anonymization requested" badge — both are a
+     wish/observation, not an earned or enforced state. */
+  .sp-badge--unique-perms { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sp-note { margin: 10px 0 0; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
   .sp-share-row {
     display: flex; align-items: flex-start; gap: 12px;
     padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); margin-bottom: 10px;
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
   }
+  /* Landing effect for a scope row clicked on the collapsed card
+     (`_spHighlightShareRow`) — brief, self-removing. */
+  .sp-share-row--highlight { border-color: var(--ds-primary); box-shadow: 0 0 0 2px var(--ds-primary); }
   .sp-share-row__main { flex: 1 1 auto; min-width: 0; }
   .sp-share-row__title { font-weight: 700; font-size: 13px; color: var(--ds-text-primary); }
   .sp-share-row__badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
@@ -1493,13 +1558,53 @@
         <div id="spw-connect-error" class="ds-wizard-error"></div>
       </section>
 
-      {# Step 2: the folder tree — one level per call (sites -> drives -> root
-         children); each selected row shows its collection badge, unselected
-         rows are explicit exclusions, anonymize sits on the same row. #}
+      {# Step 2: the folder tree — sites -> drives -> root children ->
+         arbitrary-depth subfolder children (TCRD-240); each selected row
+         shows its collection badge, unselected rows are explicit
+         exclusions, anonymize sits on the same row. A bounded server-side
+         search (never Graph's own `/search` — TCRD-240) sits above the
+         tree for bulk scope selection ("all folders starting with xxx"),
+         and a client-side instant filter narrows whatever is currently
+         loaded. #}
       <section class="ds-drawer__pane" data-spw-pane="2">
         <p class="ds-wizard-lede">
           Pick the sites, libraries or folders you want indexed. Each one becomes its own Collection.
         </p>
+
+        <div class="sp-search">
+          <div class="sp-search__row">
+            <div class="ds-field sp-search__q">
+              <label for="spw-search-q">Search folders (min 2 characters)</label>
+              <input type="text" id="spw-search-q" placeholder="e.g. contracts" autocomplete="off">
+            </div>
+            <div class="ds-field sp-search__mode">
+              <label for="spw-search-mode">Match</label>
+              <select id="spw-search-mode" class="ds-dropdown-native">
+                <option value="prefix" selected>Starts with</option>
+                <option value="contains">Contains</option>
+                <option value="glob">Pattern (glob)</option>
+              </select>
+              {{ ds.dropdown(
+                id='spw-search-mode-dd', target='spw-search-mode',
+                aria_label='Search match mode', selected='prefix',
+                options=[
+                  {'value': 'prefix', 'label': 'Starts with'},
+                  {'value': 'contains', 'label': 'Contains'},
+                  {'value': 'glob', 'label': 'Pattern (glob)'},
+                ],
+              ) }}
+            </div>
+            <button type="button" class="btn btn-secondary" id="spw-search-btn">Search</button>
+          </div>
+          <div id="spw-search-truncated" class="ds-wizard-error" style="display:none;"></div>
+          <div id="spw-search-error" class="ds-wizard-error"></div>
+          <div id="spw-search-results" class="sp-tree" style="display:none; margin-bottom:12px;"></div>
+        </div>
+
+        <div class="ds-field">
+          <label for="spw-tree-filter">Filter loaded folders</label>
+          <input type="text" id="spw-tree-filter" placeholder="Narrow what's shown below…" autocomplete="off">
+        </div>
         <nav class="sp-crumbs" id="spw-crumbs" aria-label="Browsing"></nav>
         <div id="spw-tree" class="sp-tree"><div class="ds-loading">Loading…</div></div>
         <p class="sp-note">
@@ -1953,12 +2058,42 @@ function _sourceSubtitle(row) {
   const bits = [];
   if (row.derived) {
     if (row.subtitle) bits.push(_esc(row.subtitle));
+  } else if (row.source_type === "sharepoint") {
+    bits.push(_sharepointIdentityLine(config));
   } else {
     const stackUrl = (config.stack_url || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
     bits.push(stackUrl ? `<code>${_esc(stackUrl)}</code>` : "(no connection URL)");
     if (config.project_id != null) {
       bits.push(`${_esc(config.project_name || "unnamed")} · project ${_esc(String(config.project_id))}`);
     }
+  }
+  return bits.join(" · ");
+}
+
+/* SharePoint has no "connection URL" — Graph auth is tenant + app
+   registration, not a host — so the generic branch above always fell
+   through to "(no connection URL)", which tells the admin nothing true or
+   false. Two honest facts instead: the tenant (shortened — it is a GUID,
+   the value itself is not the identifying part, just that it's stable) and
+   how many scopes are selected, plus their common site when there is one.
+   `display_path`'s first " / "-segment is the site name
+   (`connectors/sharepoint/graph_client.py`'s BFS prefixes every match with
+   `[site["name"], drive["name"]]` before appending folder names). Graph's
+   `webUrl` is never fetched or stored on a scope row — verified against
+   `app/api/admin_sharepoint.py`, where a scope is exactly
+   `{source_scope_id, display_path, anonymize, collection_id}` — so there is
+   no real link to prefer over this summary. */
+function _sharepointIdentityLine(config) {
+  const bits = [];
+  const tenantId = String(config.tenant_id || "");
+  bits.push(tenantId ? `<code>${_esc(tenantId.slice(0, 8))}…</code>` : "(no tenant configured)");
+  const scopes = Array.isArray(config.scopes) ? config.scopes : [];
+  if (scopes.length) {
+    const sites = new Set(scopes.map((s) => String((s && s.display_path) || "").split(" / ")[0]));
+    const siteLabel = sites.size === 1 ? [...sites][0] : `${sites.size} sites`;
+    bits.push(`${scopes.length} scope${scopes.length === 1 ? "" : "s"} · ${_esc(siteLabel)}`);
+  } else {
+    bits.push("no scopes selected");
   }
   return bits.join(" · ");
 }
@@ -1989,16 +2124,116 @@ function _sharepointFactsHtml(row) {
       ? (cert.set_at ? `set ${_esc(new Date(cert.set_at).toLocaleDateString())}` : "set date unknown")
       : `env <code>${_esc(cert.env_name || "")}</code>`;
 
-  const identity = fs.identity || { groups_matched: 0, collections_no_group: 0 };
-  const identityTone = identity.collections_no_group ? "is-warn" : "";
-  const identityText = `${identity.groups_matched} group${identity.groups_matched === 1 ? "" : "s"} matched`
-    + ` · ${identity.collections_no_group} collection${identity.collections_no_group === 1 ? "" : "s"} with no group`;
+  // Certificate METADATA — thumbprint (what the client actually presents,
+  // compared against the identity provider), subject, and an expiry badge.
+  // Derived server-side from the same stored PEM `certDetail` above already
+  // resolved; never the private key. Rendered only once the connection's
+  // settings resolved (`cert.error` already covers a settings-resolution
+  // failure above — repeating "not configured" here would be noise): a
+  // resolvable-but-unusable certificate (no CERTIFICATE block, or one that
+  // fails to parse) gets its own single honest line rather than silently
+  // vanishing (`cert.metadata_reason`).
+  let certMetaHtml = "";
+  if (!cert.error && cert.thumbprint_x5t) {
+    const tone = cert.status === "expired" ? "badge-danger" : cert.status === "expiring_soon" ? "badge-warn" : "badge-ok";
+    const expiresDate = cert.not_after ? new Date(cert.not_after).toLocaleDateString() : "unknown";
+    const daysText = cert.expires_in_days < 0 ? `expired ${Math.abs(cert.expires_in_days)}d ago` : `${cert.expires_in_days}d left`;
+    certMetaHtml = `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The value the client actually presents (JWT x5t) — compare against the identity provider's app registration.">Thumbprint</span>
+    <span class="ds-src__fact-v">
+      <code>${_esc(cert.thumbprint_x5t)}</code>
+      <button type="button" class="btn btn-secondary" onclick="_copySharepointThumbprint(this)">Copy</button>
+    </span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Subject</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">${_esc(cert.subject || "unknown")}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Expires</span>
+    <span class="ds-src__fact-v">
+      <span class="ds-badge ${tone}">${_esc(cert.status || "")}</span>
+      <span style="color:var(--ds-text-muted)">${_esc(expiresDate)} &middot; ${_esc(daysText)}</span>
+    </span>
+  </div>`;
+  } else if (!cert.error && cert.metadata_reason) {
+    const reasonText = cert.metadata_reason === "no_certificate_configured" ? "not configured" : "unreadable";
+    certMetaHtml = `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Thumbprint</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">${_esc(reasonText)}</span>
+  </div>`;
+  }
+
+  // Sharing state — the row used to say "N groups matched · M collections
+  // with no group", which read as internal bookkeeping ("matched" against
+  // what?). Owner feedback on live use: say what it actually means — every
+  // scope collection either has someone who can see it, or it doesn't.
+  const identity = fs.identity || { groups_matched: 0, collections_no_group: 0, collections_total: 0 };
+  let identityTone, identityText;
+  if (!identity.collections_total) {
+    identityTone = "";
+    identityText = "no scope collections yet";
+  } else if (!identity.collections_no_group) {
+    identityTone = "is-ok";
+    identityText = "all scope collections have a group";
+  } else {
+    const n = identity.collections_no_group;
+    identityTone = "is-warn";
+    identityText = `${n} collection${n === 1 ? "" : "s"} ${n === 1 ? "has" : "have"} no group — only admins see them`;
+  }
+
+  // Scope rows (spec follow-up, TCRD-240/241): this connection's OWN
+  // confirmed scopes (server shape: `admin_sharepoint._scope_out`, the
+  // SAME one the connect wizard's step-3 "Share" preview reads) — clicking
+  // one opens that wizard bound to this connection with the row
+  // highlighted, rather than the wizard-only path the owner called "a
+  // dumb path, make it clickable".
+  const scopes = fs.scopes || [];
+  const scopesHtml = scopes.length
+    ? `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Scope collections</span>
+    <span class="ds-src__fact-v">
+      <ul class="ds-sp-scopes">
+        ${scopes.map((s) => `
+        <li>
+          <button type="button" class="ds-sp-scope-row" onclick="openSpWizardForConnection('${row.id}', { highlightScopeId: '${_esc(s.source_scope_id)}' })">
+            <span class="ds-sp-scope-row__path">${_esc(s.display_path || s.source_scope_id || "")}</span>
+            ${s.collection ? `<span class="ds-badge badge-env">${_esc(s.collection.name)}</span>` : `<span class="ds-badge badge-unset">no collection yet</span>`}
+            ${s.no_group_warning ? `<span class="ds-badge badge-warn">no group</span>` : ""}
+          </button>
+        </li>`).join("")}
+      </ul>
+    </span>
+  </div>`
+    : "";
+
+  // Anonymization (spec §9.2/§13.2): "requested" is the connect wizard's
+  // checkbox (a wish); "declared" is the LAST ingest run's own claim. Never
+  // collapse the two into one word — a collection with a checkbox ticked
+  // but nothing declared yet reads "requested" (warn), never "anonymized".
+  // Row only appears at all when at least one collection requests it — an
+  // instance that never anonymizes gets no extra row.
+  const anon = fs.anonymization || { requested: [], declared: [], pending: [] };
+  const anonRowHtml = anon.requested.length
+    ? `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Requested: the connect wizard's anonymize checkbox. Declared: the producer's last ingest run actually reported it anonymized — Agnes cannot verify content itself (see docs/anonymization.md).">Anonymization</span>
+    <span class="ds-src__fact-v ${anon.pending.length ? "is-warn" : "is-ok"}">
+      ${anon.declared.length ? `<span class="ds-badge badge-env">anonymized ${anon.declared.length}</span>` : ""}
+      ${anon.pending.length ? `<span class="ds-badge badge-warn">anonymization requested ${anon.pending.length}</span>` : ""}
+    </span>
+  </div>`
+    : "";
 
   const lastRun = fs.last_run;
   const badgeDefs = [
     ["rejected_quotes", "Rejected quotes"],
     ["deferred", "Deferred"],
     ["protocol_errors", "Protocol errors"],
+    ["source_urls_rejected", "Citation links rejected"],
   ];
   const badgesHtml = lastRun
     ? badgeDefs.map(([key, label]) => {
@@ -2010,24 +2245,131 @@ function _sharepointFactsHtml(row) {
       }).join(" ")
     : `<span style="color:var(--ds-text-muted)">No ingest runs yet</span>`;
 
+  // In-Agnes extraction schedule (TCRD-226) — SEPARATE from the static
+  // `Schedule` label above, which describes the EXTERNAL producer's own
+  // crawl cadence. `in_agnes` is additive: an older/degraded cell shape
+  // with no such key renders every part as its honest "off"/"never
+  // run"/"no schedule configured" default rather than throwing.
+  const inAgnes = fs.schedule.in_agnes || {};
+  const inAgnesParts = [];
+  if (!inAgnes.enabled) inAgnesParts.push(`<span class="ds-badge badge-unset">extraction.enabled is off</span>`);
+  inAgnesParts.push(
+    inAgnes.last_run_at ? `last run ${_esc(new Date(inAgnes.last_run_at).toLocaleString())}` : "never run"
+  );
+  if (inAgnes.next_run_at) {
+    inAgnesParts.push(`next run ${_esc(new Date(inAgnes.next_run_at).toLocaleString())}`);
+  } else if (!inAgnes.schedule) {
+    inAgnesParts.push("no schedule configured");
+  }
+
   return `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Crawl runs externally — this line is a label, not live state.">Schedule</span>
     <span class="ds-src__fact-v">${_esc(fs.schedule.text)}</span>
   </div>
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k">Certificate</span>
-    <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
+    <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — a separate lane from the external producer's own crawl schedule above.">In-Agnes extraction</span>
+    <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
   </div>
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Identity matching</span>
+    <span class="ds-src__fact-k">Certificate</span>
+    <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Update</button></span>
+  </div>${certMetaHtml}
+  <div class="ds-rotate-row" id="ds-sp-cert-row-${row.id}">
+    <textarea id="ds-sp-cert-input-${row.id}" rows="5" placeholder="-----BEGIN CERTIFICATE-----...-----END PRIVATE KEY-----" autocomplete="off" spellcheck="false"></textarea>
+    <button type="button" class="btn btn-primary" onclick="saveSpCertificate('${row.id}')">Save certificate</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Cancel</button>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Sharing</span>
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
   </div>
+  ${scopesHtml}
+  ${anonRowHtml}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Last run</span>
     <span class="ds-src__fact-v">${badgesHtml}</span>
   </div>
   <div class="ds-filesource-drawer" id="ds-fs-drawer-${row.id}" hidden></div>`;
+}
+
+/* Copies the certificate thumbprint an admin compares against the identity
+   provider's app registration. Reads the rendered <code> text directly
+   (already `_esc`-escaped on the way in, and a base64url thumbprint has no
+   characters that escaping would have changed) rather than threading the
+   raw value through an onclick attribute string. */
+function _copySharepointThumbprint(btn) {
+  const code = btn.previousElementSibling;
+  const text = code && code.textContent;
+  if (!text || !navigator.clipboard || typeof navigator.clipboard.writeText !== "function") return;
+  navigator.clipboard.writeText(text).then(() => {
+    const original = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  });
+}
+
+/* Live-use feedback (TCRD-240/241 follow-up): a raw row like
+   "6a8e0bc93c07c56a — verbatim_gate_failed" "tells nobody anything". Three
+   named reasons get a full human explanation; anything else is shown
+   VERBATIM (never hidden — an unknown slug is still information) rather
+   than collapsed to a generic message. */
+const SP_REJECTION_REASON_TEXT = {
+  verbatim_gate_failed:
+    "Quote not found in the document's text — the claim was rejected, nothing was stored. Usually the producer cited text outside the uploaded content (e.g. a filename).",
+  unresolved_doc_id:
+    "The cited document isn't registered in any collection — upload it or fix the producer's corpus map.",
+  ambiguous_cross_collection_doc_id:
+    "The document exists in multiple collections and the batch didn't say which — rejected rather than guessed.",
+  not_https:
+    "The producer sent a source_url that isn't https — dropped rather than stored, so the claim wrote but has no citation link. Fix the producer to send an https deep link.",
+  no_host:
+    "The producer sent a source_url with no host — dropped rather than stored, so the claim wrote but has no citation link.",
+  too_long:
+    "The producer sent a source_url over the length cap — dropped rather than stored, so the claim wrote but has no citation link.",
+  unparseable:
+    "The producer sent a source_url Agnes couldn't parse — dropped rather than stored, so the claim wrote but has no citation link.",
+};
+function _spRejectionReasonText(reason) {
+  return SP_REJECTION_REASON_TEXT[reason] || reason || "";
+}
+
+/* Duplicate (doc_id, reason) pairs collapse into one row with a "2×" count
+   badge — a document that fails the same gate ten times in a row is one
+   fact ("this document"), not ten identical lines. Rows with different
+   reasons for the SAME doc_id stay separate, so a subline is never a blend
+   of two different explanations. */
+function _spGroupRejectionRows(rows) {
+  const groups = [];
+  const indexByKey = {};
+  rows.forEach((r) => {
+    const key = `${r.doc_id || ""} ${r.reason || ""}`;
+    if (indexByKey[key] === undefined) {
+      indexByKey[key] = groups.length;
+      groups.push(Object.assign({}, r, { count: 1 }));
+    } else {
+      groups[indexByKey[key]].count += 1;
+    }
+  });
+  return groups;
+}
+
+/* The row's PRIMARY line: the resolved file name + its collection when the
+   server could resolve `doc_id` (`_sharepoint_pipeline_cell`'s `doc` key);
+   otherwise the raw sha16 stays visible (never hidden) with an honest
+   "not in any collection" fallback. The sha16 is always available as a
+   tooltip, resolved or not, for anyone who wants to go find it. */
+function _spRejectionRowHtml(r) {
+  const docId = r.doc_id || "";
+  const doc = r.doc;
+  const primary = doc && doc.name
+    ? `<span title="${_esc(docId)}">${_esc(doc.name)} · ${_esc(doc.collection || "not in any collection")}</span>`
+    : `<code title="Crawler citation key (sha256, first 16 hex chars)">${_esc(docId)}</code> — not in any collection`;
+  const countBadge = r.count > 1 ? ` <span class="ds-badge badge-unset">${r.count}×</span>` : "";
+  const reasonText = _spRejectionReasonText(r.reason);
+  return `<li>${primary}${countBadge}${reasonText ? `<div class="ds-filesource-drawer__reason">${_esc(reasonText)}</div>` : ""}</li>`;
 }
 
 /* Segmented switch: click a badge, see that category's itemized rows below
@@ -2047,9 +2389,7 @@ function toggleFileSourceDrawer(connId, category) {
   el.dataset.category = category;
   el.hidden = false;
   el.innerHTML = rows.length
-    ? `<ul class="ds-filesource-drawer__list">${rows.map((r) =>
-        `<li><code>${_esc(r.doc_id || "")}</code> — ${_esc(r.reason || "")}</li>`
-      ).join("")}</ul>`
+    ? `<ul class="ds-filesource-drawer__list">${_spGroupRejectionRows(rows).map(_spRejectionRowHtml).join("")}</ul>`
     : `<div class="ds-empty">Nothing in this category in the last run.</div>`;
 }
 
@@ -2125,6 +2465,9 @@ function _connectionCardHtml(row) {
     </div>
     ${health ? `<span class="ds-src__health ${health.tone}">${health.label}</span>` : ""}
     <div class="ds-src__acts">
+      ${row.source_type === "sharepoint" ? `
+      <button type="button" class="btn btn-primary" onclick="openSpWizardForConnection('${id}')"
+              title="Open the connect wizard, bound to this connection, on its scope step">Manage scopes</button>` : ""}
       <button type="button" class="apg-menu__btn" data-srcmenu="${id}"
               aria-haspopup="true" aria-expanded="false">Actions ${ICO_CHEVRON}</button>
       <button type="button" class="ds-src__caret" data-disclose="${id}"
@@ -2193,7 +2536,7 @@ async function importKeboolaConnection(id) {
   }
   if (!row.token_env_allowlisted) {
     showToast(
-      "This instance's configured token_env isn't on the remote-attach allowlist — use Server config to add it via AGNES_REMOTE_ATTACH_TOKEN_ENVS, or connect a new project from “+ Add data source” instead.",
+      "This instance's configured token_env isn't on the credential allowlist — use Server config to add it via AGNES_CONFIG_SECRET_ENVS, or connect a new project from “+ Add data source” instead.",
       false,
     );
     return;
@@ -2326,6 +2669,121 @@ async function testConn(id) {
   } catch (e) {
     resultEl.className = "ds-conn-test-result show fail";
     resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* SharePoint's own cheap connectivity check. `POST .../source-connections/
+   {id}/test` (the generic `testConn` above) calls Keboola's own
+   `/v2/storage/tokens/verify` — meaningless, and 422s, for a SharePoint
+   connection (no `stack_url`). No new endpoint: this reuses the two GETs
+   the connect wizard/card already have — certificate (proves a usable PEM
+   is stored) and an unscoped tree call (proves the Graph token + cert
+   actually authenticate, since listing sites is a live upstream call). */
+async function testSpConn(id) {
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  setSourceOpen(id, true);
+  resultEl.className = "ds-conn-test-result show";
+  resultEl.textContent = "Testing…";
+  const base = `/api/admin/sharepoint/connections/${encodeURIComponent(id)}`;
+  try {
+    const certResp = await fetch(`${base}/certificate`, { credentials: "include" });
+    const cert = await certResp.json().catch(() => ({}));
+    if (!certResp.ok || !cert.certificate) {
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = "✗ " + (cert.reason || "certificate not configured");
+      return;
+    }
+    const treeResp = await fetch(`${base}/tree`, { credentials: "include" });
+    const tree = await treeResp.json().catch(() => ({}));
+    if (!treeResp.ok) {
+      const detail = tree.detail;
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = "✗ " + ((detail && (detail.message || detail.error)) || "connection failed");
+      return;
+    }
+    const n = (tree.items || []).length;
+    resultEl.className = "ds-conn-test-result show ok";
+    resultEl.textContent = `✓ Connected — ${n} site${n === 1 ? "" : "s"} reachable`;
+  } catch (e) {
+    resultEl.className = "ds-conn-test-result show fail";
+    resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* One-off admin trigger for the in-Agnes extraction job (TCRD-226):
+   `POST .../connections/{id}/extract` enqueues the existing
+   `corpus-extraction` job kind — see app/api/admin_sharepoint.py. Fire-and-
+   forget from the card's point of view (the job runs out-of-band in a
+   worker); the visible result here is "queued" or a typed refusal
+   (extraction disabled, no producer configured, or already running), never
+   the extraction's own outcome. */
+async function runSpExtraction(id) {
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  setSourceOpen(id, true);
+  resultEl.className = "ds-conn-test-result show";
+  resultEl.textContent = "Starting extraction…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extract`, {
+      method: "POST",
+      credentials: "include",
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      resultEl.className = "ds-conn-test-result show ok";
+      resultEl.textContent = `✓ Extraction queued (job ${body.job_id})`;
+      showToast("Extraction queued.", true);
+    } else {
+      const msg = detailMessage(body, "failed to start extraction");
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = "✗ " + msg;
+      showToast(msg, false);
+    }
+  } catch (e) {
+    resultEl.className = "ds-conn-test-result show fail";
+    resultEl.textContent = "✗ Request failed";
+  }
+}
+
+function toggleSpCertRow(id) {
+  const row = document.getElementById(`ds-sp-cert-row-${id}`);
+  setSourceOpen(id, true);
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    document.getElementById(`ds-sp-cert-input-${id}`).value = "";
+  } else {
+    row.classList.add("show");
+    document.getElementById(`ds-sp-cert-input-${id}`).focus();
+  }
+}
+
+async function saveSpCertificate(id) {
+  const input = document.getElementById(`ds-sp-cert-input-${id}`);
+  const pem = input.value.trim();
+  if (!pem) { showToast("Paste a certificate first.", false); return; }
+  try {
+    // Same generic secret slot Keboola's "Rotate storage token" writes
+    // (`kind: "storage"`, the default) — a SharePoint connection has no
+    // Storage API to preflight against, so the server stores it unverified,
+    // same as the connect wizard's own cert-upload step.
+    const r = await fetch(`${API_CONNECTIONS}/${id}/secret`, {
+      method: "PUT", credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: pem, kind: "storage" }),
+    });
+    if (r.ok || r.status === 204) {
+      showToast("Certificate updated.", true);
+      input.value = "";
+      toggleSpCertRow(id);
+      await loadConnections();
+    } else {
+      const body = await r.json().catch(() => ({}));
+      const msg = r.status === 409
+        ? "Server vault key missing — set AGNES_VAULT_KEY first."
+        : "Failed: " + detailMessage(body, "unknown error");
+      showToast(msg, false);
+    }
+  } catch (_) {
+    showToast("Request failed.", false);
   }
 }
 
@@ -4842,6 +5300,22 @@ function _sourceMenuItems(row) {
       <a class="apg-menu__item" role="menuitem" href="${_esc(row.settings_href || "/admin")}">${_esc(row.settings_label || "Settings")} <span class="note">→</span></a>
       <p class="apg-menu__note">${name} keeps no stored connection — its credentials and settings live where the link above goes.</p>`;
   }
+  // SharePoint owns a completely different verb set — the Keboola-only
+  // items above (table registration, storage/master token rotation, chat
+  // tools, "default project") are meaningless (and in "Test connection"'s
+  // case, actively wrong: it calls Keboola's own token-verify endpoint) for
+  // a file source. Live-use feedback: those items showing at all read as
+  // "dangerous", not just irrelevant.
+  if (row.source_type === "sharepoint") {
+    return `
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); openSpWizardForConnection('${id}')">Manage scopes…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
+    <div class="apg-menu__sep"></div>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
+    <div class="apg-menu__sep"></div>
+    <button type="button" class="apg-menu__item apg-menu__item--danger" role="menuitem" onclick="closeSourceMenu(); deleteConn('${id}')">Delete source</button>`;
+  }
   const isDefault = row.is_default === true || row.is_default === 1;
   const hasMaster = row.has_master_secret === true;
   const chatOn = row.has_chat_tools === true;
@@ -5158,15 +5632,26 @@ const SP_CONN_API = "/api/admin/source-connections";
 const SP_API = "/api/admin/sharepoint/connections";
 const SP_GROUPS_API = "/api/admin/groups";
 const SP_DEFAULT_CERT_ENV = "SHAREPOINT_CERT_PRIVATE_KEY";
+// One wording for the unique-permissions badge label, defined once so the
+// tree row and (were it ever needed elsewhere) any other renderer agree.
+const SP_UNIQUE_PERMS_LABEL = "&#9888; unique permissions";
 
 let spConnId = null;
 let spCertChoice = "upload";
-let spLevel = { site_id: null, drive_id: null };
-let spCrumbs = [];        // [{label, site_id, drive_id}]
+let spLevel = { site_id: null, drive_id: null, item_id: null };
+let spCrumbs = [];        // [{label, site_id, drive_id, item_id}]
 let spItems = [];         // current level's tree items
 let spScopes = {};        // source_scope_id -> scope row (server shape, incl. no_group_warning)
 let spGroups = null;      // cached [{id, name}]
 let spPendingGroups = {}; // source_scope_id -> Set(group_id), locally ticked but not yet applied
+let spTreeFilterQuery = "";   // client-side instant filter (#2) over spItems, reset on navigation
+let spLastSearchMatches = null; // last server-search (#3) result list, or null if none run yet
+// item_id -> true|false|null, accumulated from `?with_permissions=1` tree
+// responses across THIS wizard session only — never a full crawl, so
+// "unknown" (not present here, or `null`) must never render as "no unique
+// permissions" anywhere that reads this map. ADVISORY ONLY (Decision #2:
+// Agnes does not derive or enforce anything from a SharePoint ACL).
+let spUniquePerms = {};
 
 function spEsc(s) {
   return String(s == null ? "" : s)
@@ -5201,13 +5686,22 @@ function spApi(url, opts) {
 function openSpWizard() {
   spConnId = null;
   spCertChoice = "upload";
-  spLevel = { site_id: null, drive_id: null };
+  spLevel = { site_id: null, drive_id: null, item_id: null };
   spCrumbs = [];
   spItems = [];
   spScopes = {};
   spGroups = null;
   spPendingGroups = {};
+  spTreeFilterQuery = "";
+  spLastSearchMatches = null;
+  spUniquePerms = {};
 
+  document.getElementById("spw-tree-filter").value = "";
+  document.getElementById("spw-search-q").value = "";
+  document.getElementById("spw-search-truncated").style.display = "none";
+  document.getElementById("spw-search-results").style.display = "none";
+  document.getElementById("spw-search-results").innerHTML = "";
+  document.getElementById("spw-search-error").style.display = "none";
   document.getElementById("spw-name").value = "";
   document.getElementById("spw-tenant").value = "";
   document.getElementById("spw-client").value = "";
@@ -5224,6 +5718,10 @@ function openSpWizard() {
     const existing = document.getElementById("spw-existing");
     if (!rows.length) { existing.hidden = true; return; }
     sel.innerHTML = rows.map((c) => `<option value="${spEsc(c.id)}">${spEsc(c.name || c.id)}</option>`).join("");
+    // With exactly one existing connection there is nothing to actually
+    // choose — pre-select it so "Continue to scope" is a single click
+    // rather than an empty-looking picker with one option in it.
+    if (rows.length === 1) sel.value = rows[0].id;
     _syncDropdownRebuild(sel);
     existing.hidden = false;
   }).catch(() => { document.getElementById("spw-existing").hidden = true; });
@@ -5231,6 +5729,48 @@ function openSpWizard() {
   document.getElementById("sp-wizard-overlay").classList.add("show");
   document.body.style.overflow = "hidden";
   setTimeout(() => document.getElementById("spw-tenant").focus({ preventScroll: true }), 60);
+}
+
+/* Card entry point (spec follow-up, TCRD-240/241: "make it clickable"
+   rather than wizard-only) — opens the SAME wizard bound to an EXISTING
+   connection, skipping step 1 entirely (never creates a duplicate
+   connection). `opts.highlightScopeId` additionally jumps straight to
+   step 3 ("Share") and highlights that one scope row — the only pane with
+   a flat, source_scope_id-keyed list of every confirmed scope regardless
+   of where it lives in the folder tree; step 2 only shows scopes that
+   happen to be visible at the currently-browsed tree level, and a stored
+   scope carries no site_id/drive_id to reconstruct a tree path from, so
+   driving the tree to the right folder isn't possible from a scope row
+   alone. Mirrors the "Continue an existing connection" step-1 button's own
+   click handler below, without needing the (async) existing-connections
+   list to have loaded first — the caller already knows the id. */
+function openSpWizardForConnection(connId, opts) {
+  opts = opts || {};
+  openSpWizard();
+  spConnId = connId;
+  spEnableStep(2);
+  spEnableStep(3);
+  spLevel = { site_id: null, drive_id: null, item_id: null };
+  spCrumbs = [];
+  if (opts.highlightScopeId) {
+    spGoStep(3);
+    spLoadShare().then(() => _spHighlightShareRow(opts.highlightScopeId));
+  } else {
+    spGoStep(2);
+    spLoadScopesThenTree();
+  }
+}
+
+/* Scrolls a step-3 share row into view and gives it a brief highlight —
+   the landing effect for a scope row clicked on the card. A no-op if the
+   row isn't in the currently-rendered share list (nothing to highlight
+   yet, e.g. while it is still loading). */
+function _spHighlightShareRow(scopeId) {
+  const row = document.querySelector(`[data-spw-share-row="${CSS.escape(scopeId)}"]`);
+  if (!row) return;
+  row.scrollIntoView({ block: "center", behavior: "smooth" });
+  row.classList.add("sp-share-row--highlight");
+  setTimeout(() => row.classList.remove("sp-share-row--highlight"), 2500);
 }
 
 function closeSpWizard() {
@@ -5280,7 +5820,7 @@ document.getElementById("spw-existing-btn").addEventListener("click", () => {
   spEnableStep(2);
   spEnableStep(3);
   spGoStep(2);
-  spLevel = { site_id: null, drive_id: null };
+  spLevel = { site_id: null, drive_id: null, item_id: null };
   spCrumbs = [];
   spLoadScopesThenTree();
 });
@@ -5321,7 +5861,7 @@ document.getElementById("spw-connect-btn").addEventListener("click", () => {
       btn.textContent = "Connect & validate";
       spEnableStep(2);
       spEnableStep(3);
-      spLevel = { site_id: null, drive_id: null };
+      spLevel = { site_id: null, drive_id: null, item_id: null };
       spCrumbs = [];
       spGoStep(2);
       spLoadScopesThenTree();
@@ -5349,17 +5889,40 @@ function spLoadScopesThenTree() {
   }).catch(() => { spScopes = {}; }).then(spLoadTree);
 }
 
+/* The current browse level, derived from spLevel — one place, since
+   confirm/remove/filter all need to know it to re-render the right rows. */
+function spCurrentLevel() {
+  if (spLevel.drive_id) return "items";
+  if (spLevel.site_id) return "drives";
+  return "sites";
+}
+
 function spLoadTree() {
   spTreeErr("");
+  spTreeFilterQuery = "";
+  document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-tree").innerHTML = '<div class="ds-loading">Loading…</div>';
   spRenderCrumbs();
   const params = new URLSearchParams();
   if (spLevel.site_id) params.set("site_id", spLevel.site_id);
   if (spLevel.drive_id) params.set("drive_id", spLevel.drive_id);
+  if (spLevel.item_id) params.set("item_id", spLevel.item_id);
+  // Only the "items" level ever lists folders — sites/drives have nothing
+  // to probe, so the param is only worth sending (and paying for) there.
+  if (spLevel.drive_id) params.set("with_permissions", "1");
   const qs = params.toString();
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree${qs ? "?" + qs : ""}`)
     .then((body) => {
       spItems = body.items || [];
+      // Accumulate into the session-wide map — a folder seen `true` once
+      // stays known `true` even after navigating away and back (re-browsing
+      // does not re-clear it); `false`/`undefined` never overwrite an
+      // earlier `true` for the same id, since the flag describes the
+      // SOURCE's state, not this one response.
+      spItems.forEach((item) => {
+        if (item.unique_permissions === true) spUniquePerms[item.id] = true;
+        else if (!(item.id in spUniquePerms)) spUniquePerms[item.id] = item.unique_permissions ?? null;
+      });
       spRenderTree(body.level);
     })
     .catch((e) => {
@@ -5377,7 +5940,7 @@ function spLoadTree() {
 
 function spRenderCrumbs() {
   const nav = document.getElementById("spw-crumbs");
-  const parts = [{ label: "Sites", site_id: null, drive_id: null }].concat(spCrumbs);
+  const parts = [{ label: "Sites", site_id: null, drive_id: null, item_id: null }].concat(spCrumbs);
   nav.innerHTML = parts.map((c, i) => {
     const last = i === parts.length - 1;
     const btn = `<button type="button" data-spw-crumb="${i}" ${last ? "disabled" : ""}>${spEsc(c.label)}</button>`;
@@ -5386,9 +5949,9 @@ function spRenderCrumbs() {
   nav.querySelectorAll("[data-spw-crumb]").forEach((b) => {
     b.addEventListener("click", () => {
       const i = Number(b.dataset.spwCrumb);
-      const target = ([{ site_id: null, drive_id: null }].concat(spCrumbs))[i];
+      const target = ([{ site_id: null, drive_id: null, item_id: null }].concat(spCrumbs))[i];
       spCrumbs = spCrumbs.slice(0, i);
-      spLevel = { site_id: target.site_id, drive_id: target.drive_id };
+      spLevel = { site_id: target.site_id, drive_id: target.drive_id, item_id: target.item_id };
       spLoadTree();
     });
   });
@@ -5398,40 +5961,103 @@ function spDisplayPath(name) {
   return spCrumbs.map((c) => c.label).concat([name]).join(" / ");
 }
 
+/* ── Client-side instant filter (#2): narrows spItems already loaded at
+   the current level — no server round trip. Case/diacritics-insensitive
+   (unlike the server search's NFC-only compare — see the fold note on
+   spFilterKey), so "elektrina" narrows to "Elektřina". ─────────────────── */
+
+function spFoldDiacritics(s) {
+  // NFD decomposes a precomposed accented letter into base + combining
+  // mark(s); stripping the "Combining Diacritical Marks" block then leaves
+  // just the base letters — "Přehledy" and "Prehledy" fold to the same key.
+  return String(s == null ? "" : s).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function spFilterKey(s) {
+  return spFoldDiacritics(s).toLocaleLowerCase();
+}
+
+function spRowMatchesFilter(name) {
+  if (!spTreeFilterQuery) return true;
+  return spFilterKey(name).indexOf(spFilterKey(spTreeFilterQuery)) !== -1;
+}
+
+/* Wraps the matched substring in <mark>. Falls back to plain escaped text
+   whenever folding changed the string's length (a rare composition case) —
+   a highlight is a nicety, never worth mis-slicing a folder name over. */
+function spHighlight(name) {
+  const raw = String(name == null ? "" : name);
+  if (!spTreeFilterQuery) return spEsc(raw);
+  const foldedName = spFilterKey(raw);
+  const foldedQuery = spFilterKey(spTreeFilterQuery);
+  const idx = foldedName.indexOf(foldedQuery);
+  if (idx === -1 || foldedName.length !== raw.length || !foldedQuery) return spEsc(raw);
+  const before = spEsc(raw.slice(0, idx));
+  const match = spEsc(raw.slice(idx, idx + foldedQuery.length));
+  const after = spEsc(raw.slice(idx + foldedQuery.length));
+  return `${before}<mark>${match}</mark>${after}`;
+}
+
 function spRenderTree(level) {
   const host = document.getElementById("spw-tree");
   if (!spItems.length) {
     host.innerHTML = '<div class="sp-tree__row"><span class="sp-tree__name"><span class="leaf">Nothing here.</span></span></div>';
     return;
   }
-  const navigable = level === "sites" || level === "drives"; // one level per call — items (folders) are leaves
+  let anyVisible = false;
   host.innerHTML = spItems.map((item) => {
+    // Sites/drives are always navigable; an item (folder) at the "items"
+    // level is navigable too (TCRD-240 subfolder browsing) — a FILE never
+    // is, regardless of level.
+    const navigable = level === "sites" || level === "drives" || (level === "items" && item.is_folder);
+    const visible = spRowMatchesFilter(item.name);
+    if (visible) anyVisible = true;
     const scope = spScopes[item.id];
     const checked = !!scope;
     const anon = scope ? !!scope.anonymize : false;
+    // Requested vs declared (spec §9.2) applies here too — "· anon" alone
+    // read as a completed fact even mid-wizard; "declared" earns the word
+    // "anonymized", everything else stays the lighter "· anon" hint.
+    const anonDeclared = scope ? !!scope.anonymization_declared : false;
     const path = spDisplayPath(item.name);
     const nameHtml = navigable
-      ? `<button type="button" data-spw-drill="${spEsc(item.id)}" data-spw-name="${spEsc(item.name)}">${spEsc(item.name)}</button>`
-      : `<span class="leaf">${spEsc(item.name)}</span>`;
+      ? `<button type="button" data-spw-drill="${spEsc(item.id)}" data-spw-name="${spEsc(item.name)}">${spHighlight(item.name)}</button>`
+      : `<span class="leaf">${spHighlight(item.name)}</span>`;
+    const anonSuffix = anon ? (anonDeclared ? " · anonymized" : " · anon requested") : "";
     const badge = scope && scope.collection
-      ? `<span class="sp-badge${anon ? " sp-badge--anon" : ""}">&rarr; ${spEsc(scope.collection.slug)}${anon ? " · anon" : ""}</span>`
+      ? `<span class="sp-badge${anon ? (anonDeclared ? " sp-badge--anon-declared" : " sp-badge--anon") : ""}">&rarr; ${spEsc(scope.collection.slug)}${anonSuffix}</span>`
       : "";
-    return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}">` +
+    // ADVISORY ONLY (Decision #2) — a probe result of `false` or unknown
+    // (absent, or `null`) renders NOTHING here; only a bare `true` earns
+    // the badge, so a probe failure or an un-probed item never reads as a
+    // false reassurance of "no unique permissions".
+    const uniquePermsBadge = spUniquePerms[item.id] === true
+      ? `<span class="sp-badge sp-badge--unique-perms" title="Has its own permissions in the source — people who can't open it there may still see its content once this scope is shared here.">${SP_UNIQUE_PERMS_LABEL}</span>`
+      : "";
+    return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}"${visible ? "" : " hidden"}>` +
       `<input type="checkbox" data-spw-select="${spEsc(item.id)}" aria-label="Select ${spEsc(item.name)}"${checked ? " checked" : ""}>` +
       `<span class="sp-tree__name">${nameHtml}</span>` +
       `<label class="sp-tree__anon"><input type="checkbox" data-spw-anon="${spEsc(item.id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
       badge +
+      uniquePermsBadge +
       `</div>`;
-  }).join("");
+  }).join("") + (anyVisible ? "" : '<div class="ds-empty" data-spw-nomatch>No folders match the filter.</div>');
 
   host.querySelectorAll("[data-spw-drill]").forEach((b) => {
     b.addEventListener("click", () => {
       const id = b.dataset.spwDrill;
       const name = b.dataset.spwName;
-      spCrumbs = spCrumbs.concat([level === "sites"
-        ? { label: name, site_id: id, drive_id: null }
-        : { label: name, site_id: spLevel.site_id, drive_id: id }]);
-      spLevel = level === "sites" ? { site_id: id, drive_id: null } : { site_id: spLevel.site_id, drive_id: id };
+      if (level === "sites") {
+        spCrumbs = spCrumbs.concat([{ label: name, site_id: id, drive_id: null, item_id: null }]);
+        spLevel = { site_id: id, drive_id: null, item_id: null };
+      } else if (level === "drives") {
+        spCrumbs = spCrumbs.concat([{ label: name, site_id: spLevel.site_id, drive_id: id, item_id: null }]);
+        spLevel = { site_id: spLevel.site_id, drive_id: id, item_id: null };
+      } else {
+        // "items" level: drilling into a folder at any depth (TCRD-240).
+        spCrumbs = spCrumbs.concat([{ label: name, site_id: spLevel.site_id, drive_id: spLevel.drive_id, item_id: id }]);
+        spLevel = { site_id: spLevel.site_id, drive_id: spLevel.drive_id, item_id: id };
+      }
       spLoadTree();
     });
   });
@@ -5442,6 +6068,11 @@ function spRenderTree(level) {
     cb.addEventListener("change", () => spOnAnonToggle(cb));
   });
 }
+
+document.getElementById("spw-tree-filter").addEventListener("input", (e) => {
+  spTreeFilterQuery = e.target.value;
+  spRenderTree(spCurrentLevel());
+});
 
 function spOnSelectToggle(cb) {
   const id = cb.dataset.spwSelect;
@@ -5464,6 +6095,14 @@ function spOnAnonToggle(cb) {
   spConfirmScope(id, row.dataset.spwPath, cb.checked);
 }
 
+/* Re-renders both the tree AND the last search result list (if any is on
+   screen) after a scope changes — a confirm/remove reached from either
+   list must update the badge/checkbox state in the OTHER one too. */
+function spRefreshVisibleLists() {
+  spRenderTree(spCurrentLevel());
+  if (spLastSearchMatches) spRenderSearchResults(spLastSearchMatches);
+}
+
 function spConfirmScope(sourceScopeId, displayPath, anonymize) {
   spTreeErr("");
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
@@ -5471,7 +6110,7 @@ function spConfirmScope(sourceScopeId, displayPath, anonymize) {
     body: { source_scope_id: sourceScopeId, display_path: displayPath, anonymize: !!anonymize },
   }).then((scope) => {
     spScopes[sourceScopeId] = scope;
-    spRenderTree(spLevel.drive_id ? "items" : (spLevel.site_id ? "drives" : "sites"));
+    spRefreshVisibleLists();
   }).catch((e) => {
     spTreeErr("Could not confirm that scope: " + e.message);
     spLoadTree(); // resync checkbox state with the server
@@ -5484,12 +6123,134 @@ function spRemoveScope(sourceScopeId) {
     method: "DELETE",
   }).then(() => {
     delete spScopes[sourceScopeId];
-    spRenderTree(spLevel.drive_id ? "items" : (spLevel.site_id ? "drives" : "sites"));
+    spRefreshVisibleLists();
   }).catch((e) => {
     spTreeErr("Could not remove that scope: " + e.message);
     spLoadTree();
   });
 }
+
+/* ── Server search (#3/#4): bounded BFS over the live tree, never Graph's
+   own /search (see graph_client's module docstring). Results enter the
+   SAME scope basket as tree picks — checking a result row is an ordinary
+   spConfirmScope call, so bulk-select is just N ordinary confirms. ────── */
+
+function spSearchErr(msg) {
+  const el = document.getElementById("spw-search-error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+function spRenderSearchResults(matches) {
+  const host = document.getElementById("spw-search-results");
+  if (!matches.length) {
+    host.innerHTML = '<div class="ds-empty">No folders matched.</div>';
+    host.style.display = "";
+    return;
+  }
+  const rowsHtml = matches.map((m) => {
+    const scope = spScopes[m.item_id];
+    const checked = !!scope;
+    const anon = scope ? !!scope.anonymize : false;
+    const badge = scope && scope.collection
+      ? `<span class="sp-badge${anon ? " sp-badge--anon" : ""}">&rarr; ${spEsc(scope.collection.slug)}${anon ? " · anon" : ""}</span>`
+      : "";
+    return `<div class="sp-tree__row" data-spw-sr="${spEsc(m.item_id)}" data-spw-sr-drive="${spEsc(m.drive_id)}" data-spw-sr-path="${spEsc(m.display_path)}">` +
+      `<input type="checkbox" data-spw-sr-select="${spEsc(m.item_id)}" aria-label="Select ${spEsc(m.display_path)}"${checked ? " checked" : ""}>` +
+      `<span class="sp-tree__name"><span class="leaf">${spEsc(m.display_path)}</span></span>` +
+      `<label class="sp-tree__anon"><input type="checkbox" data-spw-sr-anon="${spEsc(m.item_id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
+      badge +
+      `</div>`;
+  }).join("");
+  host.innerHTML = `<label class="sp-search__selectall"><input type="checkbox" id="spw-search-select-all"> Select all (${matches.length})</label>` + rowsHtml;
+  host.style.display = "";
+
+  document.getElementById("spw-search-select-all").addEventListener("change", (e) => {
+    const want = e.target.checked;
+    host.querySelectorAll("[data-spw-sr-select]").forEach((cb) => {
+      if (cb.checked !== want) { cb.checked = want; cb.dispatchEvent(new Event("change")); }
+    });
+  });
+  host.querySelectorAll("[data-spw-sr-select]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnSearchSelectToggle(cb));
+  });
+  host.querySelectorAll("[data-spw-sr-anon]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnSearchAnonToggle(cb));
+  });
+}
+
+function spOnSearchSelectToggle(cb) {
+  const id = cb.dataset.spwSrSelect;
+  const row = cb.closest("[data-spw-sr]");
+  const path = row.dataset.spwSrPath;
+  const anonBox = row.querySelector("[data-spw-sr-anon]");
+  if (cb.checked) {
+    anonBox.disabled = false;
+    spConfirmScope(id, path, anonBox.checked);
+  } else {
+    anonBox.disabled = true;
+    spRemoveScope(id);
+  }
+}
+
+function spOnSearchAnonToggle(cb) {
+  const id = cb.dataset.spwSrAnon;
+  if (!spScopes[id]) return;
+  const row = cb.closest("[data-spw-sr]");
+  spConfirmScope(id, row.dataset.spwSrPath, cb.checked);
+}
+
+function spRunSearch() {
+  const q = document.getElementById("spw-search-q").value.trim();
+  document.getElementById("spw-search-truncated").style.display = "none";
+  spSearchErr("");
+  if (q.length < 2) {
+    spSearchErr("Type at least 2 characters.");
+    return;
+  }
+  const mode = document.getElementById("spw-search-mode").value;
+  const params = new URLSearchParams({ q: q, mode: mode });
+  const btn = document.getElementById("spw-search-btn");
+  btn.disabled = true;
+  btn.textContent = "Searching…";
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree/search?${params.toString()}`)
+    .then((body) => {
+      btn.disabled = false;
+      btn.textContent = "Search";
+      spLastSearchMatches = body.matches || [];
+      spRenderSearchResults(spLastSearchMatches);
+      if (body.truncated) {
+        const el = document.getElementById("spw-search-truncated");
+        // `hint` is the server's own next-step wording (admin_sharepoint.py
+        // `_SEARCH_TRUNCATED_HINT`) — one place owns the copy; the fallback
+        // only covers a response shape this build has never seen.
+        const hint = body.hint || "Scope the search to a site or folder, or narrow the pattern.";
+        el.textContent = `Stopped after ${body.visited} folder(s) visited. ${hint}`;
+        el.style.display = "block";
+      }
+    })
+    .catch((e) => {
+      btn.disabled = false;
+      btn.textContent = "Search";
+      spLastSearchMatches = null;
+      document.getElementById("spw-search-results").style.display = "none";
+      document.getElementById("spw-search-results").innerHTML = "";
+      if (e.detail && e.detail.error === "sharepoint_cert_unresolved") {
+        spSearchErr("No certificate configured yet — " + e.detail.message);
+      } else if (e.detail && e.detail.error === "sharepoint_graph_error") {
+        spSearchErr("SharePoint did not answer: " + e.detail.message);
+      } else if (e.detail && e.detail.error === "invalid_search_pattern") {
+        spSearchErr("That pattern isn't valid: " + e.detail.message);
+      } else {
+        spSearchErr("Search failed: " + e.message);
+      }
+    });
+}
+document.getElementById("spw-search-btn").addEventListener("click", spRunSearch);
+document.getElementById("spw-search-q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); spRunSearch(); }
+});
 
 document.getElementById("spw-scope-continue-btn").addEventListener("click", () => {
   spGoStep(3);
@@ -5517,7 +6278,9 @@ function spLoadShare() {
   document.getElementById("spw-corpus-map-wrap").hidden = false;
   document.getElementById("spw-corpus-map-link").href = `${SP_API}/${encodeURIComponent(spConnId)}/corpus-map`;
   document.getElementById("spw-share-rows").innerHTML = '<div class="ds-loading">Loading…</div>';
-  Promise.all([
+  // Returns the promise (unlike before) so `openSpWizardForConnection` can
+  // chain a row-highlight onto "rendered", not just "requested".
+  return Promise.all([
     spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`),
     spLoadGroups(),
   ]).then(([body]) => {
@@ -5536,10 +6299,28 @@ function spRenderShare(items) {
     host.innerHTML = '<div class="ds-empty">No scopes confirmed yet — go back to step 2 and pick at least one.</div>';
     return;
   }
-  host.innerHTML = items.map((s) => {
+  // ADVISORY ONLY (Decision #2 — Agnes never derives or enforces anything
+  // from a SharePoint ACL): counts only scopes THIS WIZARD SESSION actually
+  // saw flagged `true` while browsing step 2 (spUniquePerms) — never a full
+  // re-check of every selected scope, and never a gate on Share & finish.
+  const uniquePermsFlaggedCount = items.filter((s) => spUniquePerms[s.source_scope_id] === true).length;
+  const advisoryHtml = uniquePermsFlaggedCount === 0 ? "" : `
+    <div class="apg-strip apg-strip--warn apg-strip--block" role="note">
+      <span>&#9888; ${uniquePermsFlaggedCount} of your selected scope${uniquePermsFlaggedCount === 1 ? "" : "s"} had unique permissions in the source when last browsed. Agnes does not read or enforce those — the groups you choose below are the only access control that applies once this is shared here.</span>
+    </div>`;
+  host.innerHTML = advisoryHtml + items.map((s) => {
     const pending = spPendingGroups[s.source_scope_id] || new Set(s.group_ids || []);
     spPendingGroups[s.source_scope_id] = pending;
-    const anonBadge = s.anonymize ? '<span class="sp-badge sp-badge--anon">anonymized</span>' : "";
+    // Spec §9.2/§13.2: the checkbox alone is a WISH, never rendered as
+    // "anonymized" by itself — that badge is earned only once the latest
+    // ingest run actually declares this collection anonymized
+    // (`anonymization_declared`, computed server-side in
+    // app/api/admin_sharepoint.py::_scope_out). Requested-but-not-declared
+    // still gets a badge (so the admin sees the flag took), just a
+    // different word and tone.
+    const anonBadge = !s.anonymize ? "" : s.anonymization_declared
+      ? '<span class="sp-badge sp-badge--anon-declared">anonymized</span>'
+      : '<span class="sp-badge sp-badge--anon">anonymization requested</span>';
     const collBadge = s.collection ? `<span class="sp-badge">${spEsc(s.collection.name)}</span>` : "";
     const noGroup = pending.size === 0;
     const warn = noGroup ? '<span class="sp-warn">&#9888; indexed but invisible — no group yet</span>' : "";

@@ -110,7 +110,8 @@ class TestTheStorageTokenReadHonoursTheAllowlist:
     arbitrary host environment variable — the value is then sent to the
     configured stack as a Storage token, and here its project identity is
     rendered back onto the admin page. `/test` and `/tables` gate the same
-    read behind `is_token_env_allowed` with an explicit SECURITY comment.
+    read behind `is_config_secret_env_allowed` (the config-resolution side of
+    the allowlist split) with an explicit SECURITY comment.
     """
 
     def test_a_disallowed_token_env_is_not_read(self, monkeypatch):
@@ -140,7 +141,7 @@ class TestTheStorageTokenReadHonoursTheAllowlist:
         from connectors.keboola import semantic_layer
 
         helper = inspect.getsource(semantic_layer._token_from_env)
-        assert "is_token_env_allowed" in helper
+        assert "is_config_secret_env_allowed" in helper
 
         for fn in (semantic_layer._connection_storage_token, semantic_layer._resolve_keboola_credentials_slot):
             body = inspect.getsource(fn)

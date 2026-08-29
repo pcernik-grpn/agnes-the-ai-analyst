@@ -163,12 +163,12 @@ class TestTheDoorsAlignOnTheirTitles:
 
 
 class TestTheLeadTitleIsNotTheBannerGradient:
-    """`.klb-headline-grad` runs `--ds-assistant` → `--ds-kind-agent`. It is
-    the obvious thing to reach for here — this card deliberately borrows the
-    banner's surface — and it fails contrast at 14.5px: `--ds-assistant` is
-    4.1:1 on paper and `--ds-kind-agent` is 2.4:1 under `data-theme="dark"`,
-    against a 4.5:1 floor. The banner clears it only because its headline is
-    30px, where 3:1 applies.
+    """The retired Knowledge Layer hero's headline ran a `--ds-assistant` →
+    `--ds-kind-agent` gradient. It is the obvious thing to reach for here — this
+    card deliberately borrows that hero's surface — and it fails contrast at
+    14.5px: `--ds-assistant` is 4.1:1 on paper and `--ds-kind-agent` is 2.4:1
+    under `data-theme="dark"`, against a 4.5:1 floor. The hero cleared it only
+    because its headline was 30px, where 3:1 applies.
     """
 
     def test_the_title_is_solid_accent_ink(self):

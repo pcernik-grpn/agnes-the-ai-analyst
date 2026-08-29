@@ -42,6 +42,7 @@ from app.auth import keboola_provisioning as kprov
 from app.auth.dependencies import get_current_user
 from app.auth.provider_registry import require_provider
 from app.auth.providers import keboola_verify as kv
+from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,16 @@ async def import_discovered_projects(
         raise HTTPException(status_code=status, detail={"error": exc.reason, "message": exc.detail})
     if summary.connections_needing_chat_tools or summary.semantic_sync_needed:
         background_tasks.add_task(kprov.finish_login_provisioning, summary)
+    log_safe(
+        user_id=user.get("id"),
+        action="keboola.projects_import",
+        resource="keboola_projects",
+        params={
+            "project_ids": [str(pid) for pid in body.project_ids],
+            "projects_connected": len(summary.outcomes),
+            "memberships_added": summary.memberships_added,
+        },
+    )
     logger.info(
         "keboola select-mode import for user %s: %d project(s), %d membership add(s)",
         user.get("id"),

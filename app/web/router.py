@@ -48,6 +48,7 @@ from app.instance_config import (
     get_news_enabled,
     get_knowledge_digests_ui_enabled,
     get_contribute_skill_enabled,
+    get_store_moderation_enabled,
     get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
     feature_enabled,
@@ -586,7 +587,7 @@ _URL_MAP = {
     "admin_activity": "/admin/activity",
     "index": "/",
     "auth.login": "/login",
-    "auth.logout": "/login",  # No logout route — redirect to login
+    "auth.logout": "/auth/logout",
     "password_auth.login_email": "/auth/password/login",
     "password_auth.reset_request": "/auth/password/reset",
     "password_auth.request_access": "/auth/password/setup",
@@ -979,6 +980,18 @@ async def login_page(request: Request):
             providers.append({"name": "microsoft", "display_name": "Microsoft", "icon": "microsoft"})
     except Exception:
         pass
+    try:
+        from app.auth.providers.sso import login_offering as sso_login_offering
+
+        # One DB read answers availability AND the admin-configured button
+        # label; the allowlist check runs first so an excluded provider
+        # never costs the read.
+        if provider_allowed("sso"):
+            _sso_label = sso_login_offering()
+            if _sso_label:
+                providers.append({"name": "sso", "display_name": _sso_label, "icon": "sso"})
+    except Exception:
+        pass
 
     # Convert to login_buttons format expected by template
     login_buttons = []
@@ -1017,6 +1030,20 @@ async def login_page(request: Request):
                 _url += f"?next={quote(next_path, safe='')}"
             login_buttons.append(
                 {"url": _url, "text": "Sign in with Microsoft", "css_class": "btn-primary", "icon_html": ""}
+            )
+        elif p["name"] == "sso":
+            _url = "/auth/sso/login"
+            if next_path:
+                _url += f"?next={quote(next_path, safe='')}"
+            # display_name is admin-entered; Jinja autoescape on the template
+            # side renders it inert.
+            login_buttons.append(
+                {
+                    "url": _url,
+                    "text": f"Sign in with {p['display_name']}",
+                    "css_class": "btn-primary",
+                    "icon_html": "",
+                }
             )
 
     keboola_expected_project = ""
@@ -1283,11 +1310,11 @@ async def how_it_works_page(
     from app.services.journey import mark_journey
     from src.repositories import mcp_sources_repo
 
-    # "Use Agnes outside this tab" is earned by ARRIVING here — this page is where
+    # "Take Agnes to your tools" is earned by ARRIVING here — this page is where
     # every connector lives, and it is the checklist row's own destination. The
     # row used to tick itself the instant it was clicked, before the reader had
-    # seen anything; the tour's "Connect my AI tools" button already marks it the
-    # same way (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
+    # seen anything; the tour's closing button already marks it the same way
+    # (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
     # app/services/journey.py) — a bookkeeping write must never fail a render.
     mark_journey(user.get("id"), use_anywhere=True)
 
@@ -4968,6 +4995,11 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         "can_news": get_news_enabled(),
         "can_knowledge_digests": get_knowledge_digests_ui_enabled(),
         "can_contribute_skill": get_contribute_skill_enabled(),
+        # The Moderation & Trust hub, retired on the same pattern: its three
+        # zones each have a better door already in the column (Submissions,
+        # Marketplaces, and verification's own switch), so the page was a
+        # landing spot for links you can reach directly.
+        "can_store_moderation": get_store_moderation_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -5547,6 +5579,87 @@ def _web_csrf_ok(request: Request, supplied: str) -> bool:
         and bool(cookie_token)
         and secrets.compare_digest(supplied.encode("utf-8"), cookie_token.encode("utf-8"))
     )
+
+
+@router.get("/auth/logout", response_class=HTMLResponse)
+async def logout_page(request: Request, user: Optional[dict] = Depends(get_optional_user)):
+    """Logout CONFIRMATION page (no state change) — issue #1675.
+
+    The Logout menu item used to be a plain ``GET`` link to ``/login``,
+    which neither cleared the ``access_token`` cookie nor ended the session
+    — it just LOOKED like sign-out (the app happily reopened on the next
+    visit). Ending a session is a mutation, so it cannot happen on a GET
+    (security playbook #10, F2); this route only renders a confirm form
+    with a double-submit CSRF token. The actual cookie-clear + server-side
+    revocation is :func:`logout_submit` (POST) — same GET-confirms /
+    POST-mutates shape this codebase already uses for :func:`slack_bind` /
+    :func:`slack_bind_confirm`.
+
+    An already-signed-out visitor has nothing to confirm — straight to
+    ``/login``.
+    """
+    if user is None:
+        return RedirectResponse(url="/login", status_code=302)
+
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx = _build_context(request, user=user, csrf_token=csrf_token)
+    response = templates.TemplateResponse(request, "logout.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
+
+
+@router.post("/auth/logout", response_class=HTMLResponse)
+async def logout_submit(
+    request: Request,
+    csrf_token: str = Form(""),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """End the session — clear the cookie AND revoke it server-side.
+
+    Issue #1675 (clear the browser's ``access_token`` cookie) and #1676
+    (revoke the token so a copy captured before logout — a synced browser
+    profile, host malware, a shared machine — stops working too, not only
+    the browser that clicked Logout) land together: a client-side-only fix
+    leaves every other copy of the token valid for the rest of its 30-day
+    ``exp``.
+
+    Requires the double-submit ``web_csrf`` token minted by the GET
+    confirmation above (F2) — a state-changing action reachable from a menu
+    item on every page must not fire on ambient cookie auth alone, the same
+    reasoning the F2 security review applied to :func:`slack_bind_confirm`.
+    """
+    if not _web_csrf_ok(request, csrf_token):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    if user is not None:
+        try:
+            from src.repositories import users_repo
+
+            users_repo().revoke_sessions(user["id"])
+        except Exception:
+            # Best-effort: clearing the browser's own cookie below is the
+            # primary contract of "logout" and must complete even if the
+            # DB-backed revocation write fails (e.g. a brief outage).
+            logger.exception("session revocation failed on logout for user %s", user.get("id"))
+
+    from app.auth.public_url import cookie_secure
+    from app.instance_config import session_cookie_domain
+
+    response = RedirectResponse(url="/login", status_code=303)
+    # Must match the attributes every provider sets the cookie with
+    # (google.py / microsoft.py / email.py / password.py / keboola.py) —
+    # `domain` in particular, since session_cookie_domain() returns a
+    # `.<parent-domain>` when data_apps.subdomain_base is configured and a
+    # mismatched Domain attribute makes the deletion a silent no-op (#1675).
+    response.delete_cookie(
+        key="access_token",
+        path="/",
+        domain=session_cookie_domain(),
+        secure=cookie_secure(request),
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 _SLACK_BIND_CSRF_COOKIE = "slack_bind_csrf"
@@ -7380,9 +7493,9 @@ def _source_inventory(user: dict | None = None) -> dict:
             # unallowlisted name, in which case Import would 400 even though
             # the card looks ready. Gate the button on this too rather than
             # advertise a one-click path that dead-ends for that config.
-            from src.orchestrator_security import is_token_env_allowed
+            from src.orchestrator_security import is_config_secret_env_allowed
 
-            row["token_env_allowlisted"] = is_token_env_allowed(row["token_env"])
+            row["token_env_allowlisted"] = is_config_secret_env_allowed(row["token_env"])
         derived.append(row)
 
     try:
@@ -7568,6 +7681,63 @@ def _source_inventory(user: dict | None = None) -> dict:
 _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
 
+def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
+    """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
+    ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
+    file name + collection name it belongs to, for the card's drawer — a
+    bare hash "tells nobody anything" (live-use feedback, TCRD-240/241
+    follow-up).
+
+    ``None`` for an id this instance has never seen (`corpus_file_sources`
+    carries no row for it) — the caller renders that as the honest
+    "not in any collection" fallback next to the raw sha16, never a guess.
+    Also ``None`` on any lookup failure (PG-only `corpus_file_sources` on a
+    DuckDB-backed instance, a deleted collection, …) — resolution is a
+    read-only display nicety, never worth a 500 for the card.
+    """
+    try:
+        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+
+        source_row = corpus_file_sources_repo().get_by_source_doc_id(doc_id)
+        if source_row is None:
+            return None
+        file_row = corpus_files_repo().get(source_row["corpus_file_id"])
+        if file_row is None:
+            return None
+        collection = file_corpora_repo().get(file_row["corpus_id"])
+        return {
+            "name": file_row.get("filename"),
+            "collection": collection.get("name") if collection else None,
+        }
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: doc_id resolution failed for %s: %s", doc_id, e)
+        return None
+
+
+def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
+    """Add a resolved ``doc`` key (``{name, collection}`` or ``None``) to
+    each "Last run" rejection/deferred row, memoizing the lookup per
+    ``doc_id`` so a run with many claims against the same document does not
+    re-resolve it once per row. Every original key (``row``, ``reason``,
+    ``doc_id``, …) is preserved untouched — this only adds information, it
+    never replaces the raw fields the drawer's category counts and any
+    other reader of this cell already depend on.
+    """
+    doc_cache: dict[str, Optional[dict]] = {}
+    enriched = []
+    for row in rows:
+        row = dict(row)
+        doc_id = row.get("doc_id")
+        if doc_id:
+            if doc_id not in doc_cache:
+                doc_cache[doc_id] = _resolve_sharepoint_rejection_doc(doc_id)
+            row["doc"] = doc_cache[doc_id]
+        else:
+            row["doc"] = None
+        enriched.append(row)
+    return enriched
+
+
 def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
     (spec §13.2 "Source card"): crawl → text extraction + scan transcription
@@ -7589,12 +7759,15 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     **Error badge categories are a deliberate, narrower simplification** of
     spec §13.2's illustrative four (unsupported type / model error / deleted
     / rejected quote) — those live in the CRAWLER's own per-document error
-    log, which Agnes never receives. The three badges below are the ones
-    Agnes's own ingest run report actually carries: `rejected_quotes` (the
-    verbatim gate, spec §8, doing its job), `deferred` (a claim whose file
-    was not yet `indexed` — free retry once it is), and `protocol_errors`
-    (every OTHER `claims_rejected` reason — unresolved doc id, malformed
-    edge, alias type conflict, …).
+    log, which Agnes never receives. The badges below are the ones Agnes's
+    own ingest run report actually carries: `rejected_quotes` (the verbatim
+    gate, spec §8, doing its job), `deferred` (a claim whose file was not
+    yet `indexed` — free retry once it is), `protocol_errors` (every OTHER
+    `claims_rejected` reason — unresolved doc id, malformed edge, alias type
+    conflict, …), and `source_urls_rejected` (O7 follow-up: a document's
+    `source_url` the ingest validator dropped — the claim itself still
+    wrote, only its citation link is missing; a producer that never sends
+    `source_url` is not in this list at all).
 
     Every sub-block degrades independently on its own `try/except` — a
     repo call that raises (PG-only `RequiresPostgresBackend` on a
@@ -7662,6 +7835,11 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     if last_run is not None:
         claims_rejected = last_run.get("claims_rejected") or []
         deferred = last_run.get("deferred") or []
+        # O7 follow-up: NOT folded into `protocol_errors` — a dropped
+        # `source_url` never rejects the claim (it still writes), so it is
+        # a different signal than every `claims_rejected` reason and gets
+        # its own badge rather than muddying "why was nothing written".
+        source_urls_rejected = last_run.get("source_urls_rejected") or []
         rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
         protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
@@ -7672,9 +7850,10 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
-            "rejected_quotes": rejected_quotes,
-            "deferred": deferred,
-            "protocol_errors": protocol_errors,
+            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
+            "deferred": _enrich_sharepoint_rejection_rows(deferred),
+            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
+            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
         }
     else:
         cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
@@ -7683,22 +7862,74 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── schedule: static text — the crawl runs externally, so this is
     # honestly a label, never live state (spec §13.2's "hourly delta · 03:00
     # full check · extraction in its own lane" collapsed to one line here).
-    cell["schedule"] = {"text": "external producer · hourly delta"}
+    #
+    # `in_agnes` (TCRD-226) is a SEPARATE, additive sub-object: the
+    # in-Agnes `corpus-extraction` job kind's own schedule state for THIS
+    # connection — whether extraction.enabled is on, the configured cadence
+    # (if any), and this connection's own last/next run (last_run_at is
+    # this connection's own `config.extraction.last_run_at`, the SAME
+    # bookkeeping `app/api/admin_sharepoint.py::_record_extraction_dispatch`
+    # writes; next_run_at is a best-effort display estimate,
+    # `src.scheduler.next_due_at` — see its own docstring for why it is
+    # never the source of truth for an actual dispatch). Never confused
+    # with the static `text` above, which describes the EXTERNAL
+    # producer's own crawl cadence, not Agnes's job queue.
+    in_agnes_schedule: dict[str, Any] = {
+        "enabled": False,
+        "schedule": None,
+        "last_run_at": None,
+        "next_run_at": None,
+    }
+    try:
+        from app.instance_config import feature_enabled, get_value
+        from src.scheduler import next_due_at
+
+        in_agnes_schedule["enabled"] = feature_enabled(
+            "extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False
+        )
+        schedule_cfg = str(get_value("extraction", "schedule", default="") or "").strip() or None
+        in_agnes_schedule["schedule"] = schedule_cfg
+        extraction_state = (conn.get("config") or {}).get("extraction") or {}
+        last_run_at = extraction_state.get("last_run_at")
+        in_agnes_schedule["last_run_at"] = last_run_at
+        if schedule_cfg:
+            next_run = next_due_at(schedule_cfg, last_run_at)
+            in_agnes_schedule["next_run_at"] = next_run.isoformat() if next_run else None
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
+
+    cell["schedule"] = {"text": "external producer · hourly delta", "in_agnes": in_agnes_schedule}
 
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity
     # fields, an unset/disallowed env var) is shown as its own message
-    # rather than raised — this is a status row, not a gate.
+    # rather than raised — this is a status row, not a gate. Enriched with
+    # thumbprint/subject/issuer/expiry (`certificate_metadata` — same
+    # derivation the standalone `GET .../certificate` endpoint calls, so
+    # there is exactly one place that parses the certificate) so the card
+    # answers two real failure modes: a registered certificate that doesn't
+    # match what the connection presents, and one expiring silently.
     try:
+        from connectors.sharepoint.graph_client import certificate_metadata
         from connectors.sharepoint.settings import resolve_sharepoint_settings
 
         settings = resolve_sharepoint_settings(conn)
-        cell["certificate"] = {
+        cert_cell: dict[str, Any] = {
             "origin": settings.credential_source,
             "env_name": settings.credential_env,
             "set_at": settings.credential_set_at.isoformat() if settings.credential_set_at else None,
             "error": None,
         }
+        meta = certificate_metadata(settings.private_key)
+        if meta["certificate"] is not None:
+            cert_cell.update(meta["certificate"])
+        else:
+            # A resolvable-but-unusable certificate (no CERTIFICATE PEM
+            # block, or one that fails to parse) — distinct from `error`
+            # above, which is a settings-RESOLUTION failure, not a content
+            # one.
+            cert_cell["metadata_reason"] = meta["reason"]
+        cell["certificate"] = cert_cell
     except Exception as e:
         # Logged, not just rendered: this block swallowed a real type bug
         # (a str set-date reaching .isoformat()) for as long as its only
@@ -7714,8 +7945,13 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # collections with no group", fail-closed (an ungranted collection is
     # invisible to everyone, spec §13.1's "under-sharing looks like a bug"
     # made visible as a count rather than discovered by an analyst).
+    # `collections_total` (added alongside the card's rephrase to a plain
+    # sharing-state sentence — "all scope collections have a group" needs to
+    # know what "all" is) is `len(scope_ids)` regardless of whether the
+    # grants lookup below succeeds — it costs no extra query.
     groups_matched = 0
     collections_no_group = 0
+    collections_total = len(scope_ids)
     if scope_ids:
         try:
             from src.repositories import resource_grants_repo
@@ -7728,7 +7964,69 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
-    cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
+    cell["identity"] = {
+        "groups_matched": groups_matched,
+        "collections_no_group": collections_no_group,
+        "collections_total": collections_total,
+    }
+
+    # ── scopes: the connection's OWN confirmed scope rows (`config.scopes`),
+    # reused through `admin_sharepoint._scope_out` so the card renders
+    # exactly the connect wizard's own step-3 "Share" shape — one source of
+    # truth for what a scope row looks like, not a second projection that
+    # can drift from it. Each row degrades independently (a deleted
+    # collection, an unavailable grants repo) to its raw shape rather than
+    # dropping the row or failing the whole cell; a repo-wide failure
+    # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
+    # all rather than a 500 for the whole card — same posture as every
+    # other sub-block here. Unlike `scope_ids` above (a distinct-corpus
+    # heuristic over ingest history), this list is direct — every scope this
+    # CONNECTION has confirmed, whether or not it has ingested anything yet.
+    scopes: list[dict[str, Any]] = []
+    try:
+        from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
+
+        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
+        for raw_scope in (conn.get("config") or {}).get("scopes") or []:
+            if not isinstance(raw_scope, dict):
+                continue
+            try:
+                scopes.append(_scope_out(raw_scope, declared_corpus_ids))
+            except Exception as e:
+                logger.debug(
+                    "sharepoint pipeline cell: scope row resolution failed for %s: %s",
+                    raw_scope.get("source_scope_id"),
+                    e,
+                )
+    except Exception as e:
+        logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
+    cell["scopes"] = scopes
+
+    # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
+    # own confirmed scopes marked anonymize=true, read straight off `conn` —
+    # the SAME config `app/api/admin_sharepoint.py` writes) vs "declared"
+    # (the LATEST persisted run report's `anonymization.scopes` — the
+    # producer's own claim). Never collapse the two: a collection can be
+    # requested with nothing declared yet (badge: "anonymization
+    # requested", warn), or declared (badge: "anonymized", ok). A
+    # collection declared but never requested is surfaced too — an operator
+    # misconfiguration worth seeing, not hiding.
+    requested_ids = {
+        s.get("collection_id")
+        for s in (conn.get("config") or {}).get("scopes") or []
+        if isinstance(s, dict) and s.get("anonymize") and s.get("collection_id")
+    }
+    declared_ids: set[str] = set()
+    if last_run is not None:
+        anon = last_run.get("anonymization") or {}
+        run_scopes = anon.get("scopes")
+        if isinstance(run_scopes, dict):
+            declared_ids = set(run_scopes.keys())
+    cell["anonymization"] = {
+        "requested": sorted(requested_ids),
+        "declared": sorted(requested_ids & declared_ids),
+        "pending": sorted(requested_ids - declared_ids),
+    }
 
     return cell
 
@@ -8603,7 +8901,22 @@ async def admin_moderation_hub_page(
     submission queue and marketplace curation are surfaced as links (count +
     jump-off), not rebuilt here. ``/admin/store`` is the natural parent of the
     ``/admin/store/submissions`` review queue.
+
+    Hidden by default (``features.store_moderation_enabled``): the two links
+    it surfaces are their own nav rows, and verification has its own switch,
+    so the page was a landing spot for doors already in the column. Redirect
+    rather than 404 — its entry points were a sidebar row and a palette shortcut,
+    and a bookmark from before the flip should land somewhere useful.
+
+    NOTE: this page is the only UI that renders the queued agent-share
+    approvals (Track C6). While it is hidden they are decided through
+    ``GET/PATCH /api/admin/share-requests`` only, which is deliberate — owner-
+    initiated agent sharing is itself V2-deferred in the agent-profiles spec,
+    so on a default instance the queue this page would show is empty.
     """
+    if not get_store_moderation_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from app.instance_config import get_store_verification_enabled
 
     verification_enabled = get_store_verification_enabled()
@@ -8629,6 +8942,17 @@ async def admin_moderation_hub_page(
         limit=1,
     )
 
+    # Track C6 — agent-sharing approval queue. PG-only (A3 ratchet): on a
+    # DuckDB-backed instance the feature doesn't exist here at all, so the
+    # zone is simply omitted rather than 501ing the whole moderation hub —
+    # same posture as `app.web.admin_signals._resolve_agent_share_requests`.
+    from src.repositories import use_pg
+
+    agent_share_requests_enabled = use_pg()
+    pending_share_requests: list = []
+    if agent_share_requests_enabled:
+        pending_share_requests = _pending_agent_share_requests_for_admin()
+
     ctx = _build_context(
         request,
         user=user,
@@ -8637,8 +8961,44 @@ async def admin_moderation_hub_page(
         verification_limit=verification_limit,
         pending_submissions_total=pending_submissions_total,
         store_verification_enabled=verification_enabled,
+        agent_share_requests_enabled=agent_share_requests_enabled,
+        pending_share_requests=pending_share_requests,
     )
     return templates.TemplateResponse(request, "admin_moderation_hub.html", ctx)
+
+
+def _pending_agent_share_requests_for_admin() -> list:
+    """Pending rows for the moderation hub's "Pending agent shares" zone,
+    with the ids the template needs resolved to names — mirrors
+    ``app.api.share_requests_admin._serialize``'s projection, kept local
+    to this module rather than importing a private helper across the
+    app.api / app.web boundary."""
+    from src.repositories import (
+        agents_repo,
+        share_requests_repo,
+        user_groups_repo,
+        users_repo,
+    )
+
+    rows, _ = share_requests_repo().list_for_admin(status=["pending"], limit=200)
+    agents = agents_repo()
+    groups = user_groups_repo()
+    users = users_repo()
+    out = []
+    for r in rows:
+        agent = agents.get_by_id(r["resource_id"]) if r["resource_type"] == "agent" else None
+        requester = users.get_by_id(r["requested_by"])
+        group = groups.get(r["requested_group_id"])
+        out.append(
+            {
+                "id": r["id"],
+                "resource_name": (agent or {}).get("name") or r["resource_id"],
+                "requested_group_name": (group or {}).get("name") or r["requested_group_id"],
+                "requested_by_email": (requester or {}).get("email") or r["requested_by"],
+                "created_at": r.get("created_at"),
+            }
+        )
+    return out
 
 
 @router.get("/admin/store/submissions", response_class=HTMLResponse)
@@ -9013,6 +9373,17 @@ async def profile_page(
     telegram_status = {"linked": bool(_tg_link)}
     desktop_status = {"linked": False}
 
+    # Linked external identity (design 2026-08-28) — PG-only feature; on a
+    # DuckDB-backed instance (or any read failure) the row simply reads as
+    # not-linked so the profile never 501s over one aside line.
+    external_identity = None
+    try:
+        from src.repositories import user_external_identities_repo
+
+        external_identity = user_external_identities_repo().get_by_user_id(user["id"])
+    except Exception:
+        external_identity = None
+
     ctx = _build_context(
         request,
         user=user,
@@ -9025,6 +9396,7 @@ async def profile_page(
         sync_summary=_last_sync_summary(user["id"]),
         telegram_status=telegram_status,
         desktop_status=desktop_status,
+        external_identity=external_identity,
         # Display-only — keep original case (no .lower()), unlike the
         # refetch-groups handler below which lowercases for set comparison.
         google_group_prefix=os.environ.get("AGNES_GOOGLE_GROUP_PREFIX", "").strip(),

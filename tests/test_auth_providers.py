@@ -312,6 +312,90 @@ def _recording_smtp(sent: list):
     return FakeSMTP
 
 
+class TestEmailMagicLinkJitProvisioning:
+    """Issue #1683: a magic-link request for an address with no account yet
+    rendered the normal "Check Your Email" success page but sent nothing —
+    the person waits for a link that will never arrive. JIT-provision the
+    account, mirroring the Google/Microsoft OAuth gate (``auth.allowed_domain``),
+    so a first-time request from an allowed domain gets a real account and a
+    real link, while the *visible* response never differs by whether the
+    account existed before the request.
+    """
+
+    def test_unknown_allowed_domain_is_provisioned_and_mailed(self, client, monkeypatch):
+        from app.auth.providers import email as email_mod
+        from src.repositories import users_repo
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["test.com"])
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        sent: list = []
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp(sent))
+
+        assert users_repo().get_by_email_ci("newbie@test.com") is None
+
+        resp = client.post("/auth/email/send-link", json={"email": "newbie@test.com"})
+        assert resp.status_code == 200
+        assert resp.json() == {"message": "If this email is registered, you will receive a login link."}
+        assert len(sent) == 1, "no mail sent to the newly-provisioned account"
+
+        user = users_repo().get_by_email_ci("newbie@test.com")
+        assert user is not None, "no account provisioned for an allowed-domain address"
+
+    def test_response_is_identical_for_known_and_newly_provisioned_accounts(self, client, monkeypatch):
+        """The whole point of anti-enumeration: the caller cannot tell, from
+        the response, whether the account pre-existed or was just created."""
+        from app.auth.providers import email as email_mod
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["test.com"])
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp([]))
+
+        known = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        new = client.post("/auth/email/send-link", json={"email": "brandnew@test.com"})
+        assert known.status_code == new.status_code == 200
+        assert known.content == new.content
+
+    def test_unknown_address_outside_allowlist_gets_no_account(self, client, monkeypatch):
+        from app.auth.providers import email as email_mod
+        from src.repositories import users_repo
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["other.example"])
+        resp = client.post("/auth/email/send-link", json={"email": "nobody@test.com"})
+        assert resp.status_code == 200
+        assert resp.json() == {"message": "If this email is registered, you will receive a login link."}
+        assert users_repo().get_by_email_ci("nobody@test.com") is None
+
+    def test_empty_allowlist_keeps_existing_users_only_behavior(self, client, monkeypatch):
+        """No ``auth.allowed_domain`` configured (today's default): unknown
+        addresses get no account, exactly as before this fix — an operator
+        who never opted into an allowlist sees no behavior change."""
+        from app.auth.providers import email as email_mod
+        from src.repositories import users_repo
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: [])
+        resp = client.post("/auth/email/send-link", json={"email": "nobody@test.com"})
+        assert resp.status_code == 200
+        assert resp.json() == {"message": "If this email is registered, you will receive a login link."}
+        assert users_repo().get_by_email_ci("nobody@test.com") is None
+
+    def test_known_account_still_works_unaffected(self, client, monkeypatch):
+        """A pre-existing account is untouched by the allow-rule — it must
+        still receive its link even against an allowlist it doesn't match."""
+        from app.auth.providers import email as email_mod
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["other.example"])
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        sent: list = []
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp(sent))
+
+        resp = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        assert resp.status_code == 200
+        assert len(sent) == 1
+
+
 class TestEmailSendFailureIsSurfaced:
     """A configured mail transport that fails to deliver must not answer 200.
 
@@ -1412,3 +1496,286 @@ class TestSmtpSenderResolution:
 
         monkeypatch.setattr("app.instance_config.get_value", _boom, raising=False)
         assert _common.smtp_from_address() == "noreply@example.com"
+
+
+class TestSsoClaimEvaluation:
+    """Pure-function tests for the sso provider's claim evaluation (design
+    2026-08-28 login flow steps 2-5). No DB, no network."""
+
+    CFG = {
+        "tenant_id": "11111111-2222-3333-4444-555555555555",
+        "allowed_email_domains": ["fabrikam.com"],
+    }
+
+    def _eval(self, userinfo, cfg=None):
+        from app.auth.providers.sso import evaluate_claims
+
+        return evaluate_claims(userinfo, cfg or self.CFG)
+
+    def _userinfo(self, **overrides):
+        info = {
+            "email": "User@Fabrikam.com",
+            "oid": "AAAA0000-1111-2222-3333-444455556666",
+            "tid": "11111111-2222-3333-4444-555555555555",
+        }
+        info.update(overrides)
+        return info
+
+    def test_happy_path_normalizes_email_and_guids(self):
+        error, email, oid, tid = self._eval(self._userinfo())
+        assert error is None
+        assert email == "user@fabrikam.com"
+        assert oid == "aaaa0000-1111-2222-3333-444455556666"
+        assert tid == "11111111-2222-3333-4444-555555555555"
+
+    def test_missing_email_and_ext_upn_refused(self):
+        error, *_ = self._eval(self._userinfo(email="", preferred_username=""))
+        assert error == "sso_no_email"
+        # A B2B guest UPN is not an identity (imported microsoft rule).
+        error, *_ = self._eval(self._userinfo(email="", preferred_username="u_x.com#EXT#@t.onmicrosoft.com"))
+        assert error == "sso_no_email"
+
+    def test_mail_shaped_upn_fallback_accepted(self):
+        error, email, *_ = self._eval(self._userinfo(email="", preferred_username="upn@fabrikam.com"))
+        assert error is None
+        assert email == "upn@fabrikam.com"
+
+    def test_missing_oid_refused_never_falls_back_to_sub(self):
+        error, *_ = self._eval(self._userinfo(oid="", sub="pairwise-sub-value"))
+        assert error == "sso_no_subject"
+
+    def test_missing_tid_refused(self):
+        error, *_ = self._eval(self._userinfo(tid=""))
+        assert error == "sso_wrong_tenant"
+
+    def test_guid_configured_tenant_pins_token_tid(self):
+        error, *_ = self._eval(self._userinfo(tid="99999999-8888-7777-6666-555555555555"))
+        assert error == "sso_wrong_tenant"
+        # Case-insensitive GUID comparison.
+        error, *_ = self._eval(self._userinfo(tid="11111111-2222-3333-4444-555555555555".upper()))
+        assert error is None
+
+    def test_verified_domain_configured_tenant_defers_to_issuer(self):
+        """With a verified-domain tenant string the issuer check is the
+        authority — evaluate_claims does not second-guess the tid, it keys
+        the identity on the TOKEN's tid."""
+        cfg = {"tenant_id": "fabrikam.onmicrosoft.com", "allowed_email_domains": ["fabrikam.com"]}
+        error, _, _, tid = self._eval(self._userinfo(), cfg)
+        assert error is None
+        assert tid == "11111111-2222-3333-4444-555555555555"
+
+    def test_domain_allowlist_fails_closed(self):
+        error, *_ = self._eval(self._userinfo(email="user@evil.example"))
+        assert error == "domain_not_allowed"
+        cfg = {"tenant_id": self.CFG["tenant_id"], "allowed_email_domains": []}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+        # A missing/None allowlist key must fail closed too — refuse, never
+        # raise (Gemini second-opinion finding: the `or []` fallback was
+        # parsed as `(domain not in X) or []` and could not fire).
+        cfg = {"tenant_id": self.CFG["tenant_id"]}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+        cfg = {"tenant_id": self.CFG["tenant_id"], "allowed_email_domains": None}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+
+
+class TestSsoForcedForEmail:
+    """Truth table for ``sso_forced_for_email`` — the single predicate every
+    password / magic-link door consults before opening (force-SSO hardening
+    on top of the 2026-08-28 design). Pure: ``_config_state`` is stubbed, no
+    DB. The PG-backed per-door tests live in
+    ``tests/db_pg/test_sso_forced_login_doors.py``."""
+
+    def _sso(self, monkeypatch, cfg, secret="s3cret"):
+        from app.auth.providers import sso
+
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        monkeypatch.setattr(sso, "_config_state", lambda: (cfg, secret))
+        return sso
+
+    def _cfg(self, **overrides):
+        cfg = {
+            "tenant_id": "11111111-2222-3333-4444-555555555555",
+            "client_id": "app-client-id",
+            "display_name": "Fabrikam",
+            "allowed_email_domains": ["fabrikam.com"],
+            "enabled": True,
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_forced_when_domain_in_enabled_allowlist(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("user@fabrikam.com") is True
+
+    def test_case_and_whitespace_variants_are_forced(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("User@FABRIKAM.COM") is True
+        assert sso.sso_forced_for_email("  user@fabrikam.com  ") is True
+
+    def test_domain_after_the_last_at_sign_decides(self, monkeypatch):
+        # evaluate_claims splits on the LAST "@" — this predicate must agree,
+        # or an address would be forced by one and refused by the other.
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email('"a@b"@fabrikam.com') is True
+
+    def test_other_domain_not_forced(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("user@partner.example") is False
+
+    def test_subdomain_does_not_match(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("user@sub.fabrikam.com") is False
+
+    def test_not_an_email_never_forced(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        assert sso.sso_forced_for_email("fabrikam.com") is False
+        assert sso.sso_forced_for_email("") is False
+
+    def test_disabled_config_lifts_the_forcing(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg(enabled=False))
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_missing_config_never_forces(self, monkeypatch):
+        sso = self._sso(monkeypatch, None, secret=None)
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_missing_secret_never_forces(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg(), secret=None)
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_empty_allowlist_never_forces(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg(allowed_email_domains=[]))
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_sso_excluded_from_auth_providers_lifts_the_forcing(self, monkeypatch):
+        # An operator who 404s the sso door via auth.providers must not leave
+        # forced domains with NO door at all — forcing applies only while the
+        # sso door is actually offered (same predicate pair the admin API's
+        # last-login-door guard uses for "sso is a usable door").
+        sso = self._sso(monkeypatch, self._cfg())
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "password")
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_allowlist_naming_sso_keeps_the_forcing(self, monkeypatch):
+        sso = self._sso(monkeypatch, self._cfg())
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "sso,password")
+        assert sso.sso_forced_for_email("user@fabrikam.com") is True
+
+
+class TestSsoAvailabilityOnDuckDB:
+    """The PG-only repos must read as unavailable — never raise — on a
+    DuckDB-backed instance (the registry lockout rescue depends on it)."""
+
+    def test_probes_return_false_without_raising(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("AGNES_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        from app.auth.providers import sso
+
+        assert sso.is_available() is False
+        assert sso.is_configured() is False
+        assert sso.startup_warnings() == []
+        assert sso.login_offering() is None
+        # Every sso_forced_for_email call site is on the unauthenticated
+        # login path — on DuckDB it must answer False, never raise.
+        assert sso.sso_forced_for_email("user@fabrikam.com") is False
+
+    def test_registry_probe_reports_not_raised(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("AGNES_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        from app.auth.provider_registry import _probe_availability
+
+        available, raised = _probe_availability("sso")
+        assert available is False
+        assert raised is False  # a raising probe would suppress the lockout rescue
+
+
+class TestProviderEnumerationParity:
+    """Cheap drift insurance: the provider enumeration now lives in five
+    places (registry, login page, doctor, admin lockout validator,
+    availability probes) — they must agree on the provider set."""
+
+    def test_all_enumerations_agree_on_the_provider_set(self):
+        import inspect
+
+        import app.api.admin as admin_api
+        import app.services.instance_doctor as doctor
+        import app.web.router as web_router
+        from app.auth.provider_registry import _AVAILABILITY_PROBES, KNOWN_PROVIDERS, probe_providers
+
+        assert {p["name"] for p in probe_providers()} == set(KNOWN_PROVIDERS)
+        assert set(_AVAILABILITY_PROBES) == set(KNOWN_PROVIDERS) - {"password"}
+
+        login_src = inspect.getsource(web_router.login_page)
+        doctor_src = inspect.getsource(doctor.check_login_door)
+        save_src = inspect.getsource(admin_api._provider_available_after_save)
+        for name in KNOWN_PROVIDERS:
+            assert f'provider_allowed("{name}")' in login_src, f"login_page misses {name}"
+            assert f'"{name}"' in doctor_src, f"instance doctor misses {name}"
+            assert f'"{name}"' in save_src, f"_provider_available_after_save misses {name}"
+
+
+class TestSsoRouteGating:
+    """Normal-mode inline gating matches the require_provider 404 posture."""
+
+    @pytest.fixture
+    def sso_client(self, tmp_path, monkeypatch, shared_app):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
+        return TestClient(shared_app)
+
+    def test_normal_mode_404_when_unavailable(self, sso_client):
+        # DuckDB backend -> is_available() is False -> same 404 a disallowed
+        # provider answers (posture unchanged for users).
+        assert sso_client.get("/auth/sso/login", follow_redirects=False).status_code == 404
+        assert sso_client.get("/auth/sso/callback", follow_redirects=False).status_code == 404
+
+    def test_normal_mode_404_when_excluded_even_if_available(self, sso_client, monkeypatch):
+        import app.auth.providers.sso as sso
+
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "password")
+        monkeypatch.setattr(sso, "is_available", lambda: True)
+        assert sso_client.get("/auth/sso/login", follow_redirects=False).status_code == 404
+
+    def test_sso_only_allowlist_404s_other_providers(self, sso_client, monkeypatch):
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "sso")
+        assert sso_client.get("/auth/microsoft/login", follow_redirects=False).status_code == 404
+        assert sso_client.get("/auth/google/login", follow_redirects=False).status_code == 404
+
+    def test_test_mode_refuses_anonymous_on_duckdb_too(self, sso_client):
+        # Admin gate fires BEFORE any config/backend read.
+        assert sso_client.get("/auth/sso/login?mode=test", follow_redirects=False).status_code == 403
+
+
+class TestAdminSessionPredicateLockstep:
+    """`app.auth.access.is_admin_session` is the boolean form of
+    `require_admin` for optional-user routes (the SSO test mode). Pin the
+    shared primitive set so a check added to one without the other fails
+    loudly instead of drifting silently."""
+
+    PRIMITIVES = ("PRINCIPAL_TYPES", "is_user_admin", "elevation_paused")
+
+    def test_both_gates_compose_the_same_primitives(self):
+        import inspect
+
+        from app.auth import access
+
+        require_src = inspect.getsource(access.require_admin)
+        boolean_src = inspect.getsource(access.is_admin_session)
+        for name in self.PRIMITIVES:
+            assert name in require_src, f"require_admin lost {name} — update the lockstep pin"
+            assert name in boolean_src, f"is_admin_session misses {name} — mirror require_admin"
+
+    def test_sso_test_mode_delegates_to_the_canonical_predicate(self):
+        import inspect
+
+        from app.auth.providers import sso
+
+        src = inspect.getsource(sso._is_admin_session)
+        assert "is_admin_session" in src
+        for name in self.PRIMITIVES:
+            assert name not in src, "sso must delegate, not re-compose the admin checks"

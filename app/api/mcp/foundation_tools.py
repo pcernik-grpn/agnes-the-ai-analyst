@@ -31,6 +31,36 @@ from mcp.server.fastmcp import FastMCP
 from src.mcp_tooling import ensure_output_size, progressive_tool
 
 
+def _raise_for_status_with_detail(r: httpx.Response) -> None:
+    """``raise_for_status()`` that keeps the response body in the message.
+
+    A bare ``raise_for_status()`` surfaces only ``Client error '400 Bad
+    Request' for url …`` to the model — the body's ``detail``, which carries
+    the actionable part (e.g. ``invalid_category`` with the list of valid
+    values), is discarded, so the model cannot self-correct and the user
+    sees a dead-end error card. Same ``httpx.HTTPStatusError`` raised, with
+    the detail appended.
+    """
+    if r.status_code < 400:
+        return
+    try:
+        detail = r.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if detail is None:
+        body = r.text or ""
+    elif isinstance(detail, str):
+        body = detail
+    else:
+        body = json.dumps(detail, ensure_ascii=False)
+    suffix = f" — {body[:600]}" if body.strip() else ""
+    raise httpx.HTTPStatusError(
+        f"{r.status_code} {r.reason_phrase} for {r.request.url}{suffix}",
+        request=r.request,
+        response=r,
+    )
+
+
 def _split_marketplace_id(item_id: str) -> tuple[str, str, str]:
     """Split a marketplace item id into ``(source, part1, part2)``.
 
@@ -315,7 +345,7 @@ def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
 
     Raises :class:`PermissionError` when the token is missing or invalid —
     surfaced to the MCP client as a tool-call error, the same shape every
-    other foundation tool's ``r.raise_for_status()`` produces for a 401.
+    other foundation tool's ``_raise_for_status_with_detail`` produces for a 401.
 
     Always calls ``resolve_token_to_user`` with ``conn=None`` — its own
     docstring is explicit that the argument is ignored (repositories
@@ -389,7 +419,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -403,7 +433,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/collections", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -419,7 +449,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -473,7 +503,7 @@ def register_foundation_tools(
                 params=params,
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -514,7 +544,7 @@ def register_foundation_tools(
                 params={"q": query, "k": k},
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -537,7 +567,7 @@ def register_foundation_tools(
                 params={"q": query, "limit": k},
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -561,7 +591,7 @@ def register_foundation_tools(
                 params={"q": query, "limit": k},
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -581,7 +611,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return {"slug": slug, "document": r.text}
 
     @tool(read_only=True)
@@ -633,7 +663,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -682,7 +712,7 @@ def register_foundation_tools(
                 params=params,
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -712,7 +742,7 @@ def register_foundation_tools(
                 params={"semantic_types": semantic_types},
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, idempotent=True)
@@ -768,7 +798,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -805,7 +835,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -827,13 +857,14 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
     async def fact_search(
         type: str | None = None,
         filters: dict[str, Any] | None = None,
+        q: str | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict:
         """Search typed facts extracted from documents — entities (people,
@@ -862,6 +893,9 @@ def register_foundation_tools(
             filters: Attribute equality filters, e.g. {"status": "active"} —
                 evaluated against the PROJECTED value, so a filter on a
                 conflicted key never matches.
+            q: Optional free-text name lookup (e.g. a person or org name),
+                matched against alias names only, never claim text. An
+                exact or prefix match ranks first.
             limit: Max results (server caps at 100).
 
         Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
@@ -874,7 +908,7 @@ def register_foundation_tools(
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, limit=limit)
+        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
 
     @tool(read_only=True)
     async def fact_neighbors(
@@ -973,7 +1007,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/v2/schema/{table_id}", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -997,14 +1031,14 @@ def register_foundation_tools(
         rows = min(max(1, rows), 50)
         async with httpx.AsyncClient() as c:
             rs = await c.get(f"{base_url}/api/v2/schema/{table_id}", headers=headers_fn(), timeout=30)
-            rs.raise_for_status()
+            _raise_for_status_with_detail(rs)
             rm = await c.get(
                 f"{base_url}/api/v2/sample/{table_id}",
                 headers=headers_fn(),
                 params={"n": rows},
                 timeout=30,
             )
-            rm.raise_for_status()
+            _raise_for_status_with_detail(rm)
         return ensure_output_size(
             {"schema": rs.json(), "sample": rm.json()},
             "describe",
@@ -1038,7 +1072,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return ensure_output_size(r.json(), "query")
 
     @tool(read_only=True)
@@ -1063,7 +1097,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1087,7 +1121,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1117,7 +1151,7 @@ def register_foundation_tools(
                 params={"type": resource_type},
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, idempotent=True)
@@ -1147,7 +1181,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             body = r.json()
         # Post-subscribe hint — both supported types land as local tables pulled
         # by ``agnes pull`` (data packages → parquet, memory domains → synced
@@ -1182,12 +1216,12 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         return {"unsubscribed": True}
 
     @tool(read_only=True)
     async def stack_artefacts_candidates() -> dict:
-        """List artefacts (file Collections) you could add to your Stack.
+        """List Collections (file corpora) you could add to your Stack.
 
         Candidates are accessible to you (owned, shared with you/your team,
         or workspace-published) and NOT already in your Stack. Adding one to
@@ -1205,19 +1239,19 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, idempotent=True)
     async def stack_artefact_add(corpus_id: str) -> dict:
-        """Add an artefact (file Collection) to your Stack.
+        """Add a Collection (file corpus) to your Stack.
 
-        Makes the default agent able to use it. 404 if the artefact doesn't
-        exist; 403 if you don't have access to it (not owned, not shared
-        with you/your team, not workspace-published). Idempotent.
+        Makes the default agent able to use it. 404 if the collection
+        doesn't exist; 403 if you don't have access to it (not owned, not
+        shared with you/your team, not workspace-published). Idempotent.
 
         Args:
-            corpus_id: The artefact id, from ``stack_artefacts_candidates``.
+            corpus_id: The collection id, from ``stack_artefacts_candidates``.
 
         Returns ``{"added": true, "card": {...}}``.
         """
@@ -1227,17 +1261,17 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True, idempotent=True)
     async def stack_artefact_remove(corpus_id: str) -> dict:
-        """Remove an artefact from your Stack — drops the default agent's
-        access only. The artefact itself, its files, ownership, and sharing
-        are unaffected.
+        """Remove a Collection from your Stack — drops the default agent's
+        access only. The collection itself, its files, ownership, and
+        sharing are unaffected.
 
         Args:
-            corpus_id: The artefact id to remove from your Stack.
+            corpus_id: The collection id to remove from your Stack.
 
         Returns ``{"removed": true}`` on success.
         """
@@ -1247,7 +1281,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         return {"removed": True}
 
     @tool(read_only=False, idempotent=True)
@@ -1273,7 +1307,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1299,7 +1333,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -1325,7 +1359,9 @@ def register_foundation_tools(
                          from ``name``/``description`` when absent).
             type:        ``"skill"`` (default) or ``"agent"``.
             description: One-line *use when …* trigger (goes into frontmatter).
-            category:    Optional store category (case-insensitive).
+            category:    Optional store category (case-insensitive). Must be
+                         one of the store's fixed taxonomy — an invalid value
+                         is rejected with the list of valid categories.
 
         Returns the created entity — ``{"id", "name", "invocation_name",
         "version", "visibility_status", …}``.
@@ -1342,7 +1378,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -1430,7 +1466,7 @@ def register_foundation_tools(
                     params=params,
                     timeout=30,
                 )
-                r.raise_for_status()
+                _raise_for_status_with_detail(r)
                 items.extend(r.json().get("items", []))
         return {"items": items, "total": len(items)}
 
@@ -1457,7 +1493,7 @@ def register_foundation_tools(
             path = f"/api/marketplace/flea/{part1}/detail"
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}{path}", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, idempotent=True)
@@ -1485,7 +1521,7 @@ def register_foundation_tools(
             path = f"/api/store/entities/{part1}/install"
         async with httpx.AsyncClient() as c:
             r = await c.post(f"{base_url}{path}", json={}, headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         return {
             "installed": True,
             "next_step": "Run /update-agnes-plugins in Claude Code (or `agnes update`) to activate it.",
@@ -1510,7 +1546,7 @@ def register_foundation_tools(
             path = f"/api/store/entities/{part1}/install"
         async with httpx.AsyncClient() as c:
             r = await c.delete(f"{base_url}{path}", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         return {
             "removed": True,
             "next_step": "Run /update-agnes-plugins in Claude Code (or `agnes update`) to apply it.",
@@ -1559,7 +1595,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True)
@@ -1581,7 +1617,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         return {"deleted": True, "entity_id": entity_id}
 
     @tool(read_only=True)
@@ -1604,7 +1640,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -1628,7 +1664,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=300,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True, idempotent=True)
@@ -1652,7 +1688,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1688,7 +1724,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -1706,7 +1742,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True)
@@ -1722,7 +1758,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return {"deleted": name, "status": r.status_code}
 
     @tool(read_only=True)
@@ -1747,7 +1783,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1770,7 +1806,7 @@ def register_foundation_tools(
                 params=params,
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return {"connections": r.json()}
 
     @tool(read_only=False)
@@ -1832,7 +1868,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1860,7 +1896,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1886,7 +1922,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -1926,7 +1962,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -1960,7 +1996,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -1982,7 +2018,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return {"deleted": tag_id}
 
     @tool(read_only=True)
@@ -2012,7 +2048,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2053,7 +2089,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2074,7 +2110,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return {"unmuted": mute_id}
 
     @tool(read_only=True)
@@ -2104,7 +2140,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, idempotent=False)
@@ -2148,7 +2184,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2175,7 +2211,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         # The queue only grows, and each report carries a question, a comment
         # and possibly a whole query — so it is one of the few admin lists that
         # can genuinely outgrow a model's context. Refuse loudly rather than
@@ -2207,7 +2243,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2234,7 +2270,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2258,7 +2294,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2302,7 +2338,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2344,7 +2380,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True)
@@ -2368,7 +2404,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         return {"deleted": digest_id}
 
     @tool(read_only=False)
@@ -2446,17 +2482,16 @@ def register_foundation_tools(
                 timeout=30,
             )
             # 4xx bodies carry the connect remedy (e.g. the not-connected 403's
-            # `detail` — see mcp_user_secrets.py) — raise_for_status() would
-            # discard it and surface only a generic "403 Forbidden" to the
-            # model, defeating the "tells you where to add your token" promise
-            # above. Only genuine 5xx/transport errors still raise.
+            # `detail` — see mcp_user_secrets.py). This tool's contract is
+            # {ok, message}, not a tool-call error — return the remedy rather
+            # than raising. Only genuine 5xx/transport errors still raise.
             if 400 <= r.status_code < 500:
                 try:
                     detail = r.json().get("detail", r.text)
                 except ValueError:
                     detail = r.text
                 return {"ok": False, "tool_count": None, "message": detail}
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2489,7 +2524,7 @@ def register_foundation_tools(
             params["kind"] = kind
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/jobs", headers=headers_fn(), params=params, timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2505,7 +2540,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/jobs/{job_id}", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2534,7 +2569,7 @@ def register_foundation_tools(
             body["idempotency_key"] = idempotency_key
         async with httpx.AsyncClient() as c:
             r = await c.post(f"{base_url}/api/jobs", json=body, headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2593,7 +2628,7 @@ def register_foundation_tools(
             params["q"] = q
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True)
@@ -2629,7 +2664,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2656,7 +2691,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/v1/agents", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, open_world=True)
@@ -2691,7 +2726,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=timeout_s + 10,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2726,7 +2761,7 @@ def register_foundation_tools(
                 params=params,
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2750,7 +2785,7 @@ def register_foundation_tools(
         params = {"kind": kind} if kind else None
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/data-apps", headers=headers_fn(), params=params, timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2767,7 +2802,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/data-apps/{slug}", headers=headers_fn(), timeout=30)
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, open_world=True)
@@ -2804,7 +2839,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2837,7 +2872,7 @@ def register_foundation_tools(
                 json={"slug": slug, "name": name, "description": description},
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False)
@@ -2865,7 +2900,7 @@ def register_foundation_tools(
                 json={"branch": branch},
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, destructive=True)
@@ -2892,7 +2927,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=60,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return {"status": "deleted"}
 
     @tool(read_only=False)
@@ -2930,7 +2965,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=True)
@@ -2951,7 +2986,7 @@ def register_foundation_tools(
                 params={"tail": tail},
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     @tool(read_only=False, idempotent=True)
@@ -2979,7 +3014,7 @@ def register_foundation_tools(
                 headers=headers_fn(),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             return r.json()
 
     def _data_apps_disabled_payload() -> dict:
@@ -3038,7 +3073,7 @@ def register_foundation_tools(
             )
             if _is_data_apps_disabled_response(r):
                 return _data_apps_disabled_payload()
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
         # The POST above validates view access (403 -> raises) and installs the
         # scoped cookie via its Set-Cookie header. We intentionally do NOT read
         # or surface the cookie value: the render directive the web chat needs
@@ -3103,7 +3138,7 @@ def register_foundation_tools(
             r = await c.get(f"{base_url}/api/data-apps/{slug}", headers=headers_fn(), timeout=30)
             if _is_data_apps_disabled_response(r):
                 return _data_apps_disabled_payload()
-            r.raise_for_status()
+            _raise_for_status_with_detail(r)
             detail = r.json()
         return {
             "render": "data_app_credentials",
