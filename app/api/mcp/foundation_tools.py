@@ -2145,13 +2145,15 @@ def register_foundation_tools(
         """Is the semantic layer trustworthy right now (admin only)?
 
         Sync failures, models whose source was deleted or renamed away from
-        under them, documents that failed schema validation, three static
-        document-quality checks (a metric with no description, one name
-        defined twice with a different formula, a cross-dataset metric with
-        no declared relationship between the datasets it touches),
-        ``semantic_model_coverage``'s missing/partial counts rolled up into
-        one pair of numbers, and every currently active mute — so a finding
-        already silenced by an admin does not get reported as news twice.
+        under them, metric bindings and profiled columns that outlived the
+        table they were bound to, documents that failed schema validation,
+        three static document-quality checks (a metric with no description,
+        one name defined twice with a different formula, a cross-dataset
+        metric with no declared relationship between the datasets it
+        touches), ``semantic_model_coverage``'s missing/partial counts rolled
+        up into one pair of numbers, and every currently active mute — so a
+        finding already silenced by an admin does not get reported as news
+        twice.
 
         Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes
         semantic-model health``.

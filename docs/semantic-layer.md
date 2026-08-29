@@ -448,6 +448,12 @@ stale, or internally inconsistent" — a different question, in one response:
   source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
   not cascade to the models it fed, so a project can vanish and leave its
   models silently pointing at nothing.
+- **`orphaned_table_bindings`** — the same shape of gap, one hop over: a
+  `metric_definitions` row bound by name (`table_name`/`tables[]`) or a
+  `column_metadata` row bound by id (`table_id`) to a `table_registry` row
+  that no longer exists — unregistering (or renaming) a table has no cascade
+  either. Detection only (`src/semantic/orphans.py`); nothing here deletes
+  the dangling metric/column rows, and a table delete is never blocked on it.
 - **`invalid_models`** — documents with `status='invalid'`, and why.
 - **Three static, document-only quality checks**, none of which touch live
   data: `metrics_missing_description` (a formula with no business decision

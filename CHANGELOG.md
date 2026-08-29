@@ -10,6 +10,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **Detect semantic bindings orphaned by a table delete or rename (Block 5 of #1707).** Unregistering (or renaming) a table left no cascade for `metric_definitions` rows bound to it by name or `column_metadata` rows profiled against its id — detection only, nothing is auto-deleted. `src/semantic/orphans.py` finds both classes through the existing `table_registry`/`metric`/`column_metadata` repo factories (backend-agnostic, no Postgres gate), and a new `orphaned_table_bindings` health check surfaces the findings in `GET /api/admin/semantic-layer/health`, `agnes semantic-model health`, the `semantic_layer_health` MCP tool, and the admin Semantic Layer page's Health tab. `DELETE /api/admin/source-connections/{id}` now also returns an informational `X-Agnes-Semantic-References` header counting the semantic sources/models tied to the deleted connection — never blocking the delete.
 - **The semantic layer now reaches the agent that is about to ignore it.** An
   instance could hold a fully populated semantic layer and still be queried as
   if it had none, because nothing on the consumption path mentioned it.

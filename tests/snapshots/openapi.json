@@ -31507,7 +31507,7 @@
     },
     "/api/admin/source-connections/{connection_id}": {
       "delete": {
-        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.",
+        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.\n\nSuccess carries an ``X-Agnes-Semantic-References`` header \u2014 the number\nof semantic sources/models tied to this connection (Block 5 of #1707).\nA header, not a body field: the response is ``204 No Content`` (pinned\nby ``test_delete_returns_204``), and this is informational only \u2014 it\nnever blocks the delete, unlike the pinned-tables 409 above.",
         "operationId": "delete_connection_api_admin_source_connections__connection_id__delete",
         "parameters": [
           {
