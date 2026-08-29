@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from app.auth.dependencies import get_current_user
 from app.chat.session_principal_guard import deny_principal
 from app.secrets_vault import VaultKeyNotConfiguredError
+from src.audit_helpers import log_safe
 from src.repositories import mcp_sources_repo, per_user_secrets_repo
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,12 @@ async def set_my_secret(
             status_code=409,
             detail="vault_key_not_configured: set AGNES_VAULT_KEY on the server before storing secrets",
         ) from exc
+    # NEVER include body.value — the secret itself never enters the audit record.
+    log_safe(
+        user_id=user["id"],
+        action="mcp_user_secret.set",
+        resource=f"mcp_source:{source_id}",
+    )
 
 
 @router.delete("/{source_id}/my-secret", status_code=204)
@@ -132,6 +139,11 @@ async def delete_my_secret(
         if not per_user_secrets_repo().has(source_id, user["id"]):
             raise
     per_user_secrets_repo().delete(source_id, user["id"])
+    log_safe(
+        user_id=user["id"],
+        action="mcp_user_secret.clear",
+        resource=f"mcp_source:{source_id}",
+    )
 
 
 @router.get("/{source_id}/my-secret", response_model=HasSecretResponse)
@@ -151,6 +163,11 @@ async def get_my_secret_status(
     if source is None:
         raise HTTPException(status_code=404, detail="mcp_source_not_found")
     _require_source_grant(source_id, user)
+    log_safe(
+        user_id=user["id"],
+        action="mcp_user_secret.read",
+        resource=f"mcp_source:{source_id}",
+    )
     if (source.get("auth_method") or "").lower() == "oauth":
         from app.api.mcp_policy import oauth_connection_usable
         from src.repositories import mcp_user_oauth_tokens_repo
@@ -309,9 +326,21 @@ async def test_my_secret(source_id: str, user: dict = Depends(get_current_user))
             source_id,
             _redact_then_truncate(str(exc), token),
         )
+        log_safe(
+            user_id=user["id"],
+            action="mcp_user_secret.test",
+            resource=f"mcp_source:{source_id}",
+            result="error",
+        )
         return TestResult(
             ok=False,
             tool_count=None,
             message=f"Couldn't connect to {source_name}. Check that your token is valid and try again.",
         )
+    log_safe(
+        user_id=user["id"],
+        action="mcp_user_secret.test",
+        resource=f"mcp_source:{source_id}",
+        result="success",
+    )
     return TestResult(ok=True, tool_count=len(tools), message="ok")

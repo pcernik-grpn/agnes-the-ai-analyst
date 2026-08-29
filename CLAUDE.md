@@ -529,7 +529,10 @@ allowlist (`is_attach_host_allowed`); derive client IP from trusted proxy hops
 (`app.auth.client_ip.trusted_client_ip`), never leftmost XFF; require a CSRF
 token on state-changing web POSTs and never mutate on GET; scope infra exposure
 per-instance, never fleet-wide. `agnes-reviewer-rules` runs the reviewer
-quick-scan from that playbook on every PR.
+quick-scan from that playbook on every PR. Every audit action string must be
+registered in `src/audit_events.py`'s `CATALOG` (or covered by
+`DYNAMIC_ACTION_PREFIXES`), and new audit writes go through `log_safe` —
+enforced by `tests/test_audit_catalog.py` and `tests/test_audit_route_posture.py`.
 
 ### Vendor-agnostic public repo — no customer-specific content
 This repo is the public source-available distribution. **Nothing customer-specific belongs in code, config defaults, comments, docs, commit messages, or PR titles/bodies** — no specific deployments or brands, cloud project IDs, internal hostnames, runbook paths, internal SA emails, or cross-references to private repos. Frame motivations abstractly ("behind a TLS-terminating reverse proxy"); use placeholders in examples (`example.com`, `<your-host>`, `<install-dir>`). Customer-specific automation lives in the private infra repos that *consume* this repo. Before opening a PR, scan the diff and PR body for customer-specific tokens.

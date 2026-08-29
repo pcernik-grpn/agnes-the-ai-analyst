@@ -131,6 +131,7 @@ from app.job_correlation import bind_request_id, unbind_request_id
 from app.api.health_probes import to_thread_drain_on_cancel
 from app.observability import metrics as obs_metrics
 from app.worker import wakeup
+from app.worker.kinds import dispatch_job
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind
 
 logger = logging.getLogger(__name__)
@@ -413,7 +414,12 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
             _heartbeat_loop(job["id"], worker_id, lease_token, kind.lease_seconds),
             name=f"worker-heartbeat-{job['id']}",
         )
-        handler_future = asyncio.ensure_future(asyncio.to_thread(kind.handler, job["payload_json"]))
+        # `dispatch_job` (F2b — audit-full-coverage plan, Task 4) is the ONE
+        # dispatch-level entry point that runs a claimed job's handler and
+        # writes its `job.run` audit row — every kind funnels through it
+        # instead of this module calling `kind.handler(...)` directly, so
+        # audit coverage lives in exactly one place regardless of kind.
+        handler_future = asyncio.ensure_future(asyncio.to_thread(dispatch_job, job))
         handed_off = False
         obs_metrics.begin_job_running(job["kind"], kind.lane)
         started_at = time.monotonic()
