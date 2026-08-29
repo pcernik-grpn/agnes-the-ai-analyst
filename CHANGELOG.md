@@ -21,6 +21,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 - Cover images on package, memory-domain, marketplace and store pages now declare their size, decode off the main thread and lazy-load below the fold; page heroes are fetched at high priority.
+- Uploaded cover images are now served with a 30-day immutable cache
+  header, so browsers stop re-validating every cover on every page load.
 
 ### Removed
 
