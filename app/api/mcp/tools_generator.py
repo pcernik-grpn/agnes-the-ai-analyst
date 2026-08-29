@@ -394,3 +394,60 @@ def install_grant_filtered_list_tools(
 
     mcp_instance._mcp_server.list_tools()(_filtered_list_tools)
     return _filtered_list_tools
+
+
+def install_tool_call_audit(
+    mcp_instance: FastMCP,
+    caller_id_fn: Optional[Callable[[], Optional[str]]] = None,
+) -> Callable[..., Any]:
+    """Wrap every ``tools/call`` request with one ``mcp.tool_call`` audit
+    row (F2c — audit-full-coverage plan, Task 5).
+
+    Re-registers the low-level ``CallToolRequest`` handler exactly like
+    ``install_grant_filtered_list_tools`` re-registers ``ListToolsRequest``
+    above — the ONE dispatch point every tool invocation (foundation or
+    passthrough) passes through on BOTH transports (SSE:
+    ``app/api/mcp_http.py``, Streamable-HTTP: ``app/api/mcp_streamable.py``),
+    so this is the single place a wrapper belongs instead of instrumenting
+    ~80 individual tool bodies. Call once per transport, right after
+    ``register_passthrough_tools``/``install_grant_filtered_list_tools`` —
+    the exact call sites are each transport's ``_register_dynamic_tools``.
+
+    Emits ``params={"tool": name, "args_hash": hash_args(arguments)}`` —
+    never the raw arguments, which may carry SQL text, filter values, or
+    upstream secrets. Also stamps ``audit_context.set_client_kind("mcp")``
+    before dispatching: this wrapper IS the shared session/call-resolution
+    point both transports install it from, so any audit row a tool writes
+    directly in its OWN process — e.g. the ``fact_search``/``fact_neighbors``/
+    ``fact_claims`` tools, which call ``facts_repo()`` in-process rather than
+    self-calling over HTTP (see ``_facts_caller``'s docstring in
+    ``foundation_tools.py``) — is correctly attributed to this MCP call
+    instead of defaulting to ``client_kind="web"``.
+
+    ``caller_id_fn`` mirrors ``register_passthrough_tools``'s resolver — an
+    unresolvable caller (no id) skips the ``mcp.tool_call`` row rather than
+    writing one under ``user_id=None``, matching the fallback middleware's
+    own unauthenticated-skip rule (Task 2).
+    """
+    base_call_tool = mcp_instance.call_tool
+
+    async def _audited_call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+        from src.audit_context import set_client_kind
+        from src.audit_helpers import hash_args, log_safe
+
+        set_client_kind("mcp")
+        try:
+            caller_user_id = caller_id_fn() if caller_id_fn else None
+        except Exception:
+            caller_user_id = None
+        if caller_user_id:
+            log_safe(
+                user_id=caller_user_id,
+                action="mcp.tool_call",
+                resource=f"mcp_tool:{name}",
+                params={"tool": name, "args_hash": hash_args(arguments)},
+            )
+        return await base_call_tool(name, arguments)
+
+    mcp_instance._mcp_server.call_tool(validate_input=False)(_audited_call_tool)
+    return _audited_call_tool

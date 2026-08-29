@@ -300,6 +300,21 @@ CATALOG: dict[str, AuditEvent] = {
         "Generic fallback row written by AuditFallbackMiddleware for a mutating "
         "request whose handler wrote no audit row of its own.",
     ),
+    # Task 5 (F2c — MCP surface: tool calls, passthrough, per-table, facts)
+    "mcp.tool_call": AuditEvent("mcp.tool_call", "read", "An MCP tool was invoked (SSE or Streamable-HTTP transport)."),
+    "mcp.passthrough_call": AuditEvent(
+        "mcp.passthrough_call", "read", "A passthrough MCP tool call was forwarded to its upstream source."
+    ),
+    "mcp.passthrough_denied": AuditEvent(
+        "mcp.passthrough_denied", "system", "A passthrough MCP tool call was denied by grant/mutating/rate-limit gate."
+    ),
+    "query.table_scoped": AuditEvent(
+        "query.table_scoped", "read", "A per-table outbound MCP tool query ran (POST /api/mcp/query-table/{id})."
+    ),
+    "facts.search": AuditEvent("facts.search", "read", "The fact graph was searched by type/attribute filters."),
+    "facts.neighbors": AuditEvent("facts.neighbors", "read", "The fact graph was traversed from one subject."),
+    "facts.claims": AuditEvent("facts.claims", "read", "A fact/edge subject's readable evidence was read."),
+    "facts.ingest": AuditEvent("facts.ingest", "mutation", "A fact-graph producer batch was ingested."),
 }
 
 
