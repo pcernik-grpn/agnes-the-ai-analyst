@@ -843,6 +843,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   its grants materialized for every group), and `/admin/access` extends the
   collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
   same grants payload the checkboxes read so the two can never disagree.
+- **The `/admin` hub's "Marketplace sync" signal no longer counts bundled
+  rows.** A bundled row never syncs (it has no git remote), so its NULL
+  `last_synced_at` read as "no sync in 48h" and every instance showed a
+  permanent "Needs fixing" row for content that ships inside the image.
 - **A stale "last sync failed" on a bundled marketplace row now clears itself.**
   The failure stamped by a pre-guard "Sync now" click could never clear: the
   nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
