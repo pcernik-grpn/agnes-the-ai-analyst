@@ -1383,6 +1383,19 @@ async def lifespan(app):
         except Exception as e:
             logger.warning("Could not seed built-in marketplace: %s", e)
 
+        # Grandfather every already-registered MCP source onto the Everyone
+        # group under the new ResourceType.MCP_SOURCE gate (TCRD-236) —
+        # without this, shipping a default-deny source-level gate would drop
+        # every existing MCP connection the moment this boots. Idempotent;
+        # a source an admin later narrows keeps a grant row of its own and is
+        # left alone on every subsequent boot. See src/mcp_source_grants.py.
+        try:
+            from src.mcp_source_grants import seed_default_mcp_source_grants
+
+            seed_default_mcp_source_grants()
+        except Exception as e:
+            logger.warning("Could not seed default mcp_source grants: %s", e)
+
         # Seed admin user (SEED_ADMIN_EMAIL) and add them to the Admin user_group.
         # Optional SEED_ADMIN_PASSWORD lets the seeded user sign in immediately
         # without going through bootstrap; never overwritten if already set.

@@ -387,3 +387,31 @@ def test_admin_table_shows_no_sync_state_for_builtin_rows():
         "the sync-state cell must branch on m.is_builtin — a bundled row "
         "otherwise shows 'failed'/'never' for a sync that can never run"
     )
+
+
+def test_hub_sync_signal_ignores_bundled_rows(tmp_path, monkeypatch):
+    """Live-run find (TCRD-219 family): the /admin hub's "Marketplace sync"
+    signal counted bundled rows as broken — they never sync, so
+    `last_synced_at` is NULL forever and every instance showed a permanent
+    "Needs fixing" row for content that ships inside the image."""
+    conn = _setup_duckdb_repos(tmp_path)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
+
+    from src.repositories import marketplace_registry_repo
+
+    marketplace_registry_repo().register(
+        id="agnes-builtin", name="Agnes Built-in", url="builtin://agnes-builtin", is_builtin=True
+    )
+
+    from app.web.admin_signals import _resolve_marketplace_sync
+
+    assert _resolve_marketplace_sync() is None, (
+        "a bundled row must not read as a stale sync — it has no git remote to sync from"
+    )
+
+    # A real registered marketplace that never synced still counts.
+    marketplace_registry_repo().register(id="real-mp", name="Real", url="https://example.test/r.git")
+    sig = _resolve_marketplace_sync()
+    assert sig is not None and sig.count == 1
+    conn.close()
