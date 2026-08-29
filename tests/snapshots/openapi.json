@@ -40302,6 +40302,64 @@
         ]
       }
     },
+    "/api/knowledge/digests": {
+      "get": {
+        "description": "The maintained digests THIS caller can read (K4, #799).\n\nThe one missing piece of the analyst-facing digest surface. A digest's\nmarkdown has been readable at ``/digests/{id}/content`` since K4, and\n``agnes pull`` already writes every granted one to\n``.claude/rules/ka_<slug>.md`` \u2014 but nothing could ENUMERATE them, so a\nweb surface had no way to show a reader which digests exist without\nalready knowing an id. The Library's distillate (TCRD-250) needs exactly\nthat list.\n\nFiltered with ``_caller_can_read_digest`` \u2014 the same fail-closed\npredicate the manifest builder uses (``app.api.sync._digest_entries``),\nso the web list and the pulled files can never disagree about what a\ncaller is entitled to. A digest that has never generated (``pending``,\nempty ``output_md``) is omitted, matching the manifest: there is nothing\nto read, and listing it would promise a page that 404s.\n\nStaleness travels per row rather than being hidden, same contract as the\ncontent endpoint \u2014 a stale digest still ships its last-good markdown, so\na reader must be able to see that it is stale.\n\nResponse: ``{\"digests\": [{\"id\", \"slug\", \"title\", \"status\",\n\"status_reason\", \"generated_at\"}]}``, sorted by slug.",
+        "operationId": "list_knowledge_digests_for_caller_api_knowledge_digests_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Knowledge Digests For Caller Api Knowledge Digests Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Knowledge Digests For Caller",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
     "/api/knowledge/digests/{digest_id}/content": {
       "get": {
         "description": "Serve one maintained digest's markdown (K4, #799).\n\nConsumed by ``agnes pull`` (writes ``.claude/rules/ka_<slug>.md``); the\nPAT is the only credential. RBAC gate is\n``require_resource_access(ResourceType.KNOWLEDGE_DIGEST, ...)`` \u2014 the\nsame house style the sibling ``download_knowledge_artifact`` endpoint\nabove uses, so an ungranted caller on a real digest id sees **403**\n(matching ``test_download_ungranted_analyst_403``'s posture; supersedes\nthe K4 plan's original 404-only guess \u2014 see the PR description). Unknown\nid or a digest that has never generated (``pending``, empty\n``output_md``) is **404** for an admin, who always clears the gate \u2014 no\nexistence leak beyond \"granted but nothing here\", the same posture as\n``test_download_granted_corpus_no_artifact_built_404``. Staleness\n(status + reason) travels in the body so the client can render a\nvisible banner \u2014 never a silent stale digest.",

@@ -2065,6 +2065,21 @@ metered server-side.
   `require_resource_access`: ungranted analyst on a known collection → 403;
   unknown corpus or a not-yet-built artifact → 404. REST-only (no CLI/MCP
   analogue — mirrors `/api/data/{table_id}/download`).
+- /api/knowledge/digests — the maintained digests THIS caller can read:
+  `{digests: [{id, slug, title, status, status_reason, generated_at}]}`,
+  sorted by slug, never the markdown itself. The enumeration a WEB surface
+  needs (TCRD-250): the content endpoint below has been readable since K4 and
+  `agnes pull` writes every granted digest to `.claude/rules/ka_<slug>.md`,
+  but nothing could list them, so a page had no way to show a reader which
+  digests exist without already knowing an id. Filtered by the SAME
+  fail-closed `_caller_can_read_digest` predicate the manifest builder uses
+  (`app/api/sync.py::_digest_entries`), so the web list and the pulled files
+  can never disagree about entitlement. A digest that has never generated is
+  omitted, matching the manifest — listing it would promise a page that
+  404s. Staleness travels per row, so a stale digest is visibly stale rather
+  than silently so. REST-only by design (see the triple-surface exemption):
+  the CLI and a chat agent already RECEIVE digests as pulled files, so an
+  enumeration call is a browser's need, not theirs.
 - /api/knowledge/digests/{digest_id}/content — serves one maintained
   digest's markdown (K4, #799): `{id, slug, title, output_md, status,
   status_reason, generated_at}`. Listed in the sync manifest's
