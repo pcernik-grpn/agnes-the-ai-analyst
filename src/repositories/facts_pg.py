@@ -156,42 +156,54 @@ def _readable_ids(caller) -> Optional[frozenset]:
     return frozenset(ids)
 
 
+def _add_path_component_candidates(candidates: Set[str], value: str) -> None:
+    """Decompose ``value`` (a stored ``path`` OR a stored ``filename`` — see
+    ``_identity_candidates``) into whole-unit candidates and add them to
+    ``candidates`` in place: the string itself; every single whole
+    ``/``-separated component (a folder name, or the final segment); and
+    every CONTIGUOUS run of whole components (e.g. ``"folder/name.ext"``) —
+    the run ending at the final segment also gets an extension-stripped
+    variant. A separator-free ``value`` (the ordinary case) decomposes to
+    exactly ``{value, stem}``, identical to the pre-bundle-support shape."""
+    candidates.add(value)
+    parts = [p for p in value.split("/") if p]
+    n = len(parts)
+    for i in range(n):
+        for j in range(i + 1, n + 1):
+            candidates.add("/".join(parts[i:j]))
+            if j == n:  # this run ends at the final segment
+                last = parts[j - 1]
+                dot = last.rfind(".")
+                if dot > 0:
+                    candidates.add("/".join(parts[i : j - 1] + [last[:dot]]))
+
+
 def _identity_candidates(filename: Optional[str], path: Optional[str]) -> Set[str]:
     """Whole-unit identity-evidence candidates for the verbatim gate (spec
     §8, P0 review finding). A quote counts as identity-grounded evidence
     only when it EQUALS one of these — never merely CONTAINS one as a
     substring, which let a fabricated quote self-certify on any fragment of
     the document's own name (a bare ``".pptx"``, a stray ``"/"``, a 2-char
-    slice). Candidates: the full stored ``path``; the ``filename`` with and
-    without its extension; every single whole path component (a folder
-    name, or the filename); and every CONTIGUOUS run of whole path
-    components (e.g. ``"folder/filename.ext"``, the folder+filename shape
-    a `part_of` edge legitimately cites) — the run ending at the filename
-    also gets an extension-stripped variant. No normalization anywhere:
-    matches the chunk-text comparison exactly (an NFC/NFD quote fails
-    identically on both sides)."""
+    slice). Both ``filename`` and ``path`` are decomposed the SAME way
+    (``_add_path_component_candidates``) — an ordinary ``filename`` has no
+    ``/`` so this changes nothing for it, but a bundle member's stored
+    ``filename`` IS itself a path (``src/ingest/bundle.py`` stores the
+    archive-relative member path there, with no ``path`` at all), so
+    decomposing only ``path`` silently starved that case of any component
+    candidates (live cross-PR regression: a zip member's own folder name
+    was rejected). Candidates: each of ``filename``/``path`` in full; each
+    with its extension stripped; every single whole ``/``-separated
+    component of each (a folder name, or the final segment); and every
+    CONTIGUOUS run of whole components (e.g. ``"folder/filename.ext"``, the
+    folder+filename shape a `part_of` edge legitimately cites) — the run
+    ending at the final segment also gets an extension-stripped variant. No
+    normalization anywhere: matches the chunk-text comparison exactly (an
+    NFC/NFD quote fails identically on both sides)."""
     candidates: Set[str] = set()
-
-    def _with_stem(name: str) -> None:
-        candidates.add(name)
-        dot = name.rfind(".")
-        if dot > 0:
-            candidates.add(name[:dot])
-
     if filename:
-        _with_stem(filename)
+        _add_path_component_candidates(candidates, filename)
     if path:
-        candidates.add(path)
-        parts = [p for p in path.split("/") if p]
-        n = len(parts)
-        for i in range(n):
-            for j in range(i + 1, n + 1):
-                candidates.add("/".join(parts[i:j]))
-                if j == n:  # this run ends at the filename component
-                    last = parts[j - 1]
-                    dot = last.rfind(".")
-                    if dot > 0:
-                        candidates.add("/".join(parts[i : j - 1] + [last[:dot]]))
+        _add_path_component_candidates(candidates, path)
     candidates.discard("")
     return candidates
 

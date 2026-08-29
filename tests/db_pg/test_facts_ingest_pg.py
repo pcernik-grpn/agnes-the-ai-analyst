@@ -340,6 +340,68 @@ def test_verbatim_gate_counter_only_counts_identity_accepted_claims(pg_env, repo
     assert report["claims_accepted_via_identity"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Cross-PR regression (caught by merging with #1773, zip-member citability):
+# a zip member's stored `filename` IS itself a path
+# (`src/ingest/bundle.py::cf_repo.add(..., filename=member_path)`, no
+# `path=` at all) — `_identity_candidates` must decompose `filename` the
+# SAME way it decomposes `path`, not only `path`. Direct unit tests on the
+# function (no DB), plus one ingest-level reproduction of the exact shape
+# a bundle member's `corpus_files` row has.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_candidates_decomposes_a_separator_bearing_filename():
+    from src.repositories.facts_pg import _identity_candidates
+
+    candidates = _identity_candidates("Project Kemp/Overview.pptx", None)
+    assert "Project Kemp" in candidates  # a whole path component
+    assert "Project Kemp/Overview.pptx" in candidates  # the full string
+    assert "Project Kemp/Overview" in candidates  # the stem
+    # finding 1's tightening must still hold when the filename has a "/":
+    assert ".pptx" not in candidates
+    assert "/" not in candidates
+    assert "ve" not in candidates  # 2-char slice
+
+
+def test_identity_candidates_ordinary_filename_is_unaffected():
+    """A separator-free `filename` (the pre-bundle-support, ordinary case)
+    must decompose to EXACTLY `{filename, stem}` — proves the bundle fix
+    changed nothing for it, and that a bare extension is still rejected."""
+    from src.repositories.facts_pg import _identity_candidates
+
+    assert _identity_candidates("deck.pptx", None) == {"deck.pptx", "deck"}
+
+
+def test_verbatim_gate_accepts_a_component_of_a_separator_bearing_filename(pg_env, repo):
+    """Reproduces the actual #1773 cross-PR failure at the repo level,
+    without cherry-picking `src/ingest/bundle.py`: a `corpus_files` row
+    whose `filename` is itself an archive-relative path (a zip member,
+    `path` NULL) must still ground an identity claim on ANY of its whole
+    path components, not just the filename as one indivisible unit."""
+    file_id = "cf_zip_member"
+    doc_id = "doc_zip_member"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id, filename="Project Kemp/Overview.pptx", path=None)
+    _seed_chunk(file_id=file_id, text="Nothing about the member name appears in the extracted text.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[{"id": "engagement:zipmember", "type": "engagement", "attrs": {}, "evidence": []}],
+        edges=[
+            {
+                "type": "part_of",
+                "src": "engagement:zipmember",
+                "dst": "project:zipmember",
+                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp"}],
+            }
+        ],
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+    assert report["claims_accepted_via_identity"] == 1
+
+
 def test_verbatim_gate_still_rejects_a_quote_absent_from_chunks_and_identity(pg_env, repo):
     doc_id = _seed_ready_doc(pg_env, file_id="cf_identity2", doc_id="doc_identity2")
     report = repo.ingest_batch(
