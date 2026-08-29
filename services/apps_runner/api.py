@@ -8,6 +8,7 @@ Bound on the internal compose network only; token-gated.
 from __future__ import annotations
 
 import functools
+import hmac
 import json
 import logging
 import os
@@ -47,9 +48,26 @@ def _docker():
     return docker.from_env(timeout=timeout)
 
 
+# Defined here rather than imported: this sidecar is deliberately free of
+# `app.`/`src.` imports (it is the only process holding the Docker socket).
+# Must stay in lockstep with RUNNER_TOKEN_MIN_LENGTH in app/api/data_apps.py.
+RUNNER_TOKEN_MIN_LENGTH = 32
+
+
 def _check_token(x_runner_token: str | None) -> None:
-    expected = os.environ.get("APPS_RUNNER_TOKEN", "")
-    if not expected or x_runner_token != expected:
+    """Constant-time check of the shared control-plane secret.
+
+    Same contract (and same secret) as the control plane's own
+    ``_check_runner_token`` in ``app/api/data_apps.py``: a plain ``!=``
+    leaks the token a byte at a time under timing analysis, and a secret
+    below the length floor is treated as "auth disabled" rather than as a
+    weak secret. Fixing only one direction would leave the same key
+    guessable through the other door.
+    """
+    expected = os.environ.get("APPS_RUNNER_TOKEN", "").strip()
+    if not expected or len(expected) < RUNNER_TOKEN_MIN_LENGTH:
+        raise HTTPException(status_code=401, detail="bad_runner_token")
+    if not x_runner_token or not hmac.compare_digest(x_runner_token, expected):
         raise HTTPException(status_code=401, detail="bad_runner_token")
 
 

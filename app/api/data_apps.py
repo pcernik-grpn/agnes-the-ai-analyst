@@ -48,6 +48,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import hmac
 import os
 import re as _re
 import shutil
@@ -2072,9 +2073,28 @@ class RunnerEventPayload(BaseModel):
     params: dict[str, Any] = {}
 
 
+# Mirrors app/auth/scheduler_token.py: a secret shorter than this is treated
+# as "auth disabled" rather than as a weak secret, so an operator typo can
+# never leave a guessable token standing in front of this route.
+RUNNER_TOKEN_MIN_LENGTH = 32
+
+# Same cap the sibling client-reported audit endpoint applies to its params
+# (app/api/upload.py) — this route also ingests a semi-trusted caller's dict.
+_MAX_RUNNER_EVENT_PARAMS_BYTES = 2048
+
+
 def _check_runner_token(x_runner_token: Optional[str]) -> None:
-    expected = os.environ.get("APPS_RUNNER_TOKEN", "")
-    if not expected or x_runner_token != expected:
+    """Constant-time shared-secret check.
+
+    This route sits on the public ``/api/data-apps`` router, not a
+    compose-internal one, so the token is internet-reachable and a plain
+    ``!=`` would leak it a byte at a time under timing analysis. Same
+    contract as ``app.auth.scheduler_token.is_scheduler_token``.
+    """
+    expected = os.environ.get("APPS_RUNNER_TOKEN", "").strip()
+    if not expected or len(expected) < RUNNER_TOKEN_MIN_LENGTH:
+        raise HTTPException(status_code=401, detail="bad_runner_token")
+    if not x_runner_token or not hmac.compare_digest(x_runner_token, expected):
         raise HTTPException(status_code=401, detail="bad_runner_token")
 
 
@@ -2098,6 +2118,12 @@ async def record_runner_event(
     _check_runner_token(x_runner_token)
     if payload.action not in RUNNER_REPORTED_ACTIONS:
         raise HTTPException(status_code=400, detail="unknown_action")
+    try:
+        params_size = len(json.dumps(payload.params, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="params_not_serializable")
+    if params_size > _MAX_RUNNER_EVENT_PARAMS_BYTES:
+        raise HTTPException(status_code=400, detail="params_too_large")
     slug = payload.params.get("slug")
     resource = f"data_app:{slug}" if slug else None
     log_safe(action=payload.action, resource=resource, params=payload.params, client_kind="system")

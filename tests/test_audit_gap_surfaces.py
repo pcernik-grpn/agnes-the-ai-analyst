@@ -62,7 +62,7 @@ def test_report_event_posts_action_and_params(monkeypatch):
 
         return _Resp()
 
-    monkeypatch.setenv("APPS_RUNNER_TOKEN", "tok")
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
     monkeypatch.setattr(audit_report.httpx, "post", _capture)
 
     audit_report.report_event("data_app.container_up", {"slug": "s1"})
@@ -71,7 +71,7 @@ def test_report_event_posts_action_and_params(monkeypatch):
     url, body, headers = calls[0]
     assert url.endswith("/api/data-apps/runner-events")
     assert body == {"action": "data_app.container_up", "params": {"slug": "s1"}}
-    assert headers["X-Runner-Token"] == "tok"
+    assert headers["X-Runner-Token"] == "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ def runner_client(monkeypatch, tmp_path):
     from services.apps_runner import api
     from tests.test_apps_runner import FakeDocker
 
-    monkeypatch.setenv("APPS_RUNNER_TOKEN", "tok")
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
     monkeypatch.setenv("APPS_RUNNER_IMAGE_PREFIX", "keboolapublic.azurecr.io/data-app-python-js")
     fake = FakeDocker()
     monkeypatch.setattr(api, "_docker", lambda: fake)
@@ -117,7 +117,7 @@ def test_up_reports_container_up(runner_client):
     monkeypatch_report = lambda action, params: calls.append((action, params))  # noqa: E731
     api.report_event = monkeypatch_report
     try:
-        r = client.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": _spec(tmp), "config_json": {}})
+        r = client.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": _spec(tmp), "config_json": {}})
         assert r.status_code == 200, r.text
         assert calls == [("data_app.container_up", {"slug": "s"})]
     finally:
@@ -133,7 +133,7 @@ def test_up_still_returns_when_report_event_raises(runner_client):
 
     api.report_event = _raise
     try:
-        r = client.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": _spec(tmp), "config_json": {}})
+        r = client.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": _spec(tmp), "config_json": {}})
         assert r.status_code == 200, r.text
     finally:
         del api.report_event
@@ -141,12 +141,12 @@ def test_up_still_returns_when_report_event_raises(runner_client):
 
 def test_stop_reports_container_stop_with_mode(runner_client):
     client, fake, tmp, api = runner_client
-    client.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": _spec(tmp), "config_json": {}})
+    client.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": _spec(tmp), "config_json": {}})
 
     calls = []
     api.report_event = lambda action, params: calls.append((action, params))
     try:
-        r = client.post("/apps/s/stop", headers={"X-Runner-Token": "tok"}, json={"mode": "recreate"})
+        r = client.post("/apps/s/stop", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"mode": "recreate"})
         assert r.status_code == 200, r.text
         assert calls == [("data_app.container_stop", {"slug": "s", "mode": "removed"})]
     finally:
@@ -159,7 +159,7 @@ def test_stop_absent_does_not_report(runner_client):
     calls = []
     api.report_event = lambda action, params: calls.append((action, params))
     try:
-        r = client.post("/apps/never-existed/stop", headers={"X-Runner-Token": "tok"}, json={"mode": "recreate"})
+        r = client.post("/apps/never-existed/stop", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"mode": "recreate"})
         assert r.status_code == 200, r.text
         assert calls == []
     finally:
@@ -168,12 +168,12 @@ def test_stop_absent_does_not_report(runner_client):
 
 def test_resume_reports_container_resume(runner_client):
     client, fake, tmp, api = runner_client
-    client.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": _spec(tmp), "config_json": {}})
+    client.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": _spec(tmp), "config_json": {}})
 
     calls = []
     api.report_event = lambda action, params: calls.append((action, params))
     try:
-        r = client.post("/apps/s/resume", headers={"X-Runner-Token": "tok"})
+        r = client.post("/apps/s/resume", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
         assert r.status_code == 200, r.text
         assert calls == [("data_app.container_resume", {"slug": "s"})]
     finally:
@@ -188,7 +188,7 @@ def test_resume_reports_container_resume(runner_client):
 @pytest.fixture
 def runner_events_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("APPS_RUNNER_TOKEN", "tok")
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
     return TestClient(shared_app)
 
 
@@ -196,7 +196,7 @@ def test_runner_event_accepted_writes_system_row(runner_events_client):
     r = runner_events_client.post(
         "/api/data-apps/runner-events",
         json={"action": "data_app.container_up", "params": {"slug": "gap-s1"}},
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
     )
     assert r.status_code == 204, r.text
 
@@ -211,7 +211,7 @@ def test_runner_event_rejects_unknown_action(runner_events_client):
     r = runner_events_client.post(
         "/api/data-apps/runner-events",
         json={"action": "data_app.delete_everything", "params": {}},
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
     )
     assert r.status_code == 400
 
@@ -399,3 +399,55 @@ def test_too_many_connections_is_audited_with_the_known_user(ws_client, monkeypa
     matches = [r for r in rows if r["user_id"] == "gap-ws-capped"]
     assert matches, rows
     assert _params(matches[0]) == {"reason": "too_many_connections"}
+
+
+# ---------------------------------------------------------------------------
+# Shared-secret hardening (RBAC review finding, 2026-08-29)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_token_below_length_floor_is_refused(monkeypatch, seeded_app):
+    """A too-short secret means "auth disabled", not "weak auth".
+
+    The route sits on the public /api/data-apps router, so an operator typo
+    that left a 3-character token in place must not leave a guessable door
+    open — it must close the door entirely.
+    """
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "short")
+    r = seeded_app["client"].post(
+        "/api/data-apps/runner-events",
+        json={"action": "data_app.container_up", "params": {"slug": "demo"}},
+        headers={"X-Runner-Token": "short"},
+    )
+    assert r.status_code == 401
+
+
+def test_runner_event_params_size_is_capped(monkeypatch, seeded_app):
+    """An oversized params dict is refused rather than written verbatim."""
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "r" * 40)
+    r = seeded_app["client"].post(
+        "/api/data-apps/runner-events",
+        json={
+            "action": "data_app.container_up",
+            "params": {"slug": "demo", "junk": "x" * 4000},
+        },
+        headers={"X-Runner-Token": "r" * 40},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "params_too_large"
+
+
+def test_runner_token_check_is_constant_time():
+    """The comparison must go through hmac.compare_digest.
+
+    A plain `!=` leaks the token a byte at a time under timing analysis, and
+    this endpoint is internet-reachable. Asserted structurally because a
+    timing assertion would be inherently flaky.
+    """
+    import inspect
+
+    from app.api.data_apps import _check_runner_token
+
+    src = inspect.getsource(_check_runner_token)
+    assert "compare_digest" in src, "shared-secret compare must be constant-time"
+    assert "!= expected" not in src

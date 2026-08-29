@@ -98,7 +98,7 @@ class FakeDocker:
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    monkeypatch.setenv("APPS_RUNNER_TOKEN", "tok")
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
     monkeypatch.setenv("APPS_RUNNER_IMAGE_PREFIX", "keboolapublic.azurecr.io/data-app-python-js")
     from services.apps_runner import api
 
@@ -137,7 +137,7 @@ def test_auth_required(client):
 def test_up_writes_config_and_runs(client):
     c, fake, tmp = client
     r = c.post(
-        "/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
+        "/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
     )
     assert r.status_code == 200
     assert (tmp / "apps" / "s" / "config.json").exists()
@@ -158,7 +158,7 @@ def test_up_uses_a_bounded_restart_policy(client):
     CPU, and never settling into a state reap-idle can reconcile to `error`."""
     c, fake, tmp = client
     r = c.post(
-        "/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
+        "/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
     )
     assert r.status_code == 200
     _, kw = fake.run_calls[-1]
@@ -176,7 +176,7 @@ class TestContainerHardening:
     def test_up_applies_cap_drop_and_no_new_privileges(self, client):
         c, fake, tmp = client
         c.post(
-            "/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
+            "/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
         )
         _, kw = fake.run_calls[-1]
         assert kw["cap_drop"] == ["ALL"]
@@ -185,7 +185,7 @@ class TestContainerHardening:
     def test_up_applies_pids_limit(self, client):
         c, fake, tmp = client
         c.post(
-            "/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
+            "/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
         )
         _, kw = fake.run_calls[-1]
         assert kw["pids_limit"] == 512
@@ -196,7 +196,7 @@ class TestContainerHardening:
         spec must not mount a read-only rootfs and must add no tmpfs."""
         c, fake, tmp = client
         c.post(
-            "/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
+            "/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {"dataApp": {}}}
         )
         _, kw = fake.run_calls[-1]
         assert kw["read_only"] is False
@@ -207,7 +207,7 @@ class TestContainerHardening:
         spec's `read_only` + `tmpfs` reach docker-py unchanged."""
         c, fake, tmp = client
         spec = SPEC(tmp) | {"read_only": True, "tmpfs": {"/tmp": "", "/app": ""}}
-        c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": spec, "config_json": {"dataApp": {}}})
+        c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": spec, "config_json": {"dataApp": {}}})
         _, kw = fake.run_calls[-1]
         assert kw["read_only"] is True
         assert kw["tmpfs"] == {"/tmp": "", "/app": ""}
@@ -222,7 +222,7 @@ class TestContainerHardening:
             for k, v in SPEC(tmp).items()
             if k not in ("cap_drop", "security_opt", "pids_limit", "read_only", "tmpfs")
         }
-        r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": spec, "config_json": {"dataApp": {}}})
+        r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": spec, "config_json": {"dataApp": {}}})
         assert r.status_code == 200
         _, kw = fake.run_calls[-1]
         assert kw["cap_drop"] == ["ALL"]
@@ -234,24 +234,24 @@ class TestContainerHardening:
 def test_up_rejects_foreign_image(client):
     c, _, tmp = client
     spec = SPEC(tmp) | {"image": "evil/image:1"}
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": spec, "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": spec, "config_json": {}})
     assert r.status_code == 400
     assert r.json()["detail"] == "image_not_allowed"
 
 
 def test_stop_and_status(client):
     c, fake, tmp = client
-    c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
-    r = c.post("/apps/s/stop", headers={"X-Runner-Token": "tok"}, json={"mode": "recreate"})
+    c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/stop", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"mode": "recreate"})
     assert r.status_code == 200
     assert fake.by_name["agnes-dataapp-s"].removed
 
 
 def test_up_twice_removes_old_container_and_reruns(client):
     c, fake, tmp = client
-    c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
     first = fake.by_name["agnes-dataapp-s"]
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
     assert r.status_code == 200
     assert first.removed
     named_runs = [kw for _, kw in fake.run_calls if kw.get("name")]
@@ -267,7 +267,7 @@ def test_up_twice_removes_old_container_and_reruns(client):
 def test_resume_unpauses_container(client):
     c, fake, _ = client
     fake.by_name["agnes-dataapp-s"] = FakeContainer("agnes-dataapp-s", status="paused")
-    r = c.post("/apps/s/resume", headers={"X-Runner-Token": "tok"})
+    r = c.post("/apps/s/resume", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     assert r.json() == {"status": "running"}
     assert fake.by_name["agnes-dataapp-s"].unpaused
@@ -275,21 +275,21 @@ def test_resume_unpauses_container(client):
 
 def test_resume_absent_is_404(client):
     c, _, _ = client
-    r = c.post("/apps/s/resume", headers={"X-Runner-Token": "tok"})
+    r = c.post("/apps/s/resume", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 404
 
 
 def test_logs_returns_decoded_string(client):
     c, fake, _ = client
     fake.by_name["agnes-dataapp-s"] = FakeContainer("agnes-dataapp-s")
-    r = c.get("/apps/s/logs", headers={"X-Runner-Token": "tok"})
+    r = c.get("/apps/s/logs", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     assert r.json() == {"logs": "hello\n"}
 
 
 def test_logs_absent_is_404(client):
     c, _, _ = client
-    r = c.get("/apps/s/logs", headers={"X-Runner-Token": "tok"})
+    r = c.get("/apps/s/logs", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 404
 
 
@@ -298,7 +298,7 @@ def test_list_apps_filters_dataapp_names(client):
     fake.by_name["agnes-dataapp-a"] = FakeContainer("agnes-dataapp-a")
     fake.by_name["agnes-dataapp-b"] = FakeContainer("agnes-dataapp-b", status="paused")
     fake.by_name["some-other-container"] = FakeContainer("some-other-container")
-    r = c.get("/apps", headers={"X-Runner-Token": "tok"})
+    r = c.get("/apps", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     names = {row["name"] for row in r.json()["apps"]}
     assert names == {"agnes-dataapp-a", "agnes-dataapp-b"}
@@ -307,7 +307,7 @@ def test_list_apps_filters_dataapp_names(client):
 def test_status_paused(client):
     c, fake, _ = client
     fake.by_name["agnes-dataapp-s"] = FakeContainer("agnes-dataapp-s", status="paused")
-    r = c.get("/apps/s/status", headers={"X-Runner-Token": "tok"})
+    r = c.get("/apps/s/status", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     assert r.json() == {"container": "paused", "ready": False}
 
@@ -315,7 +315,7 @@ def test_status_paused(client):
 def test_status_maps_exited_to_stopped(client):
     c, fake, _ = client
     fake.by_name["agnes-dataapp-s"] = FakeContainer("agnes-dataapp-s", status="exited")
-    r = c.get("/apps/s/status", headers={"X-Runner-Token": "tok"})
+    r = c.get("/apps/s/status", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     assert r.json() == {"container": "stopped", "ready": False}
 
@@ -325,7 +325,7 @@ def test_up_maps_image_not_found(client):
     import docker.errors
 
     fake.raise_on_run = docker.errors.ImageNotFound("no such image")
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
     assert r.status_code == 400
     assert r.json()["detail"] == "image_not_found"
 
@@ -335,7 +335,7 @@ def test_up_maps_docker_api_error(client):
     import docker.errors
 
     fake.raise_on_run = docker.errors.APIError("daemon unavailable")
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
     assert r.status_code == 502
     assert r.json()["detail"].startswith("docker_error:")
 
@@ -366,7 +366,7 @@ def test_up_resolves_config_mount_via_dind(client, monkeypatch):
         "runner123",
         attrs={"Mounts": [{"Destination": str(tmp), "Source": "/var/lib/docker/volumes/proj_data/_data"}]},
     )
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
     assert r.status_code == 200
     _, kw = fake.run_calls[-1]
     bind_sources = list(kw["volumes"].keys())
@@ -382,7 +382,7 @@ def test_up_keeps_container_path_when_not_containerized(client, monkeypatch):
     import socket
 
     monkeypatch.setattr(socket, "gethostname", lambda: "not-a-container")
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
     assert r.status_code == 200
     _, kw = fake.run_calls[-1]
     assert str(tmp / "apps" / "s") in kw["volumes"]
@@ -396,7 +396,7 @@ def test_up_creates_the_apps_network_despite_a_substring_named_leftover(client):
     c, fake, tmp = client
     fake.networks_created.add("agnes-apps-internal")
 
-    r = c.post("/apps/s/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp), "config_json": {}})
+    r = c.post("/apps/s/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp), "config_json": {}})
 
     assert r.status_code == 200
     assert "agnes-apps" in fake.networks_created

@@ -8899,6 +8899,25 @@
         "title": "RunScriptRequest",
         "type": "object"
       },
+      "RunnerEventPayload": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Params",
+            "type": "object"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "RunnerEventPayload",
+        "type": "object"
+      },
       "SampleInteraction": {
         "description": "Example dialog shown in the \"Sample interaction\" section.\n\n``assistant`` is markdown \u2014 the API pre-renders to safe HTML in\n``assistant_html`` so the template can inject without a client-side\nmarkdown lib. ``assistant`` stays as the source for copy-paste / future\nre-rendering needs.",
         "properties": {
@@ -37598,6 +37617,65 @@
           }
         },
         "summary": "Reap Idle Data Apps",
+        "tags": [
+          "data-apps"
+        ]
+      }
+    },
+    "/api/data-apps/runner-events": {
+      "post": {
+        "description": "Receive a best-effort container-lifecycle event report from\napps-runner (Wave 2 \u2014 audit-coverage plan, Task 3).\n\napps-runner holds the Docker socket but no database access \u2014 see\n``services/apps_runner/audit_report.py`` \u2014 so this is its ONLY path to\nan ``audit_log`` row. Authenticated with the SAME shared\n``X-Runner-Token`` the control plane already presents TO the runner\n(``APPS_RUNNER_TOKEN``), just in the reverse direction. Not gated by\n``_feature_gate()``/user auth \u2014 this is a system-to-system channel, not\na user-facing route, and a report about a container that could only\nexist if the feature were on is harmless to accept either way.",
+        "operationId": "record_runner_event_api_data_apps_runner_events_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-runner-token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Runner-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerEventPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Runner Event",
         "tags": [
           "data-apps"
         ]

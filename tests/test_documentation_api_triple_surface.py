@@ -1334,6 +1334,18 @@ _EXEMPT: dict[str, str] = {
         "/api/upload/sessions and /api/upload/local-md endpoints; no standalone "
         "CLI subcommand or MCP analogue"
     ),
+    # Wave 2, Task 3. System-to-system only: apps-runner holds the Docker
+    # socket but no database access, so this is its ONLY path to an audit_log
+    # row. Authenticated by the shared X-Runner-Token, never a user session —
+    # a human or an agent calling it AS THEMSELVES has nothing to report and
+    # no credential that would work, so a CLI subcommand or MCP tool would be
+    # a surface with no caller. Same class as the webhook/OAuth-callback
+    # carve-outs above.
+    "/api/data-apps/runner-events": (
+        "apps-runner container-lifecycle event report (wave 2, audit-coverage "
+        "plan) — system-to-system, X-Runner-Token authenticated; no user-facing "
+        "CLI subcommand or MCP analogue"
+    ),
 }
 
 
