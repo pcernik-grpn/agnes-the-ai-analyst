@@ -182,6 +182,26 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="store_moderation",
+        config_keys=("features", "store_moderation_enabled"),
+        env_var="AGNES_STORE_MODERATION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The Moderation & Trust hub (/admin/store) and its nav + command-palette "
+            "entries. Off by default: its three zones each have a better door — "
+            "submission review is its own nav row (/admin/store/submissions), "
+            "marketplace curation is /admin/marketplaces, and entity verification "
+            "already has its own switch (store.verification_enabled), so the hub was "
+            "a landing page for links the column already carries. Hides UI only: "
+            "/api/admin/share-requests* and the store APIs keep serving, so an admin "
+            "can still decide a queued agent share by API while the page is hidden."
+        ),
+    ),
+    Switch(
         name="guardrails",
         config_keys=("guardrails", "enabled"),
         env_var="AGNES_GUARDRAILS_ENABLED",

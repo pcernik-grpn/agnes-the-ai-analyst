@@ -93,6 +93,8 @@ def test_get_round_trips_every_field(pg_engine, monkeypatch):
     assert row["claims_written"] == 2
     assert row["claims_rejected_count"] == 1
     assert row["claims_rejected"] == [{"row": 0, "reason": "verbatim_gate_failed", "doc_id": "d1"}]
+    assert row["source_urls_rejected_count"] == 0
+    assert row["source_urls_rejected"] == []
     assert row["deferred"] == [{"row": 1, "doc_id": "d2"}]
     assert row["subjects_created"] == 1
     assert row["subjects_deleted"] == 0
@@ -103,6 +105,32 @@ def test_get_round_trips_every_field(pg_engine, monkeypatch):
 def test_get_returns_none_when_missing(pg_engine, monkeypatch):
     repo = _make_repo(pg_engine, monkeypatch)
     assert repo.get("ir_nonexistent") is None
+
+
+def test_source_urls_rejected_defaults_to_empty_list_not_null(pg_engine, monkeypatch):
+    """A batch with no dropped source_url (the normal case) omits the field
+    entirely — the stored column must still round-trip as `[]`, never
+    `None`, same never-NULL contract as `claims_rejected`/`deferred`."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(repo)
+    row = repo.get(run_id)
+    assert row["source_urls_rejected"] == []
+    assert row["source_urls_rejected_count"] == 0
+
+
+def test_source_urls_rejected_round_trips(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    rejected = [
+        {"doc_id": "d1", "reason": "not_https"},
+        {"doc_id": "d2", "reason": "too_long"},
+    ]
+    run_id = _create(repo, source_urls_rejected=rejected)
+    row = repo.get(run_id)
+    assert row["source_urls_rejected"] == rejected
+    assert row["source_urls_rejected_count"] == 2
+
+    listed = repo.list_recent(limit=10)
+    assert listed[0]["source_urls_rejected"] == rejected
 
 
 def test_claims_rejected_count_is_derived_from_the_detail_list(pg_engine, monkeypatch):

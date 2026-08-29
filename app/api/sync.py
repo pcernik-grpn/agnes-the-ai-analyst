@@ -1939,6 +1939,12 @@ def _build_memory_domains_section(conn, user) -> list:
     from app.resource_types import ResourceType
     from app.services.stack_resolver import StackResolver
     from app.auth.session_principal import PRINCIPAL_TYPES
+    from app.api.memory import (
+        resolve_distribution_mode,
+        select_distributable_items,
+        _caller_upvoted_item_ids,
+    )
+    from src.repositories import knowledge_repo
 
     resolver = StackResolver(conn)
     stack_subject = user if isinstance(user, PRINCIPAL_TYPES) else user["id"]
@@ -1946,6 +1952,11 @@ def _build_memory_domains_section(conn, user) -> list:
     if not dom_entries:
         return []
     repo = memory_domains_repo()
+    # #1573: same predicate the JSON bundle and per-domain markdown apply —
+    # computed once per request, not per domain, since it doesn't vary by
+    # domain (the caller's votes and the configured mode are global).
+    distribution_mode = resolve_distribution_mode()
+    upvoted_ids = _caller_upvoted_item_ids(user, knowledge_repo()) if distribution_mode == "hybrid" else set()
     out: list = []
     for entry in dom_entries:
         dom = repo.get(entry.id)
@@ -1962,15 +1973,18 @@ def _build_memory_domains_section(conn, user) -> list:
         # the manifest md5 unchanged → ``agnes pull`` skips the
         # re-fetch → analyst keeps a stale bundle.md.
         #
-        # Filter to the SAME predicate the renderer uses (any
-        # ``is_required`` item OR ``status='approved' AND not is_required``)
-        # so edits to pending/rejected non-required items don't flip the
-        # md5 against an identical-bytes bundle — the original Devin
-        # review flagged this asymmetry (BUG-0001 fixed the hash inputs;
-        # this commit closes the matching 🚩 ANALYSIS that the SET of
-        # items hashed must also match what the renderer emits).
+        # Filter through the SAME function the renderer calls
+        # (``select_distributable_items``, #1573) — any ``is_required``
+        # item unconditionally, plus whichever approved items
+        # ``distribution_mode`` grants THIS caller — so edits to
+        # pending/rejected/not-yet-opted-in items don't flip the md5
+        # against an identical-bytes bundle, and a distribution_mode
+        # change or a vote flips it exactly when the rendered bytes
+        # would change (the original Devin review flagged this asymmetry
+        # for BUG-0001; this predicate is the one place both surfaces
+        # must keep calling, not re-deriving).
         h = hashlib.md5()
-        renderable = [it for it in items if it.get("is_required") or it.get("status") == "approved"]
+        renderable = select_distributable_items(items, distribution_mode, upvoted_ids)
         for it in sorted(renderable, key=lambda r: r["id"]):
             h.update(
                 f"{it['id']}|{it.get('title', '')}|{it.get('status', '')}|"

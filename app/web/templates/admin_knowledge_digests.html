@@ -1,5 +1,5 @@
 {% extends "base_admin.html" %}
-{% block title %}Maintained Digests — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}Knowledge digests — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 {# Design-system component macros — toolbar "+ New digest" + modal buttons
@@ -101,7 +101,7 @@
 {% block admin_content %}
 <div class="knowledge-digests-page">
   {% set page_hero_eyebrow = "Agent Experience" %}
-  {% set page_hero_title = "Maintained digests" %}
+  {% set page_hero_title = "Knowledge digests" %}
   {% set page_hero_plain = True %}
   {% set page_hero_subtitle = "Admin-defined digest documents the scheduler regenerates with an LLM whenever their source collections change. Delivered to analysts as .claude/rules/ka_<slug>.md on agnes pull." %}
   {% include "_page_hero.html" %}

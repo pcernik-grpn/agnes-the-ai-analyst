@@ -284,7 +284,7 @@ def test_facts_search_logs_audit_row(seeded_app, monkeypatch):
     import app.api.facts as facts_mod
 
     class _FakeRepo:
-        def search(self, user, type=None, filters=None, limit=20):
+        def search(self, user, type=None, filters=None, limit=20, **kwargs):
             return {"subjects": [{"id": "f1"}], "limit_applied": False}
 
     monkeypatch.setattr(facts_mod, "facts_repo", lambda: _FakeRepo())

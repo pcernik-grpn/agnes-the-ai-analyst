@@ -269,7 +269,9 @@
           'c': '/admin/marketplaces',     // (curated)
           'k': '/admin/tokens',           // (keys/tokens)
           'r': '/admin/store/submissions', // (review queue)
+          {% if can_store_moderation %}
           'v': '/admin/store',            // (verification / moderation & trust)
+          {% endif %}
         };
         let pending = false;
         let pendingTimer = null;
@@ -361,7 +363,9 @@
           { label: 'Studio · Suggestions queue',  hint: 'admin',        href: '/admin/studio/suggestions' },
           {% endif %}
           { label: 'Tokens',                      hint: 'admin · g k',  href: '/admin/tokens' },
+          {% if can_store_moderation %}
           { label: 'Moderation & trust',          hint: 'admin · g v',  href: '/admin/store' },
+          {% endif %}
           { label: 'Flea submissions',            hint: 'admin · g r',  href: '/admin/store/submissions' },
           { label: 'Prompts',                     hint: 'admin',        href: '/admin/prompts' },
           { label: '— User-facing —',             hint: 'separator',    href: null },
@@ -377,7 +381,9 @@
           { label: 'My agents',                   hint: 'user',         href: '/agents' },
           {% endif %}
           {% if can_mcp_connector_ui %}
-          { label: 'AI Connector',                hint: 'user',         href: '/me/ai-connector' },
+          {# `tojson` supplies its own quotes and escapes them: a brand short-name
+             containing an apostrophe would otherwise terminate the JS string. #}
+          { label: 'Take ' + {{ (instance_brand_short or 'Agnes') | tojson }} + ' to your tools', hint: 'user', href: '/me/ai-connector' },
           { label: 'Connect editor (token)',      hint: 'user',         href: '/mcp-connect' },
           {% endif %}
           {# /news is linked from /home's "What's new" strip, which only

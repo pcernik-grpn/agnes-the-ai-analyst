@@ -74,6 +74,9 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/registry/{table_id}/policy/compile": "fallback",
     "POST /api/admin/registry/{table_id}/policy/preview": "access_policy.preview",
     "POST /api/admin/run-audit-prune": "run_audit_prune",
+    # Landed on `integration` in parallel with this wave.
+    "POST /api/admin/upgrade-freeze": "upgrade_freeze.set",
+    "DELETE /api/admin/upgrade-freeze": "upgrade_freeze.lift",
     "POST /api/admin/run-blocked-purge": "run_blocked_purge",
     "POST /api/admin/run-corporate-memory": "run_corporate_memory",
     "POST /api/admin/run-jira-consistency-check": "run_jira_consistency_check",
@@ -163,6 +166,8 @@ POSTURE: dict[str, str] = {
     "POST /api/v1/sessions/{session_id}/memories": "agent.memory.write",
     # -- app.api.agent_runtime -------------------------------------------------
     "POST /api/v1/agents/{slug}/responses": "agent.invoke",
+    # Landed on `integration` in parallel with this wave.
+    "POST /api/v1/agents/{slug}/delegate": "chat.delegation",
     # -- app.api.agent_schedules -----------------------------------------------
     "DELETE /api/v1/agents/{slug}/schedules/{schedule_id}": "fallback",
     "PATCH /api/v1/agents/{slug}/schedules/{schedule_id}": "fallback",

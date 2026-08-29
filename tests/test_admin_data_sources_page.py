@@ -1346,9 +1346,56 @@ class TestSharePointSourceCard:
             assert fs["graph"] == {"facts": 0, "edges": 0}
             assert fs["last_run"] is None
             assert fs["cost_estimate"] == {"amount_usd": 0.0, "placeholder": True}
-            assert fs["identity"] == {"groups_matched": 0, "collections_no_group": 0}
+            assert fs["identity"] == {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0}
+            # `scopes` needs no Postgres at all (config.scopes + the dual-
+            # backend file_corpora/resource_grants repos) — an empty
+            # connection still yields an empty (not missing) list.
+            assert fs["scopes"] == []
         finally:
             source_connections_repo().delete(conn_id)
+
+    def test_scopes_resolve_collection_name_and_no_group_warning_without_postgres(self, seeded_app):
+        """`scopes` reuses `admin_sharepoint._scope_out`, which only touches
+        the dual-backend `file_corpora`/`resource_grants` repos — no
+        Postgres required, unlike the rest of this cell."""
+        import uuid
+
+        from src.repositories import file_corpora_repo, source_connections_repo
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        slug = f"col-{uuid.uuid4().hex[:8]}"
+        collection_id = file_corpora_repo().create(name="Contracts", slug=slug, description=None, created_by="admin1")
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={
+                "tenant_id": "t1",
+                "client_id": "c1",
+                "scopes": [
+                    {
+                        "source_scope_id": "site1-drive1",
+                        "display_path": "Site / Contracts",
+                        "anonymize": False,
+                        "collection_id": collection_id,
+                    }
+                ],
+            },
+        )
+        try:
+            from app.web.router import _source_inventory
+
+            fs = _source_inventory()["pipelines"][conn_id]["file_source"]
+            assert len(fs["scopes"]) == 1
+            row = fs["scopes"][0]
+            assert row["source_scope_id"] == "site1-drive1"
+            assert row["display_path"] == "Site / Contracts"
+            assert row["collection"]["name"] == "Contracts"
+            # No group ever granted on this collection -> the warning fires.
+            assert row["no_group_warning"] is True
+        finally:
+            source_connections_repo().delete(conn_id)
+            file_corpora_repo().soft_delete(collection_id)
 
     def test_schedule_row_is_static_and_honest(self, seeded_app):
         import uuid
@@ -1533,7 +1580,7 @@ class TestSharePointSourceCardRendering:
         "cost_estimate": {"amount_usd": 0.06, "placeholder": True},
         "schedule": {"text": "external producer · hourly delta"},
         "certificate": {"origin": "vault", "env_name": None, "set_at": "2026-08-20T12:00:00+00:00", "error": None},
-        "identity": {"groups_matched": 2, "collections_no_group": 1},
+        "identity": {"groups_matched": 2, "collections_no_group": 1, "collections_total": 3},
         "last_run": {
             "id": "ir_abc123",
             "created_at": "2026-08-27T10:00:00+00:00",
@@ -1543,6 +1590,9 @@ class TestSharePointSourceCardRendering:
                 {"row": 2, "reason": "unresolved_doc_id", "doc_id": "doc-c"},
                 {"row": 3, "reason": "malformed_edge"},
             ],
+            # O7 follow-up: a dropped documents[].source_url — the claim
+            # itself still wrote, only its citation link is missing.
+            "source_urls_rejected": [{"doc_id": "doc-d", "reason": "not_https"}],
         },
     }
 
@@ -1577,6 +1627,10 @@ class TestSharePointSourceCardRendering:
                 "function _esc(s) {",
                 "function _sharepointPipelineStripHtml(row) {",
                 "function _sharepointFactsHtml(row) {",
+                "const SP_REJECTION_REASON_TEXT = {",
+                "function _spRejectionReasonText(reason) {",
+                "function _spGroupRejectionRows(rows) {",
+                "function _spRejectionRowHtml(r) {",
                 "function toggleFileSourceDrawer(connId, category) {",
             )
         )
@@ -1618,11 +1672,13 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "vault" in html
         # Never the certificate value, only origin/set-date.
         assert "BEGIN PRIVATE KEY" not in html
-        assert "2 groups matched" in html
-        assert "1 collection with no group" in html
+        # "Sharing" row — rephrased from the cryptic "2 groups matched · 1
+        # collection with no group" to a plain sentence about what it means.
+        assert "1 collection has no group — only admins see them" in html
         assert "Rejected quotes 1" in html
         assert "Deferred 1" in html
         assert "Protocol errors 2" in html
+        assert "Citation links rejected 1" in html
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
         result = self._run(
@@ -1638,8 +1694,11 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         )
         after_open = result["afterOpen"]
         assert after_open["hidden"] is False
+        # No `doc` on this row (never resolved) -> raw sha16 fallback, and
+        # the KNOWN reason slug earns its full human sentence, not the slug.
         assert "doc-a" in after_open["innerHTML"]
-        assert "verbatim_gate_failed" in after_open["innerHTML"]
+        assert "Quote not found in the document's text" in after_open["innerHTML"]
+        assert "verbatim_gate_failed" not in after_open["innerHTML"]
         assert "doc-c" not in after_open["innerHTML"]
 
         assert result["afterToggleClose"]["hidden"] is True
@@ -1647,8 +1706,27 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         after_switch = result["afterSwitch"]
         assert after_switch["hidden"] is False
         assert "doc-c" in after_switch["innerHTML"]
-        assert "unresolved_doc_id" in after_switch["innerHTML"]
+        assert "isn't registered in any collection" in after_switch["innerHTML"]
+        assert "unresolved_doc_id" not in after_switch["innerHTML"]
+        # An UNKNOWN reason slug ("malformed_edge", row 3) is shown
+        # verbatim — never hidden, per spec.
+        assert "malformed_edge" in after_switch["innerHTML"]
         assert "doc-a" not in after_switch["innerHTML"]
+
+    def test_source_urls_rejected_drawer_shows_the_reason_not_the_slug(self):
+        """O7 follow-up: the new badge category drives the SAME generic
+        drawer/reason machinery as every other category — proven here by a
+        reason (`not_https`) none of the pre-existing categories use."""
+        result = self._run(
+            """
+            toggleFileSourceDrawer("sp-conn-1", "source_urls_rejected");
+            console.log(JSON.stringify({ ..._elements["ds-fs-drawer-sp-conn-1"] }));
+            """
+        )
+        assert result["hidden"] is False
+        assert "doc-d" in result["innerHTML"]
+        assert "isn't https" in result["innerHTML"]
+        assert "not_https" not in result["innerHTML"]
 
     def test_drawer_reports_empty_category_honestly(self):
         fs = dict(self._FILE_SOURCE)
@@ -1660,6 +1738,155 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
             file_source=fs,
         )
         assert "Nothing in this category" in result["innerHTML"]
+
+    # -- humanized rejection rows (TCRD-240/241 live-use follow-up) --------
+
+    def test_drawer_renders_resolved_name_and_collection_with_sha16_as_tooltip(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["rejected_quotes"] = [
+            {
+                "row": 0,
+                "reason": "verbatim_gate_failed",
+                "doc_id": "6a8e0bc93c07c56a",
+                "doc": {"name": "Q3 Contract.pdf", "collection": "Contracts"},
+            }
+        ]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "rejected_quotes"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        html = result["innerHTML"]
+        assert "Q3 Contract.pdf" in html
+        assert "Contracts" in html
+        # The raw sha16 is demoted to a tooltip, not shown as the primary text.
+        assert 'title="6a8e0bc93c07c56a"' in html
+        assert ">6a8e0bc93c07c56a<" not in html
+
+    def test_drawer_falls_back_to_sha16_and_not_in_any_collection_when_unresolved(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["protocol_errors"] = [
+            {"row": 0, "reason": "unresolved_doc_id", "doc_id": "deadbeefcafebabe", "doc": None}
+        ]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "protocol_errors"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        html = result["innerHTML"]
+        assert ">deadbeefcafebabe<" in html
+        assert "not in any collection" in html
+
+    def test_drawer_groups_duplicate_doc_id_reason_pairs_with_a_count_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["rejected_quotes"] = [
+            {"row": 0, "reason": "verbatim_gate_failed", "doc_id": "d1", "doc": {"name": "a.pdf", "collection": "C"}},
+            {"row": 1, "reason": "verbatim_gate_failed", "doc_id": "d1", "doc": {"name": "a.pdf", "collection": "C"}},
+            # Different reason, same doc_id -> stays a SEPARATE row (never
+            # a blended subline).
+            {"row": 2, "reason": "unresolved_doc_id", "doc_id": "d1", "doc": None},
+        ]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "rejected_quotes"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        html = result["innerHTML"]
+        assert "2×" in html
+        assert html.count("<li>") == 2  # the (d1, verbatim) pair collapsed; (d1, unresolved) stayed its own row
+
+    def test_unknown_reason_slug_is_shown_verbatim_never_hidden(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["protocol_errors"] = [{"row": 0, "reason": "some_future_reason", "doc_id": "d9", "doc": None}]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "protocol_errors"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        assert "some_future_reason" in result["innerHTML"]
+
+    def test_ambiguous_cross_collection_reason_gets_its_own_human_subline(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["protocol_errors"] = [
+            {"row": 0, "reason": "ambiguous_cross_collection_doc_id", "doc_id": "d9", "doc": None}
+        ]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "protocol_errors"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        html = result["innerHTML"]
+        assert "ambiguous_cross_collection_doc_id" not in html
+        assert "didn't say which" in html
+
+    # -- sharing-state row (rephrased from "Identity matching") ------------
+
+    def test_sharing_row_ok_when_every_scope_collection_has_a_group(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["identity"] = {"groups_matched": 2, "collections_no_group": 0, "collections_total": 2}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "all scope collections have a group" in html
+        assert "is-ok" in html
+
+    def test_sharing_row_warn_singular_and_plural_phrasing(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["identity"] = {"groups_matched": 0, "collections_no_group": 1, "collections_total": 1}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        assert "1 collection has no group — only admins see them" in result["html"]
+
+        fs["identity"] = {"groups_matched": 0, "collections_no_group": 3, "collections_total": 3}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        assert "3 collections have no group — only admins see them" in result["html"]
+
+    def test_sharing_row_empty_state_when_no_scope_collections_exist_yet(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["identity"] = {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        assert "no scope collections yet" in result["html"]
+
+    # -- scope rows (spec follow-up: clickable into the wizard) ------------
+
+    def test_scope_rows_render_clickable_and_wire_the_connection_id(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["scopes"] = [
+            {
+                "source_scope_id": "site1-drive1",
+                "display_path": "Site / Contracts",
+                "collection": {"id": "col_a", "slug": "contracts", "name": "Contracts"},
+                "no_group_warning": False,
+            }
+        ]
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "Scope collections" in html
+        assert "Site / Contracts" in html
+        assert "Contracts" in html
+        assert "openSpWizardForConnection('sp-conn-1', { highlightScopeId: 'site1-drive1' })" in html
+
+    def test_scope_row_warns_when_ungranted(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["scopes"] = [
+            {
+                "source_scope_id": "site1-drive2",
+                "display_path": "Site / Reports",
+                "collection": {"id": "col_b", "slug": "reports", "name": "Reports"},
+                "no_group_warning": True,
+            }
+        ]
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "no group" in html
+        assert "badge-warn" in html
+
+    def test_no_scope_rows_section_when_scopes_is_empty(self):
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        assert "Scope collections" not in result["html"]
 
     # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
 
@@ -1697,6 +1924,328 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "anonymization requested 1" in html
 
 
+class TestSourceTypeAwareActionsMenu:
+    """`_sourceMenuItems(row)` — a SharePoint connection gets its OWN verb
+    set (spec follow-up, TCRD-240/241 live-use feedback: the Keboola-only
+    items "meaningless/dangerous" on a file source, and no direct scope-
+    management entry at all). Executed for real via `node`, not just
+    string-matched, so a future edit that keeps the SharePoint branch's
+    literal strings but breaks the guard (e.g. falls through to the
+    Keboola branch) would fail this."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, row: dict) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _sourceMenuItems(row) {")
+        )
+        script = f"""
+{fns}
+
+console.log(_sourceMenuItems({json.dumps(row)}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout
+
+    _SP_ONLY_ITEMS = ["Manage scopes…", "Test connection", "Update certificate…", "Delete source"]
+    _KEBOOLA_ONLY_ITEMS = [
+        "Add tables…",
+        "Rotate storage token",
+        "Semantic-layer token",
+        "chat tools",
+        "Make default project",
+    ]
+
+    def test_sharepoint_menu_has_exactly_the_sharepoint_item_set(self):
+        html = self._run({"id": "sp-conn-1", "source_type": "sharepoint", "name": "Corp SharePoint"})
+        for item in self._SP_ONLY_ITEMS:
+            assert item in html, f"missing {item!r} from the SharePoint menu"
+        for item in self._KEBOOLA_ONLY_ITEMS:
+            assert item not in html, f"Keboola-only item {item!r} leaked into the SharePoint menu"
+        # The wrong "Test connection" (Keboola's storage-token verify) must
+        # not be wired — the SharePoint-specific `testSpConn` is.
+        assert "testSpConn('sp-conn-1')" in html
+        assert "testConn('sp-conn-1')" not in html
+        assert "openSpWizardForConnection('sp-conn-1')" in html
+        assert "toggleSpCertRow('sp-conn-1')" in html
+
+    def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
+        html = self._run(
+            {
+                "id": "kbc-conn-1",
+                "source_type": "keboola",
+                "name": "Corp Keboola",
+                "is_default": False,
+                "has_master_secret": False,
+                "has_chat_tools": False,
+            }
+        )
+        for item in self._KEBOOLA_ONLY_ITEMS:
+            # "chat tools" itself is a substring of both on/off labels.
+            assert item.replace("chat tools", "chat tools") in html
+        assert "Manage scopes…" not in html
+        assert "Update certificate…" not in html
+        assert "testConn('kbc-conn-1')" in html
+
+
+class TestManageScopesButtonOnTheCard:
+    """The collapsed card's primary "Manage scopes" button — the owner's
+    explicit demand ("a dumb path, make it clickable") for a direct, one-
+    click entry into the wizard bound to THIS connection, sitting next to
+    the Actions dropdown rather than buried inside it."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, row: dict) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fn = self._extract_function(tpl, "function _connectionCardHtml(row) {")
+        script = f"""
+function _esc(s) {{ return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }}
+function _connector(t) {{ return {{ abbr: "?", cls: "local" }}; }}
+function _connectorLogo(t) {{ return ""; }}
+function _sourceHealth(row) {{ return null; }}
+function _sourceSubtitle(row) {{ return ""; }}
+function _pipelineStripHtml(row) {{ return ""; }}
+function _sharepointFactsHtml(row) {{ return ""; }}
+function _secretBadgeHtml(row) {{ return ""; }}
+function _masterTokenFactHtml(row) {{ return ""; }}
+function _chatToolsFactHtml(row) {{ return ""; }}
+const ICO_CHEVRON = "";
+const ICO_CARET = "";
+
+{fn}
+
+console.log(_connectionCardHtml({json.dumps(row)}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout
+
+    def test_present_and_wired_on_a_sharepoint_card(self):
+        html = self._run({"id": "sp-conn-1", "source_type": "sharepoint", "name": "Corp SharePoint"})
+        assert "Manage scopes" in html
+        assert "openSpWizardForConnection('sp-conn-1')" in html
+
+    def test_absent_on_a_keboola_card(self):
+        html = self._run({"id": "kbc-conn-1", "source_type": "keboola", "name": "Corp Keboola"})
+        assert "Manage scopes" not in html
+
+
+class TestOpenSpWizardForConnection:
+    """`openSpWizardForConnection` — the card's "Manage scopes" button and
+    each scope row's click target. Unit-tested against STUBBED
+    `openSpWizard`/`spGoStep`/`spEnableStep`/`spLoadScopesThenTree`/
+    `spLoadShare` (each is either exercised live elsewhere or is the
+    wizard's own long-standing DOM machinery) so this test is about the ONE
+    thing this function actually adds: does it bind the right connection
+    id, land on the right step, and — when asked — highlight the right
+    scope row once step 3 has actually rendered."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, call: str, *, highlight_target_found: bool = True) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function openSpWizardForConnection(connId, opts) {",
+                "function _spHighlightShareRow(scopeId) {",
+            )
+        )
+        found = "true" if highlight_target_found else "false"
+        script = f"""
+{fns}
+
+let spConnId = null;
+let spLevel = null;
+let spCrumbs = null;
+const calls = [];
+function openSpWizard() {{ calls.push(["openSpWizard"]); }}
+function spEnableStep(n) {{ calls.push(["spEnableStep", n]); }}
+function spGoStep(n) {{ calls.push(["spGoStep", n]); }}
+function spLoadScopesThenTree() {{ calls.push(["spLoadScopesThenTree"]); }}
+function spLoadShare() {{ calls.push(["spLoadShare"]); return Promise.resolve(); }}
+
+global.CSS = {{ escape: (s) => s }};
+const highlighted = [];
+const _row = {{
+  scrollIntoView: () => highlighted.push("scrolled"),
+  classList: {{ add: () => highlighted.push("added"), remove: () => highlighted.push("removed") }},
+}};
+const document = {{ querySelector: (sel) => ({found} ? _row : null) }};
+global.setTimeout = (fn) => fn();  // run the un-highlight synchronously, deterministically
+
+{call}.then(() => {{
+  console.log(JSON.stringify({{ calls, spConnId, highlighted }}));
+}});
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_plain_call_binds_the_id_and_lands_on_the_scope_step(self):
+        result = self._run('Promise.resolve(openSpWizardForConnection("sp-conn-1"))')
+        assert result["spConnId"] == "sp-conn-1"
+        assert result["calls"] == [
+            ["openSpWizard"],
+            ["spEnableStep", 2],
+            ["spEnableStep", 3],
+            ["spGoStep", 2],
+            ["spLoadScopesThenTree"],
+        ]
+        assert result["highlighted"] == []
+
+    def test_highlight_call_lands_on_share_step_and_highlights_the_row(self):
+        result = self._run(
+            'Promise.resolve(openSpWizardForConnection("sp-conn-1", { highlightScopeId: "site1-drive1" }))'
+        )
+        assert result["spConnId"] == "sp-conn-1"
+        assert result["calls"] == [
+            ["openSpWizard"],
+            ["spEnableStep", 2],
+            ["spEnableStep", 3],
+            ["spGoStep", 3],
+            ["spLoadShare"],
+        ]
+        assert result["highlighted"] == ["scrolled", "added", "removed"]
+
+    def test_highlight_is_a_no_op_when_the_row_is_not_on_screen(self):
+        result = self._run(
+            'Promise.resolve(openSpWizardForConnection("sp-conn-1", { highlightScopeId: "missing" }))',
+            highlight_target_found=False,
+        )
+        assert result["calls"][-2] == ["spGoStep", 3]
+        assert result["highlighted"] == []
+
+
+class TestOpenSpWizardPreselectsSingleExistingConnection:
+    """`openSpWizard()`'s step-1 "Continue an existing connection" picker
+    pre-selects the only option when exactly one SharePoint connection
+    exists — one fewer click on the connect-wizard entry path too."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, connections: list) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in ("function spEsc(s) {", "function spApi(url, opts) {", "function openSpWizard() {")
+        )
+        script = f"""
+{fns}
+
+const SP_CONN_API = "/api/admin/source-connections";
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms;
+function spSetCertChoice(c) {{}}
+function spGoStep(n) {{}}
+function _syncDropdownRebuild(sel) {{}}
+
+function mockEl() {{
+  return {{
+    value: "", style: {{}}, innerHTML: "", hidden: false,
+    classList: {{ add() {{}}, remove() {{}}, contains() {{ return false; }} }},
+    focus() {{}},
+  }};
+}}
+const _elements = {{}};
+const document = {{
+  getElementById: (id) => (_elements[id] = _elements[id] || mockEl()),
+  body: {{ style: {{}} }},
+}};
+global.fetch = async (url, opts) => ({{
+  ok: true, status: 200,
+  json: async () => ({json.dumps(connections)}),
+}});
+
+openSpWizard();
+await new Promise((r) => setTimeout(r, 80));
+console.log(JSON.stringify({{
+  selectValue: _elements["spw-existing-select"].value,
+  selectHtml: _elements["spw-existing-select"].innerHTML,
+}}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_single_connection_is_preselected(self):
+        result = self._run([{"id": "sp-conn-1", "name": "Corp SharePoint"}])
+        assert result["selectValue"] == "sp-conn-1"
+
+    def test_multiple_connections_leave_the_native_default_selection(self):
+        result = self._run(
+            [{"id": "sp-conn-1", "name": "Corp SharePoint"}, {"id": "sp-conn-2", "name": "Marketing SharePoint"}]
+        )
+        # Both options are rendered; no assertion on which one is
+        # "selected" — a real <select> defaults to its first option, which
+        # this mock element doesn't model, so this only pins that the code
+        # does not special-case multiple rows the way it does exactly one.
+        assert "sp-conn-1" in result["selectHtml"]
+        assert "sp-conn-2" in result["selectHtml"]
+
+
 class TestSharePointWizardShareBadgeRendering:
     """`spRenderShare` (the connect wizard's step-3 share preview, spec
     §13.2) executed for real via `node` — the badge this task exists to
@@ -1726,6 +2275,11 @@ const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
 const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
 let spPendingGroups = {{}};
 let spGroups = [];
+// `spRenderShare` reads `spUniquePerms[source_scope_id]` for its advisory
+// summary line — an empty map here means "nothing flagged", which is
+// exactly right for this class: it is not exercising that summary, only
+// the anonymize badge ladder.
+let spUniquePerms = {{}};
 const items = {json.dumps(items)};
 
 spRenderShare(items);
@@ -1894,6 +2448,173 @@ class TestSharePointCertificateMetadataRendering:
         }
         html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
         assert html.count("Thumbprint") == 0
+
+
+class TestSourceCardSubtitleIdentity:
+    """`_sourceSubtitle` executed for real via `node`. A SharePoint connection
+    has no `config.stack_url` — the generic branch always fell through to
+    the literal `"(no connection URL)"`, which is not an honest fact about a
+    SharePoint connection (there is no connection URL to report). Pins the
+    SharePoint-specific identity line (tenant + scope summary) and that
+    every non-SharePoint card is byte-for-byte unchanged.
+    """
+
+    @staticmethod
+    def _extract_function(tpl: str, signature: str) -> str:
+        start = tpl.index(signature)
+        depth = 0
+        started = False
+        for i in range(start, len(tpl)):
+            ch = tpl[i]
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return tpl[start : i + 1]
+        raise AssertionError(f"unbalanced braces extracting {signature!r}")
+
+    def _run(self, row: dict) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _sourceSubtitle(row) {",
+                "function _sharepointIdentityLine(config) {",
+            )
+        )
+        script = f"""
+{fns}
+
+const row = {json.dumps(row)};
+console.log(_sourceSubtitle(row));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout.strip()
+
+    def test_sharepoint_card_shows_tenant_and_single_shared_site(self):
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scopes": [
+                    {
+                        "source_scope_id": "s1",
+                        "display_path": "Communication site / Shared Documents",
+                        "anonymize": False,
+                        "collection_id": "c1",
+                    },
+                    {
+                        "source_scope_id": "s2",
+                        "display_path": "Communication site / Reports",
+                        "anonymize": False,
+                        "collection_id": "c2",
+                    },
+                ],
+            },
+        }
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "<code>a1b2c3d4…</code>" in out
+        assert "2 scopes · Communication site" in out
+
+    def test_sharepoint_card_shows_n_sites_when_scopes_span_multiple_sites(self):
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scopes": [
+                    {
+                        "source_scope_id": "s1",
+                        "display_path": "Marketing site / Docs",
+                        "anonymize": False,
+                        "collection_id": "c1",
+                    },
+                    {
+                        "source_scope_id": "s2",
+                        "display_path": "Finance site / Docs",
+                        "anonymize": False,
+                        "collection_id": "c2",
+                    },
+                ],
+            },
+        }
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "2 scopes · 2 sites" in out
+
+    def test_sharepoint_card_with_no_scopes_is_honest_not_a_url_placeholder(self):
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {"tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "scopes": []},
+        }
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "no scopes selected" in out
+
+    def test_sharepoint_card_with_no_tenant_is_honest(self):
+        row = {"derived": False, "source_type": "sharepoint", "config": {"scopes": []}}
+        out = self._run(row)
+        assert "(no connection URL)" not in out
+        assert "(no tenant configured)" in out
+
+    def test_sharepoint_identity_line_escapes_the_site_name(self):
+        """`display_path` comes from a SharePoint site name — untrusted text
+        rendered into innerHTML — so the site label must go through `_esc`
+        like everything else on the card."""
+        row = {
+            "derived": False,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scopes": [
+                    {
+                        "source_scope_id": "s1",
+                        "display_path": "<img src=x onerror=alert(1)> / Docs",
+                        "anonymize": False,
+                        "collection_id": "c1",
+                    },
+                ],
+            },
+        }
+        out = self._run(row)
+        assert "<img" not in out
+        assert "&lt;img" in out
+
+    def test_non_sharepoint_card_with_no_stack_url_is_unchanged(self):
+        row = {"derived": False, "source_type": "keboola", "config": {}}
+        out = self._run(row)
+        assert out == "(no connection URL)"
+
+    def test_non_sharepoint_card_with_stack_url_is_unchanged(self):
+        row = {
+            "derived": False,
+            "source_type": "keboola",
+            "config": {"stack_url": "https://connection.keboola.com", "project_id": 42, "project_name": "My Project"},
+        }
+        out = self._run(row)
+        assert out == "<code>connection.keboola.com</code> · My Project · project 42"
 
 
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):

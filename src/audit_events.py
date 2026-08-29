@@ -514,6 +514,28 @@ CATALOG: dict[str, AuditEvent] = {
         "A CLI's batch of client-reported audit events was ingested "
         "(one row per batch; params carry accepted/rejected counts).",
     ),
+    # Landed on `integration` in parallel with this wave; registered here so
+    # the catalog stays the complete list rather than growing an exemption.
+    "chat.delegation": AuditEvent(
+        "chat.delegation",
+        "mutation",
+        "A chat session delegated work to an agent profile.",
+    ),
+    "chat.delegation_denied": AuditEvent(
+        "chat.delegation_denied",
+        "system",
+        "A delegation request was refused (scope or availability).",
+    ),
+    "upgrade_freeze.set": AuditEvent(
+        "upgrade_freeze.set",
+        "mutation",
+        "An admin froze automatic upgrades for this instance.",
+    ),
+    "upgrade_freeze.lift": AuditEvent(
+        "upgrade_freeze.lift",
+        "mutation",
+        "An admin lifted the automatic-upgrade freeze.",
+    ),
 }
 
 

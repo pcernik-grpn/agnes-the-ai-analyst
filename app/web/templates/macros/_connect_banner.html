@@ -18,9 +18,14 @@
    without `with context`. #}
 {% import "macros/_agnes_orb.html" as _cbn_orb %}
 
+{# The `copy` and `cta_label` defaults are deliberately BRAND-NEUTRAL. This
+   macro is imported without `with context`, so a default cannot read
+   `instance_brand_short` — any product name baked in here would ship
+   verbatim to a rebranded instance. A caller that wants the brand in its
+   copy passes it explicitly, as library.html does. #}
 {% macro connect_banner(variant='inline',
                         title='The same knowledge, everywhere.',
-                        copy='Agnes already uses your Stack. Connect your AI tools to give them access to the same knowledge.',
+                        copy='Your Stack is already in use here. Connect your AI tools to give them access to the same knowledge.',
                         cta_label='Connect once →',
                         cta_href='/setup') %}
 {% if variant == 'orbit' %}

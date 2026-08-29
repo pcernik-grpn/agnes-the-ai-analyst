@@ -332,7 +332,15 @@ def _allowed_passthrough_names(caller_user_id: Optional[str]) -> set[str]:
     if is_user_admin(caller_user_id):
         return {t["exposed_name"] for t in repo.list_by_mode(PASSTHROUGH, enabled_only=True)}
     group_ids = list(_user_group_ids(caller_user_id))
-    return {t["exposed_name"] for t in repo.list_passthrough_for_groups(group_ids)}
+    rows = repo.list_passthrough_for_groups(group_ids)
+    # TCRD-236: same ResourceType.MCP_SOURCE AND-gate _visible_passthrough_
+    # tools applies — kept in lockstep here (rather than delegating) because
+    # this function's whole reason to exist is mirroring that one without a
+    # shared caller-shape, per its own docstring above.
+    from app.api.mcp_policy import visible_mcp_source_ids
+
+    visible_sources = visible_mcp_source_ids(caller_user_id, {t.get("source_id") for t in rows})
+    return {t["exposed_name"] for t in rows if t.get("source_id") in visible_sources}
 
 
 def install_grant_filtered_list_tools(

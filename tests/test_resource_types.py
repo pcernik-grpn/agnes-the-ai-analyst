@@ -482,3 +482,58 @@ class TestCollectionResourceType:
         if blocks:
             ids = [it["resource_id"] for b in blocks for it in b["items"]]
             assert "col_del" not in ids
+
+
+class TestMcpSourceResourceType:
+    """TCRD-236: ``mcp_source`` makes a registered MCP server a grantable
+    resource, ANDed with the existing per-tool ``tool_grants`` gate."""
+
+    def test_mcp_source_in_enum(self):
+        assert ResourceType.MCP_SOURCE.value == "mcp_source"
+
+    def test_mcp_source_in_registry(self):
+        assert ResourceType.MCP_SOURCE in RESOURCE_TYPES
+        spec = RESOURCE_TYPES[ResourceType.MCP_SOURCE]
+        assert spec.key is ResourceType.MCP_SOURCE
+        assert spec.id_format == "<mcp_source_id>"
+        assert callable(spec.list_blocks)
+
+    def test_mcp_source_blocks_empty_when_no_sources(self, system_conn):
+        from app.resource_types import _mcp_source_blocks
+
+        assert _mcp_source_blocks() == []
+
+    def test_mcp_source_blocks_project_registered_sources(self, system_conn):
+        from app.resource_types import _mcp_source_blocks
+        from src.repositories.mcp_sources import MCPSourceRepository
+
+        MCPSourceRepository(system_conn).upsert(
+            id="src_a",
+            name="upstream-a",
+            transport="stdio",
+            command="/bin/true",
+        )
+        blocks = _mcp_source_blocks()
+        assert len(blocks) == 1
+        items = {i["resource_id"]: i for i in blocks[0]["items"]}
+        assert "src_a" in items
+        assert items["src_a"]["name"] == "upstream-a"
+
+    def test_mcp_source_blocks_include_disabled_sources(self, system_conn):
+        """A disabled source must still be manageable on /admin/access — an
+        admin narrowing access to it before re-enabling is a legitimate
+        action, unlike the marketplace-plugin projection which hides
+        admin-disabled rows."""
+        from app.resource_types import _mcp_source_blocks
+        from src.repositories.mcp_sources import MCPSourceRepository
+
+        MCPSourceRepository(system_conn).upsert(
+            id="src_off",
+            name="upstream-off",
+            transport="stdio",
+            command="/bin/true",
+            enabled=False,
+        )
+        items = {i["resource_id"]: i for i in _mcp_source_blocks()[0]["items"]}
+        assert "src_off" in items
+        assert items["src_off"]["enabled"] is False

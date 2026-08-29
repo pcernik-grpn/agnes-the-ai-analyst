@@ -154,6 +154,41 @@ def test_search_empty_result_hints_next_step():
     assert "No facts found for type 'widget'" in result.output
 
 
+def test_search_optional_query_positional_sends_q():
+    """A second, OPTIONAL positional argument (real-name lookup) — the first
+    positional (`TYPE`) stays required and unchanged, matching every
+    existing invocation above."""
+    captured = {}
+
+    def fake_post(path, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return _resp(200, {"subjects": [], "limit_applied": False})
+
+    with patch("cli.commands.facts.api_post", side_effect=fake_post):
+        result = runner.invoke(app, ["facts", "search", "organization", "Parts Authority"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"] == {"type": "organization", "filters": {}, "limit": 20, "q": "Parts Authority"}
+
+
+def test_search_without_query_omits_q_from_payload():
+    """`q` must be OMITTED (not sent as null) when not given — matches the
+    existing `--filter`-less/`edge_types`-less payload-omission convention
+    elsewhere in this file, and keeps a bare `agnes facts search <type>`
+    call byte-identical to before this change."""
+    captured = {}
+
+    def fake_post(path, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return _resp(200, {"subjects": [], "limit_applied": False})
+
+    with patch("cli.commands.facts.api_post", side_effect=fake_post):
+        result = runner.invoke(app, ["facts", "search", "person"])
+
+    assert result.exit_code == 0, result.output
+    assert "q" not in captured["json"]
+
+
 # ---------------------------------------------------------------------------
 # neighbors
 # ---------------------------------------------------------------------------
