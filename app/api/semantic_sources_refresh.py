@@ -18,14 +18,14 @@ Deliberately NOT touched here: the legacy Keboola
 They keep running on their own schedules, with their own provenance labels
 (``keboola_semantic_layer`` / the pre-cutover Databricks writer) and their
 own prune scopes, until steps 3-4 of #1707 migrate their callers onto this
-generic sweep and retire them. A Databricks `connection`-kind source can
-safely be registered and refreshed by BOTH this endpoint and its own
-scheduled refresh today, because the two write disjoint provenance:
-``import_source`` here stamps ``source='ossie_<kind>'`` /
-``source_ref=<source_id>``, while the legacy writer's rows carry a
-different label — see docs/semantic-layer.md's provenance/pruning section.
-Migrating/removing the legacy paths is explicitly out of scope for this
-change.
+generic sweep and retire them. The Databricks refresh is NOT disjoint from
+this sweep: post Phase-1 cutover it calls the very same
+``import_source('databricks_default')`` on the very same row, stamping the
+identical ``ossie_connection``/``databricks_default`` provenance — so the
+sweep SKIPS that row (``skipped_legacy_owned``) while the dedicated job
+still owns it, instead of racing it twice per 6 h tick. The skip and the
+legacy job are removed together in steps 3-4. Migrating/removing the
+legacy paths is otherwise out of scope for this change.
 
 Single-flight guarded (mirrors the Keboola/Databricks siblings): a second
 concurrent call while a sweep is in flight gets 409 already_running instead
@@ -53,6 +53,14 @@ from src.repositories import semantic_source_repo
 from src.semantic.transports import import_source
 
 logger = logging.getLogger(__name__)
+
+# Rows a dedicated legacy refresh job still imports itself (same
+# import_source call, same provenance) — the sweep must not run them a
+# second time per cycle. Removed together with those jobs in #1707
+# steps 3-4.
+from connectors.databricks.semantic_layer import DATABRICKS_SEMANTIC_SOURCE_ID
+
+_LEGACY_REFRESH_OWNED_SOURCE_IDS = frozenset({DATABRICKS_SEMANTIC_SOURCE_ID})
 router = APIRouter()
 
 _refresh_lock = asyncio.Lock()
@@ -73,6 +81,7 @@ def _run_sweep() -> dict[str, Any]:
     synced = 0
     failed = 0
     skipped_disabled = 0
+    skipped_legacy_owned = 0
     results: list[dict[str, Any]] = []
 
     for source in sources:
@@ -84,6 +93,14 @@ def _run_sweep() -> dict[str, Any]:
         if source.get("enabled") is False:
             skipped_disabled += 1
             results.append({"id": source_id, "name": name, "status": "skipped_disabled"})
+            continue
+        # A row still owned by a dedicated legacy refresh job would be
+        # imported TWICE per cycle under the same provenance (the legacy
+        # Databricks endpoint calls import_source on this very row) — skip
+        # it here until steps 3-4 of #1707 retire that job and this set.
+        if source_id in _LEGACY_REFRESH_OWNED_SOURCE_IDS:
+            skipped_legacy_owned += 1
+            results.append({"id": source_id, "name": name, "status": "skipped_legacy_owned"})
             continue
         try:
             import_source(source_id)
@@ -100,6 +117,7 @@ def _run_sweep() -> dict[str, Any]:
         "synced": synced,
         "failed": failed,
         "skipped_disabled": skipped_disabled,
+        "skipped_legacy_owned": skipped_legacy_owned,
         "sources": results,
     }
 

@@ -207,3 +207,42 @@ class TestManualSyncOnDisabledSource:
 
         r = c.post(f"/api/admin/semantic-sources/{source_id}/sync", headers=_auth(token))
         assert r.status_code == 200, r.text
+
+
+def test_a_legacy_owned_source_is_skipped_not_double_synced(seeded_app, monkeypatch):
+    """`databricks_default` is still imported by its own dedicated refresh job
+    under the identical provenance, so the sweep must skip it — running both
+    would import the same rows twice per cycle."""
+    from connectors.databricks.semantic_layer import DATABRICKS_SEMANTIC_SOURCE_ID
+
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    # The production row is created by ensure_semantic_source() through the
+    # repository with this FIXED id — the admin API generates its own ids,
+    # so go the same route the connector does.
+    from src.repositories import semantic_source_repo
+
+    semantic_source_repo().create(
+        id=DATABRICKS_SEMANTIC_SOURCE_ID,
+        kind="connection",
+        name="Databricks metric views",
+        adapter="databricks_metric_views",
+        config={},
+        enabled=True,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "app.api.semantic_sources_refresh.import_source",
+        lambda source_id: calls.append(source_id),
+    )
+    r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["skipped_legacy_owned"] == 1
+    assert DATABRICKS_SEMANTIC_SOURCE_ID not in calls
+    assert {
+        "id": DATABRICKS_SEMANTIC_SOURCE_ID,
+        "name": "Databricks metric views",
+        "status": "skipped_legacy_owned",
+    } in body["sources"]
