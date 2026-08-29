@@ -254,6 +254,13 @@ POSTURE: dict[str, str] = {
     "PATCH /api/data-apps/{slug}": "data_app.set_description",
     "POST /api/data-apps": "data_app.create",
     "POST /api/data-apps/reap-idle": "data_app.reap_idle",
+    # apps-runner's own report-back channel (Wave 2 — Task 3): a single route
+    # that emits whichever of the three container-lifecycle actions the
+    # runner reports (up/stop/resume) — see app/api/data_apps.py's
+    # `record_runner_event`. Named for the primary/most-common branch, same
+    # multi-action convention documented above (e.g. user.activate/
+    # deactivate both -> "user.update").
+    "POST /api/data-apps/runner-events": "data_app.container_up",
     "POST /api/data-apps/{slug}/deploy": "data_app.deploy",
     "POST /api/data-apps/{slug}/drafts": "data_app.draft_create",
     "POST /api/data-apps/{slug}/git-credential": "data_app.git_credential",

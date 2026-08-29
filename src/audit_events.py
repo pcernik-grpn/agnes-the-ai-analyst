@@ -989,6 +989,46 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed auto-discoverable tables without registering any.",
     ),
+    # Wave 2 — Task 3 (the three surfaces that wrote nothing: apps-runner
+    # container lifecycle report-back, the data-app subdomain proxy's
+    # windowed access log, and the notifications WS connect/reject events).
+    "data_app.container_up": AuditEvent(
+        "data_app.container_up",
+        "mutation",
+        "apps-runner started (or replaced) a data app's container. Reported "
+        "best-effort by the runner sidecar, which holds no database "
+        "access of its own — see services/apps_runner/audit_report.py.",
+    ),
+    "data_app.container_stop": AuditEvent(
+        "data_app.container_stop",
+        "mutation",
+        "apps-runner stopped (paused or removed) a data app's container. Reported best-effort by the runner sidecar.",
+    ),
+    "data_app.container_resume": AuditEvent(
+        "data_app.container_resume",
+        "mutation",
+        "apps-runner unpaused a data app's container. Reported best-effort "
+        "by the runner sidecar — this event had no control-plane "
+        "counterpart at all before this task, which is why it was invisible.",
+    ),
+    "data_app.access": AuditEvent(
+        "data_app.access",
+        "read",
+        "An end user's traffic reached a deployed data app through the "
+        "subdomain proxy. One row per (user, app) per 15-minute window, "
+        "not per request — see app/data_apps_subdomain.py.",
+    ),
+    "notifications.ws_connect": AuditEvent(
+        "notifications.ws_connect",
+        "system",
+        "A desktop/browser notifications WebSocket connection authenticated and was registered.",
+    ),
+    "notifications.ws_rejected": AuditEvent(
+        "notifications.ws_rejected",
+        "system",
+        "A notifications WebSocket connection attempt was refused "
+        "(bad/expired token, malformed handshake, or over the per-user cap).",
+    ),
 }
 
 
