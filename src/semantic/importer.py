@@ -36,18 +36,31 @@ Pipeline, per call:
 Steps 3-5 run as one unit with no early return in between: a prune that
 lands while projection then raises would leave the instance with rows
 deleted and nothing written back to replace them.
+
+``source["safe_prune"]`` (set from a source's ``config.safe_prune``, see
+``src/semantic/transports.py``) opts a source into the full-wipe guard: a
+run that produced NO valid documents at all, while rows for this scope
+already exist, prunes nothing — neither the stored documents here nor, via
+``project_document(safe_prune=...)``, their flat projection. An upstream
+that answers with nothing usable is indistinguishable from one whose content
+was genuinely deleted, and only the sources whose upstream can do the former
+(the migrated Keboola Metastore sync) ask for the guard. Off by default: for
+a git or upload source, emptying a model IS the delete signal.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.repositories import semantic_model_repo
-from src.semantic.projection import ProjectionReport, project_document
+from src.semantic.projection import ProjectionReport, _model_key, project_document
 from src.semantic.document_validation import validate_document
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,6 +70,14 @@ class ImportReport:
     models_pruned: List[str] = field(default_factory=list)
     invalid: List[dict] = field(default_factory=list)
     projection: Optional[ProjectionReport] = None
+    #: F3: this run carried a document for a DETACHED model and deliberately
+    #: held it back, so the merged projection is a knowingly incomplete
+    #: picture of this (source, source_ref). Reported, not just used locally,
+    #: because every caller that gates on "did this pass rewrite everything it
+    #: owns?" — `partial` here, the legacy-row purge in
+    #: `src/semantic/legacy_migration.py` — has to ask the same question, and
+    #: `invalid` alone answers only half of it.
+    detached_excluded: bool = False
 
 
 def _content_hash(text: str) -> str:
@@ -77,11 +98,60 @@ def _model_name(parsed: Optional[Dict[str, Any]]) -> Optional[str]:
     return models[0].get("name") or None
 
 
+def _stable_suffix(parsed: Optional[Dict[str, Any]], content_hash: str) -> str:
+    """The suffix that tells two same-named models apart, stably across runs.
+
+    Prefers the model's own upstream identifier — the same
+    ``custom_extensions[AGNES].metastore_id`` the projection keys its row ids
+    on, so the stored document and its projection stay in agreement. A
+    hand-authored document has no such id (``_model_key`` then falls back to
+    the name, which is the very thing that collided), so the document's own
+    content hash stands in: stable for as long as the content is, which is
+    what keeps the next sync a no-op instead of a prune-and-recreate.
+    """
+    models = (parsed or {}).get("semantic_model") or [{}]
+    model = models[0]
+    key = _model_key(model)
+    return key if key and key != (model.get("name") or "") else content_hash[:12]
+
+
+def _disambiguated_slug(
+    slug: str, parsed: Optional[Dict[str, Any]], content_hash: str, seen_slugs: set[str]
+) -> str:
+    """``slug`` itself the first time it appears in a batch, ``slug-<stable
+    id>`` after that.
+
+    A model NAME is not unique upstream and the slug is this table's storage
+    key, so two documents declaring one name would collapse onto a single row
+    — the later silently overwriting the earlier. The alternative tried first
+    (report the second as ``invalid``) traded that for a different silent
+    loss: the document was never stored, the run was permanently ``partial``
+    (narrowing every prune after it), and a previously-stored ``slug-<id>``
+    row was deleted by ``delete_missing``. The connector composer this
+    pipeline replaced disambiguated instead, under exactly this scheme.
+    """
+    if slug not in seen_slugs:
+        return slug
+    candidate = f"{slug}-{_stable_suffix(parsed, content_hash)}"
+    suffix = 2
+    while candidate in seen_slugs:
+        candidate = f"{slug}-{_stable_suffix(parsed, content_hash)}-{suffix}"
+        suffix += 1
+    logger.warning(
+        "Semantic import: two documents declare the model name %r; storing the later one as %r so "
+        "neither is lost.",
+        slug,
+        candidate,
+    )
+    return candidate
+
+
 def import_documents(source: dict, documents: List[str]) -> ImportReport:
     report = ImportReport()
     repo = semantic_model_repo()
     src_name = source["source"]
     src_ref = source.get("source_ref")
+    safe_prune = bool(source.get("safe_prune"))
 
     # One scoped read for the whole batch rather than a per-document lookup:
     # `semantic_model_repo().get_by_slug` is not scoped by source, so two
@@ -101,33 +171,16 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
     keep_slugs: List[str] = []
     valid_documents: List[Dict[str, Any]] = []
     seen_slugs: set[str] = set()
-    # F3: set when this batch carried a document for a DETACHED model, whose
-    # source-side content is deliberately kept out of `valid_documents`. Forces
-    # the end-of-batch projection to prune narrowly (see the `partial` argument
-    # to `project_document`), because the merged list is then knowingly missing
-    # a model that belongs to this (source, source_ref).
-    detached_excluded = False
 
     for text in documents:
         result = validate_document(text)
         content_hash = _content_hash(text)
         slug = _model_name(result.parsed) if result.ok else None
-
-        if slug is not None and slug in seen_slugs:
-            # Two documents in one batch declaring the same model name collapse
-            # onto a single row — the row id is derived from the slug, so the
-            # later one overwrites the earlier one and the report counts both as
-            # written. That is silent loss: in a git-backed source it takes only
-            # a copied file. First occurrence wins; the duplicate is reported.
-            report.invalid.append(
-                {
-                    "content_hash": content_hash,
-                    "errors": [
-                        f"duplicate model name {slug!r} in this import; the first document declaring it was kept"
-                    ],
-                }
-            )
-            continue
+        if slug is not None:
+            # First occurrence keeps the clean slug; a second document with
+            # the same model name is stored beside it under `slug-<stable id>`
+            # rather than dropped (see `_disambiguated_slug`).
+            slug = _disambiguated_slug(slug, result.parsed, content_hash, seen_slugs)
 
         if slug is not None:
             seen_slugs.add(slug)
@@ -167,7 +220,7 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
                 repo.update_source_content_hash(existing["id"], content_hash)
             if status == "valid":
                 report.models_unchanged += 1
-                detached_excluded = True
+                report.detached_excluded = True
             continue
 
         if status == "valid":
@@ -209,7 +262,21 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
         else:
             repo.mark_source_missing(existing["id"])
 
-    report.models_pruned = repo.delete_missing(source=src_name, source_ref=src_ref, keep_slugs=keep_slugs)
+    if safe_prune and not keep_slugs and existing_rows:
+        # Full-wipe guard, the document-level twin of ``project_document``'s
+        # own (see the module docstring): this run carried no valid document
+        # at all while rows for this scope exist. Deleting them here would
+        # also strand their projection — with nothing to project, the
+        # projection pass below never runs and never prunes.
+        logger.warning(
+            "Semantic import (%s/%s): no valid documents this run while %d stored model(s) exist; "
+            "skipping the prune to avoid a full wipe. Existing models retained.",
+            src_name,
+            src_ref,
+            len(existing_rows),
+        )
+    else:
+        report.models_pruned = repo.delete_missing(source=src_name, source_ref=src_ref, keep_slugs=keep_slugs)
 
     if valid_documents:
         merged = {"semantic_model": [m for doc in valid_documents for m in (doc.get("semantic_model") or [])]}
@@ -223,7 +290,8 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
             # full-scope prune would delete the absent model's own rows —
             # for a detached model, precisely the locally-edited projection
             # this sync just took care not to overwrite.
-            partial=bool(report.invalid) or detached_excluded,
+            partial=bool(report.invalid) or report.detached_excluded,
+            safe_prune=safe_prune,
         )
 
     return report

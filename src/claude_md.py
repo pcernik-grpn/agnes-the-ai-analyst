@@ -10,8 +10,9 @@ Available placeholders: instance.{name,subtitle}, server.{url,hostname},
 sync_interval, data_source.{type,source_types}, tables (list of
 {name,description,query_mode,source_type}), metrics.{count,categories},
 semantic_layer.has_models (True iff the calling user can read >=1 valid
-semantic model), semantic_layer.models (list of {slug,name,description}
-for every model the user can read — the one-line catalog),
+semantic model), semantic_layer.models (list of {slug,name,description,instructions}
+for every model the user can read — the one-line catalog; `instructions`
+is the author's own `ai_context.instructions`, truncated),
 semantic_layer.cache_ttl_hours (the TTL `agnes pull` stamps into every
 rendered `semantic/<slug>/…` cache file's header,
 src/semantic/cache_render.py), facts.enabled (True iff the `facts` feature
@@ -150,10 +151,51 @@ def _metrics_summary(conn: duckdb.DuckDBPyConnection | None, *, user: dict) -> d
     }
 
 
+# `ai_context.instructions` is authored prose of unbounded length, and this
+# file is read on every session start — a model author's essay must not become
+# the prompt. Long enough for a real rule ("always filter orders by tenant_id;
+# refunds are excluded"), short enough that ten models stay affordable.
+_MODEL_INSTRUCTIONS_MAX_CHARS = 300
+
+
+def _model_instructions(document_json: Any) -> str:
+    """The model author's own ``ai_context.instructions``, truncated to
+    ``_MODEL_INSTRUCTIONS_MAX_CHARS``.
+
+    Reads the document's TOP-LEVEL model ``ai_context`` — the Ossie schema
+    allows either a bare string or an object with ``instructions``, and both
+    forms are the same authored steering (same reading as
+    ``src/semantic_context.py::_summary``). Per-dataset and per-metric
+    ``ai_context`` is deliberately NOT gathered here: it belongs to the
+    object, reaches the agent through the rendered `semantic/<slug>/` cache
+    and ``get_semantic_context``, and would flood this file.
+
+    A row holding several models (legal, though rare) contributes the first
+    one that declares instructions — an arbitrary pick would be worse than a
+    deterministic one, and the full text is one `agnes semantic-model
+    context` call away either way.
+    """
+    if not isinstance(document_json, dict):
+        return ""
+    for model in document_json.get("semantic_model") or []:
+        if not isinstance(model, dict):
+            continue
+        ai_context = model.get("ai_context")
+        if isinstance(ai_context, dict):
+            ai_context = ai_context.get("instructions")
+        if not isinstance(ai_context, str) or not ai_context.strip():
+            continue
+        text = " ".join(ai_context.split())
+        if len(text) > _MODEL_INSTRUCTIONS_MAX_CHARS:
+            return text[: _MODEL_INSTRUCTIONS_MAX_CHARS - 1].rstrip() + "…"
+        return text
+    return ""
+
+
 def _semantic_layer_models(conn: duckdb.DuckDBPyConnection | None, *, user: dict[str, Any]) -> list[dict[str, Any]]:
     """Every ``status='valid'`` semantic model the calling user can read,
-    as ``{"slug", "name", "description"}`` — same RBAC tier as ``GET
-    /api/semantic-models/search`` (``app/api/semantic_models.py::
+    as ``{"slug", "name", "description", "instructions"}`` — same RBAC tier
+    as ``GET /api/semantic-models/search`` (``app/api/semantic_models.py::
     _can_read_model``: admin, a grant on the model itself, or a grant on a
     Data Package it's linked to).
 
@@ -161,6 +203,10 @@ def _semantic_layer_models(conn: duckdb.DuckDBPyConnection | None, *, user: dict
     .has_models``, unchanged since it's now ``bool(models)``) and its
     one-line model catalog (Fáze 1 physical-distribution plan, item 4) — a
     user with zero accessible models gets neither.
+
+    ``instructions`` is the author's own ``ai_context.instructions``: the one
+    field a model declares *for the agent*, which until now reached no agent
+    surface at all. Empty string when the model declares none.
     """
     from app.api.semantic_models import _can_read_model
     from src.repositories import semantic_model_repo
@@ -177,7 +223,12 @@ def _semantic_layer_models(conn: duckdb.DuckDBPyConnection | None, *, user: dict
         # the guard above, which degrades to "no section" — so widening
         # `app/api/semantic_models._can_read_model` is left to whoever owns it.
         return [
-            {"slug": row.get("slug"), "name": row.get("name"), "description": row.get("description") or ""}
+            {
+                "slug": row.get("slug"),
+                "name": row.get("name"),
+                "description": row.get("description") or "",
+                "instructions": _model_instructions(row.get("document_json")),
+            }
             for row in rows
             if row.get("status") == "valid" and _can_read_model(user, row, conn)  # type: ignore[arg-type]
         ]

@@ -182,7 +182,13 @@ def validate_query(
         typer.echo(f"Warning: {body['mixed_dialect_warning']}")
 
     if not body.get("locally_executable", True):
-        typer.echo("Warning: one or more used metrics are not locally executable on the target engine.")
+        # Name them when the server says which — "one or more used metrics"
+        # leaves the analyst to work out which of five is the problem. Falls
+        # back to the vague form against an older server that has no
+        # `not_executable_metrics`.
+        offenders = ", ".join(str(m) for m in (body.get("not_executable_metrics") or []))
+        subject = offenders if offenders else "one or more used metrics"
+        typer.echo(f"Warning: {subject} — not locally executable on the target engine.")
 
     if "missing_expected_objects" in body and body["missing_expected_objects"]:
         typer.echo("Missing expected objects:")

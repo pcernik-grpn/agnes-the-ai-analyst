@@ -50,19 +50,22 @@ def repo(request, tmp_path, pg_engine, monkeypatch):
         yield r
 
 
-def _upsert(repo, *, id, slug, source="git", source_ref="repo-a"):
+_UNSET = object()
+
+
+def _upsert(repo, *, id, slug, source="git", source_ref="repo-a", status="valid", document_json=_UNSET):
     return repo.upsert(
         id=id,
         slug=slug,
         name=slug.title(),
         description=None,
         document=f"version: '0.2.0.dev0'\nsemantic_model:\n  - name: {slug}\n",
-        document_json={"semantic_model": [{"name": slug}]},
+        document_json={"semantic_model": [{"name": slug}]} if document_json is _UNSET else document_json,
         spec_version="0.2.0.dev0",
         content_hash=f"hash-{slug}",
         source=source,
         source_ref=source_ref,
-        status="valid",
+        status=status,
         validation_errors=None,
         validated_at=None,
     )
@@ -196,3 +199,39 @@ def test_list_all_source_ref_none_means_unfiltered_on_both_engines(repo):
     _upsert(repo, id="m3", slug="other", source="manual", source_ref="repo-a")
 
     assert {r["id"] for r in repo.list_all(source="manual", source_ref=None)} == {"m1", "m3"}
+
+
+def test_count_valid_is_the_cheap_existence_gate(repo):
+    """`POST /api/query` asks "is there a semantic layer at all?" on EVERY
+    query. That question must cost one COUNT, not a full `list_all()` that
+    drags `document` + `document_json` for every row across the wire.
+
+    It counts exactly the rows `_accessible_valid_documents` can use:
+    `status='valid'` AND a non-NULL `document_json`.
+    """
+    assert repo.count_valid() == 0
+
+    _upsert(repo, id="m1", slug="retail")
+    assert repo.count_valid() == 1
+
+    _upsert(repo, id="m2", slug="broken", status="invalid")
+    assert repo.count_valid() == 1, "a non-valid row is not a usable model"
+
+    _upsert(repo, id="m3", slug="empty", document_json=None)
+    assert repo.count_valid() == 1, "a row with no parsed document has nothing to validate against"
+
+    _upsert(repo, id="m4", slug="finance")
+    assert repo.count_valid() == 2
+
+
+def test_count_valid_agrees_with_list_all_on_both_engines(repo):
+    """The gate must never under-count what the loader would find — that
+    would silently switch the advisory off. Pinned against the loader's own
+    predicate rather than a hand-written number."""
+    _upsert(repo, id="m1", slug="retail")
+    _upsert(repo, id="m2", slug="broken", status="invalid")
+    _upsert(repo, id="m3", slug="empty", document_json=None)
+
+    usable = [r for r in repo.list_all() if r.get("status") == "valid" and r.get("document_json")]
+    assert repo.count_valid() >= len(usable)
+    assert repo.count_valid() == len(usable)

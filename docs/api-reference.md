@@ -1717,7 +1717,8 @@ search/export) via the pure `src.semantic_validation.validate_query` engine:
 an `error`-severity constraint violation sets `valid: false`; a rule that
 cannot be checked statically degrades to `post_execution_checks`, never a
 guessed violation; a used metric whose only expressions target another
-engine sets `locally_executable: false`. With zero accessible valid models
+engine sets `locally_executable: false` and is named in
+`not_executable_metrics`. With zero accessible valid models
 the response is `{"available": false, "error": "no_semantic_model", ...}`
 rather than a misleading all-clear. CLI: `agnes semantic-model
 validate-query "<SQL>" [--expect JSON] [--target-engine duckdb] [--json]`
@@ -1769,15 +1770,14 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-blocked-purge
 - /api/admin/run-bq-metadata-refresh
 - /api/admin/run-corporate-memory
-- /api/admin/run-databricks-semantic-layer-refresh
 - /api/admin/run-jira-consistency-check
 - /api/admin/run-jira-sla-poll
-- /api/admin/run-keboola-semantic-layer-refresh
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
@@ -2208,7 +2208,7 @@ analogue) drive the in-chat split-pane preview iframe on top of this grant.
 ### `/api/glossary` — Keboola-imported business-term glossary (user-facing)
 
 Read/search over `glossary_terms`, populated by the Keboola semantic-layer
-importer (`keboola-semantic-layer-refresh` job) — see
+importer (on the `semantic-sources-refresh` sweep) — see
 `docs/superpowers/specs/2026-07-17-keboola-glossary-import-design.md`.
 Relevance-ranked search uses DuckDB FTS BM25 with an ILIKE fallback.
 

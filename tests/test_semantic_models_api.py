@@ -1109,3 +1109,55 @@ class TestSemanticModelsBundle:
         c = seeded_app["client"]
         r = c.get("/api/semantic-models/bundle")
         assert r.status_code in (401, 403)
+
+
+class TestSemanticSourceProvenanceIsNotAdminWritable:
+    """``config.provenance`` names the ``(source, source_ref)`` pair a
+    source's models, metrics, glossary terms and column descriptions are
+    written AND PRUNED under. Only the auto-migration writes it, through the
+    repository (``src/semantic/legacy_migration.py``) — accepting it over
+    HTTP would let any admin-authored source claim a migrated connector's
+    prune scope and have the next sweep delete that connection's rows.
+
+    Refused outright rather than validated, so there is exactly one place
+    provenance can enter the system.
+    """
+
+    _HIJACK = {"source": "keboola_metastore", "source_ref": "conn-a"}
+
+    def test_create_refuses_a_provenance_override(self, seeded_app):
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/admin/semantic-sources",
+            json={
+                "kind": "upload",
+                "name": "Hijack attempt",
+                "adapter": "native",
+                "config": {"documents": [], "provenance": self._HIJACK},
+            },
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "provenance_not_settable"
+
+    def test_update_refuses_a_provenance_override(self, seeded_app):
+        c = seeded_app["client"]
+        h = _auth(seeded_app["admin_token"])
+        created = c.post(
+            "/api/admin/semantic-sources",
+            json={"kind": "upload", "name": "Bundle", "adapter": "native", "config": {"documents": []}},
+            headers=h,
+        )
+        source_id = created.json()["id"]
+
+        r = c.put(
+            f"/api/admin/semantic-sources/{source_id}",
+            json={"config": {"documents": [], "provenance": self._HIJACK}},
+            headers=h,
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "provenance_not_settable"
+
+        from src.repositories import semantic_source_repo
+
+        assert "provenance" not in (semantic_source_repo().get(source_id)["config"] or {})
