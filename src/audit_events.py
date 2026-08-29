@@ -488,6 +488,13 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "Selected discovered Keboola projects were connected (select-mode multi-project login).",
     ),
+    # Task 8 (F4 — chat sessions bridge into the analyst-sessions store)
+    "chat.session_exported": AuditEvent(
+        "chat.session_exported",
+        "system",
+        "A web-chat session was materialized as a session jsonl under SESSION_DATA_DIR "
+        "(admin transcript viewer + usage rollups now cover it, same as any CLI session).",
+    ),
 }
 
 

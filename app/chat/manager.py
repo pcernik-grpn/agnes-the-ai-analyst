@@ -3534,6 +3534,17 @@ class ChatManager:
             action="chat.session_killed",
             details={"session_id": chat_id, "reason": reason},
         )
+        # F4 (audit-full-coverage plan, Task 8): this is the one finalize
+        # hook every teardown path (archive, delete, idle reaper,
+        # cross-gateway forward's local half) funnels through, so it is the
+        # general place to materialize the session jsonl the analyst-
+        # sessions pipeline already scans — best-effort, never blocks kill.
+        try:
+            from app.chat.session_export import export_chat_session_jsonl
+
+            export_chat_session_jsonl(chat_id)
+        except Exception:
+            logger.warning("chat session export failed for %s on kill (non-fatal)", chat_id, exc_info=True)
 
     # --- auto-title ---------------------------------------------------------
 

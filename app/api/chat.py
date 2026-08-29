@@ -416,6 +416,15 @@ async def set_session_archived(
     if body.archived:
         await _kill_quietly(request, chat_id, reason="user_archive")
         repo.archive_session(chat_id)
+        # F4 (audit-full-coverage plan, Task 8): direct safety net alongside
+        # the kill()-path finalize hook above — best-effort, never blocks
+        # the archive response.
+        try:
+            from app.chat.session_export import export_chat_session_jsonl
+
+            export_chat_session_jsonl(chat_id)
+        except Exception:
+            logger.exception("chat session export failed on archive for %s", chat_id)
     else:
         repo.restore_session(chat_id)
     log_safe(
@@ -647,6 +656,14 @@ async def archive_session(
     except Exception:
         logger.exception("kill on archive failed for %s", chat_id)
     repo.archive_session(chat_id)
+    # F4 (audit-full-coverage plan, Task 8): direct safety net alongside the
+    # kill()-path finalize hook above — best-effort, never blocks archive.
+    try:
+        from app.chat.session_export import export_chat_session_jsonl
+
+        export_chat_session_jsonl(chat_id)
+    except Exception:
+        logger.exception("chat session export failed on archive for %s", chat_id)
     log_safe(
         user_id=user["id"],
         action="chat.session.archive",
