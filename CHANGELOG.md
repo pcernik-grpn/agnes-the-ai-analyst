@@ -195,6 +195,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   full chat* link to the same session for the full renderer. Engine failures
   are translated into what the reader can act on instead of surfacing the
   internal kind.
+- **Zip-bundle members are now individually citable in the fact graph**
+  (design §6/§7 citability follow-up). Each member `ingest_bundle` unpacks
+  from an archive gets its own `corpus_file_sources` anchor
+  (`source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>`) — best-effort, silently a no-op on
+  a DuckDB-backed instance — so a fact-graph claim can cite the exact member
+  that contains the evidence instead of only the archive, and a producer can
+  cite a member by its own content doc_id with no `documents[]` entry. A
+  member's identity, and therefore its claims, now also survives a routine
+  re-sync of the archive: the previous behavior purged EVERY member up front
+  the moment the archive's own bytes changed (any single member changing
+  changes the zip's own sha256), re-minting every member's id and cascading
+  every member's claims on every re-sync, not just the changed one's;
+  reconciliation is now left entirely to `ingest_bundle`'s own
+  `(filename, sha256)` member matching, which purges only the members that
+  actually changed or disappeared. A member rename inside the archive is
+  still delete-old + create-new (identity stays keyed on filename+sha256,
+  unchanged by this fix) — only a byte-identical, same-named member across a
+  re-sync now keeps its row, anchor and claims.
 
 ### Changed
 - **The release-cut moves out of feature PRs and into one daily cut PR.**

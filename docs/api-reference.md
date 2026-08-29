@@ -1712,7 +1712,14 @@ content-grounded (weaker evidence still, per §8's own honesty note that the
 gate validates the quote, not the fact). `documents` may be
 omitted only when every evidence `doc_id` already resolves through a prior
 upload's `corpus_file_sources` mapping — otherwise `400` with the
-unresolved ids itemized. Corrections management
+unresolved ids itemized. A **zip-bundle member is citable exactly like a
+top-level file**: `src.ingest.bundle.ingest_bundle` writes each member's own
+`corpus_file_sources` anchor at unpack time (`source_doc_id` = the member's
+own content `sha256[:16]`, `source_stable_id` = `"<archive
+corpus_files.id>!<member path>"`), so a claim referencing that `doc_id`
+resolves to the member's `corpus_file_id`, never the archive's — no
+`documents[]` entry is required once the archive has been ingested once.
+Corrections management
 (`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
 `wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
