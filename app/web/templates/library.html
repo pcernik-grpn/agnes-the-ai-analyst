@@ -131,6 +131,16 @@
                    (The derived data-scope projection that blended ownership
                    into this went with the three-way segment it fed.) #}
                 data-stack="{{ c.stack_state }}"
+                {# The three labels this row's Access control uses, carried as
+                   data so the client-side re-render after an add/remove reuses
+                   the SERVER's copy instead of hard-coding a second vocabulary.
+                   It already did: the builders below shipped "In stack" /
+                   "Add to stack" / "Remove from stack" while the server said
+                   "Agents can use this" / "Add to my agents" / "Remove", so one
+                   click silently reverted the row to the retired wording. #}
+                data-copy-action="{{ c.stack_action or 'Add to my agents' }}"
+                data-copy-undo="{{ c.stack_undo or 'Remove' }}"
+                data-copy-pill="{{ c.stack_pill or 'Agents can use this' }}"
                 data-tag="{{ c.tags | join('|') }}"
                 {# Cumulative recency buckets as a SET, so "Last 30 days" matches
                    everything inside 30 days rather than a 23-day slice (see
@@ -139,7 +149,7 @@
                 data-age="{{ c.age_buckets | join('|') }}"
                 {# Rendered on file rows since the Type column was retired; a
                    facet reads it now instead of it being decoration. #}
-                data-format="{{ c.file_format or '' }}"
+                data-format="{{ (c.format_keys or []) | join('|') }}"
                 data-owner="{{ c.owner_key }}"
                 data-name="{{ c.title|lower }}"
                 data-added="{{ c.added_iso or '' }}"
@@ -3307,6 +3317,30 @@
   //    Driven by the shared FilterToolbar engine entirely client-side over the
   //    server-rendered rows. "Mine" expands to include shared_by_me (a shared
   //    item is still one you made).
+  // The facet definitions, hoisted out of the init call so the page's own
+  // count pass reads the SAME list the engine filters by — an option whose
+  // badge disagreed with its filter is the bug this fixes, and two copies of
+  // this array is how it would come back.
+  const LIB_FACETS = [
+    // "In stack only" — a binary condition worth seeing at rest, so it
+    // rides the bar as the #lib-stack-toggle button (`control`) rather
+    // than a menu row; slices the row's strict Stack membership.
+    { key: 'stack', attr: 'data-stack', label: 'Agents use it',
+      toggle: true, control: '#lib-stack-toggle' },
+    // "Not in stack yet" — one condition, so a TOGGLE: a single checkbox
+    // in the menu (value="available"), a chip that states the condition.
+    { key: 'availability', attr: 'data-stack', label: 'Not added yet', toggle: true },
+    { key: 'requirement', attr: 'data-requirement', label: 'Access' },
+    { key: 'tag', attr: 'data-tag', label: 'Tag', multi: true },
+    // `multi` because the recency buckets are cumulative sets on the row.
+    { key: 'age', attr: 'data-age', label: 'Added', multi: true },
+    { key: 'ownership', attr: 'data-ownership', label: 'Yours or shared' },
+    // `multi` because a folder is filterable by every format it holds.
+    { key: 'format', attr: 'data-format', label: 'File format', multi: true },
+    { key: 'owner', attr: 'data-owner', label: 'Owner' },
+    { key: 'origin', attr: 'data-origin', label: 'Source' },
+  ];
+
   let toolbar = null;
   if (document.querySelector('[data-lib-sec]') && window.FilterToolbar) {
     toolbar = window.FilterToolbar.init({
@@ -3314,24 +3348,7 @@
       // flat set for search/sort and defers grouping to the sections config.
       rows: '[data-lib-sec] tr[data-item-id]:not([data-parent-id])',
       search: { el: '#lib-search', attr: 'data-search' },
-      facets: [
-        // "In stack only" — a binary condition worth seeing at rest, so it
-        // rides the bar as the #lib-stack-toggle button (`control`) rather
-        // than a menu row; slices the row's strict Stack membership.
-        { key: 'stack', attr: 'data-stack', label: 'Agents use it',
-          toggle: true, control: '#lib-stack-toggle' },
-        // "Not in stack yet" — one condition, so a TOGGLE: a single checkbox
-        // in the menu (value="available"), a chip that states the condition.
-        { key: 'availability', attr: 'data-stack', label: 'Not added yet', toggle: true },
-        { key: 'requirement', attr: 'data-requirement', label: 'Access' },
-        { key: 'tag', attr: 'data-tag', label: 'Tag', multi: true },
-        // `multi` because the recency buckets are cumulative sets on the row.
-        { key: 'age', attr: 'data-age', label: 'Added', multi: true },
-        { key: 'ownership', attr: 'data-ownership', label: 'Yours or shared' },
-        { key: 'format', attr: 'data-format', label: 'File format' },
-        { key: 'owner', attr: 'data-owner', label: 'Owner' },
-        { key: 'origin', attr: 'data-origin', label: 'Source' },
-      ],
+      facets: LIB_FACETS,
       // The Knowledge / Capabilities tabs. `all` is never selected — the bar
       // has no such segment and the page opens on a real one (see the
       // `setSegment` bootstrap under this call), so every row is always being
@@ -3365,7 +3382,7 @@
         buttons: '.fbar-view__btn', tableWrap: '.lib-tablewrap',
         grid: '.fbar-grid', storageKey: 'lib-view', card: buildCard,
       },
-      onApply: () => { syncChildren(); markGroupEnd(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
+      onApply: () => { syncChildren(); markGroupEnd(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
     });
 
     // The engine's segment value starts at the `all` wildcard, which is not a
@@ -3462,11 +3479,97 @@
   //    without a reload would leave it stale — so recount from the rows the
   //    engine slices on (top-level ones; a file inherits its folder's state).
   //    Deliberately the UNFILTERED total, matching the category option counts.
+  // ── Every count on this page must equal what clicking it leaves on screen ──
+  //
+  //    They did not. All of them were tallied server-side over BOTH tabs, so on
+  //    Knowledge the Tags menu offered "Productivity 5" and returned nothing —
+  //    all five were Capabilities — and the stack toggle advertised 7 for a
+  //    filter that left 3. A badge beside a filter is read as a result count,
+  //    so a badge that cannot be honoured is worse than no badge.
+  //
+  //    Counted here rather than in filter_toolbar.js on purpose: four other
+  //    pages share that engine and three render the same option badges, and
+  //    making their counts live is not this change's to make. If a second page
+  //    needs it, that is the moment to promote this into the engine — with
+  //    that page's tests.
+  const LIB_ROWS_SEL = '[data-lib-sec] tr[data-item-id]:not([data-parent-id])';
+
+  //: A facet's own selection is EXCLUDED from its own counts (standard faceted
+  //: search): otherwise picking "PDF" would zero every sibling format and you
+  //: could never see what switching to "CSV" would give.
+  function libRowsMatching(exceptKey) {
+    //: `.is-active` is the ONLY trustworthy marker of the current tab: the
+    //: engine sets it (and `aria-selected`) in setSegment, while the
+    //: server-rendered `aria-checked` is never updated and sits permanently on
+    //: Knowledge — reading that one silently counted the wrong tab.
+    const seg = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
+    const tab = seg && (seg.getAttribute('data-own') || '');
+    const searchEl = document.getElementById('lib-search');
+    const q = ((searchEl && searchEl.value) || '').trim().toLowerCase();
+    const sel = {};
+    LIB_FACETS.forEach(f => {
+      const boxes = document.querySelectorAll(
+        '#lib-filter-menu input[data-facet="' + f.key + '"]:checked');
+      const on = Array.prototype.map.call(boxes, i => i.value);
+      const ctl = f.control && document.querySelector(f.control);
+      if (ctl && ctl.getAttribute('aria-pressed') === 'true') on.push('in_stack');
+      if (on.length) sel[f.key] = on;
+    });
+    return Array.prototype.filter.call(document.querySelectorAll(LIB_ROWS_SEL), row => {
+      if (tab && row.getAttribute('data-tab') !== tab) return false;
+      if (q && (row.getAttribute('data-search') || '').indexOf(q) === -1) return false;
+      for (let i = 0; i < LIB_FACETS.length; i++) {
+        const f = LIB_FACETS[i];
+        if (f.key === exceptKey) continue;
+        const on = sel[f.key];
+        if (!on) continue;
+        if (!libRowHas(row, f, on)) return false;
+      }
+      return true;
+    });
+  }
+  function libRowHas(row, f, values) {
+    const raw = row.getAttribute(f.attr) || '';
+    const mine = f.multi ? raw.split('|') : [raw];
+    for (let i = 0; i < values.length; i++) {
+      if (mine.indexOf(values[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  function refreshOptionCounts() {
+    LIB_FACETS.forEach(f => {
+      const inputs = document.querySelectorAll(
+        '#lib-filter-menu input[data-facet="' + f.key + '"]');
+      if (!inputs.length) return;
+      const base = libRowsMatching(f.key);
+      Array.prototype.forEach.call(inputs, input => {
+        const n = base.filter(row => libRowHas(row, f, [input.value])).length;
+        const label = input.closest('label');
+        const badge = label && label.querySelector('.fbar-menu__opt-n');
+        if (badge) badge.textContent = String(n);
+        // An option that can return nothing is a dead end, so it is not
+        // offered — unless it is the one currently ON, which must stay
+        // visible or its chip would have nothing to switch off.
+        if (label) label.hidden = (n === 0 && !input.checked);
+      });
+      // A category with nothing left to offer goes with its options.
+      const cat = inputs[0].closest('[data-cat]');
+      if (cat) {
+        const live = cat.querySelectorAll('.fbar-menu__opt:not([hidden])').length;
+        cat.hidden = live === 0;
+      }
+    });
+  }
+
   function refreshStackCount() {
     const badge = document.querySelector('[data-stack-count]');
     if (!badge) return;
-    badge.textContent = String(document.querySelectorAll(
-      '[data-lib-sec] tr[data-item-id]:not([data-parent-id])[data-stack="in_stack"]').length);
+    // Scoped to the active tab like every other count, and computed with the
+    // toggle's own state excluded so it still reads as "how many would this
+    // give me" while it is on.
+    badge.textContent = String(
+      libRowsMatching('stack').filter(r => r.getAttribute('data-stack') === 'in_stack').length);
   }
 
   // ── Per-category badge counts in the Filter menu, so a collapsed category
@@ -3684,16 +3787,21 @@
   // number of add/remove cycles without a reload, so each rendered state
   // re-emits all three. Artefact/install rows pass neither and behave as
   // before (one endpoint, both methods).
-  function inStackHtml(id, title, endpoint, body, removeEndpoint) {
+  // `row` is what carries the server's own copy (data-copy-*). Passing it is
+  // what stops this builder becoming a second, divergent spelling of the
+  // Access column — see the comment on data-copy-action in the row markup.
+  function inStackHtml(row, id, title, endpoint, body, removeEndpoint) {
+    const pill = (row && row.dataset.copyPill) || 'Agents can use this';
+    const undo = (row && row.dataset.copyUndo) || 'Remove';
     return '<button type="button" class="lib-stackpill lib-instack" data-stack-badge="' + id + '" ' +
       'data-remove-from-stack="' + id + '" ' +
       (endpoint ? 'data-stack-endpoint="' + esc(endpoint) + '" ' : '') +
       (body ? 'data-stack-body="' + esc(body) + '" ' : '') +
       (removeEndpoint ? 'data-stack-remove-endpoint="' + esc(removeEndpoint) + '" ' : '') +
-      'title="In your Stack — click to remove it" ' +
-      'aria-label="' + esc(title) + ' is in your stack. Remove it from your Stack">' +
-      '<span class="lib-stackpill__rest">' + STACK_CHECK_SVG + 'In stack</span>' +
-      '<span class="lib-stackpill__alt">' + STACK_MINUS_SVG + 'Remove from stack</span>' +
+      'title="' + esc(pill) + ' — click to remove it" ' +
+      'aria-label="' + esc(title) + ': ' + esc(pill) + '. ' + esc(undo) + '">' +
+      '<span class="lib-stackpill__rest">' + STACK_CHECK_SVG + esc(pill) + '</span>' +
+      '<span class="lib-stackpill__alt">' + STACK_MINUS_SVG + esc(undo) + '</span>' +
       '</button>';
   }
   // A child file shows its folder's membership as a plain status: Stack
@@ -3703,18 +3811,19 @@
     // status has nothing but its tooltip to offer on hover, so it must not be
     // the one that waits for the OS delay.
     return '<span class="lib-stackpill lib-instack lib-instack--fixed" data-stack-badge="' + id + '" ' +
-      'role="img" data-tip="Its collection is in your stack" ' +
-      'aria-label="In stack. Its collection is in your stack">' +
-      '<span class="lib-stackpill__rest">' + STACK_CHECK_SVG + 'In stack</span></span>';
+      'role="img" data-tip="Your agents can use it because its collection was added" ' +
+      'aria-label="Agents can use this. Its collection was added">' +
+      '<span class="lib-stackpill__rest">' + STACK_CHECK_SVG + 'Agents can use this</span></span>';
   }
-  function addToStackHtml(id, title, endpoint, body, removeEndpoint) {
+  function addToStackHtml(row, id, title, endpoint, body, removeEndpoint) {
+    const action = (row && row.dataset.copyAction) || 'Add to my agents';
     return '<button type="button" class="lib-stackpill lib-addstack" data-add-to-stack="' + id + '" ' +
       (endpoint ? 'data-stack-endpoint="' + esc(endpoint) + '" ' : '') +
       (body ? 'data-stack-body="' + esc(body) + '" ' : '') +
       (removeEndpoint ? 'data-stack-remove-endpoint="' + esc(removeEndpoint) + '" ' : '') +
-      'title="Let the default agent use ' + esc(title) + '" ' +
-      'aria-label="Add ' + esc(title) + ' to your Stack">' +
-      '<span class="lib-stackpill__rest">' + STACK_PLUS_SVG + 'Add to stack</span>' +
+      'title="Let your agents use ' + esc(title) + '" ' +
+      'aria-label="' + esc(action) + ': ' + esc(title) + '">' +
+      '<span class="lib-stackpill__rest">' + STACK_PLUS_SVG + esc(action) + '</span>' +
       '</button>';
   }
   function esc(s) {
@@ -3785,15 +3894,15 @@
         // false for a membership the caller had just created themselves.)
         setRowStackState(
           row,
-          inStackHtml(id, title, endpoint, stackBody, btn.dataset.stackRemoveEndpoint),
+          inStackHtml(row, id, title, endpoint, stackBody, btn.dataset.stackRemoveEndpoint),
           'in_stack');
-        if (window.appToast) window.appToast({ kind: 'success', msg: 'Added to Stack' });
+        if (window.appToast) window.appToast({ kind: 'success', msg: 'Added to your agents' });
       } else {
         setRowStackState(
           row,
-          addToStackHtml(id, title, endpoint, stackBody, btn.dataset.stackRemoveEndpoint),
+          addToStackHtml(row, id, title, endpoint, stackBody, btn.dataset.stackRemoveEndpoint),
           'available');
-        if (window.appToast) window.appToast({ kind: 'success', msg: 'Removed from Stack' });
+        if (window.appToast) window.appToast({ kind: 'success', msg: 'Removed from your agents' });
       }
     } catch (e) {
       console.error('library: stack update failed', e);
@@ -3801,7 +3910,7 @@
       if (window.appToast) {
         window.appToast({
           kind: 'error',
-          msg: (add ? 'Could not add to Stack: ' : 'Could not remove from Stack: ') + e.message,
+          msg: (add ? 'Could not add it: ' : 'Could not remove it: ') + e.message,
         });
       }
     }
@@ -3827,11 +3936,55 @@
   // A child is visible only when its folder is expanded AND the folder itself
   // survived the current filters — otherwise filtering a folder away would
   // leave its files behind as orphans.
+  //
+  // A SEARCH overrides the expanded state in both directions. A folder now
+  // matches on the filenames it holds (see `fname` in library_page), so a hit
+  // is frequently a folder the user has never opened — and the thing they
+  // typed is a file inside it. Under a query the folder opens itself and shows
+  // only the files that matched: the answer is the file, not the container.
+  // Child rows deliberately stay OUT of the engine's own row set — putting
+  // them in would scatter them away from their parent under sort and inflate
+  // every count on the page, for the same outcome this achieves.
+  // Narrowings that describe a FILE rather than a collection. Each one makes
+  // the folder a container for an answer rather than the answer, so each one
+  // opens the folder and hides the siblings — see syncChildren. The format
+  // selection is read off the checked inputs because the engine keeps its
+  // facet state private; the inputs ARE that state, so there is nothing to
+  // keep in step.
+  function childNarrowings() {
+    const searchEl = document.getElementById('lib-search');
+    const q = ((searchEl && searchEl.value) || '').trim().toLowerCase();
+    const formats = Array.prototype.map.call(
+      document.querySelectorAll('#lib-filter-menu input[data-facet="format"]:checked'),
+      i => i.value);
+    const tests = [];
+    if (q) tests.push(kid => (kid.getAttribute('data-search') || '').indexOf(q) !== -1);
+    if (formats.length) tests.push(kid => formats.indexOf(kid.getAttribute('data-format') || '') !== -1);
+    return tests;
+  }
   function syncChildren() {
+    const tests = childNarrowings();
+    const forced = new Set();
     document.querySelectorAll('[data-parent-id]').forEach(kid => {
       const parent = document.querySelector('[data-item-id="' + kid.dataset.parentId + '"]:not([data-parent-id])');
       const parentVisible = parent && !parent.hidden;
-      kid.hidden = !(parentVisible && openFolders.has(kid.dataset.parentId));
+      let show;
+      if (tests.length) {
+        show = !!parentVisible && tests.every(t => t(kid));
+        if (show) forced.add(kid.dataset.parentId);
+      } else {
+        show = !!parentVisible && openFolders.has(kid.dataset.parentId);
+      }
+      kid.hidden = !show;
+    });
+    // Keep the twisty honest: a folder showing its files must not read as
+    // collapsed. With no narrowing active the state is `openFolders` alone.
+    document.querySelectorAll('[data-folder-toggle]').forEach(toggle => {
+      const id = toggle.dataset.folderToggle;
+      const open = tests.length ? forced.has(id) : openFolders.has(id);
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      const row = toggle.closest('tr.lib-row');
+      if (row) row.classList.toggle('is-open', open);
     });
     markGroupEnd();  // expanding a folder moves where the collections block ends
   }

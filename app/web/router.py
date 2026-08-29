@@ -2432,8 +2432,16 @@ async def library_page(
             file_type_key, file_type_label = _artefact_type(file_count, first_file)
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
-            fname = first_file.get("filename") if first_file else ""
             is_folder = file_count != 1
+            # What this row can be FOUND by. Nobody searches for the folder —
+            # they search for the file inside it ("kpis"), and until now the
+            # engine saw only the folder's own name, so a file sitting visibly
+            # on screen answered "Nothing matches these filters". A folder is
+            # therefore searchable by every filename it holds; the client then
+            # opens it and hides the siblings, so the hit reads as the file.
+            fname = " ".join(f.get("filename") or "" for f in files) if is_folder else (
+                first_file.get("filename") if first_file else ""
+            )
             row = _library_row_base(
                 item_id=col["id"],
                 kind="artefact",
@@ -2492,6 +2500,17 @@ async def library_page(
             # file count there instead, so it needs none.
             row["file_format"] = "" if is_folder else _artefact_format(first_file)
             row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
+            # `file_format` is what the row PRINTS (a folder prints its file
+            # count instead, so it has none). `format_keys` is what the row can
+            # be FILTERED by, which for a folder is every format inside it —
+            # the same reason its search text holds every filename. Keeping the
+            # two apart is what lets a folder answer "show me PDFs" without
+            # claiming to be a PDF.
+            row["format_keys"] = (
+                sorted({fmt for f in files if (fmt := _artefact_format(f))})
+                if is_folder
+                else ([row["file_format"]] if row["file_format"] else [])
+            )
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2542,6 +2561,7 @@ async def library_page(
                     # nested rows are files too, and the retired Type column is
                     # where their format used to show.
                     child["file_format"] = _artefact_format(f)
+                    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
                     # Whether the extraction pass actually got text out of this
                     # file. Only surfaced when it is NOT `indexed`: a healthy
                     # file saying "indexed" on every row is noise, but a file
@@ -3362,6 +3382,16 @@ async def library_page(
             labels[k] = c.get(label_key) or k
         return sorted(((k, labels[k], n) for k, n in counts.items()), key=lambda x: x[1])
 
+    def _present_multi(attr_key: str) -> list:
+        """Tally a list-valued key. The count is top-level ROWS, not files:
+        it must equal what clicking the option leaves on screen, and the
+        engine returns rows."""
+        counts: dict = {}
+        for c in items:
+            for k in c.get(attr_key) or []:
+                counts[k] = counts.get(k, 0) + 1
+        return sorted(((k, k, n) for k, n in counts.items()), key=lambda x: x[1])
+
     library_origins = _present("origin", "origin_label")
     library_requirements = _present("requirement", "requirement_label")
     library_owners = _present("owner_key", "owner_label")
@@ -3650,7 +3680,7 @@ async def library_page(
         #: filtering: it tells you where a kind is, not how to see only it.
         #: File formats, from the rows that have one. Rendered on every file row
         #: already and filterable by nothing until now.
-        library_formats=_present("file_format", "file_format"),
+        library_formats=_present_multi("format_keys"),
         library_ownerships=library_ownerships,
         library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
