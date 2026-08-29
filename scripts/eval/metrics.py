@@ -234,6 +234,37 @@ def cluster_purity(ground_truth_facts: list[dict[str, Any]], actual_subjects: li
     return total_best_overlap / total_planted
 
 
+# ---------------------------------------------------------------------------
+# Alias-search ranking -- ordering-aware companion to precision/recall
+# (facts real-name lookup follow-up, `POST /api/facts/search {q}`).
+# ---------------------------------------------------------------------------
+
+
+def alias_search_hit_rank(actual_subjects: list[dict[str, Any]], target_alias: str) -> int | None:
+    """0-based rank of the first subject in an already `q=`-filtered
+    `POST /api/facts/search` response whose `aliases` contains
+    `target_alias`. `precision_recall_by_type`/`cluster_purity` above are
+    SET metrics -- order-blind, matching the API's pre-`q` behavior -- this
+    is the ordering-aware companion: it measures whether `q` actually RANKS
+    the intended subject near the top of `actual_subjects`, not merely
+    whether it appears anywhere. `None` when no subject in the response
+    carries the alias at all (a miss, not rank 0)."""
+    for rank, subject in enumerate(actual_subjects):
+        if target_alias in (subject.get("aliases") or []):
+            return rank
+    return None
+
+
+def top_k_alias_hit_rate(ranks: list[int | None], *, k: int = 1) -> float | None:
+    """Fraction of `alias_search_hit_rank` results landing within the top
+    `k` (0-based rank < `k`) -- a `None` rank (alias never found) always
+    counts as a miss. `None` overall when `ranks` is empty (nothing to
+    score), matching every other metric's "no data" convention here."""
+    if not ranks:
+        return None
+    return sum(1 for r in ranks if r is not None and r < k) / len(ranks)
+
+
 def conflict_rate_per_1000_docs(actual_subjects: list[dict[str, Any]], document_count: int) -> float | None:
     if document_count <= 0:
         return None
@@ -318,6 +349,20 @@ def fetch_and_score_release(
             resp.raise_for_status()
             edge_counts[subject["id"]] = len(resp.json().get("edges", []))
 
+        # Ordering-aware companion to precision/recall above: for each
+        # planted fact, query `q=` with a name derived from its own natural
+        # key (`<type>:<kebab-slug>` -> "kebab slug", the shape a human
+        # would actually type) and record where its OWN subject lands in
+        # that query's ranked results.
+        alias_ranks: list[int | None] = []
+        for fact in facts:
+            query_text = _alias_query_text(fact["natural_key"])
+            if not query_text:
+                continue
+            resp = client.post("/api/facts/search", json={"type": fact["type"], "q": query_text, "limit": 100})
+            resp.raise_for_status()
+            alias_ranks.append(alias_search_hit_rank(resp.json().get("subjects", []), fact["natural_key"]))
+
     pr_by_type = precision_recall_by_type(facts, actual_subjects)
     return {
         "release_id": release_id,
@@ -337,7 +382,16 @@ def fetch_and_score_release(
         "cluster_purity": cluster_purity(facts, actual_subjects),
         "conflict_rate_per_1000_docs": conflict_rate_per_1000_docs(actual_subjects, document_count),
         "orphan_rate": orphan_rate([s["id"] for s in actual_subjects], edge_counts),
+        "alias_search_top1_hit_rate": top_k_alias_hit_rate(alias_ranks, k=1),
     }
+
+
+def _alias_query_text(natural_key: str) -> str:
+    """`<type>:<kebab-slug>` -> `"kebab slug"` -- an approximation of the
+    natural-language name a human would type for `q=`, symmetric with the
+    repository's own normalization (casefold, spaces -> hyphens)."""
+    slug = natural_key.split(":", 1)[-1]
+    return slug.replace("-", " ").strip()
 
 
 def write_metrics_record(runs_dir: Path, release_id: str, record: dict[str, Any], *, ts: str) -> Path:

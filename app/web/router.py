@@ -48,6 +48,7 @@ from app.instance_config import (
     get_news_enabled,
     get_knowledge_digests_ui_enabled,
     get_contribute_skill_enabled,
+    get_store_moderation_enabled,
     get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
     feature_enabled,
@@ -1309,11 +1310,11 @@ async def how_it_works_page(
     from app.services.journey import mark_journey
     from src.repositories import mcp_sources_repo
 
-    # "Use Agnes outside this tab" is earned by ARRIVING here — this page is where
+    # "Take Agnes to your tools" is earned by ARRIVING here — this page is where
     # every connector lives, and it is the checklist row's own destination. The
     # row used to tick itself the instant it was clicked, before the reader had
-    # seen anything; the tour's "Connect my AI tools" button already marks it the
-    # same way (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
+    # seen anything; the tour's closing button already marks it the same way
+    # (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
     # app/services/journey.py) — a bookkeeping write must never fail a render.
     mark_journey(user.get("id"), use_anywhere=True)
 
@@ -4970,6 +4971,11 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         "can_news": get_news_enabled(),
         "can_knowledge_digests": get_knowledge_digests_ui_enabled(),
         "can_contribute_skill": get_contribute_skill_enabled(),
+        # The Moderation & Trust hub, retired on the same pattern: its three
+        # zones each have a better door already in the column (Submissions,
+        # Marketplaces, and verification's own switch), so the page was a
+        # landing spot for links you can reach directly.
+        "can_store_moderation": get_store_moderation_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -7651,6 +7657,63 @@ def _source_inventory(user: dict | None = None) -> dict:
 _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
 
+def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
+    """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
+    ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
+    file name + collection name it belongs to, for the card's drawer — a
+    bare hash "tells nobody anything" (live-use feedback, TCRD-240/241
+    follow-up).
+
+    ``None`` for an id this instance has never seen (`corpus_file_sources`
+    carries no row for it) — the caller renders that as the honest
+    "not in any collection" fallback next to the raw sha16, never a guess.
+    Also ``None`` on any lookup failure (PG-only `corpus_file_sources` on a
+    DuckDB-backed instance, a deleted collection, …) — resolution is a
+    read-only display nicety, never worth a 500 for the card.
+    """
+    try:
+        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+
+        source_row = corpus_file_sources_repo().get_by_source_doc_id(doc_id)
+        if source_row is None:
+            return None
+        file_row = corpus_files_repo().get(source_row["corpus_file_id"])
+        if file_row is None:
+            return None
+        collection = file_corpora_repo().get(file_row["corpus_id"])
+        return {
+            "name": file_row.get("filename"),
+            "collection": collection.get("name") if collection else None,
+        }
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: doc_id resolution failed for %s: %s", doc_id, e)
+        return None
+
+
+def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
+    """Add a resolved ``doc`` key (``{name, collection}`` or ``None``) to
+    each "Last run" rejection/deferred row, memoizing the lookup per
+    ``doc_id`` so a run with many claims against the same document does not
+    re-resolve it once per row. Every original key (``row``, ``reason``,
+    ``doc_id``, …) is preserved untouched — this only adds information, it
+    never replaces the raw fields the drawer's category counts and any
+    other reader of this cell already depend on.
+    """
+    doc_cache: dict[str, Optional[dict]] = {}
+    enriched = []
+    for row in rows:
+        row = dict(row)
+        doc_id = row.get("doc_id")
+        if doc_id:
+            if doc_id not in doc_cache:
+                doc_cache[doc_id] = _resolve_sharepoint_rejection_doc(doc_id)
+            row["doc"] = doc_cache[doc_id]
+        else:
+            row["doc"] = None
+        enriched.append(row)
+    return enriched
+
+
 def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
     (spec §13.2 "Source card"): crawl → text extraction + scan transcription
@@ -7755,9 +7818,9 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
-            "rejected_quotes": rejected_quotes,
-            "deferred": deferred,
-            "protocol_errors": protocol_errors,
+            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
+            "deferred": _enrich_sharepoint_rejection_rows(deferred),
+            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
         }
     else:
         cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
@@ -7813,8 +7876,13 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # collections with no group", fail-closed (an ungranted collection is
     # invisible to everyone, spec §13.1's "under-sharing looks like a bug"
     # made visible as a count rather than discovered by an analyst).
+    # `collections_total` (added alongside the card's rephrase to a plain
+    # sharing-state sentence — "all scope collections have a group" needs to
+    # know what "all" is) is `len(scope_ids)` regardless of whether the
+    # grants lookup below succeeds — it costs no extra query.
     groups_matched = 0
     collections_no_group = 0
+    collections_total = len(scope_ids)
     if scope_ids:
         try:
             from src.repositories import resource_grants_repo
@@ -7827,7 +7895,43 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
-    cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
+    cell["identity"] = {
+        "groups_matched": groups_matched,
+        "collections_no_group": collections_no_group,
+        "collections_total": collections_total,
+    }
+
+    # ── scopes: the connection's OWN confirmed scope rows (`config.scopes`),
+    # reused through `admin_sharepoint._scope_out` so the card renders
+    # exactly the connect wizard's own step-3 "Share" shape — one source of
+    # truth for what a scope row looks like, not a second projection that
+    # can drift from it. Each row degrades independently (a deleted
+    # collection, an unavailable grants repo) to its raw shape rather than
+    # dropping the row or failing the whole cell; a repo-wide failure
+    # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
+    # all rather than a 500 for the whole card — same posture as every
+    # other sub-block here. Unlike `scope_ids` above (a distinct-corpus
+    # heuristic over ingest history), this list is direct — every scope this
+    # CONNECTION has confirmed, whether or not it has ingested anything yet.
+    scopes: list[dict[str, Any]] = []
+    try:
+        from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
+
+        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
+        for raw_scope in (conn.get("config") or {}).get("scopes") or []:
+            if not isinstance(raw_scope, dict):
+                continue
+            try:
+                scopes.append(_scope_out(raw_scope, declared_corpus_ids))
+            except Exception as e:
+                logger.debug(
+                    "sharepoint pipeline cell: scope row resolution failed for %s: %s",
+                    raw_scope.get("source_scope_id"),
+                    e,
+                )
+    except Exception as e:
+        logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
+    cell["scopes"] = scopes
 
     # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
     # own confirmed scopes marked anonymize=true, read straight off `conn` —
@@ -8772,7 +8876,22 @@ async def admin_moderation_hub_page(
     submission queue and marketplace curation are surfaced as links (count +
     jump-off), not rebuilt here. ``/admin/store`` is the natural parent of the
     ``/admin/store/submissions`` review queue.
+
+    Hidden by default (``features.store_moderation_enabled``): the two links
+    it surfaces are their own nav rows, and verification has its own switch,
+    so the page was a landing spot for doors already in the column. Redirect
+    rather than 404 — its entry points were a sidebar row and a palette shortcut,
+    and a bookmark from before the flip should land somewhere useful.
+
+    NOTE: this page is the only UI that renders the queued agent-share
+    approvals (Track C6). While it is hidden they are decided through
+    ``GET/PATCH /api/admin/share-requests`` only, which is deliberate — owner-
+    initiated agent sharing is itself V2-deferred in the agent-profiles spec,
+    so on a default instance the queue this page would show is empty.
     """
+    if not get_store_moderation_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from app.instance_config import get_store_verification_enabled
 
     verification_enabled = get_store_verification_enabled()

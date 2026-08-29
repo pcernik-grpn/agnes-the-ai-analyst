@@ -103,7 +103,12 @@ extension/token-env allowlist controls *which* secret, never *where*. Gate the
 destination host with `is_attach_host_allowed(url)`
 (`AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`) before pairing any credential. Same rule
 for any new outbound call that carries a secret to a URL taken from untrusted
-data (see also the SSRF guard in `marketplace_asset_mirror`).
+data (see also the SSRF guard in `marketplace_asset_mirror`). The
+`AGNES_REMOTE_ATTACH_TOKEN_ENVS` override REPLACES the default token-env
+allowlist, so `get_allowed_token_envs()` always scrubs back out any name that
+belongs to a different consumer class (`_CONFIG_SECRET_ONLY_ENVS`,
+`_PRODUCER_KEY_ENVS`) — an operator listing one there must not resurrect it
+as a legal connector-ATTACH `token_env`.
 
 ## 9. Client IP for security decisions — trust only known hops (F9)
 

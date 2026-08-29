@@ -10,6 +10,12 @@ Covers:
   * renders the queue + marketplace jump-offs
   * lists a requested entity and links to /marketplace/flea/<id>
   * empty state when nothing is awaiting verification
+
+The page is HIDDEN by default (``features.store_moderation_enabled``, off —
+see tests/test_retired_admin_surfaces.py, which owns the hidden-by-default
+behavior and the redirect). This module is about what the page RENDERS, so
+`web_client` turns the flag on; without it every test here would assert
+against a 302 and pass for the wrong reason.
 """
 
 from __future__ import annotations
@@ -27,6 +33,8 @@ def web_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
+    # The hub is off by default; these tests are about its contents.
+    monkeypatch.setenv("AGNES_STORE_MODERATION_ENABLED", "1")
     (tmp_path / "state").mkdir()
     (tmp_path / "analytics").mkdir()
     (tmp_path / "extracts").mkdir()

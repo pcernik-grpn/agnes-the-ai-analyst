@@ -135,10 +135,15 @@ search|neighbors|claims` on the CLI; both mirror `POST /api/facts/search`,
 `POST /api/facts/neighbors`, `GET /api/facts/{id}/claims`).
 
 ```
-agnes facts search <type> [--filter key=value]   # find subjects (e.g. person, client)
-agnes facts neighbors <subject_id>                # traverse relationships (depth <= 2)
-agnes facts claims <subject_id>                   # the evidencing quote + document for one subject
+agnes facts search <type> [query] [--filter key=value]   # find subjects by type, an optional name, and/or attrs
+agnes facts neighbors <subject_id>                        # traverse relationships (depth <= 2)
+agnes facts claims <subject_id>                           # the evidencing quote + document for one subject
 ```
+
+`fact_search`'s optional `q` (the CLI's `[query]`) matches a subject's alias
+NAME only — never claim text — so use it when the question names a specific
+person or organization (e.g. "Parts Authority"); an exact or prefix match on
+the name ranks first.
 
 Cite every fact you use: `fact_claims` / `agnes facts claims` gives you the
 exact quote and its source document — name both in your answer, the same
