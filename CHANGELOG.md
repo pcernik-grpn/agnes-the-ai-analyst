@@ -234,6 +234,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   longer 500s the whole ingest.
 
 ### Changed
+- **One word per thing, across the surfaces where two had drifted (TCRD-208).** `/profile` stops calling admin elevation "god-mode" (now *full admin access*) and stops calling its confirmation a "consent gate" — "consent" already means OAuth provider consent everywhere else in Agnes, so one word was carrying two mechanisms a user meets in the same session. The connection pill on `/me/connections` states a state and nothing else (*Expired*, beside *Connected* and *Not connected*) — the remedy still lives in the detail line, where someone is actually reading. `/admin/semantic-layer` names its drift columns *in Agnes / in source* rather than *stored / upstream*, and no longer points readers at a *Master token (semantic layer)* row that was renamed to *Semantic-layer token*. `/admin/linked-apps` writes `ID` beside `URL` rather than `Id`. The login page's apostrophes are typographic, like the rest of the repo. `tests/test_product_vocabulary.py` pins each decision, because the design-system contract tests police colour and spacing but nothing policed language — which is why sixteen design reviews each re-found a naming collision independently.
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
   The old rule — whichever PR happened to land last with content under
   `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
