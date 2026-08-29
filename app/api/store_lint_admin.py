@@ -22,6 +22,7 @@ from app.instance_config import (
     get_lint_audit_min_interval_hours,
     get_lint_duplicate_top_n,
 )
+from src.audit_helpers import log_safe
 from src.repositories import store_entities_repo, store_lint_repo
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,12 @@ async def run_lint_audit(
     repo = store_lint_repo()
     last = repo.last_full_audit_run()
     if not body.force and not _audit_due(last, get_lint_audit_min_interval_hours()):
+        log_safe(
+            user_id=admin.get("id"),
+            action="run_store_lint_audit",
+            resource="job:store-lint-audit",
+            params={"skipped": True},
+        )
         return {"skipped": True, "last_run": last}
 
     # Label automated vs manual runs. The scheduler sidecar sends only
@@ -231,7 +238,19 @@ async def run_lint_audit(
         (admin.get("email") or "").strip().lower() == SCHEDULER_USER_EMAIL
     )
     trigger = "scheduler" if is_scheduler else "admin"
-    return await run_in_threadpool(_run_full_audit, trigger)
+    result = await run_in_threadpool(_run_full_audit, trigger)
+    log_safe(
+        user_id=admin.get("id"),
+        action="run_store_lint_audit",
+        resource="job:store-lint-audit",
+        params={
+            "trigger": trigger,
+            "entities_linted": result.get("entities_linted"),
+            "entities_skipped": result.get("entities_skipped"),
+            "findings_count": result.get("findings_count"),
+        },
+    )
+    return result
 
 
 @router.post("/lint-dismiss")

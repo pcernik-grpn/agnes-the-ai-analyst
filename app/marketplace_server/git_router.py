@@ -43,6 +43,7 @@ from fastapi.responses import StreamingResponse
 
 from app.auth.pat_resolver import resolve_token_to_user
 from app.marketplace_server import git_backend
+from src.audit_helpers import log_safe
 from src.db import get_system_db
 
 logger = logging.getLogger(__name__)
@@ -385,6 +386,17 @@ async def _marketplace_git(path: str, request: Request):
         return _unauthorized()
     if repo_path is None:
         return _server_error()
+
+    # Log AFTER the PAT Basic-auth resolution above so user_id is real —
+    # never before. Classified fetch vs push by the git smart-HTTP endpoint
+    # name, not by HTTP method: both info/refs and git-upload-pack
+    # negotiation (fetch) can arrive as GET or POST.
+    action = "marketplace.git_push" if path.rstrip("/").endswith("git-receive-pack") else "marketplace.git_fetch"
+    log_safe(
+        user_id=user.get("id") if isinstance(user, dict) else None,
+        action=action,
+        resource=f"marketplace.git:{user.get('id') if isinstance(user, dict) else 'unknown'}",
+    )
 
     body = await request.body()
     remote_user = user.get("email") or user.get("id")

@@ -160,7 +160,7 @@
       <li><strong>{{ c.name }}</strong> — {{ c.reason }}</li>
       {% endfor %}
     </ul>
-    A master token is set in the <em>Master token (semantic layer)</em> row at
+    A master token is set in the <em>Semantic-layer token</em> row at
     <a href="/admin/data-sources">Data sources</a> — it is a separate token from the
     storage token used to pull tables, and it must be the project owner's.
     {% else %}
@@ -174,7 +174,7 @@
     <thead>
       <tr>
         <th>Source</th>
-        <th class="num">Metrics <span class="sl-source-detail">stored / upstream</span></th>
+        <th class="num">Metrics <span class="sl-source-detail">in Agnes / in source</span></th>
         <th class="num">Glossary</th>
         <th>Last sync</th>
       </tr>

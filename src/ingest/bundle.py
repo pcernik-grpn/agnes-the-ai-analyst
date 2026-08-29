@@ -31,11 +31,13 @@ from __future__ import annotations
 import logging
 import posixpath
 import zipfile
+from collections import defaultdict
 from typing import Any, Callable, Optional
 
 from src.corpus_allowlist import MAX_UPLOAD_BYTES, classify
 from src.file_storage import store_corpus_bytes
 from src.ingest.confluence import normalize_html
+from src.ingest.member_identity import is_reserved_member_stable_id
 from src.repositories import (
     RequiresPostgresBackend,
     corpus_chunks_repo,
@@ -67,15 +69,32 @@ def _is_junk(name: str) -> bool:
     return name.startswith(_SKIP_PREFIXES) or posixpath.basename(name) in _SKIP_BASENAMES
 
 
+def _is_stable_id_race(exc: Exception) -> bool:
+    """True when ``exc`` is the ``(corpus_id, source_stable_id)`` unique-
+    constraint violation two overlapping ``ingest_bundle`` runs can produce
+    (review finding 3) — never any OTHER integrity error, which should still
+    surface as a real bug rather than being silently swallowed here."""
+    from sqlalchemy.exc import IntegrityError
+
+    return isinstance(exc, IntegrityError) and "uq_corpus_file_sources_corpus_stable_id" in str(exc)
+
+
 def _member_stable_id(archive_file_id: str, member_name: str) -> str:
     """Deterministic ``corpus_file_sources.source_stable_id`` for one member.
 
-    ``"<archive corpus_files.id>!<member path>"`` — the ``!`` cannot collide
-    with a real producer-supplied top-level ``source_stable_id``: those
-    follow the crawler's own conventions (``graph:<driveItem-id>``,
-    ``local:<relpath>``, spec §6), which never start with ``cf_``, the fixed
-    prefix every ``corpus_files.id`` carries
-    (``src/repositories/corpus_files.py::add``).
+    ``"<archive corpus_files.id>!<member path>"`` — this shape is RESERVED,
+    not merely conventionally distinct: a real producer-supplied top-level
+    ``source_stable_id`` follows the crawler's own convention
+    (``graph:<driveItem-id>``, ``local:<relpath>``, spec §6), which never
+    starts with ``cf_``, the fixed prefix every ``corpus_files.id`` carries
+    (``src/repositories/corpus_files.py::add``) — but the shape is NOT a
+    secret (an ordinary file listing exposes both halves to anyone with
+    collection READ access), so ``is_reserved_member_stable_id`` REFUSES a
+    caller-supplied value on this shape at every entry point that accepts
+    one (the upload endpoint's ``source_stable_ids``, the facts ingest
+    ``documents[].stable_id``) — only this function may mint one. The
+    assertion below keeps that invariant self-checking rather than merely
+    documented.
 
     The archive's OWN row id is used, never its (optional) own
     ``source_stable_id``: it is always present — every ``corpus_files`` row
@@ -85,7 +104,12 @@ def _member_stable_id(archive_file_id: str, member_name: str) -> str:
     what makes a routine re-upload of an N-member zip keep the N-1 unchanged
     members' anchors (and therefore their claims), not just their rows.
     """
-    return f"{archive_file_id}!{member_name}"
+    stable_id = f"{archive_file_id}!{member_name}"
+    assert is_reserved_member_stable_id(stable_id), (
+        f"minted stable_id {stable_id!r} does not match the reserved shape it is supposed to occupy "
+        f"— archive_file_id {archive_file_id!r} must start with 'cf_'"
+    )
+    return stable_id
 
 
 def ingest_bundle(
@@ -148,9 +172,26 @@ def _ingest_bundle_members(
         )
         return "rejected"
 
-    # Existing children from a previous run, for row reuse.
-    prior = {(k["filename"], k["sha256"]): k for k in cf_repo.list_children(file_id)}
-    kept_ids: set[str] = set()
+    # Existing children from a previous run, for row reuse. A MULTI-map, not
+    # a plain dict: two entries in ONE zip can legally share the same
+    # (filename, sha256) — most commonly two rejected members with the same
+    # name, since every rejected member is stored with `sha256=""`. A plain
+    # `dict` comprehension collapses duplicate keys to whichever prior row
+    # sorted last, silently dropping the rest of `prior` — invisible to both
+    # the reuse match below AND (before this fix) the prune loop, so an
+    # unmatched duplicate orphaned permanently, one more per re-sync round
+    # (review finding 4). `_claim_prior` consumes with `pop(0)`, so N
+    # same-key prior rows pair up with N same-key current entries in file
+    # order; only genuinely-unmatched leftovers (renamed/removed members)
+    # remain in `prior_by_key` for the prune step below.
+    prior_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for k in cf_repo.list_children(file_id):
+        prior_by_key[(k["filename"], k["sha256"])].append(k)
+
+    def _claim_prior(name: str, sha256: str) -> Optional[dict]:
+        bucket = prior_by_key.get((name, sha256))
+        return bucket.pop(0) if bucket else None
+
     # (child_id, member name, member sha256) for every successfully-stored
     # member — anchors are written AFTER the prune step below, not here: a
     # renamed/changed member reuses the SAME `_member_stable_id` (it is keyed
@@ -163,17 +204,20 @@ def _ingest_bundle_members(
     children = 0
 
     def _add_rejected(name: str, size: int, reason: str) -> None:
-        cid = cf_repo.add(
-            corpus_id=corpus_id,
-            filename=name,
-            sha256="",
-            file_type=None,
-            size_bytes=size,
-            storage_path=None,
-            parent_file_id=file_id,
-        )
+        existing = _claim_prior(name, "")
+        if existing:
+            cid = existing["id"]
+        else:
+            cid = cf_repo.add(
+                corpus_id=corpus_id,
+                filename=name,
+                sha256="",
+                file_type=None,
+                size_bytes=size,
+                storage_path=None,
+                parent_file_id=file_id,
+            )
         cf_repo.set_status(cid, status="rejected", detail={"reason": reason})
-        kept_ids.add(cid)
         counts["rejected"] += 1
 
     for info in infos:
@@ -203,7 +247,7 @@ def _ingest_bundle_members(
             continue
 
         stored = store_corpus_bytes(corpus_id, name, data)
-        existing = prior.get((name, stored.sha256))
+        existing = _claim_prior(name, stored.sha256)
         if existing:
             child_id = existing["id"]
         else:
@@ -216,26 +260,28 @@ def _ingest_bundle_members(
                 storage_path=stored.storage_path,
                 parent_file_id=file_id,
             )
-        kept_ids.add(child_id)
         if sources_repo is not None:
             to_anchor.append((child_id, name, stored.sha256))
         status = ingest_child(child_id)
         counts[status] = counts.get(status, 0) + 1
 
     # Prune children from a prior run that no longer match (renamed/changed).
-    # Each removed row is hard-deleted, so its own `corpus_file_sources`
-    # anchor (FK `ondelete="CASCADE"`) and any fact-graph claims
-    # (`claims.corpus_file_id -> corpus_files.id ON DELETE CASCADE`) go with
-    # it — a subject left with zero claims by that cascade is swept below,
-    # same as any other document-deletion path (spec §6). A removed member
-    # that was itself a derived table (tabular extension inside the zip) also
-    # has its `table_registry` row/parquet purged — before this capability
-    # existed, that same reconciliation branch was unreachable in practice: a
-    # changed ARCHIVE used to hard-purge every member up front (see
+    # Whatever is left in `prior_by_key` after every current entry has tried
+    # to `_claim_prior` it is, by construction, unmatched — no separate
+    # `kept_ids` membership check needed. Each removed row is hard-deleted,
+    # so its own `corpus_file_sources` anchor (FK `ondelete="CASCADE"`) and
+    # any fact-graph claims (`claims.corpus_file_id -> corpus_files.id ON
+    # DELETE CASCADE`) go with it — a subject left with zero claims by that
+    # cascade is swept below, same as any other document-deletion path
+    # (spec §6). A removed member that was itself a derived table (tabular
+    # extension inside the zip) also has its `table_registry` row/parquet
+    # purged — before this capability existed, that same reconciliation
+    # branch was unreachable in practice: a changed ARCHIVE used to
+    # hard-purge every member up front (see
     # `app.api.collections._purge_children_and_content`), so this loop never
     # ran against a real removal; now it does.
     chunks_repo = corpus_chunks_repo()
-    removed = [row for row in prior.values() if row["id"] not in kept_ids]
+    removed = [row for bucket in prior_by_key.values() for row in bucket]
     if removed:
         from app.api.collections import _schedule_derived_purge, _sweep_facts_orphans_after_delete
 
@@ -256,13 +302,39 @@ def _ingest_bundle_members(
     # with no `documents[]` entry at all, exactly like an already-resolved
     # top-level doc_id.
     for child_id, name, sha256 in to_anchor:
-        sources_repo.upsert(
-            corpus_file_id=child_id,
-            corpus_id=corpus_id,
-            source_stable_id=_member_stable_id(file_id, name),
-            source_doc_id=sha256[:16],
-            source_sha256=sha256,
-        )
+        try:
+            sources_repo.upsert(
+                corpus_file_id=child_id,
+                corpus_id=corpus_id,
+                source_stable_id=_member_stable_id(file_id, name),
+                source_doc_id=sha256[:16],
+                source_sha256=sha256,
+            )
+        except Exception as exc:
+            if not _is_stable_id_race(exc):
+                raise
+            # Concurrency guard (review finding 3): two overlapping
+            # `ingest_bundle` runs on the SAME archive — e.g. `upload_files`
+            # double-fired by a client retry racing the already-scheduled
+            # background task — can both mint a FRESH row for the same
+            # changed member and then both try to claim the same
+            # `_member_stable_id`. `upsert`'s conflict target is
+            # `corpus_file_id` (the PK), not the `(corpus_id,
+            # source_stable_id)` pair, so the loser of that race hits the
+            # unique constraint as what would otherwise be an unhandled
+            # `IntegrityError` -> 500. This run's OWN member content is
+            # already correctly stored and (re)ingested either way — only
+            # the anchor write is skipped — and the very next `ingest_bundle`
+            # pass (a routine re-sync) reconciles the loser's now-orphaned
+            # duplicate row via the ordinary `(filename, sha256)` prune, so
+            # nothing is left permanently inconsistent.
+            logger.warning(
+                "bundle member anchor race: %s already anchored by a concurrent run file_id=%s member=%r child_id=%s",
+                _member_stable_id(file_id, name),
+                file_id,
+                name,
+                child_id,
+            )
 
     detail = {"kind": "bundle", "children": children, **counts}
     if counts["indexed"] > 0:

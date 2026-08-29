@@ -91,6 +91,7 @@ from src.keboola_chat_tools import (
     derived_tool_id,
     exposed_tool_name,
 )
+from src.audit_helpers import log_safe
 from src.repositories import (
     connection_secrets_repo,
     mcp_sources_repo,
@@ -793,6 +794,12 @@ async def create_connection(
     row = _with_secret_status(repo.get(conn_id))
     if body.source_type == "keboola" and body.seed_from_instance_credentials and row is not None:
         row = await _seed_keboola_instance_credential(conn_id, row)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.create",
+        resource=f"source_connection:{conn_id}",
+        params={"name": body.name, "source_type": body.source_type},
+    )
     return row
 
 
@@ -996,6 +1003,16 @@ async def update_connection(
         is_default=body.is_default,
     )
     _resync_derived_chat_tools(connection_id)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.update",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "fields": sorted(
+                k for k, v in body.model_dump(exclude_unset=True).items() if k != "confirm_connection_change"
+            )
+        },
+    )
     return _with_secret_status(repo.get(connection_id))
 
 
@@ -1125,6 +1142,12 @@ async def delete_connection(
     # advice. (Devin Review on this PR.)
     _remove_chat_tools(connection_id)
     repo.delete(connection_id)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.delete",
+        resource=f"source_connection:{connection_id}",
+        params={"source_type": row.get("source_type")},
+    )
     # Best-effort: clear any vault secret — ignore if none exists.
     try:
         connection_secrets_repo().delete(connection_id)
@@ -1394,6 +1417,13 @@ async def set_connection_secret(
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
     await _store_connection_secret(connection_id, row, body.value, body.kind)
+    # NEVER include body.value — the secret itself never enters the audit record.
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.secret.set",
+        resource=f"source_connection:{connection_id}",
+        params={"kind": body.kind},
+    )
 
 
 @router.delete("/{connection_id}/secret", status_code=204)
@@ -1412,6 +1442,12 @@ async def delete_connection_secret(
         raise HTTPException(status_code=400, detail="invalid_kind")
     key = master_secret_key(connection_id) if kind == "master" else connection_id
     connection_secrets_repo().delete(key)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.secret.clear",
+        resource=f"source_connection:{connection_id}",
+        params={"kind": kind},
+    )
     if kind != "master":
         # The chat-tools source holds a COPY of the storage token, taken at
         # enable time. Clearing the connection's token is how an admin cuts a
@@ -1918,6 +1954,12 @@ async def test_connection(
     row = source_connections_repo().get(connection_id)
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
+
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.test",
+        resource=f"source_connection:{connection_id}",
+    )
 
     config = row.get("config") or {}
     try:
