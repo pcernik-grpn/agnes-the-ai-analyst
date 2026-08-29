@@ -68,6 +68,98 @@ router = APIRouter(tags=["semantic-models"])
 _SWEEP_BATCH_SIZE = 3
 _SWEEP_SESSION_TIMEOUT_S = 60
 
+# How stale a ``semantic_draft_pending_at`` stamp has to be before the sweep
+# treats the table as a candidate again. Seven days, and it is the ONLY thing
+# that re-opens a table whose session ran but filed nothing an admin can
+# resolve.
+#
+# The alternative — clearing the stamp on the way out of such a tick — was
+# wrong twice over. (1) ``run_one_shot`` reports a wait timeout by RETURNING
+# ``timed_out=True``, not by raising, and the sandbox keeps processing the
+# turn after it returns (``app/chat/headless.py``): every session slower than
+# ``_SWEEP_SESSION_TIMEOUT_S`` therefore looked like "filed nothing", got
+# un-stamped, and then filed in the background — so the table was re-drafted
+# on every following tick, one duplicate pending suggestion each. (2) An
+# immediate clear also makes the table eligible again on the very next tick,
+# and with ``list_all()``'s stable order a handful of tables the drafter keeps
+# declining occupy the whole batch forever, starving everything behind them.
+#
+# Seven days is a scheduler-relative number, not a magic one: the sweep fires
+# every 55 minutes, so it is ~180 skipped ticks — long enough that a declined
+# table costs about one retry a week rather than one an hour, short enough
+# that a table the drafter declined because of a transient gap (a missing
+# profile, an empty catalog, a model having a bad day) is not shelved for a
+# quarter. Fresh, never-stamped tables always take the batch ahead of
+# stale-stamped ones, so this retry stream can never starve a new table.
+_SWEEP_STAMP_RETRY_AFTER_S = 7 * 24 * 60 * 60
+
+# Sort sentinel for a never-stamped candidate — see ``_stamp_sort_key``.
+_SWEEP_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _stamp_as_utc(stamp: Any) -> datetime:
+    """Coerce a ``semantic_draft_pending_at`` value to an aware UTC datetime.
+
+    Postgres hands back an aware datetime for its ``timestamptz`` column;
+    the naive and ISO-string branches are defensive (a driver that decodes
+    differently must not crash the sweep), and a naive value is read as UTC
+    because that is what the writer stored.
+    """
+    if isinstance(stamp, str):
+        stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        return stamp.replace(tzinfo=UTC)
+    return stamp.astimezone(UTC)
+
+
+def _stamp_sort_key(stamp: Any) -> tuple[int, datetime]:
+    """Ordering key for one candidate: never-stamped first, then oldest
+    stamp first.
+
+    A single ``(group, when)`` tuple rather than two passes, so ``sorted``'s
+    stability preserves ``list_all()``'s own order inside the unstamped
+    group. Both slots always hold the same types, so the tuples are always
+    comparable (a ``None`` in slot 2 would raise on the first comparison
+    against a datetime).
+    """
+    if stamp is None:
+        return (0, _SWEEP_EPOCH)
+    return (1, _stamp_as_utc(stamp))
+
+
+def _sweep_candidates(tables: list[dict], *, now: datetime | None = None) -> list[dict]:
+    """Filter + order one tick's candidate tables.
+
+    Eligible: no ``semantic_draft_pending_at`` stamp at all, or one older
+    than :data:`_SWEEP_STAMP_RETRY_AFTER_S`. Ordered never-stamped first
+    (see :func:`_stamp_sort_key`), so a backlog of repeatedly-declined
+    tables reclaiming their eligibility can never take the batch away from
+    a table that has not been tried once.
+
+    A stamp that cannot be read at all (unparseable string, odd type) is
+    treated as "stamped and fresh" — the table is skipped this tick. Erring
+    toward skipping is the safe direction: the opposite would draft a table
+    whose session may still be running.
+    """
+    now = now or datetime.now(UTC)
+    eligible: list[dict] = []
+    for table in tables:
+        stamp = table.get("semantic_draft_pending_at")
+        if not stamp:
+            eligible.append(table)
+            continue
+        try:
+            age = (now - _stamp_as_utc(stamp)).total_seconds()
+        except (TypeError, ValueError, AttributeError):
+            logger.warning(
+                "semantic auto-draft sweep: unreadable semantic_draft_pending_at on table %s — skipping this tick",
+                table.get("id"),
+            )
+            continue
+        if age >= _SWEEP_STAMP_RETRY_AFTER_S:
+            eligible.append(table)
+    return sorted(eligible, key=lambda t: _stamp_sort_key(t.get("semantic_draft_pending_at")))
+
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -434,9 +526,9 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
 
     Scheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)
     — admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``
-    uncovered, not-already-pending tables (``tables_without_semantic_
-    coverage``, filtered on ``semantic_draft_pending_at IS NULL``), runs a
-    headless ``semantic-model-builder`` chat session (``app.chat.headless.
+    uncovered, eligible tables (``tables_without_semantic_coverage`` narrowed
+    and ordered by :func:`_sweep_candidates`), runs a headless
+    ``semantic-model-builder`` chat session (``app.chat.headless.
     run_one_shot``) authenticated as the non-admin ``semantic-drafter``
     system identity (``app.auth.system_users``) — so every draft it
     produces lands in the ``authoring_suggestions`` moderation queue
@@ -448,34 +540,49 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     clears when an admin resolves the resulting suggestion, approve or
     reject alike (``app/api/authoring_suggestions.py``).
 
+    Re-eligibility is by stamp AGE, not by clearing the stamp on the way
+    out of a tick that filed nothing: a stamp older than
+    ``_SWEEP_STAMP_RETRY_AFTER_S`` (7 days) makes the table a candidate
+    again, and never-stamped tables sort ahead of stale-stamped ones. That
+    is what keeps two things true at once — a slow session's table is not
+    re-drafted while its sandbox is still working on the turn, and a table
+    the drafter keeps declining does not sit at the head of every batch
+    forever. See the constant's own comment for the two bugs an immediate
+    clear caused.
+
     A session hitting the chat manager's per-user concurrency cap
     (``ConcurrencyCapHit``) is counted and skipped, never raised as a
-    500 — and its dedup flag is cleared again on the way out, so the
-    table stays eligible for a later tick. That un-stamping matters: the
-    cap is enforced inside ``ChatManager.create_session``, before the
-    prompt is ever sent, so a capped table's session never started and no
-    suggestion will ever exist to clear the flag on resolution. Left set,
-    the flag would exclude the table from every future sweep permanently.
+    500 — and its dedup flag IS cleared again on the way out, so the
+    table is eligible on the very next tick rather than in a week. That
+    un-stamping is safe here and nowhere else: the cap is enforced inside
+    ``ChatManager.create_session``, before the prompt is ever sent, so a
+    capped table's session provably never started and cannot file anything
+    in the background.
 
-    ANY other failure from a table's session is treated the same way and
-    for the same reason (counted in ``errored``): the table is un-stamped,
-    logged, and the sweep moves on to the next one rather than letting one
-    transient broker/LLM/spawn error 500 the whole tick and abandon the
-    rest of the batch. Un-stamping on an error the session may have
-    survived can at worst cost a duplicate draft — one extra queued
-    suggestion an admin rejects — whereas leaving it stamped costs the
-    table its eligibility forever, silently. The bounded, visible failure
-    is the right one to choose.
+    ANY other failure from a table's session is treated the same way
+    (counted in ``errored``): the table is un-stamped, logged, and the
+    sweep moves on rather than letting one transient broker/LLM/spawn
+    error 500 the whole tick and abandon the rest of the batch. Un-stamping
+    on an error the session may have survived can at worst cost a duplicate
+    draft — one extra queued suggestion an admin rejects — and unlike the
+    timeout case it is not the routine outcome, so paying for a fast retry
+    is the right trade.
 
     Returns ``{"triggered": N, "applied": A, "no_apply_call": X,
-    "skipped_cap": M, "errored": E, "remaining": R}`` — ``applied`` counts a table whose
-    session produced a NEW ``authoring_suggestions`` row before this
-    call's wait ended, detected by diffing the semantic-drafter's pending
-    suggestion count immediately before and after each session (sessions
-    run strictly in order, one at a time, so the diff cannot be confused
-    by another table's suggestion); ``no_apply_call`` is everything else
-    the session actually ran for. ``remaining`` is how many eligible
-    tables were left over after this tick's batch.
+    "timed_out": T, "skipped_cap": M, "errored": E, "remaining": R}``.
+    ``applied`` counts a table whose session produced a NEW
+    ``authoring_suggestions`` row before this call's wait ended, detected
+    by diffing the semantic-drafter's pending suggestion count immediately
+    before and after each session (sessions run strictly in order, one at a
+    time, so the diff cannot be confused by another table's suggestion).
+    ``timed_out`` counts a session whose wait hit ``_SWEEP_SESSION_TIMEOUT_S``
+    with nothing filed yet — ``run_one_shot`` reports that by RETURNING
+    ``timed_out=True`` rather than raising, and the sandbox keeps
+    processing the turn after it returns, so the table keeps its stamp and
+    a suggestion may still arrive. ``no_apply_call`` is a session that
+    genuinely finished and chose to file nothing; it keeps its stamp too
+    and comes back via the TTL. ``remaining`` is how many eligible tables
+    were left over after this tick's batch.
 
     A3 PG-first ratchet: the dedup flag this sweep relies on
     (``table_registry.mark_semantic_draft_pending`` /
@@ -496,7 +603,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     from src.semantic_autodraft import build_trigger_prompt
     from src.semantic_coverage import tables_without_semantic_coverage
 
-    candidates = [t for t in tables_without_semantic_coverage() if not t.get("semantic_draft_pending_at")]
+    candidates = _sweep_candidates(tables_without_semantic_coverage())
 
     manager = get_current_chat_manager()
     if manager is None:
@@ -506,6 +613,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
             "triggered": 0,
             "applied": 0,
             "no_apply_call": 0,
+            "timed_out": 0,
             "skipped_cap": 0,
             "errored": 0,
             "remaining": len(candidates),
@@ -540,6 +648,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     triggered = 0
     applied = 0
     no_apply_call = 0
+    timed_out = 0
     skipped_cap = 0
     errored = 0
 
@@ -547,7 +656,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
         registry.mark_semantic_draft_pending(table["id"])
         before = _pending_count()
         try:
-            await run_one_shot(
+            outcome = await run_one_shot(
                 manager,
                 user_email=SEMANTIC_DRAFTER_USER_EMAIL,
                 agent_id=None,
@@ -589,14 +698,45 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
             continue
         triggered += 1
         if _pending_count() > before:
+            # Filing happens mid-turn, so this is checked before the timeout
+            # branch: a session can land its suggestion and STILL have its
+            # wait time out afterwards. Either way an admin resolution is
+            # now what clears the stamp.
             applied += 1
+        elif (outcome or {}).get("timed_out"):
+            # NOT a failure and NOT "filed nothing": `run_one_shot` returns
+            # `timed_out=True` without raising, and the sandbox keeps
+            # processing the turn after it returns
+            # (`app/chat/headless.py`). Un-stamping here — which is what
+            # the old code did, by discarding this return and falling into
+            # the branch below — let the background session file its
+            # suggestion AFTER the table was made eligible again, so the
+            # next tick drafted it a second time, and the one after that a
+            # third. The stamp stays; if a suggestion does arrive, its
+            # resolution clears it, and if none ever does, the stamp ages
+            # past `_SWEEP_STAMP_RETRY_AFTER_S` and the table comes back.
+            logger.info(
+                "semantic auto-draft sweep: session for table %s is still running past %ss — "
+                "keeping its pending flag so a later tick cannot double-draft it",
+                table["id"],
+                _SWEEP_SESSION_TIMEOUT_S,
+            )
+            timed_out += 1
         else:
+            # The session ran to completion and chose not to submit a
+            # suggestion. The stamp stays here too: an immediate clear made
+            # the table eligible on the very next tick, and a few tables the
+            # drafter keeps declining then hold the whole batch forever
+            # (`list_all()` order is stable), so nothing behind them is ever
+            # reached. `_SWEEP_STAMP_RETRY_AFTER_S` is what brings it back,
+            # behind any table that has never been tried.
             no_apply_call += 1
 
     result = {
         "triggered": triggered,
         "applied": applied,
         "no_apply_call": no_apply_call,
+        "timed_out": timed_out,
         "skipped_cap": skipped_cap,
         "errored": errored,
         "remaining": remaining,

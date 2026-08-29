@@ -463,6 +463,125 @@ class TestTableBinding:
         assert [m for m in metric_repo().list() if m.get("source") == "manual"] == []
 
 
+class TestWarehouseShapedBindings:
+    """Table-driven cover for the two warehouse identifier shapes the generic
+    binder (#1631/#1668) was built for but never pinned as a goal: Snowflake's
+    ``DATABASE.SCHEMA.TABLE`` (emitted UPPERCASE unless the object was created
+    quoted) and Databricks's ``catalog.schema.view`` (emitted lowercase).
+
+    The registered row and the document can disagree in case for the very same
+    table — the admin who ran ``agnes admin register-table --bucket … --source-
+    table …`` typed whatever they typed, and the adapter composes from the
+    account's own information-schema — so every row below is stated as
+    (what was registered) × (what the document says), and both must resolve to
+    the same registry row. A document identifier is matched on its LAST TWO
+    segments, so the leading database/catalog segment is ignored by design:
+    the same table registered once serves a document that names it with or
+    without its catalog.
+    """
+
+    # (case id, registered source_type, registered bucket, registered
+    #  source_table, the identifier the document declares)
+    _BINDS = [
+        # --- Snowflake: UPPERCASE identifiers, 3 segments ------------------
+        ("sf_upper_both_sides", "snowflake", "RAW", "ORDERS", "ESHOP_DEMO.RAW.ORDERS"),
+        ("sf_doc_upper_row_lower", "snowflake", "raw", "orders", "ESHOP_DEMO.RAW.ORDERS"),
+        ("sf_doc_lower_row_upper", "snowflake", "RAW", "ORDERS", "eshop_demo.raw.orders"),
+        ("sf_mixed_case", "snowflake", "Raw", "Orders", "EshopDemo.RAW.orders"),
+        # A 2-segment identifier (no database qualifier) is the same match.
+        ("sf_two_segments", "snowflake", "RAW", "ORDERS", "RAW.ORDERS"),
+        # --- Databricks: lowercase catalog.schema.view --------------------
+        ("dbx_lower_both_sides", "databricks", "sales", "orders_view", "main.sales.orders_view"),
+        ("dbx_doc_mixed_row_lower", "databricks", "sales", "orders_view", "Main.Sales.Orders_View"),
+        ("dbx_doc_lower_row_upper", "databricks", "SALES", "ORDERS_VIEW", "main.sales.orders_view"),
+        ("dbx_two_segments", "databricks", "sales", "orders_view", "sales.orders_view"),
+    ]
+
+    @pytest.mark.parametrize(
+        "source_type,bucket,source_table,identifier",
+        [pytest.param(*case[1:], id=case[0]) for case in _BINDS],
+    )
+    def test_the_metric_binds_to_the_registered_table(
+        self, system_db, source_type, bucket, source_table, identifier
+    ):
+        _register_table(source_type, bucket, source_table, "warehouse_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": identifier}, table_id=identifier),
+            source="ossie_git",
+            source_ref="repo-a",
+        )
+
+        row = _only_metric(source="ossie_git", source_ref="repo-a")
+        assert row["table_name"] == "warehouse_orders"
+        # Bound means RUNNABLE — a composed SELECT, not the bare fragment.
+        assert row["sql"].startswith("SELECT ")
+        assert "SUM(amount)" in row["sql"]
+
+    @pytest.mark.parametrize(
+        "source_type,bucket,source_table,identifier",
+        [pytest.param(*case[1:], id=case[0]) for case in _BINDS],
+    )
+    def test_the_dataset_resolves_to_the_registered_table_id(
+        self, system_db, source_type, bucket, source_table, identifier
+    ):
+        """The same shapes through the OTHER resolver — the one
+        ``column_metadata`` keys on and ``tables_without_semantic_coverage``
+        reads. The two must agree, or a table would count as covered while
+        its metric was skipped (or the reverse)."""
+        from src.semantic.projection import resolve_dataset_table
+
+        _register_table(source_type, bucket, source_table, "warehouse_orders")
+
+        resolved = resolve_dataset_table({"name": "orders", "source": identifier}, "ossie_git")
+
+        assert resolved == "warehouse_orders"
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            pytest.param("ESHOP_DEMO.RAW.GHOSTS", id="sf_unregistered_table"),
+            pytest.param("ESHOP_DEMO.STAGING.ORDERS", id="sf_wrong_schema"),
+            pytest.param("main.sales.ghosts", id="dbx_unregistered_view"),
+            pytest.param("orders", id="single_segment_never_matches"),
+        ],
+    )
+    def test_an_identifier_that_matches_nothing_is_skipped_not_guessed(self, system_db, identifier):
+        """The steady state is a semantic layer describing more tables than
+        the instance registers. A near-miss must not fall through onto the
+        one registered row — a metric bound to the wrong table is worse than
+        a metric that is absent."""
+        from src.repositories import metric_repo
+        from src.semantic.projection import resolve_dataset_table
+
+        _register_table("snowflake", "RAW", "ORDERS", "warehouse_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": identifier}, table_id=identifier),
+            source="ossie_git",
+            source_ref="repo-a",
+        )
+
+        assert [m for m in metric_repo().list() if m.get("source") == "ossie_git"] == []
+        assert resolve_dataset_table({"name": "orders", "source": identifier}, "ossie_git") is None
+
+    def test_a_keboola_identifier_still_takes_the_keboola_path(self, system_db):
+        """Regression guard for the shapes above: a Keboola tableId's bucket
+        is itself dotted (``in.c-shop.orders``), so a last-two-segments split
+        would read bucket=``c-shop``. Registering warehouse-shaped rows
+        alongside must not start routing it there."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+        _register_table("snowflake", "c-shop", "orders", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "in.c-shop.orders"}),
+            source="keboola_metastore",
+            source_ref="conn-1",
+        )
+
+        assert _only_metric()["table_name"] == "shop_orders"
+
+
 class TestConstraints:
     def test_model_constraints_reach_the_metric_they_name(self, system_db):
         project_document(
