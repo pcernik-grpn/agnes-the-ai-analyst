@@ -445,6 +445,42 @@ CATALOG: dict[str, AuditEvent] = {
     "chat.copresence.leave": AuditEvent(
         "chat.copresence.leave", "mutation", "A participant left a co-presence chat session."
     ),
+    # Task 4 (F2b — agent invocation + worker/job execution + silent scheduler jobs)
+    "agent.invoke": AuditEvent(
+        "agent.invoke", "mutation", "An agent was invoked via POST /api/v1/agents/{slug}/responses."
+    ),
+    "agent.session.create": AuditEvent(
+        "agent.session.create", "mutation", "A multi-turn agent-API session was created."
+    ),
+    "agent.session.message": AuditEvent(
+        "agent.session.message", "mutation", "A message was sent on a multi-turn agent-API session."
+    ),
+    "agent.session.cancel": AuditEvent(
+        "agent.session.cancel", "mutation", "A multi-turn agent-API session's in-flight turn was cancelled."
+    ),
+    "agent.session.delete": AuditEvent(
+        "agent.session.delete", "mutation", "A multi-turn agent-API session was deleted (archived)."
+    ),
+    "agent.webhook.create": AuditEvent("agent.webhook.create", "mutation", "An outbound agent webhook was registered."),
+    "agent.webhook.delete": AuditEvent("agent.webhook.delete", "mutation", "An outbound agent webhook was deleted."),
+    "job.run": AuditEvent(
+        "job.run",
+        "system",
+        "The worker dispatched and ran one claimed job (any kind) — one row per "
+        "job run, regardless of kind, written by the single dispatch-level wrapper.",
+    ),
+    "run_bq_metadata_refresh": AuditEvent(
+        "run_bq_metadata_refresh", "system", "The scheduled BigQuery metadata-cache refresh ran."
+    ),
+    "run_keboola_semantic_layer_refresh": AuditEvent(
+        "run_keboola_semantic_layer_refresh", "system", "The scheduled Keboola semantic-layer refresh ran."
+    ),
+    "run_databricks_semantic_layer_refresh": AuditEvent(
+        "run_databricks_semantic_layer_refresh", "system", "The scheduled Databricks semantic-layer refresh ran."
+    ),
+    "run_store_lint_audit": AuditEvent(
+        "run_store_lint_audit", "system", "The scheduled marketplace-store skill-lint audit ran."
+    ),
 }
 
 

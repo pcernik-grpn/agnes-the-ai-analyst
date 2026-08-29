@@ -162,20 +162,20 @@ POSTURE: dict[str, str] = {
     # -- app.api.agent_memory --------------------------------------------------
     "POST /api/v1/sessions/{session_id}/memories": "agent.memory.write",
     # -- app.api.agent_runtime -------------------------------------------------
-    "POST /api/v1/agents/{slug}/responses": "fallback",
+    "POST /api/v1/agents/{slug}/responses": "agent.invoke",
     # -- app.api.agent_schedules -----------------------------------------------
     "DELETE /api/v1/agents/{slug}/schedules/{schedule_id}": "fallback",
     "PATCH /api/v1/agents/{slug}/schedules/{schedule_id}": "fallback",
     "POST /api/v1/agents/run-due": "agent_schedules.run_due.tick",
     "POST /api/v1/agents/{slug}/schedules": "fallback",
     # -- app.api.agent_sessions ------------------------------------------------
-    "DELETE /api/v1/sessions/{session_id}": "fallback",
-    "POST /api/v1/agents/{slug}/sessions": "fallback",
-    "POST /api/v1/sessions/{session_id}/cancel": "fallback",
-    "POST /api/v1/sessions/{session_id}/messages": "fallback",
+    "DELETE /api/v1/sessions/{session_id}": "agent.session.delete",
+    "POST /api/v1/agents/{slug}/sessions": "agent.session.create",
+    "POST /api/v1/sessions/{session_id}/cancel": "agent.session.cancel",
+    "POST /api/v1/sessions/{session_id}/messages": "agent.session.message",
     # -- app.api.agent_webhooks ------------------------------------------------
-    "DELETE /api/v1/agents/{slug}/webhooks/{webhook_id}": "fallback",
-    "POST /api/v1/agents/{slug}/webhooks": "fallback",
+    "DELETE /api/v1/agents/{slug}/webhooks/{webhook_id}": "agent.webhook.delete",
+    "POST /api/v1/agents/{slug}/webhooks": "agent.webhook.create",
     # -- app.api.agents_admin --------------------------------------------------
     "DELETE /api/v1/agents/{agent_id}": "fallback",
     "DELETE /api/v1/agents/{agent_id}/memories/{memory_id}": "agent.memory.delete",
@@ -189,7 +189,7 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/authoring-suggestions/{sid}/reject": "authoring_suggestion.dynamic",
     "POST /api/studio/suggestions": "authoring_suggestion.submit",
     # -- app.api.bq_metadata_refresh -------------------------------------------
-    "POST /api/admin/run-bq-metadata-refresh": "fallback",
+    "POST /api/admin/run-bq-metadata-refresh": "run_bq_metadata_refresh",
     "POST /api/v2/metadata-cache/refresh": "fallback",
     # -- app.api.broker --------------------------------------------------------
     "POST /api/broker/agnes-api": "broker_admin_route_rejected",
@@ -268,7 +268,7 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/data-packages/{pkg_id}/tools": "data_package.add_tool",
     "PUT /api/admin/data-packages/{pkg_id}": "data_package.update",
     # -- app.api.databricks_semantic_layer_refresh -----------------------------
-    "POST /api/admin/run-databricks-semantic-layer-refresh": "fallback",
+    "POST /api/admin/run-databricks-semantic-layer-refresh": "run_databricks_semantic_layer_refresh",
     # -- app.api.db_state ------------------------------------------------------
     "POST /api/admin/db/cancel/{job_id}": "fallback",
     "POST /api/admin/db/migrate": "fallback",
@@ -298,7 +298,7 @@ POSTURE: dict[str, str] = {
     # -- app.api.keboola_login_projects ----------------------------------------
     "POST /api/auth/keboola/projects": "fallback",
     # -- app.api.keboola_semantic_layer_refresh --------------------------------
-    "POST /api/admin/run-keboola-semantic-layer-refresh": "fallback",
+    "POST /api/admin/run-keboola-semantic-layer-refresh": "run_keboola_semantic_layer_refresh",
     # -- app.api.knowledge_digests ---------------------------------------------
     "DELETE /api/admin/knowledge-digests/{digest_id}": "knowledge_digest.delete",
     "POST /api/admin/knowledge-digests": "knowledge_digest.create",
@@ -460,7 +460,7 @@ POSTURE: dict[str, str] = {
     "PUT /api/store/entities/{entity_id}/publisher": "store.entity.publisher",
     "PUT /api/store/entities/{entity_id}/verification": "store.entity.verification",
     # -- app.api.store_lint_admin ----------------------------------------------
-    "POST /api/admin/store/lint-audit": "fallback",
+    "POST /api/admin/store/lint-audit": "run_store_lint_audit",
     "POST /api/admin/store/lint-dismiss": "fallback",
     # -- app.api.sync ----------------------------------------------------------
     "POST /api/sync/pull-confirm": "sync.pull_confirmed",
