@@ -1984,9 +1984,10 @@ class TestUpgradeFreezeSmoke:
         h = {"Authorization": f"Bearer {seeded_app_both['admin_token']}"}
         assert c.get("/api/admin/upgrade-freeze", headers=h).json()["active"] is False
         r = c.post("/api/admin/upgrade-freeze", headers=h, json={"hours": 1})
-        assert r.status_code == 200 and r.json()["active"] is True
+        assert r.status_code == 201 and r.json()["active"] is True
         r = c.delete("/api/admin/upgrade-freeze", headers=h)
-        assert r.status_code == 200 and r.json()["active"] is False
+        assert r.status_code == 204
+        assert c.get("/api/admin/upgrade-freeze", headers=h).json()["active"] is False
 
 
 # ---------------------------------------------------------------------------

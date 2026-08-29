@@ -41,7 +41,7 @@ class TestFreezeEndpoint:
 
     def test_post_writes_the_marker_and_status_reflects_it(self, client):
         r = client["client"].post("/api/admin/upgrade-freeze", headers=client["admin"], json={"hours": 2})
-        assert r.status_code == 200, r.text
+        assert r.status_code == 201, r.text
         until = r.json()["until_epoch"]
         assert until == pytest.approx(time.time() + 2 * 3600, abs=120)
 
@@ -55,7 +55,7 @@ class TestFreezeEndpoint:
     def test_delete_lifts_the_freeze(self, client):
         client["client"].post("/api/admin/upgrade-freeze", headers=client["admin"], json={"hours": 1})
         r = client["client"].delete("/api/admin/upgrade-freeze", headers=client["admin"])
-        assert r.status_code == 200, r.text
+        assert r.status_code == 204, r.text
         assert not _marker(client["data_dir"]).exists()
         status = client["client"].get("/api/admin/upgrade-freeze", headers=client["admin"]).json()
         assert status["active"] is False

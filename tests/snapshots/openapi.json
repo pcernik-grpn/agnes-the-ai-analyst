@@ -32731,7 +32731,7 @@
     },
     "/api/admin/upgrade-freeze": {
       "delete": {
-        "description": "Lift the freeze immediately (idempotent).",
+        "description": "Lift the freeze immediately (idempotent). 204 per the API design\nrules \u2014 the post-delete state is a GET away and always \"no freeze\".",
         "operationId": "lift_freeze_api_admin_upgrade_freeze_delete",
         "parameters": [
           {
@@ -32752,14 +32752,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FreezeStatus"
-                }
-              }
-            },
+          "204": {
             "description": "Successful Response"
           },
           "401": {
@@ -32870,7 +32863,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "content": {
               "application/json": {
                 "schema": {

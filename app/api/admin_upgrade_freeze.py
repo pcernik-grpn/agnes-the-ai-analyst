@@ -88,7 +88,7 @@ async def get_freeze(user: dict = Depends(require_admin)):
     return _status()
 
 
-@router.post("", response_model=FreezeStatus)
+@router.post("", response_model=FreezeStatus, status_code=201)
 async def set_freeze(body: FreezeRequest, user: dict = Depends(require_admin)):
     """Freeze auto-upgrades for ``hours`` from now (1–72).
 
@@ -110,9 +110,10 @@ async def set_freeze(body: FreezeRequest, user: dict = Depends(require_admin)):
     return _status()
 
 
-@router.delete("", response_model=FreezeStatus)
+@router.delete("", status_code=204)
 async def lift_freeze(user: dict = Depends(require_admin)):
-    """Lift the freeze immediately (idempotent)."""
+    """Lift the freeze immediately (idempotent). 204 per the API design
+    rules — the post-delete state is a GET away and always "no freeze"."""
     marker = _marker_path()
     try:
         marker.unlink()
@@ -127,4 +128,3 @@ async def lift_freeze(user: dict = Depends(require_admin)):
         result="success",
         client_kind="web",
     )
-    return _status()
