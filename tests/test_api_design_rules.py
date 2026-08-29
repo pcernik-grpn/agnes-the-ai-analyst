@@ -243,6 +243,10 @@ _CREATOR_POST_ALLOWLIST = frozenset(
         # Consent toggle upsert — sets the caller's own opt-in flag (200), not
         # a resource create. GET on the same path returns the current state.
         "/api/studio/memory-mining/consent",
+        # Logout (#1675) — GET renders the CSRF confirm form, POST ends the
+        # session and redirects (303). Nothing is created; the path only has
+        # both verbs because mutating on a GET is forbidden here.
+        "/auth/logout",
         # Subscription upsert — sets per-table enabled flags, not a pure create
         "/api/sync/table-subscriptions",
         # Auth flows — 200 is conventional for token/session responses

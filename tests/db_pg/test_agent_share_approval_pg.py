@@ -228,6 +228,13 @@ def test_admin_decide_rejects_unknown_decision_value(tmp_path, monkeypatch, pg_e
 
 
 def test_moderation_hub_lists_pending_share_and_approve_clears_it(tmp_path, monkeypatch, pg_engine):
+    # The hub is hidden by default (`features.store_moderation_enabled`) and
+    # redirects home — tests/test_retired_admin_surfaces.py owns that. This
+    # test is about the zone the hub RENDERS, which only exists with the page
+    # on. Note the hub is currently the only UI for this queue; with it hidden,
+    # the API half below (`/api/admin/share-requests`) is the whole story, and
+    # that half is deliberately ungated.
+    monkeypatch.setenv("AGNES_STORE_MODERATION_ENABLED", "1")
     client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
     env = _make_owner_and_group()
     agent_id = _create_agent(client, env["owner_token"], name="Hub Agent")

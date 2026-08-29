@@ -739,7 +739,7 @@ CREATE TABLE IF NOT EXISTS user_groups (
 CREATE TABLE IF NOT EXISTS user_group_members (
     user_id   VARCHAR NOT NULL,
     group_id  VARCHAR NOT NULL REFERENCES user_groups(id),
-    source    VARCHAR NOT NULL,  -- 'admin' | 'google_sync' | 'system_seed'
+    source    VARCHAR NOT NULL,  -- 'admin' | 'google_sync' | 'microsoft_sync' | 'system_seed'
     added_at  TIMESTAMP DEFAULT current_timestamp,
     added_by  VARCHAR,
     PRIMARY KEY (user_id, group_id)

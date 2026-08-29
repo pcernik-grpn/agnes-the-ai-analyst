@@ -2427,6 +2427,14 @@ KNOWN_UNTESTED = {
     # tests/test_web_nav_cowork.py.
     "GET /how-it-works",
     "GET /install",
+    # Logout (#1675): GET renders the CSRF confirm form, POST validates the
+    # double-submit token, revokes server-side and clears the cookie. Both
+    # verbs are covered behaviourally in tests/test_web_logout.py, and the
+    # revocation half is contract-tested on BOTH backends in
+    # tests/db_pg/test_session_revocation.py — richer than this harness's
+    # status-code sweep can express.
+    "GET /auth/logout",
+    "POST /auth/logout",
     "GET /login",
     "GET /login/email",
     "GET /login/password",

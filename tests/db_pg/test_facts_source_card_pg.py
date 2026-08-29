@@ -167,6 +167,56 @@ def test_error_badges_from_the_last_run_report_are_categorized(tmp_path, monkeyp
     assert fs["cost_estimate"]["amount_usd"] > 0
 
 
+def test_rejection_rows_resolve_doc_id_to_file_name_and_collection(tmp_path, monkeypatch, pg_engine):
+    """The live-use complaint this fixes: a bare sha16 like
+    `6a8e0bc93c07c56a` "tells nobody anything". `_enrich_sharepoint_
+    rejection_rows` resolves it through `corpus_file_sources` to the corpus
+    file's own name + its collection's name, added as a `doc` key alongside
+    (never replacing) the raw `doc_id`/`reason` fields."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from src.repositories import corpus_file_sources_repo
+
+    # `d1` is the rejected-quote row's doc_id in `_fixture`'s last run —
+    # anchor it to the already-seeded `cf_a1` (filename `cf_a1.md`) in
+    # CORPUS_A ("col_a", named "col_a" — `_seed_collection` uses the id as
+    # its display name too).
+    corpus_file_sources_repo().upsert(
+        corpus_file_id="cf_a1", corpus_id=CORPUS_A, source_stable_id="stable-1", source_doc_id="d1"
+    )
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    rejected = fs["last_run"]["rejected_quotes"]
+    assert len(rejected) == 1
+    assert rejected[0]["doc_id"] == "d1"  # raw field untouched
+    assert rejected[0]["reason"] == "verbatim_gate_failed"
+    assert rejected[0]["doc"] == {"name": "cf_a1.md", "collection": CORPUS_A}
+
+
+def test_rejection_rows_degrade_to_unresolved_when_doc_id_is_unknown(tmp_path, monkeypatch, pg_engine):
+    """`_fixture`'s protocol-error doc_id (`d2`) was never anchored through
+    `corpus_file_sources` — the card must fall back to `doc: None` (the
+    template renders the raw sha16 + "not in any collection"), never a
+    500 for the whole cell."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    protocol_errors = fs["last_run"]["protocol_errors"]
+    assert len(protocol_errors) == 1
+    assert protocol_errors[0]["doc_id"] == "d2"
+    assert protocol_errors[0]["doc"] is None
+
+
 def test_identity_row_counts_matched_groups_and_ungranted_collections(tmp_path, monkeypatch, pg_engine):
     pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
     _fixture(pg_env)
@@ -177,7 +227,96 @@ def test_identity_row_counts_matched_groups_and_ungranted_collections(tmp_path, 
 
     fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
     # CORPUS_A is granted (1 group), CORPUS_B is not — fail-closed, counted.
-    assert fs["identity"] == {"groups_matched": 1, "collections_no_group": 1}
+    assert fs["identity"] == {"groups_matched": 1, "collections_no_group": 1, "collections_total": 2}
+
+
+def test_anonymization_distinguishes_requested_declared_and_pending(tmp_path, monkeypatch, pg_engine):
+    """Spec §9.2/§13.2: the checkbox alone (`requested`) must never be
+    read as `declared` — only the LATEST run's own declaration earns that.
+    A_scope is requested AND the latest run declares it (-> declared);
+    B_scope is requested but the run declares nothing for it (-> pending)."""
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _seed_collection(CORPUS_A)
+    _seed_collection(CORPUS_B)
+
+    from src.repositories import facts_ingest_runs_repo
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=[CORPUS_A],
+        caller="scheduler@system.local",
+        documents_seen=1,
+        claims_written=1,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=1,
+        subjects_deleted=0,
+        review_items=[],
+        anonymization={"declared": True, "scopes": {CORPUS_A: {"docs_anonymized": 2, "docs_skipped": 0}}},
+    )
+
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=[
+            {"source_scope_id": "s-a", "display_path": "A", "anonymize": True, "collection_id": CORPUS_A},
+            {"source_scope_id": "s-b", "display_path": "B", "anonymize": True, "collection_id": CORPUS_B},
+        ],
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert fs["anonymization"] == {
+        "requested": [CORPUS_A, CORPUS_B],
+        "declared": [CORPUS_A],
+        "pending": [CORPUS_B],
+    }
+
+
+def test_scopes_cell_lists_each_confirmed_scope_with_its_resolved_collection_and_group_state(
+    tmp_path, monkeypatch, pg_engine
+):
+    """`scopes` is the connection's own `config.scopes`, reused through
+    `admin_sharepoint._scope_out` — the exact shape the connect wizard's own
+    step-3 "Share" preview reads, so clicking a scope row on the card can
+    open the wizard straight onto that same row."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)
+
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=[
+            {"source_scope_id": "s-a", "display_path": "A / Contracts", "anonymize": False, "collection_id": CORPUS_A},
+            {"source_scope_id": "s-b", "display_path": "B / Reports", "anonymize": False, "collection_id": CORPUS_B},
+        ],
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    by_id = {s["source_scope_id"]: s for s in fs["scopes"]}
+    assert set(by_id) == {"s-a", "s-b"}
+    # CORPUS_A is granted a group in `_fixture` -> no warning, group present.
+    assert by_id["s-a"]["collection"]["name"] == CORPUS_A
+    assert by_id["s-a"]["no_group_warning"] is False
+    assert by_id["s-a"]["group_ids"]
+    # CORPUS_B is left ungranted in `_fixture` -> the warning fires.
+    assert by_id["s-b"]["collection"]["name"] == CORPUS_B
+    assert by_id["s-b"]["no_group_warning"] is True
+    assert by_id["s-b"]["group_ids"] == []
+
+
+def test_anonymization_empty_when_no_scope_requests_it(tmp_path, monkeypatch, pg_engine):
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)  # last run exists but no `anonymization` block was sent
+    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert fs["anonymization"] == {"requested": [], "declared": [], "pending": []}
 
 
 def test_certificate_row_shows_origin_and_never_the_value(tmp_path, monkeypatch, pg_engine):

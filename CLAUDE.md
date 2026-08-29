@@ -406,7 +406,7 @@ New connector = `connectors/<name>/extractor.py` producing `extract.duckdb + dat
 ### Authentication
 Auth providers in `app/auth/` (FastAPI-based):
 - **Google**: OAuth via Google (Workspace group memberships pulled at sign-in — see [`docs/auth-groups.md`](docs/auth-groups.md) for the GCP setup checklist + the `security` label gotcha)
-- **Microsoft**: OAuth via Microsoft Entra ID, single-tenant *enforced* — the reserved `common`/`organizations`/`consumers` endpoints are refused and leave the provider unavailable. Authentication only, no Graph group sync yet; a tenant is not an identity boundary on its own, so pin `auth.allowed_domain` (see [`docs/auth-microsoft-oauth.md`](docs/auth-microsoft-oauth.md))
+- **Microsoft**: OAuth via Microsoft Entra ID, single-tenant *enforced* — the reserved `common`/`organizations`/`consumers` endpoints are refused and leave the provider unavailable. Optional Graph group sync (`GET /me/memberOf`, `source='microsoft_sync'`) mirrors Google's, gated off by default (`auth.microsoft.group_sync_enabled`); a tenant is not an identity boundary on its own, so pin `auth.allowed_domain` (see [`docs/auth-microsoft-oauth.md`](docs/auth-microsoft-oauth.md))
 - **Email**: magic link (itsdangerous token)
 - **Keboola**: OAuth via the Keboola stack (project-bound; optional `X-StorageApi-Token` header auth for existing users, switch-gated)
 - **Desktop**: JWT for API

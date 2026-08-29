@@ -196,3 +196,36 @@ def test_ingest_runs_invalid_limit_is_422(facts_client):
         "/api/facts/ingest-runs", params={"limit": 0}, headers=_auth(facts_client["admin_token"])
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# `anonymization` block on POST /api/facts/ingest (spec §9.2) — additive,
+# optional, validated BEFORE the PG-only repo call, so a malformed block
+# 422s cleanly even on the DuckDB backend.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_malformed_anonymization_declared_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"anonymization": {"declared": "not-a-bool"}},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_malformed_anonymization_scope_count_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"anonymization": {"scopes": {"col_a": {"docs_anonymized": -1}}}},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_omitted_anonymization_is_fine_pre_pg(facts_client):
+    """No `anonymization` key at all — the field is optional; the request
+    still validates and only fails past the gate at the PG-only repo call,
+    same as every other bare ingest request against the DuckDB backend."""
+    r = facts_client["client"].post("/api/facts/ingest", json={}, headers=_auth(facts_client["admin_token"]))
+    assert r.status_code == 501, r.text

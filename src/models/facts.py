@@ -165,3 +165,8 @@ class IngestRun(Base):
     subjects_created: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     subjects_deleted: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     review_items: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    #: The producer's OPTIONAL anonymization declaration for this batch
+    #: (spec §9.2): ``{declared: bool, scopes: {corpus_id: {docs_anonymized,
+    #: docs_skipped}}}``. Empty ``{}`` (never null) when the producer never
+    #: anonymizes — see ``migrations/versions/0081_ingest_runs_anonymize.py``.
+    anonymization: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"), nullable=False)

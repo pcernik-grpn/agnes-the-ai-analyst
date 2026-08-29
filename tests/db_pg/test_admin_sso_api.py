@@ -271,6 +271,32 @@ def test_guard_inactive_when_sso_is_not_a_usable_door(sso_env, monkeypatch):
     assert client.delete("/api/admin/sso/config", headers=_h(admin_token)).status_code == 204
 
 
+def test_guard_counts_a_password_holder_inside_a_forced_domain(sso_env, monkeypatch):
+    """A holder whose domain is force-SSO'd still counts as a usable door
+    for THIS guard — deliberately. Every guarded operation (disable, delete
+    config, clear secret) also lifts the forcing (``sso_forced_for_email``
+    follows the live enabled config), so the holder's password door is
+    exactly the one that reopens the moment the operation lands. Excluding
+    forced-domain holders would instead 422 the off-switch forever on an
+    instance whose only users are the customer's."""
+    client, admin_token, _ = sso_env
+    monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "sso,password")
+    _enable_sso(client, admin_token)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="forced-holder", email="holder@fabrikam.com", name="H", password_hash="x" * 60)
+    r = _put_config(client, admin_token, enabled=False)
+    assert r.status_code == 200
+    assert client.get("/api/admin/sso/config", headers=_h(admin_token)).json()["enabled"] is False
+
+    # And the door the guard counted on has indeed reopened: the domain is
+    # no longer forced once the config is disabled.
+    from app.auth.providers.sso import sso_forced_for_email
+
+    assert sso_forced_for_email("holder@fabrikam.com") is False
+
+
 # ---------------------------------------------------------------------------
 # test-config probe
 # ---------------------------------------------------------------------------

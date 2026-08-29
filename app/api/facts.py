@@ -56,7 +56,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth.access import require_admin, require_facts_enabled
 from app.auth.dependencies import get_current_user
@@ -78,12 +78,23 @@ router = APIRouter(
 
 
 class FactsSearchRequest(BaseModel):
+    # extra='forbid' (TCRD follow-up from a live finding): this endpoint had
+    # no free-text parameter at all, so an unknown field like the `q` a
+    # caller might guess at was silently swallowed by pydantic's default
+    # extra='ignore' — the call degenerated to an unfiltered, id-ordered
+    # dump instead of erroring. An unknown field on ANY facts request model
+    # must 422, never be swallowed into a convincing wrong answer.
+    model_config = ConfigDict(extra="forbid")
+
     type: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
+    q: Optional[str] = Field(default=None, max_length=200)
     limit: int = Field(default=20, ge=1, le=100)
 
 
 class FactsNeighborsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     subject_id: str
     edge_types: Optional[List[str]] = None
     depth: int = Field(default=1, ge=1, le=2)
@@ -102,14 +113,17 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     from readable claims only, per-key latest-document_date-wins with a
     `conflicted` marker on a genuine tie — the projection runs in SQL so
     `filters` evaluate against it BEFORE the `limit` is applied (never a
-    Python post-filter, which would leak a shortfall signal). Response:
-    ``{"subjects": [{"id", "type", "aliases", "attrs", "claim_count",
-    "quote_count", "revealed"}], "limit_applied"}`` — `limit_applied` is
-    True only when the CALLER'S OWN readable result set exceeds `limit`,
-    never a signal that grants hid additional matches.
+    Python post-filter, which would leak a shortfall signal). ``q`` is an
+    OPTIONAL free-text name lookup matched against alias natural keys ONLY
+    (never claim text) — see :meth:`FactsPgRepository.search` for the
+    normalization and ranking rules. Response: ``{"subjects": [{"id",
+    "type", "aliases", "attrs", "claim_count", "quote_count", "revealed"}],
+    "limit_applied"}`` — `limit_applied` is True only when the CALLER'S OWN
+    readable result set exceeds `limit`, never a signal that grants hid
+    additional matches.
     """
     try:
-        return facts_repo().search(user, type=body.type, filters=body.filters or {}, limit=body.limit)
+        return facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -172,6 +186,32 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
 # ---------------------------------------------------------------------------
 
 
+class FactsIngestAnonymizationScope(BaseModel):
+    """One corpus's anonymization tally within this batch (spec §9.2). A
+    self-reported COUNT, never independently verified by Agnes — see
+    ``docs/anonymization.md``'s "current limits"."""
+
+    docs_anonymized: int = Field(default=0, ge=0)
+    docs_skipped: int = Field(default=0, ge=0)
+
+
+class FactsIngestAnonymizationReport(BaseModel):
+    """OPTIONAL producer declaration that (some of) this batch went through
+    the anonymize-in-front pipeline (spec §9: source -> crawl -> convert ->
+    anonymize -> Agnes) before ingestion. Additive to the wire contract — a
+    producer that never anonymizes omits this field entirely.
+
+    ``scopes`` is keyed by ``corpus_id`` (the collection id, matching the
+    connect wizard's own scope-row shape); a key that does not resolve to a
+    real collection is KEPT, not rejected — this is a self-reported tally,
+    not a join against ``file_corpora`` (spec §9.2's "current limits": Agnes
+    records the declaration, it cannot verify the content was anonymized).
+    """
+
+    declared: bool = False
+    scopes: Dict[str, FactsIngestAnonymizationScope] = Field(default_factory=dict)
+
+
 class FactsIngestRequest(BaseModel):
     """Wire format accepted verbatim (spec §7.0/§7.2) — ``documents`` are the
     crawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/
@@ -180,12 +220,17 @@ class FactsIngestRequest(BaseModel):
     schema — the producer contract explicitly tolerates unknown fields
     (underscore-prefixed crawler internals are stripped server-side, not
     rejected), so a rigid Pydantic model would reject valid producer input
-    on every crawler-side field addition."""
+    on every crawler-side field addition.
+
+    ``anonymization`` is the one exception: a small, OPTIONAL, strictly
+    typed block (spec §9.2) — malformed input there is a real protocol
+    error (422), not tolerated crawler noise."""
 
     documents: List[Dict[str, Any]] = Field(default_factory=list)
     full_documents: List[str] = Field(default_factory=list)
     nodes: List[Dict[str, Any]] = Field(default_factory=list)
     edges: List[Dict[str, Any]] = Field(default_factory=list)
+    anonymization: Optional[FactsIngestAnonymizationReport] = None
 
 
 @router.post("/ingest")
@@ -197,10 +242,23 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     protocol error (never split across requests, per §7.2). ``documents``
     may be omitted only when every evidence ``doc_id`` already resolves
     through a prior upload's ``corpus_file_sources`` mapping — otherwise
-    400 with the unresolved ids itemized. Everything else — the verbatim
-    gate, deferred-vs-rejected, union vs `full_documents` replace, alias/
-    edge resolution, correction re-attachment, the post-ingest orphan
-    sweep — happens in :meth:`FactsPgRepository.ingest_batch`; this
+    400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)
+    can anchor more than one ``corpus_file_sources`` row for the same
+    ``doc_id``; resolution is corpus-scoped and deterministic (indexed
+    copies preferred, ``corpus_file_id`` as tiebreak) — never an arbitrary
+    cross-collection pick, since that would mis-scope a claim's visibility.
+    When this batch's ``documents[]`` declared at least one collection but a
+    cited ``doc_id`` is anchored only in some OTHER, undeclared collection,
+    that claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized
+    in ``claims_rejected`` like any other reason) rather than written under
+    a collection wider than the producer's batch ever declared (RBAC
+    review, PR #1736) — nothing is ever silently attached cross-collection.
+    An entirely `documents[]`-omitted batch (the "already resolves" replay
+    above) has no batch-declared scope to escape and is unaffected.
+    Everything else — the verbatim gate, deferred-vs-rejected, union vs
+    `full_documents` replace, alias/edge resolution, correction
+    re-attachment, the post-ingest orphan sweep — happens in
+    :meth:`FactsPgRepository.ingest_batch`; this
     handler only translates its typed exceptions to HTTP status codes.
     Response IS the run report: ``{claims_written, claims_rejected:
     [{row, reason}], deferred: [...], subjects_created, subjects_deleted,
@@ -213,6 +271,13 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     its transaction: a run-report write is a side record, never a condition
     of the ingest succeeding, so a failure there is logged and swallowed,
     never surfaced as a 5xx for a batch that in fact wrote its claims fine.
+
+    ``anonymization`` (spec §9.2, optional) rides along INTO that persisted
+    run report only — never into the returned report above, and never
+    joined against real corpus ids (a corpus id the batch's own
+    ``documents`` never mention is kept, not rejected: this is the
+    producer's self-reported tally of what it anonymized, not something
+    Agnes independently verifies — see ``docs/anonymization.md``).
     """
     try:
         report = facts_repo().ingest_batch(
@@ -243,6 +308,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             subjects_created=report.get("subjects_created", 0),
             subjects_deleted=report.get("subjects_deleted", 0),
             review_items=report.get("review_items", []),
+            anonymization=body.anonymization.model_dump() if body.anonymization else None,
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)
@@ -251,6 +317,8 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
 
 
 class FactsCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     verdict: str = Field(pattern="^(wrong|restricted|revealed)$")
     reason: str = Field(min_length=1, max_length=2000)
 

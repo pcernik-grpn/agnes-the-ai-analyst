@@ -163,6 +163,13 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "default": False,
     },
     {
+        "key": "store_moderation_enabled",
+        "resolver": "get_store_moderation_enabled",
+        "env_var": "AGNES_STORE_MODERATION_ENABLED",
+        "yaml_path": "features.store_moderation_enabled",
+        "default": False,
+    },
+    {
         "key": "agent_profiles_enabled",
         "resolver": "get_agent_profiles_enabled",
         "env_var": "AGNES_AGENT_PROFILES_ENABLED",
