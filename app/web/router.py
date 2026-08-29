@@ -7735,12 +7735,15 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     **Error badge categories are a deliberate, narrower simplification** of
     spec §13.2's illustrative four (unsupported type / model error / deleted
     / rejected quote) — those live in the CRAWLER's own per-document error
-    log, which Agnes never receives. The three badges below are the ones
-    Agnes's own ingest run report actually carries: `rejected_quotes` (the
-    verbatim gate, spec §8, doing its job), `deferred` (a claim whose file
-    was not yet `indexed` — free retry once it is), and `protocol_errors`
-    (every OTHER `claims_rejected` reason — unresolved doc id, malformed
-    edge, alias type conflict, …).
+    log, which Agnes never receives. The badges below are the ones Agnes's
+    own ingest run report actually carries: `rejected_quotes` (the verbatim
+    gate, spec §8, doing its job), `deferred` (a claim whose file was not
+    yet `indexed` — free retry once it is), `protocol_errors` (every OTHER
+    `claims_rejected` reason — unresolved doc id, malformed edge, alias type
+    conflict, …), and `source_urls_rejected` (O7 follow-up: a document's
+    `source_url` the ingest validator dropped — the claim itself still
+    wrote, only its citation link is missing; a producer that never sends
+    `source_url` is not in this list at all).
 
     Every sub-block degrades independently on its own `try/except` — a
     repo call that raises (PG-only `RequiresPostgresBackend` on a
@@ -7808,6 +7811,11 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     if last_run is not None:
         claims_rejected = last_run.get("claims_rejected") or []
         deferred = last_run.get("deferred") or []
+        # O7 follow-up: NOT folded into `protocol_errors` — a dropped
+        # `source_url` never rejects the claim (it still writes), so it is
+        # a different signal than every `claims_rejected` reason and gets
+        # its own badge rather than muddying "why was nothing written".
+        source_urls_rejected = last_run.get("source_urls_rejected") or []
         rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
         protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
@@ -7821,6 +7829,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
             "deferred": _enrich_sharepoint_rejection_rows(deferred),
             "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
+            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
         }
     else:
         cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}

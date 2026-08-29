@@ -25,7 +25,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 
-_LIST_JSON_FIELDS = ("corpus_ids", "claims_rejected", "deferred", "review_items")
+_LIST_JSON_FIELDS = ("corpus_ids", "claims_rejected", "source_urls_rejected", "deferred", "review_items")
 
 
 def _decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -70,6 +70,7 @@ class FactsIngestRunsPgRepository:
         subjects_deleted: int,
         review_items: List[Dict[str, Any]],
         anonymization: Optional[Dict[str, Any]] = None,
+        source_urls_rejected: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Persist one ingest batch's run report. Returns the generated id.
 
@@ -84,17 +85,29 @@ class FactsIngestRunsPgRepository:
         pipeline before ingestion — ``None`` (the default, a producer that
         never anonymizes) stores ``{}``, never ``NULL``, so every reader can
         treat the column as always-present.
+
+        ``source_urls_rejected`` (O7 follow-up) is the itemized
+        ``{doc_id, reason}`` list of ``documents[].source_url`` values
+        ``ingest_batch`` dropped as invalid (never-https, no host, too
+        long, ...) — the claim itself still wrote, only its citation link
+        is missing. ``None``/omitted (the default, no drops this batch)
+        stores ``[]``, same never-``NULL`` contract as every other list
+        field here; ``source_urls_rejected_count`` is derived the same way
+        ``claims_rejected_count`` is, never trusted from the caller.
         """
         run_id = "ir_" + secrets.token_hex(8)
+        source_urls_rejected = source_urls_rejected or []
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text(
                     "INSERT INTO facts_ingest_runs "
                     "(id, corpus_ids, caller, documents_seen, claims_written, "
-                    " claims_rejected_count, claims_rejected, deferred, "
+                    " claims_rejected_count, claims_rejected, "
+                    " source_urls_rejected_count, source_urls_rejected, deferred, "
                     " subjects_created, subjects_deleted, review_items, anonymization) "
                     "VALUES (:id, :corpus_ids, :caller, :documents_seen, :claims_written, "
-                    "        :claims_rejected_count, :claims_rejected, :deferred, "
+                    "        :claims_rejected_count, :claims_rejected, "
+                    "        :source_urls_rejected_count, :source_urls_rejected, :deferred, "
                     "        :subjects_created, :subjects_deleted, :review_items, :anonymization)"
                 ),
                 {
@@ -105,6 +118,8 @@ class FactsIngestRunsPgRepository:
                     "claims_written": claims_written,
                     "claims_rejected_count": len(claims_rejected),
                     "claims_rejected": json.dumps(claims_rejected),
+                    "source_urls_rejected_count": len(source_urls_rejected),
+                    "source_urls_rejected": json.dumps(source_urls_rejected),
                     "deferred": json.dumps(deferred),
                     "subjects_created": subjects_created,
                     "subjects_deleted": subjects_deleted,

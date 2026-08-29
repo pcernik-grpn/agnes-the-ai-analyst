@@ -931,6 +931,11 @@
      ingest run actually declared this collection anonymized (spec §9.2). */
   .sp-badge--anon { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sp-badge--anon-declared { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  /* Unique-permissions advisory (Decision #2: Agnes never derives or
+     enforces anything from a SharePoint ACL — this warns, never gates).
+     Same warn tone as the "anonymization requested" badge — both are a
+     wish/observation, not an earned or enforced state. */
+  .sp-badge--unique-perms { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sp-note { margin: 10px 0 0; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
   .sp-share-row {
     display: flex; align-items: flex-start; gap: 12px;
@@ -2202,6 +2207,7 @@ function _sharepointFactsHtml(row) {
     ["rejected_quotes", "Rejected quotes"],
     ["deferred", "Deferred"],
     ["protocol_errors", "Protocol errors"],
+    ["source_urls_rejected", "Citation links rejected"],
   ];
   const badgesHtml = lastRun
     ? badgeDefs.map(([key, label]) => {
@@ -2269,6 +2275,14 @@ const SP_REJECTION_REASON_TEXT = {
     "The cited document isn't registered in any collection — upload it or fix the producer's corpus map.",
   ambiguous_cross_collection_doc_id:
     "The document exists in multiple collections and the batch didn't say which — rejected rather than guessed.",
+  not_https:
+    "The producer sent a source_url that isn't https — dropped rather than stored, so the claim wrote but has no citation link. Fix the producer to send an https deep link.",
+  no_host:
+    "The producer sent a source_url with no host — dropped rather than stored, so the claim wrote but has no citation link.",
+  too_long:
+    "The producer sent a source_url over the length cap — dropped rather than stored, so the claim wrote but has no citation link.",
+  unparseable:
+    "The producer sent a source_url Agnes couldn't parse — dropped rather than stored, so the claim wrote but has no citation link.",
 };
 function _spRejectionReasonText(reason) {
   return SP_REJECTION_REASON_TEXT[reason] || reason || "";
@@ -5427,6 +5441,9 @@ const SP_CONN_API = "/api/admin/source-connections";
 const SP_API = "/api/admin/sharepoint/connections";
 const SP_GROUPS_API = "/api/admin/groups";
 const SP_DEFAULT_CERT_ENV = "SHAREPOINT_CERT_PRIVATE_KEY";
+// One wording for the unique-permissions badge label, defined once so the
+// tree row and (were it ever needed elsewhere) any other renderer agree.
+const SP_UNIQUE_PERMS_LABEL = "&#9888; unique permissions";
 
 let spConnId = null;
 let spCertChoice = "upload";
@@ -5438,6 +5455,12 @@ let spGroups = null;      // cached [{id, name}]
 let spPendingGroups = {}; // source_scope_id -> Set(group_id), locally ticked but not yet applied
 let spTreeFilterQuery = "";   // client-side instant filter (#2) over spItems, reset on navigation
 let spLastSearchMatches = null; // last server-search (#3) result list, or null if none run yet
+// item_id -> true|false|null, accumulated from `?with_permissions=1` tree
+// responses across THIS wizard session only — never a full crawl, so
+// "unknown" (not present here, or `null`) must never render as "no unique
+// permissions" anywhere that reads this map. ADVISORY ONLY (Decision #2:
+// Agnes does not derive or enforce anything from a SharePoint ACL).
+let spUniquePerms = {};
 
 function spEsc(s) {
   return String(s == null ? "" : s)
@@ -5480,6 +5503,7 @@ function openSpWizard() {
   spPendingGroups = {};
   spTreeFilterQuery = "";
   spLastSearchMatches = null;
+  spUniquePerms = {};
 
   document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-search-q").value = "";
@@ -5692,10 +5716,22 @@ function spLoadTree() {
   if (spLevel.site_id) params.set("site_id", spLevel.site_id);
   if (spLevel.drive_id) params.set("drive_id", spLevel.drive_id);
   if (spLevel.item_id) params.set("item_id", spLevel.item_id);
+  // Only the "items" level ever lists folders — sites/drives have nothing
+  // to probe, so the param is only worth sending (and paying for) there.
+  if (spLevel.drive_id) params.set("with_permissions", "1");
   const qs = params.toString();
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree${qs ? "?" + qs : ""}`)
     .then((body) => {
       spItems = body.items || [];
+      // Accumulate into the session-wide map — a folder seen `true` once
+      // stays known `true` even after navigating away and back (re-browsing
+      // does not re-clear it); `false`/`undefined` never overwrite an
+      // earlier `true` for the same id, since the flag describes the
+      // SOURCE's state, not this one response.
+      spItems.forEach((item) => {
+        if (item.unique_permissions === true) spUniquePerms[item.id] = true;
+        else if (!(item.id in spUniquePerms)) spUniquePerms[item.id] = item.unique_permissions ?? null;
+      });
       spRenderTree(body.level);
     })
     .catch((e) => {
@@ -5800,11 +5836,19 @@ function spRenderTree(level) {
     const badge = scope && scope.collection
       ? `<span class="sp-badge${anon ? (anonDeclared ? " sp-badge--anon-declared" : " sp-badge--anon") : ""}">&rarr; ${spEsc(scope.collection.slug)}${anonSuffix}</span>`
       : "";
+    // ADVISORY ONLY (Decision #2) — a probe result of `false` or unknown
+    // (absent, or `null`) renders NOTHING here; only a bare `true` earns
+    // the badge, so a probe failure or an un-probed item never reads as a
+    // false reassurance of "no unique permissions".
+    const uniquePermsBadge = spUniquePerms[item.id] === true
+      ? `<span class="sp-badge sp-badge--unique-perms" title="Has its own permissions in the source — people who can't open it there may still see its content once this scope is shared here.">${SP_UNIQUE_PERMS_LABEL}</span>`
+      : "";
     return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}"${visible ? "" : " hidden"}>` +
       `<input type="checkbox" data-spw-select="${spEsc(item.id)}" aria-label="Select ${spEsc(item.name)}"${checked ? " checked" : ""}>` +
       `<span class="sp-tree__name">${nameHtml}</span>` +
       `<label class="sp-tree__anon"><input type="checkbox" data-spw-anon="${spEsc(item.id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
       badge +
+      uniquePermsBadge +
       `</div>`;
   }).join("") + (anyVisible ? "" : '<div class="ds-empty" data-spw-nomatch>No folders match the filter.</div>');
 
@@ -5987,7 +6031,11 @@ function spRunSearch() {
       spRenderSearchResults(spLastSearchMatches);
       if (body.truncated) {
         const el = document.getElementById("spw-search-truncated");
-        el.textContent = `Stopped after ${body.visited} folder(s) — refine the pattern or raise the depth/visited limits.`;
+        // `hint` is the server's own next-step wording (admin_sharepoint.py
+        // `_SEARCH_TRUNCATED_HINT`) — one place owns the copy; the fallback
+        // only covers a response shape this build has never seen.
+        const hint = body.hint || "Scope the search to a site or folder, or narrow the pattern.";
+        el.textContent = `Stopped after ${body.visited} folder(s) visited. ${hint}`;
         el.style.display = "block";
       }
     })
@@ -6060,7 +6108,16 @@ function spRenderShare(items) {
     host.innerHTML = '<div class="ds-empty">No scopes confirmed yet — go back to step 2 and pick at least one.</div>';
     return;
   }
-  host.innerHTML = items.map((s) => {
+  // ADVISORY ONLY (Decision #2 — Agnes never derives or enforces anything
+  // from a SharePoint ACL): counts only scopes THIS WIZARD SESSION actually
+  // saw flagged `true` while browsing step 2 (spUniquePerms) — never a full
+  // re-check of every selected scope, and never a gate on Share & finish.
+  const uniquePermsFlaggedCount = items.filter((s) => spUniquePerms[s.source_scope_id] === true).length;
+  const advisoryHtml = uniquePermsFlaggedCount === 0 ? "" : `
+    <div class="apg-strip apg-strip--warn apg-strip--block" role="note">
+      <span>&#9888; ${uniquePermsFlaggedCount} of your selected scope${uniquePermsFlaggedCount === 1 ? "" : "s"} had unique permissions in the source when last browsed. Agnes does not read or enforce those — the groups you choose below are the only access control that applies once this is shared here.</span>
+    </div>`;
+  host.innerHTML = advisoryHtml + items.map((s) => {
     const pending = spPendingGroups[s.source_scope_id] || new Set(s.group_ids || []);
     spPendingGroups[s.source_scope_id] = pending;
     // Spec §9.2/§13.2: the checkbox alone is a WISH, never rendered as

@@ -260,9 +260,23 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     re-attachment, the post-ingest orphan sweep — happens in
     :meth:`FactsPgRepository.ingest_batch`; this
     handler only translates its typed exceptions to HTTP status codes.
-    Response IS the run report: ``{claims_written, claims_rejected:
-    [{row, reason}], deferred: [...], subjects_created, subjects_deleted,
-    corrections_active: [...], review_items: [...]}``.
+    Response IS the run report: ``{claims_written,
+    claims_accepted_via_identity, claims_rejected: [{row, reason}],
+    source_urls_rejected: [{doc_id, reason}], deferred: [...],
+    subjects_created, subjects_deleted, corrections_active: [...],
+    review_items: [...]}``.
+
+    ``claims_accepted_via_identity`` (spec §8) is the subset of
+    ``claims_written`` whose quote passed the verbatim gate ONLY via the
+    document's own SERVER-STORED ``filename``/``path`` — never a chunk of
+    its extracted text — so an operator can see how much evidence is
+    filename-grounded rather than content-grounded.
+
+    ``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``
+    the validator dropped as invalid (``too_long`` / ``unparseable`` /
+    ``not_https`` / ``no_host``) — the claim itself still wrote, only its
+    citation link is missing; a producer that never sends ``source_url`` is
+    not itemized here at all, only one that sends a value Agnes refuses.
 
     A copy of that same report is ALSO persisted to ``facts_ingest_runs``
     (``GET /api/facts/ingest-runs``, the source card's pipeline strip and
@@ -304,6 +318,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             documents_seen=len(body.documents),
             claims_written=report.get("claims_written", 0),
             claims_rejected=report.get("claims_rejected", []),
+            source_urls_rejected=report.get("source_urls_rejected", []),
             deferred=report.get("deferred", []),
             subjects_created=report.get("subjects_created", 0),
             subjects_deleted=report.get("subjects_deleted", 0),

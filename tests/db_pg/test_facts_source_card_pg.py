@@ -160,11 +160,50 @@ def test_error_badges_from_the_last_run_report_are_categorized(tmp_path, monkeyp
     assert len(last_run["protocol_errors"]) == 1
     assert last_run["protocol_errors"][0]["reason"] == "unresolved_doc_id"
     assert len(last_run["deferred"]) == 1
+    # O7 follow-up: no dropped source_url in this fixture's run — the badge
+    # category is always present (never a missing key), just empty.
+    assert last_run["source_urls_rejected"] == []
 
     # Cost placeholder is explicitly labeled as such and derived from the
-    # same 3 queue items (1 rejected quote + 1 protocol error + 1 deferred).
+    # same 3 queue items (1 rejected quote + 1 protocol error + 1 deferred)
+    # — a dropped source_url is deliberately NOT in that count (the claim
+    # itself still wrote, nothing is queued for retry over it).
     assert fs["cost_estimate"]["placeholder"] is True
     assert fs["cost_estimate"]["amount_usd"] > 0
+
+
+def test_source_urls_rejected_badge_is_populated_from_the_last_run(tmp_path, monkeypatch, pg_engine):
+    """O7 follow-up: a dropped `source_url` surfaces as its own badge
+    category on the source card, itemized doc_id + reason — never folded
+    into `protocol_errors` (a dropped source_url never rejects the claim,
+    so it is a different signal)."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from src.repositories import facts_ingest_runs_repo
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=[CORPUS_A],
+        caller="scheduler@system.local",
+        documents_seen=1,
+        claims_written=1,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        source_urls_rejected=[{"doc_id": "d4", "reason": "not_https"}],
+    )
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    rejected = fs["last_run"]["source_urls_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason"] == "not_https"
+    assert rejected[0]["doc_id"] == "d4"
 
 
 def test_rejection_rows_resolve_doc_id_to_file_name_and_collection(tmp_path, monkeypatch, pg_engine):
