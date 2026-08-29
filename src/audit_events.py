@@ -293,6 +293,13 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "user_onboarded": AuditEvent("user_onboarded", "mutation", "A new user completed onboarding."),
     # --- entries below appended by later audit-coverage tasks ---
+    # Task 2 (F1 — fallback middleware + route-posture ratchet)
+    "http.request": AuditEvent(
+        "http.request",
+        "mutation",
+        "Generic fallback row written by AuditFallbackMiddleware for a mutating "
+        "request whose handler wrote no audit row of its own.",
+    ),
 }
 
 

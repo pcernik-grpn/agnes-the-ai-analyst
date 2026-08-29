@@ -2605,6 +2605,19 @@ def create_app() -> FastAPI:
 
     app.add_middleware(SecurityHeadersMiddleware)
 
+    # Fallback audit safety net (F1 — audit-full-coverage plan, Task 2) —
+    # writes a generic `http.request` row for any authenticated mutating
+    # request whose handler wrote no audit row of its own. Added BEFORE
+    # AuditTimingMiddleware below so it ends up the more INNER of the two:
+    # by the time its post-response check runs (after `await self.app(...)`
+    # returns), AuditTimingMiddleware's "before" phase has already stamped
+    # the correlation_id contextvar this middleware reads as a tie-break.
+    # See app/middleware/audit_fallback.py for the full mechanism (and why
+    # it does NOT lean on the audit-identity contextvar alone).
+    from app.middleware.audit_fallback import AuditFallbackMiddleware
+
+    app.add_middleware(AuditFallbackMiddleware)
+
     # Audit-timing + request-meta contextvars (pure ASGI, zero hot-path
     # overhead) — lets AuditRepository.log() auto-fill duration_ms,
     # client_ip and correlation_id for every HTTP-triggered audit write;
