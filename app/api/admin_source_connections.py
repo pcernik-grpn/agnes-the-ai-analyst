@@ -849,6 +849,16 @@ async def update_connection(
     default at all, which falls back to the legacy
     ``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See
     :func:`_guard_default_repoint`.
+
+    SharePoint connections: ``config.scopes`` (the connect wizard's
+    server-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) is
+    carried forward when the request's ``config`` omits the key — the same
+    "explicit wins" contract as Keboola's ``project_id``/``project_name``
+    above — since this endpoint's wholesale ``config`` replace would
+    otherwise let an ordinary edit through the generic connection editor
+    (which never renders that field) silently erase every confirmed scope's
+    ``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29). An
+    explicit ``scopes: []`` in the request still clears it deliberately.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -913,6 +923,25 @@ async def update_connection(
                     **{k: v for k, v in old_config.items() if k in ("project_id", "project_name")},
                     **config,
                 }
+            # SharePoint's `scopes` is the same shape of problem, one source
+            # type over: it is server-written via the dedicated connect-wizard
+            # scope endpoints (`app/api/admin_sharepoint.py`'s POST/DELETE
+            # `.../scopes`, `src.connection_specs._validate_sharepoint`'s
+            # docstring), never typed by hand — the generic editor's form does
+            # not even render it. Because this endpoint REPLACES `config`
+            # wholesale, an ordinary edit through that form (a rename, a
+            # certificate env change, re-saving the same fields) silently
+            # wiped every confirmed scope's `anonymize` flag, which is the
+            # ONLY place the anonymize-in-front pipeline's opt-in lives
+            # (`app/worker/kinds.py::_anonymize_marked_scope_map`) — the
+            # anonymize-fail-closed report, 2026-08-29. Carried forward
+            # unless the caller explicitly supplies the key, same "explicit
+            # wins" contract as `project_id`/`project_name` above: an
+            # explicit `scopes: []` (or the wizard's own DELETE endpoint)
+            # still empties it.
+            elif existing_row.get("source_type") == "sharepoint" and "scopes" not in config:
+                if old_config.get("scopes") is not None:
+                    config = {**config, "scopes": old_config["scopes"]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`
