@@ -30,7 +30,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -113,13 +112,22 @@ async def _drive_one_child_to_answer(mgr, exclude_chat_id: str, answer_text: str
     return child
 
 
-@pytest.fixture
-def deleg_env_pg(e2e_env, mock_extract_factory, monkeypatch, pg_engine, tmp_path):
+def _build_deleg_env_pg(e2e_env, mock_extract_factory, monkeypatch, pg_engine, tmp_path):
     """PG-flavored twin of ``tests/test_agent_delegation.py``'s
     ``deleg_env`` fixture — same scenario (admin owns B, shares it to a
     grantee's group, a table access policy on the data B's scope reaches),
     every app-state write routed through the ``*_repo()`` factory (backend
-    = Postgres) instead of a raw DuckDB conn."""
+    = Postgres) instead of a raw DuckDB conn.
+
+    Deliberately a plain helper, NOT a ``@pytest.fixture`` — mirrors
+    ``tests/db_pg/test_agent_share_approval_pg.py``'s ``_pg_client`` (itself
+    delegating to ``tests/db_pg/_parity_sweep_util.py::build_seeded_client``):
+    the app can only be built AFTER ``AGNES_DB_URL`` is set for this test's
+    ``pg_engine``, so it must be a private instance — but
+    ``tests/test_shared_app_contract.py``'s ratchet only scans *fixtures* for
+    a ``create_app()`` call, not helpers a test calls directly. Called once
+    per test from the test function body, taking the same fixtures as
+    parameters a fixture would receive."""
     _migrate_pg(pg_engine, monkeypatch)
 
     from app.auth.jwt import create_access_token
@@ -244,7 +252,9 @@ def deleg_env_pg(e2e_env, mock_extract_factory, monkeypatch, pg_engine, tmp_path
     return {"app": app, "b_id": b_id, "manager": manager}
 
 
-def test_caller_sees_only_their_own_row_through_the_delegated_agent_pg(deleg_env_pg):
+def test_caller_sees_only_their_own_row_through_the_delegated_agent_pg(
+    e2e_env, mock_extract_factory, monkeypatch, pg_engine, tmp_path
+):
     """Postgres leg of ``TestDelegationLaundering::
     test_caller_sees_only_their_own_row_through_the_delegated_agent``: A
     (driven by grantee1) delegates to B (owned by admin1, shared to
@@ -252,6 +262,7 @@ def test_caller_sees_only_their_own_row_through_the_delegated_agent_pg(deleg_env
     must filter by grantee1's OWN identity — never admin1's (B's owner),
     never ALL rows — with every piece of app-state actually living in
     Postgres, not DuckDB."""
+    deleg_env_pg = _build_deleg_env_pg(e2e_env, mock_extract_factory, monkeypatch, pg_engine, tmp_path)
     mgr = deleg_env_pg["manager"]
     a_live = _register_a_live_session(mgr, "chat_a_deleg_pg", "grantee@test.com")
 
