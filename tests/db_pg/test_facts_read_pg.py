@@ -1030,6 +1030,80 @@ def test_s9_alias_oracle_is_closed(pg_env, repo):
     assert "halyard" not in str(subject).lower()
 
 
+def test_s9_backfill_makes_a_legacy_alias_and_q_search_work_for_a_non_admin(pg_engine, monkeypatch, tmp_path):
+    """Adversarial-review finding: ``0084_fact_alias_sources`` creates the
+    table EMPTY. Without a backfill, ``_alias_readable_sql`` treats a
+    zero-provenance-row alias as unreadable for every non-admin — i.e.
+    every alias minted BEFORE this deploy — and ``search()``'s
+    ``candidates`` CTE requires a readable alias match whenever ``q`` is
+    given, so `q` would return ZERO results for every pre-existing subject
+    on any instance with real fact data (an operator would have to
+    re-ingest to get working search back).
+
+    This test steps the Alembic chain itself — upgrade to
+    ``0083_ingest_runs_source_urls`` (``fact_alias_sources`` doesn't exist
+    yet), seed a fact/alias/claim through the SAME repo methods
+    pre-deploy code used (``create_fact``/``add_claim`` with no
+    ``corpus_id`` — the table isn't there to write to), THEN upgrade to
+    head — so it actually exercises the migration's backfill INSERT, not
+    merely the read-path filter (every other S9 test seeds provenance
+    explicitly via ``add_alias(..., corpus_id=...)`` and would pass even
+    if the backfill were deleted). Fails on the pre-backfill migration:
+    with no backfill, both assertions below see an empty result."""
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "0083_ingest_runs_source_urls")
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    from tests.db_pg._parity_sweep_util import _seed_pg_system_groups
+
+    _seed_pg_system_groups(pg_engine)
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    repo = FactsPgRepository(db_pg.get_engine())
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    # Legacy data: an alias with NO fact_alias_sources row, because the
+    # table doesn't exist at this revision yet — exactly the shape every
+    # subject minted before this PR is in.
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:legacy-rollout")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The legacy engagement is underway.",
+    )
+
+    command.upgrade(cfg, "head")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="lena", email="lena@test.com", name="Lena")
+    _make_group_with_grant(pg_engine, group_name="group-lena-s9", collection_id=CORPUS_A, member_user_id="lena")
+
+    result = repo.search(_dict_user("lena"), type="engagement")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+    assert result["subjects"][0]["aliases"] == ["engagement:legacy-rollout"]
+
+    q_result = repo.search(_dict_user("lena"), type="engagement", q="legacy-rollout")
+    assert [s["id"] for s in q_result["subjects"]] == [fact_id]
+
+
 def test_s9_admin_sees_the_restricted_alias_regardless(pg_env, repo):
     """God-mode: an Admin-group caller sees every alias unconditionally —
     never gated on ``fact_alias_sources`` having a row for it either

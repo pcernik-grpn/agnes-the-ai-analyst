@@ -1658,7 +1658,14 @@ the count of fact-graph claims dropped for that file because its content
 changed in place (§6) — 0 for a brand-new file, an unchanged-content resync
 or rename, or when the `facts` flag is off — so a producer's ingest
 idempotence can tell "content changed, re-ingest is genuinely needed" apart
-from "already shipped".
+from "already shipped". The optional `source_stable_ids` field refuses any
+value matching the RESERVED zip-bundle member-anchor shape
+(`cf_<hex>!<member path>`, only `ingest_bundle` may mint one) with a `400`
+(`reason: "reserved_source_stable_id"`) before any file in the batch is
+stored — otherwise a caller with mere collection READ access (enough to see
+a real member's id and filename in this same listing) could re-upload an
+unrelated file under a member's own anchor and have it silently resolve to
+(and overwrite) that member's row.
 
 - /api/collections
 - /api/collections/search
@@ -1745,6 +1752,11 @@ own content `sha256[:16]`, `source_stable_id` = `"<archive
 corpus_files.id>!<member path>"`), so a claim referencing that `doc_id`
 resolves to the member's `corpus_file_id`, never the archive's — no
 `documents[]` entry is required once the archive has been ingested once.
+That shape is RESERVED: a `documents[].stable_id` matching it is refused
+with a `400` (`reason: "reserved_source_stable_id"`) before any document in
+the batch is resolved — the identical guard the collections upload endpoint
+enforces on `source_stable_ids` (see the Collections section below); only
+`ingest_bundle` may mint an anchor on that shape.
 Corrections management
 (`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
 `wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
@@ -2360,6 +2372,7 @@ fanned out into group members' installs and cannot be uninstalled
 ### `/api/upload` — Session and artifact upload
 
 - /api/upload/artifacts
+- /api/upload/audit-events
 - /api/upload/local-md
 - /api/upload/sessions
 

@@ -9,6 +9,7 @@ body -> Fernet-encrypted at rest in ``system_secrets``. It is never returned
 by any endpoint and never placed in an audit record (audit params are empty,
 mirroring the MCP secret endpoints).
 """
+
 from __future__ import annotations
 
 import logging
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 from app.auth.access import require_admin
 from app.secrets_vault import VaultKeyNotConfiguredError
 from services.slack_bot.secrets import SLACK_SECRET_NAMES
+from src.audit_helpers import log_safe
 from src.repositories import audit_repo, system_secrets_repo
 
 logger = logging.getLogger(__name__)
@@ -35,9 +37,7 @@ def _audit(actor_id: str, action: str, resource: str) -> None:
     value never enters the audit record (mirrors the MCP secret endpoints).
     Routed through the ``audit_repo()`` factory so it works on either backend."""
     try:
-        audit_repo().log(
-            user_id=actor_id, action=action, resource=resource, params={}
-        )
+        audit_repo().log(user_id=actor_id, action=action, resource=resource, params={})
     except Exception:
         logger.warning("audit log failed for %s/%s", action, resource)
 
@@ -55,6 +55,8 @@ async def list_slack_secrets(user: dict = Depends(require_admin)):
         else:
             source, has_value = "unset", False
         out.append({"name": name, "source": source, "has_value": has_value})
+    # NEVER a value — this endpoint only ever reports presence/source.
+    log_safe(user_id=user.get("id"), action="slack.secret.read", resource="slack_secrets")
     return {"secrets": out}
 
 

@@ -287,6 +287,19 @@ async def _handle_dm(app, event: dict) -> None:
             "You don't have access to Agnes chat yet — ask an admin to grant your group access on /admin/access.",
         )
         return
+    # F2d (audit-full-coverage plan, Task 6): a read event — the bot accepted
+    # an inbound DM from a bound, granted user. client_kind is explicit since
+    # this dispatch coroutine runs detached from any HTTP request context
+    # (ack-then-async — see the module docstring in app/api/slack.py).
+    from src.audit_helpers import log_safe
+
+    log_safe(
+        user_id=_u["id"],
+        action="slack.message",
+        resource=f"channel:{channel}",
+        params={"surface": "dm"},
+        client_kind="slack",
+    )
     mgr = app.state.chat_manager
     from app.chat.types import Surface
 
@@ -408,6 +421,17 @@ async def _handle_mention(app, event: dict) -> None:
             "You don't have access to Agnes chat yet — ask an admin to grant your group access on /admin/access.",
         )
         return
+    # F2d (audit-full-coverage plan, Task 6): see _handle_dm's twin call for
+    # why client_kind is explicit here.
+    from src.audit_helpers import log_safe
+
+    log_safe(
+        user_id=_u["id"],
+        action="slack.message",
+        resource=f"channel:{channel}",
+        params={"surface": "mention"},
+        client_kind="slack",
+    )
 
     # 5b. Channel→agent binding: an agent holding scope item
     # ('slack_channel', <channel_id>) owns mentions in this channel — the
