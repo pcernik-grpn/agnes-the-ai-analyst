@@ -30,6 +30,7 @@ from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.resource_types import ResourceType
+from src.audit_helpers import log_safe
 from src.repositories import agents_repo, user_journey_repo
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,12 @@ async def create_session(
     except ConcurrencyCapHit as exc:
         raise HTTPException(status_code=429, detail={"kind": "concurrency_cap", "hint": str(exc)})
     ticket = _issue_ticket(s.id, user["email"])
+    log_safe(
+        user_id=user["id"],
+        action="chat.session.create",
+        resource=f"session:{s.id}",
+        params={"surface": body.surface},
+    )
     return {
         "id": s.id,
         "surface": s.surface.value,
@@ -411,6 +418,12 @@ async def set_session_archived(
         repo.archive_session(chat_id)
     else:
         repo.restore_session(chat_id)
+    log_safe(
+        user_id=user["id"],
+        action="chat.session.archive",
+        resource=f"session:{chat_id}",
+        params={"archived": body.archived},
+    )
     return {"id": chat_id, "archived": body.archived}
 
 
@@ -438,6 +451,7 @@ async def delete_session_permanently(
         raise HTTPException(404)
     await _kill_quietly(request, chat_id, reason="user_delete")
     repo.hard_delete_session(chat_id)
+    log_safe(user_id=user["id"], action="chat.session.delete", resource=f"session:{chat_id}")
 
 
 def _chat_config_for_delivery(request: Request):
@@ -561,6 +575,7 @@ async def reissue_ticket(
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
     ticket = _issue_ticket(chat_id, user["email"])
+    log_safe(user_id=user["id"], action="chat.session.ticket", resource=f"session:{chat_id}")
     return {
         "id": chat_id,
         "ws_ticket": ticket,
@@ -632,6 +647,12 @@ async def archive_session(
     except Exception:
         logger.exception("kill on archive failed for %s", chat_id)
     repo.archive_session(chat_id)
+    log_safe(
+        user_id=user["id"],
+        action="chat.session.archive",
+        resource=f"session:{chat_id}",
+        params={"archived": True},
+    )
 
 
 async def _flush_gap_replay(ws: WebSocket, gate: GapReplayGate, mgr: ChatManager, chat_id: str, last_seq: int) -> None:

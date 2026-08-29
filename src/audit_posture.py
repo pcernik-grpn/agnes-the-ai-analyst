@@ -203,19 +203,19 @@ POSTURE: dict[str, str] = {
     # -- app.api.catalog -------------------------------------------------------
     "POST /api/catalog/profile/{table_name}/refresh": "fallback",
     # -- app.api.chat ----------------------------------------------------------
-    "DELETE /api/chat/sessions/{chat_id}": "fallback",
-    "DELETE /api/chat/sessions/{chat_id}/permanent": "fallback",
-    "POST /api/chat/sessions": "fallback",
-    "POST /api/chat/sessions/{chat_id}/ticket": "fallback",
+    "DELETE /api/chat/sessions/{chat_id}": "chat.session.archive",
+    "DELETE /api/chat/sessions/{chat_id}/permanent": "chat.session.delete",
+    "POST /api/chat/sessions": "chat.session.create",
+    "POST /api/chat/sessions/{chat_id}/ticket": "chat.session.ticket",
     "PUT /api/chat/journey": "fallback",
-    "PUT /api/chat/sessions/{chat_id}/archived": "fallback",
+    "PUT /api/chat/sessions/{chat_id}/archived": "chat.session.archive",
     "PUT /api/chat/sessions/{chat_id}/pin": "fallback",
     "PUT /api/chat/sessions/{chat_id}/title": "fallback",
     # -- app.api.chat_copresence -----------------------------------------------
     "POST /api/chat/{session_id}/fork": "fallback",
-    "POST /api/chat/{session_id}/invite": "co_session_fork",
-    "POST /api/chat/{session_id}/join-ticket": "fallback",
-    "POST /api/chat/{session_id}/leave": "fallback",
+    "POST /api/chat/{session_id}/invite": "chat.copresence.invite",
+    "POST /api/chat/{session_id}/join-ticket": "chat.copresence.join",
+    "POST /api/chat/{session_id}/leave": "chat.copresence.leave",
     # -- app.api.chat_session_files --------------------------------------------
     "POST /api/chat/sessions/{chat_id}/files/save-artefact": "fallback",
     # -- app.api.chat_uploads --------------------------------------------------
@@ -469,7 +469,7 @@ POSTURE: dict[str, str] = {
     "POST /api/sync/trigger": "sync.trigger",
     # -- app.api.telegram ------------------------------------------------------
     "POST /api/telegram/unlink": "fallback",
-    "POST /api/telegram/verify": "fallback",
+    "POST /api/telegram/verify": "telegram.bind",
     # -- app.api.tokens --------------------------------------------------------
     "DELETE /auth/admin/tokens/{token_id}": "fallback",
     "DELETE /auth/tokens/{token_id}": "token.revoke",

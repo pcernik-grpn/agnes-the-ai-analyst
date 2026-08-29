@@ -300,19 +300,55 @@ CATALOG: dict[str, AuditEvent] = {
         "Generic fallback row written by AuditFallbackMiddleware for a mutating "
         "request whose handler wrote no audit row of its own.",
     ),
+    # Task 6 (F2d — messaging surfaces: Telegram, Slack inbound, chat lifecycle)
+    "telegram.bind": AuditEvent("telegram.bind", "auth", "A Telegram account was linked to an Agnes user."),
+    "telegram.message": AuditEvent(
+        "telegram.message", "read", "The Telegram bot received and processed a message from a linked user."
+    ),
+    "telegram.script_run": AuditEvent(
+        "telegram.script_run",
+        "mutation",
+        "A Telegram button press ran a user notification script via the sudo path.",
+    ),
+    "slack.message": AuditEvent(
+        "slack.message", "read", "The Slack bot accepted an inbound DM or channel mention from a bound user."
+    ),
+    "slack.command": AuditEvent("slack.command", "mutation", "A Slack slash command was dispatched."),
+    "chat.session.create": AuditEvent("chat.session.create", "mutation", "A chat session was created."),
+    "chat.session.delete": AuditEvent("chat.session.delete", "mutation", "A chat session was permanently deleted."),
+    "chat.session.archive": AuditEvent("chat.session.archive", "mutation", "A chat session was archived or restored."),
+    "chat.session.ticket": AuditEvent(
+        "chat.session.ticket", "mutation", "A fresh WebSocket ticket was issued for an existing chat session."
+    ),
+    "chat.user_message": AuditEvent(
+        "chat.user_message", "read", "A user message reached the chat manager's delivery ingress."
+    ),
+    "chat.copresence.invite": AuditEvent(
+        "chat.copresence.invite", "mutation", "A co-presence chat session was created via invite."
+    ),
+    "chat.copresence.join": AuditEvent(
+        "chat.copresence.join", "mutation", "A live participant obtained a co-presence join ticket."
+    ),
+    "chat.copresence.leave": AuditEvent(
+        "chat.copresence.leave", "mutation", "A participant left a co-presence chat session."
+    ),
 }
 
 
 # ---------------------------------------------------------------------------
 # LEGACY_ALIASES — read-side only mapping from a retired action name to its
-# current name. No writer in this codebase currently emits a key in this
-# dict (the historical `km_*` prefix has no live writer as of this plan) —
-# the mechanism exists so a FUTURE rename never needs a matching write-side
-# migration: add the alias here, classification code resolves through it,
-# done. `is_cataloged` does NOT consult this dict — an alias key is by
-# definition a name nothing should still be emitting.
+# current name. No writer in this codebase currently emits "co_session_fork"
+# any more (Task 6 — F2d — renamed the one write site to "chat.copresence.
+# invite" for naming symmetry with the sibling join/leave actions added in
+# the same task); the "co_session_fork" key stays in CATALOG above, unrenamed
+# and unremoved, so historical rows written under it remain a known action —
+# this dict is what actually resolves them to their current name for
+# read-side classification. `is_cataloged` does NOT consult this dict — an
+# alias key is by definition a name nothing should still be emitting.
 # ---------------------------------------------------------------------------
-LEGACY_ALIASES: dict[str, str] = {}
+LEGACY_ALIASES: dict[str, str] = {
+    "co_session_fork": "chat.copresence.invite",
+}
 
 
 # ---------------------------------------------------------------------------
