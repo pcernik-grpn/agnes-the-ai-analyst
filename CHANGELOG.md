@@ -781,6 +781,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   it and surfaced as an unhandled server error (#1656). Such a caller now
   fails closed with a clean 403 — the git surface is owner-authority, and a
   restricted principal has no sound identity to run that check against.
+- **Security: direct `kbc."bucket"."table"` paths are now registry-, grant- and
+  policy-gated (#1492).** Every Keboola sync writes a `_remote_attach` row that
+  re-ATTACHes the `kbc` catalog onto the read-only analytics connection with
+  the *instance* storage token, so a qualified path used to read whatever that
+  token could see — no registration check, no `resource_grants` consultation,
+  no access-policy substitution — while `bq`/`sf`/`dbx` each had all three. A
+  new `_kbc_guardrail_inputs` (mirroring the Snowflake guard, the closer
+  precedent: extension-resolved, not a shipped-to engine) now refuses an
+  unregistered path (`kbc_path_not_registered`, admins included), an
+  ungranted one (`kbc_path_access_denied`), and a path naming the physical
+  source of a policied row (`kbc_path_policied`) on both `/api/query` and the
+  snapshot `--from-query` path; matching normalizes pre-fix wizard rows that
+  stored the full `<bucket>.<table>` id in `source_table`, so legitimately
+  registered tables keep working. Mixed internal + `kbc.*` statements get the
+  same explicit refusal `bq.*`/`sf.*` already had. **Operator note:** any
+  analyst workflow that queried `kbc.*` directly against an unregistered
+  table now gets a 403 with a register-or-use-catalog-name hint — that read
+  was riding the instance token, which is what this closes. The gate covers
+  `/api/query` and `/api/v2/scan`; `POST /api/query/hybrid` runs
+  admin-supplied SQL on the same connection without any of the three
+  prefix guards (pre-existing, equally true of `bq`/`sf`, admin-only) and is
+  left to a follow-up that can decide its registered-BQ sub-query contract.
+- **Security: a SQL comment no longer hides a `bq.*` / `sf.*` / `kbc.*` path
+  from its registry/grant/policy guard.** DuckDB treats `/* … */` as
+  insignificant whitespace — `SELECT * FROM kbc/*x*/."bucket"."table"` parses
+  and reaches the ATTACHed catalog — but the guards' `qualified_path_re` scan
+  matched only literal whitespace between segments, so a comment placed
+  between a prefix and its path (or between the two identifiers) slipped the
+  gate entirely and read an unregistered or ungranted table through the
+  instance-wide connector token. All three now scan comment-masked SQL, the
+  masking `_assert_no_ungranted_catalog_ref` has always applied for exactly
+  this reason. String literals are deliberately still visible to the scan, so
+  the documented strict-deny on a path-shaped literal (`WHERE c =
+  'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
+  another. `dbx` gates on a parse rather than a regex and was never affected.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
