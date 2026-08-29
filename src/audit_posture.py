@@ -277,9 +277,9 @@ POSTURE: dict[str, str] = {
     "POST /api/store/entities/builder/turn": "fallback",
     # -- app.api.facts ---------------------------------------------------------
     "DELETE /api/facts/corrections/{subject_kind}/{subject_id}": "facts.correction.delete",
-    "POST /api/facts/ingest": "fallback",
-    "POST /api/facts/neighbors": "fallback",
-    "POST /api/facts/search": "fallback",
+    "POST /api/facts/ingest": "facts.ingest",
+    "POST /api/facts/neighbors": "facts.neighbors",
+    "POST /api/facts/search": "facts.search",
     "PUT /api/facts/corrections/{subject_kind}/{subject_id}": "facts.correction.upsert",
     # -- app.api.initial_workspace ---------------------------------------------
     "DELETE /api/admin/initial-workspace": "initial_workspace.delete",
@@ -323,9 +323,9 @@ POSTURE: dict[str, str] = {
     # -- app.api.mcp_oauth_connect ---------------------------------------------
     "DELETE /api/mcp/sources/{source_id}/oauth/connection": "fallback",
     # -- app.api.mcp_passthrough -----------------------------------------------
-    "POST /api/mcp/passthrough/tools/{tool_id}/call": "fallback",
+    "POST /api/mcp/passthrough/tools/{tool_id}/call": "mcp.passthrough_call",
     # -- app.api.mcp_per_table -------------------------------------------------
-    "POST /api/mcp/query-table/{table_id}": "fallback",
+    "POST /api/mcp/query-table/{table_id}": "query.table_scoped",
     # -- app.api.mcp_streamable ------------------------------------------------
     "DELETE /api/mcp/http": "fallback",
     "POST /api/mcp/http": "fallback",

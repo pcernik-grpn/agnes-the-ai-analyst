@@ -46,6 +46,7 @@ from app.api.mcp_policy import (
 from app.auth.access import _user_group_ids
 from app.auth.dependencies import get_current_user
 from connectors.mcp.client import call_tool_async, exc_summary
+from src.audit_helpers import log_safe
 from src.repositories import mcp_sources_repo, tool_registry_repo
 from src.repositories.tool_registry import PASSTHROUGH
 
@@ -191,8 +192,22 @@ async def invoke_passthrough_tool(
     try:
         enforce_passthrough_access(tool, user)
     except (GrantDenied, MutatingNotAllowed) as exc:
+        log_safe(
+            user_id=authority.user_id,
+            action="mcp.passthrough_denied",
+            resource=f"mcp_tool:{tool_id}",
+            result="denied",
+            params={"reason": type(exc).__name__},
+        )
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RateLimited as exc:
+        log_safe(
+            user_id=authority.user_id,
+            action="mcp.passthrough_denied",
+            resource=f"mcp_tool:{tool_id}",
+            result="denied",
+            params={"reason": "rate_limited"},
+        )
         raise HTTPException(
             status_code=429,
             detail=str(exc),
@@ -287,5 +302,11 @@ async def invoke_passthrough_tool(
         text=result.text,
         data=result.data,
         pii_fields=tool.get("pii_fields") if isinstance(tool.get("pii_fields"), list) else None,
+    )
+    log_safe(
+        user_id=authority.user_id,
+        action="mcp.passthrough_call",
+        resource=f"mcp_source:{tool['source_id']}",
+        params={"tool_id": tool_id, "is_error": result.is_error},
     )
     return InvokeResponse(is_error=result.is_error, text=redacted_text, data=redacted_data)

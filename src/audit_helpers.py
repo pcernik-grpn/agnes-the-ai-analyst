@@ -1,10 +1,27 @@
 """Shared helpers for audit logging."""
 
+import hashlib
+import json
 import logging
+from typing import Any
 
 from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
 
 logger = logging.getLogger(__name__)
+
+
+def hash_args(args: Any) -> str:
+    """Return first 16 hex chars of SHA-256 of the JSON-serialised args.
+
+    Moved here from ``app.chat.audit`` (F2c — audit-full-coverage plan, Task
+    5) so the MCP tool-call dispatch wrapper (``app.api.mcp.tools_generator
+    .install_tool_call_audit``) can reuse it without importing the
+    chat-specific module. ``app.chat.audit.hash_args`` re-exports this same
+    function — existing call sites there are unaffected.
+    """
+    raw = json.dumps(args, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
 
 # Every value ``client_kind_from_user`` / ``src.audit_context.set_client_kind``
 # may produce, and every surface a caller can stamp explicitly (F0 —
