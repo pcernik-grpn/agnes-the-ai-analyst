@@ -845,6 +845,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   had no username to associate the credential with and never saved it; the
   email is now a visible, readonly field in the same form (readonly inputs
   still submit — the POST contract is unchanged).
+- **The marketplace token cell now says whose PAT it is, not just that one
+  exists.** Every sync on an instance can run under one person's personal
+  token, and the UI showed a bare yes/no dot — a rotation or expiry then
+  became an unattributable fleet-wide sync failure. The list payload gains
+  `token_env` (the variable name, never the value) plus `token_set_by` /
+  `token_set_at`, projected from the audit rows token writes already leave
+  (`marketplace.create`/`.update`); the admin table shows the saver and date
+  under the dot, full detail in the tooltip. Best-effort by design: a trail
+  pruned past the write degrades to the env name alone, and an audit-read
+  failure never breaks the marketplaces list.
 - **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
   values.** Vertex validates the `anthropic-beta` header and refuses the whole
   request on any value it does not recognize (the first-party API ignores

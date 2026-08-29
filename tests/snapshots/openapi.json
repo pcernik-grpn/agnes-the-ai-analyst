@@ -5951,6 +5951,39 @@
             ],
             "title": "Registered By"
           },
+          "token_env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Env"
+          },
+          "token_set_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Set At"
+          },
+          "token_set_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Set By"
+          },
           "url": {
             "title": "Url",
             "type": "string"
