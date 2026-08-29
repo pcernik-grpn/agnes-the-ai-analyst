@@ -18,7 +18,7 @@ artifacts; this report is the committed summary).
 2. **Ontology import** — `scripts/ontology/import_ontology.py --server` live
    against the semantic-model API: 10 datasets, 12 relationships + 1
    inferred self-relationship. (First live exercise of that path.)
-3. **Ship** — the producer ship client (cuesta-star-graph `zs/agnes-producer`)
+3. **Ship** — the producer ship client (the producer repo, `zs/agnes-producer`)
    end-to-end: corrections export → upload → ingest.
    *First pass:* 999/1000 uploaded (1 scan PDF has no text artifact —
    counted, not hidden), 47/47 claims through the verbatim gate, 0

@@ -20,6 +20,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Added
 
 ### Changed
+- **Customer-specific names scrubbed from the shipped surfaces.** This repo's
+  vendor-agnostic rule ("nothing customer-specific in code, config defaults,
+  comments, docs, commit messages") had drifted: the ontology builder's own
+  name field suggested a customer's ontology as its placeholder
+  (`e.g. cuesta_star`), `connectors/sharepoint/graph_client.py` named a
+  private producer repo in its module docstring, the fact-graph design spec
+  and its run log referenced that repo ten times, and two admin-doctor tests
+  used a customer's product name as their brand fixture. All now read as the
+  role rather than the customer — "the producer repo", "the producer
+  pipeline", `e.g. acme_knowledge`. No behaviour change; the eval fixtures
+  under `tests/fixtures/eval/` are deliberately untouched (see the PR body).
 
 ### Removed
 

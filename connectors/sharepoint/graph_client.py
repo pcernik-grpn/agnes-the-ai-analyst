@@ -1,7 +1,7 @@
 """Microsoft Graph app-only client for the SharePoint connect wizard's
 folder-tree browser (spec 2026-08-27 §13.2).
 
-Not a producer — the actual crawl lives outside Agnes (the cuesta-star-graph
+Not a producer — the actual crawl lives outside Agnes (the producer
 pipeline, §7.1). This module exists only so the wizard's step-2 tree endpoint
 (``GET /api/admin/sharepoint/connections/{id}/tree``) can show an admin real
 sites/drives/folders to pick a scope from, using the same certificate the
