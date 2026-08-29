@@ -128,6 +128,91 @@ def test_unresolved_caller_fails_closed(seeded_app):
     mock.assert_not_called()
 
 
+# ── source gate (TCRD-236) ───────────────────────────────────────────────────
+
+
+def _narrow_source_to_group(source_id: str, group_id: str) -> None:
+    """Give ``source_id`` its FIRST ResourceType.MCP_SOURCE grant, restricted
+    to ``group_id`` — this is what an admin narrowing a server on
+    /admin/access does, and it is what flips the source from "ungated
+    (visible to everyone)" to "gated (visible only to explicitly granted
+    groups)"."""
+    from src.repositories import resource_grants_repo
+
+    resource_grants_repo().ensure_grant(group_id=group_id, resource_type="mcp_source", resource_id=source_id)
+
+
+def test_narrowed_source_denies_tool_granted_caller_outside_it(seeded_app):
+    """A caller whose group holds the TOOL grant is still refused once an
+    admin narrows the SOURCE to a different group — the mcp_source gate is
+    ANDed with tool_grants, not replaced by it."""
+    _seed_tool(tool_id="up.narrowed", exposed_name="narrowed", grant_to_analyst=True)
+    other_grp = UserGroupsRepository(get_system_db()).create(name="other-narrow-grp", description=None)
+    _narrow_source_to_group("src_up", other_grp["id"])
+
+    fn = _closure("narrowed", caller_id_fn=lambda: "analyst1")
+    with _patch_upstream(text="LEAK") as mock:
+        with pytest.raises(RuntimeError, match="no grant on source"):
+            asyncio.run(fn())
+    mock.assert_not_called()
+
+
+def test_narrowed_source_allows_member_of_the_granted_group(seeded_app):
+    """The tool_grants intersection AND the mcp_source grant both point at
+    the same group -> the call goes through."""
+    conn = get_system_db()
+    sources = MCPSourceRepository(conn)
+    tools = ToolRegistryRepository(conn)
+    groups = UserGroupsRepository(conn)
+    members = UserGroupMembersRepository(conn)
+
+    sources.upsert(id="src_narrow2", name="narrow2", transport="stdio", command="/bin/true", args=[])
+    tools.upsert(
+        tool_id="narrow2.lookup",
+        source_id="src_narrow2",
+        original_name="lookup",
+        exposed_name="narrowed2",
+        mode=PASSTHROUGH,
+        description="test",
+    )
+    grp = groups.create(name="narrow2-grp", description=None)
+    tools.add_grant("narrow2.lookup", grp["id"])
+    members.add_member("analyst1", grp["id"], source="system_seed")
+    conn.close()
+
+    _narrow_source_to_group("src_narrow2", grp["id"])
+
+    fn = _closure("narrowed2", caller_id_fn=lambda: "analyst1")
+    with _patch_upstream(text="ok") as mock:
+        out = asyncio.run(fn())
+    assert out == "ok"
+    mock.assert_awaited_once()
+
+
+def test_admin_bypasses_narrowed_source(seeded_app):
+    _seed_tool(tool_id="up.narrowadmin", exposed_name="narrowadmin", grant_to_analyst=False)
+    other_grp = UserGroupsRepository(get_system_db()).create(name="other-narrow-admin-grp", description=None)
+    _narrow_source_to_group("src_up", other_grp["id"])
+
+    fn = _closure("narrowadmin", caller_id_fn=lambda: "admin1")
+    with _patch_upstream(text="ok") as mock:
+        out = asyncio.run(fn())
+    assert out == "ok"
+    mock.assert_awaited_once()
+
+
+def test_ungated_source_stays_visible_by_default(seeded_app):
+    """A source nobody has ever granted at the mcp_source level (the common
+    case today) is treated as visible-to-everyone — this is the
+    backward-compat default the whole feature exists to preserve."""
+    _seed_tool(tool_id="up.ungated", exposed_name="ungated", grant_to_analyst=True)
+    fn = _closure("ungated", caller_id_fn=lambda: "analyst1")
+    with _patch_upstream(text="ok") as mock:
+        out = asyncio.run(fn())
+    assert out == "ok"
+    mock.assert_awaited_once()
+
+
 # ── mutating gate ──────────────────────────────────────────────────────────
 
 

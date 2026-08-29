@@ -306,7 +306,10 @@ def _resolve_marketplace_sync() -> Optional[Signal]:
 
     cutoff = _now() - timedelta(hours=STALE_MARKETPLACE_SYNC_HOURS)
     broken = 0
-    for row in marketplace_registry_repo().list_all():
+    # list_non_builtin: a bundled row never syncs (no git remote), so its
+    # NULL last_synced_at would read as "broken" forever on every instance
+    # — the same permanent-red wound TCRD-219 closes in the admin table.
+    for row in marketplace_registry_repo().list_non_builtin():
         if row.get("last_error"):
             broken += 1
             continue

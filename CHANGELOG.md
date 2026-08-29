@@ -12,6 +12,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 - **SharePoint connect wizard: unique-permissions advisory badge + raised search caps for real library scale.** `GET .../tree?with_permissions=1` (default off, batched via Graph's `POST /$batch`) probes each listed folder's `hasUniqueRoleAssignments` and the wizard now shows a warn-tone "unique permissions" badge on a folder whose source-side permissions break inheritance from its parent, plus a one-line advisory on the share step when a selected scope was flagged — **advisory only**: Agnes still does not derive or enforce anything from a SharePoint ACL (Decision #2 stands), a probe failure or an un-probed folder always renders as "unknown", never a false "no unique permissions". A real library measured at 443k files / 97,899 folders made the previous search caps (depth 10 / visited 2000) truncate almost every whole-library search at the very top; caps are now depth 12 / visited 20000 (default `max_visited` also raised, 500 → 2000), and a truncated `GET .../tree/search` response carries a `hint` the UI's truncation banner now shows alongside the visited count.
+- **MCP servers are now a grantable resource — `ResourceType.MCP_SOURCE`.** Admin-registered MCP servers (`/admin/mcp-sources`) previously had no source-wide visibility control: any user who could see one of a server's tools (via the existing per-tool `tool_grants`) could discover the server existed, and there was no one-action way to hide a whole server from a group. A new `mcp_source` resource type shows up on `/admin/access` like every other grantable resource (data packages, agents, collections, …) and gates the two listing surfaces (`GET /api/mcp/passthrough/tools`, the SSE/Streamable-HTTP `tools/list`) and the call itself (`enforce_passthrough_access`) — ANDed with, never replacing, the existing per-tool grant. Backward compatible by construction: a source with no `mcp_source` grant at all is treated as visible-to-everyone (the "nobody has narrowed this yet" case), every already-registered source is idempotently grandfathered onto the `Everyone` group at boot, and a newly registered source gets the same default at creation time — so existing MCP connections keep working until an admin deliberately narrows a specific server.
+- **@delegation between shared agents — server-side handoff (Track C7 MVP).** A live, user-driven agent turn (agent A) can mid-turn hand ONE sub-request off to another agent the caller may run (agent B), get B's answer back into A's turn, and continue — a new in-sandbox tool (`delegate_to_agent`) reaches `POST /api/v1/agents/{slug}/delegate`, which resolves B exactly as the agent-runtime routes do (`agents_repo().get_runnable_by_slug` — the CALLER's own runnable set, never A's owner's) and spawns B as a fresh child chat session under the ORIGINAL CALLER's identity (`ChatManager.create_session(user_email=<caller>, agent_id=B)`) — never A's owner, never B's owner — so B's row-level access policies bind to the caller exactly like the existing C2.3 shared-agent-runtime mechanism, and A can never see a wider slice of data through B than the caller already has. Depth-1 only (a delegated session cannot itself delegate) and one delegation per turn; an RBAC denial, an exhausted monthly budget on B, the per-user concurrency cap, or B simply not answering in time all degrade the result (a normal `200` body) rather than failing A's turn. Delegation rides the existing generic `tool_call`/`tool_result` frame pipeline (already AG-UI-mapped) — no new frame types — and gets a friendly "Delegating to another agent" label in the web chat UI. Hardening: the route's `require_delegating_session` guard now fails closed (403) if a live `AgentPrincipal` is ever missing its resolved caller identity, instead of silently falling back to A's owner — defense-in-depth against a future refactor reopening the owner-fallback laundering seam (no production path exercises it today).
+- **A per-instance upgrade freeze an admin can set without SSH.** An
+  auto-upgrade tick once landed mid-demo; the mitigation was a human lock
+  ("ping the operator an hour ahead"). `GET/POST/DELETE /api/admin/upgrade-freeze`
+  now manages a marker file on the shared state disk
+  (`{DATA_DIR}/state/upgrade-freeze-until`, a UTC epoch, capped at 72 h so a
+  typo can't silently disable upgrades for a month), and the VM's
+  `agnes-auto-upgrade.sh` tick consults it before pulling — logging the
+  remaining freeze time on every skipped tick, failing open on a corrupt
+  marker, and cleaning up an expired one. Both actions are audit-logged
+  (`upgrade_freeze.set` / `.lift`).
 - **External SSO sign-in — runtime-configured Entra ID OIDC** (design doc `docs/superpowers/specs/2026-08-28-external-sso-login-design.md`). A new optional `sso` provider slot lets users of an *external* organization's Entra tenant sign in alongside every existing login method: an admin configures it at runtime (web panel on `/admin/server-config` or `agnes admin sso …` — tenant ID, client ID, a write-only Fernet-encrypted client secret, a **mandatory, explicit** email-domain allowlist that is deliberately not inherited from `auth.allowed_domain`, and the login-button label) and changes apply on the next login attempt, no restart. Every sign-in captures the validated token's `oid`/`tid` into the new PG-only `user_external_identities` table (subject binding beats email attach; same-tenant conflicts refuse with admin-findable diagnostics; stale bindings self-heal after a tenant re-point), exposed via `GET /api/me/external-identity`, the profile page's *Linked identity* line, `agnes whoami`, and the paginated admin identities list with per-user unlink. Ships with a side-effect-free admin **test sign-in** (`/auth/sso/login?mode=test`, works pre-enable), a server-side discovery probe, startup-warning announcements, and a last-login-door guard (`422 last_login_door`) so disabling or deleting the config can never lock the instance out. Postgres app-state backend required (typed `501` on DuckDB); operator doc: `docs/auth-sso-entra.md`.
 - **Force-SSO for allowlisted domains.** The local credential doors — password and magic link (login, `/auth/token`, forgot-password, invite/setup and magic-link legs, request and redemption sides alike) — now refuse every address whose domain is in the enabled SSO config's `allowed_email_domains`, so a link or password minted before the domain joined the allowlist stops working the moment it does. (The OAuth providers are separate doors with their own domain policies, unchanged by the forcing — see the operator doc.) This makes the allowlist's delegation real: when the external tenant offboards someone, no leftover local credential keeps their access alive. Browser forms redirect the address to `/auth/sso/login`; JSON credential endpoints keep their existing generic refusals (no domain oracle). Forcing follows the live config — disable SSO, clear the secret, delete the config, drop the domain from the allowlist, or exclude `sso` from `auth.providers`, and the other doors reopen; stored password hashes are never destroyed. See the trust-model section of `docs/auth-sso-entra.md`.
 - **Agent profiles run on the embedded kai-agent engine — the agent API no longer refuses `chat.provider: kai-agent`.** The three artifacts the native workdir seam materializes for an agent session now ride the engine's workspace tarball (`GET /api/kai/workspace`): the persona `CLAUDE.md` (data-access rails appended, replacing the rendered Workspace Prompt exactly as `WorkdirManager._materialize_profile` does natively — override mode included), the identity skill (minted without the remember-tool recipe, which is uncallable from the engine sandbox), and the active memories at `.claude/agent-memory.md`, rendered by the same helper the native seam writes through (`agent_profile.render_memories`) so the two sandboxes cannot drift. A scope-limited agent's tool calls are no longer refused (`403 mcp_not_available_to_scoped_agent` is gone): `/api/kai/mcp` mints and registers the same `agent_session` token the native broker replay uses, so `resolve_token_to_user` rebuilds owner-grants ∩ agent-scope live per request (`AgentPrincipal`) — narrowing an agent or revoking a grant takes effect on the next tool call, and the mint's token cache now keys on the identity *shape* so flipping an agent to `'selected'` mid-conversation can never keep serving the owner token. The same narrowed path covers an all-'all' agent whose session user is not its owner (Slack channel binding), and the flattened marketplace overlay in the tarball is intersection-filtered for restricted sessions — a scoped agent's `AgentPrincipal`, a co-session's live participant `SessionPrincipal` — rather than shipping the caller's (or stored owner's) whole stack. An agent session without a persona now gets the session user's rendered Workspace Prompt (native parity) instead of the unfiltered bundled text. With both halves in place, `POST /api/v1/agents/{slug}/sessions` drops its `503 agent_sessions_unavailable_on_provider` guard — the agent API, `agnes chat <slug>`, one-shot `/responses`, schedules, webhooks and Slack agent bindings all run on the engine provider with the right persona and the right authority. Still engine-side gaps, documented in docs/cloud-chat.md: co-drive keeps failing closed (`mcp_not_available_to_co_session`), and agent memory *writes* have no engine channel (`memory_write_mode` is effectively read-only there).
@@ -750,6 +762,61 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   shows the tenant (shortened GUID) and a scope summary, e.g. `a1b2c3d4… ·
   2 scopes · Communication site`, or `N sites` when the selected scopes span
   more than one site.
+- **Corporate Memory: the nightly collector no longer queues duplicate
+  suggestions the catalog-refresh LLM failed to recognize as restatements of
+  an existing item.** Its own `existing_id` verdict was the only dedup
+  signal, so a paraphrase reported as brand new landed as a second item in
+  the triage queue. A deterministic, stdlib-only guard now re-checks every
+  `existing_id: null` item against same-category catalog items — both
+  already-approved items and suggestions still awaiting review — before it
+  is accepted: an exact match after normalization, or a normalized-token
+  Jaccard / `difflib.SequenceMatcher` similarity of 0.9 or higher, skips the
+  proposal (logged, and counted in the run's `items_duplicate_skipped`
+  stat, visible on `/admin/scheduler-runs` and in the CLI collector's
+  summary). Below that threshold nothing is skipped — a false "duplicate"
+  would silently drop a real finding.
+- The data-app git surface (`/data-apps.git/<slug>/…`) no longer answers a
+  restricted principal's credential with a raw 500. An agent-session or
+  co-session token resolves to a frozen principal dataclass with no single
+  caller identity; the route's owner/admin checks raised `AttributeError` on
+  it and surfaced as an unhandled server error (#1656). Such a caller now
+  fails closed with a clean 403 — the git surface is owner-authority, and a
+  restricted principal has no sound identity to run that check against.
+- **Security: direct `kbc."bucket"."table"` paths are now registry-, grant- and
+  policy-gated (#1492).** Every Keboola sync writes a `_remote_attach` row that
+  re-ATTACHes the `kbc` catalog onto the read-only analytics connection with
+  the *instance* storage token, so a qualified path used to read whatever that
+  token could see — no registration check, no `resource_grants` consultation,
+  no access-policy substitution — while `bq`/`sf`/`dbx` each had all three. A
+  new `_kbc_guardrail_inputs` (mirroring the Snowflake guard, the closer
+  precedent: extension-resolved, not a shipped-to engine) now refuses an
+  unregistered path (`kbc_path_not_registered`, admins included), an
+  ungranted one (`kbc_path_access_denied`), and a path naming the physical
+  source of a policied row (`kbc_path_policied`) on both `/api/query` and the
+  snapshot `--from-query` path; matching normalizes pre-fix wizard rows that
+  stored the full `<bucket>.<table>` id in `source_table`, so legitimately
+  registered tables keep working. Mixed internal + `kbc.*` statements get the
+  same explicit refusal `bq.*`/`sf.*` already had. **Operator note:** any
+  analyst workflow that queried `kbc.*` directly against an unregistered
+  table now gets a 403 with a register-or-use-catalog-name hint — that read
+  was riding the instance token, which is what this closes. The gate covers
+  `/api/query` and `/api/v2/scan`; `POST /api/query/hybrid` runs
+  admin-supplied SQL on the same connection without any of the three
+  prefix guards (pre-existing, equally true of `bq`/`sf`, admin-only) and is
+  left to a follow-up that can decide its registered-BQ sub-query contract.
+- **Security: a SQL comment no longer hides a `bq.*` / `sf.*` / `kbc.*` path
+  from its registry/grant/policy guard.** DuckDB treats `/* … */` as
+  insignificant whitespace — `SELECT * FROM kbc/*x*/."bucket"."table"` parses
+  and reaches the ATTACHed catalog — but the guards' `qualified_path_re` scan
+  matched only literal whitespace between segments, so a comment placed
+  between a prefix and its path (or between the two identifiers) slipped the
+  gate entirely and read an unregistered or ungranted table through the
+  instance-wide connector token. All three now scan comment-masked SQL, the
+  masking `_assert_no_ungranted_catalog_ref` has always applied for exactly
+  this reason. String literals are deliberately still visible to the scan, so
+  the documented strict-deny on a path-shaped literal (`WHERE c =
+  'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
+  another. `dbx` gates on a parse rather than a regex and was never affected.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
@@ -823,6 +890,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   prompt with the shipped default — no confirmation, nothing recoverable. The
   reset now goes through the design-system confirm dialog (same idiom as every
   other destructive admin action), naming what will be lost.
+- **Password managers can now fill and save on every auth form.** The login
+  identifier fields said `autocomplete="email"` — managers key saved logins on
+  `username` (the spec's token for the account identifier, even when it is an
+  email address), which is why the same login page offered credentials to one
+  person and nothing to another. And the setup/reset forms carried the account
+  email only as a hidden input, so a manager watching the `new-password` field
+  had no username to associate the credential with and never saved it; the
+  email is now a visible, readonly field in the same form (readonly inputs
+  still submit — the POST contract is unchanged).
+- **The marketplace token cell now says whose PAT it is, not just that one
+  exists.** Every sync on an instance can run under one person's personal
+  token, and the UI showed a bare yes/no dot — a rotation or expiry then
+  became an unattributable fleet-wide sync failure. The list payload gains
+  `token_env` (the variable name, never the value) plus `token_set_by` /
+  `token_set_at`, projected from the audit rows token writes already leave
+  (`marketplace.create`/`.update`); the admin table shows the saver and date
+  under the dot, full detail in the tooltip. Best-effort by design: a trail
+  pruned past the write degrades to the env name alone, and an audit-read
+  failure never breaks the marketplaces list.
 - **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
   values.** Vertex validates the `anthropic-beta` header and refuses the whole
   request on any value it does not recognize (the first-party API ignores
@@ -844,6 +930,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   its grants materialized for every group), and `/admin/access` extends the
   collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
   same grants payload the checkboxes read so the two can never disagree.
+- **The `/admin` hub's "Marketplace sync" signal no longer counts bundled
+  rows.** A bundled row never syncs (it has no git remote), so its NULL
+  `last_synced_at` read as "no sync in 48h" and every instance showed a
+  permanent "Needs fixing" row for content that ships inside the image.
 - **A stale "last sync failed" on a bundled marketplace row now clears itself.**
   The failure stamped by a pre-guard "Sync now" click could never clear: the
   nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
