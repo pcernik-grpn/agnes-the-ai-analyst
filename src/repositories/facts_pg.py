@@ -603,6 +603,7 @@ class FactsPgRepository:
         *,
         type: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
+        q: Optional[str] = None,
         limit: int = MAX_SEARCH_LIMIT,
     ) -> Dict[str, Any]:
         """Type/filter search over visible FACT subjects (spec §5). A
@@ -612,7 +613,25 @@ class FactsPgRepository:
         ONLY (via ``counted_claims``/``attr_kv`` below, never
         ``endpoint_claims``) — an endpoint-only fact (visible purely via an
         edge) always serves ``attrs: {}`` and a ``claim_count`` of 0, closing
-        the attribute oracle (S2) exactly as before this refinement."""
+        the attribute oracle (S2) exactly as before this refinement.
+
+        ``q`` is an OPTIONAL free-text name lookup, matched against
+        ``fact_aliases.natural_key`` ONLY — never a claim's quote or attrs,
+        so it can never reopen the S2 attribute oracle. It is a real FILTER
+        (candidates without a matching alias never enter ``visible`` at
+        all — S6's shortfall rule: pre-limit, in SQL, never a Python
+        post-filter), not merely a sort key. The query is normalized
+        (casefolded, spaces -> hyphens) before matching so a natural-
+        language name like "Parts Authority" matches the
+        ``<type>:<kebab-slug>`` alias ``organization:parts-authority`` as a
+        substring. Matching subjects are then RANKED — an exact match on the
+        alias's slug (the part after the first ``:``) first, a slug prefix
+        match second, any other substring match last, shorter alias and
+        then ``subject_id`` breaking further ties. No ``pg_trgm`` (or other
+        extension) similarity ranking: this schema does not enable one, and
+        this repo intentionally does not add the operational dependency —
+        this deterministic CASE-based tiering needs nothing beyond stock
+        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"."""
         filters = filters or {}
         if len(filters) > MAX_SEARCH_FILTERS:
             raise ValueError(f"too many filters (max {MAX_SEARCH_FILTERS})")
@@ -624,8 +643,25 @@ class FactsPgRepository:
         vis = self._visibility_predicate("c.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
 
+        q_clean = (q or "").strip()
+        q_norm = q_clean.casefold().replace(" ", "-") if q_clean else None
+        q_substr: Optional[str] = None
+        q_prefix: Optional[str] = None
+        if q_norm:
+            # ESCAPE '\' per the security playbook (F-series LIKE guidance):
+            # a literal '%'/'_' in the query must never act as a wildcard.
+            q_escaped = q_norm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            q_substr = f"%{q_escaped}%"
+            q_prefix = f"{q_escaped}%"
+
         filter_clauses = []
-        params: Dict[str, Any] = {"type": type, "limit_plus_one": limit + 1}
+        params: Dict[str, Any] = {
+            "type": type,
+            "limit_plus_one": limit + 1,
+            "q_substr": q_substr,
+            "q_prefix": q_prefix,
+            "q_norm": q_norm,
+        }
         if not is_admin:
             params["readable"] = list(readable)
         for i, (fkey, fval) in enumerate(filters.items()):
@@ -643,6 +679,13 @@ class FactsPgRepository:
                 SELECT f.id AS subject_id, f.type AS subject_type
                 FROM facts f
                 WHERE (CAST(:type AS TEXT) IS NULL OR f.type = :type)
+                  AND (
+                    CAST(:q_substr AS TEXT) IS NULL
+                    OR EXISTS (
+                        SELECT 1 FROM fact_aliases fa
+                        WHERE fa.fact_id = f.id AND fa.natural_key ILIKE :q_substr ESCAPE '\\'
+                    )
+                  )
                   AND NOT EXISTS (
                     SELECT 1 FROM corrections co
                     WHERE co.subject_kind = 'fact' AND co.subject_id = f.id
@@ -703,6 +746,25 @@ class FactsPgRepository:
             target_ids AS (
                 SELECT subject_id FROM visible
             ),
+            alias_rank AS (
+                -- Deterministic, extension-free ranking (no pg_trgm in this
+                -- schema): exact slug match (0) < slug prefix match (1) <
+                -- any other substring match (2), shortest alias next. Empty
+                -- (zero rows) whenever `q` is absent, so the final ORDER BY
+                -- below degrades to the pre-`q` `v.subject_id` ordering.
+                SELECT fa.fact_id AS subject_id,
+                       MIN(CASE
+                             WHEN split_part(fa.natural_key, ':', 2) = :q_norm THEN 0
+                             WHEN split_part(fa.natural_key, ':', 2) ILIKE :q_prefix ESCAPE '\\' THEN 1
+                             ELSE 2
+                           END) AS match_tier,
+                       MIN(LENGTH(fa.natural_key)) AS alias_len
+                FROM fact_aliases fa
+                WHERE fa.fact_id IN (SELECT subject_id FROM target_ids)
+                  AND CAST(:q_substr AS TEXT) IS NOT NULL
+                  AND fa.natural_key ILIKE :q_substr ESCAPE '\\'
+                GROUP BY fa.fact_id
+            ),
             {self._projection_cte_sql(with_aliases=True)}
             SELECT v.subject_id, v.subject_type, v.is_revealed,
                    COALESCE(cnt.claim_count, 0) AS claim_count,
@@ -712,8 +774,9 @@ class FactsPgRepository:
             LEFT JOIN counts cnt ON cnt.subject_id = v.subject_id
             LEFT JOIN aliases al ON al.subject_id = v.subject_id
             LEFT JOIN subject_attrs sa ON sa.subject_id = v.subject_id
+            LEFT JOIN alias_rank ar ON ar.subject_id = v.subject_id
             WHERE TRUE {filter_sql}
-            ORDER BY v.subject_id
+            ORDER BY COALESCE(ar.match_tier, 3), COALESCE(ar.alias_len, 0), v.subject_id
             LIMIT :limit_plus_one
             """
         )

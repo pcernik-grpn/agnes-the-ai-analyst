@@ -234,3 +234,24 @@ def test_owner_direct_call_sees_the_full_grant(pg_env, repo, mcp_call):
     result = mcp_call("fact_search", token, type="engagement")
     ids = {s["id"] for s in result["subjects"]}
     assert ids == {fact_a, fact_b}
+
+
+def test_fact_search_q_reaches_the_repository(pg_env, repo, mcp_call):
+    """`q` on the `fact_search` MCP tool reaches `FactsPgRepository.search`
+    (not silently dropped) -- the same free-text alias lookup as
+    `POST /api/facts/search` and `agnes facts search <type> [QUERY]`."""
+    from app.auth.jwt import create_access_token
+
+    owner_id, owner_email = _seed_two_collection_fixture()
+
+    parts_authority = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=parts_authority, type="organization", natural_key="organization:parts-authority")
+    repo.add_claim(fact_id=parts_authority, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="PA.")
+    other = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=other, type="organization", natural_key="organization:zephyr-corp")
+    repo.add_claim(fact_id=other, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Zephyr.")
+
+    token = create_access_token(user_id=owner_id, email=owner_email)
+    result = mcp_call("fact_search", token, type="organization", q="Parts Authority")
+    ids = [s["id"] for s in result["subjects"]]
+    assert ids == [parts_authority]

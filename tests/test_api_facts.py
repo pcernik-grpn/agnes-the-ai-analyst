@@ -126,3 +126,34 @@ def test_neighbors_limit_over_500_is_422(facts_client):
         headers=_headers(facts_client),
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# extra='forbid' (TCRD follow-up): an unknown request field must 422, never
+# be silently swallowed by pydantic's default extra='ignore' and degrade a
+# filtered search into an unfiltered, id-ordered dump. This is a stopgap for
+# EVERY field name typo, not just the `q` free-text one added alongside it.
+# ---------------------------------------------------------------------------
+
+
+def test_search_unknown_field_is_422_not_silently_ignored(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/search", json={"type": "person", "bogus": "nope"}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 422
+
+
+def test_neighbors_unknown_field_is_422_not_silently_ignored(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/neighbors", json={"subject_id": "f_x", "bogus": "nope"}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 422
+
+
+def test_search_accepts_q_field(facts_client):
+    """`q` is a real, modeled field — not swallowed, not a 422 — it just
+    can't get past the PG-only gate on this DuckDB-backed fixture."""
+    r = facts_client["client"].post(
+        "/api/facts/search", json={"type": "person", "q": "Alice"}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 501, r.text
