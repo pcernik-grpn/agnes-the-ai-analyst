@@ -2109,6 +2109,25 @@
   #ax-people-faces:empty { display: none; }
   .ax-people__hdrow .ax-av { width: 22px; height: 22px; font-size: 9px; }
   .ax-pstrip { margin: 2px 0 10px; }
+
+  /* ── The list has no frame ───────────────────────────────────────────
+     The white surface under the rows was drawn as a bordered, rounded card
+     back when the page sat on the grey app background and the table needed
+     its own ground to be a table. The admin shell is a white sheet now, so
+     that surface matches the page it is drawn on and the border is the only
+     thing left of the card — an outline around content that is already the
+     width of the page, which reads as a panel on a page rather than as the
+     page's list. The rows' own hairlines are what separate them.
+
+     `overflow: clip` goes with it: it existed to clip the corner radius, and
+     what it otherwise clips is anything that has to escape the list — the
+     member-search popover, a row menu near the bottom edge. */
+  #ax-groups {
+    background: none;
+    border: 0;
+    border-radius: 0;
+    overflow: visible;
+  }
 </style>
 {% endblock %}
 

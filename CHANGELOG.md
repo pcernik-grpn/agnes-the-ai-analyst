@@ -216,6 +216,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+- **The access list has no frame.** Its white, bordered, rounded surface was
+  drawn when the page sat on the grey app background and a table needed its
+  own ground to be a table. The admin shell is a white sheet now, so that
+  surface matches the page under it and the border was the only card left —
+  an outline around content already the width of the page, reading as a
+  panel *on* a page rather than as the page's own list. The rows' hairlines
+  separate them. `overflow: clip` went with it: it was there to clip the
+  corner radius, and what it otherwise clips is anything that has to escape
+  the list (the member-search popover, a row menu near the bottom edge).
 - **One kind tag, one glyph set, across the platform.** A resource kind was
   drawn three ways — the Library's tinted glyph tile, the access page's
   worded chip, and the catalog card's icon — from two glyph sources that had
