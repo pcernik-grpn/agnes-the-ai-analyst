@@ -309,7 +309,8 @@ def download(
             resource=f"{username}/{session_file}",
             params={"bytes": path.stat().st_size},
             result="success",
-            client_kind="web",
+            # client_kind intentionally omitted (F0 audit-context autofill,
+            # Task 1) — this admin read isn't necessarily browser-only.
         )
     except Exception:
         logger.exception("audit_log write failed for session_download")
@@ -387,7 +388,8 @@ def transcript(
             resource=f"{username}/{session_file}",
             params={"events": len(events)},
             result="success",
-            client_kind="web",
+            # client_kind intentionally omitted (F0 audit-context autofill,
+            # Task 1) — this admin read isn't necessarily browser-only.
         )
     except Exception:
         logger.exception("audit_log write failed for session.transcript_view")

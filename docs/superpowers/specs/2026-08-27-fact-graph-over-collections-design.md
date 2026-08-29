@@ -456,9 +456,17 @@ with content). Metadata-only rows carry a *provisional* doc_id
     id** — including a manual path re-upload of a crawler-anchored file, so
     a hand upload can no longer cascade a document's claims away. Unchanged
     sha → skip re-chunking entirely; changed → purge chunks + reset
-    `processing_status` on the same row. **In-place update on a bundle
-    (zip archive) row leaves its zip-bundle children ALONE** — reconciling
-    them is `ingest_bundle`'s own job (below), not this purge's;
+    `processing_status` on the same row. **In-place update on a row that
+    STAYS a bundle (zip archive) both before AND after the update leaves
+    its zip-bundle children ALONE** — reconciling them is `ingest_bundle`'s
+    own job (below), not this purge's. A row that stops being a bundle
+    (re-uploaded at the same identity as a non-zip type) takes the full
+    purge path instead — deciding this from the OLD filename alone was
+    itself a bug (adversarial review of the citability follow-up): the row
+    stays a `bundle` by its old name while the ingest router dispatches on
+    the row's NEW type after the update, so neither side ever purged or
+    reconciled the old members, leaving a deleted document's chunks/claims
+    permanently readable under a row that is now some other file type;
   – **frozen-pair obligation**: the update-in-place methods land in
     `corpus_files.py` AND `corpus_files_pg.py` with the contract test
     extended — this PR touches a maintained pair, unlike the facts PR;
@@ -473,10 +481,19 @@ with content). Metadata-only rows carry a *provisional* doc_id
   DuckDB) once the member's own row is matched/created, so a claim can cite
   the exact member instead of only the archive, and the member's id (hence
   its claims) survives a re-sync of the archive exactly like a top-level
-  file's does. The `!` separator cannot collide with a real
-  producer-supplied top-level `source_stable_id` (`graph:…`/`local:…` never
-  start with `cf_`, the fixed `corpus_files.id` prefix). See
-  `src/ingest/bundle.py::_member_stable_id`.
+  file's does. The `!`-separated shape (`cf_<hex>!<member path>`) **is
+  RESERVED and refused from callers**, not merely conventionally distinct
+  from a real producer-supplied top-level `source_stable_id` (`graph:…`/
+  `local:…` never start with `cf_`, the fixed `corpus_files.id` prefix):
+  the shape is visible to anyone with mere collection READ access (an
+  ordinary file listing returns both the archive id and every member
+  filename), so a caller-supplied `source_stable_id` on this shape is
+  refused with a `400` at BOTH entry points that accept one — the upload
+  endpoint's `source_stable_ids` field and the facts ingest
+  `documents[].stable_id` — before anything is resolved or written; only
+  `ingest_bundle` may mint one. See `src/ingest/member_identity.py`
+  (the shared predicate) and `src/ingest/bundle.py::_member_stable_id`
+  (the sole minter).
 
 Lifecycle:
 

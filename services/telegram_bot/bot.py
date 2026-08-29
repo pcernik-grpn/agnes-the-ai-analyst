@@ -20,6 +20,7 @@ import sys
 from aiohttp import web
 
 from app.logging_config import setup_logging
+from src.audit_helpers import log_safe
 
 from . import config
 from .dispatch import dispatch_desktop_notification
@@ -56,6 +57,30 @@ logger = logging.getLogger("notify-bot")
 # --- Telegram Polling ---
 
 
+def _telegram_email(username: str) -> str:
+    """The Agnes email this bot username maps to — same derivation /whoami
+    already used, factored out so the audit writer below can share it."""
+    if _bot_domain_suffix:
+        return f"{username}@{_bot_domain_suffix}"
+    return username
+
+
+def _audit_user_id(username: str) -> str:
+    """``users.id`` for the Agnes account this bot username is derived
+    from, or the computed email string when it doesn't resolve to one —
+    audit only, never an authorization decision. Mirrors
+    ``app.chat.audit._resolve_user_id``'s email-string-fallback convention:
+    better a searchable identifier than a dropped row."""
+    email = _telegram_email(username)
+    try:
+        from src.repositories import users_repo
+
+        row = users_repo().get_by_email(email)
+        return row["id"] if row else email
+    except Exception:
+        return email
+
+
 async def handle_message(message: dict) -> None:
     """Handle an incoming Telegram message."""
     chat_id = message.get("chat", {}).get("id")
@@ -63,6 +88,19 @@ async def handle_message(message: dict) -> None:
 
     if not chat_id:
         return
+
+    # F2d (audit-full-coverage plan, Task 6): a read event — the bot received
+    # and processed a message. Only for a linked account (nothing to attribute
+    # otherwise); the command name only, never any free-text the user typed.
+    linked_username = get_username_by_chat_id(chat_id)
+    if linked_username:
+        log_safe(
+            user_id=_audit_user_id(linked_username),
+            action="telegram.message",
+            resource=f"chat:{chat_id}",
+            params={"command": text.split(None, 1)[0] if text else ""},
+            client_kind="telegram",
+        )
 
     if text == "/start":
         username = get_username_by_chat_id(chat_id)
@@ -184,6 +222,20 @@ async def handle_callback_query(callback_query: dict) -> None:
 
     logger.info(f"On-demand run: {script_name} for {username}")
     output = await asyncio.to_thread(run_user_script, username, script_name)
+
+    # F2d (audit-full-coverage plan, Task 6): the sudo path — a Telegram
+    # button press runs a script as an arbitrary OS user via `sudo -u`
+    # (services/telegram_bot/runner.py). Highest-value audit row in this
+    # task: who triggered it, which script, which OS user, and whether the
+    # subprocess actually succeeded.
+    log_safe(
+        user_id=_audit_user_id(username),
+        action="telegram.script_run",
+        resource=f"script:{script_name}",
+        params={"script": script_name, "os_user": username},
+        result="success" if output is not None else "error",
+        client_kind="telegram",
+    )
 
     if output is None:
         await send_message(chat_id, f"`{script_name}` failed. Check server logs.", parse_mode="Markdown")
