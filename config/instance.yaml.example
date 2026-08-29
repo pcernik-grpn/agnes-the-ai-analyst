@@ -1096,6 +1096,21 @@ chat:
   #     project_id: my-gcp-project
   #     region: europe-west1      # or "global"
 
+# --- Session archive / analyst-sessions bridge (optional) ---
+# Web-chat sessions (`chat_messages`, the `chat:` block above) materialize
+# into the same jsonl shape the CLI/analyst session pipeline already reads
+# (SESSION_DATA_DIR -> services/session_pipeline), so the usage rollups and
+# the /admin/sessions transcript viewer pick up chat conversations exactly
+# like any other session (audit-full-coverage plan, F4).
+sessions:
+  # ON by default: a chat session is exported (best-effort, atomic write)
+  # when it ends (archive/delete/idle-reaper kill) and by a bounded
+  # pipeline sweep for any still-active session. Set false to keep chat
+  # transcripts out of the filesystem session store entirely — the prior
+  # behavior, where chat_messages was the only copy and had no admin
+  # transcript viewer. Env override: AGNES_SESSIONS_INCLUDE_CHAT.
+  include_chat: true
+
 # --- Hosted Data Apps (optional) ---
 # Hosted data apps (user web applications run next to the data)
 data_apps:
