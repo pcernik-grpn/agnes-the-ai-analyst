@@ -53,7 +53,9 @@
    hero (macros/_detail.html imports it) so index cards and detail pages
    show the same glyph. Accepts both the card's plural kinds and the
    hero's singular aliases (recipe→recipes, plugin→plugins, table→data).
-   Keep in lockstep with KIND_GLYPH in static/js/catalog_card.js. #}
+   This is the ORIGINAL; static/js/kind_glyph.js is its client-side
+   transcription and every JS surface reads the set from there. Adding a
+   kind here means adding it there — and nowhere else. #}
 {%- macro kind_glyph(kind) -%}
   {%- set kind = {'recipe': 'recipes', 'plugin': 'plugins', 'table': 'data'}.get(kind, kind) -%}
   {%- if kind == 'data' -%}

@@ -919,16 +919,10 @@
   }
   .ax-r:hover { background: var(--ds-surface-dim); }
 
-  /* Mono, outlined, quiet — a label for the row, never mistaken for the
-     family heading above it. Amber-linked when an owner shared it. */
-  .ax-r__kd {
-    font-family: var(--ds-font-mono, ui-monospace, monospace);
-    font-size: 10.5px; line-height: 1.5;
-    color: var(--ds-text-link); border: 1px solid var(--ds-text-link);
-    border-radius: 3px; padding: 0 5px; text-align: center;
-    white-space: nowrap; justify-self: start;
-  }
-  .ax-r__kd.is-own { color: var(--ds-warn-ink, #96690A); border-color: var(--ds-warn-ink, #96690A); }
+  /* The kind mark is `.ds-kindtag` (components.css) — shared with the
+     Library, glyph and colour and all. The page adds only placement. */
+  .ax-r__kd { justify-self: start; }
+  .ax-r__kd.is-own { --ds-kindtag: var(--ds-warn-ink, #96690A); }
 
   .ax-r__nm { font-size: 13.5px; font-weight: 600; min-width: 0; }
   .ax-r__nm a { color: inherit; text-decoration: none; }
@@ -1155,44 +1149,13 @@
   .ax-r__d { font-size: 12px; color: var(--ds-text-secondary); margin-top: 2px; line-height: 1.4; }
   .ax-r__who { font-size: 11px; color: var(--ds-text-muted); margin-top: 3px; }
 
-  /* Kind chip — the design system's resource colours, soft fill so it reads
-     as a label rather than a link. */
-  .ax-r__kd {
-    font-family: var(--ds-font-mono); font-size: 10.5px; line-height: 18px;
-    height: 18px; padding: 0 7px; border-radius: 3px; border: 0;
-    background: var(--ds-surface); color: var(--ds-text-secondary);
-    box-shadow: inset 0 0 0 1px var(--ds-border);
-    justify-self: start; white-space: nowrap;
-  }
-  /* ── Kind, the same colour it wears everywhere else ───────────────────
-     Each kind resolves ONE variable, exactly as the detail hero does
-     (`macros/_detail.html` sets `--kind: var(--ds-kind-{kind})`) and as the
-     Library's bands do (`--lib-kind`). A package is the same colour in the
-     admin table, in the Library list and on its own page, so a type is
-     recognisable before its label is read.
-
-     The tile is mixed from that ink into the CURRENT surface rather than
-     taken from `--ds-kind-*-soft`: those tints are defined light-only while
-     the ink flips in dark mode, so the paired token would put light ink on a
-     light tile. `color-mix` against `--ds-surface` is theme-safe by
-     construction — it is how `design-tokens.css` derives the `-soft` values
-     in the first place. (The Library reaches the `-soft` tokens through an
-     inline `style` attribute, which the contrast guard cannot see; matching
-     the look without borrowing the hazard.) */
-  .ax-r__kd[data-kind="data"]    { --kind: var(--ds-kind-data); }
-  .ax-r__kd[data-kind="memory"]  { --kind: var(--ds-kind-memory); }
-  .ax-r__kd[data-kind="recipe"]  { --kind: var(--ds-kind-recipe); }
-  .ax-r__kd[data-kind="library"] { --kind: var(--ds-kind-library); }
-  .ax-r__kd[data-kind="file"]    { --kind: var(--ds-kind-file); }
-  .ax-r__kd[data-kind="app"]     { --kind: var(--ds-kind-app); }
-  .ax-r__kd[data-kind="plugin"]  { --kind: var(--ds-kind-plugin); }
-  .ax-r__kd[data-kind="skill"]   { --kind: var(--ds-kind-skill); }
-  .ax-r__kd[data-kind="agent"]   { --kind: var(--ds-kind-agent); }
-  .ax-r__kd[data-kind] {
-    color: var(--kind);
-    background: color-mix(in srgb, var(--kind) 12%, var(--ds-surface));
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--kind) 22%, transparent);
-  }
+  /* ── Kind: the platform's tag, not this page's ────────────────────────
+     Colour, glyph, corner and fill all moved to `.ds-kindtag` in
+     components.css. What lived here was a faithful copy of the Library's
+     per-row kind mark, which is precisely the problem: two copies of one
+     idea, in two files, drifting apart one polish pass at a time. The page
+     keeps only what is about ITS table — where the tag sits in the grid. */
+  .ax-r__kd { justify-self: start; }
 
   /* Reads — a quiet label over a solid value, right-aligned so the column
      has an edge to scan down. */
@@ -1545,15 +1508,15 @@
   .ax-table .ax-r:hover { background-color: var(--ds-surface-dim); }
   /* Keyboard parity: the focused row wears its kind as a wash plus a rail on
      the leading edge, exactly as `.lib-row:focus-within` does. */
-  .ax-r[data-kind="data"], .ax-r__kd[data-kind="data"]       { --kind: var(--ds-kind-data); }
-  .ax-r[data-kind="memory"], .ax-r__kd[data-kind="memory"]   { --kind: var(--ds-kind-memory); }
-  .ax-r[data-kind="recipe"], .ax-r__kd[data-kind="recipe"]   { --kind: var(--ds-kind-recipe); }
-  .ax-r[data-kind="library"], .ax-r__kd[data-kind="library"] { --kind: var(--ds-kind-library); }
-  .ax-r[data-kind="file"], .ax-r__kd[data-kind="file"]       { --kind: var(--ds-kind-file); }
-  .ax-r[data-kind="app"], .ax-r__kd[data-kind="app"]         { --kind: var(--ds-kind-app); }
-  .ax-r[data-kind="plugin"], .ax-r__kd[data-kind="plugin"]   { --kind: var(--ds-kind-plugin); }
-  .ax-r[data-kind="skill"], .ax-r__kd[data-kind="skill"]     { --kind: var(--ds-kind-skill); }
-  .ax-r[data-kind="agent"], .ax-r__kd[data-kind="agent"]     { --kind: var(--ds-kind-agent); }
+  .ax-r[data-kind="data"] { --kind: var(--ds-kind-data); }
+  .ax-r[data-kind="memory"] { --kind: var(--ds-kind-memory); }
+  .ax-r[data-kind="recipe"] { --kind: var(--ds-kind-recipe); }
+  .ax-r[data-kind="library"] { --kind: var(--ds-kind-library); }
+  .ax-r[data-kind="file"] { --kind: var(--ds-kind-file); }
+  .ax-r[data-kind="app"] { --kind: var(--ds-kind-app); }
+  .ax-r[data-kind="plugin"] { --kind: var(--ds-kind-plugin); }
+  .ax-r[data-kind="skill"] { --kind: var(--ds-kind-skill); }
+  .ax-r[data-kind="agent"] { --kind: var(--ds-kind-agent); }
   .ax-table .ax-r:focus-within {
     background-color: color-mix(in srgb, var(--kind, var(--ds-text-muted)) 8%, transparent);
     box-shadow: inset 2px 0 0 var(--kind, var(--ds-text-muted));
@@ -2102,6 +2065,40 @@
   .ax-av--more { color: var(--ds-text-muted); font-weight: 600; }
   .ax-pstrip__f { font-size: 12.5px; color: var(--ds-text-muted); min-width: 0; }
   .ax-pstrip__f b { font-weight: 600; color: var(--ds-text-secondary); }
+
+  /* ── The action rows span the list ───────────────────────────────────
+     Inset, a tinted box read as a card that had been dropped into a table.
+     It is not a card — it is the row that makes a row — so it spans the
+     list's full width like every other row, and keeps only its corner. */
+  /* A <button> does not stretch to its container the way a div does — it
+     sizes to its content — so "full width" has to be asked for. */
+  .ax-add, .ax-table .ax-add, .ax-newrow {
+    box-sizing: border-box; width: 100%; margin: 8px 0;
+    padding-left: 16px; padding-right: 16px;
+  }
+
+  /* ── Depth reads left to right ────────────────────────────────────────
+     A bundle's rows were starting further LEFT than the band that contains
+     them: the family eyebrow at 16, the kind band at 26, and then the rows
+     back at 12 — so the deepest level looked like the shallowest. Each
+     level now starts inside the one above it, and the row's own caret is
+     what sets its left edge (it is the leftmost thing in the row). */
+  .ax-gs--bb > .ax-gs__hd { padding-left: 36px; }
+  /* The rows a bundle opens onto sit inside the bundle in turn. */
+  .ax-gs--bb .ax-table .ax-colhd,
+  .ax-gs--bb .ax-table .ax-r { padding-left: 46px; }
+  /* The action rides its own list's indent — same left edge as the rows it
+     will add to, still spanning the full width like every other row. */
+  .ax-gs--bb .ax-table .ax-add { margin-left: 0; padding-left: 46px; }
+
+  /* ── The row carries its kind's colour, as it does in the Library ─────
+     There, the accent is on every row (the tinted glyph tile), not only on
+     the band — which is what lets you find "the packages" in a mixed list
+     without reading a word. The tag brings the colour; this brings the edge
+     the eye actually tracks down. Kept to the hairline weight the Library
+     uses for a resting row, so it marks without competing with the band. */
+  .ax-table .ax-r[data-kind] { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--kind) 42%, transparent); }
+  .ax-table .ax-r[data-kind]:hover { box-shadow: inset 2px 0 0 var(--kind); }
 </style>
 {% endblock %}
 
@@ -2602,6 +2599,17 @@
   };
   const kindToken = (t) => KIND_TOKEN[t.type_key] || "";
 
+  /* The kind chip is the shared `.ds-kindtag` now — same glyph, same colour
+     and same corner as the Library's per-row kind mark, from one source
+     (js/kind_glyph.js + the --ds-kind-* pair). This page uses the WORDED
+     density because a group's holdings are of mixed kind, which is exactly
+     the case the word exists for. */
+  const kindTag = (t) => {
+    const k = kindToken(t);
+    const glyph = window.AgnesKindGlyph ? window.AgnesKindGlyph.get(k) : "";
+    return `<span class="ax-r__kd ds-kindtag" data-kind="${esc(k)}">${glyph}<span>${esc(kindWord(t))}</span></span>`;
+  };
+
   /* Who wrote this grant. Two writers, two shapes: the admin API records an
      email, the Library's owner-sharing path records a user id. Resolve both
      against the user list and fall back to whatever is stored — a raw value
@@ -2991,7 +2999,7 @@
           : `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button></span>`;
       return `
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
-        <span class="ax-r__kd" data-kind="${esc(kindToken(t))}">${esc(kindWord(t))}</span>
+        ${kindTag(t)}
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
           <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
             i.description && who ? `<span class="ax-r__sep"> · </span>` : ""}${
@@ -3919,7 +3927,7 @@
         openBundles.has(bkey) ? " open" : ""}>
         <summary class="ax-gs__hd">
           <span class="ax-gs__car" aria-hidden="true">›</span>
-          <span class="ax-r__kd" data-kind="${esc(kindToken(r.t))}">${esc(kindWord(r.t))}</span>
+          ${kindTag(r.t)}
           <span class="ax-gs__id ax-gs__id--bb">
             <span class="ax-gs__line">
               <span class="ax-g__name">${esc(r.i.name || r.i.resource_id)}</span>
@@ -4605,7 +4613,7 @@
             return `
             <button type="button" class="ax-pk-r ${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
               <span class="ax-pk-r__box" aria-hidden="true">${on ? "✓" : ""}</span>
-              <span class="ax-r__kd" data-kind="${esc(kindToken(t))}">${esc(kindWord(t))}</span>
+              ${kindTag(t)}
               <span class="ax-pk-r__nm">${esc(i.name || i.resource_id)}${block ? `<span class="ax-r__blk"> · ${esc(block)}</span>` : ""}
                 ${i.description ? `<span class="ax-r__d">${esc(String(i.description).slice(0, 100))}</span>` : ""}
               </span>

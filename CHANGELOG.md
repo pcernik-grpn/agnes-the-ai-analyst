@@ -216,6 +216,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+- **One kind tag, one glyph set, across the platform.** A resource kind was
+  drawn three ways — the Library's tinted glyph tile, the access page's
+  worded chip, and the catalog card's icon — from two glyph sources that had
+  already drifted (the `KIND_GLYPH` copy in `catalog_card.js` was six kinds
+  behind the `kind_glyph()` macro it was documented to be in lockstep with).
+  The glyph set is now `static/js/kind_glyph.js` (`window.AgnesKindGlyph`,
+  loaded globally, a transcription of the macro and keyed by the
+  `--ds-kind-*` token names, so a caller that resolved a kind to its colour
+  has by construction resolved it to its glyph); `catalog_card.js` reads from
+  it rather than carrying its own. The mark itself is `.ds-kindtag` in
+  `components.css`, in two densities on purpose: **glyph + word** for a list
+  of MIXED kind (the access page, where the word is the only thing telling a
+  package from a plugin) and **glyph alone** for a list GROUPED by kind (the
+  Library, where the band overhead already said the word). Same glyph, same
+  colour, same corner — the label is the variable, not the identity.
+- **The access page's rows carry their kind's colour, and its levels nest
+  visibly.** Rows take the leading kind accent the Library's rows have, so
+  "the packages" are findable in a mixed list without reading a word. The
+  bundle view's depth was inverted — the family eyebrow sat at 16px, the kind
+  band at 26px, and the rows they contain back at 12px, so the deepest level
+  looked like the shallowest; each level now starts inside the one above it
+  (16 → 26 → 36 → 46). The three add-rows span the full width of the list
+  they belong to rather than sitting inset like a card dropped into a table:
+  a `<button>` sizes to its content, so full width had to be asked for.
 - **The three ways to add on the access page are one control with three
   labels.** "New group", "Add to this group" and "Share with another group"
   were three near-misses of each other, and all three were ghost rows — on a

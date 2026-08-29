@@ -225,3 +225,62 @@
   flex: none;
   vertical-align: -0.125em;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Kind tag — "what kind of thing is this row".
+
+   One component, two densities, because the two surfaces that name a kind
+   have opposite problems:
+
+     .ds-kindtag           glyph + word. For a list whose rows are of MIXED
+                           kind (/admin/access: a package, a plugin and an
+                           agent in one group's holdings), where the word is
+                           the only thing that says which is which.
+     .ds-kindtag--glyph    glyph alone. For a list GROUPED by kind (the
+                           Library), where the band overhead already said the
+                           word and repeating it on every row is noise.
+
+   Same glyph (js/kind_glyph.js / the kind_glyph() macro), same colour
+   (--ds-kind-*), same corner. The label is the variable, not the identity —
+   which is what makes a row recognisable as the same kind of thing whichever
+   page it is read on.
+
+   Colour arrives through `data-kind`, so a caller sets ONE attribute and gets
+   both halves. An unmapped kind falls back to the neutral border and the
+   neutral glyph rather than borrowing a colour that means something else. */
+.ds-kindtag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex: none;
+    padding: 2px 8px 2px 6px;
+    border: 1px solid color-mix(in srgb, var(--ds-kindtag, var(--ds-border)) 30%, transparent);
+    border-radius: var(--ds-radius-btn);
+    background: color-mix(in srgb, var(--ds-kindtag, var(--ds-text-muted)) 8%, var(--ds-surface));
+    color: var(--ds-kindtag, var(--ds-text-secondary));
+    font-size: 11.5px;
+    font-weight: 600;
+    line-height: 1.5;
+    white-space: nowrap;
+}
+.ds-kindtag svg { width: 13px; height: 13px; flex: none; }
+/* Glyph-only: square, so a row of them reads as a column of icons rather
+   than as a column of empty pills. */
+.ds-kindtag--glyph {
+    gap: 0;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+}
+.ds-kindtag--glyph svg { width: 15px; height: 15px; }
+
+.ds-kindtag[data-kind="data"]    { --ds-kindtag: var(--ds-kind-data); }
+.ds-kindtag[data-kind="memory"]  { --ds-kindtag: var(--ds-kind-memory); }
+.ds-kindtag[data-kind="recipe"]  { --ds-kindtag: var(--ds-kind-recipe); }
+.ds-kindtag[data-kind="library"] { --ds-kindtag: var(--ds-kind-library); }
+.ds-kindtag[data-kind="file"]    { --ds-kindtag: var(--ds-kind-file); }
+.ds-kindtag[data-kind="app"]     { --ds-kindtag: var(--ds-kind-app); }
+.ds-kindtag[data-kind="plugin"]  { --ds-kindtag: var(--ds-kind-plugin); }
+.ds-kindtag[data-kind="skill"]   { --ds-kindtag: var(--ds-kind-skill); }
+.ds-kindtag[data-kind="agent"]   { --ds-kindtag: var(--ds-kind-agent); }
