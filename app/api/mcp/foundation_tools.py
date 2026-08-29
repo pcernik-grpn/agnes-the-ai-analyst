@@ -118,6 +118,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # `src.repositories.facts_repo()` directly rather than self-calling over
     # HTTP (see `_facts_caller`'s docstring below).
     "fact_search",
+    "fact_type_map",
     "fact_neighbors",
     "fact_claims",
     "schema",
@@ -866,6 +867,36 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
+
+    @tool(read_only=True)
+    async def fact_type_map() -> dict:
+        """List every fact type in the graph with a live count of the
+        subjects YOU can see. Use this to orient BEFORE `fact_search` when
+        you do not yet know what types exist — each row's `type` is a valid
+        `fact_search(type=...)` argument, and its `count` tells you whether
+        searching it is worth a call.
+
+        Counted through the same visibility gate `fact_search` applies, so a
+        number is what you could actually reach and never a total inflated
+        by evidence you cannot read. A type with no subjects visible to you
+        is omitted entirely rather than returned with a count of 0 — absence
+        here means "nothing you can see", which is deliberately
+        indistinguishable from "no such type". Behind the `facts` feature
+        flag (off by default); requires the Postgres app-state backend.
+        Mirrors `GET /api/facts/type-map` and `agnes facts type-map`.
+
+        Returns ``{"types": [{"type", "count"}], "total"}``, ordered by type.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        counts = await asyncio.to_thread(facts_repo().count_visible_facts_by_type, caller)
+        return {
+            "types": [{"type": t, "count": n} for t, n in counts.items()],
+            "total": sum(counts.values()),
+        }
 
     @tool(read_only=True)
     async def fact_neighbors(

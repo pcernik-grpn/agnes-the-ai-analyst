@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from typing import Optional
 
 import typer
@@ -139,6 +140,22 @@ def query_command(
         _query_auto(resolved_sql, fmt, limit, auto_snapshot=auto_snapshot)
 
 
+_TABLE_REF_RE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_.\"]*)", re.IGNORECASE)
+
+
+def _tables_in_sql(sql: str) -> list[str]:
+    """Best-effort list of table/view identifiers referenced by `sql`, for
+    audit metadata only (`query.local_offline` params) — NEVER the SQL text
+    itself. Regex-based, not a full parser: approximate names beat none for
+    an offline audit trail."""
+    seen: list[str] = []
+    for m in _TABLE_REF_RE.finditer(sql):
+        name = m.group(1).strip('"').split(".")[-1]
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _run_local(sql: str, fmt: str, limit: int):
     """Execute `sql` against the local DuckDB.
 
@@ -146,10 +163,19 @@ def _run_local(sql: str, fmt: str, limit: int):
     if the failure looks like an unresolvable table name (possibly a
     `query_mode='remote'` or `server_only` table), or re-raises any other
     exception unchanged. Callers decide how to present each case.
+
+    Every attempt that actually reaches DuckDB (success or failure) records
+    one `query.local_offline` client-reported audit event to the local spool
+    (`cli.lib.audit_spool`) — this command never talks to the server, so
+    without this the whole offline-query surface would be invisible to
+    `audit_log` (F3 — audit-full-coverage plan, Task 9). Never the SQL text,
+    only its hash.
     """
     from src.duckdb_conn import _open_duckdb
 
+    from cli.lib.audit_spool import record_local_event
     from cli.lib.workspace_resolve import resolve_data_workspace
+    from src.audit_helpers import hash_args
 
     local_dir = resolve_data_workspace()
     if local_dir is None:
@@ -159,11 +185,30 @@ def _run_local(sql: str, fmt: str, limit: int):
         raise _LocalDbMissing()
 
     conn = _open_duckdb(str(db_path), read_only=True)
+    t0 = time.perf_counter()
     try:
         result = conn.execute(sql).fetchmany(limit)
         columns = [desc[0] for desc in conn.description] if conn.description else []
+        record_local_event(
+            "query.local_offline",
+            {
+                "tables": _tables_in_sql(sql),
+                "sql_hash": hash_args(sql),
+                "rows": len(result),
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
         _output(columns, result, fmt)
     except Exception as e:
+        record_local_event(
+            "query.local_offline",
+            {
+                "tables": _tables_in_sql(sql),
+                "sql_hash": hash_args(sql),
+                "rows": 0,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
         # DuckDB's "Did you mean <similar materialized view>" suggestion is
         # misleading when the unresolvable identifier is actually a
         # `query_mode='remote'` table OR a `server_only` table — neither has

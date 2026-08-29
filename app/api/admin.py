@@ -28,7 +28,7 @@ from connectors.snowflake.settings import (
     SF_PRIVATE_KEY_PASSPHRASE_ENV,
     SF_TOKEN_ENV,
 )
-from src.audit_helpers import client_kind_from_user
+from src.audit_helpers import client_kind_from_user, log_safe
 from src.identifier_validation import (
     is_safe_identifier as _is_safe_identifier,
 )
@@ -2773,6 +2773,12 @@ async def get_server_config(
     # Always surface the optional BQ knobs so the operator sees them in the
     # UI's JSON editor instead of having to know they exist (Phase J).
     _ensure_bq_optional_fields(sections)
+    log_safe(
+        user_id=user.get("id"),
+        action="server_config.read",
+        resource="instance.yaml",
+        params={"view": "redacted"},
+    )
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
@@ -2852,6 +2858,12 @@ async def get_server_config_overlay(
         for section in _EDITABLE_SECTIONS
         if isinstance(raw.get(section), dict)
     }
+    log_safe(
+        user_id=user.get("id"),
+        action="server_config.read",
+        resource="instance.yaml",
+        params={"view": "overlay"},
+    )
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
@@ -7028,6 +7040,10 @@ async def configure_instance(
 
     config_path = _state_dir() / "instance.yaml"
 
+    # Changed top-level overlay KEY NAMES only (never values) — the audit
+    # row `instance.configure` reports at the end of this handler.
+    changed_keys: set = set()
+
     # Same serialization + corrupt-overlay handling as POST /server-config.
     with _overlay_write_lock:
         overlay: dict = {}
@@ -7074,9 +7090,11 @@ async def configure_instance(
         # env-resolved merged config.
         if request.instance_name:
             overlay.setdefault("instance", {})["name"] = request.instance_name
+            changed_keys.add("instance")
 
         if request.allowed_domain:
             overlay.setdefault("auth", {})["allowed_domain"] = request.allowed_domain
+            changed_keys.add("auth")
 
         # data_source.type is fully owned by this endpoint, but the REST of
         # the data_source block is not — an instance can already carry
@@ -7089,6 +7107,7 @@ async def configure_instance(
             existing_data_source = {}
         existing_data_source["type"] = request.data_source
         overlay["data_source"] = existing_data_source
+        changed_keys.add("data_source")
         if request.data_source == "keboola":
             overlay["data_source"]["keboola"] = {
                 "stack_url": request.keboola_url,
@@ -7115,6 +7134,7 @@ async def configure_instance(
                     "model": "claude-haiku-4-5-20251001",
                     "structured_output": "auto",
                 }
+                changed_keys.add("ai")
             elif llm_key:
                 overlay["ai"] = {
                     "provider": "anthropic",
@@ -7122,6 +7142,7 @@ async def configure_instance(
                     "model": "claude-haiku-4-5-20251001",
                     "structured_output": "auto",
                 }
+                changed_keys.add("ai")
 
         # Atomic write to writable data volume — same tmp + os.replace pattern
         # as the server-config editor so a concurrent save can't tear the file.
@@ -7141,6 +7162,7 @@ async def configure_instance(
         secrets_to_persist["KEBOOLA_STACK_URL"] = request.keboola_url
 
     if secrets_to_persist:
+        changed_keys.add("secrets")
         # SECURITY (#12): this path writes KEBOOLA_STORAGE_TOKEN to the plaintext
         # .env_overlay even when the Fernet vault is configured, bypassing
         # encryption-at-rest. Warn so it's visible; full fix (route datasource
@@ -7192,6 +7214,15 @@ async def configure_instance(
     from app.instance_config import reset_cache
 
     reset_cache()
+
+    # Changed key NAMES only — never values (secret-bearing keys/config
+    # content never enters an audit record).
+    log_safe(
+        user_id=user.get("id"),
+        action="instance.configure",
+        resource="instance.yaml",
+        params={"keys": sorted(changed_keys)},
+    )
 
     return {
         "status": "ok",

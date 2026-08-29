@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse, Response
 from app.auth.dependencies import _get_db, get_current_user
 from app.marketplace_server import cowork_packager, packager
 from src import marketplace_filter
+from src.audit_helpers import identity_for_audit, log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,13 @@ def marketplace_zip(
         return Response(status_code=304, headers={"ETag": f'"{etag}"'})
 
     data, _ = packager.build_zip(conn, user, plugins=plugins, etag=etag)
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="marketplace.bundle_download",
+        resource="marketplace.zip",
+        params={"plugin_count": len(plugins)},
+    )
     return Response(
         content=data,
         media_type="application/zip",
@@ -109,6 +117,12 @@ def cowork_plugin_zip(
     # the raw path param — and control chars stripped so it can't inject
     # response headers via Content-Disposition.
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "", match["prefixed_name"]) or "plugin"
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="marketplace.bundle_download",
+        resource=f"marketplace:cowork:{prefixed_name}",
+    )
     return Response(
         content=data,
         media_type="application/zip",

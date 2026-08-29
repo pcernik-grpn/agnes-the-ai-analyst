@@ -2219,10 +2219,32 @@ function _sharepointFactsHtml(row) {
       }).join(" ")
     : `<span style="color:var(--ds-text-muted)">No ingest runs yet</span>`;
 
+  // In-Agnes extraction schedule (TCRD-226) — SEPARATE from the static
+  // `Schedule` label above, which describes the EXTERNAL producer's own
+  // crawl cadence. `in_agnes` is additive: an older/degraded cell shape
+  // with no such key renders every part as its honest "off"/"never
+  // run"/"no schedule configured" default rather than throwing.
+  const inAgnes = fs.schedule.in_agnes || {};
+  const inAgnesParts = [];
+  if (!inAgnes.enabled) inAgnesParts.push(`<span class="ds-badge badge-unset">extraction.enabled is off</span>`);
+  inAgnesParts.push(
+    inAgnes.last_run_at ? `last run ${_esc(new Date(inAgnes.last_run_at).toLocaleString())}` : "never run"
+  );
+  if (inAgnes.next_run_at) {
+    inAgnesParts.push(`next run ${_esc(new Date(inAgnes.next_run_at).toLocaleString())}`);
+  } else if (!inAgnes.schedule) {
+    inAgnesParts.push("no schedule configured");
+  }
+
   return `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Crawl runs externally — this line is a label, not live state.">Schedule</span>
     <span class="ds-src__fact-v">${_esc(fs.schedule.text)}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — a separate lane from the external producer's own crawl schedule above.">In-Agnes extraction</span>
+    <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
   </div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Certificate</span>
@@ -2656,6 +2678,40 @@ async function testSpConn(id) {
     const n = (tree.items || []).length;
     resultEl.className = "ds-conn-test-result show ok";
     resultEl.textContent = `✓ Connected — ${n} site${n === 1 ? "" : "s"} reachable`;
+  } catch (e) {
+    resultEl.className = "ds-conn-test-result show fail";
+    resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* One-off admin trigger for the in-Agnes extraction job (TCRD-226):
+   `POST .../connections/{id}/extract` enqueues the existing
+   `corpus-extraction` job kind — see app/api/admin_sharepoint.py. Fire-and-
+   forget from the card's point of view (the job runs out-of-band in a
+   worker); the visible result here is "queued" or a typed refusal
+   (extraction disabled, no producer configured, or already running), never
+   the extraction's own outcome. */
+async function runSpExtraction(id) {
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  setSourceOpen(id, true);
+  resultEl.className = "ds-conn-test-result show";
+  resultEl.textContent = "Starting extraction…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extract`, {
+      method: "POST",
+      credentials: "include",
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      resultEl.className = "ds-conn-test-result show ok";
+      resultEl.textContent = `✓ Extraction queued (job ${body.job_id})`;
+      showToast("Extraction queued.", true);
+    } else {
+      const msg = detailMessage(body, "failed to start extraction");
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = "✗ " + msg;
+      showToast(msg, false);
+    }
   } catch (e) {
     resultEl.className = "ds-conn-test-result show fail";
     resultEl.textContent = "✗ Request failed";
@@ -5120,6 +5176,7 @@ function _sourceMenuItems(row) {
     return `
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); openSpWizardForConnection('${id}')">Manage scopes…</button>
     <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>

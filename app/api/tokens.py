@@ -13,6 +13,7 @@ from app.auth.access import require_admin
 from app.auth.dependencies import require_session_token, get_current_user, _get_db
 from app.auth.jwt import create_access_token
 
+from src.audit_helpers import log_safe
 from src.repositories import (
     access_token_repo,
     audit_repo,
@@ -208,6 +209,7 @@ async def list_tokens(
     # `agnes auth token list` CLI flow (HEADLESS_USAGE.md). Only `create_token`
     # is session-only (to block PAT-spawning-PAT chains).
     rows = access_token_repo().list_for_user(user["id"])
+    log_safe(user_id=user["id"], action="token.list", resource="token:own", params={"scope": "own"})
     return [_row_to_item(r) for r in rows]
 
 
@@ -220,6 +222,7 @@ async def get_token(
     row = access_token_repo().get_by_id(token_id)
     if not row or row["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Token not found")
+    log_safe(user_id=user["id"], action="token.list", resource=f"token:{token_id}", params={"scope": "one"})
     return _row_to_item(row)
 
 
@@ -247,7 +250,9 @@ async def admin_list_tokens(
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    return [_row_to_admin_item(r) for r in access_token_repo().list_all_with_user(limit=limit, offset=offset)]
+    rows = access_token_repo().list_all_with_user(limit=limit, offset=offset)
+    log_safe(user_id=user["id"], action="token.list", resource="token:admin_all", params={"scope": "admin_all"})
+    return [_row_to_admin_item(r) for r in rows]
 
 
 @admin_router.delete("/{token_id}", status_code=204)

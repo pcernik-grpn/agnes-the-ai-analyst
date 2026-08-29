@@ -14,6 +14,17 @@ def _zip_bytes(entries: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
+def _zip_bytes_allow_dup_names(entries: list[tuple[str, bytes]]) -> bytes:
+    """Like ``_zip_bytes`` but takes a list, not a dict, so two entries can
+    share the exact same member name — a plain ``dict`` literal cannot
+    express that, and a real-world zip tool CAN legally produce it."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
 def _new_corpus(slug: str) -> str:
     from src.repositories import file_corpora_repo
 
@@ -198,3 +209,38 @@ def test_bundle_confluence_member_normalized(e2e_env):
         stored = fh.read()
     assert b"breadcrumb-section" not in stored
     assert b"real content" in stored
+
+
+def test_bundle_duplicate_member_name_does_not_orphan_across_resyncs(e2e_env):
+    """Review finding 4: two entries in ONE zip sharing the exact same
+    member name (legal at the zip format level) both get rejected (same
+    unsupported extension), so both are stored with ``sha256=""`` — a plain
+    ``dict``-keyed ``prior`` lookup collapses ``(name, "")`` to a single
+    entry, so re-ingesting the identical archive used to leave one of the
+    two permanently un-reused AND un-pruned: an orphan accumulating once per
+    re-sync round. The multi-map ``prior_by_key`` fix pairs same-key rows up
+    1:1 in file order, so re-ingesting the SAME bytes must keep exactly the
+    same two rows, not three or four."""
+    from src.ingest.bundle import ingest_bundle
+    from src.repositories import corpus_files_repo
+
+    corpus_id = _new_corpus("bun-dupname")
+    data = _zip_bytes_allow_dup_names([("dup.dwg", b"one"), ("dup.dwg", b"two")])
+    fid, path = _make_archive_row(corpus_id, data)
+
+    assert ingest_bundle(corpus_id, fid, path, ingest_child=_fake_indexing_ingest) == "needs_review"
+    first = corpus_files_repo().list_children(fid)
+    assert len(first) == 2, "both duplicate-named rejected entries must get their own row"
+    assert {k["processing_detail"]["reason"] for k in first} == {"unsupported_type"}
+
+    # Re-ingest the IDENTICAL bytes three more times — a real re-sync of an
+    # unchanged archive. Neither prior round's rows may be dropped nor
+    # multiplied: still exactly 2 rows, and (since nothing changed) the
+    # exact same two ids, every round.
+    first_ids = sorted(k["id"] for k in first)
+    for _ in range(3):
+        ingest_bundle(corpus_id, fid, path, ingest_child=_fake_indexing_ingest)
+        again = corpus_files_repo().list_children(fid)
+        assert sorted(k["id"] for k in again) == first_ids, (
+            "re-syncing an unchanged archive must neither orphan nor duplicate duplicate-named rejected members"
+        )
