@@ -3,7 +3,7 @@
 ``table_registry.semantic_draft_pending_at`` is a Postgres-only column (A3
 PG-first ratchet — the DuckDB app-state migration ladder is frozen at v124,
 see CLAUDE.md -> "Dual-backend discipline" and
-``migrations/versions/0076_semantic_draft_pending.py``). The DuckDB-side
+``migrations/versions/0086_semantic_draft_pending.py``). The DuckDB-side
 no-op is covered in ``tests/test_semantic_apply.py``
 (``test_approve_succeeds_despite_pg_only_dedup_column`` /
 ``test_reject_succeeds_despite_pg_only_dedup_column``) and

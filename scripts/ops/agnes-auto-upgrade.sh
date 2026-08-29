@@ -93,6 +93,34 @@ export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES AGN
 
 STATE_DIR="${STATE_DIR:-/data/state}"
 
+# Per-instance upgrade freeze (TCRD-238). An admin sets it through
+# POST /api/admin/upgrade-freeze, which writes a UTC epoch into this marker
+# on the shared state disk — the same channel instance.yaml already rides,
+# so the freeze holds even while app containers are being recreated, which
+# is exactly when it matters. Rules, shared with the API's reader:
+#   - a plain-epoch value in the future  -> skip this tick, log remaining time
+#   - absent, expired, or non-numeric    -> fail OPEN (a corrupt marker must
+#     never freeze the fleet forever); non-numeric is logged so it's findable
+# The API caps freezes at 72h; a hand-written longer epoch still works but
+# every skipped tick logs, so a forgotten freeze is visible in syslog.
+FREEZE_MARKER="${STATE_DIR}/upgrade-freeze-until"
+if [ -f "$FREEZE_MARKER" ]; then
+  FREEZE_UNTIL="$(head -c 32 "$FREEZE_MARKER" | tr -d '[:space:]')"
+  if printf '%s' "$FREEZE_UNTIL" | grep -qE '^[0-9]+$'; then
+    NOW_EPOCH="$(date +%s)"
+    if [ "$FREEZE_UNTIL" -gt "$NOW_EPOCH" ]; then
+      logger -t agnes-auto-upgrade \
+        "upgrade freeze in force for another $(( (FREEZE_UNTIL - NOW_EPOCH) / 60 )) min (until epoch ${FREEZE_UNTIL}) — skipping tick"
+      exit 0
+    fi
+    # Expired: tidy up so status reads clean and the next admin GET is honest.
+    rm -f "$FREEZE_MARKER"
+  else
+    logger -t agnes-auto-upgrade \
+      "upgrade-freeze marker holds a non-numeric value — ignoring it (fail-open)"
+  fi
+fi
+
 # Shared alert-webhook config (same file + payload contract as
 # agnes-watchdog.sh / agnes-db-backup.sh): empty WEBHOOK_URL = log-only.
 # Used below when a role-split rolling recreate has to abort mid-rollout.

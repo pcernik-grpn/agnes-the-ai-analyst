@@ -1,0 +1,12 @@
+{% extends "base_ds.html" %}
+
+{% block content %}
+<div class="container">
+  <h1>Log out?</h1>
+  <p>Sign out of {{ instance_brand or 'Agnes' }} on this browser as <strong>{{ user.email }}</strong>.</p>
+  <form method="post" action="/auth/logout">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button type="submit" class="btn btn-primary">Log out</button>
+  </form>
+</div>
+{% endblock %}

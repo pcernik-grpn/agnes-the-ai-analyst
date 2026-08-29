@@ -128,12 +128,18 @@ def _now() -> datetime:
 
 
 def _resolve_store_verification() -> Optional[Signal]:
-    from app.instance_config import get_store_verification_enabled
+    from app.instance_config import get_store_moderation_enabled, get_store_verification_enabled
     from src.repositories import store_entities_repo
 
     if not get_store_verification_enabled():
         # Feature off on this instance — not "zero waiting", but "not a thing
         # here". Either way the row must not render (rule 1).
+        return None
+    # The hub this card links to is hidden by default, and it is where the
+    # Verify / Request changes actions are reached from. A count pointing at
+    # a redirect is worse than no card — same posture as
+    # `_resolve_studio_suggestions`.
+    if not get_store_moderation_enabled():
         return None
     # limit=1: we want the repo's real total, not the rows.
     _, total = store_entities_repo().list(verification_state=["requested"], limit=1)
@@ -161,6 +167,33 @@ def _resolve_store_submissions() -> Optional[Signal]:
         count=total,
         href=href,
         blurb=f"{_plural(total, 'submission needs', 'submissions need')} review before publishing.",
+    )
+
+
+def _resolve_agent_share_requests() -> Optional[Signal]:
+    """Track C6 — agent-sharing approval queue. PG-only (A3 ratchet): on a
+    DuckDB-backed instance the feature simply doesn't exist here (not
+    "broken"), so this returns `None` BEFORE calling the repo rather than
+    letting `RequiresPostgresBackend` degrade the row to "could not be
+    checked" forever — same posture as `_resolve_studio_suggestions`'s
+    feature-flag early-return."""
+    from app.instance_config import get_store_moderation_enabled
+    from src.repositories import share_requests_repo, use_pg
+
+    if not use_pg():
+        return None
+    # `/admin/store` is the ONLY page that renders this queue, and it is hidden
+    # by default — so with the hub off there is nowhere for this card to send
+    # anyone. Checked before the count, like the flag guards above.
+    if not get_store_moderation_enabled():
+        return None
+    _, total = share_requests_repo().list_for_admin(status=["pending"], limit=1)
+    if not total:
+        return None
+    return Signal(
+        count=total,
+        href="/admin/store",
+        blurb=f"agent {_plural(total, 'share needs', 'shares need')} approval.",
     )
 
 
@@ -195,6 +228,36 @@ def _resolve_studio_suggestions() -> Optional[Signal]:
         count=total,
         href="/admin/studio/suggestions",
         blurb=f"authoring {_plural(total, 'suggestion is', 'suggestions are')} waiting to be replayed.",
+    )
+
+
+def _resolve_ungranted_plugins() -> Optional[Signal]:
+    """Plugins ingested but granted to no group — "indexed but invisible".
+
+    Ingesting content and granting it to nobody has no legitimate steady
+    state: every non-admin sees an absence, and nothing anywhere says why
+    (TCRD-221 — this exact silence ate ~50 minutes of a live walkthrough).
+    Admin-disabled plugins don't count (deliberately hidden, not a mistake)
+    and neither do system plugins (``mark_system`` materializes their grant
+    for every group, so they cannot be orphaned without also tripping the
+    disabled path)."""
+    from src.repositories import marketplace_plugins_repo, resource_grants_repo
+
+    granted = {g["resource_id"] for g in resource_grants_repo().list_all(resource_type="marketplace_plugin")}
+    orphans = [
+        p
+        for p in marketplace_plugins_repo().list_all()
+        if not p.get("admin_disabled")
+        and not p.get("is_system")
+        and f"{p['marketplace_id']}/{p['name']}" not in granted
+    ]
+    if not orphans:
+        return None
+    return Signal(
+        count=len(orphans),
+        href="/admin/access",
+        blurb=f"{_plural(len(orphans), 'plugin is', 'plugins are')} granted to no group — nobody can see "
+        + (f"{orphans[0]['name']}." if len(orphans) == 1 else "them."),
     )
 
 
@@ -243,7 +306,10 @@ def _resolve_marketplace_sync() -> Optional[Signal]:
 
     cutoff = _now() - timedelta(hours=STALE_MARKETPLACE_SYNC_HOURS)
     broken = 0
-    for row in marketplace_registry_repo().list_all():
+    # list_non_builtin: a bundled row never syncs (no git remote), so its
+    # NULL last_synced_at would read as "broken" forever on every instance
+    # — the same permanent-red wound TCRD-219 closes in the admin table.
+    for row in marketplace_registry_repo().list_non_builtin():
         if row.get("last_error"):
             broken += 1
             continue
@@ -318,6 +384,13 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         resolve=_resolve_store_submissions,
     ),
     SignalSpec(
+        key="agent_share_requests",
+        title="Agent shares to approve",
+        zone=ZONE_NEEDS_YOU,
+        severity="action",
+        resolve=_resolve_agent_share_requests,
+    ),
+    SignalSpec(
         key="memory_items",
         title="Memory items pending",
         zone=ZONE_NEEDS_YOU,
@@ -330,6 +403,13 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         zone=ZONE_NEEDS_YOU,
         severity="action",
         resolve=_resolve_studio_suggestions,
+    ),
+    SignalSpec(
+        key="ungranted_plugins",
+        title="Plugins nobody can see",
+        zone=ZONE_NEEDS_YOU,
+        severity="warn",
+        resolve=_resolve_ungranted_plugins,
     ),
     SignalSpec(
         key="store_lint",

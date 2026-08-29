@@ -308,6 +308,34 @@ class TestDataAppsGitHttp:
         )
         assert r.status_code == 403
 
+    def test_restricted_principal_403s_not_500(self, data_apps_git_env, monkeypatch):
+        """#1656 leftover: an agent-session (or co-session) token resolves to a
+        frozen principal dataclass with no ``["id"]`` — the owner/admin checks
+        used to raise on it and surface as a raw 500. The git surface is
+        owner-authority; a restricted principal fails closed with a clean 403."""
+        from app.auth.session_principal import AgentPrincipal
+
+        principal = AgentPrincipal(
+            session_id="s1",
+            agent_id="a1",
+            owner_user_id="owner1",
+            owner_email="owner@test.local",
+            intersection={},
+            caller_user_id="owner1",
+            caller_email="owner@test.local",
+        )
+        monkeypatch.setattr(
+            "app.api.data_apps_git.resolve_token_to_user",
+            lambda *a, **kw: (principal, None),
+        )
+        c = data_apps_git_env["client"]
+        for service in ("git-upload-pack", "git-receive-pack"):
+            r = c.get(
+                f"/data-apps.git/sales/info/refs?service={service}",
+                headers={"Authorization": _basic("x", data_apps_git_env["owner_pat"])},
+            )
+            assert r.status_code == 403, service
+
     def test_read_allowed_via_resource_grant(self, data_apps_git_env):
         from src.db import get_system_db
         from src.repositories.user_groups import UserGroupsRepository

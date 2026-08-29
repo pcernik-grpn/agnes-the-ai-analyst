@@ -10,6 +10,12 @@ Covers:
   * renders the queue + marketplace jump-offs
   * lists a requested entity and links to /marketplace/flea/<id>
   * empty state when nothing is awaiting verification
+
+The page is HIDDEN by default (``features.store_moderation_enabled``, off —
+see tests/test_retired_admin_surfaces.py, which owns the hidden-by-default
+behavior and the redirect). This module is about what the page RENDERS, so
+`web_client` turns the flag on; without it every test here would assert
+against a 302 and pass for the wrong reason.
 """
 
 from __future__ import annotations
@@ -27,6 +33,8 @@ def web_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
+    # The hub is off by default; these tests are about its contents.
+    monkeypatch.setenv("AGNES_STORE_MODERATION_ENABLED", "1")
     (tmp_path / "state").mkdir()
     (tmp_path / "analytics").mkdir()
     (tmp_path / "extracts").mkdir()
@@ -128,3 +136,29 @@ def test_empty_state_when_nothing_awaiting(web_client, monkeypatch):
     r = web_client.get("/admin/store", cookies=admin_cookies)
     assert r.status_code == 200
     assert "No verification requests waiting." in r.text
+
+
+def test_empty_queue_uses_the_shared_empty_state(web_client, monkeypatch):
+    """TCRD-207: an empty moderation queue is EMPTY on the shared vocabulary
+    (macros/_state.html) — distinct from the feature-disabled banner above it,
+    which is a config gate, not one of the four states, and keeps its own
+    plain `.empty-state` copy (see the Postgres-backend assertion elsewhere
+    in this file)."""
+    _enable_verification(monkeypatch)
+    _, admin_cookies = _create_admin(web_client)
+    r = web_client.get("/admin/store", cookies=admin_cookies)
+    body = r.text
+    block = body[body.index("No verification requests waiting.") - 600 :]
+    assert 'data-state-kind="empty"' in block
+    assert "state-panel--neutral" in block
+
+
+def test_agent_share_requests_zone_disabled_on_duckdb_backend(web_client):
+    """Track C6's approval queue is PG-only (A3 ratchet) — on this DuckDB-
+    backed fixture the zone must say so rather than 501ing the whole page
+    or silently pretending there's nothing waiting."""
+    _, admin_cookies = _create_admin(web_client)
+    r = web_client.get("/admin/store", cookies=admin_cookies)
+    assert r.status_code == 200
+    assert "Pending agent shares" in r.text
+    assert "requires a Postgres app-state backend" in r.text

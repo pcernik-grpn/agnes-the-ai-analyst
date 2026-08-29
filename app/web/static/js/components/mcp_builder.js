@@ -27,6 +27,7 @@
   var SOURCES_API = '/api/admin/mcp-sources';
   var GROUPS_API = '/api/admin/groups';
   var TURN_API = '/api/admin/mcp-sources/builder/turn';
+  var TOOLS_API = '/api/admin/mcp-tools';
 
   var TRANSPORTS = [
     { id: 'http', label: 'HTTP', hint: 'streamable' },
@@ -56,7 +57,7 @@
       auth_decided: false,
       secret_value: '',
       introspected: false,
-      tools: [],          // [{name, description}] straight from the server
+      tools: [],          // [{name, description, input_schema}] from the server
       enabled: {},        // tool name -> true; every tool starts on
       groups: [],         // [{id, name}] to grant after create
     };
@@ -68,9 +69,14 @@
     return r.json().catch(function () { return {}; }).then(function (j) {
       if (!r.ok) {
         var d = j && j.detail;
-        var msg = typeof d === 'string' ? d : (d && (d.hint || d.kind)) || ('HTTP ' + r.status);
+        var msg = typeof d === 'string' ? d : (d && (d.message || d.hint || d.kind)) || ('HTTP ' + r.status);
         var e = new Error(msg);
         e.status = r.status;
+        // The structured half, kept: a caller has to be able to tell WHICH
+        // 409 it got. `grantGroup` reads `error` to separate "already granted"
+        // from "there is nothing to grant" — swallowing both as done is how a
+        // Save reported success over an access change that never happened.
+        e.detail = d;
         throw e;
       }
       return j;
@@ -146,7 +152,15 @@
       .then(function (body) {
         var tools = (body && body.tools) || [];
         draft.tools = tools.map(function (t) {
-          return { name: String(t.name || t), description: String(t.description || '') };
+          return {
+            name: String(t.name || t),
+            description: String(t.description || ''),
+            // Kept, not dropped: this is what a passthrough row stores so an
+            // agent knows the tool's arguments. The mapper used to keep only
+            // name + description, which was fine while nothing here was
+            // written and wrong the moment Save started registering tools.
+            input_schema: (t && typeof t.input_schema === 'object' && t.input_schema) || null,
+          };
         });
         draft.enabled = {};
         draft.tools.forEach(function (t) { draft.enabled[t.name] = true; });
@@ -181,12 +195,59 @@
 
   var savedId = null;
 
+  /* 409 from the source-wide grant is not one thing.
+     `no_tools_registered` means the source has no ENABLED tool row to grant,
+     so nothing was granted and the group has no access — a failure, and the
+     one this builder can actually cause: turn every tool off, pick a group,
+     Save. A blanket "409 means already granted" reported that as success, and
+     re-enabling the tools later does not go back and grant anyone.
+     (Already-granted is not a 409 on this endpoint at all — it answers 200
+     with an `already` count. The swallow stays narrowed rather than deleted so
+     an endpoint that later adds one does not break the resumable Save.) */
   function grantGroup(sourceId, group) {
     return postJson(SOURCES_API + '/' + encodeURIComponent(sourceId) + '/grants', { group_id: group.id })
       .catch(function (e) {
-        if (e && e.status === 409) return null;  // already granted — the end state we wanted
+        var kind = e && e.detail && e.detail.error;
+        if (e && e.status === 409 && kind !== 'no_tools_registered') return null;  // already granted
         throw e;
       });
+  }
+
+  /* Register one introspected tool so agents can actually call it.
+
+     A source with no `tool_registry` rows exposes NOTHING: the MCP server
+     builds its tool list from `list_by_mode('passthrough', enabled_only=True)`
+     (app/api/mcp/tools_generator.py), so Save used to hand back a registered
+     source with zero callable tools — while the Tools panel said "turn off
+     anything agents should not call" and counted "N of M" on. The toggles
+     described an outcome Save did not produce, in both directions.
+
+     `tool_id` is deterministic (`<source>__<original name>`, the same
+     composite the source detail page uses) so pressing Save twice cannot
+     create a second row for one tool, and the 409 a re-register answers reads
+     as done — the same end-state-not-error rule the grant step follows.
+
+     `mode` is passthrough: the mode the toggle is ABOUT (callable by an
+     agent). Materialize needs a schedule and a table, which this panel does
+     not ask for; the source's own page still offers it. */
+  function registerTool(sourceId, tool) {
+    return postJson(TOOLS_API, {
+      tool_id: sourceId + '__' + tool.name,
+      source_id: sourceId,
+      original_name: tool.name,
+      exposed_name: tool.name,
+      mode: 'passthrough',
+      description: tool.description || null,
+      input_schema: tool.input_schema || null,
+      enabled: true,
+    }).catch(function (e) {
+      if (e && e.status === 409) return null;  // already registered — the end state we wanted
+      throw e;
+    });
+  }
+
+  function enabledTools() {
+    return draft.tools.filter(function (t) { return draft.enabled[t.name] !== false; });
   }
 
   function save() {
@@ -205,6 +266,17 @@
           method: 'PUT', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ value: draft.secret_value }),
         }).catch(function (e) { throw new Error('Registered, but storing the secret failed: ' + e.message); });
+      })
+      .then(function () {
+        // Before the grants: a group pointed at a source with no callable
+        // tools has been given nothing.
+        var wanted = enabledTools();
+        if (!wanted.length) return null;
+        return Promise.all(wanted.map(function (t) {
+          return registerTool(savedId, t);
+        })).catch(function (e) {
+          throw new Error('Registered, but adding the tools failed: ' + e.message);
+        });
       })
       .then(function () {
         if (!draft.groups.length) return null;
@@ -428,8 +500,7 @@
 
   function toolSummary() {
     if (!draft.introspected) return 'not checked';
-    var on = draft.tools.filter(function (t) { return draft.enabled[t.name] !== false; }).length;
-    return on + ' of ' + draft.tools.length;
+    return enabledTools().length + ' of ' + draft.tools.length;
   }
 
   function progressHtml() {

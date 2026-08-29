@@ -1,5 +1,5 @@
 """``SemanticModelsPgRepository``'s F3 detach/override methods (PG-only,
-A3 ratchet — see migrations/versions/0077_semantic_models_detach.py).
+A3 ratchet — see migrations/versions/0090_semantic_models_detach.py).
 
 No DuckDB parametrization here: the DuckDB sibling has no columns to back
 these methods, so it just raises ``RequiresPostgresBackend`` — that fail-

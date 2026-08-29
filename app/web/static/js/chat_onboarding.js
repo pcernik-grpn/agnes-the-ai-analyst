@@ -24,7 +24,7 @@
 
 // The checklist renders in THIS order, and it is the order the coach-mark tour
 // walks (TOURS.welcome in tour.js): ask → see your Library → put something in
-// your stack → add or share your own → use Agnes elsewhere. It used to run
+// your stack → add or share your own → take Agnes to your tools. It used to run
 // stack-before-Library, which contradicted the tour and, worse, put the one
 // step you cannot complete by looking at anything (`stack_setup_done` lands
 // when a package is actually subscribed) ahead of the one the tour completes
@@ -133,7 +133,7 @@ const STEP_META = {
   // The canonical home for the setting stays /me/profile#notifications — this is
   // a signpost to it, not a second implementation.
   use_anywhere: {
-    label: "Use Agnes outside this tab",
+    label: "Take Agnes to your tools",
     why: "Reuse the same trusted company context in Claude Code, Cursor, and VS Code — and pick where Agnes reaches you when a long run finishes.",
     href: "/how-it-works#connect",
     tour: { id: CONNECT_TOUR, step: "connect" },

@@ -75,7 +75,8 @@ def _audit_read(user: dict, endpoint: str, filter_payload: dict) -> None:
         action="activity.read",
         params={"endpoint": endpoint, **filter_payload},
         result="success",
-        client_kind="web",
+        # client_kind intentionally omitted (F0 audit-context autofill,
+        # Task 1) — this read isn't necessarily browser-only.
     )
     try:
         get_posthog().capture(

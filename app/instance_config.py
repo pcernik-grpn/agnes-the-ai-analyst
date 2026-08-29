@@ -854,6 +854,26 @@ def get_contribute_skill_enabled() -> bool:
     )
 
 
+def get_store_moderation_enabled() -> bool:
+    """Whether the Moderation & Trust hub (``/admin/store``) and its nav +
+    command-palette entries are exposed.
+
+    **Off by default.** The hub was a landing page for links the admin column
+    already carries: submission review has its own nav row, marketplace
+    curation is ``/admin/marketplaces``, and entity verification is gated by
+    its own ``store.verification_enabled``.
+
+    Hides UI only. ``/api/admin/share-requests*`` and the store APIs keep
+    serving, so a queued agent share can still be decided by API while the
+    page is hidden — the hub is the only PAGE that renders that queue.
+
+    Resolution: env var > ``features.store_moderation_enabled`` YAML > False.
+    """
+    return feature_enabled(
+        "features", "store_moderation_enabled", env_var="AGNES_STORE_MODERATION_ENABLED", default=False
+    )
+
+
 def get_agent_profiles_enabled() -> bool:
     """Whether the Agent profiles surface (``/agents`` builder, the
     ``/api/v1/agents*`` management + runtime API, and the ``agnes agent`` /

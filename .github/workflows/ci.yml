@@ -8,12 +8,16 @@ on:
     # in isolation.
     branches: [main, integration, "feature/**", "ci/update-test-durations-*"]
   pull_request:
-    # PRs targeting `integration` must run the full suite too — without
-    # this filter GitHub fires no workflow at all for them and the PR shows
-    # a green rollup that asserted nothing. Same trap for the long-lived
-    # `mf/semantic-layer-v0` feature base: its PR stack showed empty green
-    # rollups until it was listed here.
-    branches: [main, integration, mf/semantic-layer-v0]
+    # NO branch filter, deliberately (#1636). A `branches:` list here means
+    # GitHub fires no workflow at all for a PR whose base is not on it — and
+    # the PR then shows a green rollup that asserted nothing, which is worse
+    # than a red one. That is not hypothetical: the semantic-layer stack took
+    # four PRs into `mf/semantic-layer-v0` with no test run between them, and
+    # the base sat at two alembic heads the whole time with nothing to say so.
+    # Naming stack bases individually was the cheaper option and was rejected:
+    # it needs a naming convention nobody enforces, and it fails silently the
+    # first time someone picks a name outside it. A PR that gets no CI is not
+    # reviewable, whatever it targets.
   schedule:
     - cron: "0 3 * * *"  # Nightly at 03:00 UTC — runs docker-e2e
   workflow_dispatch:
@@ -61,16 +65,24 @@ jobs:
           TESTING: "1"
 
   test-pg:
-    # Runs tests/db_pg/ split across 2 parallel jobs to halve wall-clock time.
-    # Keeping these separate from the main split shards avoids the pgserver
-    # session-fixture startup overhead (~60 s per worker) from landing in shard
-    # 1 and skewing the main shards. pytest-split balances the 2 groups; tests
-    # without timing data receive the mean duration so the split is roughly even.
+    # Runs tests/db_pg/ split across 4 parallel jobs. Keeping these separate
+    # from the main split shards avoids the pgserver session-fixture startup
+    # overhead (~60 s per worker) from landing in shard 1 and skewing the main
+    # shards. pytest-split balances the groups by `.test_durations`; tests
+    # without timing data receive the mean duration.
+    #
+    # 2 -> 4 groups because this job, not the 8 main shards, is the critical
+    # path: measured over four consecutive `integration` runs the shards came
+    # in at 11-17 min while both test-pg jobs sat at 26-34 min, so every CI
+    # cycle in the repo waited on test-pg regardless of how fast the rest was.
+    # The split is nearly free to widen — a job's step timings show 26.3 of its
+    # 27 min is the pytest run itself (checkout/setup-python/uv are cached to
+    # ~0.1 min), and the committed durations cut 4 ways at 11.2 min each.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        group: [1, 2]
+        group: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
 
@@ -86,13 +98,13 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system ".[dev,server]"
 
-      - name: Run Postgres contract tests (shard ${{ matrix.group }}/2)
-        run: pytest tests/db_pg/ -v --tb=short -n auto --splits 2 --group ${{ matrix.group }}
+      - name: Run Postgres contract tests (shard ${{ matrix.group }}/4)
+        run: pytest tests/db_pg/ -v --tb=short -n auto --splits 4 --group ${{ matrix.group }}
         env:
           TESTING: "1"
 
   # Single required status check. Branch protection requires `test`, but the
-  # matrices above publish `test-shard (1..8)` and `test-pg (1..2)` — this job
+  # matrices above publish `test-shard (1..8)` and `test-pg (1..4)` — this job
   # aggregates them into one `test` result so no branch-protection change is needed.
   test:
     needs: [test-shard, test-pg]

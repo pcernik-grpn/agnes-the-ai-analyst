@@ -50,7 +50,8 @@ who receives it:
 
 - `/admin/marketplaces` — register/sync the marketplace repositories the
   instance ingests.
-- `/admin/store` — store moderation: approve or reject published items.
+- `/admin/store` — store moderation: approve or reject published items. Hidden
+  by default (`features.store_moderation_enabled`); redirects home when off.
 - `/admin/store/submissions` — community submissions queue.
 - `/admin/store/lint` — lint results for store content.
 - `/admin/corporate-memory` — corporate-memory domains and their content.

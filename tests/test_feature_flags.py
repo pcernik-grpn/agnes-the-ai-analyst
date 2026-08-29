@@ -89,11 +89,13 @@ class TestFeatureFlagsRegistry:
             "news",
             "knowledge_digests",
             "contribute_skill",
+            "store_moderation",
             "guardrails",
             "chat",
             "chat_provider",
             "chat_approvals",
             "chat_bootstrap_marketplace",
+            "chat_broker_admin_reads",
             "data_apps",
             "data_apps_allow_same_origin",
             "library_show_unverified_trust",
@@ -109,6 +111,7 @@ class TestFeatureFlagsRegistry:
             "access_policies",
             "keboola_token_header",
             "keboola_multi_project_mode",
+            "microsoft_group_sync",
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
@@ -152,6 +155,7 @@ class TestFeatureFlagsRegistry:
         assert by_name["news"].default is False
         assert by_name["knowledge_digests"].default is False
         assert by_name["contribute_skill"].default is False
+        assert by_name["store_moderation"].default is False
 
     def test_new_flags_default_off(self):
         by_name = {f.name: f for f in ic.FEATURE_FLAGS}
@@ -295,11 +299,13 @@ class TestServerConfigFeatureFlagsInventory:
             "news",
             "knowledge_digests",
             "contribute_skill",
+            "store_moderation",
             "guardrails",
             "chat",
             "chat_provider",
             "chat_approvals",
             "chat_bootstrap_marketplace",
+            "chat_broker_admin_reads",
             "data_apps",
             "data_apps_allow_same_origin",
             "library_show_unverified_trust",
@@ -314,6 +320,7 @@ class TestServerConfigFeatureFlagsInventory:
             "access_policies",
             "keboola_token_header",
             "keboola_multi_project_mode",
+            "microsoft_group_sync",
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",

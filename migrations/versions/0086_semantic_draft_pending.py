@@ -9,8 +9,8 @@ second one. Plain additive column, no backfill — NULL on every existing row
 means "no draft pending", the correct reading for a table nothing has swept
 yet.
 
-Revision ID: 0076_semantic_draft_pending
-Revises: 0075_column_meta_source_ref
+Revision ID: 0086_semantic_draft_pending
+Revises: 0085_column_meta_source_ref
 Create Date: 2026-08-26
 """
 
@@ -21,8 +21,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0076_semantic_draft_pending"
-down_revision: Union[str, None] = "0075_column_meta_source_ref"
+revision: str = "0086_semantic_draft_pending"
+down_revision: Union[str, None] = "0085_column_meta_source_ref"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
