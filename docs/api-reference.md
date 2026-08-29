@@ -1604,6 +1604,14 @@ inline on this origin. Both read-gate on the parent collection's access OR a
 grant on the `corpus_file` itself, so a file shared out of a folder stays
 viewable by the person it was shared with.
 
+Uploading (`POST .../files`) returns one `{file_id, filename, path,
+processing_status, …, claims_purged}` per file. `claims_purged` (spec §8) is
+the count of fact-graph claims dropped for that file because its content
+changed in place (§6) — 0 for a brand-new file, an unchanged-content resync
+or rename, or when the `facts` flag is off — so a producer's ingest
+idempotence can tell "content changed, re-ingest is genuinely needed" apart
+from "already shipped".
+
 - /api/collections
 - /api/collections/search
 - /api/collections/{collection_id}
@@ -1650,13 +1658,15 @@ is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `413`; a single document's evidence alone over the claim cap is a `422`
 `document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
 must be a substring of one chunk of the evidencing document's extracted
-text), union vs `full_documents` replace mode, alias/edge resolution,
-a `documents[]` entry's OPTIONAL `source_url` (§8/O7, e.g. the crawler's
-Graph `webUrl`) persisted onto `corpus_file_sources` for the citation's
-"Open in source" link — validated https-only/length-capped, dropped (never
-rejects the surrounding claim) when absent or invalid; a SENT-but-invalid
-value is itemized on the response's `source_urls_rejected: [{doc_id,
-reason}]` (never an absent one), same shape as `claims_rejected`,
+text OR of the document's own SERVER-STORED `filename`/`path` — never a
+producer-supplied identity string off the wire, which would let a producer
+self-certify an invented quote), union vs `full_documents` replace mode,
+alias/edge resolution, a `documents[]` entry's OPTIONAL `source_url` (§8/O7,
+e.g. the crawler's Graph `webUrl`) persisted onto `corpus_file_sources` for
+the citation's "Open in source" link — validated https-only/length-capped,
+dropped (never rejects the surrounding claim) when absent or invalid; a
+SENT-but-invalid value is itemized on the response's `source_urls_rejected:
+[{doc_id, reason}]` (never an absent one), same shape as `claims_rejected`,
 `wrong`-correction re-attachment across a subject's delete-then-recreate,
 and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
 `review_items` mixes two self-describing shapes (a `kind` discriminator on
@@ -1670,9 +1680,14 @@ dst's claims are gone. Same detection re-runs at read time in
 caller-scoped: a dst the caller cannot independently read (its own claim
 AND the edge's own claim both readable, the same discipline
 `possible_duplicate_of` review items get) never appears. Response is the
-run report: `{claims_written, claims_rejected: [{row,
-reason}], deferred: [...], subjects_created, subjects_deleted,
-corrections_active: [...], review_items: [...]}`. `documents` may be
+run report: `{claims_written, claims_accepted_via_identity,
+claims_rejected: [{row, reason}], deferred: [...], subjects_created,
+subjects_deleted, corrections_active: [...], review_items: [...]}`.
+`claims_accepted_via_identity` is the subset of `claims_written` whose
+quote passed the gate ONLY via the document's filename/path — surfaced so
+an operator can see how much evidence is filename- rather than
+content-grounded (weaker evidence still, per §8's own honesty note that the
+gate validates the quote, not the fact). `documents` may be
 omitted only when every evidence `doc_id` already resolves through a prior
 upload's `corpus_file_sources` mapping — otherwise `400` with the
 unresolved ids itemized. Corrections management

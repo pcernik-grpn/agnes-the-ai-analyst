@@ -2142,6 +2142,7 @@ class FactsPgRepository:
             return chunk_cache[file_id]
 
         claims_written = 0
+        claims_accepted_via_identity = 0
         claims_rejected: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
         subjects_created = 0
@@ -2159,7 +2160,7 @@ class FactsPgRepository:
             row_ref: str,
             row_attrs: Optional[Dict[str, Any]] = None,
         ) -> None:
-            nonlocal claims_written
+            nonlocal claims_written, claims_accepted_via_identity
             with self._engine.connect() as conn:
                 for ev_idx, ev in enumerate(evidence):
                     doc_id = ev.get("doc_id")
@@ -2188,9 +2189,32 @@ class FactsPgRepository:
                         )
                         continue
                     texts = _chunk_texts(file_id)
+                    accepted_via_identity = False
                     if not any(quote in t for t in texts):
-                        claims_rejected.append({"row": item_ref, "reason": "verbatim_gate_failed", "doc_id": doc_id})
-                        continue
+                        # Widened gate: the document's own SERVER-STORED
+                        # identity (`corpus_files.filename`/`path`) counts as
+                        # verbatim evidence too — the extraction ontology
+                        # legitimately grounds a claim in a document's folder
+                        # path + filename (e.g. a `part_of` edge citing
+                        # "Project Kemp/Parts Authority — …pptx"), and those
+                        # quotes have no chunk to land in (spec §8).
+                        # Deliberately `frow` (fetched from `corpus_files`
+                        # above), NEVER anything off the wire (`doc`/`ev`) —
+                        # a producer-declared name/path is used only to
+                        # RESOLVE which row this evidence is about, never as
+                        # evidence itself, or a producer could self-certify
+                        # an invented quote by declaring whatever string it
+                        # likes. No normalization is applied here, matching
+                        # the chunk-text check above exactly — an NFC/NFD
+                        # form mismatch fails identically on both sides.
+                        identity_haystack = [s for s in (frow.get("filename"), frow.get("path")) if s]
+                        if any(quote in s for s in identity_haystack):
+                            accepted_via_identity = True
+                        else:
+                            claims_rejected.append(
+                                {"row": item_ref, "reason": "verbatim_gate_failed", "doc_id": doc_id}
+                            )
+                            continue
                     written_id = self.add_claim(
                         fact_id=subject_id if kind == "fact" else None,
                         edge_id=subject_id if kind == "edge" else None,
@@ -2213,6 +2237,8 @@ class FactsPgRepository:
                     )
                     if written_id is not None:
                         claims_written += 1
+                        if accepted_via_identity:
+                            claims_accepted_via_identity += 1
                         if kind == "fact":
                             touched_fact_ids.add(subject_id)
 
@@ -2382,6 +2408,13 @@ class FactsPgRepository:
 
         return {
             "claims_written": claims_written,
+            # Of `claims_written`, the subset that only passed the gate via
+            # the document's SERVER-STORED filename/path — never a chunk —
+            # so an operator can see how much evidence is filename-grounded
+            # (weaker evidence still: §8 notes the gate validates the quote,
+            # not the fact, and an identity-grounded quote grounds even
+            # less).
+            "claims_accepted_via_identity": claims_accepted_via_identity,
             "claims_rejected": claims_rejected,
             "source_urls_rejected": source_urls_rejected,
             "deferred": deferred,
