@@ -60,6 +60,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth.access import require_admin, require_facts_enabled
 from app.auth.dependencies import get_current_user
+from src.audit_helpers import identity_for_audit, log_safe
 from src.repositories import audit_repo, facts_ingest_runs_repo, facts_repo
 from src.repositories.facts_pg import (
     FactNotFound,
@@ -124,9 +125,16 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     additional matches.
     """
     try:
-        return facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
+        result = facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.search",
+        params={"type": body.type, "result_count": len(result.get("subjects", [])), "limit": body.limit},
+    )
+    return result
 
 
 @router.post("/neighbors")
@@ -146,7 +154,7 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
     point of view (spec §5 rule 2).
     """
     try:
-        return facts_repo().neighbors(
+        result = facts_repo().neighbors(
             user,
             body.subject_id,
             edge_types=body.edge_types,
@@ -156,6 +164,14 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
         )
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.neighbors",
+        resource=f"fact:{body.subject_id}",
+        params={"node_count": len(result.get("nodes", [])), "edge_count": len(result.get("edges", []))},
+    )
+    return result
 
 
 @router.get("/{subject_id}/claims")
@@ -177,9 +193,17 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
     # collection, so no route-template gate can express the check; every
     # repo read method filters by the caller (spec §5), tested S1-S6.
     try:
-        return facts_repo().claims(user, subject_id)
+        result = facts_repo().claims(user, subject_id)
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.claims",
+        resource=f"fact:{subject_id}",
+        params={"claim_count": len(result.get("claims", []))},
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +339,17 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             status_code=400,
             detail={"reason": "reserved_source_stable_id", "stable_ids": exc.stable_ids},
         )
+
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.ingest",
+        params={
+            "documents": len(body.documents),
+            "claims_written": report.get("claims_written", 0),
+            "claims_rejected": len(report.get("claims_rejected", [])),
+        },
+    )
 
     try:
         corpus_ids = sorted({d.get("corpus_id") for d in body.documents if d.get("corpus_id")})

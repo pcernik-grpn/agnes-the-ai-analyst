@@ -188,8 +188,11 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
+from typing import Optional
 
-from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
+from app.worker.registry import JOB_KINDS, EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
+from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -1555,6 +1558,54 @@ def _run_corpus_extraction(payload: dict) -> dict:
         "corpus_id": corpus_id,
         "returncode": result.returncode,
     }
+
+
+def dispatch_job(job: dict) -> Optional[dict]:
+    """THE single dispatch-level entry point for running one claimed job's
+    handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
+    up in the process-wide ``JOB_KINDS`` registry, runs its handler, and
+    writes exactly one ``job.run`` audit row regardless of outcome — no
+    individual ``_run_*`` handler above calls ``log_safe`` itself, so a
+    future kind gets audit coverage for free just by registering through
+    ``register_kind``.
+
+    ``app/worker/runtime.py``'s ``_run_one`` calls this (via
+    ``asyncio.to_thread``) INSTEAD OF ``kind.handler(job["payload_json"])``
+    directly — the one place in the whole worker that actually executes a
+    claimed job, so this is also the one place audit coverage needs to
+    live (one dispatch-level wrapper, not one per kind).
+
+    Runs outside any HTTP request — there is no ASGI scope for
+    ``src.audit_context``'s autofill to read, so ``duration_ms`` is
+    measured explicitly here and ``client_kind="scheduler"`` is always
+    passed. ``user_id=None``: a scheduled/worker job has no human caller to
+    attribute the row to.
+    """
+    kind = JOB_KINDS[job["kind"]]
+    t0 = time.monotonic()
+    try:
+        result = kind.handler(job["payload_json"])
+    except Exception as exc:
+        log_safe(
+            user_id=None,
+            action="job.run",
+            resource=f"job:{job['kind']}",
+            params={"kind": job["kind"], "outcome": "error", "job_id": job.get("id")},
+            result=f"error:{type(exc).__name__}",
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            client_kind="scheduler",
+        )
+        raise
+    log_safe(
+        user_id=None,
+        action="job.run",
+        resource=f"job:{job['kind']}",
+        params={"kind": job["kind"], "outcome": "success", "job_id": job.get("id")},
+        result="success",
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        client_kind="scheduler",
+    )
+    return result
 
 
 def register_all_kinds() -> None:

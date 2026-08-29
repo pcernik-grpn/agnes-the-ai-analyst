@@ -828,6 +828,7 @@ class TestUploadSmoke:
         "POST /api/upload/sessions",
         "POST /api/upload/artifacts",
         "POST /api/upload/local-md",
+        "POST /api/upload/audit-events",
     }
 
     def test_upload_session(self, seeded_app_both):
@@ -857,6 +858,30 @@ class TestUploadSmoke:
             headers=_admin_headers(seeded_app_both),
         )
         assert r.status_code in (200, 201)
+
+    def test_upload_audit_events(self, seeded_app_both):
+        """Client-reported CLI audit events land identically on both backends.
+
+        Asserts the accept/reject split too — the server-side action allowlist
+        is the security boundary here, and a backend that silently accepted an
+        uncataloged action would still return 200.
+        """
+        r = seeded_app_both["client"].post(
+            "/api/upload/audit-events",
+            json={
+                "events": [
+                    {
+                        "action": "query.local_offline",
+                        "params": {"tables": ["orders"], "sql_hash": "deadbeef01234567", "rows": 1},
+                        "observed_at": "2026-08-29T12:00:00Z",
+                    },
+                    {"action": "not.a.client.action", "params": {}, "observed_at": "2026-08-29T12:00:01Z"},
+                ]
+            },
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200
+        assert r.json() == {"accepted": 1, "rejected": 1}
 
 
 # ---------------------------------------------------------------------------

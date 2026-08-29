@@ -72,6 +72,7 @@ from app.chat.types import Surface
 from app.coordination.factory import coordination
 from app.logging_config import request_id_var
 from app.resource_types import ResourceType
+from src.audit_helpers import log_safe
 from src.object_store import object_store
 from src.repositories import agent_artifacts_repo, agents_repo, chat_message_repo, chat_session_repo
 
@@ -242,6 +243,12 @@ async def create_agent_session(
         if str(exc) != "chat.enabled is false":
             raise
         raise HTTPException(status_code=503, detail={"code": "chat_disabled"}) from exc
+    log_safe(
+        user_id=user["id"],
+        action="agent.session.create",
+        resource=f"session:{session.id}",
+        params={"agent_id": agent["id"]},
+    )
     return {"session_id": session.id}
 
 
@@ -336,6 +343,13 @@ async def post_session_message(
             coordination().lease_release(lock_key, lock_holder)
         raise
 
+    log_safe(
+        user_id=principal.user["id"],
+        action="agent.session.message",
+        resource=f"session:{session_id}",
+        params={"chars": len(effective_input)},
+    )
+
     request_id = request_id_var.get() or uuid.uuid4().hex
     return StreamingResponse(
         _event_stream(manager, session_id, sink, lock_key, lock_holder),
@@ -376,6 +390,11 @@ async def cancel_session(
     if manager is None:
         raise HTTPException(status_code=503, detail={"code": "chat_disabled"})
     await manager.cancel(session_id)
+    log_safe(
+        user_id=principal.user["id"],
+        action="agent.session.cancel",
+        resource=f"session:{session_id}",
+    )
     return {}
 
 
@@ -422,6 +441,11 @@ async def delete_session(
         except Exception:
             logger.exception("kill on agent-session delete failed for %s", session_id)
     chat_session_repo().archive_session(session_id)
+    log_safe(
+        user_id=principal.user["id"],
+        action="agent.session.delete",
+        resource=f"session:{session_id}",
+    )
 
 
 #: Presigned-GET TTL cap for the opt-in `?redirect=1` download path (C5) —
