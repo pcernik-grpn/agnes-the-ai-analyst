@@ -66,7 +66,7 @@ POSTURE: dict[str, str] = {
     "DELETE /api/admin/registry/{table_id}": "unregister_table",
     "DELETE /api/admin/store/submissions/{submission_id}": "store.submission.deleted",
     "PATCH /api/admin/registry/{table_id}/docs": "fallback",
-    "POST /api/admin/configure": "fallback",
+    "POST /api/admin/configure": "instance.configure",
     "POST /api/admin/discover-and-register": "fallback",
     "POST /api/admin/register-table": "register_table",
     "POST /api/admin/register-table/precheck": "fallback",
@@ -103,9 +103,9 @@ POSTURE: dict[str, str] = {
     "DELETE /api/admin/contributed-skills/{name}": "fallback",
     "POST /api/admin/contributed-skills": "fallback",
     # -- app.api.admin_datasource_secrets --------------------------------------
-    "DELETE /api/admin/datasource-secrets/{name}": "fallback",
+    "DELETE /api/admin/datasource-secrets/{name}": "datasource.secret.clear",
     "POST /api/admin/validate-gws-credentials": "fallback",
-    "PUT /api/admin/datasource-secrets/{name}": "fallback",
+    "PUT /api/admin/datasource-secrets/{name}": "datasource.secret.set",
     # -- app.api.admin_doctor --------------------------------------------------
     "POST /api/admin/doctor/new-instance": "fallback",
     # -- app.api.admin_keboola_test --------------------------------------------
@@ -135,17 +135,17 @@ POSTURE: dict[str, str] = {
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "fallback",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "fallback",
     # -- app.api.admin_slack_secrets -------------------------------------------
-    "DELETE /api/admin/slack-secrets/{name}": "fallback",
-    "PUT /api/admin/slack-secrets/{name}": "fallback",
+    "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
+    "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
     # -- app.api.admin_source_connections --------------------------------------
-    "DELETE /api/admin/source-connections/{connection_id}": "fallback",
+    "DELETE /api/admin/source-connections/{connection_id}": "source_connection.delete",
     "DELETE /api/admin/source-connections/{connection_id}/chat-tools": "fallback",
-    "DELETE /api/admin/source-connections/{connection_id}/secret": "fallback",
-    "POST /api/admin/source-connections": "fallback",
+    "DELETE /api/admin/source-connections/{connection_id}/secret": "source_connection.secret.clear",
+    "POST /api/admin/source-connections": "source_connection.create",
     "POST /api/admin/source-connections/{connection_id}/chat-tools": "fallback",
-    "POST /api/admin/source-connections/{connection_id}/test": "fallback",
-    "PUT /api/admin/source-connections/{connection_id}": "fallback",
-    "PUT /api/admin/source-connections/{connection_id}/secret": "fallback",
+    "POST /api/admin/source-connections/{connection_id}/test": "source_connection.test",
+    "PUT /api/admin/source-connections/{connection_id}": "source_connection.update",
+    "PUT /api/admin/source-connections/{connection_id}/secret": "source_connection.secret.set",
     # -- app.api.admin_sso -----------------------------------------------------
     "DELETE /api/admin/sso/client-secret": "fallback",
     "DELETE /api/admin/sso/config": "fallback",
@@ -288,7 +288,7 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/initial-workspace/sync-if-configured": "fallback",
     "POST /api/initial-workspace/applied": "initial_workspace.applied",
     # -- app.api.jira_webhooks -------------------------------------------------
-    "POST /webhooks/jira": "fallback",
+    "POST /webhooks/jira": "webhook.jira_received",
     # -- app.api.jobs ----------------------------------------------------------
     "POST /api/jobs": "fallback",
     # -- app.api.kai -----------------------------------------------------------
@@ -330,9 +330,9 @@ POSTURE: dict[str, str] = {
     "DELETE /api/mcp/http": "fallback",
     "POST /api/mcp/http": "fallback",
     # -- app.api.mcp_user_secrets ----------------------------------------------
-    "DELETE /api/mcp/sources/{source_id}/my-secret": "fallback",
-    "POST /api/mcp/sources/{source_id}/my-secret/test": "fallback",
-    "PUT /api/mcp/sources/{source_id}/my-secret": "fallback",
+    "DELETE /api/mcp/sources/{source_id}/my-secret": "mcp_user_secret.clear",
+    "POST /api/mcp/sources/{source_id}/my-secret/test": "mcp_user_secret.test",
+    "PUT /api/mcp/sources/{source_id}/my-secret": "mcp_user_secret.set",
     # -- app.api.me ------------------------------------------------------------
     "PATCH /api/me/display-name": "user_display_name_updated",
     "POST /api/me/elevation": "admin_elevation_paused",
@@ -412,11 +412,11 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/recipes/{recipe_id}/restore": "recipe.restore",
     "PUT /api/admin/recipes/{recipe_id}": "recipe.update",
     # -- app.api.scripts -------------------------------------------------------
-    "DELETE /api/scripts/{script_id}": "fallback",
-    "POST /api/scripts/deploy": "fallback",
-    "POST /api/scripts/run": "fallback",
+    "DELETE /api/scripts/{script_id}": "script.delete",
+    "POST /api/scripts/deploy": "script.deploy",
+    "POST /api/scripts/run": "script.run",
     "POST /api/scripts/run-due": "script_runner.tick",
-    "POST /api/scripts/{script_id}/run": "fallback",
+    "POST /api/scripts/{script_id}/run": "script.run",
     # -- app.api.semantic_models -----------------------------------------------
     "DELETE /api/admin/semantic-models/{model_id:path}": "fallback",
     "DELETE /api/admin/semantic-sources/{source_id}": "fallback",
@@ -463,9 +463,9 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/store/lint-audit": "fallback",
     "POST /api/admin/store/lint-dismiss": "fallback",
     # -- app.api.sync ----------------------------------------------------------
-    "POST /api/sync/pull-confirm": "fallback",
-    "POST /api/sync/settings": "fallback",
-    "POST /api/sync/table-subscriptions": "fallback",
+    "POST /api/sync/pull-confirm": "sync.pull_confirmed",
+    "POST /api/sync/settings": "sync.settings_update",
+    "POST /api/sync/table-subscriptions": "sync.subscriptions_update",
     "POST /api/sync/trigger": "sync.trigger",
     # -- app.api.telegram ------------------------------------------------------
     "POST /api/telegram/unlink": "fallback",
@@ -475,8 +475,8 @@ POSTURE: dict[str, str] = {
     "DELETE /auth/tokens/{token_id}": "token.revoke",
     "POST /auth/tokens": "token.create",
     # -- app.api.upload --------------------------------------------------------
-    "POST /api/upload/artifacts": "fallback",
-    "POST /api/upload/local-md": "fallback",
+    "POST /api/upload/artifacts": "artifact.upload",
+    "POST /api/upload/local-md": "local_md.upload",
     "POST /api/upload/sessions": "session.upload",
     # -- app.api.uploads -------------------------------------------------------
     "POST /api/admin/uploads/cover-image": "fallback",
@@ -515,7 +515,11 @@ POSTURE: dict[str, str] = {
     "POST /auth/refresh-groups": "auth.refresh_groups",
     "POST /auth/token": "token_created",
     # -- app.marketplace_server.git_router -------------------------------------
-    "POST /marketplace.git/{path:path}": "fallback",
+    # POST serves both git-upload-pack (fetch negotiation) and git-receive-pack
+    # (push) through the same handler; fetch is the overwhelmingly common case
+    # for this read-mostly bare repo — see marketplace.git_push for the other
+    # branch, still a real cataloged row on its own path.
+    "POST /marketplace.git/{path:path}": "marketplace.git_fetch",
     # -- app.web.router --------------------------------------------------------
     "POST /admin/contribute-skill": "fallback",
     "POST /admin/contribute-skill/{name}/delete": "fallback",

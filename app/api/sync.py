@@ -21,7 +21,7 @@ from app.auth.dependencies import get_current_user, _get_db
 from app.instance_config import distribution_signed_urls_mode
 from app.job_correlation import stamp_request_id
 from app.utils import get_data_dir as _get_data_dir
-from src.audit_helpers import client_kind_from_user
+from src.audit_helpers import client_kind_from_user, log_safe
 from src.distribution import cached_mirror_index
 from src.object_store import ObjectStore, object_store
 from src.rbac import get_accessible_tables
@@ -2314,6 +2314,13 @@ def pull_confirm(
         )
     except Exception:
         logger.warning("usage_events emit failed for sync.pull_completed")
+    log_safe(
+        user_id=user["id"],
+        action="sync.pull_confirmed",
+        resource="sync:pull",
+        params={k: v for k, v in props.items() if k != "client_kind"},
+        result="success",
+    )
     return {"recorded": True}
 
 
@@ -2592,6 +2599,12 @@ def update_sync_settings(
         settings_repo.set_dataset_enabled(user["id"], dataset, enabled)
         results[dataset] = {"enabled": enabled}
 
+    log_safe(
+        user_id=user["id"],
+        action="sync.settings_update",
+        resource="sync:settings",
+        params={"datasets": sorted(request.datasets.keys())},
+    )
     return {"updated": results}
 
 
@@ -2641,4 +2654,10 @@ def update_table_subscriptions(
             continue
         repo.set_dataset_enabled(user["id"], table_name, enabled)
         results[table_name] = {"enabled": enabled}
+    log_safe(
+        user_id=user["id"],
+        action="sync.subscriptions_update",
+        resource="sync:table_subscriptions",
+        params={"table_mode": request.table_mode, "tables": sorted(request.tables.keys())},
+    )
     return {"table_mode": request.table_mode, "updated": results}
