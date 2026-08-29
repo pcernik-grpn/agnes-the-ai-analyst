@@ -1291,6 +1291,82 @@ def test_dup_doc_id_indexed_copy_preferred_over_pending_not_deferred(pg_env, rep
     assert report["deferred"] == []
 
 
+def test_dup_doc_id_document_date_survives_the_indexed_preference_override(pg_env, repo):
+    """P2 review finding: `document_date` was looked up by the FILE this
+    batch's own `documents[]` entry resolved to, but a SECOND indexed copy
+    landing later (TCRD-241) makes the deterministic override pick a
+    DIFFERENT winner file -- one this batch never touched, so it has no
+    entry in that batch's `doc_dates`. The claim then silently wrote
+    `document_date=NULL`, breaking the succession rule (latest date wins):
+    an undated claim is treated as inferior to any dated one, so a stale
+    value would win forever. `document_date` must travel with the batch's
+    OWN declared doc_id, not the resolved file id, so it survives the
+    override."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_1_old", status="indexed", path="docs/old.docx")
+    text = "Acme Corp renewal status: in_progress. Later note: Acme Corp renewal status: renewed."
+    _seed_chunk(file_id="cf_1_old", text=text)
+
+    # Batch 1: the ONLY copy at this point -- establishes doc_id -> cf_1_old
+    # with an early document_date; no TCRD-241 override in play yet.
+    r1 = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": "dupdocdate",
+                "corpus_id": CORPUS_A,
+                "path": "docs/old.docx",
+                "stable_id": "path-old",
+                "modified": "2026-01-01",
+            }
+        ],
+        nodes=[
+            {
+                "id": "engagement:dupdocdate",
+                "type": "engagement",
+                "attrs": {"status": "in_progress"},
+                "evidence": [{"doc_id": "dupdocdate", "quote": "Acme Corp renewal status: in_progress."}],
+            }
+        ],
+    )
+    assert r1["claims_written"] == 1
+
+    # A SECOND copy of the SAME doc_id lands, not yet indexed (a fresh
+    # SharePoint duplicate just uploaded) -- `cf_1_old` still wins the
+    # deterministic (indexed-preferred) tiebreak, even though THIS batch's
+    # own documents[] entry resolves to the NEW copy.
+    _seed_corpus_file(file_id="cf_2_new", status="processing", path="docs/new.docx")
+
+    r2 = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": "dupdocdate",
+                "corpus_id": CORPUS_A,
+                "path": "docs/new.docx",
+                "stable_id": "path-new",
+                "modified": "2026-03-01",
+            }
+        ],
+        nodes=[
+            {
+                "id": "engagement:dupdocdate",
+                "type": "engagement",
+                "attrs": {"status": "renewed"},
+                "evidence": [{"doc_id": "dupdocdate", "quote": "Acme Corp renewal status: renewed."}],
+            }
+        ],
+    )
+    assert r2["claims_written"] == 1
+    assert r2["deferred"] == []  # resolved to the indexed cf_1_old, not the pending cf_2_new
+
+    result = repo.search(_admin(), type="engagement")
+    subject = next(s for s in result["subjects"] if "engagement:dupdocdate" in s["aliases"])
+    assert subject["attrs"]["status"]["value"] == "renewed"  # succession picked the LATER date
+
+    claims = repo.claims(_admin(), subject["id"])
+    dates = sorted(c["document_date"] for c in claims["claims"])
+    assert dates == ["2026-01-01", "2026-03-01"]  # neither claim's date silently dropped to null
+
+
 def test_dup_doc_id_undeclared_doc_id_resolving_only_outside_batch_corpora_is_rejected(pg_env, repo):
     """RBAC review (PR #1736): a claim's doc_id has NO `documents[]` entry
     in THIS batch, and the corpora this batch's `documents[]` DID declare

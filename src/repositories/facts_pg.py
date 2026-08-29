@@ -1945,6 +1945,10 @@ class FactsPgRepository:
         # unrestricted tier-3 scan. `declared_corpus_ids` is the batch's
         # true declared scope: the gate for tier 3 below.
         declared_corpus_ids: Set[str] = set()
+        # doc_id -> this batch's own declared `modified` date. Keyed by
+        # doc_id, NOT corpus_file_id (P2 review finding) — see the write
+        # site below for why a file_id key silently drops the date on a
+        # TCRD-241 duplicate-copy override.
         doc_dates: Dict[str, date] = {}
         # O7 follow-up: a `source_url` the validator dropped — itemized so a
         # non-zero count on the run report tells the operator "your producer
@@ -2020,7 +2024,17 @@ class FactsPgRepository:
                 if file_id is not None:
                     parsed = _parse_document_date(doc.get("modified"))
                     if parsed is not None:
-                        doc_dates[file_id] = parsed
+                        # P2 review finding: keyed by `doc_id`, NOT `file_id`.
+                        # TCRD-241's deterministic override (below) can
+                        # re-point a doc_id's resolution at a DIFFERENT
+                        # corpus_file_id than the one THIS entry resolved to
+                        # (an older, already-indexed copy winning over the
+                        # fresh one THIS batch declared) — a file_id-keyed
+                        # date would then look up a key nothing set,
+                        # silently writing `document_date=NULL` and handing
+                        # the succession/latest-wins projection a stale,
+                        # dated claim over the new undated one.
+                        doc_dates[doc_id] = parsed
 
         def _copies_for(corpus_id: str, doc_id: str, conn) -> List[Dict[str, Any]]:
             """Every ``corpus_files`` row anchored to ``(corpus_id, doc_id)``
@@ -2325,7 +2339,14 @@ class FactsPgRepository:
                         # ever supplies one (forward-compatible, unused
                         # today).
                         attrs=ev.get("attrs") or row_attrs or {},
-                        document_date=doc_dates.get(file_id),
+                        # P2 review finding: looked up by the EVIDENCE'S OWN
+                        # `doc_id`, not the resolved `file_id` — the
+                        # TCRD-241 deterministic override can resolve this
+                        # doc_id to a corpus_file_id THIS batch never itself
+                        # declared a date for (see `doc_dates`' definition
+                        # above), which previously wrote `document_date` as
+                        # silently NULL.
+                        document_date=doc_dates.get(doc_id),
                     )
                     if written_id is not None:
                         claims_written += 1
