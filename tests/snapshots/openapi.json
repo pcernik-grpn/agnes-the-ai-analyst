@@ -12612,7 +12612,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.92.0"
+    "version": "0.91.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -29831,7 +29831,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/tree/search": {
       "get": {
-        "description": "Bounded breadth-first folder search (TCRD-240) \u2014 the server-side\nstand-in for Graph's own ``/search``, which silently under-returns\nunder app-only auth (``connectors.sharepoint.graph_client`` module\ndocstring). Never a single call: it walks ``.../root/children`` and\n``.../items/{id}/children`` the same way the tree browser does, capped\nby ``max_depth``/``max_visited`` \u2014 CLAMPED to their caps\n(:data:`_SEARCH_MAX_DEPTH_CAP` / :data:`_SEARCH_MAX_VISITED_CAP`) rather\nthan rejected, so asking for more than the server allows still returns\nthe best bounded answer instead of a 422.\n\nRoot: ``drive_id`` + ``item_id`` scopes to that folder's subtree;\n``drive_id`` alone scopes to the whole drive; neither given searches\nevery drive of every reachable site. ``item_id`` without ``drive_id``\nis rejected \u2014 there is no drive to resolve it against.\n\nResponse: ``{matches: [{item_id, drive_id, display_path}], visited,\ntruncated, hint}``. ``truncated`` is ``True`` whenever a cap is what\nstopped the walk \u2014 never a silently partial result; ``visited`` is how\nmany \"list children\" calls it took to get there; ``hint`` is a short,\nactionable string (scope the search, narrow the pattern) when\n``truncated`` is ``True``, else ``null``.",
+        "description": "Bounded breadth-first folder search (TCRD-240) \u2014 the server-side\nstand-in for Graph's own ``/search``, which silently under-returns\nunder app-only auth (``connectors.sharepoint.graph_client`` module\ndocstring). Never a single call: it walks ``.../root/children`` and\n``.../items/{id}/children`` the same way the tree browser does, capped\nby ``max_depth``/``max_visited`` \u2014 CLAMPED to their caps\n(:data:`_SEARCH_MAX_DEPTH_CAP` / :data:`_SEARCH_MAX_VISITED_CAP`) rather\nthan rejected, so asking for more than the server allows still returns\nthe best bounded answer instead of a 422.\n\nRoot: ``drive_id`` + ``item_id`` scopes to that folder's subtree;\n``drive_id`` alone scopes to the whole drive; neither given searches\nevery drive of every reachable site. ``item_id`` without ``drive_id``\nis rejected \u2014 there is no drive to resolve it against.\n\nA site or folder the app registration cannot read (Graph 403/404) is\nskipped, not fatal \u2014 app-only permissions are never uniform across a\nreal tenant. It is never silently dropped: see ``skipped`` below.\n\nResponse: ``{matches: [{item_id, drive_id, display_path}], visited,\ntruncated, skipped, hint}``.\n\n- ``truncated`` is ``True`` whenever a cap (``max_depth``/``max_visited``)\n  is what stopped the walk \u2014 never a silently partial result.\n- ``visited`` is how many \"list children\" calls it took to get there.\n- ``skipped`` lists every site/folder the walk could not enter for\n  permissions reasons, each as ``{scope: \"site\"|\"folder\", reason:\n  \"forbidden\"|\"not_found\", status_code, site_id, site_name, drive_id,\n  item_id, display_path}`` \u2014 deliberately separate from ``truncated``:\n  a cap and a permission refusal are different facts and call for\n  different admin actions (narrow the search vs. request access).\n- ``hint`` is a short, actionable string (scope the search, narrow the\n  pattern) when ``truncated`` is ``True``, else ``null`` \u2014 unrelated to\n  ``skipped``, which speaks for itself.",
         "operationId": "search_tree_api_admin_sharepoint_connections__connection_id__tree_search_get",
         "parameters": [
           {
@@ -30462,7 +30462,7 @@
         ]
       },
       "put": {
-        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.",
+        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.\n\nSharePoint connections: ``config.scopes`` (the connect wizard's\nserver-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and\n``config.extraction`` (the in-Agnes extraction schedule's own\n``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried\nforward when the request's ``config`` omits the key \u2014 the same\n\"explicit wins\" contract as Keboola's ``project_id``/``project_name``\nabove \u2014 since this endpoint's wholesale ``config`` replace would\notherwise let an ordinary edit through the generic connection editor\n(which renders neither field) silently erase every confirmed scope's\n``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or\nreset the extraction schedule's clock. An explicit ``scopes: []`` (or\n``extraction: null``) in the request still clears it deliberately. The\nfull set of keys is ``app.api.admin_sharepoint.\nSHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by\n``tests/test_sharepoint_config_carry_forward_ratchet.py``.",
         "operationId": "update_connection_api_admin_source_connections__connection_id__put",
         "parameters": [
           {
@@ -39006,9 +39006,98 @@
         ]
       }
     },
+    "/api/facts/facets": {
+      "get": {
+        "description": "Filterable entity values per type, with a document count each \u2014 what\nthe Library's filter menu offers instead of hand-entered tags.\n\nThe vocabulary comes from the extraction pass (client, industry, service\noffering, document type), so it is maintained by ingestion rather than by\nsomebody remembering to tag a file.\n\nGated exactly as :func:`facts_search` is: a facet lists only subjects\nthis caller could reach, and each `document_count` counts only documents\nin collections they can read \u2014 a `revealed` subject's unreadable evidence\nis not tallied, since that would report how many files sit in a\ncollection they cannot open. Response: ``{\"facets\": {type: [{\"subject_id\",\n\"label\", \"document_count\"}]}}``.",
+        "operationId": "facts_facets_api_facts_facets_get",
+        "parameters": [
+          {
+            "description": "Comma-separated fact types to facet on. Defaults to the Library's four.",
+            "in": "query",
+            "name": "types",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated fact types to facet on. Defaults to the Library's four.",
+              "title": "Types"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit_per_type",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit Per Type",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Facets Api Facts Facets Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Facets",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {

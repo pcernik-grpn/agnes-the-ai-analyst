@@ -120,7 +120,14 @@ distribution mirror, and the api-role write conversions) map onto:
   token, which resolves to a synthetic ``Admin``-group user — see
   ``_agnes_producer_callback_env``'s own docstring for the full argument);
   every OTHER instance secret (vault key, LLM API key, DB DSN, ...) still
-  never reaches this subprocess. The producer itself
+  never reaches this subprocess. On a role-split ``extraction-worker``
+  container (``AGNES_ROLE=worker``, a SEPARATE container from ``app`` —
+  ``docker-compose.yml``), ``_agnes_producer_callback_env`` also refuses to
+  resolve the callback URL's own loopback fallback: that fallback would
+  point the producer at the WORKER's own loopback rather than the
+  instance's real callback surface, so an unconfigured ``SERVER_URL``/
+  ``AGNES_INTERNAL_URL`` there fails the job clean instead of shipping a
+  URL nothing outside that container answers. The producer itself
   is a separate project the operator supplies, adopted rather than
   ported into this repo (spec §1 "Out of scope") — see
   ``_run_corpus_extraction`` below for exactly where that boundary is.
@@ -1336,6 +1343,28 @@ def _agnes_producer_callback_env() -> dict[str, str]:
     subsystem at import time" posture — see the module docstring). Always
     forwarded; it names no secret.
 
+    Loopback guard: that chain's own fallback (``http://127.0.0.1:8000``)
+    is correct for the default ALL-IN-ONE process — the producer's parent
+    process IS the app, so its own loopback genuinely answers. It is WRONG
+    for the ``extraction-worker`` compose service (a role-split
+    ``AGNES_ROLE=worker`` container, separate from ``app``): the fallback
+    would then hand the producer THAT WORKER's own loopback, where the
+    corpus-map/scopes/facts-ingest routes it needs are not the instance's
+    real callback surface — a misconfiguration that reads like a producer
+    bug (crawl succeeds, only the final callback fails) rather than a named
+    config error. So when neither ``SERVER_URL`` nor ``AGNES_INTERNAL_URL``
+    is set AND this process is NOT all-in-one (:func:`app.roles.
+    is_all_in_one`), this function raises instead of resolving the
+    fallback — the same "refuse before running the producer" posture as
+    the ``extraction.enabled`` / no-producer-configured checks in
+    :func:`_run_corpus_extraction`. Checking the unconfigured DEFAULT
+    (both env vars empty) rather than "is the resolved URL a loopback
+    address" is deliberate: an operator who explicitly points
+    ``SERVER_URL``/``AGNES_INTERNAL_URL`` at a loopback-looking address on
+    purpose (e.g. a local network-namespace-sharing setup) made a real
+    choice this function has no basis to second-guess — only the silent,
+    unconfigured fallback is refused.
+
     ``AGNES_API_TOKEN`` — the scheduler sidecar's own shared-secret bearer
     token (:func:`app.auth.scheduler_token.get_scheduler_secret`), forwarded
     ONLY when one is actually configured (an instance with no
@@ -1359,6 +1388,16 @@ def _agnes_producer_callback_env() -> dict[str, str]:
     resolves): the token reaches the producer ONLY via the child process
     environment, never on argv, never logged.
     """
+    from app.roles import is_all_in_one
+
+    if not (os.environ.get("SERVER_URL") or os.environ.get("AGNES_INTERNAL_URL")) and not is_all_in_one():
+        raise RuntimeError(
+            "corpus-extraction: this is a role-split worker process (AGNES_ROLE != all) with neither "
+            "SERVER_URL nor AGNES_INTERNAL_URL configured — refusing to hand the producer this worker's "
+            "own loopback address instead of a reachable callback URL. Set SERVER_URL (or "
+            "AGNES_INTERNAL_URL) in the extraction-worker's environment."
+        )
+
     from app.chat.manager import agnes_server_url
 
     env: dict[str, str] = {"AGNES_API_URL": agnes_server_url()}
@@ -1432,11 +1471,13 @@ def _run_corpus_extraction(payload: dict) -> dict:
     levels.
 
     No-op guard: raises (so the job fails cleanly, not with a confusing
-    subprocess error) when ``extraction.enabled`` is false or no producer
-    command/module is configured — the same "off unless explicitly turned
-    on" posture as ``ducklake-maintenance``'s backend check, just failing
-    instead of silently returning, since a `corpus-extraction` job only
-    ever exists because something explicitly enqueued it.
+    subprocess error) when ``extraction.enabled`` is false, no producer
+    command/module is configured, or (see :func:`_agnes_producer_callback_env`)
+    this is a role-split worker with no callback URL configured — the same
+    "off unless explicitly turned on" posture as ``ducklake-maintenance``'s
+    backend check, just failing instead of silently returning, since a
+    `corpus-extraction` job only ever exists because something explicitly
+    enqueued it.
     """
     from app.instance_config import feature_enabled
 

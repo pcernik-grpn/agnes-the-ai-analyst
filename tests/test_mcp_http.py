@@ -339,6 +339,10 @@ class TestToolRegistration:
             # Triple-surface with GET /api/facts/type-map and
             # `agnes facts type-map`.
             "fact_type_map",
+            # Entity facets for the Library's filter menu (TCRD-250).
+            # Triple-surface with GET /api/facts/facets and
+            # `agnes facts facets`.
+            "fact_facets",
             # Config-surface introspection — an operator's Claude reads this
             # instance's live configurable surface (knobs + sources, registered
             # IWT, marketplaces, infra_repo_url). Triple-surface with

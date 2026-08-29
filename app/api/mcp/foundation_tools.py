@@ -119,6 +119,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # HTTP (see `_facts_caller`'s docstring below).
     "fact_search",
     "fact_type_map",
+    "fact_facets",
     "fact_neighbors",
     "fact_claims",
     "schema",
@@ -896,6 +897,43 @@ def register_foundation_tools(
         return {
             "types": [{"type": t, "count": n} for t, n in counts.items()],
             "total": sum(counts.values()),
+        }
+
+    @tool(read_only=True)
+    async def fact_facets(
+        types: list[str] | None = None,
+        limit_per_type: Annotated[int, Field(ge=1, le=200)] = 50,
+    ) -> dict:
+        """List the entity values documents can be filtered by — clients,
+        industries, service offerings, document types — with a document count
+        each. Use this to answer "which clients do we have work for?" or
+        "how much do we have on X?" without reading any document, and to pick
+        a concrete value before calling `fact_search`.
+
+        Counts cover only documents in collections YOU can read, so a facet
+        never reports files you could not open — including for a subject
+        carrying a `revealed` correction, whose unreadable evidence is
+        deliberately not tallied. Behind the `facts` feature flag; requires
+        the Postgres app-state backend. Mirrors `GET /api/facts/facets` and
+        `agnes facts facets`.
+
+        Args:
+            types: Fact types to facet on. Omit for the default four.
+            limit_per_type: Max values returned per type.
+
+        Returns ``{"facets": {type: [{"subject_id", "label", "document_count"}]}}``.
+        """
+        from app.api.facts import DEFAULT_FACET_TYPES
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        wanted = list(types) if types else list(DEFAULT_FACET_TYPES)
+        return {
+            "facets": await asyncio.to_thread(
+                facts_repo().facet_values, caller, types=wanted, limit_per_type=limit_per_type
+            )
         }
 
     @tool(read_only=True)

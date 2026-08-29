@@ -32,6 +32,9 @@ _COHORT: dict[str, tuple[str, str]] = {
     # types exist before spending a `fact_search` call. Joins its
     # search/neighbors/claims siblings on all three surfaces.
     "/api/facts/type-map": ("facts type-map", "fact_type_map"),
+    # Entity facets for the Library's filter menu (TCRD-250 piece 4). Same
+    # three surfaces as its type-map sibling above.
+    "/api/facts/facets": ("facts facets", "fact_facets"),
     # Reading one collection file's text (#1240). The endpoint's path is
     # browser-shaped — the Library's preview modal fetches it directly — but
     # its contract is now agent-facing: an agent shown a file it could not
