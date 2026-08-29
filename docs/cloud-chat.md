@@ -775,6 +775,19 @@ How it works:
 - **kai-agent provider:** needs no change — the engine keeps speaking the
   first-party Messages format and the broker rewrites those calls into the
   Vertex shape (model moves from body to URL, `anthropic_version` injected).
+- **Agent-as-API runtime:** `POST /api/v1/agents/{slug}/responses` needs no
+  separate Vertex support either — it spawns a headless chat session through
+  `app/chat/headless.py` → the same `ChatManager`/broker path above, so the
+  per-agent model allowlist and monthly token budget
+  (`app/api/broker_agent_policy.py`) already enforce against a Vertex-shaped
+  model path (`vertex_target.model`, not the request body).
+- **`anthropic-beta` filtering:** Vertex validates that header and refuses
+  the whole request on any value it does not recognize, while first-party
+  clients (the engine's SDK included) freely send first-party-only betas.
+  The broker filters the header in vertex mode to the values Vertex accepts
+  (renaming where its spelling differs), logs what it drops, and omits the
+  header when nothing survives — an unknown future beta degrades one
+  optional feature instead of 400-ing every turn.
 
 Operator prerequisites:
 
@@ -864,7 +877,7 @@ user's on-host workspace tree.
 - **Startup gates refuse chat with a clear log line on any missing prerequisite.** `ANTHROPIC_API_KEY` + `JWT_SECRET_KEY` always; `KAI_HOST_JWT_SECRET` + a well-formed `chat.kai_agent_url` under `provider: kai-agent`; a non-loopback rails URL + a reachable sidecar with the sandbox image present under `provider: docker`.
 - **A "Continue on web" click that lands on another replica loses the pending approval.** `attach()` resolves a session owned by a different gateway through a claim-then-respawn takeover, and a fresh runner has no memory of the suspended tool call — the old sandbox's gate dies with it. The user sees the turn restart rather than the card. Single-replica deployments are unaffected; on a multi-replica one, answer from a browser attached to the owning gateway (or just re-ask).
 - **Slash-command sessions get no approval nudge of their own.** `EphemeralCommandSink` posts to a `response_url` and carries no `chat_id`/`web_base` to build a deep link from, so it stays silent on `approval_request`. In practice those sessions also carry a `SlackSinkBridge`, which does post the nudge.
-- **The approval gate matches `Bash` tool calls only.** The bundled workspace hook returns `allow` for every non-Bash tool, so no policy is lost as shipped. An operator override that adds `ask` rules for `Write`/`Edit`/`WebFetch` would find them inert in cloud chat until the SDK hook matcher (`app/chat/runner.py`) is widened past `Bash` — a deliberate scope choice (gating every `Read`/`Write` through a per-call file-hook subprocess adds real latency).
+- **The approval gate matches `Bash` tool calls and MCP tool calls.** MCP tools are routed by their own `readOnlyHint` annotation, not by name: a read-only tool runs unasked, anything else — including a tool with no annotation the runner knows (a per-caller passthrough tool, or one from a workspace-configured MCP server) — takes the same approve/deny round-trip. Built-in non-Bash tools (`Read`/`Write`/`Edit`/`WebFetch`) are still not gated: the bundled workspace hook returns `allow` for every non-Bash tool, so no policy is lost as shipped, and an operator override that adds `ask` rules for them would find them inert in cloud chat until the SDK hook matchers (`app/chat/runner.py::_build_pretool_matchers`) are widened — a deliberate scope choice (gating every `Read`/`Write` through a per-call file-hook subprocess adds real latency).
 - **`audit_log.user_id` for chat rows holds the user email, not the user UUID.** Joining `audit_log` to `users` for chat events requires `audit_log.user_id = users.email` for `action LIKE 'chat.%'` and the usual `audit_log.user_id = users.id` for everything else. Documented in `app/chat/audit.py::write_audit`.
 - **`_real_agent_loop` enforces a turn-level wall-clock cap, not per-tool.** `claude-agent-sdk` 0.2.x doesn't expose per-tool dispatch hooks; the runner enforces `tool_calls_per_turn_budget` and a turn-level timeout instead of per-tool granularity. Revisit when the SDK ships per-tool hooks.
 - **No runtime failover between providers.** The provider is a restart-scoped

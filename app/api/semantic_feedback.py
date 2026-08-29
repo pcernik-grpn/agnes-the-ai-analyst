@@ -114,9 +114,9 @@ async def submit_semantic_feedback(
         created_by=user.get("email") or user.get("id"),
     )
 
-    from src.repositories import audit_repo
+    from src.audit_helpers import log_safe
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         action="semantic_feedback.submit",
         resource=row["id"],
@@ -178,9 +178,9 @@ async def resolve_semantic_feedback(
             },
         )
 
-    from src.repositories import audit_repo
+    from src.audit_helpers import log_safe
 
-    audit_repo().log(
+    log_safe(
         user_id=admin.get("id"),
         action="semantic_feedback.resolved",
         resource=feedback_id,

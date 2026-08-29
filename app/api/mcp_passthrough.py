@@ -42,10 +42,12 @@ from app.api.mcp_policy import (
     enforce_per_user_credential,
     enforce_source_url_runtime_policy,
     redact_response,
+    visible_mcp_source_ids,
 )
 from app.auth.access import _user_group_ids
 from app.auth.dependencies import get_current_user
 from connectors.mcp.client import call_tool_async, exc_summary
+from src.audit_helpers import log_safe
 from src.repositories import mcp_sources_repo, tool_registry_repo
 from src.repositories.tool_registry import PASSTHROUGH
 
@@ -101,7 +103,11 @@ def _visible_passthrough_tools(user: Any) -> List[Dict[str, Any]]:
     """List of passthrough tool rows the caller is allowed to see.
 
     Admin sees every enabled passthrough tool. Non-admin sees the
-    intersection of ``tool_grants`` with their ``user_group_members``.
+    intersection of ``tool_grants`` with their ``user_group_members``,
+    further ANDed with ``ResourceType.MCP_SOURCE`` visibility (TCRD-236) —
+    a coarser, source-wide knob that never widens the tool-level grant, only
+    narrows it once an admin explicitly restricts a specific server (see
+    ``app/api/mcp_policy.py::visible_mcp_source_ids``).
 
     An ``AgentPrincipal`` (V1d) sees its OWNER's set — with the admin
     short-circuit forced off, so an admin-owned agent never inherits the full
@@ -125,6 +131,14 @@ def _visible_passthrough_tools(user: Any) -> List[Dict[str, Any]]:
         rows = tools_repo.list_by_mode(PASSTHROUGH, enabled_only=True)
     else:
         rows = tools_repo.list_passthrough_for_groups(list(_user_group_ids(authority.user_id)))
+        # TCRD-236: the tool's MCP source must ALSO be visible under
+        # ResourceType.MCP_SOURCE — ANDed with the tool_grants intersection
+        # above, never widening it. A source with no mcp_source grant at all
+        # counts as visible (backward-compat default; see
+        # visible_mcp_source_ids), so an admin never sees this filter drop
+        # anything until they deliberately narrow a specific source.
+        visible_sources = visible_mcp_source_ids(authority.user_id, {t.get("source_id") for t in rows})
+        rows = [t for t in rows if t.get("source_id") in visible_sources]
     allowed_sources = connection_scope_ids(authority)
     if allowed_sources is None:
         return rows
@@ -191,8 +205,22 @@ async def invoke_passthrough_tool(
     try:
         enforce_passthrough_access(tool, user)
     except (GrantDenied, MutatingNotAllowed) as exc:
+        log_safe(
+            user_id=authority.user_id,
+            action="mcp.passthrough_denied",
+            resource=f"mcp_tool:{tool_id}",
+            result="denied",
+            params={"reason": type(exc).__name__},
+        )
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RateLimited as exc:
+        log_safe(
+            user_id=authority.user_id,
+            action="mcp.passthrough_denied",
+            resource=f"mcp_tool:{tool_id}",
+            result="denied",
+            params={"reason": "rate_limited"},
+        )
         raise HTTPException(
             status_code=429,
             detail=str(exc),
@@ -287,5 +315,11 @@ async def invoke_passthrough_tool(
         text=result.text,
         data=result.data,
         pii_fields=tool.get("pii_fields") if isinstance(tool.get("pii_fields"), list) else None,
+    )
+    log_safe(
+        user_id=authority.user_id,
+        action="mcp.passthrough_call",
+        resource=f"mcp_source:{tool['source_id']}",
+        params={"tool_id": tool_id, "is_error": result.is_error},
     )
     return InvokeResponse(is_error=result.is_error, text=redacted_text, data=redacted_data)

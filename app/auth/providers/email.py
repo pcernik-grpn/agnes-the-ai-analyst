@@ -18,7 +18,9 @@ from app.auth.access import is_user_admin
 from app.auth.dependencies import _get_db, is_local_dev_mode
 from app.auth.public_url import public_base_url
 from app.auth.provider_registry import require_provider
+from app.auth.providers.sso import sso_forced_for_email
 from app.auth.rate_limit import limiter as _rate_limiter
+from app.instance_config import get_allowed_domains
 
 
 from src.repositories import (
@@ -94,6 +96,48 @@ def _build_magic_link(email: str, token: str, next_path: str = "", base_url: str
     return link
 
 
+def _provision_if_allowed(email: str) -> dict | None:
+    """JIT-provision a brand-new account for a first-time magic-link
+    request — but only when the address matches the instance's sign-in
+    domain allowlist (``auth.allowed_domain`` / :func:`get_allowed_domains`),
+    the same gate the Google/Microsoft OAuth callbacks already use before
+    calling :func:`~app.auth.provisioning.ensure_user`.
+
+    Without this, a magic-link request for an address with no account
+    rendered the ordinary "Check Your Email" success page but delivered
+    nothing — the anti-enumeration response was preserved, but so was the
+    silence: the person had no way to tell whether they mistyped, aren't
+    invited, or the system is broken (#1683).
+
+    Unlike the OAuth gate, an EMPTY allowlist here means "provision
+    nobody" — OAuth only reaches this decision after an external IdP has
+    already authenticated the claim, so an open allowlist there trusts any
+    account that IdP vouches for. A magic-link request is just a string
+    typed into a form with no authentication behind it yet; an open door
+    here would let anyone self-provision an Agnes account by typing an
+    address. Instances that never opted into ``auth.allowed_domain`` keep
+    today's existing-users-only behavior.
+
+    Returns ``None`` (never raises) so the caller's single early-exit
+    "unknown address" shape is unchanged whether provisioning was skipped
+    by policy or the resolved account turned out to be deactivated.
+    """
+    domains = get_allowed_domains()
+    if not domains:
+        return None
+    domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
+    if domain not in domains:
+        return None
+
+    from app.auth.provisioning import UserDeactivatedError, ensure_user
+
+    name = email.split("@", 1)[0]
+    try:
+        return ensure_user(email, name, source="auth.email:first-signin")
+    except UserDeactivatedError:
+        return None
+
+
 def _generate_and_deliver_magic_link(
     email: str, next_path: str = "", base_url: str | None = None
 ) -> tuple[dict | None, str | None, str | None]:
@@ -103,9 +147,10 @@ def _generate_and_deliver_magic_link(
     one place.
 
     Returns ``(user, link, send_error)``. ``user`` is ``None`` when the
-    account doesn't exist — callers must still respond as if a link was
-    sent (anti-enumeration) and must not use ``link``/``send_error`` in
-    that case. ``send_error`` carries the exception string when the
+    account doesn't exist AND doesn't pass the JIT-provisioning allow-rule
+    (see :func:`_provision_if_allowed`) — callers must still respond as if a
+    link was sent (anti-enumeration) and must not use ``link``/``send_error``
+    in that case. ``send_error`` carries the exception string when the
     transport is configured but delivery failed.
     """
     # Strip here, in the shared helper, so the JSON /send-link and the web
@@ -116,7 +161,9 @@ def _generate_and_deliver_magic_link(
     repo = users_repo()
     user = repo.get_by_email_ci(email)
     if not user:
-        return None, None, None
+        user = _provision_if_allowed(email)
+        if not user:
+            return None, None, None
 
     token = secrets.token_urlsafe(32)
     repo.update(
@@ -154,6 +201,11 @@ async def send_magic_link(
     logged to stderr and returned in the response body so a developer can
     click it without an email transport.
     """
+    if sso_forced_for_email((body.email or "").strip()):
+        # Forced to the sso door: no token is minted, and the response is the
+        # same generic copy an unknown address gets (no domain oracle).
+        return {"message": "If this email is registered, you will receive a login link."}
+
     # The delivery helper does a blocking SMTP send (+ sync repo writes);
     # offload it so a slow mail server can't freeze the single event
     # loop for every other request (the Tier-1 convention in get_current_user).
@@ -221,6 +273,18 @@ async def send_magic_link_web(
     from app.auth._common import safe_next_path
     from app.web.router import _build_context, templates
 
+    # Strip early so the rendered "we sent a link to <address>" copy shows the
+    # cleaned address; the shared helper strips again, harmlessly.
+    email = (email or "").strip()
+    if sso_forced_for_email(email):
+        # Checked before the availability guard: a forced address belongs on
+        # the sso door regardless of whether this one is even configured.
+        target = safe_next_path(next, default="")
+        return RedirectResponse(
+            url="/auth/sso/login" + (f"?next={quote(target, safe='')}" if target else ""),
+            status_code=303,
+        )
+
     # Mirror the GET page's availability guard (login_email_page): without a
     # mail transport the sent-page's "We sent a sign-in link" would be a lie —
     # _generate_and_deliver_magic_link silently skips delivery. Reachable
@@ -229,9 +293,6 @@ async def send_magic_link_web(
     if not is_available():
         return RedirectResponse(url="/login?error=email_not_configured", status_code=303)
 
-    # Strip early so the rendered "we sent a link to <address>" copy shows the
-    # cleaned address; the shared helper strips again, harmlessly.
-    email = (email or "").strip()
     next_path = safe_next_path(next, default="")
 
     # Offload the blocking SMTP send off the event loop — same Tier-1
@@ -332,6 +393,11 @@ async def verify_magic_link(
     Rate limited 10/min per IP to slow brute-forcing the 32-byte
     ``reset_token`` (the same column doubles as the magic-link token).
     """
+    if sso_forced_for_email((body.email or "").strip()):
+        # A link minted before the domain joined the allowlist must not
+        # still redeem. Same generic 401 an expired link gets; the token is
+        # left unconsumed.
+        raise HTTPException(status_code=401, detail="Invalid or expired link")
     user = _consume_token(body.email, body.token)
     role_label = _role_label(user, conn)
     jwt_token = create_access_token(user["id"], user["email"])
@@ -359,6 +425,16 @@ async def verify_magic_link_get(
     Rate limited 10/min per IP for the same reason as the POST variant —
     don't let the click-through path bypass the brute-force throttle.
     """
+    if sso_forced_for_email((email or "").strip()):
+        # Emailed-link click-through for a forced address: route to the door
+        # that opens, without consuming the token or minting a session.
+        from app.auth._common import safe_next_path
+
+        target = safe_next_path(next, default="")
+        return RedirectResponse(
+            url="/auth/sso/login" + (f"?next={quote(target, safe='')}" if target else ""),
+            status_code=302,
+        )
     user = _consume_token(email, token)
     jwt_token = create_access_token(user["id"], user["email"])
     from app.auth.login_audit import audit_login_success

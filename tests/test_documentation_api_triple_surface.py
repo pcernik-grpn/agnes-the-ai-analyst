@@ -683,6 +683,18 @@ _LIBRARY_SHARING_REASON = (
     "so a second CLI/MCP vocabulary for it would duplicate the admin one."
 )
 
+_SHARE_REQUESTS_ADMIN_REASON = (
+    "Track C6 agent-sharing approval queue — web-only, same reasoning as "
+    "_LIBRARY_SHARING_REASON above: the underlying write is the exact same "
+    "`resource_grants` row the admin `agnes admin grant …` CLI already "
+    "mints, so approve/reject here only decides a QUEUED instance of that "
+    "same grant. The queue itself has no analyst-facing use — it exists "
+    "purely so an admin can review a non-admin owner's agent-share request, "
+    "a decision made from the admin moderation hub (`/admin/store`), never "
+    "scripted. No CLI/MCP vocabulary is warranted for either the list or "
+    "the approve/reject verbs."
+)
+
 _DATA_APPS_PREVIEW_GRANT_REASON = (
     "preview-grant mints the in-chat iframe cookie for the web chat surface; chat-only, no CLI/MCP analogue (spec §7)"
 )
@@ -724,6 +736,77 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/v1/agents/{slug}/delegate": (
+        "Track C7 (@delegation MVP) — sandbox-internal RPC, reachable only "
+        "by a live agent turn's own in-process delegation tool "
+        "(app/chat/runner.py's `_delegation_mcp_server`) under that turn's "
+        "own session-scoped ticket (never a durable user credential an "
+        "analyst would hold at a terminal — see app/api/agent_delegation.py's "
+        "module docstring). A CLI/MCP 'delegate now' command is a plausible "
+        "FUTURE feature, but exposing THIS exact route as a generic "
+        "analyst-facing tool would let a caller puppet another agent's turn "
+        "outside the depth-1/one-per-turn/caller-binding guarantees this "
+        "route enforces for a LIVE delegating turn"
+    ),
+    "/api/admin/upgrade-freeze": (
+        "per-instance auto-upgrade freeze (TCRD-238) — deliberately never "
+        "MCP-exposed per the 'operator security-posture' standing exemption "
+        "in CONTRIBUTING.md: an agent-invokable tool that can suspend a "
+        "fleet's upgrade path (and therefore its security patching) is a "
+        "denial-of-patching seam, not a convenience. No CLI surface either: "
+        "the consumer is the host's own cron tick reading a marker on the "
+        "state disk, and the human who sets it is the operator already in "
+        "/admin before a demo — an `agnes admin` verb would be a third way "
+        "to write one file, with no analyst workflow behind it"
+    ),
+    "/api/admin/sso/config": (
+        "external SSO login config (design 2026-08-28) — CLI-reachable via "
+        "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
+        "the PUT/DELETE reconfigure which external tenant this instance "
+        "trusts to assert identities (the 'admin credential-provisioning "
+        "writes' standing exemption in CONTRIBUTING.md), and the GET "
+        "enumerates the instance's auth posture (the 'operator "
+        "security-posture diagnostics' standing exemption)"
+    ),
+    "/api/admin/sso/client-secret": (
+        "external SSO client secret (write-only vault write) — CLI-reachable "
+        "via `agnes admin sso set-secret|clear-secret`, deliberately never "
+        "MCP-exposed per the 'admin credential-provisioning writes' standing "
+        "exemption in CONTRIBUTING.md: an agent-invokable tool that stores "
+        "the credential a third-party tenant authenticates with is a "
+        "privilege-escalation seam, not a convenience"
+    ),
+    "/api/admin/sso/test-config": (
+        "external SSO discovery probe — CLI-reachable via `agnes admin sso "
+        "test`, deliberately never MCP-exposed per the 'admin "
+        "credential-provisioning writes' standing exemption in "
+        "CONTRIBUTING.md (it validates the same credential-trust config the "
+        "writes provision, against the live tenant)"
+    ),
+    "/api/admin/sso/identities": (
+        "linked external identities list — CLI-reachable via `agnes admin "
+        "sso identities`, deliberately never MCP-exposed (own reasoning, "
+        "not a standing-exemption citation): a per-user roster of which "
+        "external principal can authenticate as whom (emails + subject "
+        "GUIDs) is admin recovery tooling, and handing it to an "
+        "agent-invokable tool would give a prompt-injected session a "
+        "one-call identity map of the instance; it is not analyst tooling"
+    ),
+    "/api/admin/sso/identities/{user_id}": (
+        "admin unlink of one external identity — CLI-reachable via `agnes "
+        "admin sso unlink`, deliberately never MCP-exposed: unlinking "
+        "re-opens first-login email attach for that user (an auth-trust "
+        "mutation), and is admin recovery tooling, not analyst tooling"
+    ),
+    "/api/me/external-identity": (
+        "the caller's own external-identity linkage — CLI-reachable via the "
+        "`agnes whoami` linked-identity line, deliberately never MCP-exposed "
+        "(own reasoning, not a standing-exemption citation: the operator-"
+        "diagnostics clause covers instance-wide posture, and this is "
+        "self-scoped): it reveals which external principal can authenticate "
+        "as the caller (`oid`/`tid`) — auth-linkage reconnaissance a "
+        "prompt-injected chat session has no analyst-tooling reason to hold"
+    ),
     # `/api/agents/{agent_id}/builder/turn` is NOT here: it sits with the other
     # four builder-turn routes further down, as `_AGENTS_BUILDER_TURN_REASON`.
     # It used to be in both places — an inline prose entry here and the
@@ -804,6 +887,8 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
+    "/api/admin/share-requests": _SHARE_REQUESTS_ADMIN_REASON,
+    "/api/admin/share-requests/{request_id}": _SHARE_REQUESTS_ADMIN_REASON,
     "/api/me/elevation": (
         "admin elevation consent gate — sets the browser-session cookie the "
         "elevation middleware reads; structurally a web-browser surface (the "
@@ -987,8 +1072,13 @@ _EXEMPT: dict[str, str] = {
     # eventual document surface is `agnes facts …`, already triple-surface
     # in _COHORT above).
     "/api/admin/sharepoint/connections/{connection_id}/tree": (
-        "live Graph folder-tree browse (sites -> drives -> root children, one level "
-        "per call) for the wizard's step-2 scope picker — admin-only, no analyst "
+        "live Graph folder-tree browse (sites -> drives -> root children -> "
+        "arbitrary-depth subfolder children, TCRD-240) for the wizard's step-2 "
+        "scope picker — admin-only, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/tree/search": (
+        "bounded BFS folder search (TCRD-240) over the same live tree — admin-only "
+        "display primitive feeding the wizard's step-2 search box, no analyst "
         "CLI/MCP analogue"
     ),
     "/api/admin/sharepoint/connections/{connection_id}/scopes": (
@@ -999,6 +1089,25 @@ _EXEMPT: dict[str, str] = {
         "producer handoff: the flat {source_scope_id: collection_id} mapping "
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
         "admin-only, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/certificate": (
+        "read-only certificate metadata (thumbprint/subject/issuer/expiry) for the "
+        "wizard's source card, derived at request time from the connection's own "
+        "stored PEM — admin-only display primitive, no analyst CLI/MCP analogue"
+    ),
+    # Extraction enqueue wiring (TCRD-226) — admin/scheduler job-trigger
+    # endpoints, same exemption class as run-corporate-memory/
+    # run-knowledge-digests/reap-idle below: an admin action and a
+    # scheduler sweep, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extract": (
+        "admin-triggered one-off run of the existing corpus-extraction job kind — "
+        "admin/scheduler maintenance op, mirrors the run-corporate-memory exemption; "
+        "no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/extraction/run-due": (
+        "scheduler-driven sweep firing corpus-extraction for every due SharePoint "
+        "connection — admin/scheduler maintenance op, mirrors the "
+        "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
     ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
@@ -1305,6 +1414,20 @@ _EXEMPT: dict[str, str] = {
     "/api/facts/ingest-runs": (
         "persisted ingest run reports (spec §7.2/§13.2) — admin-only, feeds the "
         "/admin/data-sources source card, not an analyst query surface; no CLI/MCP analogue"
+    ),
+    # F3 (audit-full-coverage plan, Task 9). Batch ingestion endpoint the
+    # `agnes push` command calls internally to upload the offline-query
+    # audit spool — mirrors the grandfathered /api/upload/sessions and
+    # /api/upload/local-md endpoints (no standalone `agnes upload …`
+    # subcommand, no MCP analogue: there is nothing for an agent or an
+    # analyst to invoke here directly, it's a delivery mechanism for
+    # events the CLI already produced as a side effect of `agnes
+    # query`/`agnes explore` running locally).
+    "/api/upload/audit-events": (
+        "client-reported CLI audit event batch upload (F3, audit-full-coverage "
+        "plan) — internal to `agnes push`, mirrors the grandfathered "
+        "/api/upload/sessions and /api/upload/local-md endpoints; no standalone "
+        "CLI subcommand or MCP analogue"
     ),
 }
 

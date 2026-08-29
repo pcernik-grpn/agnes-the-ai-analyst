@@ -14,6 +14,7 @@ from app.auth.dependencies import get_current_user, _get_db
 from app.auth.access import require_admin, is_user_admin, can_access, can_access_session
 from app.auth.session_principal import PRINCIPAL_TYPES
 
+from src.audit_helpers import identity_for_audit, log_safe
 from src.knowledge_directive_scan import DELIVERY_NOTICE, scan_item
 from src.repositories import (
     audit_repo,
@@ -1675,6 +1676,83 @@ async def get_tree(
     }
 
 
+# ---- Distribution mode (#1573) ----
+#
+# corporate_memory.distribution_mode decides which OPTIONAL (approved,
+# non-required) items reach a given caller's bundle/markdown/manifest.
+# Required (mandatory) items are unaffected by any mode — all three modes
+# agree they reach the target audience automatically (see
+# docs/corporate-memory-governance.md's "Three Governance Modes").
+#
+# ``select_distributable_items`` is the SINGLE predicate consulted by the
+# JSON bundle (below), the per-domain markdown ``agnes pull`` downloads,
+# and the manifest md5 those two must byte-for-byte agree with
+# (``app/api/sync.py::_build_memory_domains_section``). Any of the three
+# computing this independently is how they'd silently drift apart and
+# leave an analyst's sync unable to converge — so all three import and
+# call this module's functions rather than re-deriving the rule.
+
+_VALID_DISTRIBUTION_MODES = ("mandatory_only", "admin_curated", "hybrid")
+
+
+def resolve_distribution_mode() -> str:
+    """Read + validate ``corporate_memory.distribution_mode``.
+
+    Unset config (or an unset key) resolves to the documented default,
+    ``"hybrid"``. An unrecognized value is coerced to ``"hybrid"`` too, but
+    loudly — a warning, not silent inertness (the whole reason #1573 exists:
+    a knob nothing reads is worse than no knob).
+    """
+    from app.instance_config import get_corporate_memory_config
+
+    cfg = get_corporate_memory_config() or {}
+    mode = cfg.get("distribution_mode") or "hybrid"
+    if mode not in _VALID_DISTRIBUTION_MODES:
+        logger.warning(
+            "corporate_memory.distribution_mode=%r is not one of %s; falling back to 'hybrid'",
+            mode,
+            _VALID_DISTRIBUTION_MODES,
+        )
+        return "hybrid"
+    return mode
+
+
+def _caller_upvoted_item_ids(user, repo) -> set:
+    """Item ids the caller has personally upvoted (``vote > 0``).
+
+    Session/agent principals (``PRINCIPAL_TYPES``) have no personal vote
+    identity — they get an empty set, so "hybrid" mode's opt-in channel
+    narrows to nothing for them rather than guessing which items a human
+    would have picked (narrow only, never widen).
+    """
+    if isinstance(user, PRINCIPAL_TYPES):
+        return set()
+    votes = repo.get_votes_by_user(user["id"])
+    return {item_id for item_id, vote in votes.items() if vote > 0}
+
+
+def select_distributable_items(items: list, mode: str, upvoted_item_ids: set) -> list:
+    """Filter RBAC-scoped items to the ones a caller should receive under
+    ``mode``. Preserves input order.
+
+    - Required (mandatory) items always pass, in every mode.
+    - ``"mandatory_only"`` / ``"admin_curated"``: no optional channel at
+      all — approved-but-not-required items stay catalog-only ("Distribution
+      is always admin-driven" per the docs); voting in ``admin_curated`` is
+      feedback for admins, not a distribution trigger.
+    - ``"hybrid"``: approved items are opt-in, personally, via upvote
+      (``vote > 0`` in ``knowledge_votes``) — "Optional items → user
+      upvotes in hybrid mode".
+    """
+    out = []
+    for item in items:
+        if item.get("is_required"):
+            out.append(item)
+        elif mode == "hybrid" and item.get("status") == "approved" and item["id"] in upvoted_item_ids:
+            out.append(item)
+    return out
+
+
 # ---- Bundle endpoint ----
 
 
@@ -1682,16 +1760,18 @@ def _build_per_domain_markdown(slug: str, user: dict, conn: duckdb.DuckDBPyConne
     """Render a deterministic markdown bundle for a single memory domain.
 
     Used by ``agnes pull`` to write ``~/.claude/memory/<slug>/bundle.md``.
-    The bundle includes both ``is_required=TRUE`` and approved items so
-    the per-domain md5 in ``/api/sync/manifest`` (built from the same
-    item set in ``_build_memory_domains_section``) matches the md5 of
-    what the CLI just received. Items are sorted by ``id`` to mirror the
-    manifest's md5 computation byte-for-byte (Section 5.1 of the
-    unified-stack design).
+    The bundle includes ``is_required=TRUE`` items plus whichever approved
+    items ``corporate_memory.distribution_mode`` grants this caller
+    (``select_distributable_items``, #1573) so the per-domain md5 in
+    ``/api/sync/manifest`` (built from the same item set + same filter in
+    ``_build_memory_domains_section``) matches the md5 of what the CLI just
+    received. Items are sorted by ``id`` to mirror the manifest's md5
+    computation byte-for-byte (Section 5.1 of the unified-stack design).
 
     RBAC: the caller must have a grant on the domain — admins bypass
     via ``can_access``'s admin short-circuit. Anonymous or grantless
-    callers get 403.
+    callers get 403. ``distribution_mode`` narrows further on top of that
+    grant; it never widens it.
     """
     repo = memory_domains_repo()
     dom = repo.get_by_slug(slug)
@@ -1703,6 +1783,14 @@ def _build_per_domain_markdown(slug: str, user: dict, conn: duckdb.DuckDBPyConne
         allowed = can_access(user["id"], "memory_domain", dom["id"], conn)
     if not allowed:
         raise HTTPException(status_code=403, detail="no_grant")
+
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="memory.bundle_download",
+        resource=f"memory_domain:{dom['id']}",
+        params={"slug": slug},
+    )
 
     # Pull items the same way the manifest md5 helper does — id order,
     # full payload (title/status/is_required pulled via the knowledge
@@ -1726,8 +1814,11 @@ def _build_per_domain_markdown(slug: str, user: dict, conn: duckdb.DuckDBPyConne
         lines.append(dom["description"])
         lines.append("")
 
-    required = [it for it in full_items if it.get("is_required")]
-    approved = [it for it in full_items if not it.get("is_required") and it.get("status") == "approved"]
+    mode = resolve_distribution_mode()
+    upvoted_ids = _caller_upvoted_item_ids(user, knowledge) if mode == "hybrid" else set()
+    selected = select_distributable_items(full_items, mode, upvoted_ids)
+    required = [it for it in selected if it.get("is_required")]
+    approved = [it for it in selected if not it.get("is_required")]
 
     if required:
         lines.append("## Required")
@@ -1760,9 +1851,13 @@ async def get_bundle(
     """Token-budgeted bundle of knowledge items for AI agent injection.
 
     Mandatory items are always included regardless of the token budget.
-    Approved items are confidence×recency-ranked and included until the budget
-    is exhausted. Audience-filtered by the caller's group memberships (admins
-    see everything).
+    Approved items are first narrowed to whichever ones
+    ``corporate_memory.distribution_mode`` grants this caller
+    (``select_distributable_items``, #1573 — the same predicate the
+    per-domain markdown and manifest md5 use), then confidence×recency-ranked
+    and included until the budget is exhausted. Audience-filtered by the
+    caller's group memberships (admins see everything RBAC-wise; distribution
+    mode narrows on top of that for everyone, admins included).
 
     v49: when ``?domain=<slug>`` is supplied the response shape switches
     to ``text/markdown`` containing a deterministic per-domain bundle —
@@ -1816,6 +1911,14 @@ async def get_bundle(
         offset=0,
     )
 
+    # #1573: narrow the RBAC-scoped approved candidates to whichever ones
+    # distribution_mode grants this caller — the SAME predicate the
+    # per-domain markdown and manifest md5 apply, so this JSON bundle can
+    # never disagree with what `agnes pull` writes to disk.
+    distribution_mode = resolve_distribution_mode()
+    upvoted_ids = _caller_upvoted_item_ids(user, repo) if distribution_mode == "hybrid" else set()
+    approved = select_distributable_items(approved, distribution_mode, upvoted_ids)
+
     # Rank approved by confidence × recency (days since updated_at, max 365).
     # updated_at is intentional: a recently admin-edited item reflects a human
     # who just reviewed and corrected it, making it more trustworthy than an
@@ -1860,6 +1963,13 @@ async def get_bundle(
         approved_included.append(item)
         budget_remaining -= cost
 
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="memory.bundle_download",
+        resource="memory:bundle",
+        params={"mandatory_count": len(mandatory), "approved_count": len(approved_included)},
+    )
     return {
         "mandatory": mandatory,
         "approved": approved_included,

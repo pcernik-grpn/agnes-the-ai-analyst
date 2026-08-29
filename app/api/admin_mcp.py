@@ -795,6 +795,16 @@ async def create_mcp_source(
     except (duckdb.ConstraintException, sa_exc.IntegrityError):
         # Same duplicate name, same 409, either backend — see update_mcp_source.
         raise HTTPException(status_code=409, detail="name_exists")
+    # TCRD-236: a freshly registered source defaults to visible-to-everyone —
+    # "works like today" — under the new ResourceType.MCP_SOURCE gate; an
+    # admin narrows it afterwards on /admin/access. Best-effort: a failure
+    # here must not undo the source registration that already succeeded.
+    try:
+        from src.mcp_source_grants import ensure_default_mcp_source_grant
+
+        ensure_default_mcp_source_grant(source_id)
+    except Exception:
+        logger.exception("could not seed the default Everyone grant for mcp_source %s", source_id)
     _audit(
         conn,
         user["id"],

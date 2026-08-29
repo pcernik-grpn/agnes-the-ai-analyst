@@ -116,6 +116,55 @@ def validate_vertex_target(target: VertexTarget, project_id: str, region: str) -
     return None
 
 
+# ``anthropic-beta`` values the Vertex endpoint recognizes, mapped to the
+# spelling Vertex wants (identity for most; ``advanced-tool-use`` is served
+# under its earlier ``tool-search-tool`` name there). Vertex VALIDATES this
+# header and 400s the whole request on any value it does not know — the
+# first-party API just ignores unknowns — so pass-through is not an option:
+# the kai-agent engine's SDK speaks first-party and sends betas like
+# ``advisor-tool-2026-03-01`` that only api.anthropic.com understands, which
+# is exactly how the first Vertex chat turn on a real deployment died.
+# Default-deny keeps that failure mode dead for betas that do not exist yet:
+# an unknown value degrades one optional feature instead of 400-ing every
+# turn. Seeded from the community-maintained map LiteLLM ships for its own
+# Vertex passthrough (litellm/anthropic_beta_headers_config.json, vertex_ai
+# section, checked 2026-08-28) — extend here when Vertex learns a new one.
+_VERTEX_BETA_VALUES: dict[str, str] = {
+    "advanced-tool-use-2025-11-20": "tool-search-tool-2025-10-19",
+    "compact-2026-01-12": "compact-2026-01-12",
+    "computer-use-2025-01-24": "computer-use-2025-01-24",
+    "computer-use-2025-11-24": "computer-use-2025-11-24",
+    "context-1m-2025-08-07": "context-1m-2025-08-07",
+    "context-management-2025-06-27": "context-management-2025-06-27",
+    "interleaved-thinking-2025-05-14": "interleaved-thinking-2025-05-14",
+    "tool-search-tool-2025-10-19": "tool-search-tool-2025-10-19",
+    "web-search-2025-03-05": "web-search-2025-03-05",
+}
+
+
+def sanitize_beta_header(value: str) -> tuple[str, tuple[str, ...]]:
+    """Filter one ``anthropic-beta`` header value for the Vertex endpoint.
+
+    Returns ``(kept, dropped)``: ``kept`` is the comma-joined outbound value
+    (may be empty — the caller then omits the header entirely), ``dropped``
+    the original spellings that were removed, for the caller to log. Mapping
+    may alias two inbound values to one outbound spelling, so ``kept``
+    dedupes while preserving first-seen order.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        mapped = _VERTEX_BETA_VALUES.get(item)
+        if mapped is None:
+            dropped.append(item)
+        elif mapped not in kept:
+            kept.append(mapped)
+    return ", ".join(kept), tuple(dropped)
+
+
 def messages_to_vertex(raw_body: bytes, project_id: str, region: str) -> tuple[str, bytes, str]:
     """Rewrite a first-party ``POST /v1/messages`` body into Vertex shape.
 

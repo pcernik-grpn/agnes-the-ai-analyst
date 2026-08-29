@@ -160,9 +160,12 @@ async def invite(
 
     from app.chat.audit import write_audit
 
+    # F2d (audit-full-coverage plan, Task 6): renamed from the legacy
+    # "co_session_fork" action — see src.audit_events.LEGACY_ALIASES for the
+    # read-side mapping so historical rows still classify correctly.
     write_audit(
         user_email=user["email"],
-        action="co_session_fork",
+        action="chat.copresence.invite",
         details={"source": session_id, "co_session": s1.id, "invitee": invitee_email},
     )
     return {"session_id": s1.id, "is_co_session": True}
@@ -194,6 +197,13 @@ async def join_ticket(
     from app.api.chat import _issue_ticket
 
     ticket = _issue_ticket(session_id, user["email"])
+    from app.chat.audit import write_audit
+
+    write_audit(
+        user_email=user["email"],
+        action="chat.copresence.join",
+        details={"session_id": session_id},
+    )
     return {
         "ticket": ticket,
         "ws": f"/api/chat/sessions/{session_id}/join?ticket={ticket}",
@@ -232,6 +242,13 @@ async def leave(
         await _get_manager(request).leave_session(session_id, user["email"])
     else:
         raise HTTPException(403, "not a participant of this session")
+    from app.chat.audit import write_audit
+
+    write_audit(
+        user_email=user["email"],
+        action="chat.copresence.leave",
+        details={"session_id": session_id, "role": "owner" if s.user_email == user["email"] else "participant"},
+    )
     return {"ok": True}
 
 

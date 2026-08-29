@@ -369,7 +369,8 @@ def _resolve_keboola_credentials_slot(
     if not conn_token:
         # BEHAVIOUR CHANGE, stated rather than slipped in: this read was
         # ungated, so an instance whose `token_env` names something outside
-        # `AGNES_REMOTE_ATTACH_TOKEN_ENVS` (default: KBC_TOKEN,
+        # the config-secret allowlist (`AGNES_CONFIG_SECRET_ENVS` ∪
+        # `AGNES_REMOTE_ATTACH_TOKEN_ENVS`; default: KBC_TOKEN,
         # KBC_STORAGE_TOKEN, KEBOOLA_STORAGE_TOKEN, …) stops syncing on
         # upgrade until the name is added. That is the right side of the
         # trade — the ungated read let an admin point a connection at any host
@@ -1667,9 +1668,9 @@ def _token_from_env(conn: dict) -> str:
     token_env = conn.get("token_env") or ""
     if not token_env:
         return ""
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_token_env_allowed(token_env):
+    if not is_config_secret_env_allowed(token_env):
         logger.warning(
             "connection %s names token_env %r, which is not in the allowlist — not read",
             conn.get("id"),

@@ -1241,9 +1241,17 @@
     // `_collection_blocks()` (app/resource_types.py) — the single source
     // every list built from that projection reads, so this pane and any
     // future one agree without recomputing the grant scan client-side.
+    // Grants across ALL groups, derived from the same payload the checkboxes
+    // read — so the badge can never disagree with them. A resource with no
+    // row here reaches nobody, whichever group is selected. Collections keep
+    // their server-computed grant_count; marketplace plugins (TCRD-221 — an
+    // ungranted plugin looked identical to a missing one) derive purely from
+    // the grants payload.
+    const grantedAnywhere = new Set((overview.grants || []).map((g) => `${g.resource_type}:${g.resource_id}`));
+    const NOBODY_TYPES = new Set(["collection", "marketplace_plugin"]);
     const nobodyBadge = (t, i) =>
-      t.type_key === "collection" && !(i.grant_count > 0)
-        ? ` <span class="ax-chip warn" style="padding:1px 8px;font-size:11px;" title="No group can see this collection — indexed but invisible.">&#9888; nobody</span>`
+      NOBODY_TYPES.has(t.type_key) && !(i.grant_count > 0) && !grantedAnywhere.has(`${t.type_key}:${i.resource_id}`)
+        ? ` <span class="ax-chip warn" style="padding:1px 8px;font-size:11px;" title="No group can see this — indexed but invisible.">&#9888; nobody</span>`
         : "";
 
     const itemRow = (t, i) => {

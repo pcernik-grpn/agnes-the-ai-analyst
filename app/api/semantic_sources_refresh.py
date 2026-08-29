@@ -75,6 +75,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth.access import require_admin
+from src.audit_helpers import log_safe
 from src.repositories import semantic_source_repo
 from src.semantic.legacy_migration import (
     claim_source_for_import,
@@ -267,5 +268,22 @@ async def run_semantic_sources_refresh(
         result["skipped_running"],
         result["skipped_duplicate_project"],
         len(result["migrated"]),
+    )
+    # Mirrors the response shape exactly — no `skipped_legacy_owned`, because
+    # retiring the dedicated Keboola/Databricks refreshes removed the second
+    # writer this sweep used to yield to, and with it that counter.
+    log_safe(
+        user_id=user.get("id"),
+        action="run_semantic_sources_refresh",
+        resource="job:semantic-sources-refresh",
+        params={
+            "run_id": run_id,
+            "synced": result["synced"],
+            "failed": result["failed"],
+            "skipped_disabled": result["skipped_disabled"],
+            "skipped_running": result["skipped_running"],
+            "skipped_duplicate_project": result["skipped_duplicate_project"],
+            "migrated": len(result["migrated"]),
+        },
     )
     return {**result, "run_id": run_id, "started_at": started_at}

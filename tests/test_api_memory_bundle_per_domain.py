@@ -28,8 +28,12 @@ def _create_domain(slug: str, name: str = "T") -> str:
         if existing:
             return existing["id"]
         domain_id = repo.create(
-            name=name, slug=slug, description="Test domain",
-            icon=None, color=None, created_by="test",
+            name=name,
+            slug=slug,
+            description="Test domain",
+            icon=None,
+            color=None,
+            created_by="test",
         )
     finally:
         conn.close()
@@ -55,22 +59,16 @@ def _create_item_in_domain(
             status=status,
             is_required=is_required,
         )
-        MemoryDomainsRepository(conn).add_item(
-            domain_id, item_id, added_by="test"
-        )
+        MemoryDomainsRepository(conn).add_item(domain_id, item_id, added_by="test")
     finally:
         conn.close()
     return item_id
 
 
-def _grant_user_group_access_to_domain(
-    domain_id: str, group_name: str = "Everyone", *, user_id: str = "analyst1"
-):
+def _grant_user_group_access_to_domain(domain_id: str, group_name: str = "Everyone", *, user_id: str = "analyst1"):
     conn = get_system_db()
     try:
-        gid = conn.execute(
-            "SELECT id FROM user_groups WHERE name = ?", [group_name]
-        ).fetchone()[0]
+        gid = conn.execute("SELECT id FROM user_groups WHERE name = ?", [group_name]).fetchone()[0]
         ResourceGrantsRepository(conn).create(
             group_id=gid,
             resource_type="memory_domain",
@@ -81,8 +79,18 @@ def _grant_user_group_access_to_domain(
         # Everyone backfill, so they aren't members of any group yet. Add
         # them explicitly so the grant resolves through the user.
         UserGroupMembersRepository(conn).add_member(
-            user_id, gid, source="test",
+            user_id,
+            gid,
+            source="test",
         )
+    finally:
+        conn.close()
+
+
+def _upvote(item_id: str, user_id: str) -> None:
+    conn = get_system_db()
+    try:
+        KnowledgeRepository(conn).vote(item_id, user_id, 1)
     finally:
         conn.close()
 
@@ -92,7 +100,12 @@ class TestPerDomainBundle:
         c = seeded_app["client"]
         dom_id = _create_domain("phase7-admin", "Admin Domain")
         _create_item_in_domain(dom_id, "T1", "Body 1", is_required=True)
-        _create_item_in_domain(dom_id, "T2", "Body 2")
+        t2_id = _create_item_in_domain(dom_id, "T2", "Body 2")
+        # #1573: default distribution_mode (hybrid) gates non-required
+        # approved items behind a personal upvote — vote as the caller so
+        # this test still exercises both the "Required" and "Approved"
+        # sections rendering, not just required-only.
+        _upvote(t2_id, "admin1")
 
         resp = c.get(
             "/api/memory/bundle?domain=phase7-admin",
@@ -110,8 +123,10 @@ class TestPerDomainBundle:
     def test_user_with_grant_can_fetch(self, seeded_app):
         c = seeded_app["client"]
         dom_id = _create_domain("phase7-granted", "Granted Domain")
-        _create_item_in_domain(dom_id, "Granted Item", "Body")
+        item_id = _create_item_in_domain(dom_id, "Granted Item", "Body")
         _grant_user_group_access_to_domain(dom_id, "Everyone")
+        # #1573: hybrid mode's optional channel is personal opt-in via vote.
+        _upvote(item_id, "analyst1")
 
         resp = c.get(
             "/api/memory/bundle?domain=phase7-granted",

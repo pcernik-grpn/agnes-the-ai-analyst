@@ -61,7 +61,8 @@ def test_factory_roundtrip_reads_seeded_session(seeded_app_both):
 
 
 # ---------------------------------------------------------------------------
-# GET /admin/chat/{chat_id}/tail-ticket
+# POST /admin/chat/{chat_id}/tail-ticket (POST since the broker admin-read
+# hardening: minting a ticket is a state change — see app/api/admin_chat.py)
 # Reads via app.state.chat_repo.get_session(); mints a ticket if the session
 # exists (200), else 404. The read discriminator for the cluster.
 # Must enter the lifespan so app.state.chat_repo is wired (see module docstring).
@@ -71,7 +72,7 @@ def test_tail_ticket_finds_seeded_session(seeded_app_both):
     sess = _seed_session()
     client = seeded_app_both["client"]
     with client as c:
-        r = c.get(
+        r = c.post(
             f"/admin/chat/{sess.id}/tail-ticket",
             headers=_auth(seeded_app_both),
         )
@@ -88,7 +89,7 @@ def test_tail_ticket_missing_session_is_404(seeded_app_both):
     """Negative control: an unseeded id 404s on both backends."""
     client = seeded_app_both["client"]
     with client as c:
-        r = c.get(
+        r = c.post(
             "/admin/chat/chat_does_not_exist/tail-ticket",
             headers=_auth(seeded_app_both),
         )

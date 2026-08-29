@@ -828,6 +828,7 @@ class TestUploadSmoke:
         "POST /api/upload/sessions",
         "POST /api/upload/artifacts",
         "POST /api/upload/local-md",
+        "POST /api/upload/audit-events",
     }
 
     def test_upload_session(self, seeded_app_both):
@@ -857,6 +858,30 @@ class TestUploadSmoke:
             headers=_admin_headers(seeded_app_both),
         )
         assert r.status_code in (200, 201)
+
+    def test_upload_audit_events(self, seeded_app_both):
+        """Client-reported CLI audit events land identically on both backends.
+
+        Asserts the accept/reject split too — the server-side action allowlist
+        is the security boundary here, and a backend that silently accepted an
+        uncataloged action would still return 200.
+        """
+        r = seeded_app_both["client"].post(
+            "/api/upload/audit-events",
+            json={
+                "events": [
+                    {
+                        "action": "query.local_offline",
+                        "params": {"tables": ["orders"], "sql_hash": "deadbeef01234567", "rows": 1},
+                        "observed_at": "2026-08-29T12:00:00Z",
+                    },
+                    {"action": "not.a.client.action", "params": {}, "observed_at": "2026-08-29T12:00:01Z"},
+                ]
+            },
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200
+        assert r.json() == {"accepted": 1, "rejected": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -1968,6 +1993,28 @@ class TestPrivacyPageSmoke:
         assert "Where your data goes" in r.text
 
 
+class TestUpgradeFreezeSmoke:
+    """Behavioral depth (marker file, bounds, audit, host-script contract) is
+    in tests/test_upgrade_freeze.py; this is the parameter-free cross-backend
+    smoke check the route-coverage guard requires."""
+
+    COVERED_ROUTES = {
+        "GET /api/admin/upgrade-freeze",
+        "POST /api/admin/upgrade-freeze",
+        "DELETE /api/admin/upgrade-freeze",
+    }
+
+    def test_freeze_lifecycle(self, seeded_app_both):
+        c = seeded_app_both["client"]
+        h = {"Authorization": f"Bearer {seeded_app_both['admin_token']}"}
+        assert c.get("/api/admin/upgrade-freeze", headers=h).json()["active"] is False
+        r = c.post("/api/admin/upgrade-freeze", headers=h, json={"hours": 1})
+        assert r.status_code == 201 and r.json()["active"] is True
+        r = c.delete("/api/admin/upgrade-freeze", headers=h)
+        assert r.status_code == 204
+        assert c.get("/api/admin/upgrade-freeze", headers=h).json()["active"] is False
+
+
 # ---------------------------------------------------------------------------
 # Route-coverage guard
 # ---------------------------------------------------------------------------
@@ -2007,6 +2054,26 @@ KNOWN_UNTESTED = {
     "POST /api/semantic-feedback",
     "GET /api/admin/semantic-feedback",
     "POST /api/admin/semantic-feedback/{feedback_id}/resolve",
+    # External SSO login (design 2026-08-28) — PG-only feature covered
+    # depth-first in its own harnesses rather than duplicated here:
+    # tests/db_pg/test_admin_sso_api.py (admin gate, validation matrix,
+    # write-only secret + vault 409, last-login-door guard, identities
+    # pagination, /api/me/external-identity, and the DuckDB typed-501
+    # answer this both-backends sweep would otherwise trip over),
+    # tests/db_pg/test_sso_provider.py (login/callback flow with a faked
+    # authlib client, binding algorithm, test-mode security), and the
+    # parity sweeps' _PG_ONLY_ROUTE_EXEMPTIONS fail-clean assertions.
+    "GET /api/admin/sso/config",
+    "PUT /api/admin/sso/config",
+    "PUT /api/admin/sso/client-secret",
+    "DELETE /api/admin/sso/client-secret",
+    "DELETE /api/admin/sso/config",
+    "POST /api/admin/sso/test-config",
+    "GET /api/admin/sso/identities",
+    "DELETE /api/admin/sso/identities/{user_id}",
+    "GET /api/me/external-identity",
+    "GET /auth/sso/login",
+    "GET /auth/sso/callback",
     # Agent-builder page (paper-theme redesign) — self-contained web page,
     # covered in tests/test_ui_layout_theme.py (chrome/list/auth/actions)
     # rather than duplicated in this PG smoke harness. The builder API it
@@ -2376,7 +2443,7 @@ KNOWN_UNTESTED = {
     "GET /admin/chat",
     "GET /admin/chat/readiness",
     "GET /admin/chat/{chat_id}/debug",
-    "GET /admin/chat/{chat_id}/tail-ticket",
+    "POST /admin/chat/{chat_id}/tail-ticket",
     "GET /admin/corporate-memory",
     "GET /admin/database",
     "GET /admin/grants",
@@ -2445,6 +2512,14 @@ KNOWN_UNTESTED = {
     # tests/test_web_nav_cowork.py.
     "GET /how-it-works",
     "GET /install",
+    # Logout (#1675): GET renders the CSRF confirm form, POST validates the
+    # double-submit token, revokes server-side and clears the cookie. Both
+    # verbs are covered behaviourally in tests/test_web_logout.py, and the
+    # revocation half is contract-tested on BOTH backends in
+    # tests/db_pg/test_session_revocation.py — richer than this harness's
+    # status-code sweep can express.
+    "GET /auth/logout",
+    "POST /auth/logout",
     "GET /login",
     "GET /login/email",
     "GET /login/password",
@@ -2911,6 +2986,13 @@ KNOWN_UNTESTED = {
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
+    # Agent-sharing approval queue (Track C6, PG-only). Covered end to end
+    # (queue/approve/reject, C2.3 runtime honoring an approved grant, admin
+    # RBAC, moderation-hub UI wiring, DuckDB typed-501 fail-clean) by
+    # tests/db_pg/test_agent_share_approval_pg.py + the repo-level tests in
+    # tests/db_pg/test_share_requests_pg.py; not duplicated here.
+    "GET /api/admin/share-requests",
+    "PATCH /api/admin/share-requests/{request_id}",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
     # Data-package builder page — the same HTML surface, hosting the drawer
@@ -2970,6 +3052,21 @@ KNOWN_UNTESTED = {
     # duplicated in this PG smoke sweep.
     "POST /api/v1/agents/{slug}/responses",
     "GET /api/v1/jobs/{job_id}",
+    # @delegation between shared agents (Track C7 MVP) — sandbox-internal
+    # RPC, reachable only through the secret broker under a live turn's own
+    # session-scoped ticket (see app/api/agent_delegation.py's module
+    # docstring) — never parameter-free from an ordinary credential, same
+    # shape as the broker routes above. Behaviour (depth-1 guard, one-per-
+    # turn guard, RBAC denial, budget-exhausted degrade, output visible,
+    # the HTTP seam driven by a real AgentPrincipal, and the fail-closed
+    # guard against an unresolved caller) covered by
+    # tests/test_agent_delegation.py; not duplicated in this PG smoke
+    # sweep. The mandatory caller-bound-row laundering guard specifically
+    # ALSO runs against a real Postgres backend — see
+    # tests/db_pg/test_agent_delegation_pg.py — rather than being exempted
+    # here, since it is the one assertion this exemption cannot silently
+    # cover for both backends.
+    "POST /api/v1/agents/{slug}/delegate",
     # Agent-as-API multi-turn sessions (V1b Task 4) — SSE turn streaming,
     # cancel, history, delete. Auth chain (owner/agent-PAT 404 matrix),
     # SSE framing (RUN_STARTED once/turn, id: lines), turn-in-flight 409,
@@ -3038,10 +3135,32 @@ KNOWN_UNTESTED = {
     # warning, and the corpus-map producer handoff are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    # Bounded BFS folder search (TCRD-240) over the same live tree — never
+    # Graph's own `/search`. Same "no new schema surface" reasoning as the
+    # sibling `/tree` route above; auth matrix, query-length/mode/glob
+    # validation, subtree scoping, and cap-clamping are all covered by
+    # tests/test_admin_sharepoint.py::TestTreeSearch.
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree/search",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
+    # Certificate metadata (thumbprint/subject/issuer/expiry) — derived at
+    # request time from the connection's own stored PEM, no new schema
+    # surface. Auth matrix + typed-absence paths covered by
+    # tests/test_admin_sharepoint.py::TestCertificateMetadata; not
+    # duplicated in this PG smoke sweep.
+    "GET /api/admin/sharepoint/connections/{connection_id}/certificate",
+    # Extraction enqueue wiring (TCRD-226) — enqueues into the EXISTING
+    # `jobs` table (both backends) via the existing `jobs_repo()`/
+    # `source_connections_repo()` factories; no new schema surface to
+    # verify per-backend. Auth matrix, 404-before-work, the feature-usable
+    # gate, duplicate-run dedup, exact payload shape, and the sweep's
+    # due-check/no-op paths are all covered by
+    # tests/test_admin_sharepoint.py::TestExtractionTrigger /
+    # TestExtractionRunDue; not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extract",
+    "POST /api/admin/sharepoint/extraction/run-due",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

@@ -526,6 +526,15 @@ CREATE TABLE _remote_attach (
 );
 ```
 
+`token_env` must name a variable on the connector-ATTACH token allowlist
+(`src/orchestrator_security.py`) — data-source attach tokens only, extendable
+via `AGNES_REMOTE_ATTACH_TOKEN_ENVS` (the override REPLACES the defaults).
+Config-resolution secrets (names a settings resolver reads from a connection's
+config, extendable via `AGNES_CONFIG_SECRET_ENVS`) are deliberately *not*
+valid here: the orchestrator refuses them before any ATTACH, so a connector
+can never direct one to its own `url`. Pin the destination hosts credentials
+may be sent to with `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`.
+
 ### Identifier validation
 
 Import shared validators from `src/identifier_validation.py`:

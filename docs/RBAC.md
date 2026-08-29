@@ -55,7 +55,7 @@ Grants and agent scopes both answer "can this group/agent reach the table at all
 | Table | Purpose |
 |---|---|
 | `user_groups` | Named groups. Two rows seeded as `is_system=TRUE`: **Admin** (god mode) and **Everyone** (auto-membership at creation for every new user by default; Workspace-mirrored instead when `AGNES_GROUP_EVERYONE_EMAIL` is set — see [Group membership sources](#group-membership-sources)). |
-| `user_group_members` | `(user_id, group_id, source)`. `source ∈ {admin, google_sync, system_seed}` so each writer only manipulates its own rows — Google sync's nightly DELETE+INSERT does not clobber admin-added members. **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
+| `user_group_members` | `(user_id, group_id, source)`. `source ∈ {admin, google_sync, microsoft_sync, system_seed}` so each writer only manipulates its own rows — a sync's DELETE+INSERT never clobbers admin-added members or another provider's synced rows. `microsoft_sync` is config-gated and off by default — see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default). **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
 | `resource_grants` | `(group_id, resource_type, resource_id)`. The grant table the resolver hits when Admin short-circuit doesn't apply. **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
 
 `resource_type` is a string from the `app.resource_types.ResourceType` `StrEnum`. `resource_id` is a path string whose format is owned by the registering module — for `marketplace_plugin` it's `<marketplace_slug>/<plugin_name>`.
@@ -69,6 +69,18 @@ resource's *owner* through the Library's Share dialog — same rows, narrower
 writer (the owner may only share what they own; admins pass for everything,
 including linked data apps whose synthetic `system` owner matches no real
 user).
+
+**Agent sharing needs admin approval, on Postgres (Track C6).** A user may
+build an agent freely, but sharing one is the one owner-writable grant that
+isn't instant: when a NON-ADMIN actor shares an `agent` with a group it
+hasn't already reached, the write lands in a `share_requests` queue instead
+of `resource_grants` directly, and an admin decides via
+`GET /api/admin/share-requests` + `PATCH .../{id}` (approve writes the exact
+same `ensure_grant` an admin-curated `/admin/access` write would). An admin
+actor and any un-share both stay instant. The queue table is Postgres-only
+(A3 ratchet); on a DuckDB-backed instance the approval step is inactive and
+a non-admin's agent share falls back to the pre-C6 instant grant rather than
+failing — see `docs/api-reference.md` → `/api/admin/share-requests`.
 
 Governance note for `data_app`, decided deliberately (Devin Review on #1321):
 sharing a hosted app shares its **rendered output**. The app executes under
@@ -217,13 +229,14 @@ No DB migration, no startup hook, no second wiring step in `access-overview` —
 
 ## Group membership sources
 
-Members are added to groups by three sources, distinguished by the `source` column:
+Members are added to groups by four sources, distinguished by the `source` column:
 
 - **`google_sync`** — written by the OAuth callback on every login. The previous Google-sync set is wholesale replaced (DELETE + INSERT) so a removed Workspace membership disappears immediately.
-- **`admin`** — written by admin actions in the UI (`/admin/groups/{id}` → Members), CLI (`agnes admin group add-member …`), or REST (`POST /api/admin/groups/{id}/members`). Survives Google sync. Admin can only delete admin-source rows.
-- **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: Google OAuth first sign-in, `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs — unless `AGNES_GROUP_EVERYONE_EMAIL` maps Everyone to a Workspace group instead, in which case Everyone comes exclusively from `google_sync`). The Everyone grant fires once, at creation time, and is never re-asserted afterward — an admin who later removes a user from Everyone stays removed on their next login/boot.
+- **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/memberOf` instead of the Workspace Admin SDK. Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
+- **`admin`** — written by admin actions in the UI (`/admin/groups/{id}` → Members), CLI (`agnes admin group add-member …`), or REST (`POST /api/admin/groups/{id}/members`). Survives either sync. Admin can only delete admin-source rows.
+- **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs — unless `AGNES_GROUP_EVERYONE_EMAIL` maps Everyone to a Workspace group instead, in which case Everyone comes exclusively from `google_sync`). The Everyone grant fires once, at creation time, and is never re-asserted afterward — an admin who later removes a user from Everyone stays removed on their next login/boot.
 
-Removing a user from a group via the admin path (UI/CLI/REST) only deletes admin-source rows. To revoke a Google-synced membership, the operator must change the upstream Workspace group instead — Agnes will pick up the change on the user's next login.
+Removing a user from a group via the admin path (UI/CLI/REST) only deletes admin-source rows. To revoke a synced membership, the operator must change the upstream directory group instead (Workspace or Entra ID) — Agnes will pick up the change on the user's next login.
 
 ---
 
