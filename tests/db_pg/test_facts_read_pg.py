@@ -1966,3 +1966,89 @@ def test_neighbors_applies_a_statement_timeout(pg_env, repo):
 
     result = repo.neighbors(_dict_user("ivan"), fact_id)
     assert result["nodes"][0]["id"] == fact_id
+
+
+# ---------------------------------------------------------------------------
+# Type map — the Library's node-type counts must obey the same gate as
+# search(), or the aggregate becomes the S1/S2 existence oracle in another
+# shape: a reader counting subjects they are not allowed to read.
+# ---------------------------------------------------------------------------
+
+
+def test_type_map_omits_a_type_the_caller_cannot_see(pg_env, repo):
+    """A type whose every subject sits behind an ungranted collection is
+    ABSENT from the map — not reported with a count of 0, which would
+    itself confirm the type exists and that something occupies it."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:secret-project")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Secret Project kicked off in March.",
+        attrs={"status": "active"},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.count_visible_facts_by_type(_dict_user("alice")) == {}
+
+
+def test_type_map_counts_what_the_caller_can_see(pg_env, repo):
+    """The uploader reaches their own collection, so the type appears with
+    a real count — proving the empty result above is the grant talking and
+    not the query simply never returning anything."""
+    _seed_full_fixture()
+    for slug in ("alpha", "beta"):
+        fact_id = repo.create_fact(type="engagement")
+        repo.add_alias(fact_id=fact_id, type="engagement", natural_key=f"engagement:{slug}")
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"{slug} kicked off in March.",
+            attrs={"status": "active"},
+        )
+    client_id = repo.create_fact(type="client")
+    repo.add_alias(fact_id=client_id, type="client", natural_key="client:parts-authority")
+    repo.add_claim(
+        fact_id=client_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Parts Authority signed.",
+        attrs={},
+    )
+
+    assert repo.count_visible_facts_by_type(_dict_user("uploader1")) == {"client": 1, "engagement": 2}
+
+
+def test_type_map_agrees_with_search_for_the_same_caller(pg_env, repo):
+    """The map's number for a type is exactly what search(type=...) lets
+    the same caller reach — the contract the Knowledge tab relies on when
+    it makes each type a way in."""
+    _seed_full_fixture()
+    for slug in ("alpha", "beta"):
+        fact_id = repo.create_fact(type="engagement")
+        repo.add_alias(fact_id=fact_id, type="engagement", natural_key=f"engagement:{slug}")
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"{slug} kicked off in March.",
+            attrs={},
+        )
+
+    caller = _dict_user("uploader1")
+    mapped = repo.count_visible_facts_by_type(caller)
+    searched = repo.search(caller, type="engagement")
+    assert mapped["engagement"] == len(searched["subjects"])

@@ -1,0 +1,86 @@
+/* Fact-graph type map (TCRD-250) — the head of the Library's Knowledge tab.
+   Owned entirely by macros/_type_map.html so the tab can adopt it with one
+   import; every colour comes from a --ds-* token, never a raw hex, per the
+   design-system contract. */
+
+.tmap {
+  margin: 0 0 1.5rem;
+}
+
+.tmap-head {
+  margin-bottom: 0.75rem;
+}
+
+.tmap-title {
+  font-family: var(--ds-font);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--ds-text-primary);
+  margin: 0 0 0.25rem;
+}
+
+.tmap-sub,
+.tmap-empty {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--ds-text-muted);
+  margin: 0;
+  max-width: 60ch;
+}
+
+.tmap-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.tmap-item {
+  margin: 0;
+}
+
+.tmap-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.45rem 0.75rem;
+  border: 1px solid var(--ds-border-light);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface);
+  text-decoration: none;
+  transition: border-color 0.15s var(--ds-ease-standard), background-color 0.15s var(--ds-ease-standard);
+}
+
+a.tmap-chip:hover,
+a.tmap-chip:focus-visible {
+  border-color: var(--ds-primary);
+  background: var(--ds-surface-dim);
+}
+
+a.tmap-chip:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+
+.tmap-chip--static {
+  cursor: default;
+}
+
+.tmap-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  color: var(--ds-text-primary);
+}
+
+.tmap-type {
+  font-size: 0.8125rem;
+  color: var(--ds-text-secondary);
+  text-transform: lowercase;
+}
+
+.tmap-empty {
+  padding: 0.75rem 0;
+}
