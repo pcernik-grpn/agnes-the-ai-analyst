@@ -172,6 +172,44 @@ def test_error_badges_from_the_last_run_report_are_categorized(tmp_path, monkeyp
     assert fs["cost_estimate"]["amount_usd"] > 0
 
 
+def test_meaningfulness_floor_rejection_joins_the_rejected_quotes_badge(tmp_path, monkeypatch, pg_engine):
+    """`quote_not_meaningful` (spec §8.4) is a DIFFERENT `claims_rejected`
+    reason from `verbatim_gate_failed`, but the SAME gate (§8) doing its
+    job — both must land in the `rejected_quotes` badge, never
+    `protocol_errors` (unresolved doc id, malformed edge, …)."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from src.repositories import facts_ingest_runs_repo
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=[CORPUS_A],
+        caller="scheduler@system.local",
+        documents_seen=1,
+        claims_written=0,
+        claims_rejected=[
+            {"row": 0, "reason": "quote_not_meaningful", "doc_id": "d5"},
+            {"row": 1, "reason": "unresolved_doc_id", "doc_id": "d6"},
+        ],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+    )
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    last_run = fs["last_run"]
+    rejected_reasons = {r["reason"] for r in last_run["rejected_quotes"]}
+    assert rejected_reasons == {"quote_not_meaningful"}
+    protocol_reasons = {r["reason"] for r in last_run["protocol_errors"]}
+    assert "quote_not_meaningful" not in protocol_reasons
+    assert "unresolved_doc_id" in protocol_reasons
+
+
 def test_source_urls_rejected_badge_is_populated_from_the_last_run(tmp_path, monkeypatch, pg_engine):
     """O7 follow-up: a dropped `source_url` surfaces as its own badge
     category on the source card, itemized doc_id + reason — never folded

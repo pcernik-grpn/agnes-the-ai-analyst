@@ -1763,6 +1763,18 @@ Corrections management
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
 
+`GET /api/facts/facets` answers "what can I filter documents by" —
+`{"facets": {type: [{"subject_id", "label", "document_count"}]}}`, defaulting
+to `client`, `industry`, `service_offering` and `doc_type`. The vocabulary
+comes from the extraction pass rather than hand-entered tags, so it is
+maintained by ingestion. Same gate as `search()`; `document_count` tallies
+only documents in collections the caller can READ, and deliberately does not
+tally a `revealed` subject's unreadable evidence — a revealed correction
+reveals the subject, not the geography of its evidence (§4), and counting
+those files would report how many sit in a collection the caller cannot
+open. Triple-surface with `agnes facts facets` and the `fact_facets` MCP
+tool.
+
 `GET /api/facts/type-map` answers "what is in the graph at all" —
 `{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
 through the SAME visibility gate as `search()` with no `type` (shared via
@@ -1786,6 +1798,7 @@ not an analyst query (no CLI/MCP analogue).
 
 - /api/facts/search
 - /api/facts/type-map
+- /api/facts/facets
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
@@ -2065,6 +2078,21 @@ metered server-side.
   `require_resource_access`: ungranted analyst on a known collection → 403;
   unknown corpus or a not-yet-built artifact → 404. REST-only (no CLI/MCP
   analogue — mirrors `/api/data/{table_id}/download`).
+- /api/knowledge/digests — the maintained digests THIS caller can read:
+  `{digests: [{id, slug, title, status, status_reason, generated_at}]}`,
+  sorted by slug, never the markdown itself. The enumeration a WEB surface
+  needs (TCRD-250): the content endpoint below has been readable since K4 and
+  `agnes pull` writes every granted digest to `.claude/rules/ka_<slug>.md`,
+  but nothing could list them, so a page had no way to show a reader which
+  digests exist without already knowing an id. Filtered by the SAME
+  fail-closed `_caller_can_read_digest` predicate the manifest builder uses
+  (`app/api/sync.py::_digest_entries`), so the web list and the pulled files
+  can never disagree about entitlement. A digest that has never generated is
+  omitted, matching the manifest — listing it would promise a page that
+  404s. Staleness travels per row, so a stale digest is visibly stale rather
+  than silently so. REST-only by design (see the triple-surface exemption):
+  the CLI and a chat agent already RECEIVE digests as pulled files, so an
+  enumeration call is a browser's need, not theirs.
 - /api/knowledge/digests/{digest_id}/content — serves one maintained
   digest's markdown (K4, #799): `{id, slug, title, output_md, status,
   status_reason, generated_at}`. Listed in the sync manifest's

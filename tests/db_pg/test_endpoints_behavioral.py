@@ -1395,9 +1395,10 @@ class TestFactsReadSurfaceSmoke:
         "POST /api/facts/search",
         "POST /api/facts/neighbors",
         "GET /api/facts/{subject_id}/claims",
+        "GET /api/facts/facets",
     }
 
-    def test_flag_off_404s_all_three_routes(self, seeded_app_both):
+    def test_flag_off_404s_every_read_route(self, seeded_app_both):
         """facts.enabled defaults off — the whole router disappears, on
         either backend."""
         s = seeded_app_both
@@ -1405,6 +1406,8 @@ class TestFactsReadSurfaceSmoke:
         assert client.post("/api/facts/search", json={}, headers=headers).status_code == 404
         assert client.post("/api/facts/neighbors", json={"subject_id": "f_x"}, headers=headers).status_code == 404
         assert client.get("/api/facts/f_x/claims", headers=headers).status_code == 404
+        assert client.get("/api/facts/type-map", headers=headers).status_code == 404
+        assert client.get("/api/facts/facets", headers=headers).status_code == 404
 
     def test_neighbors_requires_subject_id_on_both_backends(self, seeded_app_both, monkeypatch):
         """422 identically on both backends — Pydantic validation runs
@@ -1472,6 +1475,14 @@ class TestFactsReadSurfaceSmoke:
         claims = r.json()["claims"]
         assert len(claims) == 1
         assert claims[0]["quote"] == "The engagement is underway."
+
+        # Facets read the same graph from the other direction: the client the
+        # engagement is filed under, counted by DOCUMENTS rather than subjects.
+        r = client.get("/api/facts/facets?types=engagement", headers=headers)
+        assert r.status_code == 200, r.text
+        vals = r.json()["facets"]["engagement"]
+        assert [v["subject_id"] for v in vals] == [fact_id]
+        assert vals[0]["document_count"] == 1
 
     def test_search_and_claims_round_trip_for_a_granted_non_admin_caller_on_pg(
         self, state_backend, seeded_app_both, monkeypatch
