@@ -521,7 +521,7 @@ class FactsPgRepository:
         return bool(status["revealed"] or status["has_claim_visibility"])
 
     @staticmethod
-    def _projection_cte_sql(*, with_aliases: bool, is_admin: bool = True) -> str:
+    def _projection_cte_sql(*, with_aliases: bool, is_admin: bool) -> str:
         """The per-key latest-document_date-wins attrs projection (spec
         §12), factored out of ``search()`` so ``neighbors()`` can serve
         the SAME projected shape on its nodes/edges without duplicating
