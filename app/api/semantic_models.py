@@ -124,6 +124,37 @@ class SemanticSourceUpdate(BaseModel):
 _VALID_KINDS = ("git", "upload", "connection")
 
 
+def _assert_no_provenance_override(config: dict | None) -> None:
+    """Refuse an admin-supplied ``config.provenance``.
+
+    ``provenance`` names the ``(source, source_ref)`` pair a source's models,
+    metrics, glossary terms and column descriptions are written AND PRUNED
+    under (see ``src/semantic/transports.py``). It exists for exactly one
+    writer — the auto-migration of the retired per-connector semantic
+    refreshes, which writes its rows through the repository, never through
+    this API — so accepting it here would let an admin-authored source claim
+    a migrated connection's prune scope and have the next sweep delete that
+    connection's rows.
+
+    Refused outright rather than validated: one enforcement story, and no
+    second place the field can enter the system. (``resolve_provenance``
+    still validates every stored override on read — this is the outer wall,
+    not the only one.)
+    """
+    if config and "provenance" in config:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "provenance_not_settable",
+                "hint": (
+                    "config.provenance is managed by Agnes (it is how a source migrated off a retired "
+                    "connector refresh keeps owning the rows it already wrote) and cannot be set through "
+                    "this API. Remove it and register the source normally."
+                ),
+            },
+        )
+
+
 def _assert_known_adapter(name: str) -> None:
     """Refuse an adapter name nothing is registered under.
 
@@ -889,6 +920,7 @@ async def create_semantic_source(body: SemanticSourceCreate, user: dict = Depend
             detail=f"unknown kind {body.kind!r} (expected one of {', '.join(_VALID_KINDS)})",
         )
     _assert_known_adapter(body.adapter)
+    _assert_no_provenance_override(body.config)
     from uuid import uuid4
 
     source_id = f"ss_{uuid4().hex[:12]}"
@@ -920,6 +952,7 @@ async def update_semantic_source(source_id: str, body: SemanticSourceUpdate, use
         return repo.get(source_id)
     if fields.get("adapter") is not None:
         _assert_known_adapter(fields["adapter"])
+    _assert_no_provenance_override(fields.get("config"))
     return repo.update(source_id, **fields)
 
 
@@ -931,8 +964,25 @@ async def delete_semantic_source(source_id: str, user: dict = Depends(require_ad
 
 @router.post("/api/admin/semantic-sources/{source_id}/sync")
 async def sync_semantic_source(source_id: str, user: dict = Depends(require_admin)):
-    if semantic_source_repo().get(source_id) is None:
+    row = semantic_source_repo().get(source_id)
+    if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
+    # `enabled=False` excludes a source from BOTH the scheduled sweep
+    # (app/api/semantic_sources_refresh.py) and this manual escape hatch —
+    # an admin who disabled a source expects nothing to touch it until they
+    # flip it back on.
+    if row.get("enabled") is False:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "source_disabled",
+                "hint": (
+                    f"Semantic source '{source_id}' is disabled and excluded from sync. "
+                    f"Re-enable it first: PUT /api/admin/semantic-sources/{source_id} "
+                    '{"enabled": true}'
+                ),
+            },
+        )
 
     from dataclasses import asdict
 
