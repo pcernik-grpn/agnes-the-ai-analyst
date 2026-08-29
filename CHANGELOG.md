@@ -216,6 +216,116 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+- **A four-tester pass over `/admin/access`, and the repairs it found.** The
+  page could grant a data package, a memory domain or a marketplace plugin and
+  never un-grant it — those three kinds rendered the Available/Required pair
+  *instead of* a Revoke, in both lenses, so an admin had to reach for the API
+  to undo a click. ADMIN CONTROL is now one shape for every row —
+  **`Available | Required | Revoke`** from a single `controlCell()` — with the
+  tier pair shown but disabled on kinds that have no tier, which also answers
+  the "why does this row have a choice and that one not" question the old
+  asymmetry raised and never addressed. Revoke now confirms first, naming the
+  resource, the group and how many people lose it. Alongside it: a group with
+  **zero grants had no way to receive its first one** (the empty state rendered
+  copy pointing at a checkbox list that no longer existed, and a dead "show
+  everything" link, but no Add control); **rename and delete were unreachable**
+  because the kebab's CSS was keyed on a `.ax-grow` wrapper the `<details>`
+  rewrite stopped emitting, leaving every kebab `opacity: 0` and positioned
+  against `<body>` off the top-left corner of the page; and the **person lens
+  told an admin they could not use things they can** — red "Cannot use" chips
+  rendered directly beneath the chip saying they reach everything regardless of
+  grants, on the one page whose job is answering exactly that.
+- **One vocabulary for the grant tier, and a guard that can actually see it.**
+  `tests/test_access_vocabulary.py` has retired *Optional* / *Automatic* since
+  the access-page definition landed, but it matched the label as a rendered
+  element — and the person lens wrote its tier as chip prose ("· Automatic — in
+  their stack"), so the retired pair survived there and one Required package
+  was described two ways within two inches of itself. A second test in
+  `tests/test_web_admin_access.py` had meanwhile been asserting the OPPOSITE —
+  that both retired words must be present — and both passed only because each
+  was reading a different half of the page. Reconciled onto the Library's
+  words, with the guard extended to the prose form. The tier toast is also
+  keyed on kind now and quotes the sentence the person will actually read,
+  instead of firing data-package language ("permanent, and always downloaded")
+  at memory domains and plugins.
+- **The access page's numbers agree with each other.** Five separate
+  "which denominator?" mistakes: the group row's `N granted` came from a
+  server-computed count that no mutation updated (three numbers for one fact on
+  one screen until a reload); a bundle's reach SUMMED its groups' member counts,
+  so anything granted to `Everyone` plus one other group reported more people
+  than the instance has; the kind filter's menu badges counted grants while the
+  lists count bundles and groups; the By-bundle tab badge counted distinct grant
+  rows of every type; and the `N of M` counter ignored the search box entirely.
+  Each now derives from the same source as the thing it describes. The overview
+  payload gained `member_ids` per group (excluding `Everyone`, whose roster is
+  every account) and an `account_total` so distinct reach is exact rather than
+  estimated.
+- **The URL carries the view.** An access audit's natural output is a link, but
+  the open group, the search term and the kind filter were all invisible to the
+  URL — a reload dropped you back to nothing, and because every navigation used
+  `replaceState`, Back walked out of the page instead of to the previous lens.
+  All three now round-trip, tab/group/filter changes push real history entries
+  (typing stays on replace), and a `popstate` handler restores the view rather
+  than just the address bar. `?user=<id>` on its own now implies the person lens
+  instead of being silently discarded.
+- **Search matches people, and rows say why they matched.** The box has
+  promised "groups, bundles or people" all along and never matched a person;
+  typing a colleague's address returned zero results on an instance where they
+  were in two groups. It now matches members (against the roster the person lens
+  already loads, fetched on first search), the placeholder describes the lens
+  you are actually on, and a row surfaced by something other than its own name
+  carries a `matched …` chip — searching "Delivery" and getting a group called
+  Admin looked like a bug until you knew it held an agent named Delivery Health.
+- **A grantable thing with no title shows its slug, not its id.** An agent saved
+  without a name rendered as `agt_797047742dec48998ce45792b9110ce1` — as a row
+  title, and as 12 of the 13 options in one group's picker, which made the
+  picker unusable for the kind that needs it most. The slug was already in the
+  payload and nothing read it.
+- **A group looks like a group, on every page that names one.** A group was
+  drawn four different ways depending on where you met it — a lettered square
+  on /admin/access, an origin-coloured pill on /admin/users and a profile, an
+  origin pill trailing the name on the MCP tool grants, and, on most surfaces,
+  nothing at all. That last one is the failure: in the access page's bundle
+  view the audience row carried no marker, so `Delivery` and `Board Materials`
+  sat one line apart in identical type with nothing saying which was the group
+  and which was the thing it reached; the same held in every share dialog,
+  every builder's scope list, and the person lens's prose. There is now one
+  mark, in the one shared glyph set (`kind_glyph()` / `AgnesKindGlyph`), in two
+  densities — a tile for the leading marker of a row, the bare glyph for inside
+  a chip, a link or a sentence — reached as `ds.group_mark()` from a template
+  and `AgnesKindGlyph.groupTile()` / `.groupGlyph()` from JS. It is
+  deliberately COLOURLESS: `--ds-kind-*` names types of content and a group is
+  not content, it is who the content reaches, so it is marked in neutral ink,
+  which is also what keeps it legible beside a coloured kind in a mixed row.
+  Applied to /admin/access (all three lenses, the sticky group header and the
+  share picker), /admin/users, a user's detail page (membership chips and the
+  "granted via" cell), /me/profile, the package detail's "shared with" rows,
+  the shared share dialog and package drawer, the linked-apps and MCP builders,
+  the MCP tool grants, /admin/tables, /admin/corporate-memory,
+  /admin/data-sources, the moderation hub and the skill-contribution result.
+  Two hand-rolled share/network glyphs (the data-package card's, the Library's
+  visibility chip) are retired onto the same shape — every state they cover is
+  an audience of groups.
+- **A group row in the By-bundle view no longer wears the bundle's colour.**
+  The row carries `data-kind` because the bundle overhead is what the kind
+  belongs to, and the leading kind accent was reading that attribute — so a
+  collection's coral ran down the side of "Delivery", claiming a colour that
+  means *collection* for a row that is an audience. The accent stays in the
+  group view, where those rows really are things of that kind.
+- **A group's People and Access counts sit beside their labels, and the body
+  stops restating them.** "2 members" was ~900px from the word *People*, far
+  enough that the two read as separate facts — and the provenance strip
+  directly below then opened with "**2** added by an admin", which is the same
+  number a second time. The count moves next to the title block; the strip
+  keeps its words (where the members came from is what decides whether they
+  can be removed here) and drops the number whenever a single source covers
+  everyone, since one bucket holding all of them is not a breakdown.
+- **People and Access, inside an opened group, now look like they open.** Each
+  was a bold label at the far left with a count and a 35%-opacity chevron
+  ~900px away at the far right and nothing in between, which reads as a heading
+  with a number after it. The disclosure marker moves to the left — the same
+  `›` the group row above it carries, one indent in, rotating the same way —
+  the redundant right-hand chevron goes, and the strip answers to the pointer.
 - **The access list has no frame.** Its white, bordered, rounded surface was
   drawn when the page sat on the grey app background and a table needed its
   own ground to be a table. The admin shell is a white sheet now, so that
@@ -1269,6 +1379,94 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 
 ### Fixed
+- **Leaving the person lens no longer loses the person.** A row in "what
+  their Library shows" linked to the ANALYST page for that resource with
+  `?from=admin&user=` glued on — a param those pages ignore — so clicking a
+  package in *malcolm's* preview opened *your* Library view of it ("You have
+  access", "Add to stack") and its back link dropped him; the memory route had
+  no way back at all, a one-way exit out of an audit. Both now go to the admin
+  page for the resource carrying `?from=simulate&user=`, the contract the
+  working "Share it →" flow already used, so each lands with "← Back to
+  preview: <name>" and returns with "Re-check <name> →". That banner had been
+  written inline in the data-package route, which is precisely why only one
+  destination closed the loop; it is `_simulate_preview_ctx()` now and
+  `/admin/corporate-memory` renders it too.
+- **`role="tablist"` on the access page now behaves like one.** The tabs named
+  no panel, the panels claimed no role, and Left/Right did nothing — assistive
+  tech was told a tab set existed and given no way to operate it. Added
+  `aria-controls`/`role="tabpanel"`, a roving tabindex, and arrow/Home/End
+  navigation. The count badges also read as bare numbers ("By group 5" with
+  nothing saying what 5 counts) and now carry their own accessible text. The
+  new-group drawer's validation error is a `role="alert"` with
+  `aria-invalid`/`aria-describedby` on the field, and it clears as soon as you
+  type a name instead of sitting there until the next submit.
+- **The access page stopped scrolling sideways on a phone, and stopped hiding
+  the column that explains itself.** Two late rules were quietly undoing two
+  earlier media queries: `flex-wrap: nowrap` (there to stop a long description
+  making one row taller than its neighbours) also won inside the 720px block,
+  so a 375px viewport carried 445px of content; and "What they will see" was
+  `display: none` below 900px, removing the half of the row a reader is least
+  able to reconstruct. The row wraps on phones only, and that column moves
+  under the name with a label rather than vanishing.
+- **Keyboard focus survived nothing on `/admin/access`.** Every mutation
+  re-renders its section wholesale, so the control you were standing on stopped
+  existing and the browser dropped focus to `<body>` — invisible with a mouse,
+  and with a keyboard it threw you to the top of the document after every
+  single tier toggle. Focus is now carried across the repaint by the row's own
+  identity (`data-type` + `data-rid`, the same pair the click handlers resolve
+  grants by), falling to the section's Add control when the row itself is gone.
+  Separately, the People search advertises `role="combobox"` with
+  `aria-autocomplete="list"` and never told assistive tech which option was
+  current — the cursor lived in a CSS class alone, every row stayed
+  `aria-selected="false"`, and the input never pointed at one. Enter also now
+  commits a single unambiguous result without requiring an ArrowDown first.
+- **Copy that described a UI which no longer exists.** "Share with another
+  group" hard-coded the hint "every group in the list below already has it" on
+  every granted bundle — a button telling you not to press it, which then
+  opened a picker with four groups in it. The add/share drawers promised
+  "Added as Available — each person chooses whether to keep a local copy" for
+  agents, collections and chat, which have no tier and no local copy. The
+  create-group toast said the new group was "selected on the left" of a
+  single-column list. The granted-to-nobody roll-up said "1 memory domains".
+  The two invite buttons in the People search carried `btn--primary`, a class
+  this app does not define, and had been rendering as bare UA grey where a
+  primary action belongs — beside a comment claiming that bug was already
+  fixed. The By-person tab computed a count and then discarded it
+  (`? null : null`), leaving a badge that read as forever loading. And
+  `?group=<deleted id>` fell through in silence, which looks like the link
+  worked and the group is empty.
+- **/admin/access's search only repainted half the page.** The input handler
+  called `renderGroups()` and nothing else, so the list narrowed and
+  auto-opened its first match while the work pane beside it kept whatever it
+  last drew — an OPEN group sitting above "Open a group to see what it can
+  use." — and `syncQuery()`, which decides whether the query also narrows an
+  open group's rows, never ran at all. In the bundle lens the same handler
+  rendered the GROUP list into the bundle tab. Typing now repaints the whole
+  view, re-fetching the roster only when the query actually moved the
+  selection.
+- **The "N groups" count ignored the search box.** It kept its own copy of the
+  narrowing rules and that copy knew only about the kind chip, so a query that
+  cut the list to one group still read "5 groups". The count is now reported by
+  whoever rendered the list, so it cannot disagree with what is on screen.
+- **The By-bundle tab badge counted something else than the tab lists** —
+  distinct grant rows of every type (9) over a list of every leading bundle
+  including the ungranted ones (23). Both read from one place now, and the
+  three copies of the "kinds an admin hands out as a unit" set are one.
+- **/admin/access could hang on "Loading groups…" on a cold load.** The page's
+  date formatter reached straight through `window.AgnesTime`, which
+  `datetime.js` publishes on a `defer`d script — but `boot()` starts its fetch
+  during parse, so on a cold load the overview endpoint could answer first and
+  the resulting `TypeError` aborted `boot()` with nothing rendered and no
+  visible error. It now falls back to the raw timestamp, the way
+  `/admin/users/{id}` already did.
+- **The "Share with another group" action sat a few px below the middle of its
+  own tile.** Its padding was trimmed at the bottom back when it was a flat
+  ghost row butting up against the column header; once it became a bordered
+  tile with its own margin the trim just decentred it.
+- **A group's name was interpolated unescaped into `innerHTML`** in the
+  per-table RBAC grant rows (/admin/tables) and the memory-domain grant rows
+  (/admin/corporate-memory) — escaped now, like every sibling row on those
+  pages.
 - **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote that is a substring of the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The run report now distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
 - **Removed a committed `data` symlink pointing into a contributor's home
 - **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home

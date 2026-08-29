@@ -107,7 +107,10 @@
       '        <div class="gdw-found" id="gdw-found" role="listbox" hidden></div>' +
       '      </div>' +
       '      <p class="gdw-locked" data-gdw="locked" hidden></p>' +
-      '      <div class="ds-drawer__err" data-gdw="err1" hidden></div>' +
+      // `role="alert"` because this is the only feedback the form gives and
+      // it appears without focus moving to it — without the role, a screen
+      // reader user presses Create and is told nothing at all.
+      '      <div class="ds-drawer__err" data-gdw="err1" id="gdw-err1" role="alert" hidden></div>' +
       '    </section>' +
       '  </div>' +
       '  <div class="ds-drawer__foot">' +
@@ -144,6 +147,11 @@
     });
     els.name.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); els.next.click(); }
+    });
+    // Typing a name is the fix for "a name is required", so the complaint
+    // goes as soon as there is one.
+    els.name.addEventListener('input', function () {
+      if (els.name.value.trim() && !els.err1.hidden) clearNameError();
     });
     els.next.addEventListener('click', onNext);
     bindFind();
@@ -361,13 +369,25 @@
 
   /* ── Step 1: the group itself ─────────────────────────────────────── */
 
+  /* The validation message used to sit there while you typed a perfectly
+     good name, and only cleared on the NEXT submit — so the form told you it
+     was wrong the whole time you were fixing it. */
+  function clearNameError() {
+    els.err1.hidden = true;
+    els.name.removeAttribute('aria-invalid');
+    els.name.removeAttribute('aria-describedby');
+  }
+
   function saveNameThen(done) {
     var name = els.name.value.trim();
+    clearNameError();
     var description = els.desc.value.trim();
     els.err1.hidden = true;
     if (!name) {
       els.err1.textContent = 'A name is required — it is what every grant is written against.';
       els.err1.hidden = false;
+      els.name.setAttribute('aria-invalid', 'true');
+      els.name.setAttribute('aria-describedby', 'gdw-err1');
       els.name.focus();
       return;
     }

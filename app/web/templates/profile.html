@@ -113,7 +113,7 @@
      /admin/users/{id}, so a group wears one colour across the product. The
      name stays on one line (a wrapped pill reads as two chips) and ellipsises
      instead; the full value is on the chip's `title` either way. */
-  .group-chip { font-size: 12.5px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 3px 11px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .group-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 3px 11px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .group-chip.is-admin       { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .group-chip.is-everyone    { background: var(--ds-surface-sunken); color: var(--ds-text-secondary); }
   .group-chip.is-google_sync { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
@@ -284,7 +284,7 @@
             {% set chip_class = "is-" ~ (m.origin or "custom") %}
           {% endif %}
           <li class="pf-row" role="listitem">
-            <span class="group-chip {{ chip_class }}" title="{{ m.name }}">{{ m.display_name or m.name }}</span>
+            <span class="group-chip {{ chip_class }}" title="{{ m.name }}">{{ ds.group_mark('inline') }}{{ m.display_name or m.name }}</span>
             <span class="pf-row-body">
               {# Plain English, not the raw `source` slug the row used to
                  print in monospace. #}

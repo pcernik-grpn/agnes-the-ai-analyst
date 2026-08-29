@@ -21,6 +21,8 @@ What matters, and so what is pinned here:
 
 from __future__ import annotations
 
+import re
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -81,14 +83,27 @@ class TestAccessPage:
         assert r.status_code == 404
 
     def test_tiers_are_worded_as_what_they_do(self, seeded_app):
-        """`available`/`required` is the API's vocabulary; an admin reads
-        Optional/Automatic. Both must be present — the plain-language label
-        for the reader, the system word for the control's title so the two
-        vocabularies stay connected."""
+        """The label an admin reads and the word the API stores, together.
+
+        This test used to require the OPPOSITE labels — it asserted that
+        "Optional" and "Automatic" were present, while
+        `tests/test_access_vocabulary.py` asserted they were absent. Both
+        passed for a while only because one matched the rendered element and
+        the other matched a chip's prose, so each was seeing a different half
+        of the page. That is exactly the split those labels caused for
+        readers too: one Required package described two ways on one screen.
+
+        The Library's words win, per
+        `docs/superpowers/specs/2026-08-28-access-page-definition.md` — the
+        person on the other end reads "Required by your admin", so the admin
+        setting it reads Required. The wire words are unchanged; renaming
+        those would be a data migration.
+        """
         c = seeded_app["client"]
         body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
-        assert "Optional" in body and "Automatic" in body
+        assert ">Available<" in body and ">Required<" in body
         assert '"available"' in body and '"required"' in body
+        assert ">Optional<" not in body and ">Automatic<" not in body
 
     def test_simulate_uses_the_effective_access_endpoint(self, seeded_app):
         """The reason chain is derived from the explicit grant graph the API
@@ -206,13 +221,23 @@ class TestAccessIsInTheNav:
         c = seeded_app["client"]
         auth = _auth(seeded_app["admin_token"])
 
+        # Asserted on the CLASS of each pane, not on the whole opening tag.
+        # This used to match the exact literal `<div class="ax-pane is-on"
+        # data-axpane="edit">`, so adding the `role="tabpanel"` / `id` /
+        # `aria-labelledby` the tablist needs broke a test about server-side
+        # lens selection — which is not what those attributes changed.
+        def pane_classes(html: str, pane: str) -> str:
+            m = re.search(rf'<div class="([^"]*)"[^>]*data-axpane="{pane}"', html)
+            assert m, f"no {pane} pane in the response"
+            return m.group(1)
+
         bare = c.get("/admin/access", headers=auth).text
-        assert '<div class="ax-pane is-on" data-axpane="edit">' in bare
-        assert '<div class="ax-pane" data-axpane="sim">' in bare
+        assert "is-on" in pane_classes(bare, "edit")
+        assert "is-on" not in pane_classes(bare, "sim")
 
         sim = c.get("/admin/access?lens=simulate", headers=auth).text
-        assert '<div class="ax-pane" data-axpane="edit">' in sim
-        assert '<div class="ax-pane is-on" data-axpane="sim">' in sim
+        assert "is-on" not in pane_classes(sim, "edit")
+        assert "is-on" in pane_classes(sim, "sim")
 
 
 class TestMembersInContext:

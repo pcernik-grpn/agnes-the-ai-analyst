@@ -284,3 +284,32 @@
 .ds-kindtag[data-kind="plugin"]  { --ds-kindtag: var(--ds-kind-plugin); }
 .ds-kindtag[data-kind="skill"]   { --ds-kindtag: var(--ds-kind-skill); }
 .ds-kindtag[data-kind="agent"]   { --ds-kindtag: var(--ds-kind-agent); }
+
+/* A GROUP is the one mark in this set that is deliberately COLOURLESS.
+   `--ds-kind-*` is a palette of content types, and a group is not content —
+   it is who the content reaches. Left unmapped, `--ds-kindtag` resolves to
+   the neutral fallbacks declared above, which is exactly right: in a mixed
+   row ("this package, reaching these groups") the coloured half is the thing
+   and the neutral half is the audience. Written out rather than left to the
+   fallback so the absence reads as a decision, and so nobody closes the
+   apparent gap by inventing a --ds-kind-group. */
+.ds-kindtag[data-kind="group"] {
+    --ds-kindtag: var(--ds-text-secondary);
+    background: var(--ds-surface-sunken);
+    border-color: var(--ds-border);
+}
+
+/* The group mark's second density: the bare shape, for inside something that
+   already has a shell — an origin chip, a "via <b>Delivery</b>", a link. The
+   26px tile above is for the leading marker of a ROW; a tile inside a pill is
+   a box in a box. Sized and nudged to sit on the text's own line. */
+.ds-groupglyph {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    width: 12.5px;
+    height: 12.5px;
+    vertical-align: -1.5px;
+    opacity: .75;
+}
+.ds-groupglyph svg { width: 100%; height: 100%; }

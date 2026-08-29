@@ -105,6 +105,19 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
     def test_retired_chip_labels_are_gone(self, retired):
         assert retired not in self._source()
 
+    @pytest.mark.parametrize("retired", ["· Optional —", "· Automatic —"])
+    def test_the_retired_words_are_gone_from_prose_too(self, retired):
+        """The element-shaped sweep above missed these for months.
+
+        The person lens wrote its tier as a chip SUFFIX — "· Automatic — in
+        their stack" — which is prose, not a label, so the `>Automatic<`
+        check never saw it. The result was one Required package described
+        two ways on one screen: "Automatic" in the chip and "Required by
+        your admin" in the Library panel directly beneath it. Same
+        vocabulary, matched in the shape it actually appears in.
+        """
+        assert retired not in self._source()
+
     def test_the_tier_control_has_exactly_one_definition(self):
         """Three surfaces render this control — the group rows, the bundle
         rows, and Advanced. Each keeping its own copy of the labels is
@@ -116,10 +129,31 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         assert src.count('data-tier="required"') == 1
         assert src.count("const tierControl") == 1
         # The definition is `const tierControl = (…) =>`, so it does not
-        # match `tierControl(` — this counts call sites only. Two now: the
-        # group's own rows and the bundle view's. Advanced was the third and
-        # was removed with the browsing tree.
-        assert src.count("tierControl(") == 2
+        # match `tierControl(` — this counts CALL SITES only. There is now
+        # exactly ONE: neither lens renders the tier pair directly any more.
+        # Both go through `controlCell`, the whole ADMIN CONTROL cell — tier
+        # pair plus Revoke — so a grant of any kind can be undone from the
+        # page that made it. Holding this at one is what stops a lens quietly
+        # growing its own copy of the labels again.
+        assert src.count("tierControl(") == 1
+        assert src.count("const controlCell") == 1
+        assert src.count("controlCell(") == 2      # the group lens and the bundle lens
+
+    def test_a_grant_of_any_kind_can_be_revoked(self):
+        """A control that grants and cannot revoke is a one-way door.
+
+        The tiered kinds — data package, memory domain, marketplace plugin —
+        used to render the Available/Required pair INSTEAD of a Revoke, so
+        those three could be granted from this page and never un-granted, in
+        either lens. An admin had to reach for the API to undo a click. The
+        cell carries both now, for every kind, which is also why there is a
+        single `controlCell` for the guard above to count.
+        """
+        src = self._source()
+        start = src.index("const controlCell")
+        cell = src[start:start + 1800]
+        assert "data-revoke" in cell, "the shared control cell must carry Revoke"
+        assert "tierControl(" in cell, "…and the tier pair, so both live in one place"
 
     def test_simulate_speaks_the_person_s_words(self):
         src = self._source()

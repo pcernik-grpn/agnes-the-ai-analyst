@@ -1054,7 +1054,9 @@
         return '<div class="pdw-pick" data-group-id="' + esc(gid) + '">'
           + '<input type="checkbox" aria-label="Share with ' + esc(gname) + '">'
           + '<span class="pdw-pick__txt">'
-          + '<span class="pdw-pick__name">' + esc(gname) + '</span>'
+          + '<span class="pdw-pick__name">'
+          + (window.AgnesKindGlyph ? window.AgnesKindGlyph.groupGlyph() + ' ' : '')
+          + esc(gname) + '</span>'
           + (sub ? '<span class="pdw-pick__sub">' + esc(sub) + '</span>' : '')
           + '</span>'
           // The tier's system word (what the API and the audit log call it)

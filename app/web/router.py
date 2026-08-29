@@ -5467,6 +5467,44 @@ async def studio(
     )
 
 
+def _simulate_preview_ctx(request: Request) -> dict | None:
+    """Who the admin came here to fix, when they arrived from the person lens.
+
+    The Access page's person lens links out with `?from=simulate&user=<id>`,
+    and a page that understands it can show "← Back to preview: Jane" and a
+    "Re-check Jane →" return link — a closed loop, instead of dropping the
+    person the moment you leave the audit.
+
+    This lived inline in the data-package route, so the package page was the
+    only destination that closed the loop; the memory link was a one-way exit
+    with no way back at all. Resolved server-side to a name plus their groups
+    so the banner can say "Jane — Everyone, product-team" rather than echoing
+    a uuid. An unknown or garbage id resolves to None and the page renders
+    normally — the banner is chrome, never a 500.
+    """
+    if request.query_params.get("from") != "simulate":
+        return None
+    uid = request.query_params.get("user") or ""
+    if not uid:
+        return None
+    try:
+        person = users_repo().get_by_id(uid)
+    except Exception:  # noqa: BLE001
+        person = None
+    if not person:
+        return None
+    try:
+        groups = list(user_group_members_repo().list_group_names_for_user(uid))
+    except Exception:  # noqa: BLE001
+        groups = []
+    return {
+        "user_id": uid,
+        "name": person.get("name") or person.get("email") or uid,
+        "groups": [g for g in groups if g],
+        "back_href": f"/admin/access?lens=simulate&user={uid}",
+    }
+
+
 @router.get("/admin/corporate-memory", response_class=HTMLResponse)
 async def corporate_memory_admin(
     request: Request,
@@ -5558,6 +5596,7 @@ async def corporate_memory_admin(
         contradictions=contradictions,
         audit_entries=[],
         knowledge_json_exists=knowledge_json_exists,
+        preview_ctx=_simulate_preview_ctx(request),
     )
     return templates.TemplateResponse(request, "admin_corporate_memory.html", ctx)
 
@@ -7027,30 +7066,7 @@ async def admin_package_detail(
         logger.warning("package detail: could not compute delivery state: %s", e)
 
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
-    # The Simulate lens's "Share it →" lands here carrying WHO the admin came
-    # to fix. Resolved server-side to a name + their groups so the banner can
-    # say "Jane — Everyone, product-team" instead of echoing a uuid, and the
-    # back link returns to the preview with the same person still selected.
-    # Unknown/garbage ids resolve to None and the page renders normally.
-    preview_ctx = None
-    if request.query_params.get("from") == "simulate":
-        _puid = request.query_params.get("user") or ""
-        if _puid:
-            try:
-                _pu = users_repo().get_by_id(_puid)
-            except Exception:  # noqa: BLE001 — the banner is chrome, never a 500
-                _pu = None
-            if _pu:
-                try:
-                    _pgroups = list(user_group_members_repo().list_group_names_for_user(_puid))
-                except Exception:  # noqa: BLE001
-                    _pgroups = []
-                preview_ctx = {
-                    "user_id": _puid,
-                    "name": _pu.get("name") or _pu.get("email") or _puid,
-                    "groups": [g for g in _pgroups if g],
-                    "back_href": f"/admin/access?lens=simulate&user={_puid}",
-                }
+    preview_ctx = _simulate_preview_ctx(request)
 
     ctx = _build_context(
         request,

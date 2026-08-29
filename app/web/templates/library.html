@@ -341,7 +341,11 @@
                   {% if c.visibility == 'private' %}
                   <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.9"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.9"/></svg>
                   {% else %}
-                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="18" cy="6" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="6" cy="12" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="18" cy="18" r="2.6" stroke="currentColor" stroke-width="1.9"/><path d="M8.4 10.8l7.2-3.6M8.4 13.2l7.2 3.6" stroke="currentColor" stroke-width="1.9"/></svg>
+                  {# Not a share/network glyph of its own: every state this arm
+                     covers — "Everyone", "Specific groups" — is an audience of
+                     GROUPS, so it wears the same shape a group wears wherever it
+                     is named (js/kind_glyph.js `group`). #}
+                  {{ kind_glyph('group') }}
                   {% endif %}
                 {% endset %}
                 {% set _chevron %}<svg class="lib-vis__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>{% endset %}
@@ -2964,12 +2968,10 @@
     '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
     '<rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.9"/>' +
     '<path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.9"/></svg>';
-  const PEOPLE_ICON_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-    '<circle cx="18" cy="6" r="2.6" stroke="currentColor" stroke-width="1.9"/>' +
-    '<circle cx="6" cy="12" r="2.6" stroke="currentColor" stroke-width="1.9"/>' +
-    '<circle cx="18" cy="18" r="2.6" stroke="currentColor" stroke-width="1.9"/>' +
-    '<path d="M8.4 10.8l7.2-3.6M8.4 13.2l7.2 3.6" stroke="currentColor" stroke-width="1.9"/></svg>';
+  //: The audience half of that pair is the shared group shape, not a drawing
+  //: of its own — the Jinja twin above renders `kind_glyph('group')`, and the
+  //: two views of one row must not disagree about what a group looks like.
+  const PEOPLE_ICON_SVG = AgnesKindGlyph.get('group');
   const TAG_ICON_SVG =
     '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
     '<path d="M4 10.5V5a1 1 0 0 1 1-1h5.5a1 1 0 0 1 .7.3l8 8a1 1 0 0 1 0 1.4l-5.5 5.5a1 1 0 0 1-1.4 0l-8-8a1 1 0 0 1-.3-.7Z" ' +

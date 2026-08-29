@@ -78,7 +78,7 @@
       <tr data-share-request-id="{{ sr.id }}">
         <td>{{ sr.resource_name }}</td>
         <td class="mod-owner">{{ sr.requested_by_email }}</td>
-        <td>{{ sr.requested_group_name }}</td>
+        <td>{{ ds.group_mark('inline') }}{{ sr.requested_group_name }}</td>
         <td class="mod-owner">{{ sr.created_at }}</td>
         <td class="num">
           <div class="mod-share-actions">

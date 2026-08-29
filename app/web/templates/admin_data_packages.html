@@ -137,7 +137,10 @@
   {% if shares %}
   <span class="fbar-card__access fbar-card__access--fixed"
         title="{{ shares | map(attribute='group_name') | join(', ') }}">
-    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="18" cy="6" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="6" cy="12" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="18" cy="18" r="2.6" stroke="currentColor" stroke-width="1.9"/><path d="M8.4 10.8l7.2-3.6M8.4 13.2l7.2 3.6" stroke="currentColor" stroke-width="1.9"/></svg>
+    {# The shared group mark, not a share/network glyph of its own: what
+       this slot names IS a group, and it is the same shape a group wears
+       on every other page. #}
+    {{ ds.group_mark('inline') }}
     {# One group is named; several are counted. A list of five group names in a
        26px slot ellipsises after the first anyway, and the count is the fact
        the reader is scanning for — the names ride the title attribute. #}

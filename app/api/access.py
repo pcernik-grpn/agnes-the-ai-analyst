@@ -163,6 +163,8 @@ async def access_overview(
     the left, resources tree on the right with per-item checkboxes whose
     state derives from ``grants``.
     """
+    from src.db import SYSTEM_EVERYONE_GROUP
+
     groups_rows = user_groups_repo().list_all()
     members_repo = user_group_members_repo()
     grants_repo = resource_grants_repo()
@@ -190,6 +192,31 @@ async def access_overview(
                 "created_at": str(g["created_at"]) if g.get("created_at") else None,
                 "member_count": members_repo.count_members(g["id"]),
                 "grant_count": grants_repo.count_for_group(g["id"]),
+                # Who is actually in the group, so the UI can report the reach
+                # of a bundle held by SEVERAL groups as a distinct union
+                # rather than a sum. Summing double-counts anyone in two of
+                # them, and produced reach figures larger than the number of
+                # accounts on the instance.
+                #
+                # `Everyone` is deliberately excluded: it holds every account
+                # by construction, so its roster is the largest list on the
+                # instance and shipping it here would dominate a payload that
+                # is refetched on every mutation. The client reads
+                # `is_everyone` + the `account_total` below instead, which is
+                # the same answer at O(1).
+                "is_everyone": g.get("name") == SYSTEM_EVERYONE_GROUP,
+                "member_ids": (
+                    []
+                    if g.get("name") == SYSTEM_EVERYONE_GROUP
+                    else [
+                        # `list_members_for_group` joins users and returns the
+                        # account under `id` (u.id), not `user_id` — identically
+                        # on both backends.
+                        m["id"]
+                        for m in members_repo.list_members_for_group(g["id"])
+                        if m.get("id")
+                    ]
+                ),
             }
         )
 
@@ -200,9 +227,9 @@ async def access_overview(
             "resource_type": r["resource_type"],
             "resource_id": r["resource_id"],
             # The tier belongs in the snapshot: the editor on /admin/access
-            # renders an Optional/Automatic pair per grant off this payload,
-            # and without the field every grant read back as Optional — a
-            # grant saved as Automatic (here, or through the group drawer,
+            # renders an Available/Required pair per grant off this payload,
+            # and without the field every grant read back as Available — a
+            # grant saved as Required (here, or through the group drawer,
             # or by `agnes admin grant`) showed the wrong half lit until the
             # page was reloaded from a different endpoint. Same default the
             # single-grant response uses.
@@ -264,6 +291,10 @@ async def access_overview(
         "grants": grants,
         "resources": resources,
         "families": families,
+        # Everyone's reach, at O(1) — see the `member_ids` note above. Also
+        # the ceiling for any reach figure the UI prints: no set of groups
+        # can reach more people than there are accounts.
+        "account_total": users_repo().count_all(),
     }
 
 
@@ -474,12 +505,52 @@ async def update_group(
     if payload.description is not None:
         updates["description"] = payload.description
     if updates:
+        # Taken-name check BEFORE the write, so a rename collision reads the
+        # same way a create collision does. Both backends enforce this with a
+        # UNIQUE constraint, but letting the driver raise gives two different
+        # exception types and — on DuckDB — an unhandled 500. The constraint
+        # is still the authority; this is the readable path, and the handler
+        # below is the backstop for the race between check and write.
+        new_name = updates.get("name")
+        if new_name:
+            clash = repo.get_by_name(new_name)
+            if clash and clash["id"] != group_id:
+                raise HTTPException(
+                    status_code=409, detail=f"Group {new_name!r} already exists"
+                )
         try:
             repo.update(group_id, **updates)
         except SystemGroupProtected:
             raise HTTPException(
                 status_code=409,
                 detail="System groups cannot be renamed",
+            )
+        except (duckdb.ConstraintException, sa_exc.IntegrityError) as exc:
+            # A rename of a group that has members or grants cannot be done
+            # in place on the DuckDB app-state backend: `user_groups.name`
+            # is UNIQUE, so DuckDB rewrites the row as delete+insert, and the
+            # delete trips the FKs that `user_group_members.group_id` and
+            # `resource_grants.group_id` hold on `user_groups.id` — even when
+            # the name is unchanged. There is no in-place path: DuckDB has no
+            # deferrable constraints and no ALTER TABLE DROP CONSTRAINT, and
+            # dropping the UNIQUE would need a schema step the PG-first
+            # ratchet freezes (src/db.py FROZEN_DUCKDB_SCHEMA_VERSION). The
+            # only DuckDB-side workaround — delete the child rows, rewrite the
+            # parent, re-insert — is not atomic there, and losing a group's
+            # memberships to a mid-write crash is not a trade worth making on
+            # an authorization table.
+            #
+            # Postgres renames in place and is unaffected. So this fails
+            # clean, names the real constraint, and says what to do.
+            logger.warning("group rename rejected by a database constraint: %s", exc)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This group cannot be renamed while it has members or grants, "
+                    "because the app-state database is DuckDB. Move the instance to "
+                    "Postgres to rename it, or create a new group with the name you "
+                    "want. Its description can still be edited here."
+                ),
             )
         _audit(conn, user["id"], "user_group.updated", f"group:{group_id}", updates)
     g = repo.get(group_id)
