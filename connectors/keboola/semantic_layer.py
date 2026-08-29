@@ -1230,6 +1230,16 @@ def sweep_project_identity(config: dict) -> Optional[tuple[str, Any]]:
     return _project_key(url, KeboolaStorageClient(url=url, token=token).verify_token())
 
 
+def _stamped_source_ref(row: dict) -> Optional[str]:
+    """The ``source_ref`` a row's provenance override stamps, or ``None`` when
+    it carries none (which is also a real, distinct scope — the legacy env
+    pair's own)."""
+    provenance = (row.get("config") or {}).get("provenance")
+    if isinstance(provenance, dict) and provenance.get("source") == SEMANTIC_PROVENANCE_SOURCE:
+        return provenance.get("source_ref")
+    return None
+
+
 def _claims_provenance(row: dict, *, connection_id: Optional[str], source_ref: Optional[str]) -> bool:
     """True when an existing ``semantic_sources`` row already owns this
     project's scope — matched on the adapter plus either the connection it
@@ -1240,12 +1250,27 @@ def _claims_provenance(row: dict, *, connection_id: Optional[str], source_ref: O
     it from registering a second writer for a scope that is already claimed
     (the legacy-credentials row and a later master-token row for the same
     default connection would otherwise both import the same project).
+
+    ONE row is excluded from the provenance half: the migration's own
+    legacy-credentials row, when the claim is for a master-capable connection
+    (``connection_id`` given). That row reads a credential the master-token
+    world no longer uses, and
+    :func:`_supersede_legacy_credentials_source` disables it in this same
+    call — letting it satisfy the claim would skip creating the connection's
+    own row and then disable the only row left, leaving the scope with no
+    enabled writer and every later sweep repeating the skip (the disabled row
+    still stamps the provenance). Scoped to the fixed id this migration owns,
+    which is exactly the row the supersede below can act on: an admin cannot
+    register a competing provenance row by hand
+    (``400 provenance_not_settable``).
     """
     if (row.get("adapter") or "") != SEMANTIC_ADAPTER:
         return False
     config = row.get("config") or {}
     if connection_id and str(config.get("connection_id") or "") == connection_id:
         return True
+    if connection_id and row.get("id") == LEGACY_CREDENTIALS_SOURCE_ID:
+        return False
     provenance = config.get("provenance")
     if isinstance(provenance, dict) and provenance.get("source") == SEMANTIC_PROVENANCE_SOURCE:
         return provenance.get("source_ref") == source_ref
@@ -1333,7 +1358,7 @@ def ensure_semantic_sources() -> list[dict]:
 
 def _supersede_legacy_credentials_source(repo: Any, existing: list[dict]) -> None:
     """Disable the legacy-credentials row once any connection holds a master
-    token.
+    token — but never before something else owns the scope it was writing.
 
     ``sync_semantic_layer`` ignores the legacy env pair entirely the moment a
     master token exists ("when at least one master token exists these are the
@@ -1341,9 +1366,39 @@ def _supersede_legacy_credentials_source(repo: Any, existing: list[dict]) -> Non
     project a second time under NULL provenance — duplicate metrics under two
     scopes, the exact outcome this migration is sequenced to avoid. Scoped to
     the row THIS migration created (its fixed id), never an admin's own.
+
+    The handover is create-then-supersede, and this is the second half of it.
+    A wizard-connected connection (storage token, no master token) is synced
+    through THIS row, stamped with that connection's own ``source_ref``; when
+    an admin later adds a master token, the loop above creates the
+    connection-backed row that takes the scope over and this call steps the
+    old one down. If that create did not land — its derived id is already
+    taken, the repo refused it — stepping down anyway would leave the scope
+    with no enabled writer at all, which no later sweep recovers from. So the
+    step-down is conditional: a row stamping a connection's ref waits until an
+    enabled row actually stamps that same ref. A row stamping NULL owns a
+    scope no connection-backed row can ever claim, and is superseded
+    unconditionally as before — that is the duplicate this sequencing exists
+    to prevent.
     """
     row = next((r for r in existing if r["id"] == LEGACY_CREDENTIALS_SOURCE_ID), None)
     if row is None or row.get("enabled") is False:
+        return
+    source_ref = _stamped_source_ref(row)
+    if source_ref is not None and not any(
+        r["id"] != LEGACY_CREDENTIALS_SOURCE_ID
+        and (r.get("adapter") or "") == SEMANTIC_ADAPTER
+        and r.get("enabled") is not False
+        and _stamped_source_ref(r) == source_ref
+        for r in existing
+    ):
+        logger.warning(
+            "Keboola semantic layer: connection %s now holds a master token, but no enabled semantic "
+            "source claims its scope; keeping the legacy-credentials source %s enabled so the "
+            "connection keeps syncing rather than stopping silently.",
+            source_ref,
+            LEGACY_CREDENTIALS_SOURCE_ID,
+        )
         return
     logger.info(
         "Keboola semantic layer: a connection now holds a master token; disabling the "

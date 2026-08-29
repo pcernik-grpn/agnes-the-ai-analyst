@@ -226,6 +226,12 @@ def ensure_semantic_source() -> str | None:
 
     Never a get-or-*replace*: an existing row keeps whatever an admin did to
     it (rename, disable, narrower ``config.catalogs``).
+
+    No ``config.provenance`` override — Databricks already writes under the
+    generic ``ossie_connection`` provenance since the Track D6 cutover, so an
+    override would MOVE its rows rather than preserve them. It does carry
+    ``config.safe_prune``, for the same reason the migrated Keboola source
+    does: see the comment on it below.
     """
     from src.repositories import semantic_source_repo
 
@@ -240,7 +246,18 @@ def ensure_semantic_source() -> str | None:
         kind="connection",
         name=DATABRICKS_SEMANTIC_SOURCE_NAME,
         adapter="databricks_metric_views",
-        config={},
+        config={
+            # `safe_prune`: the adapter skips a metric view whose SHOW CREATE
+            # TABLE it cannot read rather than sinking the whole run
+            # (`connectors/databricks/semantic_ossie.py`), so a transient
+            # warehouse fault across every view is a SUCCESSFUL sync that
+            # returns nothing — indistinguishable from "the workspace has no
+            # metric views any more". Without the valve that empty result
+            # prunes every row this source owns. A total discovery failure is
+            # a different case and stays fatal: the adapter raises, so
+            # `import_source` records the error and imports nothing.
+            "safe_prune": True,
+        },
     )
     return DATABRICKS_SEMANTIC_SOURCE_ID
 

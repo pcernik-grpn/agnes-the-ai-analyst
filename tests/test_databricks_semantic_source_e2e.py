@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from connectors.databricks.semantic_ossie import DatabricksMetricViewAdapter
 from tests.test_databricks_semantic_ossie import _SETTINGS, FakeStatementClient
 
@@ -103,3 +105,94 @@ def test_sync_prunes_a_measure_removed_upstream(e2e_env):
 
     assert metric_repo().get(f"ossie_connection/{source_id}/main.sales.orders_metrics/Order Count") is None
     assert metric_repo().get(f"ossie_connection/{source_id}/main.sales.orders_metrics/Total Revenue") is not None
+
+
+# ---------------------------------------------------------------------------
+# The full-wipe guard on the source the sweep auto-registers
+# ---------------------------------------------------------------------------
+
+
+def _ensured_source() -> str:
+    """The Databricks source as the sweep's auto-migration registers it —
+    the config under test, never a hand-written stand-in."""
+    from connectors.databricks.semantic_layer import ensure_semantic_source
+
+    with patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS):
+        source_id = ensure_semantic_source()
+    assert source_id is not None
+    return source_id
+
+
+def test_the_ensured_source_carries_the_full_wipe_guard(e2e_env):
+    """``safe_prune`` is the same valve the migrated Keboola source carries,
+    and for the same reason: a discovery that succeeds while every view's
+    ``SHOW CREATE TABLE`` fails is indistinguishable from "the workspace has
+    no metric views any more"."""
+    from src.repositories import semantic_source_repo
+
+    source_id = _ensured_source()
+    assert semantic_source_repo().get(source_id)["config"]["safe_prune"] is True
+
+
+def test_a_successful_but_empty_discovery_does_not_wipe_the_workspaces_rows(e2e_env):
+    """Every view's ``SHOW CREATE TABLE`` failing is a SUCCESSFUL sync that
+    returns nothing (the adapter skips a view it cannot read rather than
+    sinking the whole run). Without the guard that empty result prunes every
+    row this source owns."""
+    from connectors.databricks.client import DatabricksApiError
+    from src.repositories import metric_repo, semantic_model_repo, semantic_source_repo
+    from src.semantic.transports import import_source
+
+    source_id = _ensured_source()
+    with (
+        patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: FakeStatementClient()),
+    ):
+        import_source(source_id)
+    assert len(metric_repo().list()) == 2
+
+    blinded = FakeStatementClient(
+        fail_with=DatabricksApiError("transient", status=503),
+        fail_views={"orders_metrics"},
+    )
+    with (
+        patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: blinded),
+    ):
+        report = import_source(source_id)
+
+    assert not report.models_pruned
+    assert len(metric_repo().list()) == 2
+    assert len(semantic_model_repo().list_all()) == 1
+    # The sync itself is still recorded as the success it was.
+    assert semantic_source_repo().get(source_id)["last_sync_status"] == "ok"
+
+
+def test_a_transient_discovery_failure_raises_and_imports_nothing(e2e_env):
+    """The other half of the same protection: when the workspace cannot be
+    enumerated at all, the adapter must RAISE rather than return an empty
+    document list — an error recorded on the row, and not one row touched."""
+    from connectors.databricks.client import DatabricksApiError
+    from src.repositories import metric_repo, semantic_source_repo
+    from src.semantic.transports import import_source
+
+    source_id = _ensured_source()
+    with (
+        patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: FakeStatementClient()),
+    ):
+        import_source(source_id)
+    assert len(metric_repo().list()) == 2
+
+    down = FakeStatementClient(fail_with=DatabricksApiError("warehouse unavailable", status=503))
+    with (
+        patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: down),
+        pytest.raises(DatabricksApiError),
+    ):
+        import_source(source_id)
+
+    assert len(metric_repo().list()) == 2
+    row = semantic_source_repo().get(source_id)
+    assert row["last_sync_status"] == "error"
+    assert "warehouse unavailable" in (row["last_sync_error"] or "")

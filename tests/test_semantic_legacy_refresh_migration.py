@@ -347,6 +347,126 @@ class TestLegacyCredentialsMigration:
         assert any((r["config"] or {}).get("connection_id") == "conn-a" and r["enabled"] for r in repo.list_all())
 
 
+class TestAWizardConnectionLaterGainsAMasterToken:
+    """The upgrade path that a naive provenance claim strands.
+
+    A wizard-connected project (``/admin/data-sources`` -> a
+    ``source_connections`` row holding a STORAGE token, no master token) is
+    synced through the legacy-credentials row, which the first sweep stamps
+    with THAT connection's id as its ``source_ref`` — the credentials came
+    from the connection, so the rows are the connection's.
+
+    When an admin later adds a master token to the same connection, the sweep
+    has to hand the scope over: the connection-backed row takes it, the
+    legacy-credentials row steps down. Getting the order wrong leaves the
+    connection with no enabled source at all and every later sweep repeating
+    the skip, because the disabled row still claims the provenance.
+    """
+
+    def _wizard_connection(self, conn_id: str, *, token: str) -> str:
+        """A connection as the admin wizard leaves it: a storage token in the
+        connection's own vault slot, nothing in the master slot."""
+        from src.repositories import connection_secrets_repo, source_connections_repo
+
+        source_connections_repo().create(
+            id=conn_id,
+            name=f"name-{conn_id}",
+            source_type="keboola",
+            config={"stack_url": STACK_URL},
+            is_default=True,
+            created_by="test",
+        )
+        connection_secrets_repo().upsert(conn_id, token)
+        return conn_id
+
+    def _enabled_keboola_sources(self) -> list[dict]:
+        from src.repositories import semantic_source_repo
+
+        return [
+            r
+            for r in semantic_source_repo().list_all()
+            if r["adapter"] == "keboola_metastore" and r["enabled"] is not False
+        ]
+
+    def test_the_scope_moves_to_the_connection_row_and_keeps_syncing(self, e2e_env, vault_key):
+        from app.api.admin_source_connections import master_secret_key
+        from src.repositories import connection_secrets_repo, metric_repo, semantic_source_repo
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources
+
+        conn_id = "conn-wizard"
+        _register_keboola_table("in.c-example_source", "orders", TABLE_NAME)
+        self._wizard_connection(conn_id, token=MASTER_TOKEN)
+
+        # --- sweep 1: no master token anywhere, so the legacy-credentials row
+        # carries this connection's scope and syncs it.
+        created = ensure_legacy_semantic_sources()
+        assert [r["id"] for r in created] == [LEGACY_ID]
+        assert created[0]["config"]["provenance"] == {"source": "keboola_metastore", "source_ref": conn_id}
+        _import_migrated_source(PROJECTS, LEGACY_ID)
+        assert {m["source_ref"] for m in metric_repo().list()} == {conn_id}
+        assert len(metric_repo().list()) == 2
+
+        # --- the admin adds a master token to that same connection.
+        connection_secrets_repo().upsert(master_secret_key(conn_id), MASTER_TOKEN)
+
+        # --- sweep 2: the connection is now master-capable.
+        ensure_legacy_semantic_sources()
+
+        repo = semantic_source_repo()
+        enabled = self._enabled_keboola_sources()
+        # Exactly ONE enabled source, connection-backed, and carrying the SAME
+        # provenance the legacy row had — the rows already written stay owned.
+        assert len(enabled) == 1, [r["id"] for r in enabled]
+        assert enabled[0]["config"]["connection_id"] == conn_id
+        assert enabled[0]["config"]["provenance"] == {"source": "keboola_metastore", "source_ref": conn_id}
+        assert enabled[0]["config"]["safe_prune"] is True
+        # And the legacy row stepped down rather than lingering as a second
+        # writer of the same scope.
+        assert repo.get(LEGACY_ID)["enabled"] is False
+
+        # --- and the next import still lands under that same scope: no
+        # orphaned rows, no duplicate set beside them.
+        _import_migrated_source(PROJECTS, enabled[0]["id"])
+        assert {m["source_ref"] for m in metric_repo().list()} == {conn_id}
+        assert len(metric_repo().list()) == 2
+
+        # --- steady state: nothing new on any later sweep.
+        assert ensure_legacy_semantic_sources() == []
+        assert len(self._enabled_keboola_sources()) == 1
+
+    def test_the_legacy_row_stays_enabled_when_the_handover_could_not_happen(self, e2e_env, vault_key):
+        """The handover is create-then-supersede, and the supersede is
+        conditional on the create having landed. A connection row that could
+        not be created (its derived id already taken by an admin's row for a
+        different scope) must not cost the scope its only writer."""
+        from app.api.admin_source_connections import master_secret_key
+        from connectors.keboola.semantic_layer import semantic_source_id
+        from src.repositories import connection_secrets_repo, semantic_source_repo
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources
+
+        conn_id = "conn-wizard"
+        self._wizard_connection(conn_id, token=MASTER_TOKEN)
+        ensure_legacy_semantic_sources()
+
+        repo = semantic_source_repo()
+        # An admin's own, unrelated row squatting on the id the migration
+        # would derive — and disabled, so it cannot take over the scope.
+        repo.create(
+            id=semantic_source_id(conn_id),
+            kind="upload",
+            name="Admin's own row on that id",
+            adapter="native",
+            config={"documents": []},
+            enabled=False,
+        )
+        connection_secrets_repo().upsert(master_secret_key(conn_id), MASTER_TOKEN)
+
+        ensure_legacy_semantic_sources()
+
+        assert repo.get(LEGACY_ID)["enabled"] is True
+        assert len(self._enabled_keboola_sources()) == 1
+
+
 class TestDatabricksAutoMigration:
     def test_registers_the_workspace_only_when_it_is_configured(self, e2e_env):
         from connectors.databricks.semantic_layer import DATABRICKS_SEMANTIC_SOURCE_ID
@@ -376,6 +496,11 @@ class TestDatabricksAutoMigration:
         # Databricks already writes under the generic provenance since the
         # Track D6 cutover — no override, or its rows would move scope.
         assert "provenance" not in (row["config"] or {})
+        # The full-wipe guard IS shared with the Keboola side: the adapter
+        # skips a metric view it cannot read, so a transient warehouse fault
+        # is a successful sync returning nothing. See
+        # `tests/test_databricks_semantic_source_e2e.py` for the end-to-end.
+        assert row["config"]["safe_prune"] is True
 
 
 # ---------------------------------------------------------------------------
