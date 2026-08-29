@@ -851,14 +851,17 @@ async def update_connection(
     :func:`_guard_default_repoint`.
 
     SharePoint connections: ``config.scopes`` (the connect wizard's
-    server-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) is
-    carried forward when the request's ``config`` omits the key — the same
+    server-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and
+    ``config.extraction`` (the in-Agnes extraction schedule's own
+    ``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried
+    forward when the request's ``config`` omits the key — the same
     "explicit wins" contract as Keboola's ``project_id``/``project_name``
     above — since this endpoint's wholesale ``config`` replace would
     otherwise let an ordinary edit through the generic connection editor
-    (which never renders that field) silently erase every confirmed scope's
-    ``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29). An
-    explicit ``scopes: []`` in the request still clears it deliberately.
+    (which renders neither field) silently erase every confirmed scope's
+    ``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or
+    reset the extraction schedule's clock. An explicit ``scopes: []`` (or
+    ``extraction: null``) in the request still clears it deliberately.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -939,9 +942,18 @@ async def update_connection(
             # wins" contract as `project_id`/`project_name` above: an
             # explicit `scopes: []` (or the wizard's own DELETE endpoint)
             # still empties it.
-            elif existing_row.get("source_type") == "sharepoint" and "scopes" not in config:
-                if old_config.get("scopes") is not None:
-                    config = {**config, "scopes": old_config["scopes"]}
+            #
+            # `extraction` (TCRD-226, merged same day) is a second
+            # server-written SharePoint key landing in this exact same
+            # `config` column — the in-Agnes extraction schedule's own
+            # `last_run_at`/`last_job_id` bookkeeping
+            # (`app/api/admin_sharepoint.py::_record_extraction_dispatch`),
+            # also never rendered by this generic editor's form. Same bug,
+            # same fix: an ordinary edit must not silently reset that clock.
+            elif existing_row.get("source_type") == "sharepoint":
+                for _sp_key in ("scopes", "extraction"):
+                    if _sp_key not in config and old_config.get(_sp_key) is not None:
+                        config = {**config, _sp_key: old_config[_sp_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`

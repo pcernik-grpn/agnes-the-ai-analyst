@@ -2264,3 +2264,36 @@ class TestSharePointScopesSurviveOrdinaryEdits:
         )
         assert r.status_code == 200, r.text
         assert r.json()["config"].get("scopes") == []
+
+    def test_editing_config_without_extraction_preserves_it(self, seeded_app):
+        """``config.extraction`` (TCRD-226, ``app/api/admin_sharepoint.py::
+        _record_extraction_dispatch``) is the SAME shape of server-written
+        bookkeeping as ``scopes`` — the in-Agnes extraction schedule's
+        ``last_run_at``/``last_job_id``, never typed by an admin, never
+        rendered by the generic editor's form. An ordinary edit through
+        this endpoint must not silently reset that clock any more than it
+        may wipe ``scopes``."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-extraction-preserve")
+
+        # Simulate a prior extraction dispatch the way
+        # `_record_extraction_dispatch` writes it: a full config
+        # read-modify-write straight through the repo, not through this
+        # endpoint.
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        config = dict(row["config"])
+        config["extraction"] = {"last_run_at": "2026-08-29T00:00:00+00:00", "last_job_id": "job_1"}
+        source_connections_repo().update(conn_id, config=config)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("extraction") == {
+            "last_run_at": "2026-08-29T00:00:00+00:00",
+            "last_job_id": "job_1",
+        }
