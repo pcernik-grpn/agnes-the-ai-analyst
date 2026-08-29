@@ -90,6 +90,7 @@ from connectors.sharepoint.graph_client import (
     list_item_children,
     list_root_children,
     list_sites,
+    probe_unique_permissions,
     search_folders,
 )
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
@@ -152,6 +153,40 @@ def _validate_graph_id(value: str, field: str) -> None:
     500 from a Graph call that silently misrouted."""
     if not value or not _GRAPH_ID_RE.match(value):
         raise HTTPException(status_code=422, detail={"error": f"invalid_{field}", "message": f"malformed {field}"})
+
+
+#: A single browse click never fans out into more Graph calls than this many
+#: folders' worth of unique-permissions probing — Graph's own children page
+#: can be far larger than a sane one-click batch fan-out (the real library
+#: this cap was sized against has 97,899 folders total; a single folder's
+#: OWN children rarely approach that, but nothing bounds it upstream).
+#: Folders beyond the cap are left unprobed (``unique_permissions: None`` —
+#: "unknown", same as any other probe failure), never silently dropped from
+#: the listing itself.
+_MAX_PERMISSION_PROBE_ITEMS = 200
+
+
+async def _annotate_unique_permissions(token: str, drive_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach a best-effort ``unique_permissions: true|false|null`` to every
+    FOLDER item (files are never scoped by the wizard, so they are never
+    probed and never carry the key) — ADVISORY ONLY (Decision #2, module
+    docstring: Agnes never derives or enforces anything from a SharePoint
+    ACL). Bounded by :data:`_MAX_PERMISSION_PROBE_ITEMS`; on any probe
+    failure (caught defensively here too, though
+    :func:`connectors.sharepoint.graph_client.probe_unique_permissions`
+    already never raises) every folder degrades to ``null`` rather than
+    failing the browse — the advisory signal must never be able to make an
+    otherwise-successful tree fetch fail.
+    """
+    folder_ids = [item["id"] for item in items if item.get("is_folder")][:_MAX_PERMISSION_PROBE_ITEMS]
+    if not folder_ids:
+        return items
+    try:
+        flags = await probe_unique_permissions(token, drive_id, folder_ids)
+    except Exception:  # noqa: BLE001 — advisory probe must never fail the browse
+        logger.warning("sharepoint unique-permissions probe raised; degrading to unknown", exc_info=True)
+        flags = {}
+    return [{**item, "unique_permissions": flags.get(item["id"])} if item.get("is_folder") else item for item in items]
 
 
 def _scopes(row: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -292,6 +327,7 @@ async def browse_tree(
     site_id: Optional[str] = None,
     drive_id: Optional[str] = None,
     item_id: Optional[str] = None,
+    with_permissions: bool = False,
     _user: dict = Depends(require_admin),
 ):
     """One level of the live SharePoint folder tree.
@@ -302,6 +338,17 @@ async def browse_tree(
     subfolder browsing at any depth — ``item_id`` is the previous call's own
     item id, never a path, and is structurally validated before it reaches
     a Graph URL).
+
+    ``with_permissions=1`` (default off) additionally probes each listed
+    FOLDER for ``hasUniqueRoleAssignments`` — an ADVISORY-ONLY signal
+    (Decision #2: Agnes never derives or enforces anything from a
+    SharePoint ACL; see :func:`connectors.sharepoint.graph_client.
+    probe_unique_permissions`) — and adds ``unique_permissions:
+    true|false|null`` to each folder item. Off by default so plain browsing
+    never pays for it; batched and bounded
+    (:data:`_MAX_PERMISSION_PROBE_ITEMS`) when on, and a probe failure never
+    fails the browse itself — affected folders just come back ``null``
+    ("unknown").
     """
     if item_id is not None:
         if not drive_id:
@@ -314,6 +361,8 @@ async def browse_tree(
             items = await (
                 list_item_children(token, drive_id, item_id) if item_id else list_root_children(token, drive_id)
             )
+            if with_permissions:
+                items = await _annotate_unique_permissions(token, drive_id, items)
             return {"level": "items", "site_id": site_id, "drive_id": drive_id, "item_id": item_id, "items": items}
         if site_id:
             items = await list_drives(token, site_id)
@@ -327,8 +376,35 @@ async def browse_tree(
         ) from exc
 
 
-_SEARCH_MAX_DEPTH_CAP = 10
-_SEARCH_MAX_VISITED_CAP = 2000
+# Real library scale (measured, 2026-08-29): 443k files / 97,899 folders in
+# ONE library. The previous caps (depth 10 / visited 2000) made a
+# whole-library search almost always `truncated` right at the top — safe,
+# but nearly useless for the scale this wizard actually needs to serve.
+#
+# New caps, still conservative against Graph throttling: each visited
+# folder costs exactly one Graph "list children" call, and
+# `search_folders`' BFS walks them ONE AT A TIME — a single `await` in one
+# loop, never fanned out concurrently — so a 20000-visited walk is 20000
+# *sequential* Graph calls. That is self-throttling by construction (one
+# admin's one search can only ever have one children-call in flight), unlike
+# a concurrent fan-out that could burn a shared per-app-per-tenant Graph
+# budget in one burst. 12 is a small bump on the previous depth cap of 10 —
+# enough headroom for one more level without materially changing the walk's
+# shape or its worst-case call count (`sum` of a wide tree's per-level
+# fan-out, not a multiplicative blowup from depth alone).
+#
+# These remain CAPS, not defaults for automation: a routine narrow search
+# still returns fast and well under the ceiling; only a genuinely
+# whole-library, unscoped walk approaches it, and even then may still
+# truncate at 97,899 real folders — the honest answer is to scope the
+# search (§ the `hint` field below), not to raise the cap without limit.
+_SEARCH_MAX_DEPTH_CAP = 12
+_SEARCH_MAX_VISITED_CAP = 20000
+
+#: The UI's truncation banner reads this verbatim (`spw-search-truncated` in
+#: admin_data_sources.html) rather than composing its own guess at what an
+#: admin should do next — one wording, defined once.
+_SEARCH_TRUNCATED_HINT = "Scope the search to a site or folder, or narrow the pattern."
 
 
 @router.get("/connections/{connection_id}/tree/search")
@@ -339,7 +415,7 @@ async def search_tree(
     drive_id: Optional[str] = None,
     item_id: Optional[str] = None,
     max_depth: int = 5,
-    max_visited: int = 500,
+    max_visited: int = 2000,
     _user: dict = Depends(require_admin),
 ):
     """Bounded breadth-first folder search (TCRD-240) — the server-side
@@ -347,9 +423,10 @@ async def search_tree(
     under app-only auth (``connectors.sharepoint.graph_client`` module
     docstring). Never a single call: it walks ``.../root/children`` and
     ``.../items/{id}/children`` the same way the tree browser does, capped
-    by ``max_depth``/``max_visited`` — CLAMPED to their caps rather than
-    rejected, so asking for more than the server allows still returns the
-    best bounded answer instead of a 422.
+    by ``max_depth``/``max_visited`` — CLAMPED to their caps
+    (:data:`_SEARCH_MAX_DEPTH_CAP` / :data:`_SEARCH_MAX_VISITED_CAP`) rather
+    than rejected, so asking for more than the server allows still returns
+    the best bounded answer instead of a 422.
 
     Root: ``drive_id`` + ``item_id`` scopes to that folder's subtree;
     ``drive_id`` alone scopes to the whole drive; neither given searches
@@ -357,8 +434,11 @@ async def search_tree(
     is rejected — there is no drive to resolve it against.
 
     Response: ``{matches: [{item_id, drive_id, display_path}], visited,
-    truncated}``. ``truncated`` is ``True`` whenever a cap is what stopped
-    the walk — never a silently partial result.
+    truncated, hint}``. ``truncated`` is ``True`` whenever a cap is what
+    stopped the walk — never a silently partial result; ``visited`` is how
+    many "list children" calls it took to get there; ``hint`` is a short,
+    actionable string (scope the search, narrow the pattern) when
+    ``truncated`` is ``True``, else ``null``.
     """
     if item_id and not drive_id:
         raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
@@ -377,7 +457,7 @@ async def search_tree(
     clamped_depth = max(1, min(max_depth, _SEARCH_MAX_DEPTH_CAP))
     clamped_visited = max(1, min(max_visited, _SEARCH_MAX_VISITED_CAP))
     try:
-        return await search_folders(
+        result = await search_folders(
             token,
             matcher=matcher,
             drive_id=drive_id,
@@ -385,6 +465,8 @@ async def search_tree(
             max_depth=clamped_depth,
             max_visited=clamped_visited,
         )
+        result["hint"] = _SEARCH_TRUNCATED_HINT if result.get("truncated") else None
+        return result
     except SharePointGraphError as exc:
         raise HTTPException(
             status_code=502,

@@ -1185,6 +1185,21 @@ certificate is a typed `409 sharepoint_cert_unresolved` (surface absence
 rather than fail the crawl); a rejected/failed Graph call is a typed `502
 sharepoint_graph_error`.
 
+`?with_permissions=1` (default off) additionally probes each listed FOLDER
+for `hasUniqueRoleAssignments` (batched via Graph's `POST /$batch`, capped
+at 20 sub-requests per batch and at 200 folders per browse click) and adds
+`unique_permissions: true|false|null` to each folder item — `null` covers
+both "never probed" (beyond the 200-folder cap) and "the probe itself
+failed", collapsed into one honest "unknown". This is an **advisory-only**
+signal for the wizard's own unique-permissions badge (see below) — Agnes
+does not derive or enforce anything from a SharePoint ACL today (design
+spec §13.1, "Decision #2"); a Phase-2 design for actually deriving and
+mirroring source permissions exists as a separate, not-yet-merged spec
+("SharePoint ACL mirroring design") and is out of scope for this endpoint.
+Off by default so plain browsing never pays the extra Graph round trip; a
+probe failure never fails the browse itself, only degrades the affected
+folders to `null`.
+
 `GET …/tree/search` (TCRD-240) is a bounded breadth-first folder search over
 the same live tree — Graph's own `/search` is known to silently under-return
 under app-only auth, so this module never calls it. Params: `q` (required,
@@ -1193,10 +1208,17 @@ under app-only auth, so this module never calls it. Params: `q` (required,
 unbalanced `[`/`]`, is a typed `422 invalid_search_pattern`), an optional
 `drive_id` + `item_id` subtree root (neither given searches every drive of
 every reachable site; `item_id` without `drive_id` is `422`), and
-`max_depth`/`max_visited` (defaults `5`/`500`, CLAMPED to caps `10`/`2000`
-rather than rejected). Response: `{matches: [{item_id, drive_id,
-display_path}], visited, truncated}` — `truncated` is `true` whenever a cap
-is what stopped the walk, never a silently partial result.
+`max_depth`/`max_visited` (defaults `5`/`2000`, CLAMPED to caps `12`/`20000`
+rather than rejected — raised from the original `10`/`2000` once a real
+library measured at 443k files / 97,899 folders made the old visited cap
+truncate almost every whole-library search at the very top; each visited
+folder is one *sequential* Graph call, never fanned out concurrently, which
+is what keeps the raised cap from turning into a throttling risk). Response:
+`{matches: [{item_id, drive_id, display_path}], visited, truncated, hint}`
+— `truncated` is `true` whenever a cap is what stopped the walk, never a
+silently partial result; `hint` is a short next-step string ("scope the
+search to a site or folder, or narrow the pattern") when `truncated` is
+`true`, else `null`.
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
