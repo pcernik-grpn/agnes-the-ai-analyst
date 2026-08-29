@@ -1,5 +1,6 @@
 """ASGI safety net: log any authenticated mutating request whose handler
-wrote no audit row of its own (F1 — audit-full-coverage plan, Task 2).
+wrote no audit row of its own (F1 — audit-full-coverage plan, Task 2;
+declarative-action contract rewritten by Wave 2 — Task 1).
 
 Every handler that already calls ``log_safe`` (directly, or through an
 intra-module ``_audit`` wrapper) increments
@@ -7,14 +8,17 @@ intra-module ``_audit`` wrapper) increments
 ``AuditRepository.log()`` on both backends (Task 1). This middleware runs
 the request through unchanged, and only AFTER the response has started
 checks whether that counter is still zero: if so, and the request carried an
-authenticated identity, it writes one generic ``http.request`` row keyed by
-``"{METHOD} {route_template}"`` so no mutating endpoint can silently leave
-zero trace. ``src.audit_posture.POSTURE`` lets a route opt out entirely via
-an ``"exempt:<reason>"`` entry — everything else (a real cataloged action,
-the placeholder ``"fallback"``, or simply absent from the dict) still gets
-the generic row when the handler didn't write one; ``POSTURE`` documents
-which routes have upgraded to their own dedicated action, not which routes
-this middleware may cover.
+authenticated identity, it looks up the route's DECLARED action via
+``src.audit_posture.declared_action()`` and writes a row under THAT action —
+never a generic placeholder — with ``resource`` built by
+``resource_from_scope()`` from the route template plus any path params. A
+route declared ``"exempt:<reason>"`` (or simply undeclared) makes
+``declared_action()`` return ``None``, and this middleware writes nothing
+for it — an undeclared mutating route is caught by
+``tests/test_audit_route_posture.py``, not silently covered here. No writer
+in this codebase emits the historical ``"http.request"`` action any more; it
+stays in ``src.audit_events.CATALOG`` only because rows already written
+under it are real history that must keep classifying as a known action.
 
 **Sync path functions break the two contextvar reads above** — a large
 share of this codebase's routes and the ``get_current_user`` dependency are
@@ -67,7 +71,27 @@ from starlette.requests import Request
 
 from src.audit_context import audit_written_count, auto_audit_identity, auto_correlation_id
 from src.audit_helpers import identity_for_audit, log_safe
-from src.audit_posture import MUTATING, POSTURE
+from src.audit_posture import MUTATING, declared_action
+
+
+def resource_from_scope(scope) -> str:
+    """The ``resource`` value for a declared-action row: the route's path
+    template, plus its resolved path params when it has any.
+
+    No params: the template alone (``"/api/stack/subscribe"``). With
+    params: the template followed by each ``key=value`` pair, sorted by key
+    for a stable, diffable string (``"/api/stack/subscription/{resource_type}/
+    {resource_id} resource_id=42 resource_type=data_package"``) — so a reader
+    can tell which subscription a ``DELETE`` acted on without opening
+    ``params``.
+    """
+    route = scope.get("route")
+    template = getattr(route, "path", None) or scope.get("path", "?")
+    path_params = scope.get("path_params") or {}
+    if not path_params:
+        return template
+    pairs = " ".join(f"{k}={v}" for k, v in sorted(path_params.items()))
+    return f"{template} {pairs}"
 
 
 class AuditFallbackMiddleware:
@@ -107,14 +131,17 @@ class AuditFallbackMiddleware:
 
         route = scope.get("route")
         template = getattr(route, "path", None) or scope.get("path", "?")
-        key = f"{scope['method']} {template}"
-        if POSTURE.get(key, "").startswith("exempt:"):
+        action = declared_action(scope["method"], template)
+        if action is None:
+            # Exempt, or an undeclared route — the latter is caught by the
+            # route-posture ratchet (tests/test_audit_route_posture.py), not
+            # a runtime concern here.
             return
 
         log_safe(
             user_id=user_id,
-            action="http.request",
-            resource=key,
+            action=action,
+            resource=resource_from_scope(scope),
             params={"status": status_holder.get("status")},
         )
 
