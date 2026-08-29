@@ -1256,7 +1256,9 @@ class FactsPgRepository:
     # into actually lists.
     # ------------------------------------------------------------------
 
-    def _visible_facts_for_corpus_cte(self, is_admin: bool, all_evidence: bool) -> str:
+    def _visible_facts_for_corpus_cte(
+        self, is_admin: bool, all_evidence: bool, *, all_collections: bool = False
+    ) -> str:
         """SQL for a ``visible(subject_id, is_revealed)`` CTE: facts with at
         least one OWN claim evidenced by ``:corpus_id`` (bound by the
         caller — candidacy is deliberately still OWN-claims-only: "evidenced
@@ -1271,16 +1273,29 @@ class FactsPgRepository:
         be revealed by a readable incident-edge claim. Returned as a
         fragment (no leading ``WITH``) so callers can embed it beside their
         own CTEs; every caller must bind ``:corpus_id`` and, when
-        ``is_admin`` is False, ``:readable``."""
+        ``is_admin`` is False, ``:readable``.
+
+        With ``all_collections=True`` the ONLY change is candidacy: every
+        non-withheld fact instead of the ones evidenced by a bound
+        ``:corpus_id`` (which must then NOT be bound), giving the same
+        population ``search()`` gates with ``type=None``. The visibility
+        rule below is shared verbatim rather than restated for the wider
+        scope — a second copy is how the two drift, and drift in this gate
+        is the S2 existence oracle the spec's rev 1->2 closed."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
         all_ev_sql = "TRUE" if all_evidence else "FALSE"
+        candidate_where = (
+            "c.fact_id IS NOT NULL"
+            if all_collections
+            else "c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL"
+        )
         return f"""
             candidates AS (
                 SELECT DISTINCT c.fact_id AS subject_id
                 FROM claims c
-                WHERE c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL
+                WHERE {candidate_where}
                   AND NOT EXISTS (
                     SELECT 1 FROM corrections co
                     WHERE co.subject_kind = 'fact' AND co.subject_id = c.fact_id
@@ -1329,6 +1344,37 @@ class FactsPgRepository:
                    )
             )
             """
+
+    def count_visible_facts_by_type(self, caller) -> Dict[str, int]:
+        """Caller-scoped ``{type: count}`` over every visible fact — the
+        Library type map's live counts (spec §13.2 "Library"), where each
+        type is a way in to the graph.
+
+        Shares :meth:`_visible_facts_for_corpus_cte`'s gate via
+        ``all_collections=True``, so a type's number counts exactly the
+        subjects this caller could reach through ``search(type=...)`` and
+        never more. A naive ``SELECT type, COUNT(*) FROM facts GROUP BY
+        type`` would be the S2 existence oracle in aggregate form: it would
+        report facts whose every claim sits in a collection the caller
+        cannot read, letting a reader count what they cannot see. A type
+        with no visible subjects is omitted rather than reported as 0 — the
+        caller cannot distinguish "no such type in this ontology" from
+        "none you can see", which is the same non-disclosure
+        ``search()`` makes.
+        """
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        params: Dict[str, Any] = {} if is_admin else {"readable": list(readable)}
+        sql = sa.text(
+            f"WITH {cte} "
+            "SELECT f.type, COUNT(*) AS n FROM visible v JOIN facts f ON f.id = v.subject_id "
+            "GROUP BY f.type ORDER BY f.type"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+        return {r["type"]: int(r["n"]) for r in rows}
 
     def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
         """Caller-scoped count of facts evidenced by ``corpus_id`` — the

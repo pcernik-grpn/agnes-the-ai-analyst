@@ -27,6 +27,11 @@ from pathlib import Path
 # (the policy is a ratchet, not a sweep). Tuple of (cli_cmd, mcp_tool).
 _COHORT: dict[str, tuple[str, str]] = {
     "/documentation/api": ("docs api", "documentation_api"),
+    # Fact-graph node types with caller-scoped counts (TCRD-250): the head
+    # of the Library's Knowledge tab, and an agent's way to learn which
+    # types exist before spending a `fact_search` call. Joins its
+    # search/neighbors/claims siblings on all three surfaces.
+    "/api/facts/type-map": ("facts type-map", "fact_type_map"),
     # Reading one collection file's text (#1240). The endpoint's path is
     # browser-shaped — the Library's preview modal fetches it directly — but
     # its contract is now agent-facing: an agent shown a file it could not

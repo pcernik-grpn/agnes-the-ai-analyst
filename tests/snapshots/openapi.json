@@ -39280,6 +39280,64 @@
         ]
       }
     },
+    "/api/facts/type-map": {
+      "get": {
+        "description": "Live counts per node type over everything the caller can see \u2014 the\nhead of the Library's Knowledge tab, where each type is a way in.\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach. A type nobody can see\nis absent rather than reported as ``0``, so the response never\ndistinguishes \"no such type here\" from \"none you may read\" \u2014 the same\nnon-disclosure ``search()`` makes. Response: ``{\"types\": [{\"type\",\n\"count\"}], \"total\"}``, ordered by type.",
+        "operationId": "facts_type_map_api_facts_type_map_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Type Map Api Facts Type Map Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Type Map",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
     "/api/facts/{subject_id}/claims": {
       "get": {
         "description": "The caller's readable evidence for one subject (fact or edge).\n\nEach entry carries the evidencing document's identity (``corpus_id``,\n``corpus_file_id``, ``document: {name, path, source_url?}``), the\nverbatim ``quote``, that claim's own (unprojected) ``attrs``, and\n``document_date``. A subject under an active `revealed` correction is\nserved to every authenticated caller regardless of grants, but with\nevery ``quote`` suppressed to an empty string (`\"revealed\": true` on\nthe response marks this). `404` (never `403`) when `subject_id` does\nnot exist or has no readable claim \u2014 same status, body shape, and cost\nprofile either way (spec \u00a75 rule 2): this endpoint never lets a caller\ndistinguish \"nothing there\" from \"something you can't see\".",

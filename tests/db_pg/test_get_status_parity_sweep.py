@@ -69,6 +69,12 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "ontology_drafts_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/ontology_drafts_pg.py"
     ),
+    # Node-type counts for the Library's Knowledge tab (TCRD-250) —
+    # parameter-free and reaches facts_repo() before anything else.
+    "GET /api/facts/type-map": (
+        "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
+        "to resolve; see src/repositories/facts_pg.py"
+    ),
     "GET /api/facts/ingest-runs": (
         "facts_ingest_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/facts_ingest_runs_pg.py"

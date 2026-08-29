@@ -1763,6 +1763,18 @@ Corrections management
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
 
+`GET /api/facts/type-map` answers "what is in the graph at all" —
+`{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
+through the SAME visibility gate as `search()` with no `type` (shared via
+`_visible_facts_for_corpus_cte(all_collections=True)`, never a second copy
+of the rule), so a type's number is exactly what that caller could reach
+through `search(type=...)`. A type with no subjects visible to the caller
+is OMITTED rather than reported as `0`: absence is deliberately
+indistinguishable from "no such type in this ontology", because a `0` would
+confirm the type exists and that something occupies it — the aggregate form
+of the §5 existence oracle. Triple-surface with `agnes facts type-map` and
+the `fact_type_map` MCP tool.
+
 Every successful ingest batch also persists a copy of its run report to
 `facts_ingest_runs` — written AFTER the ingest transaction commits, so a
 report-write failure never rolls back or fails the ingest itself (see
@@ -1773,6 +1785,7 @@ counts and per-category error badges — an admin-only, UI-internal surface,
 not an analyst query (no CLI/MCP analogue).
 
 - /api/facts/search
+- /api/facts/type-map
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest

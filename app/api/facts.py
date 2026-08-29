@@ -104,6 +104,26 @@ class FactsNeighborsRequest(BaseModel):
     limit: int = Field(default=500, ge=1, le=500)
 
 
+@router.get("/type-map")
+def facts_type_map(user=Depends(get_current_user)) -> Dict[str, Any]:
+    """Live counts per node type over everything the caller can see — the
+    head of the Library's Knowledge tab, where each type is a way in.
+
+    Same visibility gate as :func:`facts_search` with no ``type``, just
+    aggregated: a type's ``count`` is exactly how many subjects a
+    ``search(type=...)`` would let this caller reach. A type nobody can see
+    is absent rather than reported as ``0``, so the response never
+    distinguishes "no such type here" from "none you may read" — the same
+    non-disclosure ``search()`` makes. Response: ``{"types": [{"type",
+    "count"}], "total"}``, ordered by type.
+    """
+    counts = facts_repo().count_visible_facts_by_type(user)
+    return {
+        "types": [{"type": t, "count": n} for t, n in counts.items()],
+        "total": sum(counts.values()),
+    }
+
+
 @router.post("/search")
 def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Dict[str, Any]:
     """Search typed subjects (facts) by ``type`` and attribute ``filters``.
