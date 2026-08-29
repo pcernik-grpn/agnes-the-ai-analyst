@@ -483,3 +483,385 @@ def test_identity_grounded_quote_accepted_for_the_member_not_the_archive(pg_repo
         )
     assert claim["corpus_file_id"] == member["id"], "identity-grounded quote must attach to the MEMBER"
     assert claim["corpus_file_id"] != archive_id, "the archive's OWN filename ('dump.zip') never contains this quote"
+
+
+# ---------------------------------------------------------------------------
+# 6. Adversarial review findings on the citability follow-up itself:
+#    (1) the reserved member-anchor shape must be refused, not merely
+#        conventionally avoided, at BOTH entry points that accept a
+#        caller-supplied `source_stable_id`;
+#    (2) a bundle row re-uploaded as a NON-bundle at the same identity must
+#        still purge its old children/chunks/claims/anchors — deciding this
+#        from the OLD filename alone left them live forever, attached to a
+#        row that is now some other file type;
+#    (3) two concurrent `ingest_bundle` runs racing the same anchor write
+#        must not 500 the whole ingest.
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_stable_id_refused_at_upload_endpoint(pg_engine, monkeypatch, tmp_path):
+    """A caller who can only READ a collection can already reconstruct a
+    real member's exact anchor from an ordinary file listing (`_file_out`
+    returns both `corpus_files.id` and `filename`); a caller with WRITE
+    access must not be able to re-upload an unrelated file under that same
+    `source_stable_id` and have it silently resolve to (and overwrite) the
+    real member's row. Refused up front, before any file is stored."""
+    import io
+
+    from ._parity_sweep_util import build_seeded_client
+
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+
+    cr = client.post("/api/collections", json={"name": "Reserved Shape"}, headers=auth)
+    assert cr.status_code == 201, cr.text
+    corpus_id = cr.json()["id"]
+
+    forged = "cf_deadbeefdeadbeef!secret/member.md"
+    resp = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"hello"), "text/markdown")},
+        data={"source_stable_ids": forged},
+        headers=auth,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reserved_source_stable_id" in resp.text
+    assert forged in resp.text
+
+    # Nothing was written — the batch is refused whole, before any blob.
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    assert listing.json()["files"] == []
+
+    # Negative control: an ordinary crawler-style stable_id is unaffected.
+    ok = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"hello"), "text/markdown")},
+        data={"source_stable_ids": "graph:real-item-id"},
+        headers=auth,
+    )
+    assert ok.status_code == 201, ok.text
+
+
+def test_reserved_stable_id_cannot_retarget_a_real_member_via_upload(pg_repos, pg_engine, monkeypatch, tmp_path):
+    """End-to-end version of the attack the guard closes: mint a real
+    member anchor via `ingest_bundle`, then try to re-upload a DIFFERENT
+    file's bytes under that EXACT anchor through the upload endpoint. Must
+    be refused, and the real member's row must be byte-for-byte untouched
+    afterward."""
+    import io
+
+    from src.ingest.bundle import ingest_bundle
+
+    from ._parity_sweep_util import build_seeded_client
+
+    corpus_id = _new_corpus(pg_repos, "impersonate-1")
+    data = _zip_bytes({"member.md": b"the real member's content"})
+    stored = _store(corpus_id, "dump.zip", data)
+    archive_id = pg_repos.corpus_files_repo().add(
+        corpus_id=corpus_id,
+        filename="dump.zip",
+        sha256=stored.sha256,
+        file_type="zip",
+        size_bytes=stored.size_bytes,
+        storage_path=stored.storage_path,
+    )
+    assert ingest_bundle(corpus_id, archive_id, stored.storage_path, ingest_child=_fake_index_with_chunk) == "indexed"
+    member = _members_by_filename(pg_repos, archive_id)["member.md"]
+    real_stable_id = f"{archive_id}!member.md"
+    assert pg_repos.corpus_file_sources_repo().resolve(corpus_id, real_stable_id) == member["id"]
+
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    resp = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("attacker.md", io.BytesIO(b"attacker-controlled content"), "text/markdown")},
+        data={"source_stable_ids": real_stable_id},
+        headers=auth,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reserved_source_stable_id" in resp.text
+
+    unchanged = pg_repos.corpus_files_repo().get(member["id"])
+    assert unchanged["sha256"] == member["sha256"], "the real member's content must be untouched by the refused upload"
+
+
+def test_reserved_stable_id_refused_at_facts_ingest(pg_repos, pg_engine):
+    """The second, worse path the review flagged: `documents[].stable_id`
+    resolves through the SAME stable-id-first match, then
+    `sources_repo.upsert(...)` whose conflict target is the `corpus_file_id`
+    PK — so a forged stable_id there would let a caller overwrite a real
+    member's `source_doc_id`, hijacking the citation key. Refused up front,
+    whole batch, before any document is resolved."""
+    from src.ingest.bundle import ingest_bundle
+    from src.repositories.facts_pg import IngestReservedStableId
+
+    corpus_id = _new_corpus(pg_repos, "impersonate-2")
+    data = _zip_bytes({"member.md": b"the real member's content"})
+    stored = _store(corpus_id, "dump.zip", data)
+    archive_id = pg_repos.corpus_files_repo().add(
+        corpus_id=corpus_id,
+        filename="dump.zip",
+        sha256=stored.sha256,
+        file_type="zip",
+        size_bytes=stored.size_bytes,
+        storage_path=stored.storage_path,
+    )
+    assert ingest_bundle(corpus_id, archive_id, stored.storage_path, ingest_child=_fake_index_with_chunk) == "indexed"
+    member = _members_by_filename(pg_repos, archive_id)["member.md"]
+    real_stable_id = f"{archive_id}!member.md"
+    original_doc_id = pg_repos.corpus_file_sources_repo().get(member["id"])["source_doc_id"]
+
+    facts_repo = pg_repos.facts_repo()
+    import pytest as _pytest
+
+    with _pytest.raises(IngestReservedStableId) as excinfo:
+        facts_repo.ingest_batch(
+            documents=[
+                {
+                    "doc_id": "attackerdoc00000",
+                    "corpus_id": corpus_id,
+                    "stable_id": real_stable_id,
+                }
+            ],
+            nodes=[
+                {
+                    "id": "engagement:hijack",
+                    "type": "engagement",
+                    "evidence": [{"doc_id": "attackerdoc00000", "quote": "irrelevant"}],
+                }
+            ],
+        )
+    assert real_stable_id in excinfo.value.stable_ids
+
+    # Nothing was written: the real member's own citation key is untouched,
+    # and no claim was created under either doc_id.
+    assert pg_repos.corpus_file_sources_repo().get(member["id"])["source_doc_id"] == original_doc_id
+    assert _claim_count(pg_engine, member["id"]) == 0
+
+
+def test_facts_ingest_http_400s_on_reserved_stable_id(pg_engine, monkeypatch, tmp_path):
+    """HTTP round trip proving the exception is actually wired to a 400."""
+    from ._parity_sweep_util import build_seeded_client
+
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    cr = client.post("/api/collections", json={"name": "Facts Reserved Shape"}, headers=auth)
+    assert cr.status_code == 201, cr.text
+    corpus_id = cr.json()["id"]
+
+    forged = "cf_deadbeefdeadbeef!x.md"
+    resp = client.post(
+        "/api/facts/ingest",
+        json={
+            "documents": [{"doc_id": "somedoc00000000", "corpus_id": corpus_id, "stable_id": forged}],
+            "nodes": [
+                {
+                    "id": "engagement:x",
+                    "type": "engagement",
+                    "evidence": [{"doc_id": "somedoc00000000", "quote": "x"}],
+                }
+            ],
+        },
+        headers=auth,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reserved_source_stable_id" in resp.text
+    assert forged in resp.text
+
+
+def test_bundle_to_non_bundle_replacement_purges_children_chunks_claims_and_anchors(pg_repos, pg_engine):
+    """Review finding 2. `report.zip` (2 indexed members, each with a
+    claim) re-uploaded at the SAME identity as `report.pdf`: deciding
+    whether to purge children from the row's OLD filename alone skipped the
+    children-walk (old name says bundle) while `ingest_file` dispatches on
+    the NEW filename after `update_in_place` (new name says pdf, never
+    routes to `ingest_bundle` either) — so the old members' rows, chunks,
+    claims and anchors survived FOREVER, attached to a row that is now a
+    PDF. Requiring BOTH old and new classification to be `bundle` before
+    skipping the purge closes it: a type change away from bundle always
+    takes the full purge path."""
+    from app.api.collections import _upsert_corpus_file
+    from src.ingest.bundle import ingest_bundle
+    from src.repositories import corpus_chunks_repo
+
+    corpus_id = _new_corpus(pg_repos, "bundle-type-change")
+    sources_repo = pg_repos.corpus_file_sources_repo()
+    cf_repo = pg_repos.corpus_files_repo()
+    chunks_repo = corpus_chunks_repo()
+    facts_repo = pg_repos.facts_repo()
+
+    v1 = _zip_bytes({"a.md": b"alpha content", "b.md": b"beta content"})
+    stored_v1 = _store(corpus_id, "report.zip", v1)
+    archive_id, _, _ = _upsert_corpus_file(
+        corpus_id,
+        path="docs/report",
+        stable_id="graph:typechange",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="report.zip",
+        sha256=stored_v1.sha256,
+        file_type="zip",
+        size_bytes=stored_v1.size_bytes,
+        storage_path=stored_v1.storage_path,
+        sources_repo=sources_repo,
+    )
+    assert ingest_bundle(corpus_id, archive_id, stored_v1.storage_path, ingest_child=_fake_index_with_chunk) == (
+        "indexed"
+    )
+    members = _members_by_filename(pg_repos, archive_id)
+    assert set(members) == {"a.md", "b.md"}
+    for name, member in members.items():
+        _seed_claim(
+            facts_repo,
+            file_id=member["id"],
+            corpus_id=corpus_id,
+            natural_key=f"engagement:typechange-{name}",
+            sha=member["sha256"],
+            quote=f"seeded for {name}",
+        )
+        assert _claim_count(pg_engine, member["id"]) == 1
+        assert len(chunks_repo.list_for_file(member["id"])) == 1
+        assert sources_repo.get(member["id"]) is not None
+
+    # Re-upload at the SAME identity (path + stable_id) as a PDF, not a zip.
+    pdf_bytes = b"%PDF-1.4 not really a pdf but a different file type"
+    stored_pdf = _store(corpus_id, "report.pdf", pdf_bytes)
+    archive_id2, needs_processing, _ = _upsert_corpus_file(
+        corpus_id,
+        path="docs/report",
+        stable_id="graph:typechange",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="report.pdf",
+        sha256=stored_pdf.sha256,
+        file_type="pdf",
+        size_bytes=stored_pdf.size_bytes,
+        storage_path=stored_pdf.storage_path,
+        sources_repo=sources_repo,
+    )
+    assert archive_id2 == archive_id, "the row id is still preserved across the type change (§6)"
+    assert needs_processing is True
+
+    # Every trace of the two zip members must be gone: rows, chunks, claims,
+    # anchors — the row is now a PDF and must not still serve deleted zip
+    # content.
+    assert cf_repo.list_children(archive_id) == []
+    for name, member in members.items():
+        assert cf_repo.get(member["id"]) is None, f"{name}'s row must be hard-deleted"
+        assert _claim_count(pg_engine, member["id"]) == 0, f"{name}'s claim must be gone"
+        assert chunks_repo.list_for_file(member["id"]) == [], f"{name}'s chunks must be gone"
+        assert sources_repo.get(member["id"]) is None, f"{name}'s anchor must be gone"
+
+
+def test_non_bundle_to_bundle_replacement_still_works(pg_repos, pg_engine):
+    """Reverse direction, negative control: a plain document re-uploaded as
+    a zip at the same identity has no children to lose (a non-bundle row
+    never has any), and the archive's own content-changed purge behaves
+    exactly as it always did — then the next `ingest_bundle` pass populates
+    fresh members normally."""
+    from app.api.collections import _upsert_corpus_file
+    from src.ingest.bundle import ingest_bundle
+
+    corpus_id = _new_corpus(pg_repos, "reverse-type-change")
+    sources_repo = pg_repos.corpus_file_sources_repo()
+    cf_repo = pg_repos.corpus_files_repo()
+
+    stored_md = _store(corpus_id, "note.md", b"plain document content")
+    file_id, _, _ = _upsert_corpus_file(
+        corpus_id,
+        path="docs/note",
+        stable_id="graph:reversetype",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="note.md",
+        sha256=stored_md.sha256,
+        file_type="md",
+        size_bytes=stored_md.size_bytes,
+        storage_path=stored_md.storage_path,
+        sources_repo=sources_repo,
+    )
+    cf_repo.set_status(file_id, status="indexed")
+
+    v_zip = _zip_bytes({"x.md": b"member content"})
+    stored_zip = _store(corpus_id, "note.zip", v_zip)
+    file_id2, needs_processing, _ = _upsert_corpus_file(
+        corpus_id,
+        path="docs/note",
+        stable_id="graph:reversetype",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="note.zip",
+        sha256=stored_zip.sha256,
+        file_type="zip",
+        size_bytes=stored_zip.size_bytes,
+        storage_path=stored_zip.storage_path,
+        sources_repo=sources_repo,
+    )
+    assert file_id2 == file_id
+    assert needs_processing is True
+
+    assert ingest_bundle(corpus_id, file_id, stored_zip.storage_path, ingest_child=_fake_index_with_chunk) == (
+        "indexed"
+    )
+    members = _members_by_filename(pg_repos, file_id)
+    assert set(members) == {"x.md"}
+    assert sources_repo.resolve(corpus_id, f"{file_id}!x.md") == members["x.md"]["id"]
+
+
+def test_concurrent_anchor_write_race_does_not_500(pg_repos, pg_engine):
+    """Review finding 3. Two overlapping `ingest_bundle` runs on the same
+    archive can both mint a fresh row for the same changed member and both
+    try to claim the identical `_member_stable_id` — `upsert`'s conflict
+    target is `corpus_file_id` (the PK), not the `(corpus_id,
+    source_stable_id)` pair, so the loser hits the unique constraint.
+    Simulated here by pre-seeding a conflicting anchor under a DIFFERENT
+    `corpus_file_id` before the anchor-write pass runs; `ingest_bundle` must
+    not raise, and the archive must still reach a terminal status."""
+    from src.ingest.bundle import ingest_bundle
+
+    corpus_id = _new_corpus(pg_repos, "race-1")
+    sources_repo = pg_repos.corpus_file_sources_repo()
+    cf_repo = pg_repos.corpus_files_repo()
+
+    data = _zip_bytes({"a.md": b"racing content"})
+    stored = _store(corpus_id, "dump.zip", data)
+    archive_id = cf_repo.add(
+        corpus_id=corpus_id,
+        filename="dump.zip",
+        sha256=stored.sha256,
+        file_type="zip",
+        size_bytes=stored.size_bytes,
+        storage_path=stored.storage_path,
+    )
+
+    # Simulate the "loser" side of the race: a decoy row already holds the
+    # exact stable_id this run's own member is about to mint — a STANDALONE
+    # file (no `parent_file_id`), so `ingest_bundle`'s own child
+    # reconciliation (which only ever walks `archive_id`'s children) can
+    # never see or prune it away before the anchor-write pass runs; the
+    # conflict must persist until that pass actually hits it, exactly as a
+    # concurrent winning run's freshly-committed anchor would.
+    decoy_id = cf_repo.add(
+        corpus_id=corpus_id,
+        filename="decoy.md",
+        sha256="decoysha",
+        file_type="md",
+        size_bytes=1,
+        storage_path=None,
+    )
+    sources_repo.upsert(
+        corpus_file_id=decoy_id,
+        corpus_id=corpus_id,
+        source_stable_id=f"{archive_id}!a.md",
+    )
+
+    status = ingest_bundle(corpus_id, archive_id, stored.storage_path, ingest_child=_fake_index_with_chunk)
+    assert status == "indexed", "the race must not 500 the whole ingest"
+
+    # This run's own member content is correctly stored and indexed either
+    # way — only its OWN anchor write lost the race.
+    member = _members_by_filename(pg_repos, archive_id)["a.md"]
+    assert member["processing_status"] == "indexed"
+    assert member["id"] != decoy_id

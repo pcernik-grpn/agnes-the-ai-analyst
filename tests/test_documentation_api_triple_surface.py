@@ -1334,6 +1334,20 @@ _EXEMPT: dict[str, str] = {
         "persisted ingest run reports (spec §7.2/§13.2) — admin-only, feeds the "
         "/admin/data-sources source card, not an analyst query surface; no CLI/MCP analogue"
     ),
+    # F3 (audit-full-coverage plan, Task 9). Batch ingestion endpoint the
+    # `agnes push` command calls internally to upload the offline-query
+    # audit spool — mirrors the grandfathered /api/upload/sessions and
+    # /api/upload/local-md endpoints (no standalone `agnes upload …`
+    # subcommand, no MCP analogue: there is nothing for an agent or an
+    # analyst to invoke here directly, it's a delivery mechanism for
+    # events the CLI already produced as a side effect of `agnes
+    # query`/`agnes explore` running locally).
+    "/api/upload/audit-events": (
+        "client-reported CLI audit event batch upload (F3, audit-full-coverage "
+        "plan) — internal to `agnes push`, mirrors the grandfathered "
+        "/api/upload/sessions and /api/upload/local-md endpoints; no standalone "
+        "CLI subcommand or MCP analogue"
+    ),
 }
 
 

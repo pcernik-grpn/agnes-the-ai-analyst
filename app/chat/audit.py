@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import time
 from typing import Any
+
+from src.audit_helpers import hash_args  # noqa: F401 — re-exported, see below
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,3 @@ def write_audit(
         )
     except Exception:
         logger.exception("audit_log write failed: action=%s", action)
-
-
-def hash_args(args: Any) -> str:
-    """Return first 16 hex chars of SHA-256 of the JSON-serialised args."""
-    raw = json.dumps(args, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
