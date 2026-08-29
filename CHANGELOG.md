@@ -230,7 +230,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   of MIXED kind (the access page, where the word is the only thing telling a
   package from a plugin) and **glyph alone** for a list GROUPED by kind (the
   Library, where the band overhead already said the word). Same glyph, same
-  colour, same corner — the label is the variable, not the identity.
+  colour, same corner — the label is the variable, not the identity. The
+  Library's row tile IS that component now rather than a lookalike of it:
+  `.lib-icon` survives only as the drag-and-drop hook and the carrier of the
+  collection ring, and hands the section's already-resolved `--lib-kind`
+  straight to the tag.
 - **The access page's rows carry their kind's colour, and its levels nest
   visibly.** Rows take the leading kind accent the Library's rows have, so
   "the packages" are findable in a mixed list without reading a word. The
