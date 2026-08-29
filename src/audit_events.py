@@ -300,6 +300,104 @@ CATALOG: dict[str, AuditEvent] = {
         "Generic fallback row written by AuditFallbackMiddleware for a mutating "
         "request whose handler wrote no audit row of its own.",
     ),
+    # Task 7 (F2e — secrets, admin config, distribution channels, ingress)
+    "source_connection.create": AuditEvent(
+        "source_connection.create", "mutation", "A named data-source connection was created."
+    ),
+    "source_connection.update": AuditEvent(
+        "source_connection.update", "mutation", "A named data-source connection was updated."
+    ),
+    "source_connection.delete": AuditEvent(
+        "source_connection.delete", "mutation", "A named data-source connection was deleted."
+    ),
+    "source_connection.test": AuditEvent(
+        "source_connection.test", "mutation", "A named data-source connection's connectivity was tested."
+    ),
+    "source_connection.secret.set": AuditEvent(
+        "source_connection.secret.set", "mutation", "A source connection's vault-stored token was set/rotated."
+    ),
+    "source_connection.secret.clear": AuditEvent(
+        "source_connection.secret.clear", "mutation", "A source connection's vault-stored token was cleared."
+    ),
+    "mcp_user_secret.set": AuditEvent(
+        "mcp_user_secret.set", "mutation", "An analyst's own per-user MCP source credential was set/rotated."
+    ),
+    "mcp_user_secret.clear": AuditEvent(
+        "mcp_user_secret.clear", "mutation", "An analyst's own per-user MCP source credential was cleared."
+    ),
+    "mcp_user_secret.test": AuditEvent(
+        "mcp_user_secret.test", "mutation", "An analyst's own per-user MCP source credential was test-connected."
+    ),
+    "mcp_user_secret.read": AuditEvent(
+        "mcp_user_secret.read", "read", "An analyst read their own per-user MCP source credential status."
+    ),
+    "datasource.secret.set": AuditEvent(
+        "datasource.secret.set", "mutation", "A server-wide datasource vault secret was set/rotated."
+    ),
+    "datasource.secret.clear": AuditEvent(
+        "datasource.secret.clear", "mutation", "A server-wide datasource vault secret was cleared."
+    ),
+    "datasource.secret.read": AuditEvent(
+        "datasource.secret.read", "read", "The server-wide datasource secrets' presence/source status was read."
+    ),
+    "slack.secret.set": AuditEvent(
+        "slack.secret.set", "mutation", "A server-wide Slack bot vault secret was set/rotated."
+    ),
+    "slack.secret.clear": AuditEvent(
+        "slack.secret.clear", "mutation", "A server-wide Slack bot vault secret was cleared."
+    ),
+    "slack.secret.read": AuditEvent(
+        "slack.secret.read", "read", "The server-wide Slack bot secrets' presence/source status was read."
+    ),
+    "server_config.read": AuditEvent(
+        "server_config.read", "read", "The admin server-config editor's current instance.yaml view was read."
+    ),
+    "instance.configure": AuditEvent(
+        "instance.configure",
+        "mutation",
+        "POST /api/admin/configure wrote data-source/instance settings to instance.yaml.",
+    ),
+    "script.deploy": AuditEvent("script.deploy", "mutation", "An admin-authored server script was deployed."),
+    "script.run": AuditEvent("script.run", "mutation", "An admin-authored server script was run (ad-hoc or deployed)."),
+    "script.delete": AuditEvent("script.delete", "mutation", "A deployed server script was undeployed."),
+    "marketplace.bundle_download": AuditEvent(
+        "marketplace.bundle_download",
+        "read",
+        "The aggregated marketplace zip (or a single-plugin repackage) was downloaded.",
+    ),
+    "marketplace.git_fetch": AuditEvent(
+        "marketplace.git_fetch", "read", "The per-user marketplace bare repo was fetched over git smart-HTTP."
+    ),
+    "marketplace.git_push": AuditEvent(
+        "marketplace.git_push", "mutation", "A push was attempted against the per-user marketplace bare repo."
+    ),
+    "store.bundle_download": AuditEvent(
+        "store.bundle_download", "read", "A ZIP export of Store entities was downloaded."
+    ),
+    "memory.bundle_download": AuditEvent(
+        "memory.bundle_download", "read", "A token-budgeted (or per-domain markdown) corporate-memory bundle was read."
+    ),
+    "webhook.jira_received": AuditEvent(
+        "webhook.jira_received", "system", "A Jira webhook event passed signature verification."
+    ),
+    "webhook.jira_rejected": AuditEvent(
+        "webhook.jira_rejected", "system", "A Jira webhook event was rejected (bad/missing signature)."
+    ),
+    "artifact.upload": AuditEvent(
+        "artifact.upload", "mutation", "A user artifact (HTML report, chart, ...) was uploaded."
+    ),
+    "local_md.upload": AuditEvent(
+        "local_md.upload", "mutation", "A CLAUDE.local.md was uploaded for corporate-memory processing."
+    ),
+    "sync.pull_confirmed": AuditEvent(
+        "sync.pull_confirmed", "mutation", "The CLI reported completion of an `agnes pull`."
+    ),
+    "sync.settings_update": AuditEvent(
+        "sync.settings_update", "mutation", "A user's dataset sync settings were updated."
+    ),
+    "sync.subscriptions_update": AuditEvent(
+        "sync.subscriptions_update", "mutation", "A user's per-table subscription settings were updated."
+    ),
 }
 
 

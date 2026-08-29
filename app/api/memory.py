@@ -14,6 +14,7 @@ from app.auth.dependencies import get_current_user, _get_db
 from app.auth.access import require_admin, is_user_admin, can_access, can_access_session
 from app.auth.session_principal import PRINCIPAL_TYPES
 
+from src.audit_helpers import identity_for_audit, log_safe
 from src.knowledge_directive_scan import DELIVERY_NOTICE, scan_item
 from src.repositories import (
     audit_repo,
@@ -1704,6 +1705,14 @@ def _build_per_domain_markdown(slug: str, user: dict, conn: duckdb.DuckDBPyConne
     if not allowed:
         raise HTTPException(status_code=403, detail="no_grant")
 
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="memory.bundle_download",
+        resource=f"memory_domain:{dom['id']}",
+        params={"slug": slug},
+    )
+
     # Pull items the same way the manifest md5 helper does — id order,
     # full payload (title/status/is_required pulled via the knowledge
     # repository for content), no token-budget truncation.
@@ -1860,6 +1869,13 @@ async def get_bundle(
         approved_included.append(item)
         budget_remaining -= cost
 
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="memory.bundle_download",
+        resource="memory:bundle",
+        params={"mandatory_count": len(mandatory), "approved_count": len(approved_included)},
+    )
     return {
         "mandatory": mandatory,
         "approved": approved_included,

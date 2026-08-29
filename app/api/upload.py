@@ -15,7 +15,7 @@ from app.auth.dependencies import get_current_user
 from app.utils import get_data_dir as _get_data_dir
 from app.utils import local_md_filename as _local_md_filename
 from app.utils import uploaded_local_md_dir as _uploaded_local_md_dir
-from src.audit_helpers import client_kind_from_user
+from src.audit_helpers import client_kind_from_user, log_safe
 
 from src.repositories import (
     audit_repo,
@@ -209,6 +209,13 @@ async def upload_artifact(
     except Exception:
         Path(tmp.name).unlink(missing_ok=True)
         raise
+    log_safe(
+        user_id=user_id,
+        action="artifact.upload",
+        params={"filename": filename[:256], "bytes": size},
+        result="success",
+        client_kind=client_kind_from_user(user),
+    )
     return {"status": "ok", "filename": filename, "size": size}
 
 
@@ -232,6 +239,14 @@ async def upload_local_md(
     # (or the directory) written here.
     target = md_dir / _local_md_filename(user_email)
     target.write_text(request.content, encoding="utf-8")
+    # NEVER the content — only its byte length enters the audit record.
+    log_safe(
+        user_id=user.get("id"),
+        action="local_md.upload",
+        params={"bytes": len(request.content)},
+        result="success",
+        client_kind=client_kind_from_user(user),
+    )
     return {
         "status": "ok",
         "user": user_email,
