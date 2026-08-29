@@ -104,6 +104,41 @@ class FactsNeighborsRequest(BaseModel):
     limit: int = Field(default=500, ge=1, le=500)
 
 
+DEFAULT_FACET_TYPES = ("client", "industry", "service_offering", "doc_type")
+
+
+@router.get("/facets")
+def facts_facets(
+    types: Optional[str] = Query(
+        default=None,
+        description="Comma-separated fact types to facet on. Defaults to the Library's four.",
+        max_length=200,
+    ),
+    limit_per_type: int = Query(default=50, ge=1, le=200),
+    user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Filterable entity values per type, with a document count each — what
+    the Library's filter menu offers instead of hand-entered tags.
+
+    The vocabulary comes from the extraction pass (client, industry, service
+    offering, document type), so it is maintained by ingestion rather than by
+    somebody remembering to tag a file.
+
+    Gated exactly as :func:`facts_search` is: a facet lists only subjects
+    this caller could reach, and each `document_count` counts only documents
+    in collections they can read — a `revealed` subject's unreadable evidence
+    is not tallied, since that would report how many files sit in a
+    collection they cannot open. Response: ``{"facets": {type: [{"subject_id",
+    "label", "document_count"}]}}``.
+    """
+    wanted = [t.strip() for t in types.split(",") if t.strip()] if types else list(DEFAULT_FACET_TYPES)
+    if not wanted:
+        raise HTTPException(status_code=422, detail="no facet types requested")
+    if len(wanted) > 12:
+        raise HTTPException(status_code=422, detail="too many facet types (max 12)")
+    return {"facets": facts_repo().facet_values(user, types=wanted, limit_per_type=limit_per_type)}
+
+
 @router.get("/type-map")
 def facts_type_map(user=Depends(get_current_user)) -> Dict[str, Any]:
     """Live counts per node type over everything the caller can see — the
