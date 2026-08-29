@@ -26,7 +26,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from src.audit_context import auto_duration_ms
+from src.audit_context import (
+    auto_client_ip,
+    auto_client_kind,
+    auto_correlation_id,
+    auto_duration_ms,
+    mark_audit_written,
+)
 from src.audit_helpers import (
     AUDIT_SOURCE_CASE_SQL,
     RESULT_CLASS_CASE_SQL,
@@ -110,8 +116,22 @@ class AuditPgRepository:
         client_kind: Optional[str] = None,
         correlation_id: Optional[str] = None,
     ) -> str:
+        """Insert one audit_log row. Returns the new row id.
+
+        `client_ip` / `correlation_id` / `client_kind` autofill from the
+        `src.audit_context` contextvars (F0 — audit-full-coverage plan, Task
+        1) when the caller passes `None` — an explicit kwarg always wins.
+        Mirrors `src/repositories/audit.py::AuditRepository.log` exactly;
+        keep both in lockstep.
+        """
         if duration_ms is None:
             duration_ms = auto_duration_ms()
+        if client_ip is None:
+            client_ip = auto_client_ip()
+        if correlation_id is None:
+            correlation_id = auto_correlation_id()
+        if client_kind is None:
+            client_kind = auto_client_kind()
         entry_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         with self._engine.begin() as conn:
@@ -145,6 +165,7 @@ class AuditPgRepository:
                     "correlation_id": correlation_id,
                 },
             )
+        mark_audit_written()
         return entry_id
 
     # -----------------------------------------------------------------

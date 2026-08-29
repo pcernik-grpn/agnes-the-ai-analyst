@@ -55,6 +55,7 @@ from app.auth.dependencies import get_current_user
 from app.services.journey import mark_journey
 from src.corpus_allowlist import classify
 from src.file_storage import delete_corpus_file, store_corpus_file
+from src.ingest.member_identity import is_reserved_member_stable_id
 from src.sql_ident import quote_ident
 from src.repositories import (
     corpus_chunks_repo,
@@ -699,26 +700,43 @@ def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
         return 0
 
 
-def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> int:
+def _purge_children_and_content(
+    collection_id: str, row: dict, *, new_filename: str, defer_row_purge: bool = False
+) -> int:
     """Purge the row's OWN chunks, derived tables and fact claims ahead of an
-    in-place content update that reuses ``row``'s id — plus, for a
-    NON-bundle row, its (non-existent in practice, but walked defensively)
-    children.
+    in-place content update that reuses ``row``'s id — plus, for a row that
+    is NOT staying a bundle across this update, its (non-existent in
+    practice for a plain document, but walked defensively) children.
 
-    A bundle (zip archive) row is the deliberate exception: its zip-bundle
-    children are left ALONE here. Reconciling them is ``ingest_bundle``'s own
-    job — it matches each member to its existing row by ``(filename,
-    sha256)`` and purges only the ones that actually changed or disappeared
-    (``src/ingest/bundle.py``, "Prune children from a prior run"), which is
-    what lets a routine re-upload of an N-member zip with one changed member
-    keep the other N-1 members' rows, anchors and claims intact. Purging
-    every child here unconditionally was the previous behavior, and it
-    defeated that: the archive's OWN content-changed branch always fires on ANY
-    member change (the zip's bytes differ), so every re-sync re-minted every
-    member's id and cascaded every member's claims, not just the changed
-    one's. The needs_processing reschedule below still runs
-    ``ingest_bundle`` right after, so the members ARE reconciled — just
-    narrowly, not by nuking the lot first.
+    A row that IS a bundle both BEFORE (``row``'s OLD filename) and AFTER
+    (``new_filename``, the incoming upload's own name) this update is the
+    deliberate exception: its zip-bundle children are left ALONE here.
+    Reconciling them is ``ingest_bundle``'s own job — it matches each member
+    to its existing row by ``(filename, sha256)`` and purges only the ones
+    that actually changed or disappeared (``src/ingest/bundle.py``, "Prune
+    children from a prior run"), which is what lets a routine re-upload of
+    an N-member zip with one changed member keep the other N-1 members'
+    rows, anchors and claims intact. Purging every child here unconditionally
+    was the previous behavior, and it defeated that: the archive's OWN
+    content-changed branch always fires on ANY member change (the zip's
+    bytes differ), so every re-sync re-minted every member's id and
+    cascaded every member's claims, not just the changed one's. The
+    needs_processing reschedule below still runs ``ingest_bundle`` right
+    after, so the members ARE reconciled — just narrowly, not by nuking the
+    lot first.
+
+    Deciding this from ``row``'s OLD filename ALONE (dropped after review) was
+    its own bug: a zip re-uploaded, same identity, as a NON-zip (e.g.
+    ``report.zip`` -> ``report.pdf``) skipped the children-walk (old name
+    said bundle) while ``runner.ingest_file`` dispatches on the row's NEW
+    ``file_type``/filename after ``update_in_place`` — so it never routes to
+    ``ingest_bundle`` either (new name says pdf). The old members' rows,
+    chunks, claims and anchors then survived FOREVER, attached to a row that
+    is now a PDF — a visibility bug (a deleted document's content still
+    readable), not untidiness. Requiring BOTH sides to still classify as
+    ``bundle`` closes that: a type change away from ``bundle`` always takes
+    the full children-purge path below, exactly like today's regular
+    (non-bundle) row does.
 
     ``row`` itself, and its own blob, are left for the caller
     (``_upsert_corpus_file``): ``row`` still carries its OLD ``storage_path``
@@ -729,10 +747,10 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
 
     ``defer_row_purge`` withholds ONLY the row's own derived-table purge, for
     a caller that is going to re-ingest this same row and must therefore run
-    purge-then-ingest as one ordered unit (see ``upload_files``). For a
-    NON-bundle row with (defensively-walked) children, those child rows are
-    still hard-deleted here, so the next ingest mints fresh child ids and
-    fresh ``table_id``s — there is nothing for a later purge to collide with.
+    purge-then-ingest as one ordered unit (see ``upload_files``). For a row
+    with (real or defensively-walked) children, those child rows are still
+    hard-deleted here, so the next ingest mints fresh child ids and fresh
+    ``table_id``s — there is nothing for a later purge to collide with.
 
     Returns the number of fact claims purged for ``row`` itself (0 when the
     ``facts`` flag is off, which is the default) — the caller threads this
@@ -743,10 +761,10 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
     cf_repo = corpus_files_repo()
     chunks_repo = corpus_chunks_repo()
 
-    is_bundle = classify(row.get("filename") or "") == "bundle"
+    stays_bundle = classify(row.get("filename") or "") == "bundle" and classify(new_filename) == "bundle"
 
     children: list[dict] = []
-    if not is_bundle:
+    if not stays_bundle:
         stack = [row["id"]]
         while stack:
             for child in cf_repo.list_children(stack.pop()):
@@ -876,7 +894,9 @@ def _upsert_corpus_file(
         content_changed = existing.get("sha256") != sha256
         old_blob = existing.get("storage_path")
         if content_changed:
-            claims_purged = _purge_children_and_content(collection_id, existing, defer_row_purge=defer_row_purge)
+            claims_purged = _purge_children_and_content(
+                collection_id, existing, new_filename=filename, defer_row_purge=defer_row_purge
+            )
         cf_repo.update_in_place(
             file_id,
             filename=filename,
@@ -1142,6 +1162,27 @@ async def upload_files(
         non_blank_ids = [s.strip() for s in source_stable_ids if s and s.strip()]
         if len(non_blank_ids) != len(set(non_blank_ids)):
             raise HTTPException(status_code=400, detail="duplicate_source_stable_id_in_batch")
+
+        # RESERVED SHAPE (security, not a format quirk): `cf_<hex>!<member
+        # path>` is the shape ONLY `src.ingest.bundle._member_stable_id`
+        # may mint. A caller-supplied `source_stable_id` on this shape would
+        # resolve through the exact same stable-id-first match `_upsert_
+        # corpus_file` uses for a real member (§6) — an unrelated file
+        # re-uploaded under a member's own stable_id would silently replace
+        # that member's content IN PLACE, bypassing `ingest_bundle` entirely,
+        # while the archive's own children list and zip bytes on disk stay
+        # unaware. The shape is visible to anyone with mere collection READ
+        # access (`_file_out` returns both `corpus_files.id` and `filename`
+        # for every listed row), so this is reachable by any caller who can
+        # already see the archive plus WRITE to this endpoint — refused up
+        # front, before any file is stored, same style as the duplicate
+        # check above.
+        reserved = sorted({s for s in non_blank_ids if is_reserved_member_stable_id(s)})
+        if reserved:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "reserved_source_stable_id", "source_stable_ids": reserved},
+            )
 
     # Resolve the (PG-only) source-mapping repo ONCE, up front, when this
     # request actually uses it — so a DuckDB-backed instance fails clean

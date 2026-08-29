@@ -326,6 +326,15 @@ class AgnesMCPOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             # like the CLI workspace, instead of inheriting catalog
             # god-mode. Browser session JWTs carry no scope claim and are
             # unaffected.
+            #
+            # F0 audit-context (Task 1): the SAME ``scope="mcp-oauth"``
+            # claim also makes ``app.auth.pat_resolver.resolve_token_to_user``
+            # — every subsequent request's actual verify path, since this
+            # JWT is a standard Agnes session token, not something this
+            # module re-verifies itself — stamp ``user["token_type"] =
+            # "mcp_oauth"``, so ``src.audit_helpers.client_kind_from_user``
+            # classifies the request as ``client_kind="mcp"`` instead of the
+            # generic ``"web"`` default.
             extra_claims={"scope": "mcp-oauth"},
         )
 
@@ -430,6 +439,15 @@ class AgnesMCPOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
             # like the CLI workspace, instead of inheriting catalog
             # god-mode. Browser session JWTs carry no scope claim and are
             # unaffected.
+            #
+            # F0 audit-context (Task 1): the SAME ``scope="mcp-oauth"``
+            # claim also makes ``app.auth.pat_resolver.resolve_token_to_user``
+            # — every subsequent request's actual verify path, since this
+            # JWT is a standard Agnes session token, not something this
+            # module re-verifies itself — stamp ``user["token_type"] =
+            # "mcp_oauth"``, so ``src.audit_helpers.client_kind_from_user``
+            # classifies the request as ``client_kind="mcp"`` instead of the
+            # generic ``"web"`` default.
             extra_claims={"scope": "mcp-oauth"},
         )
         oauth_clients_repo().save_access_token(
