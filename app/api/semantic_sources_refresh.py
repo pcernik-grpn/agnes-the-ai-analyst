@@ -38,6 +38,16 @@ instance:
   upstream project is skipped (``skipped_duplicate_project``) instead of
   importing that project a second time under a second prune scope.
 
+The Databricks row (``databricks_default``) is now swept like any other:
+exactly once per run, by this sweep alone. While the dedicated Databricks
+refresh still existed, the two were NOT disjoint — that job called the very
+same ``import_source('databricks_default')`` on the very same row under the
+identical ``ossie_connection``/``databricks_default`` provenance, so the sweep
+had to skip the row (``skipped_legacy_owned``) to avoid importing it twice per
+tick. Retiring the job removed the second writer and with it the reason for
+the skip, so both are gone and the ``skipped_legacy_owned`` counter no longer
+appears in this endpoint's response.
+
 Both are failure-isolated: a migration or reconciliation that raises is
 logged and the sweep continues. A sweep that could not migrate is still a
 sweep over whatever is registered.

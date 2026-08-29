@@ -407,3 +407,47 @@ class TestSweepSummary:
         assert summary["last_status"] == "ok"
         assert summary["last_completed_at"]
         assert summary["last_result"]["synced"] == 1
+
+
+def test_the_databricks_row_is_swept_exactly_once(seeded_app, monkeypatch):
+    """The inverse of the guard this sweep needed before the migration.
+
+    While the dedicated Databricks refresh existed, it called the very same
+    ``import_source('databricks_default')`` on the very same row under the
+    identical provenance, so the sweep had to SKIP that row or import it twice
+    per tick. That job is gone (#1707 steps 3-4) and the sweep is now its only
+    writer — the row must be imported, exactly once, like any other.
+    """
+    from connectors.databricks.semantic_layer import DATABRICKS_SEMANTIC_SOURCE_ID
+    from src.repositories import semantic_source_repo
+
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    # The production row is created by ensure_semantic_source() through the
+    # repository with this FIXED id — the admin API generates its own ids,
+    # so go the same route the connector does.
+    semantic_source_repo().create(
+        id=DATABRICKS_SEMANTIC_SOURCE_ID,
+        kind="connection",
+        name="Databricks metric views",
+        adapter="databricks_metric_views",
+        config={"safe_prune": True},
+        enabled=True,
+    )
+
+    calls = []
+
+    def _record(source_id):
+        calls.append(source_id)
+        return _FAKE_REPORT
+
+    monkeypatch.setattr("app.api.semantic_sources_refresh.import_source", _record)
+    r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert calls == [DATABRICKS_SEMANTIC_SOURCE_ID]
+    assert body["synced"] == 1
+    assert {"id": DATABRICKS_SEMANTIC_SOURCE_ID, "name": "Databricks metric views", "status": "ok"} in body["sources"]
+    # The counter that named the retired job is gone with it.
+    assert "skipped_legacy_owned" not in body
