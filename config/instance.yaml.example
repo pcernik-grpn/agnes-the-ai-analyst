@@ -1197,6 +1197,16 @@ facts:
 # extraction-worker deployment) — this is operator/deploy-time config, not
 # a runtime toggle. The rest of this block (`producer`, `schedule`,
 # `timeout_s`) is plain instance data, read directly via get_value.
+#
+# Flipping `enabled` here is NOT, by itself, enough to run the
+# extraction-worker compose service. That service sets AGNES_ROLE=worker
+# (a role split), which makes the deployment multi-process — see
+# `deployment.role` and `coordination.backend` above, and
+# docs/DEPLOYMENT.md#multi-process. Before starting it you ALSO need:
+# Postgres app-state (`database.backend`), explicit
+# `JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis`.
+# Without those, `app/startup_guards.py::validate_deployment` refuses to
+# boot the worker container.
 extraction:
   enabled: false
   producer:
