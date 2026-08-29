@@ -773,6 +773,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   producer key) there re-opened the exact hole the consumer-class split
   above closes; `get_allowed_token_envs()` now always subtracts both other
   boundaries back out, even from the override.
+- **`corporate_memory.distribution_mode` now actually gates what reaches a
+  caller (#1573).** The knob was documented, editable in
+  `/admin/server-config`, and read by nothing — every mode shipped every
+  approved item to every user. It now narrows the OPTIONAL (approved,
+  non-required) channel of `GET /api/memory/bundle` (both the JSON and the
+  per-domain markdown `agnes pull` writes) and the corresponding
+  `memory_domains[].md5` in `/api/sync/manifest`: `"mandatory_only"` and
+  `"admin_curated"` ship required items only (approved items stay
+  catalog-browsable, matching "distribution is always admin-driven"
+  for those two modes); `"hybrid"` (default, unchanged behavior for an
+  instance that has never voted) makes approved items personally opt-in via
+  upvote. An unrecognized value now logs a warning and falls back to
+  `"hybrid"` instead of silently doing nothing. Required (mandatory) items
+  are unaffected in every mode. All three surfaces share one selector
+  (`select_distributable_items`) so they can't independently drift out of
+  agreement — the manifest's md5 always corresponds to what the markdown
+  route would render, which is what lets `agnes pull` converge instead of
+  either serving a permanently stale bundle or refetching forever.
 - The group picker on `/admin/users/{id}` ("Add to group") showed only its
   first option under themes that render the custom dropdown: the section
   card's `overflow: hidden` clipped the popover at the card's bottom edge,

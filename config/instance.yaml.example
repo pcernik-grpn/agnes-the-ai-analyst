@@ -750,14 +750,17 @@ ai:
 # a hint, so use it to discover the schema if this comment block has aged.
 #
 # corporate_memory:
-#   # How knowledge reaches users:
-#   # "mandatory_only" — admin controls everything, no user voting
-#   # "admin_curated" — admin controls, users vote as feedback signal
-#   # "hybrid" — mandatory from admin + optional from user voting (default)
-#   #
-#   # NOT YET ENFORCED (#1573): GET /api/memory/bundle currently ships every
-#   # approved item to every user regardless of this value — changing it has
-#   # no effect on distribution yet.
+#   # Which OPTIONAL (approved, non-required) items are distributed to a
+#   # user's bundle (GET /api/memory/bundle, the per-domain markdown
+#   # `agnes pull` writes, and the matching sync-manifest md5). Required
+#   # (mandatory) items always reach their target audience regardless of
+#   # this setting — it only ever narrows the optional channel, never it.
+#   # "mandatory_only" — no optional channel at all; approved items stay
+#   #   catalog-browsable but are never bundled/synced
+#   # "admin_curated"  — same distribution as mandatory_only; voting is a
+#   #   feedback signal for admins only, it never triggers distribution
+#   # "hybrid"          — approved items are personally opt-in: only items
+#   #   the caller has upvoted (vote > 0) join their bundle (default)
 #   distribution_mode: "hybrid"
 #
 #   # How new AI-extracted items enter the system:
