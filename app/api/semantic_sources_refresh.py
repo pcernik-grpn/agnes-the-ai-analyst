@@ -51,6 +51,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.auth.access import require_admin
 from src.repositories import semantic_source_repo
 from src.semantic.transports import import_source
+from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -161,5 +162,17 @@ async def run_semantic_sources_refresh(
         result["synced"],
         result["failed"],
         result["skipped_disabled"],
+    )
+    log_safe(
+        user_id=user.get("id"),
+        action="run_semantic_sources_refresh",
+        resource="job:semantic-sources-refresh",
+        params={
+            "run_id": run_id,
+            "synced": result["synced"],
+            "failed": result["failed"],
+            "skipped_disabled": result["skipped_disabled"],
+            "skipped_legacy_owned": result.get("skipped_legacy_owned", 0),
+        },
     )
     return {**result, "run_id": run_id, "started_at": started_at}
