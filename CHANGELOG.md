@@ -25,6 +25,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+- Pillow is now a core dependency: cover-image variants are generated on the server.
 
 ## [0.92.0] - 2026-08-29
 
