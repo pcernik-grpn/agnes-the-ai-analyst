@@ -843,3 +843,49 @@ def test_test_endpoint_over_rate_limit_429(seeded_app, monkeypatch):
     assert r.status_code == 429
     assert "Retry-After" in r.headers
     reset_rate_buckets_for_tests()
+
+
+def test_revoking_the_last_grant_reopens_the_source_KNOWN_TRAP(seeded_app):
+    """Pins a fail-open the backward-compat default carries: an admin who
+    removes the LAST group from a source does not close it — the source
+    falls back to "no grant rows at all ⇒ ungated ⇒ visible to everyone",
+    the opposite of the intent behind unticking the last box.
+
+    Named a trap rather than a bug because the same fallback is what keeps
+    every pre-existing source (and every test fixture that inserts an
+    `mcp_sources` row directly) working the moment the gate ships. Closing
+    it needs a way to distinguish "never gated" from "deliberately granted
+    to nobody" — a design call, tracked on TCRD-236. This test exists so
+    the behaviour is explicit in the suite instead of lurking, and so the
+    day someone fixes it, this test fails loudly and gets rewritten.
+    """
+    from src.repositories import resource_grants_repo
+
+    seeded = _seed_two_tools_two_groups()
+    conn = get_system_db()
+    other_grp = UserGroupsRepository(conn).create(name="trap-narrow-grp", description=None)
+    conn.close()
+    _narrow_source_to_group("src_test", other_grp["id"])
+
+    client = seeded_app["client"]
+    hidden = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+    )
+    assert "test-upstream.lookup" not in {t["tool_id"] for t in hidden.json()}, (
+        "precondition: narrowing to another group hides the tool"
+    )
+
+    # The admin unticks the last remaining group — intent: nobody sees it.
+    for g in resource_grants_repo().list_all(resource_type="mcp_source"):
+        if g["resource_id"] == "src_test":
+            resource_grants_repo().delete(g["id"])
+
+    reopened = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+    )
+    assert "test-upstream.lookup" in {t["tool_id"] for t in reopened.json()}, (
+        "documents the trap: removing the last grant re-opens the source to everyone"
+    )
+    assert seeded is not None
