@@ -1395,9 +1395,10 @@ class TestFactsReadSurfaceSmoke:
         "POST /api/facts/search",
         "POST /api/facts/neighbors",
         "GET /api/facts/{subject_id}/claims",
+        "GET /api/facts/type-map",
     }
 
-    def test_flag_off_404s_all_three_routes(self, seeded_app_both):
+    def test_flag_off_404s_every_read_route(self, seeded_app_both):
         """facts.enabled defaults off — the whole router disappears, on
         either backend."""
         s = seeded_app_both
@@ -1405,6 +1406,7 @@ class TestFactsReadSurfaceSmoke:
         assert client.post("/api/facts/search", json={}, headers=headers).status_code == 404
         assert client.post("/api/facts/neighbors", json={"subject_id": "f_x"}, headers=headers).status_code == 404
         assert client.get("/api/facts/f_x/claims", headers=headers).status_code == 404
+        assert client.get("/api/facts/type-map", headers=headers).status_code == 404
 
     def test_neighbors_requires_subject_id_on_both_backends(self, seeded_app_both, monkeypatch):
         """422 identically on both backends — Pydantic validation runs
@@ -1472,6 +1474,17 @@ class TestFactsReadSurfaceSmoke:
         claims = r.json()["claims"]
         assert len(claims) == 1
         assert claims[0]["quote"] == "The engagement is underway."
+
+        # The type map counts the SAME subject the search above reached, so
+        # the two surfaces cannot drift into disagreeing about what exists
+        # (TCRD-250). A type nobody can see is absent rather than 0, which
+        # is why this asserts presence-and-count rather than a fixed shape.
+        r = client.get("/api/facts/type-map", headers=headers)
+        assert r.status_code == 200, r.text
+        tm = r.json()
+        counts = {row["type"]: row["count"] for row in tm["types"]}
+        assert counts.get("engagement") == 1, tm
+        assert tm["total"] == sum(counts.values())
 
 
 # ---------------------------------------------------------------------------
