@@ -1698,7 +1698,8 @@ search/export) via the pure `src.semantic_validation.validate_query` engine:
 an `error`-severity constraint violation sets `valid: false`; a rule that
 cannot be checked statically degrades to `post_execution_checks`, never a
 guessed violation; a used metric whose only expressions target another
-engine sets `locally_executable: false`. With zero accessible valid models
+engine sets `locally_executable: false` and is named in
+`not_executable_metrics`. With zero accessible valid models
 the response is `{"available": false, "error": "no_semantic_model", ...}`
 rather than a misleading all-clear. CLI: `agnes semantic-model
 validate-query "<SQL>" [--expect JSON] [--target-engine duckdb] [--json]`

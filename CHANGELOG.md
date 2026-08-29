@@ -10,6 +10,50 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **The semantic layer now reaches the agent that is about to ignore it.** An
+  instance could hold a fully populated semantic layer and still be queried as
+  if it had none, because nothing on the consumption path mentioned it.
+  - **`POST /api/query` validates against the semantic layer on its own.**
+    After a statement succeeds, the caller's readable `status='valid'` models
+    are checked (same `_can_read_model` RBAC tier as the rest of the read
+    surface) and the response carries a new optional `semantic_validation`
+    field — but only when there is something to say: an error-severity
+    constraint violation, or a used metric with no expression for the engine
+    that actually ran the statement. Enforcement is **soft**: rows are
+    untouched, the status stays `200`, and a failure of the check itself is
+    logged and the field omitted rather than costing the caller their result.
+    A clean query, a caller who can read no model, and an instance with no
+    semantic layer all return `null`, so the field appearing means something.
+    `agnes query` prints each warning to stderr as `[semantic] …` (stdout
+    stays machine-parseable), and the MCP `query` tool passes it through.
+    The advisory names only the metrics that actually failed, states in the
+    payload and in every warning line that object detection is a best-effort
+    text match on declared names rather than SQL parsing (a column sharing a
+    metric's name matches too), and forwards `post_execution_checks` as
+    information — rules that cannot be checked before running are surfaced,
+    never evaluated. On both MCP transports the advisory is shortened, then
+    dropped, before the rows are, so an advisory can never push a deliverable
+    result over the tool output cap (which raises rather than truncating).
+  - **`validate-query` says WHICH metric is not executable.** `POST
+    /api/semantic-models/validate-query` and its CLI/MCP wrappers carry a new
+    `not_executable_metrics` list next to the `locally_executable` bool. The
+    bool alone forced a consumer that wanted to warn about it to name every
+    metric the statement touched, turning one unusable metric into an
+    accusation against all of them. `agnes semantic-model validate-query`
+    prints the names instead of "one or more used metrics".
+  - **MCP clients are steered to the layer before they write SQL.** The
+    server-level instructions both MCP transports advertise now say to read a
+    business term's declared definition first (`glossary_search`, then
+    `get_semantic_context`) and to call `validate_semantic_query` before
+    running SQL over modeled data; the `catalog` and `query` tool descriptions
+    carry the same cross-reference. The two transports previously held
+    byte-identical hand-copies of that prose and now read one shared constant.
+  - **A model author's `ai_context.instructions` reaches the workspace
+    prompt.** The one field a document declares *for the agent* reached no
+    agent surface at all; each model's bullet in the rendered `CLAUDE.md`
+    "Semantic layer" section now carries it (truncated to ~300 chars). That
+    section also names `agnes glossary search` and `agnes semantic-model
+    apply`, which it taught around but never mentioned.
 - **Registered semantic sources (git/upload/connection) now refresh on a schedule, not just on manual sync.** `POST /api/admin/run-semantic-sources-refresh` sweeps every `semantic_sources` row through the shared import pipeline on a `SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL` cadence (default 6 h, scheduler entry `semantic-sources-refresh`); one failing source never aborts the sweep over the rest. `enabled: false` now excludes a source from both this scheduled sweep and manual sync — `POST /api/admin/semantic-sources/{id}/sync` (and `agnes admin semantic-source sync`) on a disabled source answers `409 source_disabled` with a hint to re-enable it instead of silently syncing anyway. This is Block 3 step 2 of #1707; steps 3-4 (migrating the legacy Keboola/Databricks refreshes onto this sweep and retiring them) landed in the same release — see Changed.
 - **Document extraction now actually enqueues (TCRD-226) — the runtime PR #1692 built had nothing to create a job.** `POST /api/admin/sharepoint/connections/{id}/extract` lets an admin trigger the existing `corpus-extraction` job kind on demand — 404s on an unknown connection before any work, refuses cleanly with a typed `409` when `extraction.enabled` is off or no producer is configured (never a job that fails 30 minutes later in a worker), and `409 extraction_already_running` when a run for that connection is already queued. A new `POST /api/admin/sharepoint/extraction/run-due` scheduler sweep (registered only when the new `extraction.schedule` config is set — off by default) applies that single instance-wide cadence independently to each connection's own last-run stamp, same shape as the existing `agents:run-due` sweep. The producer subprocess also gets a credential to call back into Agnes's own API for the first time — `AGNES_API_URL` always, and `AGNES_API_TOKEN` (the scheduler's own shared-secret token) when one is configured — a deliberate, explicitly-documented over-grant (that token is Admin-group god-mode, far more than the producer needs) reused because it's the only credential class a headless subprocess can already present; never on argv, never logged. The SharePoint source card surfaces the in-Agnes schedule's last/next run and a "Run extraction now" action, separate from the external producer's own static crawl-cadence label.
 - **Full audit-log coverage for state-changing requests** (audit-full-coverage plan). A typed audit action catalog (`src/audit_events.py`) is now the single source of truth for every `action` string an audit writer can emit, and every `audit_log` row is auto-filled with per-request context (`client_ip`, `correlation_id`, `client_kind`, caller identity) so callers no longer thread it through by hand. Every mutating route declares its audit posture in `src/audit_posture.py` (`tests/test_audit_route_posture.py` ratchets it), and `AuditFallbackMiddleware` writes a generic `http.request` row for any authenticated mutating request whose handler wrote none — the shrinking `"fallback"` list is the map of what's left to close.
