@@ -6,8 +6,6 @@ returned profile dict has the shape downstream callers expect from
 ``profile_table``.
 """
 
-import json
-import os
 from pathlib import Path
 
 import duckdb
@@ -24,12 +22,47 @@ def tiny_parquet(tmp_path: Path) -> Path:
     try:
         safe = str(pq).replace("'", "''")
         conn.execute(
-            f"COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) "
-            f"AS t(id, label)) TO '{safe}' (FORMAT PARQUET)"
+            f"COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(id, label)) TO '{safe}' (FORMAT PARQUET)"
         )
     finally:
         conn.close()
     return pq
+
+
+@pytest.fixture
+def decimal_parquet(tmp_path: Path) -> Path:
+    """Parquet with a DECIMAL column, as produced by NUMERIC warehouse types."""
+    pq = tmp_path / "decimal.parquet"
+    conn = duckdb.connect()
+    try:
+        safe = str(pq).replace("'", "''")
+        conn.execute(
+            f"COPY (SELECT * FROM (VALUES "
+            f"(CAST(1.25 AS DECIMAL(18,2)), 'a'), "
+            f"(CAST(2.50 AS DECIMAL(18,2)), 'b'), "
+            f"(CAST(3.75 AS DECIMAL(18,2)), 'c')) "
+            f"AS t(amount, label)) TO '{safe}' (FORMAT PARQUET)"
+        )
+    finally:
+        conn.close()
+    return pq
+
+
+def test_worker_serializes_decimal_profile(decimal_parquet):
+    # DECIMAL columns (Snowflake/warehouse NUMERIC) yield decimal.Decimal
+    # stats from DuckDB, which json.dumps refuses without a default handler —
+    # the worker crashed and failed the whole data-refresh job (TCRD-243).
+    result = run_subprocess_job(
+        "src._profiler_worker",
+        {
+            "table_name": "decimals",
+            "table_id": "decimals",
+            "parquet_path": str(decimal_parquet),
+        },
+        timeout_sec=60,
+    )
+    assert isinstance(result, dict)
+    assert "row_count" in result or "rows" in result or "columns" in result
 
 
 def test_worker_returns_profile_dict(tiny_parquet, tmp_path):

@@ -55,7 +55,7 @@ import typer
 from cli.client import api_delete, api_get, api_patch, api_post, api_put
 from cli.error_render import render_error
 
-agent_app = typer.Typer(help="Manage agent profiles, scope, tokens, and one-shot asks")
+agent_app = typer.Typer(help="Manage agents, scope, tokens, and one-shot asks")
 scope_app = typer.Typer(help="Manage an agent's resource scope grants")
 agent_app.add_typer(scope_app, name="scope")
 webhooks_app = typer.Typer(help="Manage an agent's outbound job-completion webhooks")
@@ -154,7 +154,7 @@ def _print_agent(row: dict) -> None:
 
 @agent_app.command("list")
 def list_agents(as_json: bool = typer.Option(False, "--json")):
-    """List your agent profiles."""
+    """List your agents."""
     resp = api_get("/api/v1/agents")
     if resp.status_code != 200:
         _fail(resp)
@@ -189,7 +189,7 @@ def create_agent(
     budget: Optional[int] = typer.Option(None, "--budget", help="Monthly token budget"),
     as_json: bool = typer.Option(False, "--json"),
 ):
-    """Create a new agent profile.
+    """Create a new agent.
 
     New agents default all four scope modes (plugins/connections/tables/
     memory) to `selected` server-side — use `agnes agent scope set` to grant
@@ -222,7 +222,7 @@ def show_agent(
     slug: str = typer.Argument(..., help="Agent slug"),
     as_json: bool = typer.Option(False, "--json"),
 ):
-    """Show one agent profile's full detail."""
+    """Show one agent's full detail."""
     row = _resolve_agent(slug)
     if as_json:
         typer.echo(json.dumps(row, indent=2))
@@ -235,7 +235,7 @@ def delete_agent(
     slug: str = typer.Argument(..., help="Agent slug"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
-    """Delete an agent profile (and revoke every PAT minted for it). The
+    """Delete an agent (and revoke every PAT minted for it). The
     default agent cannot be deleted — the server rejects that with
     `default_agent_undeletable`."""
     row = _resolve_agent(slug)

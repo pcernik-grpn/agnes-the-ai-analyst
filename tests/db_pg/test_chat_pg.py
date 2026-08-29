@@ -948,3 +948,43 @@ def test_both_forks_still_mint_the_default_shape_without_one_pg(sessions, partic
     assert co.id.startswith("chat_")
     priv = participants.fork_co_session_to_private(source_session_id=co.id, owner_email="o@x.com")
     assert priv.startswith("chat_")
+
+
+# ---------------------------------------------------------------------------
+# Dual-backend contract: list_recently_active (F4, audit-full-coverage plan
+# Task 8 — the session-pipeline chat-export sweep's discovery query)
+# ---------------------------------------------------------------------------
+
+
+def test_list_recently_active_orders_and_caps(_chat_env):
+    """Sessions with a message come back most-recently-active first, and the
+    ``limit`` kwarg caps the result on both backends. A session with zero
+    messages never appears — nothing to export for it."""
+    repo = _chat_env
+    empty = repo.create_session(user_email="u@example.com", surface=Surface.WEB)
+    older = repo.create_session(user_email="u@example.com", surface=Surface.WEB)
+    repo.append_message(session_id=older.id, role="user", content="hi")
+    newer = repo.create_session(user_email="u@example.com", surface=Surface.WEB)
+    repo.append_message(session_id=newer.id, role="user", content="hi")
+
+    active = repo.list_recently_active(limit=200)
+    ids = [s.id for s in active]
+    assert empty.id not in ids
+    assert ids.index(newer.id) < ids.index(older.id)
+
+    capped = repo.list_recently_active(limit=1)
+    assert len(capped) == 1
+    assert capped[0].id == newer.id
+
+
+def test_list_recently_active_is_cross_user(_chat_env):
+    """No owner filter — a caller sees sessions across every user, the same
+    shape as ``list_paused_sessions``."""
+    repo = _chat_env
+    a = repo.create_session(user_email="a@example.com", surface=Surface.WEB)
+    repo.append_message(session_id=a.id, role="user", content="hi")
+    b = repo.create_session(user_email="b@example.com", surface=Surface.WEB)
+    repo.append_message(session_id=b.id, role="user", content="hi")
+
+    ids = {s.id for s in repo.list_recently_active(limit=200)}
+    assert {a.id, b.id} <= ids

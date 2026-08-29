@@ -695,3 +695,77 @@ class TestUnmigratedRowsUnchanged:
         jobs = {j[0]: (j[2], j[3]) for j in build_jobs()}
         for name, expected in self._EXPECTED_UNMIGRATED.items():
             assert jobs[name] == expected, f"{name} endpoint/method drifted: {jobs[name]!r} != {expected!r}"
+
+
+# ── Document extraction sweep (TCRD-226) ──
+
+
+def _extraction_env_clean(monkeypatch):
+    monkeypatch.delenv("SCHEDULER_EXTRACTION_SCHEDULE", raising=False)
+    # No instance.yaml on the test box → get_value returns default "".
+
+
+def test_extraction_schedule_defaults_to_disabled(monkeypatch):
+    """Off by default — unlike initial-workspace, there is no sensible
+    fallback cadence, so absent config means no scheduler row at all."""
+    _extraction_env_clean(monkeypatch)
+    from services.scheduler.__main__ import _extraction_schedule, build_jobs
+
+    assert _extraction_schedule() is None
+    assert "extraction-run-due" not in {j[0] for j in build_jobs()}
+
+
+def test_extraction_schedule_env_override(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_EXTRACTION_SCHEDULE", "daily 02:00")
+    from services.scheduler.__main__ import _extraction_schedule, build_jobs
+
+    assert _extraction_schedule() == "daily 02:00"
+    jobs = {name: schedule for name, schedule, *_ in build_jobs()}
+    assert jobs["extraction-run-due"] == "daily 02:00"
+
+
+def test_extraction_schedule_garbage_env_falls_back_to_disabled(monkeypatch):
+    """A typo in the override must not crash build_jobs() nor silently
+    produce an unparseable schedule — falls back to disabled (no sensible
+    default cadence to guess, unlike initial-workspace's daily 03:30)."""
+    monkeypatch.setenv("SCHEDULER_EXTRACTION_SCHEDULE", "not-a-schedule")
+    from services.scheduler.__main__ import _extraction_schedule, build_jobs
+
+    assert _extraction_schedule() is None
+    assert "extraction-run-due" not in {j[0] for j in build_jobs()}
+
+
+def test_extraction_schedule_yaml_value_honored(monkeypatch):
+    _extraction_env_clean(monkeypatch)
+    import app.instance_config as ic
+
+    monkeypatch.setattr(
+        ic,
+        "get_value",
+        lambda *keys, default=None: "every 6h" if keys == ("extraction", "schedule") else default,
+    )
+    from services.scheduler.__main__ import _extraction_schedule, build_jobs
+
+    assert _extraction_schedule() == "every 6h"
+    jobs = {name: schedule for name, schedule, *_ in build_jobs()}
+    assert jobs["extraction-run-due"] == "every 6h"
+
+
+def test_build_jobs_includes_extraction_run_due_endpoint(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_EXTRACTION_SCHEDULE", "every 4h")
+    from services.scheduler.__main__ import build_jobs
+
+    target = next(j for j in build_jobs() if j[0] == "extraction-run-due")
+    name, schedule, endpoint, method, _timeout = target
+    assert endpoint == "/api/admin/sharepoint/extraction/run-due"
+    assert method == "POST"
+
+
+def test_build_jobs_tick_guard_ignores_extraction_daily_schedule(monkeypatch):
+    """A `daily …` extraction schedule isn't part of the tick<=smallest-
+    interval guard — same treatment as initial-workspace/jira-org-refresh."""
+    monkeypatch.setenv("SCHEDULER_EXTRACTION_SCHEDULE", "daily 02:00")
+    from services.scheduler.__main__ import build_jobs
+
+    jobs = build_jobs()  # must not raise
+    assert any(j[0] == "extraction-run-due" for j in jobs)

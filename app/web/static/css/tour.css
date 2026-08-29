@@ -317,7 +317,7 @@
   background: var(--ds-assistant-dark);
 }
 
-/* Final choice — "Connect my AI tools" (secondary) */
+/* Final choice — "Take Agnes to my tools" (secondary) */
 .tour-btn-connect {
   background: var(--ds-surface-dim);
   color: var(--ds-text-primary);

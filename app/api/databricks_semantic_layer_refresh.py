@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.auth.access import require_admin
 from connectors.databricks.client import DatabricksApiError
 from connectors.databricks.semantic_layer import ensure_semantic_source, purge_legacy_metric_rows
+from src.audit_helpers import log_safe
 from src.semantic.transports import import_source
 
 logger = logging.getLogger(__name__)
@@ -117,5 +118,17 @@ async def run_databricks_semantic_layer_refresh(
         len(result.get("models_pruned") or []),
         len(result.get("invalid") or []),
         result.get("purged_legacy"),
+    )
+    log_safe(
+        user_id=user.get("id"),
+        action="run_databricks_semantic_layer_refresh",
+        resource="job:databricks-semantic-layer-refresh",
+        params={
+            "run_id": run_id,
+            "models_written": result.get("models_written"),
+            "models_pruned": len(result.get("models_pruned") or []),
+            "invalid": len(result.get("invalid") or []),
+            "purged_legacy": result.get("purged_legacy"),
+        },
     )
     return {**result, "status": "ok", "run_id": run_id, "started_at": started_at}

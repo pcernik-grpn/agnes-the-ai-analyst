@@ -15,8 +15,8 @@ renamed to the repo's sequential revision-id convention. ``downgrade()`` is
 the true inverse — the table is new, so dropping it restores the previous
 schema exactly.
 
-Revision ID: 0073_resource_source_tags
-Revises: 0076_semantic_draft_pending
+Revision ID: 0087_resource_source_tags
+Revises: 0086_semantic_draft_pending
 Create Date: 2026-08-26
 
 Re-chained (not renamed) TWICE, both times when this branch merged ``main``,
@@ -39,11 +39,22 @@ does not re-run it; only its parent moved, twice.
 Third re-chain (F3 merge): the same two migrations this file's parent chain
 runs through were RENUMBERED — ``0073_column_metadata_source_ref_v125`` ->
 ``0075_column_meta_source_ref`` and ``0074_semantic_draft_pending`` ->
-``0076_semantic_draft_pending`` — so that the semantic chain hangs off
+``0075_semantic_draft_pending`` — so that the semantic chain hangs off
 ``0074_llm_usage_caller_user_id`` (the tip ``main`` actually landed) rather
 than forking from ``0073_agent_scope_granted_by`` a second time. Same
-migrations, same order, new ids; this file follows its parent to the new id.
-Revision ID still unchanged, for the same reason as the first two.
+migrations, same order, new ids; this file followed its parent to the new id.
+Revision ID still unchanged at that point, for the same reason as the first
+two.
+
+Fourth re-chain (``integration`` merge, landing-plan step 0): the whole
+semantic chain — this file included — was renumbered to ``0085``..``0090``
+and appended after ``integration``'s ``0079_sso_login``..
+``0084_fact_alias_sources``, so this file's id moved
+``0073_resource_source_tags`` -> ``0087_resource_source_tags`` and its parent
+``0076_semantic_draft_pending`` -> ``0086_semantic_draft_pending``. Unlike
+the first three, THIS one does change the revision ID: see the chain root
+``0085_column_meta_source_ref`` for the full account and the re-stamp note
+for a development database already sitting on an old id.
 """
 
 from __future__ import annotations
@@ -53,8 +64,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0073_resource_source_tags"
-down_revision: Union[str, None] = "0076_semantic_draft_pending"
+revision: str = "0087_resource_source_tags"
+down_revision: Union[str, None] = "0086_semantic_draft_pending"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

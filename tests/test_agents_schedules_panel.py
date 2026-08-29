@@ -59,7 +59,7 @@ class TestPanelExists:
     def test_disabled_instance_is_named_not_generic(self, markup):
         """The 403 {"kind": "agent_profiles_disabled"} answer must say what is
         off and who can change it, not render a retry-me error."""
-        assert "agent profiles are disabled" in markup
+        assert "agents are disabled" in markup
 
 
 class TestBackloggedIsAWarning:

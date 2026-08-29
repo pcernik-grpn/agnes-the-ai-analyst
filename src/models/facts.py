@@ -53,6 +53,28 @@ class FactAlias(Base):
     fact_id: Mapped[str] = mapped_column(String, ForeignKey("facts.id", ondelete="CASCADE"), nullable=False)
 
 
+class FactAliasSource(Base):
+    """Per-corpus provenance for a ``fact_aliases`` row (security hardening
+    — see ``migrations/versions/0084_fact_alias_sources.py``): the set of
+    corpora whose evidence actually contributed to minting this EXACT
+    ``(type, natural_key)`` string, distinct from "any corpus with a claim
+    on the same fact". ``src/repositories/facts_pg.py``'s alias-visibility
+    filter joins through this table instead of ever showing
+    ``fact_aliases.natural_key`` unconditionally.
+    """
+
+    __tablename__ = "fact_alias_sources"
+    __table_args__ = (
+        sa.ForeignKeyConstraint(
+            ["type", "natural_key"], ["fact_aliases.type", "fact_aliases.natural_key"], ondelete="CASCADE"
+        ),
+    )
+
+    type: Mapped[str] = mapped_column(String, primary_key=True)
+    natural_key: Mapped[str] = mapped_column(String, primary_key=True)
+    corpus_id: Mapped[str] = mapped_column(String, primary_key=True)
+
+
 class Edge(Base):
     __tablename__ = "edges"
     __table_args__ = (
@@ -161,7 +183,19 @@ class IngestRun(Base):
     claims_written: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     claims_rejected_count: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     claims_rejected: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    #: Same shape as `claims_rejected_count`/`claims_rejected`, one column
+    #: pair over — a document's `source_url` Agnes dropped as invalid
+    #: (O7, `_validate_source_url`). The claim itself still writes; only the
+    #: citation link is missing, and this is the operator-visible record of
+    #: why (see migrations/versions/0083_ingest_runs_source_urls.py).
+    source_urls_rejected_count: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    source_urls_rejected: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
     deferred: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
     subjects_created: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     subjects_deleted: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     review_items: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    #: The producer's OPTIONAL anonymization declaration for this batch
+    #: (spec §9.2): ``{declared: bool, scopes: {corpus_id: {docs_anonymized,
+    #: docs_skipped}}}``. Empty ``{}`` (never null) when the producer never
+    #: anonymizes — see ``migrations/versions/0081_ingest_runs_anonymize.py``.
+    anonymization: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"), nullable=False)
