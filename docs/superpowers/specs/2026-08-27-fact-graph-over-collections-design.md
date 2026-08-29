@@ -2,9 +2,9 @@
 
 **Date:** 2026-08-27 (rev 3)
 **Status:** buildable draft — revision 3 after a six-way audit (spec internals,
-Agnes code, cuesta-star-graph, evaluation workbook v0.2, licences/services, UI)
+Agnes code, the producer repo, evaluation workbook v0.2, licences/services, UI)
 **Verified against:** Agnes worktree `zs/facts-scope-access` (base `d97e186a8`),
-`keboola/cuesta-star-graph` main `753be22`, `eval_scoring_workbook_v0.2.xlsx`
+the producer repo's main at `753be22`, `eval_scoring_workbook_v0.2.xlsx`
 (FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
 **Scope note:** this spec deliberately contains customer-specific material
 (the evaluation workbook, Kantata, personas, TCRD ticket ids, the 1P vault
@@ -46,7 +46,7 @@ constrains the design.
 **Rev 2 → 3 (full audit against artifacts):**
 
 6. **The evaluation standard is workbook v0.2 in full** (§14) — five arms,
-   five thresholds, 0/1/2 rubric, cadence, protocol. The cuesta repo's eval
+   five thresholds, 0/1/2 rubric, cadence, protocol. The producer repo's eval
    was aligned to v0.2 on 2026-08-27 (commit `753be22`): its 12 sandbox
    questions now map onto the ten workbook prompts (two are sandbox-only
    leftovers and two workbook ids are uncovered — §14.5), and its protocol already
@@ -134,14 +134,14 @@ from documents, where every assertion carries the document it came from, the
 verbatim sentence supporting it, and the date of that document. Built as a
 layer **over the existing Collections subsystem**, not beside it.
 
-It is a general Agnes capability. SharePoint (via the cuesta-star-graph
+It is a general Agnes capability. SharePoint (via the producer
 crawler) is the first contributor of documents; anything that can put files
 into a collection contributes the same way. Agnes owns the schema; producers
 write into it through the contract in §7.
 
 **Out of scope, deliberately** (each is somebody's work, not nobody's):
 
-- the crawler — **adopted** from `keboola/cuesta-star-graph`, with a named
+- the crawler — **adopted** from the producer repo, with a named
   hardening backlog (§7.1), never rewritten;
 - the extraction pass (`extract.py` + `skills/kg-builder-agent.md`) — a
   producer against §7's contract;
@@ -527,7 +527,7 @@ same as any other edge — only the READ path (§4/§5) withholds it.
 
 ### 7.0 Wire format (verbatim from the producing pipeline)
 
-The producer is the cuesta-star-graph pipeline (crawl → convert → anonymize →
+The producer is the external producer pipeline (crawl → convert → anonymize →
 extract → reconcile → gates). Its emitted shapes, which the ingest endpoint
 accepts as-is:
 
@@ -543,7 +543,7 @@ accepts as-is:
 ```
 
 Conventions the pipeline enforces and ingest relies on
-(cuesta-star-graph, verified): node id matches
+(producer repo, verified): node id matches
 `([a-z_]+):([a-z0-9][a-z0-9-]*)` with prefix == type
 (`validate_graph.py:60`); slugs are lowercase ASCII with `&`→`and`; every
 **edge** carries ≥1 evidence entry (`possible_duplicate_of` exempt —
@@ -1337,7 +1337,7 @@ half and you miss leaks.
 - Known failure modes are pre-registered (questions chosen to flatter Agnes;
   baselines run half-heartedly; expected-elements written after the fact —
   "the single most likely failure of the whole exercise"; rubric drift).
-- **Sandbox state** (cuesta repo main `753be22`): 12 sandbox questions
+- **Sandbox state** (producer repo main `753be22`): 12 sandbox questions
   Q01–Q12 now carry `shan_category` mappings onto the ten v0.2 prompts;
   Q07 (v0.1 S1) and Q09 (v0.1 R1) are **sandbox-only** (dropped upstream);
   **L1 and N1 have no dedicated sandbox question** — eval prep must add them
@@ -1616,7 +1616,7 @@ overclaim).
   anonymizer driver. This widens the build scope: those items are tasks in
   this plan now, not an external dependency.
 - **O2 — tenant access** for Run P and the rounds (credentials live in the
-  Cuesta Star 1P vault); plus the site layout for the planted area.
+  the producer team's password vault); plus the site layout for the planted area.
 - **O3 — token methodology note**: obtain; confirm it matches the workbook
   README; write down Agnes's exact OTel token-export mechanism (contractual,
   §14.6).
