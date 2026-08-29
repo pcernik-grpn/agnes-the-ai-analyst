@@ -92,6 +92,8 @@ def _metric(
 ) -> None:
     from src.repositories import metric_repo
 
+    # Registry-fed source: hand-authored sources are deliberately excluded
+    # from the orphan finder, so seed the provenance it actually inspects.
     metric_repo().create(
         id=metric_id,
         name=name,
@@ -101,6 +103,7 @@ def _metric(
         description=description,
         table_name=table_name,
         tables=tables,
+        source="keboola_metastore",
     )
 
 

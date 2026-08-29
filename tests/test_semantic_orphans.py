@@ -39,9 +39,12 @@ def _register_table(id_, name):
     )
 
 
-def _create_metric(id_, name, *, table_name=None, tables=None):
+def _create_metric(id_, name, *, table_name=None, tables=None, source="keboola_metastore"):
     from src.repositories import metric_repo
 
+    # Registry-fed source by default: hand-authored sources (manual /
+    # yaml_import / web_upload) are deliberately excluded from the orphan
+    # finder, so tests seed the provenance the finder actually inspects.
     metric_repo().create(
         id=id_,
         name=name,
@@ -50,6 +53,7 @@ def _create_metric(id_, name, *, table_name=None, tables=None):
         sql="SELECT 1",
         table_name=table_name,
         tables=tables,
+        source=source,
     )
 
 
@@ -66,17 +70,17 @@ def _save_column(table_id, column_name):
 
 class TestFindOrphanedMetrics:
     def test_a_metric_bound_to_a_missing_table_name_is_flagged(self):
-        metrics = [{"id": "m1", "name": "revenue", "table_name": "orders_gone", "tables": None}]
+        metrics = [{"id": "m1", "name": "revenue", "source": "keboola_metastore", "table_name": "orders_gone", "tables": None}]
         orphans = find_orphaned_metrics(metrics, known_table_names={"customers"})
         assert orphans == [{"metric_id": "m1", "name": "revenue", "missing_tables": ["orders_gone"]}]
 
     def test_a_metric_bound_to_a_live_table_name_is_not_flagged(self):
-        metrics = [{"id": "m1", "name": "revenue", "table_name": "orders", "tables": None}]
+        metrics = [{"id": "m1", "name": "revenue", "source": "keboola_metastore", "table_name": "orders", "tables": None}]
         orphans = find_orphaned_metrics(metrics, known_table_names={"orders"})
         assert orphans == []
 
     def test_a_join_metric_reports_every_missing_table_in_the_tables_array(self):
-        metrics = [{"id": "m1", "name": "arpu", "table_name": "orders", "tables": ["orders", "customers_gone"]}]
+        metrics = [{"id": "m1", "name": "arpu", "source": "keboola_metastore", "table_name": "orders", "tables": ["orders", "customers_gone"]}]
         orphans = find_orphaned_metrics(metrics, known_table_names={"orders"})
         assert orphans == [{"metric_id": "m1", "name": "arpu", "missing_tables": ["customers_gone"]}]
 
