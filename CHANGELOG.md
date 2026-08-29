@@ -743,6 +743,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 
 ### Fixed
+- **Local dev: `/library` took minutes to load, because `LOCAL_DEV_MODE`
+  silently switched on the profiling debug toolbar.** `LOCAL_DEV_MODE=1`
+  implied `DEBUG=1`, mounting the FastAPI debug toolbar, whose per-request
+  instrumentation pegs CPU on heavy HTML pages — and every documented
+  local-dev command sets `LOCAL_DEV_MODE`. The heaviest template in the
+  product, `/library`, stopped answering within a request timeout while
+  `/api/version` stayed instant, which reads as a database or template
+  fault rather than a middleware one. Measured on one instance with one
+  variable changed: `>300s` with the toolbar armed, `1.4s` without. The
+  toolbar is now armed only by an explicitly truthy `DEBUG`; local dev
+  with it is `DEBUG=1 LOCAL_DEV_MODE=1`, as `docs/development.md` already
+  documented. Production never set `LOCAL_DEV_MODE`, so no deployed
+  instance was affected.
 - **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote that is a substring of the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The run report now distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
 - **Removed a committed `data` symlink pointing into a contributor's home
 - **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home
