@@ -53,6 +53,28 @@ class FactAlias(Base):
     fact_id: Mapped[str] = mapped_column(String, ForeignKey("facts.id", ondelete="CASCADE"), nullable=False)
 
 
+class FactAliasSource(Base):
+    """Per-corpus provenance for a ``fact_aliases`` row (security hardening
+    — see ``migrations/versions/0084_fact_alias_sources.py``): the set of
+    corpora whose evidence actually contributed to minting this EXACT
+    ``(type, natural_key)`` string, distinct from "any corpus with a claim
+    on the same fact". ``src/repositories/facts_pg.py``'s alias-visibility
+    filter joins through this table instead of ever showing
+    ``fact_aliases.natural_key`` unconditionally.
+    """
+
+    __tablename__ = "fact_alias_sources"
+    __table_args__ = (
+        sa.ForeignKeyConstraint(
+            ["type", "natural_key"], ["fact_aliases.type", "fact_aliases.natural_key"], ondelete="CASCADE"
+        ),
+    )
+
+    type: Mapped[str] = mapped_column(String, primary_key=True)
+    natural_key: Mapped[str] = mapped_column(String, primary_key=True)
+    corpus_id: Mapped[str] = mapped_column(String, primary_key=True)
+
+
 class Edge(Base):
     __tablename__ = "edges"
     __table_args__ = (

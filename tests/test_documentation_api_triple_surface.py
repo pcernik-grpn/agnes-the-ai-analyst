@@ -27,6 +27,11 @@ from pathlib import Path
 # (the policy is a ratchet, not a sweep). Tuple of (cli_cmd, mcp_tool).
 _COHORT: dict[str, tuple[str, str]] = {
     "/documentation/api": ("docs api", "documentation_api"),
+    # Fact-graph node types with caller-scoped counts (TCRD-250): the head
+    # of the Library's Knowledge tab, and an agent's way to learn which
+    # types exist before spending a `fact_search` call. Joins its
+    # search/neighbors/claims siblings on all three surfaces.
+    "/api/facts/type-map": ("facts type-map", "fact_type_map"),
     # Reading one collection file's text (#1240). The endpoint's path is
     # browser-shaped — the Library's preview modal fetches it directly — but
     # its contract is now agent-facing: an agent shown a file it could not
@@ -679,6 +684,19 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/knowledge/digests": (
+        "enumerating maintained digests for a WEB surface (TCRD-250). Both "
+        "other surfaces already RECEIVE digests by a better route than a "
+        "list call: `agnes pull` writes every granted digest to "
+        "`.claude/rules/ka_<slug>.md` from the manifest "
+        "(app/api/sync.py::_digest_entries), and a chat agent therefore "
+        "reads them as files already in its sandbox rather than by calling "
+        "a tool. This route exists only because a browser cannot read that "
+        "directory — it is the enumeration a page needs, not an analyst "
+        "query. Same reasoning as the grandfathered GET "
+        "/api/facts/ingest-runs. The digest CONTENT endpoint it pairs with "
+        "is itself grandfathered, and is what `agnes pull` calls"
+    ),
     "/api/v1/agents/{slug}/delegate": (
         "Track C7 (@delegation MVP) — sandbox-internal RPC, reachable only "
         "by a live agent turn's own in-process delegation tool "
@@ -1038,6 +1056,20 @@ _EXEMPT: dict[str, str] = {
         "wizard's source card, derived at request time from the connection's own "
         "stored PEM — admin-only display primitive, no analyst CLI/MCP analogue"
     ),
+    # Extraction enqueue wiring (TCRD-226) — admin/scheduler job-trigger
+    # endpoints, same exemption class as run-corporate-memory/
+    # run-knowledge-digests/reap-idle below: an admin action and a
+    # scheduler sweep, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extract": (
+        "admin-triggered one-off run of the existing corpus-extraction job kind — "
+        "admin/scheduler maintenance op, mirrors the run-corporate-memory exemption; "
+        "no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/extraction/run-due": (
+        "scheduler-driven sweep firing corpus-extraction for every due SharePoint "
+        "connection — admin/scheduler maintenance op, mirrors the "
+        "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.
@@ -1319,6 +1351,20 @@ _EXEMPT: dict[str, str] = {
     "/api/facts/ingest-runs": (
         "persisted ingest run reports (spec §7.2/§13.2) — admin-only, feeds the "
         "/admin/data-sources source card, not an analyst query surface; no CLI/MCP analogue"
+    ),
+    # F3 (audit-full-coverage plan, Task 9). Batch ingestion endpoint the
+    # `agnes push` command calls internally to upload the offline-query
+    # audit spool — mirrors the grandfathered /api/upload/sessions and
+    # /api/upload/local-md endpoints (no standalone `agnes upload …`
+    # subcommand, no MCP analogue: there is nothing for an agent or an
+    # analyst to invoke here directly, it's a delivery mechanism for
+    # events the CLI already produced as a side effect of `agnes
+    # query`/`agnes explore` running locally).
+    "/api/upload/audit-events": (
+        "client-reported CLI audit event batch upload (F3, audit-full-coverage "
+        "plan) — internal to `agnes push`, mirrors the grandfathered "
+        "/api/upload/sessions and /api/upload/local-md endpoints; no standalone "
+        "CLI subcommand or MCP analogue"
     ),
 }
 

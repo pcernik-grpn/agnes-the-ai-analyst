@@ -828,6 +828,7 @@ class TestUploadSmoke:
         "POST /api/upload/sessions",
         "POST /api/upload/artifacts",
         "POST /api/upload/local-md",
+        "POST /api/upload/audit-events",
     }
 
     def test_upload_session(self, seeded_app_both):
@@ -857,6 +858,30 @@ class TestUploadSmoke:
             headers=_admin_headers(seeded_app_both),
         )
         assert r.status_code in (200, 201)
+
+    def test_upload_audit_events(self, seeded_app_both):
+        """Client-reported CLI audit events land identically on both backends.
+
+        Asserts the accept/reject split too — the server-side action allowlist
+        is the security boundary here, and a backend that silently accepted an
+        uncataloged action would still return 200.
+        """
+        r = seeded_app_both["client"].post(
+            "/api/upload/audit-events",
+            json={
+                "events": [
+                    {
+                        "action": "query.local_offline",
+                        "params": {"tables": ["orders"], "sql_hash": "deadbeef01234567", "rows": 1},
+                        "observed_at": "2026-08-29T12:00:00Z",
+                    },
+                    {"action": "not.a.client.action", "params": {}, "observed_at": "2026-08-29T12:00:01Z"},
+                ]
+            },
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200
+        assert r.json() == {"accepted": 1, "rejected": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -3098,6 +3123,16 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestCertificateMetadata; not
     # duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate",
+    # Extraction enqueue wiring (TCRD-226) — enqueues into the EXISTING
+    # `jobs` table (both backends) via the existing `jobs_repo()`/
+    # `source_connections_repo()` factories; no new schema surface to
+    # verify per-backend. Auth matrix, 404-before-work, the feature-usable
+    # gate, duplicate-run dedup, exact payload shape, and the sweep's
+    # due-check/no-op paths are all covered by
+    # tests/test_admin_sharepoint.py::TestExtractionTrigger /
+    # TestExtractionRunDue; not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extract",
+    "POST /api/admin/sharepoint/extraction/run-due",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and
@@ -3116,6 +3151,18 @@ KNOWN_UNTESTED = {
     # covered by tests/db_pg/test_facts_ingest_runs_pg.py + the source-card
     # PG test; the write happens post-ingest in tests/db_pg/test_facts_ingest_pg.py.
     "GET /api/facts/ingest-runs",
+    # Node-type counts for the Library's Knowledge tab (TCRD-250) — covered
+    # by tests/test_api_facts.py (flag-off 404, auth, DuckDB typed-501) and
+    # tests/db_pg/test_facts_read_pg.py (per-caller counts, a type the
+    # caller cannot see is absent, agreement with search()); not duplicated
+    # here.
+    "GET /api/facts/type-map",
+    # The maintained digests a caller can read (TCRD-250) — covered by
+    # tests/test_api_knowledge_digests_distribution.py::TestAnalystDigestList
+    # (401, RBAC both ways, never-generated omitted, staleness, no markdown
+    # in the list, and agreement with the sync manifest for the same
+    # caller); not duplicated here.
+    "GET /api/knowledge/digests",
 }
 
 

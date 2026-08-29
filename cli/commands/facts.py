@@ -136,6 +136,46 @@ def search_facts(
         )
 
 
+@facts_app.command("type-map")
+def facts_type_map(
+    json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+) -> None:
+    """Show every node type in the graph with a live count of what YOU can see.
+
+    Each row is a way in: pass its TYPE to `agnes facts search` to list the
+    subjects behind the number. Counts are gated exactly as `search` is, so
+    a type's number is what you could reach and never a total that includes
+    evidence you cannot read. A type you have no visible subjects for is
+    omitted entirely rather than shown as 0.
+    """
+    resp = api_get("/api/facts/type-map")
+    if resp.status_code != 200:
+        typer.echo(render_error(resp.status_code, resp.json()), err=True)
+        raise typer.Exit(1)
+
+    _echo_server_label()
+    data = resp.json()
+    if json:
+        typer.echo(json_lib.dumps(data, indent=2, default=str))
+        return
+
+    types = data.get("types", [])
+    if not types:
+        typer.echo("No node types are visible to you.")
+        typer.echo(
+            "Either nothing has been extracted into the graph yet, or none of its evidence "
+            "is in a collection you can read — ask an admin about collection grants."
+        )
+        return
+
+    width = max(len(t["type"]) for t in types)
+    typer.echo(f"{'TYPE':{width}s}  COUNT")
+    for t in types:
+        typer.echo(f"{t['type']:{width}s}  {t['count']}")
+    typer.echo(f"\n{data.get('total', 0)} subjects across {len(types)} types.")
+    typer.echo("Run `agnes facts search <TYPE>` to list the subjects behind a row.", err=True)
+
+
 @facts_app.command("neighbors")
 def facts_neighbors(
     subject_id: str = typer.Argument(..., help="Fact id to traverse from (from `agnes facts search`)"),

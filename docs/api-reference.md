@@ -1173,6 +1173,8 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
 - /api/admin/sharepoint/connections/{connection_id}/certificate
+- /api/admin/sharepoint/connections/{connection_id}/extract
+- /api/admin/sharepoint/extraction/run-due
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1249,6 +1251,30 @@ connection presents (opaque provider auth error), and a certificate
 expiring silently. Never returns the private key. No certificate configured
 or an unparseable one is a typed absence — `{"certificate": null, "reason":
 "..."}` — not an error status.
+
+**Extraction enqueue wiring (TCRD-226).** `POST …/extract` is a one-off
+admin trigger for the existing `corpus-extraction` job kind
+(`app/worker/kinds.py::_run_corpus_extraction`) — enqueues
+`{"connection_id": connection_id}` and returns `202
+{"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
+any other work; refuses cleanly (never a job that fails 30 minutes later in
+a worker) with `409 extraction_disabled` (`extraction.enabled` is false) or
+`409 extraction_producer_not_configured` (no `extraction.producer.command`/
+`.module` set); a run already queued/running for the same connection is
+`409 extraction_already_running` — deduped on a stable per-connection
+idempotency key shared with the sweep below.
+
+`POST /api/admin/sharepoint/extraction/run-due` is the scheduler-driven
+sweep: fires `corpus-extraction` for every SharePoint connection whose
+cadence (`extraction.schedule`, a single instance-wide setting in the
+`extraction:` config block, applied independently to each connection's own
+last-run stamp) says it is due — same shape as `POST /api/v1/agents/run-due`
+(walk + per-row due-check + enqueue into an existing job kind, no second
+scheduling mechanism). Scheduler row `extraction-run-due` in
+`services/scheduler/__main__.py`, registered only when `extraction.schedule`
+is configured (absent/empty = off). A clean, typed no-op (`{"dispatched":
+[], "count": 0, "skipped": true, "reason": ...}`), never an error, when the
+feature isn't usable or no schedule is configured.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
@@ -1632,7 +1658,14 @@ the count of fact-graph claims dropped for that file because its content
 changed in place (§6) — 0 for a brand-new file, an unchanged-content resync
 or rename, or when the `facts` flag is off — so a producer's ingest
 idempotence can tell "content changed, re-ingest is genuinely needed" apart
-from "already shipped".
+from "already shipped". The optional `source_stable_ids` field refuses any
+value matching the RESERVED zip-bundle member-anchor shape
+(`cf_<hex>!<member path>`, only `ingest_bundle` may mint one) with a `400`
+(`reason: "reserved_source_stable_id"`) before any file in the batch is
+stored — otherwise a caller with mere collection READ access (enough to see
+a real member's id and filename in this same listing) could re-upload an
+unrelated file under a member's own anchor and have it silently resolve to
+(and overwrite) that member's row.
 
 - /api/collections
 - /api/collections/search
@@ -1712,11 +1745,35 @@ content-grounded (weaker evidence still, per §8's own honesty note that the
 gate validates the quote, not the fact). `documents` may be
 omitted only when every evidence `doc_id` already resolves through a prior
 upload's `corpus_file_sources` mapping — otherwise `400` with the
-unresolved ids itemized. Corrections management
+unresolved ids itemized. A **zip-bundle member is citable exactly like a
+top-level file**: `src.ingest.bundle.ingest_bundle` writes each member's own
+`corpus_file_sources` anchor at unpack time (`source_doc_id` = the member's
+own content `sha256[:16]`, `source_stable_id` = `"<archive
+corpus_files.id>!<member path>"`), so a claim referencing that `doc_id`
+resolves to the member's `corpus_file_id`, never the archive's — no
+`documents[]` entry is required once the archive has been ingested once.
+That shape is RESERVED: a `documents[].stable_id` matching it is refused
+with a `400` (`reason: "reserved_source_stable_id"`) before any document in
+the batch is resolved — the identical guard the collections upload endpoint
+enforces on `source_stable_ids` (see the Collections section below); only
+`ingest_bundle` may mint an anchor on that shape.
+Corrections management
 (`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
 `wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
+
+`GET /api/facts/type-map` answers "what is in the graph at all" —
+`{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
+through the SAME visibility gate as `search()` with no `type` (shared via
+`_visible_facts_for_corpus_cte(all_collections=True)`, never a second copy
+of the rule), so a type's number is exactly what that caller could reach
+through `search(type=...)`. A type with no subjects visible to the caller
+is OMITTED rather than reported as `0`: absence is deliberately
+indistinguishable from "no such type in this ontology", because a `0` would
+confirm the type exists and that something occupies it — the aggregate form
+of the §5 existence oracle. Triple-surface with `agnes facts type-map` and
+the `fact_type_map` MCP tool.
 
 Every successful ingest batch also persists a copy of its run report to
 `facts_ingest_runs` — written AFTER the ingest transaction commits, so a
@@ -1728,6 +1785,7 @@ counts and per-category error badges — an admin-only, UI-internal surface,
 not an analyst query (no CLI/MCP analogue).
 
 - /api/facts/search
+- /api/facts/type-map
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
@@ -2007,6 +2065,21 @@ metered server-side.
   `require_resource_access`: ungranted analyst on a known collection → 403;
   unknown corpus or a not-yet-built artifact → 404. REST-only (no CLI/MCP
   analogue — mirrors `/api/data/{table_id}/download`).
+- /api/knowledge/digests — the maintained digests THIS caller can read:
+  `{digests: [{id, slug, title, status, status_reason, generated_at}]}`,
+  sorted by slug, never the markdown itself. The enumeration a WEB surface
+  needs (TCRD-250): the content endpoint below has been readable since K4 and
+  `agnes pull` writes every granted digest to `.claude/rules/ka_<slug>.md`,
+  but nothing could list them, so a page had no way to show a reader which
+  digests exist without already knowing an id. Filtered by the SAME
+  fail-closed `_caller_can_read_digest` predicate the manifest builder uses
+  (`app/api/sync.py::_digest_entries`), so the web list and the pulled files
+  can never disagree about entitlement. A digest that has never generated is
+  omitted, matching the manifest — listing it would promise a page that
+  404s. Staleness travels per row, so a stale digest is visibly stale rather
+  than silently so. REST-only by design (see the triple-surface exemption):
+  the CLI and a chat agent already RECEIVE digests as pulled files, so an
+  enumeration call is a browser's need, not theirs.
 - /api/knowledge/digests/{digest_id}/content — serves one maintained
   digest's markdown (K4, #799): `{id, slug, title, output_md, status,
   status_reason, generated_at}`. Listed in the sync manifest's
@@ -2327,6 +2400,7 @@ fanned out into group members' installs and cannot be uninstalled
 ### `/api/upload` — Session and artifact upload
 
 - /api/upload/artifacts
+- /api/upload/audit-events
 - /api/upload/local-md
 - /api/upload/sessions
 

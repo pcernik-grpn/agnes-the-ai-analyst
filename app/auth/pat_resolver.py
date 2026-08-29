@@ -407,6 +407,14 @@ def resolve_token_to_user(
         # short-circuit in src/rbac.py).
         if payload.get("scope") in ("chat", "mcp-oauth"):
             user["credential_surface"] = "stack"
+        if payload.get("scope") == "mcp-oauth":
+            # F0 audit-context (Task 1): stamp so
+            # src.audit_helpers.client_kind_from_user classifies every
+            # request authenticated by an MCP-OAuth connector token (Claude
+            # Desktop / claude.ai, minted by
+            # app.auth.mcp_oauth.AgnesMCPOAuthProvider's exchange_* methods)
+            # as client_kind='mcp', not 'web'.
+            user["token_type"] = "mcp_oauth"
 
         # Issue #1676: server-side session revocation. `session_revoked_before`
         # (PG-only column — A3 ratchet, see

@@ -11,6 +11,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Maintained digests can be listed, not just fetched by id (TCRD-250).** `GET /api/knowledge/digests` returns the digests the caller can read — `{id, slug, title, status, status_reason, generated_at}`, sorted by slug, never the markdown. The content endpoint has been readable since K4 and `agnes pull` already writes every granted digest to `.claude/rules/ka_<slug>.md`, but nothing could enumerate them, so a web surface had no way to show a reader which digests exist without already knowing an id. Filtered by the SAME fail-closed predicate the sync manifest uses, so the browser list and the pulled files can never disagree about entitlement — there is a test asserting exactly that. A digest that has never generated is omitted, matching the manifest, since listing it would promise a page that 404s; staleness travels per row so a stale digest is visibly stale.
+- **The fact graph now says what is in it (TCRD-250).** `GET /api/facts/type-map` (plus `agnes facts type-map` and the `fact_type_map` MCP tool) returns every node type with a live count of the subjects the caller can actually see — the head of the Library's Knowledge tab, where each type is a way in, and an agent's way to learn which types exist before spending a `fact_search` call. Counts run through the SAME visibility gate as `search()` with no `type`, shared rather than restated: `_visible_facts_for_corpus_cte` gained an `all_collections` switch that changes only which facts are candidates, never the rule that decides visibility. A naive `GROUP BY type` would have been the fact graph's existence oracle in aggregate form — a reader counting subjects whose every claim sits in a collection they cannot read — so a type with no visible subjects is OMITTED rather than reported as `0`, leaving "nothing you can see" deliberately indistinguishable from "no such type".
+- **Connecting an outside AI tool is a conversation now, not a page of instructions (TCRD-206).** A new bundled `connect-this-tool` skill reaches the chat agent in every session: it asks which tool you are connecting rather than assuming Claude, hands over the two things any MCP client actually needs (the `/api/mcp/sse` endpoint and an `Authorization: Bearer` header), names where Claude Code, Cursor and VS Code each keep that config, and translates the same shape for a client it does not know rather than inventing a file path. It confirms the connection landed by reading the token's own `last_used_at` through `agnes tokens list` instead of assuming a written config means a connected client, and it refuses to let a token into the transcript — if one is pasted it says so and tells you to regenerate, which revokes it. The instructions page stays for reading ahead and copying a config. Gated on `mcp.connector_ui_enabled`, so an instance with the connector UI switched off never offers a path that dead-ends.
+- **Bundled-skill feature gates carry their own default.** The gate registry hardcoded `default=False`, which was correct while every gated skill was for a default-off feature. A default-ON flag would have pruned its skill from every instance that never set the flag — the common case — so each entry now names the default its own flag has.
+- **Document extraction now actually enqueues (TCRD-226) — the runtime PR #1692 built had nothing to create a job.** `POST /api/admin/sharepoint/connections/{id}/extract` lets an admin trigger the existing `corpus-extraction` job kind on demand — 404s on an unknown connection before any work, refuses cleanly with a typed `409` when `extraction.enabled` is off or no producer is configured (never a job that fails 30 minutes later in a worker), and `409 extraction_already_running` when a run for that connection is already queued. A new `POST /api/admin/sharepoint/extraction/run-due` scheduler sweep (registered only when the new `extraction.schedule` config is set — off by default) applies that single instance-wide cadence independently to each connection's own last-run stamp, same shape as the existing `agents:run-due` sweep. The producer subprocess also gets a credential to call back into Agnes's own API for the first time — `AGNES_API_URL` always, and `AGNES_API_TOKEN` (the scheduler's own shared-secret token) when one is configured — a deliberate, explicitly-documented over-grant (that token is Admin-group god-mode, far more than the producer needs) reused because it's the only credential class a headless subprocess can already present; never on argv, never logged. The SharePoint source card surfaces the in-Agnes schedule's last/next run and a "Run extraction now" action, separate from the external producer's own static crawl-cadence label.
+- **Full audit-log coverage for state-changing requests** (audit-full-coverage plan). A typed audit action catalog (`src/audit_events.py`) is now the single source of truth for every `action` string an audit writer can emit, and every `audit_log` row is auto-filled with per-request context (`client_ip`, `correlation_id`, `client_kind`, caller identity) so callers no longer thread it through by hand. Every mutating route declares its audit posture in `src/audit_posture.py` (`tests/test_audit_route_posture.py` ratchets it), and `AuditFallbackMiddleware` writes a generic `http.request` row for any authenticated mutating request whose handler wrote none — the shrinking `"fallback"` list is the map of what's left to close.
+- **Auth, agent, and background-job surfaces now write audit rows.** PAT enumeration (`GET /auth/tokens*`, `token.list`) and Keboola project-import (`keboola.projects_import`) close out the auth remainder. Agent invocation (`agent.invoke`), multi-turn agent-API session lifecycle (`agent.session.*`), webhook registration/removal (`agent.webhook.*`), every worker job dispatch (`job.run`), and the previously silent scheduled refresh jobs (BigQuery metadata cache, Keboola/Databricks semantic-layer sync, marketplace store lint audit) are now audited too.
+- **MCP, messaging, and admin/secrets/distribution surfaces now write audit rows.** Every MCP `tools/call` on both the SSE and Streamable-HTTP transports (`mcp.tool_call`), passthrough forwards and denials (`mcp.passthrough_call` / `mcp.passthrough_denied`), per-table queries (`query.table_scoped`), and the fact-graph REST endpoints (`facts.*`) are covered through a single dispatch-level wrapper rather than instrumenting each of the ~80 individual tools. Telegram and Slack messaging surfaces — including the Telegram script-run sudo path — chat session lifecycle (create/delete/archive/ticket), inbound user-message metadata, and co-presence invite/join/leave events are audited. So are source-connection CRUD and secret set/clear/test, per-user MCP source secrets, server-wide datasource/Slack secret reads, `POST /api/admin/configure` and the server-config reader, script deploy/run/delete, the marketplace zip/git-smart-HTTP distribution channels, Store/corporate-memory bundle downloads, Jira webhook ingress, artifact/`CLAUDE.local.md` uploads, and the CLI's sync telemetry.
+- **Offline `agnes query`/`agnes explore` runs are now audited too, client-reported after the fact.** Every local-DuckDB run (no server round-trip) is appended to a durable per-workspace spool (`cli/lib/audit_spool.py`) with metadata only — table names, a SQL hash, row/duration counts, **never SQL text** — and `agnes push` uploads the spool in one batch to the new `POST /api/upload/audit-events`. The server trusts nothing the client sends beyond a narrow action whitelist (`query.local_offline`, `explore.local_offline`) and a 2KB-per-event params cap; accepted rows are stamped `client_reported: true` so they read distinctly from server-observed audit rows. A server outage during the spool upload never fails `agnes push` — the spool stays intact and retries next run.
+- Web-chat sessions now materialize into the analyst-sessions jsonl store (`sessions.include_chat`, default on) — `/admin/sessions` and the usage rollups pick up chat conversations the same as any CLI session.
 - **SharePoint connect wizard: subfolder browsing, an instant client filter, and a bounded server-side search** (TCRD-240). `GET .../tree` now takes an `item_id` (with `drive_id`) to browse an arbitrary folder's children — the wizard's step-2 tree can drill past the drive root to any depth, not just sites → drives → root children; `item_id` is structurally validated before it ever reaches a Graph URL path segment. A new `GET .../tree/search` does a bounded breadth-first folder search over the same live tree (never Microsoft Graph's own `/search`, which is known to under-return under app-only auth) — `q` (min 2 chars), `mode` (`prefix`/`contains`/`glob`, case- and NFC-composition-insensitive), an optional `drive_id`+`item_id` subtree root (neither given searches every drive of every reachable site), and `max_depth`/`max_visited` caps (defaults 5/500, clamped rather than rejected at 10/2000) — the response's `truncated` flag is `true` whenever a cap is what stopped the walk, never a silently partial result. In the wizard: a text input above the tree instantly narrows/highlights whatever is already loaded (case- and diacritics-insensitive, no round trip), and a search box with a mode picker lists matching folders with a "Select all (N)" control — each checked result is an ordinary scope confirm, so bulk selection is just N ordinary confirms through the existing `POST .../scopes` contract, never a new bulk endpoint.
 - **SharePoint certificate metadata** — `GET /api/admin/sharepoint/connections/{id}/certificate` and the source card's Certificate row now show the thumbprint the connection's client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t` value — compare it against the identity provider's app registration) plus the conventional uppercase-hex SHA-1 fingerprint, subject/issuer, and a derived `ok`/`expiring_soon` (≤30 days)/`expired` status with days remaining. Derived at request time from the certificate half of the connection's already-stored PEM — no new storage, never the private key; no certificate configured or an unparseable one renders a clean "not configured"/"unreadable" line instead of an error. Catches two real failure modes: a registered certificate that doesn't match what the connection presents (opaque provider auth error), and one expiring silently.
 - **Microsoft Entra ID group sync**, mirroring Google Workspace sync — off by default (`auth.microsoft.group_sync_enabled` / `AGNES_MICROSOFT_GROUP_SYNC_ENABLED`). On sign-in, Agnes calls Microsoft Graph `GET /me/memberOf` with the delegated OAuth token, pages through `@odata.nextLink`, filters to `#microsoft.graph.group` entries, and replaces the user's `source='microsoft_sync'` rows in `user_group_members` (admin/system-seed/other-provider rows untouched). Turning the switch on also widens the requested OAuth scope to the delegated Graph permission `GroupMember.Read.All`, which needs its own admin-consent grant in the Entra app registration and a restart (see `docs/auth-microsoft-oauth.md`); the sync gate itself is read live, so a stale token scope fails soft rather than failing the login. `AGNES_MICROSOFT_GROUP_PREFIX` (env-only, mirrors `AGNES_GOOGLE_GROUP_PREFIX`) narrows which fetched groups are mirrored and, when set, refuses sign-in (`/login?error=microsoft_not_in_allowed_group`) for a user whose non-empty group fetch matched none of it — any other sync failure (feature off, empty fetch, Graph error) never blocks login.
@@ -195,6 +205,37 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   full chat* link to the same session for the full renderer. Engine failures
   are translated into what the reader can act on instead of surfacing the
   internal kind.
+- **Zip-bundle members are now individually citable in the fact graph**
+  (design §6/§7 citability follow-up). Each member `ingest_bundle` unpacks
+  from an archive gets its own `corpus_file_sources` anchor
+  (`source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>`) — best-effort, silently a no-op on
+  a DuckDB-backed instance — so a fact-graph claim can cite the exact member
+  that contains the evidence instead of only the archive, and a producer can
+  cite a member by its own content doc_id with no `documents[]` entry. A
+  member's identity, and therefore its claims, now also survives a routine
+  re-sync of the archive: the previous behavior purged EVERY member up front
+  the moment the archive's own bytes changed (any single member changing
+  changes the zip's own sha256), re-minting every member's id and cascading
+  every member's claims on every re-sync, not just the changed one's;
+  reconciliation is now left entirely to `ingest_bundle`'s own
+  `(filename, sha256)` member matching, which purges only the members that
+  actually changed or disappeared. A member rename inside the archive is
+  still delete-old + create-new (identity stays keyed on filename+sha256,
+  unchanged by this fix) — only a byte-identical, same-named member across a
+  re-sync now keeps its row, anchor and claims. The member-anchor shape
+  (`cf_<hex>!<member path>`) is RESERVED and refused with a `400` from a
+  caller-supplied `source_stable_id` at both entry points that accept one —
+  the collections upload endpoint's `source_stable_ids` field and the facts
+  ingest `documents[].stable_id` — since the shape is visible to anyone with
+  mere collection READ access and would otherwise let a caller with WRITE
+  access silently retarget (or, via facts ingest, hijack the citation key
+  of) a real member's row. A bundle row re-uploaded at the same identity as
+  a non-bundle file type also now fully purges its old members' rows,
+  chunks, claims and anchors (deciding this from the row's OLD filename
+  alone left them permanently live, attached to a row that is now some
+  other file type); and a concurrent double-mint race on the same member no
+  longer 500s the whole ingest.
 
 ### Changed
 - **The Library says what your agents get, not what the server does.** Every
@@ -283,6 +324,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     utilities that tint when on, and "+ Add" is the only filled control.
   - **Bands open on arrival**, and an empty tab says so in its own words rather
     than offering a "Clear filters" button for filters that are not applied.
+- **Authoring surfaces no longer open on a name field (TCRD-205).** The agent builder, the skill/plugin/agent-template builder and the data-package drawer each now open on what the thing is for — a role, a description, what the package carries — and ask what to call it last. The name was the least interesting decision on each form and the hardest to make first, and on the data package it was actively harmful: the slug derives from the name as you type, so a placeholder name immediately became a placeholder identifier. The derivation is unchanged and still correct; asked last, it finally has a real name to derive from. Nothing became more or less required — none of the three gated saving on a name (each already rendered `Unnamed`), so this is ordering only.
+- **One word per thing, across the surfaces where two had drifted (TCRD-208).** `/profile` stops calling admin elevation "god-mode" (now *full admin access*) and stops calling its confirmation a "consent gate" — "consent" already means OAuth provider consent everywhere else in Agnes, so one word was carrying two mechanisms a user meets in the same session. The connection pill on `/me/connections` states a state and nothing else (*Expired*, beside *Connected* and *Not connected*) — the remedy still lives in the detail line, where someone is actually reading. `/admin/semantic-layer` names its drift columns *in Agnes / in source* rather than *stored / upstream*, and no longer points readers at a *Master token (semantic layer)* row that was renamed to *Semantic-layer token*. `/admin/linked-apps` writes `ID` beside `URL` rather than `Id`. The login page's apostrophes are typographic, like the rest of the repo. `tests/test_product_vocabulary.py` pins each decision, because the design-system contract tests police colour and spacing but nothing policed language — which is why sixteen design reviews each re-found a naming collision independently.
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
   The old rule — whichever PR happened to land last with content under
   `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
@@ -829,8 +872,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 
 ### Fixed
+- **The fact-graph read path could show a display name minted from a document the caller cannot read.** A subject (e.g. an engagement or organization) becomes visible once the caller can read ANY one of its claims — but its alias/display name (`fact_aliases.natural_key`) was joined with no grant filter at all, so a caller who could see one unrelated, readable claim on a subject would also see a name that was minted purely from a *different*, restricted claim on the same subject. Each alias now carries its own per-corpus provenance (new `fact_alias_sources` table, populated going forward at ingest time from the evidence that actually established it — including a node with NO claims of its own, reachable only as the anchor of an evidenced edge, e.g. the ordinary "industry"/"sponsor"-shaped ontology row: its provenance now comes from the edge's own claim too, not just claims on the node directly) and is shown only when the caller can read at least one of those corpora, or the subject carries an admin `revealed` correction (same instance-wide bypass `attrs` already gets) — a visible-but-unnamed subject falls back to its opaque id rather than a 404. The free-text `q` search parameter is filtered the same way, so matching against a restricted-only alias can no longer be used to probe for a name's existence via hit count or result ranking. The migration backfills provenance for every alias that predates this release the same way — from that fact's own claims' corpora AND its incident edges' claims' corpora — deliberately BROADER than the live per-alias rule (it can't know which specific claim minted a legacy alias, so it credits every corpus a claim on the fact or an incident edge comes from), because a narrower backfill would silently blank real display names and break `q` search on existing data instead. New aliases minted after this release get the precise, narrow guarantee; a legacy alias's provenance is a best-effort reconstruction, not a promise. Because the original `0084` shipped with the own-claims-only backfill and an instance that already applied it will never re-run it, a follow-up migration (`0085_alias_edge_backfill`) replays the corrected backfill idempotently — a no-op on a fresh instance, and the only route to the fix for one that migrated early.
+- **A streamed answer no longer looks stuck while it finishes (TCRD-213).** The one-click follow-up chips are a fenced `next_actions` trailer inside the same streamed answer, not a second model call made after streaming ends — so once the prose finishes, tokens keep arriving for as long as the model spends on its `sources` and `next_actions` trailers, while the painter deliberately withholds a half-open fence and the text on screen cannot change. The only signal was a caret blinking under finished-looking prose, which is indistinguishable from a hang. That window is now named: while a trailer fence is open the caret is replaced, in place, by a quiet `Finishing…` label, so a turn that is still working says so. No change to when the chips appear — this makes the existing wait legible rather than shortening it.
+- **The session-files drawer explains its own buttons, and a saved file stays visibly saved (TCRD-212).** Every action in the drawer — download, save to Library, open in Library, refresh, close — moves off the native `title` attribute onto an instant, styled tooltip that also appears on keyboard focus; `title` had a ~1s delay, could not be styled, and never showed for a keyboard user, so the sentence explaining each icon was in practice unreachable. The bubble is positioned `fixed` on `document.body` because the file list is its own scroll container and would otherwise clip it, and its colour is an inversion of the theme's own text/surface pair rather than a picked value, so it cannot repeat the white-on-white tooltip failure (DES-134) in any of the four themes. Saving a file now also records the outcome in the row itself — a `Saved to Library` badge beside the filename — instead of only a toast that expires after 2.4s and an icon that explained itself on hover alone.
+- **Local dev: `/library` took minutes to load, because `LOCAL_DEV_MODE`
+  silently switched on the profiling debug toolbar.** `LOCAL_DEV_MODE=1`
+  implied `DEBUG=1`, mounting the FastAPI debug toolbar, whose per-request
+  instrumentation pegs CPU on heavy HTML pages — and every documented
+  local-dev command sets `LOCAL_DEV_MODE`. The heaviest template in the
+  product, `/library`, stopped answering within a request timeout while
+  `/api/version` stayed instant, which reads as a database or template
+  fault rather than a middleware one. Measured on one instance with one
+  variable changed: `>300s` with the toolbar armed, `1.4s` without. The
+  toolbar is now armed only by an explicitly truthy `DEBUG`; local dev
+  with it is `DEBUG=1 LOCAL_DEV_MODE=1`, as `docs/development.md` already
+  documented. Production never set `LOCAL_DEV_MODE`, so no deployed
+  instance was affected.
 - **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote that is a substring of the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The run report now distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
-- **Removed a committed `data` symlink pointing into a contributor's home
 - **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home
   directory.** `data -> /Users/<contributor>/Documents/.../data` reached
   `integration` as a tracked mode-120000 blob. It is broken for everyone
@@ -905,6 +963,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the documented strict-deny on a path-shaped literal (`WHERE c =
   'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
   another. `dbx` gates on a parse rather than a regex and was never affected.
+- **One vocabulary for empty vs blocked vs forbidden (TCRD-207).** Nine
+  design reviews independently found the same collapse: a search that ran and
+  matched nothing, an access denial, and a request that never completed all
+  rendered as the same quiet state on different surfaces, in different words.
+  Investigation found most of the nine already patched piecemeal (collections
+  search, `/admin/linked-apps`, `/admin/semantic-layer`, `/chat` sources,
+  `/me/connections`, `/admin/data-sources`, the corporate-memory review
+  queue) — each with its own wording, none sharing a component. One still-live
+  bug remained: `/chat`'s conversation list (both the rail's renderer and the
+  chat page's own boot path) caught a failed `GET /api/chat/sessions` and
+  showed the exact same "No conversations yet." a genuinely empty account
+  gets — indistinguishable from "your account cannot see the conversation
+  list," even though the conversations were still saved. Fixed with a new
+  shared component, `state.panel()` (`app/web/templates/macros/_state.html`,
+  `app/web/static/css/state_panel.css`) covering four states — nothing
+  matched a query, the collection is genuinely empty, a disclosed access
+  block, and a failed request — each visually distinct (neutral / warn /
+  danger tone, distinct icon), applied to the chat conversation list (adding
+  the missing FAILED state with a Retry action) and the admin moderation
+  queues. The remaining surfaces, `/library` among them, follow separately —
+  they already tell their states apart in copy; what they lack is the shared
+  component. Decision + the security tradeoff
+  on acknowledging blocked-vs-absent:
+  `docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md`.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
@@ -1269,6 +1351,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `next` through the one implementation that knows about app origins.
 - **Facts ingest resolves a duplicate `doc_id` deterministically and within its declaring collection, instead of picking an arbitrary copy across ALL collections (TCRD-241).** A byte-identical SharePoint copy shares its sha-derived `doc_id` with every other copy of the same file, so more than one `corpus_file_sources` row can legally anchor the same `doc_id` — possibly in a different Collection. `FactsPgRepository.ingest_batch` previously resolved evidence with an unscoped `SELECT … WHERE source_doc_id = :doc_id LIMIT 1`, which could attach a claim to whichever collection's copy happened to sort first — mis-scoping the claim's visibility onto the wrong collection's grants and, on `full_documents` replace, leaving a stale claim behind on the copy that didn't win. Resolution is now corpus-scoped and deterministic (indexed copies preferred, `corpus_file_id` as a tiebreak): a claim resolves within the Collection its `documents[]` entry declared, then within the OTHER collections this same batch's `documents[]` touched. When this batch DID declare at least one collection but a cited `doc_id` is anchored only in some other, undeclared one, the claim is now REJECTED (`ambiguous_cross_collection_doc_id`, itemized in `claims_rejected`) rather than silently written under a collection wider than the producer's batch ever declared — a batch scoped to a restricted collection can no longer leak a claim into a more broadly-granted one. A `documents[]`-omitted batch (the documented "every doc_id already resolves" replay) has no batch-declared scope to escape and is unaffected. Replace mode now purges claims off every anchored copy within the declaring collection, not just the one resolution currently prefers.
 
+- **Customer-specific names scrubbed from the shipped surfaces.** This repo's
+  vendor-agnostic rule ("nothing customer-specific in code, config defaults,
+  comments, docs, commit messages") had drifted: the ontology builder's own
+  name field suggested a customer's ontology as its placeholder
+  (`e.g. cuesta_star`), `connectors/sharepoint/graph_client.py` named a
+  private producer repo in its module docstring, the fact-graph design spec
+  and its run log referenced that repo ten times, and two admin-doctor tests
+  used a customer's product name as their brand fixture. All now read as the
+  role rather than the customer — "the producer repo", "the producer
+  pipeline", `e.g. acme_knowledge`. No behaviour change; the eval fixtures
+  under `tests/fixtures/eval/` are deliberately untouched (see the PR body).
 
 ### Removed
 - **The Knowledge Layer hero's leftovers.** Retiring it from the chat landing left the parts behind: `macros/_knowledge_layer.html` was still imported by `chat.html` and still defined the whole banner, and ~230 lines of `.klb-*` CSS in `style-custom.css` (plus a dead `.klb-hub-label--lead` block in `chat.css` styling a class no template emitted, and a `.klb-cta` paper-theme override) were still shipped to every page — so the framing could come back through a one-line call. All of it is deleted. The two things inside it that were still doing work survive with names that describe them: the near-white knowledge-surface gradient is now `.cbn--bar`'s own rule (its only consumer, and the fill `.cld-door--lead` deliberately imitates), and the trust caption "Secure. Private. Always in sync." is inlined into `chat.html` as `.cld-trust-claim` — it was a macro only so the hero and this line could share one caption, and its title half was dead code every caller opted out of. `tests/test_web_chat_empty_state.py` now guards the whole `klb` prefix out of the rendered page rather than the four class names someone thought to list.
@@ -1350,6 +1443,240 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- The group picker on `/admin/users/{id}` ("Add to group") showed only its
+  first option under themes that render the custom dropdown: the section
+  card's `overflow: hidden` clipped the popover at the card's bottom edge,
+  leaving every option past it invisible with no scroll or affordance. The
+  card's clip now yields while a dropdown menu inside it is open
+  (`section_card.css`), which fixes every ds-dropdown near the bottom of any
+  section card, not just this picker.
+- **MCP foundation-tool errors now carry the server's remedy, and the chat
+  approval card says what it is approving.** Every foundation tool used a bare
+  `raise_for_status()`, so a 4xx surfaced to the model as a generic
+  `Client error '400 Bad Request' for url …` while the response's `detail` —
+  the actionable part, e.g. `invalid_category` with the list of valid
+  categories — was discarded; the shared helper now appends it, letting the
+  model self-correct instead of dead-ending. The chat approval card now names
+  the tool being approved in its title (it previously said only "Approval
+  required", forcing the reader to infer the tool from a neighbouring card),
+  a no-args engine tool call no longer renders a code block containing just
+  `{}`, JSON args are pretty-printed, and while a call waits on the decision
+  its tool card reads "waiting for approval" instead of a contradictory
+  "running…".
+- **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
+  values.** Vertex validates the `anthropic-beta` header and refuses the whole
+  request on any value it does not recognize (the first-party API ignores
+  unknowns), and the kai-agent engine's SDK sends first-party betas like
+  `advisor-tool-2026-03-01` — so on `chat.llm.provider: vertex` every engine
+  chat turn died with `400 Unexpected value(s) … for the anthropic-beta
+  header`. The broker now filters the header in vertex mode to the values the
+  Vertex endpoint accepts (renaming where its spelling differs, e.g.
+  `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`), drops the
+  rest (logged; default-deny, so a future unknown beta degrades one optional
+  feature instead of 400-ing every turn), and omits the header entirely when
+  nothing survives.
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
+- **A failed builder Preview now says why, instead of pointing at the browser
+  console.** Reported from a deployed instance: the agent builder's Preview
+  answered "The preview could not answer. The details are in the browser
+  console." — useless to the author, to the person they reported it to, and to
+  the engineer after that. Reproducing it against the scripted engine showed
+  what the copy was discarding: an `engine_error` frame carrying
+  `engine refused the turn (500): {"detail":"… KAI_HOST_JWT_SECRET is unset …
+  Set the SAME value here and on the Agnes process …"}` — a complete diagnosis,
+  thrown away because `engine_error` matched none of the recognised patterns
+  and the fallback named devtools rather than the reason. The unrecognised case
+  now puts the engine's own words on screen (unwrapping the upstream's JSON
+  `detail`, keeping the prefix that says which step failed), `kind` is read as
+  well as `message` since several frames carry the useful half in the kind, and
+  `runner_not_ready` — the 30-second engine-start timeout, usually nobody's
+  mistake on a cold instance — gets its own retryable sentence. The whole error
+  frame is logged as well, so devtools keeps everything it had.
+- **All four conversational builders now say when they are talking to the
+  scripted stand-in.** Every turn endpoint has always reported which engine
+  answered it — that is the whole point of naming the engine — but only the
+  Library and MCP-source builders rendered it; the agents and data-package
+  builders took `engine` off the wire and dropped it, so on those two a stub
+  still passed for a real model. The notice moved into the shared shell
+  (`BuilderShell.engineNotice`), replacing two near-identical copies, so a
+  builder gets it by using the shell rather than by remembering, and all four
+  word it the same. Guarded by `tests/test_every_builder_names_its_engine.py`,
+  which pins both halves — the render and the assignment — for each builder.
+- **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
+  did not type, not just a `url`.** All three name what the instance dials or
+  runs, and only `url` was guarded. `command` and `args` are the sharper pair:
+  on `stdio` transport they are what reach `StdioServerParameters` and are
+  launched as a subprocess on the server, so a patched `command` chooses the
+  binary — and `args` alone is enough, since a benign `npx` or `node` the admin
+  typed will run whatever it is handed. All three are now accepted only when
+  they read exactly as the draft already holds them, so a patch echoing the
+  panel back is harmless and a patch inventing a target is a no-op. Every one
+  stays settable the ordinary way: the panel's own inputs. This sanitizer had
+  no direct tests while its three siblings all did, which is how the gap
+  survived; it has 18 now.
+- **Saving in the MCP-source builder is resumable instead of duplicating the
+  source.** Save makes up to four calls — register the row, store the secret,
+  then one grant per group — so a failure in a later step left a registered
+  source on screen with an error, and pressing Save again re-ran the whole
+  sequence and registered a SECOND source: the only recovery from "secret
+  stored, grant failed" was a duplicate. Save now remembers the row it created
+  and resumes from the step that failed, and says so ("The source is registered
+  — press Save again to finish the rest").
+- **An already-granted group no longer fails a builder save.** Both the
+  MCP-source and link-external-apps builders grant in a batch, and a duplicate
+  grant answers `409` — which is the end state the save is asking for, not a
+  failure. Counting it as one was not cosmetic in the linked-apps builder:
+  `Promise.all` rejects on the first failure, so a single already-granted pair
+  failed the whole save, and every retry then failed identically because the
+  pairs that had succeeded were 409s too — Save became permanently unreachable.
+  Grants are now settled independently, a 409 counts as done, and a partial
+  failure names the app → group pairs that are still not granted instead of
+  reporting "some grants failed". (The pre-builder `/admin/linked-apps` wizard
+  already read 409 as done; the builder that replaced it had lost that.)
+- **The local-dev audience switch is admin-gated in code, not only in its
+  comment.** Both the partial and `_chrome_ctx` stated the switch was
+  LOCAL_DEV_MODE-and-admin, but `dev_preview_available` only ever checked dev
+  mode, so a non-admin on a local instance got the switch. It changes what
+  renders and never any permission, so this was cosmetic rather than a leak —
+  but the claim now matches the check (`session.user.is_admin`, the same one
+  the rail uses). The flag also had a dead first clause whose condition cannot
+  be true without its second.
+- **Collapsing or expanding a section in the builder's Configuration panel no
+  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
+  discarding its scroll position — so opening a section near the bottom
+  scrolled away from the thing you had just opened. Every section's body is
+  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
+  flips the class in place and re-renders nothing.
+- **The `/agents` builder's Configuration panel lists what the agent HAS, not
+  everything it could have.** Data & resources and Capabilities used to render
+  the caller's entire reachable pool — every data package, memory domain and
+  marketplace plugin — as a list of toggles, which made the panel a form to
+  fill in and buried the two or three things actually attached among the
+  dozens that were not. Both sections now show only what is connected (each
+  row's action is *Remove*), with the full pool one click behind a **+** in
+  the section header that opens a searchable picker over the shared
+  `.modal-backdrop` modal. The conversation stays the primary way to attach
+  things; the picker is the by-hand path. An attached id that has since left
+  the caller's scope is still listed, marked *Unavailable*, rather than
+  silently dropped — the panel must not disagree with the agent.
+- **The builder is full-bleed instead of a card inside the page column.** It
+  broke out of the index shell's centred `--width-wide` container (via a
+  `body.ag-building` class, cleared on the way back to the list, which is
+  still a document and keeps its column), so both panes get the screen. The
+  conversation keeps a 780px measure inside its pane so prose does not stretch
+  to 1200px lines. Each section's explanatory sentence moved from the header
+  into the body, where it is read when you open the section to act rather than
+  wrapping to four lines under all six collapsed titles.
+- **A completed sign-in is now recorded in `audit_log`, for every provider.**
+  `login_failed` was the only authentication event the trail carried: the
+  Google, Microsoft, email magic-link and Keboola providers wrote nothing at
+  all on their success paths, and the password provider audited only its
+  failures — so an instance whose people sign in through OAuth could not answer
+  "who signed in, and when" from its own audit log. Both password routes (the
+  browser form and the JSON route used by the CLI/desktop client, distinguished
+  by `client_kind`) and all four OAuth/magic-link callbacks now write a
+  `login_success` row carrying the provider and the trusted client IP. Two
+  adjacent gaps in the same lifecycle close with it: consuming an invite
+  (`/auth/password/setup/confirm`) writes `account_activated` alongside the
+  sign-in it also performs, and the self-service `/auth/password/setup/request`
+  writes `setup_link_requested` — whose anti-enumeration response is identical
+  whether or not the address matched, making the audit row the only place the
+  real outcome is visible. Completing a password reset
+  (`/auth/password/reset/confirm`) and the JSON `/auth/password/setup` sibling
+  both finish a sign-in too — one sets the cookie, the other hands back a
+  bearer token — and both wrote nothing; they record it now, the JSON one as
+  `client_kind="cli"` with `account_activated` beside it, matching its web
+  sibling. Two guards keep this from rotting: one walks `app/auth/providers/`
+  by source rather than a hand-maintained list, so the next provider to mint a
+  session cookie cannot ship without recording it, and a second checks
+  per-FUNCTION — the module-level walk is satisfied the moment a file audits
+  anywhere, which is exactly why those two routes were missed. Separately, the user-management
+  audit helper in `app/api/users.py` swallowed every write failure with a bare
+  `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
+  which keeps the same never-block-the-request policy but leaves a line in the
+  application log when a row is dropped.
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
@@ -5786,8 +6113,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -5828,8 +6153,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - Domain migrations keep the old hostname working: set `DOMAIN_ALIAS` to the name you are moving away from and Caddy serves it alongside `DOMAIN`, with its own certificate, instead of failing the TLS handshake the moment `DOMAIN` changes — which is what would otherwise break bookmarks, `agnes` CLI configs and MCP connector URLs with a certificate error instead of a path onto the new address. Two audiences, two answers: someone arriving in a browser gets a short notice page naming the new address and what still points at the old one (deep links preserved, auto-forwarding after 15 s), while the CLI, MCP clients and anything else get a plain 308 — a silent redirect for everyone would never prompt a human to update the bookmark, and an HTML notice served to a machine client is just a confusing parse error. The split keys on `Accept: text/html` and is scoped to GET/HEAD, so a POST is never swallowed by the notice page. Unset (the default) the block is inert — it resolves to a non-published localhost port and, carrying no `tls` directive, is served an internal certificate silently rather than retrying a public one once a minute forever. Exposed on the `customer-instance` module as a per-VM `domain_alias` field on `prod_instance` / `dev_instances`; drop it once the old DNS record is retired. Cutover checklist — including the three things that do *not* follow `DOMAIN` (`SERVER_URL`/`public_url`, the Google OAuth client's redirect URIs, and already-connected MCP clients): `docs/DEPLOYMENT.md` → "Migrating to a new domain".
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -5935,8 +6258,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -5991,8 +6312,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - The chat sandbox's `agnes` CLI wheel and restored-conversation transcript are now staged for every sandbox provider, not only for providers that also upload the workspace. Only the workspace tarball itself remains tied to that decision. E2B behavior is unchanged.
 - `/admin/chat/secrets/test` ("Test connections" in server config) reports the sandbox credential for the configured provider: the E2B key on an E2B instance, a Docker daemon + image probe on a self-hosted one, instead of a permanently failing E2B row. The chat readiness list on the same page is provider-aware too — rows render from the server's readiness payload (`APPS_RUNNER_TOKEN`/`chat.docker_image` on a docker instance) instead of a fixed E2B-only set.
-
-### Fixed
 
 ### Removed
 
@@ -6102,8 +6421,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   TLS-terminating reverse proxy's access log (see `docs/DEPLOYMENT.md`).
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -6450,8 +6767,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - `agnes refresh-marketplace` (and the `agnes update` convergence) now prunes plugins that left your stack: an `@agnes` plugin installed in the workspace but absent from a successfully-fetched, non-empty marketplace manifest is uninstalled and its `enabledPlugins` entry dropped (entries from other marketplaces are never touched). A transiently empty or unreadable manifest still never removes anything.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -6481,8 +6796,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **BREAKING** (admins only): session-JWT agent surfaces follow the stack too — the web-chat/E2B runner (`scope="chat"`) and the MCP streamable-HTTP OAuth transport (Claude Desktop / claude.ai connectors) now resolve with the `stack` data-read surface, matching the PAT default. Browser sessions, `/admin`, and non-admins are unchanged.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -6498,8 +6811,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 - `/admin/data-sources`'s semantic-layer card is now a one-line status ("Semantic layer: <status> — manage at /admin/semantic-layer"); the per-project counts, "Sync now" control, and the new orphaned-rows view moved to `/admin/semantic-layer`.
-
-### Fixed
 
 ### Removed
 
@@ -6520,8 +6831,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 - **BREAKING** (admins only): PATs minted by `agnes init` / the CLI login exchange, Cowork setup bundles, and self-service MCP connections now carry `surface='stack'` — an admin's workspace/agent catalog and server-side queries follow their stack (required ∪ subscribed data packages + internal tables) like any analyst, instead of god-mode over every registered table. Existing tokens are grandfathered to `surface='all'`; opt up per-workspace with `agnes init --as-admin`. Parquet distribution was already stack-scoped and is unchanged; session (browser) logins and `/admin` are unchanged.
-
-### Fixed
 
 ### Removed
 
@@ -6671,8 +6980,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   were ignored and the yaml decided). Unset behavior is unchanged, and the
   shipped infra module only ever writes `true`. (#1022)
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -6726,8 +7033,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   appeared in any recent window and read as data loss — on a production
   dataset, 34 of 157 uploads in 30 days were invisible this way. Adoption
   charts stay anchored on `started_at` (usage-over-time semantics).
-
-### Fixed
 
 ### Removed
 
@@ -7136,8 +7441,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   running and it finishes after resume, so "please resend" there would invite
   a duplicate turn. Idle sessions drain silently as before.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -7215,8 +7518,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   with hidden input via `--set-password`, so it never lands on the process argv
   (security audit F14). Scripts passing `--password <secret>` must switch to the
   env var.
-
-### Fixed
 
 ### Removed
 
@@ -7595,8 +7896,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   1,000,000) so a single request can't exhaust worker memory; raise the env var
   if you need larger local result sets.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -7679,8 +7978,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
     may call them); `data_app_deploy`/`data_app_logs` are owner/Admin-only.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -7872,8 +8169,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -7988,8 +8283,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   DB table.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9435,8 +9728,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9569,8 +9860,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.74.37] - 2026-07-10### Added
 - Operator toggle to hide individual `/login` feature cards without forking: set `instance.hide_login_features` (a YAML list or comma-separated string of the stable keys `data`, `marketplace`, `mcp`, `memory`, `anywhere`) in `instance.yaml`, or the `AGNES_INSTANCE_HIDE_LOGIN_FEATURES` env override. Empty by default — nothing is hidden.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9671,8 +9960,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9683,8 +9970,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9693,8 +9978,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - `agnes statusline` now surfaces a one-line "what changed" summary after a detached `agnes update` convergence actually changes something (e.g. `Agnes: CLI 0.72.9 -> 0.73.0 (active next session) · +2 plugins · workspace refreshed`), shown once per convergence report; an all-`ok`/`skipped` report renders nothing, and the CLI portion is phrased honestly ("active next session" vs already active) since a freshly-installed binary only takes effect on the next `agnes` invocation (#744)
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9726,8 +10009,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Security
@@ -9750,8 +10031,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - BigQuery job labels (`workload_type`, `agent_name`, `environment`, `user_id`) on agent-issued BQ jobs. The **hybrid** path labels its billable jobs; the `/api/v2/scan` and remote-`/api/query` paths label only the dry-run cost estimate — their billable execution runs through the DuckDB BigQuery extension, which (like sync/snapshot) cannot carry job labels. Full billable-job attribution for those paths is a follow-up slice (bytes/slot capture).
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9787,8 +10066,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - Interactive chat turns (web + Slack) now emit a `chat.message` usage event (`source='server'`, surface + session id in props), so `/admin/telemetry` and the adoption dashboard's active-user counts include chat activity — previously `usage_events` only saw desktop CC sessions (`agnes push`) and server product events
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9834,8 +10111,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 - Manual "Optional: create a one-word shortcut" step removed from `/home` setup wizard — shortcut is now created automatically by `agnes init`.
@@ -9845,8 +10120,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.74.7] - 2026-07-07### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9869,8 +10142,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9891,8 +10162,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 - Unused externally-branded icon asset from `app/web/static/` — added in #724 without description or code references; instance branding is driven by instance config (`get_instance_logo_svg()`), and deployment-specific assets belong in the consuming deployment's own repo, not the public distribution.
 
@@ -9901,8 +10170,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.74.2] - 2026-07-02### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9913,8 +10180,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - `POST /api/admin/validate-gws-credentials` — admin-only format check for the Google Workspace OAuth `client_id` (no network call, no persistence). Powers a new "Test" button on the GWS card of `/admin/datasource-credentials`; the endpoint was documented for #718 but never wired up (previously returned 405 / absent from OpenAPI).
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -10083,8 +10348,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - **AI Connector page leads with a "Control Agnes from your AI agent" connector panel.** The page moved to `/me/ai-connector` (the old `/me/cowork` and `/me/mcp` now 301-redirect there). The OAuth 2.1 connector URL (`/api/mcp/http`) is now the primary call to action — a prominent panel with the copy-able connector URL, a 3-step connect flow, and the supported clients (Claude Cowork, Claude web, ChatGPT, Gemini, Cursor, Microsoft Copilot, VS Code). Previously this no-token connect path was undiscoverable: the page surfaced only the setup-bundle download and the legacy SSE endpoint. The setup-bundle UI and the legacy SSE endpoint display were removed from the page (the bundle and SSE backend endpoints are unchanged). The "AI Connector" name is now applied consistently across the profile dropdown menu, the onboarding tour, and the help/onboarding docs (previously still labelled "AI Cowork"); references to the third-party Claude Cowork product are unchanged. The hero subtitle and the connector panel's lead paragraph now span the full content width instead of wrapping early.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -10274,8 +10537,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -10299,8 +10560,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   writes now use ZSTD compression (was Snappy) and have `write_statistics=True`
   plus `write_page_index=True` for improved DuckDB query performance.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -10310,8 +10569,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - **Built-in marketplace** — two vendor-neutral plugins ship with every instance and are seeded automatically (offline, from `src/_builtin_marketplace/`, no git fetch): `agnes-analyst` (how to query/discover/snapshot Agnes data + look up metrics, served to `Everyone`) and `agnes-operator` (how to configure the instance — init prompt, workspace, branding, connectors — backed by a live `config-surface` call so guidance names this instance's real pointers, served to `Admin`). New `marketplace_registry.is_builtin` flag (the nightly git-sync skips built-in rows) and `marketplace_plugins.admin_disabled` flag for per-plugin admin disable, on both the DuckDB (v77→v78) and Postgres ladders.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -10504,8 +10761,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   No-op when the URL is unset. (#397, #648)
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -10755,8 +11010,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - API coverage: the `/api/* → CLI + MCP` triple-surface check (`tests/test_documentation_api_triple_surface.py`) is now a ratchet — a new endpoint must be classified triple-surface (`_COHORT`) or consciously REST-only (`_EXEMPT`); existing endpoints are grandfathered (`tests/api_triple_surface_grandfathered.txt`). Complements the docs-coverage gate from #565.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -11956,8 +12209,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - **Migrated `admin_corporate_memory`, `admin_server_config`, `me_activity`, `admin/news_editor` onto `base_ds.html` (#482, batch 14 — final).** The last four `base.html` leaf pages: `admin_server_config` moves its top `<style>` → `{% block head_extra %}` and keeps its `_page_hero` inside the `.cfg-page` (1260px) wrapper — faithful, not hoisted to a full-width hero; `me_activity` keeps its `{% block layout %}` full-width override (body via `self.content()`) and its in-`content` `<style>`; `admin_corporate_memory` and `news_editor` already carried their CSS in `{% block head_extra %}` (extends-swap only, chip-input `extra_scripts` / `body.news-admin` script preserved). Redundant `_components.html` imports dropped (`base_ds` auto-imports `ds`). Rendered output unchanged. **This completes the #482 leaf-page migration** — only seven intentionally-bespoke templates remain on `base.html` (the catalog/marketplace detail card-heroes, the dead `admin_scheduler_runs` redirect, and the `_message` partial).
 - **`base_ds.html` now carries `data-theme` + the favicon `<link>` like `base.html`.** The DS base set neither, so every page migrated onto `base_ds` / `base_page` fell back to the default **navy** hero gradient instead of the instance's configured theme (**blue** by default — the hero eyebrow + CTA colours flip with it) and lost its tab favicon. A browser before/after of the #482 batch surfaced it — the marker-only render-checks can't see a theme/pixel change. `<html data-theme="{{ instance_theme | default('blue') }}">` + the favicon link restore exact parity, so the page-shell migration is genuinely render-identical; verified in-browser (hero back to blue `#0073D1`, `data-theme=blue`, favicon present) on `me_activity` + `admin_server_config`. Closes the last `base_ds` parity gap from #367 (alongside the operator `custom_scripts` fix).
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -11966,8 +12217,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.59.2] — 2026-06-02### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 

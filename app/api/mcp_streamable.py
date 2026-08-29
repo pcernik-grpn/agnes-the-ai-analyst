@@ -591,6 +591,7 @@ def _register_dynamic_tools(mcp: FastMCP) -> None:
     try:
         from app.api.mcp.tools_generator import (
             install_grant_filtered_list_tools,
+            install_tool_call_audit,
             register_passthrough_tools,
         )
     except Exception:
@@ -611,3 +612,9 @@ def _register_dynamic_tools(mcp: FastMCP) -> None:
         install_grant_filtered_list_tools(mcp, caller_id_fn=_current_caller_id, passthrough_names=names)
     except Exception:
         logger.exception("Streamable MCP: grant-filtered tools/list install failed")
+    # F2c (audit-full-coverage plan, Task 5): one audit row per tool call,
+    # shared with the SSE transport via the same wrapper — see its docstring.
+    try:
+        install_tool_call_audit(mcp, caller_id_fn=_current_caller_id)
+    except Exception:
+        logger.exception("Streamable MCP: tool-call audit install failed")

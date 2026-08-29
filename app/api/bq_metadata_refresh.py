@@ -43,10 +43,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.auth.access import require_admin
 from app.auth.dependencies import get_current_user
 
+from src.audit_helpers import log_safe
 from src.repositories import (
     bq_metadata_cache_repo,
     table_registry_repo,
 )
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -140,18 +142,20 @@ def refresh_one(row: dict[str, Any]) -> dict[str, Any]:
     source_table = row.get("source_table") or table_id
     repo = bq_metadata_cache_repo()
 
-    if not (
-        validate_quoted_identifier(bucket, "bucket")
-        and validate_quoted_identifier(source_table, "source_table")
-    ):
+    if not (validate_quoted_identifier(bucket, "bucket") and validate_quoted_identifier(source_table, "source_table")):
         repo.mark_error(table_id, "invalid bucket/source_table identifier")
         return {
-            "table_id": table_id, "status": "error", "error": "invalid identifier",
-            "fetch_ms": fetch_ms, "total_ms": int((time.monotonic() - t0) * 1000),
+            "table_id": table_id,
+            "status": "error",
+            "error": "invalid identifier",
+            "fetch_ms": fetch_ms,
+            "total_ms": int((time.monotonic() - t0) * 1000),
         }
 
     req = MetadataRequest(
-        table_id=table_id, bucket=bucket, source_table=source_table,
+        table_id=table_id,
+        bucket=bucket,
+        source_table=source_table,
     )
     fetch_t0 = time.monotonic()
     try:
@@ -165,16 +169,21 @@ def refresh_one(row: dict[str, Any]) -> dict[str, Any]:
         logger.warning("bq metadata refresh failed for %s: %s", table_id, msg)
         repo.mark_error(table_id, msg)
         return {
-            "table_id": table_id, "status": "error", "error": msg,
-            "fetch_ms": fetch_ms, "total_ms": int((time.monotonic() - t0) * 1000),
+            "table_id": table_id,
+            "status": "error",
+            "error": msg,
+            "fetch_ms": fetch_ms,
+            "total_ms": int((time.monotonic() - t0) * 1000),
         }
     fetch_ms = int((time.monotonic() - fetch_t0) * 1000)
 
     if result is None:
         repo.mark_error(table_id, "provider returned no data")
         return {
-            "table_id": table_id, "status": "no_data",
-            "fetch_ms": fetch_ms, "total_ms": int((time.monotonic() - t0) * 1000),
+            "table_id": table_id,
+            "status": "no_data",
+            "fetch_ms": fetch_ms,
+            "total_ms": int((time.monotonic() - t0) * 1000),
         }
 
     repo.upsert_success(
@@ -199,10 +208,7 @@ def refresh_one(row: dict[str, Any]) -> dict[str, Any]:
 
 def _list_remote_bq_rows() -> list[dict[str, Any]]:
     rows = table_registry_repo().list_all()
-    return [
-        r for r in rows
-        if r.get("query_mode") == "remote" and r.get("source_type") == "bigquery"
-    ]
+    return [r for r in rows if r.get("query_mode") == "remote" and r.get("source_type") == "bigquery"]
 
 
 def _refresh_concurrency() -> int:
@@ -296,28 +302,39 @@ async def run_bq_metadata_refresh(
 
             t0 = time.monotonic()
             results = await asyncio.gather(
-                *(_one(r) for r in rows), return_exceptions=True,
+                *(_one(r) for r in rows),
+                return_exceptions=True,
             )
             duration_ms = int((time.monotonic() - t0) * 1000)
         finally:
             _refresh_state["run_id"] = None
             _refresh_state["started_at"] = None
 
-    succeeded = sum(
-        1 for r in results if isinstance(r, dict) and r.get("status") == "ok"
-    )
-    no_data = sum(
-        1 for r in results if isinstance(r, dict) and r.get("status") == "no_data"
-    )
-    failed = sum(
-        1 for r in results
-        if isinstance(r, Exception)
-        or (isinstance(r, dict) and r.get("status") == "error")
-    )
+    succeeded = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "ok")
+    no_data = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "no_data")
+    failed = sum(1 for r in results if isinstance(r, Exception) or (isinstance(r, dict) and r.get("status") == "error"))
 
     logger.info(
         "bq metadata refresh: run_id=%s total=%d ok=%d no_data=%d failed=%d duration_ms=%d",
-        run_id, len(rows), succeeded, no_data, failed, duration_ms,
+        run_id,
+        len(rows),
+        succeeded,
+        no_data,
+        failed,
+        duration_ms,
+    )
+    log_safe(
+        user_id=user.get("id"),
+        action="run_bq_metadata_refresh",
+        resource="job:bq-metadata-refresh",
+        params={
+            "run_id": run_id,
+            "total": len(rows),
+            "succeeded": succeeded,
+            "no_data": no_data,
+            "failed": failed,
+            "duration_ms": duration_ms,
+        },
     )
     return {
         "run_id": run_id,
@@ -369,19 +386,21 @@ def metadata_cache_status(
     for r in cache_rows:
         refreshed_at = r.get("refreshed_at")
         error_at = r.get("error_at")
-        tables.append({
-            "table_id": r["table_id"],
-            "refreshed_at": refreshed_at.isoformat() if refreshed_at else None,
-            "rows": r.get("rows"),
-            "size_bytes": r.get("size_bytes"),
-            "partition_by": r.get("partition_by"),
-            "clustered_by": r.get("clustered_by") or [],
-            "entity_type": r.get("entity_type"),
-            "known_columns": r.get("known_columns") or [],
-            "error_at": error_at.isoformat() if error_at else None,
-            "error_msg": r.get("error_msg"),
-            "freshness": compute_freshness(r, now=now, fresh_threshold=threshold),
-        })
+        tables.append(
+            {
+                "table_id": r["table_id"],
+                "refreshed_at": refreshed_at.isoformat() if refreshed_at else None,
+                "rows": r.get("rows"),
+                "size_bytes": r.get("size_bytes"),
+                "partition_by": r.get("partition_by"),
+                "clustered_by": r.get("clustered_by") or [],
+                "entity_type": r.get("entity_type"),
+                "known_columns": r.get("known_columns") or [],
+                "error_at": error_at.isoformat() if error_at else None,
+                "error_msg": r.get("error_msg"),
+                "freshness": compute_freshness(r, now=now, fresh_threshold=threshold),
+            }
+        )
     return {
         "scheduler_interval_seconds": interval,
         "fresh_threshold_seconds": threshold,

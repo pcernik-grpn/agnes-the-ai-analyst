@@ -138,6 +138,9 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     # source; registered here so validate() never falls back to SELECT id.
     "fact_aliases": ["type", "natural_key"],
     "corrections": ["subject_kind", "subject_id"],
+    # fact-graph alias provenance (0084) — per-corpus join table over
+    # fact_aliases, likewise PG-only with no DuckDB source.
+    "fact_alias_sources": ["type", "natural_key", "corpus_id"],
     # external SSO login (0079) — PG-only with no DuckDB source; the
     # identity table's PK IS the bound user (one external identity per
     # user), and sso_config keeps its default "id" PK.

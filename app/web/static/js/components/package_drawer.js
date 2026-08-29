@@ -112,20 +112,11 @@
       '  </div>' +
       '  <div class="ds-drawer__body">' +
       '    <section class="ds-drawer__pane is-on">' +
-      '      <p class="ds-drawer__lede">Name it after what it carries. Everything below this' +
-      '        stays editable on the package’s own page afterwards.</p>' +
+      '      <p class="ds-drawer__lede">Start with what it carries — the name comes last, and' +
+      '        everything here stays editable on the package’s own page afterwards.</p>' +
       '      <div class="ds-drawer__field">' +
-      '        <label for="pdw-name">Name</label>' +
-      '        <input type="text" id="pdw-name" autocomplete="off" placeholder="Sales bundle">' +
-      '      </div>' +
-      '      <div class="ds-drawer__field">' +
-      '        <label for="pdw-slug">Slug</label>' +
-      '        <input type="text" id="pdw-slug" autocomplete="off" placeholder="sales-bundle">' +
-      '        <p class="ds-drawer__hint" id="pdw-slug-hint">URL-safe identifier; follows the name until you edit it.</p>' +
-      '      </div>' +
-      '      <div class="ds-drawer__field">' +
-      '        <label for="pdw-desc">Description <span class="ds-drawer__opt">(optional)</span></label>' +
-      '        <textarea id="pdw-desc" autocomplete="off" placeholder="What is in here, and who it is for."></textarea>' +
+      '        <label for="pdw-desc">What is in here, and who is it for?</label>' +
+      '        <textarea id="pdw-desc" autocomplete="off" placeholder="e.g. Daily sessions and traffic for the growth team."></textarea>' +
       '      </div>' +
       '      <div class="ds-drawer__row">' +
       '        <div class="ds-drawer__field">' +
@@ -179,6 +170,22 @@
       '          Leave this closed and the package is private until you share it.</p>' +
       '        <div id="pdw-groups"></div>' +
       '      </details>' +
+      // Naming comes LAST (TCRD-205). It is the least interesting decision
+      // and the hardest to make first — you do not know what to call a thing
+      // you have not described yet, and the slug derives from the name as you
+      // type, so a placeholder name immediately became a placeholder
+      // identifier. Deriving is still right; it just needs a real name to
+      // derive from, which is what putting it after the substance gets.
+      '      <div class="ds-drawer__field">' +
+      '        <label for="pdw-name">Name</label>' +
+      '        <input type="text" id="pdw-name" autocomplete="off" placeholder="Sales bundle">' +
+      '        <p class="ds-drawer__hint">What analysts see in the Library.</p>' +
+      '      </div>' +
+      '      <div class="ds-drawer__field">' +
+      '        <label for="pdw-slug">Slug</label>' +
+      '        <input type="text" id="pdw-slug" autocomplete="off" placeholder="sales-bundle">' +
+      '        <p class="ds-drawer__hint" id="pdw-slug-hint">URL-safe identifier; follows the name until you edit it.</p>' +
+      '      </div>' +
       '      <div class="ds-drawer__err" id="pdw-err" hidden></div>' +
       '    </section>' +
       '  </div>' +

@@ -12,8 +12,11 @@
                   followed by sections numbered 1 and 2) and made revising the
                   choice feel like abandoning the draft rather than editing a
                   field. Sections 2-3 render only once a type exists.
-     2 IDENTITY   Name, description, category — identical for every type, so
-                  switching never moves the name field out from under you.
+     2 IDENTITY   Description, category, then the name — identical for every
+                  type, so switching never moves a field out from under you.
+                  The name comes LAST (TCRD-205): it is the least interesting
+                  decision and the hardest to make before you have described
+                  the thing.
      3 CONTENT    The type's own thing: a Markdown body, or a .zip bundle.
                   A Markdown body can be WRITTEN or UPLOADED, offered as an
                   explicit two-button choice rather than as a hint above the
@@ -1472,19 +1475,19 @@
     return BuilderShell.section({
         key: 'identity',
         collapsed: !!collapsed['identity'], no: 1, title: 'Identity',
-        sub: 'What it is called and when someone should reach for it.',
+        sub: 'When someone should reach for it — and, last, what to call it.',
         summary: draft.name || 'Unnamed',
         body:
-              '<label class="sk-field"><span>Name <em>— lowercase-hyphenated handle</em></span>' +
-                '<input type="text" data-sk-field="name" value="' + esc(draft.name) + '" placeholder="' + esc(c.namePlaceholder) + '" maxlength="64" autocomplete="off" spellcheck="false"></label>' +
-              '<p class="sk-hint' + (ns.err ? ' err' : '') + '" id="sk-name-hint">' + esc(ns.msg) + '</p>' +
-              fieldErrHtml('name') +
               '<label class="sk-field"><span>' + esc(c.descLabel) + ' <em>' + esc(c.descNote) + '</em></span>' +
                 '<textarea rows="2" data-sk-field="description" placeholder="' + esc(c.descPlaceholder) + '">' + esc(draft.description) + '</textarea></label>' +
               fieldErrHtml('description') +
               '<label class="sk-field"><span>Category</span>' +
                 '<div class="sk-selectwrap"><select id="sk-category" data-sk-field="category" class="ds-dropdown-native">' + catOptions() + '</select>' + catDropdownHtml() + '</div></label>' +
-          fieldErrHtml('category'),
+          fieldErrHtml('category') +
+              '<label class="sk-field"><span>Name <em>— lowercase-hyphenated handle</em></span>' +
+                '<input type="text" data-sk-field="name" value="' + esc(draft.name) + '" placeholder="' + esc(c.namePlaceholder) + '" maxlength="64" autocomplete="off" spellcheck="false"></label>' +
+              '<p class="sk-hint' + (ns.err ? ' err' : '') + '" id="sk-name-hint">' + esc(ns.msg) + '</p>' +
+              fieldErrHtml('name'),
       }) +
       // Section 2 — the type's content: markdown body, or a .zip bundle.
       BuilderShell.section({

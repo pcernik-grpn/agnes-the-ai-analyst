@@ -8086,7 +8086,43 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── schedule: static text — the crawl runs externally, so this is
     # honestly a label, never live state (spec §13.2's "hourly delta · 03:00
     # full check · extraction in its own lane" collapsed to one line here).
-    cell["schedule"] = {"text": "external producer · hourly delta"}
+    #
+    # `in_agnes` (TCRD-226) is a SEPARATE, additive sub-object: the
+    # in-Agnes `corpus-extraction` job kind's own schedule state for THIS
+    # connection — whether extraction.enabled is on, the configured cadence
+    # (if any), and this connection's own last/next run (last_run_at is
+    # this connection's own `config.extraction.last_run_at`, the SAME
+    # bookkeeping `app/api/admin_sharepoint.py::_record_extraction_dispatch`
+    # writes; next_run_at is a best-effort display estimate,
+    # `src.scheduler.next_due_at` — see its own docstring for why it is
+    # never the source of truth for an actual dispatch). Never confused
+    # with the static `text` above, which describes the EXTERNAL
+    # producer's own crawl cadence, not Agnes's job queue.
+    in_agnes_schedule: dict[str, Any] = {
+        "enabled": False,
+        "schedule": None,
+        "last_run_at": None,
+        "next_run_at": None,
+    }
+    try:
+        from app.instance_config import feature_enabled, get_value
+        from src.scheduler import next_due_at
+
+        in_agnes_schedule["enabled"] = feature_enabled(
+            "extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False
+        )
+        schedule_cfg = str(get_value("extraction", "schedule", default="") or "").strip() or None
+        in_agnes_schedule["schedule"] = schedule_cfg
+        extraction_state = (conn.get("config") or {}).get("extraction") or {}
+        last_run_at = extraction_state.get("last_run_at")
+        in_agnes_schedule["last_run_at"] = last_run_at
+        if schedule_cfg:
+            next_run = next_due_at(schedule_cfg, last_run_at)
+            in_agnes_schedule["next_run_at"] = next_run.isoformat() if next_run else None
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
+
+    cell["schedule"] = {"text": "external producer · hourly delta", "in_agnes": in_agnes_schedule}
 
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity
