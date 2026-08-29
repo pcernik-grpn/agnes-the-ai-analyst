@@ -102,6 +102,29 @@ question, not an error: **what facts buy over the retrieval Collections
 already does.** It is a measured gate (§14, Decision #2) — and the workbook
 itself pre-registers the uncomfortable answer as a legitimate outcome.
 
+**Rev 3.2 → 3.3 (live regression fix, 2026-08-29):**
+
+14. **The verbatim gate rejected legitimate identity-grounded evidence, and
+    the producer's workaround broke something worse.** The extraction
+    ontology grounds some claims (e.g. `part_of`) in a document's own folder
+    path + filename, which the chunk-only gate (§8) rejected — 3 quotes in a
+    live run. The producer's fix, prepending a `Source: <site>/<path>`
+    header into the uploaded artifact's text, turned a filename quote into a
+    content quote, but made the artifact's bytes change on every rename,
+    which the collections upsert (§6) reads as `content_changed` and purges
+    the file's chunks AND claims for what is really a no-op rename — five
+    subjects 404'd after one rename in a live run, reappearing with NEW ids
+    on re-ingest. Fixed at the root: the gate now also accepts a quote that
+    is a substring of the document's own SERVER-STORED `filename`/`path`
+    (§8.2, never a producer-supplied identity string, which would let a
+    producer self-certify an invented quote) — the header workaround is no
+    longer needed. Counted honestly (`claims_accepted_via_identity` in the
+    run report, §7.2/§8.2) so the gate's broadening is never silent. The
+    other, independently real half of the same incident — a producer's
+    ingest idempotence having no signal that a purge happened — is closed by
+    `claims_purged` on the collections upload response (§8.3); consuming it
+    producer-side is a separate, later change.
+
 ---
 
 ## 1. What this is
@@ -577,9 +600,12 @@ Semantics:
   entity-resolution review items — they are the reconcile pass's keep-split
   signal, and the sandbox's own checklist ("conflict → review queue visible
   to humans, not buried in JSONL") is still open there; Agnes closes it.
-- **Response = run report**: `{claims_written, claims_rejected: [{row,
-  reason}], subjects_created, subjects_deleted (orphans), corrections_active:
-  [...]}` — the orphan count is the honesty §6 requires.
+- **Response = run report**: `{claims_written, claims_accepted_via_identity,
+  claims_rejected: [{row, reason}], subjects_created, subjects_deleted
+  (orphans), corrections_active: [...]}` — the orphan count is the honesty §6
+  requires, and `claims_accepted_via_identity` (§8.2) is the honesty the
+  widened verbatim gate requires: how many of `claims_written` are
+  filename-grounded, not content-grounded.
 - **Idempotent**: replaying the same batch is a no-op by the uniqueness keys.
 
 **What the producer uploads as file content — decided, because §8's gate
@@ -628,23 +654,38 @@ HEAVY (concurrency 1) would block every table sync.
 
 ## 8. What "verbatim" actually means
 
-The gate: a claim's quote must be a **substring of one chunk of the
-document's extracted text** (`corpus_chunks.text`; `corpus_files` holds no
-text). Rejected at write, mechanical, the single most valuable check — and
-narrower than it sounds. Four limits, stated for customer material:
+The gate: a claim's quote must be a substring of **either** (a) one chunk of
+the document's extracted text (`corpus_chunks.text`; `corpus_files` holds no
+text), **or** (b) the document's own **server-stored identity strings** —
+`corpus_files.filename` / `corpus_files.path`, exactly as Agnes holds them,
+never a producer-supplied name/path read off the wire (that would let a
+producer self-certify an invented quote by declaring whatever string it
+likes — see §8.3). Rejected at write, mechanical, the single most valuable
+check — and narrower than it sounds. Four limits, stated for customer
+material:
 
-1. **It validates the quote, not the fact.** An invented relationship citing
-   a real adjacent sentence passes. (Test EQ2 documents this honestly; the
-   producer's own skill rule 11 — "the quote must STATE the fact, not merely
-   mention its entities" — is prompt-level mitigation, not a guarantee.)
-2. **The text is the extraction, not the document.** Markdown conversion
-   moved tables into pipe syntax, normalized ligatures, relocated headers. A
-   user searching the quote in the original will sometimes not find it.
-3. **Quotes cannot cross a chunk boundary** — the substring test is per
-   chunk.
+1. **It validates the quote, not the fact — and an identity-grounded quote
+   validates even less.** An invented relationship citing a real adjacent
+   sentence passes; one grounded only in the document's filename/path proves
+   the document exists and is named that, nothing about what it says. (Test
+   EQ2 documents the chunk half honestly; the producer's own skill rule 11 —
+   "the quote must STATE the fact, not merely mention its entities" — is
+   prompt-level mitigation, not a guarantee, for either half.)
+2. **The chunk text is the extraction, not the document.** Markdown
+   conversion moved tables into pipe syntax, normalized ligatures, relocated
+   headers. A user searching the quote in the original will sometimes not
+   find it. The identity half doesn't share this gap — `filename`/`path` are
+   the same strings a caller sees in the Library UI — but shares the next
+   two.
+3. **A quote cannot cross a boundary** — the substring test is per chunk for
+   (a), and `filename`/`path` are checked as two SEPARATE strings for (b),
+   never concatenated: a quote spanning "the folder name / the file name" in
+   a way that isn't literally contiguous in either string still fails, even
+   though a human reading the two together would recognize it.
 4. **Cross-language extraction fails the gate by construction** (Czech
-   document, English claim → no substring). Open (O6); blocks any
-   multilingual corpus.
+   document, English claim → no substring) — for both halves: a folder path
+   in one language and a claim in another still produces no match. Open
+   (O6); blocks any multilingual corpus.
 
 **Citation to the source system is new work**: `source_url` lives in
 `corpus_file_sources` when the crawler supplies it (O7); until then a
@@ -684,6 +725,62 @@ place.
 
 Conversion fidelity is therefore a **correctness dependency**, gated by test
 EQ8 (§15.3).
+
+### 8.2 The identity haystack (ratified 2026-08-29, live regression fix)
+
+**Why identity strings count as evidence at all.** The extraction ontology
+legitimately treats a document's own identity — folder path + filename — as
+a fact in its own right: a `part_of` edge grounded in "Project Kemp/Parts
+Authority — Overview.pptx" states something true (this document lives under
+Project Kemp) using words that only ever appear in the document's name, never
+its body text. The chunk-only gate rejected these by construction (3 of the
+producer's quotes in a live proving run) even though the evidence is real.
+
+**Why only SERVER-STORED strings, never wire-supplied ones.** `documents[]`
+entries on the ingest wire (§7.0) carry a producer-declared `path`, but that
+field exists to **resolve** which `corpus_files` row an evidence `doc_id`
+means — it is never written into `corpus_files.path` by the ingest path, and
+the gate reads `frow["filename"]`/`frow["path"]` from the row `corpus_files`
+already holds, fetched independently of anything on this request. A producer
+that declared an invented `path` on the wire cannot use it to manufacture a
+match: the gate only ever sees the identity Agnes itself assigned at upload
+time (`app/api/collections.py::_upsert_corpus_file`), so self-certification
+is refused by construction, not by a runtime check that could be forgotten.
+
+**The count.** Every ingest response reports `claims_accepted_via_identity`
+— the subset of `claims_written` whose quote matched ONLY the identity
+haystack, never a chunk — so an operator can see how much of a batch's
+evidence is filename-grounded rather than content-grounded (weaker still,
+per limit 1 above). Zero silent widening: the gate got broader, but the
+report says by how much.
+
+**The coupled bug this closes.** Before this widening, the producer's only
+way past the chunk-only gate for a filename-grounded quote was to prepend a
+`Source: <site>/<path>` provenance header INTO the uploaded artifact's text
+— turning a filename quote into a content quote. That fixed the rejections
+but broke something worse: a rename recomputes the header, so the artifact's
+bytes change even though nothing about the document's CONTENT changed,
+Agnes takes the `content_changed` branch in the collections upsert (§6), and
+purges the file's chunks **and its claims** for what is, from the document's
+point of view, a no-op rename. §8.3 below is the other half of that same
+incident — the two together are why this section exists.
+
+### 8.3 The upload purge signal (ratified 2026-08-29)
+
+A collections upload that lands on the `content_changed` branch (§6) drops
+the replaced file's fact-graph claims (`_purge_facts_claims_for_replaced_file`
+— a claim's quote is a verbatim span of the OLD bytes, and once the sha
+moves those bytes are gone). Before this change nothing told the producer
+that happened: its own ingest idempotence (union mode merges on `(subject,
+corpus_file_id, quote_hash)`, §7.2) sees no NEW quotes to write and reports
+"already shipped", so the claims stay missing until an operator forces a
+re-ingest. `POST .../files` now returns `claims_purged` per file — the count
+dropped for THAT file on this upload, 0 for a brand-new file, an
+unchanged-content resync/rename, or when the `facts` flag is off — so a
+producer can treat a non-zero count as "re-ingest this document", closing
+the loop the two systems previously ran past each other on. (Consuming the
+signal on the producer side is a separate, later change; this section
+defines the contract it will read.)
 
 ---
 

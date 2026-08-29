@@ -208,6 +208,138 @@ def test_verbatim_gate_accepts_a_real_substring(pg_env, repo):
 
 
 # ---------------------------------------------------------------------------
+# Identity haystack — a document's own SERVER-STORED filename/path counts as
+# verbatim evidence too (spec §8, live regression: the extraction ontology
+# legitimately grounds e.g. a `part_of` edge in the document's folder path +
+# filename, which the chunk-only gate rejected).
+# ---------------------------------------------------------------------------
+
+
+def test_verbatim_gate_accepts_a_quote_grounded_in_the_stored_filename(pg_env, repo):
+    file_id = "cf_identity1"
+    doc_id = "doc_identity1"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(
+        file_id=file_id,
+        filename="Parts Authority — Overview.pptx",
+        path="Project Kemp/Parts Authority — Overview.pptx",
+    )
+    _seed_chunk(file_id=file_id, text="Nothing about the filename appears in the extracted text.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[{"id": "engagement:kemp", "type": "engagement", "attrs": {}, "evidence": []}],
+        edges=[
+            {
+                "type": "part_of",
+                "src": "engagement:kemp",
+                "dst": "project:kemp",
+                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp/Parts Authority"}],
+            }
+        ],
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+    assert report["claims_accepted_via_identity"] == 1
+
+
+def test_verbatim_gate_still_rejects_a_quote_absent_from_chunks_and_identity(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, file_id="cf_identity2", doc_id="doc_identity2")
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:fabricated",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "This was never in the document or its name."}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 0
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+    assert report["claims_accepted_via_identity"] == 0
+
+
+def test_producer_supplied_document_path_does_not_widen_the_identity_haystack(pg_env, repo):
+    """Security: `documents[]`' `path` is producer-declared and used only to
+    MATCH an existing row — it must never itself become identity evidence,
+    or a producer could self-certify an invented quote by declaring
+    whatever path it likes on the wire. Only the SERVER-STORED
+    `corpus_files.filename`/`path` may widen the gate."""
+    file_id = "cf_identity3"
+    doc_id = "doc_identity3"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id, filename="real-name.pptx", path="Real/Folder/real-name.pptx")
+    _seed_chunk(file_id=file_id, text="Nothing relevant here.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": doc_id,
+                "corpus_id": CORPUS_A,
+                "path": "Fake/Spoofed Path — Not Real.pptx",
+            }
+        ],
+        nodes=[
+            {
+                "id": "engagement:spoof",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "Spoofed Path — Not Real"}],
+            }
+        ],
+    )
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+    assert report["claims_accepted_via_identity"] == 0
+
+
+def test_unicode_normalization_is_consistent_between_identity_and_chunk_paths(pg_env, repo):
+    """No normalization is added on either side of the gate — an NFD quote
+    against NFC-stored text fails the SAME way whether the text lives in a
+    chunk or in the document's own filename/path (a prior live finding was
+    an NFC/NFD mismatch; this guards against reintroducing an asymmetry
+    between the two haystacks)."""
+    import unicodedata as ud
+
+    nfc_word = ud.normalize("NFC", "Café")
+    nfd_word = ud.normalize("NFD", "Café")
+    assert nfc_word != nfd_word  # sanity: genuinely different code points
+
+    file_id = "cf_identity4"
+    doc_id = "doc_identity4"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(
+        file_id=file_id,
+        filename=f"{nfc_word} Overview.pptx",
+        path=f"Docs/{nfc_word} Overview.pptx",
+    )
+    _seed_chunk(file_id=file_id, text=f"{nfc_word} is on schedule.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    # Cross-form quote fails against the NFC chunk text (pre-existing, no
+    # normalization anywhere in the gate)...
+    chunk_mismatch = repo.ingest_batch(nodes=[_node("e:mismatch1", doc_id, f"{nfd_word} is on schedule")])
+    assert chunk_mismatch["claims_written"] == 0
+
+    # ...and fails identically against the NFC-stored filename/path.
+    identity_mismatch = repo.ingest_batch(nodes=[_node("e:mismatch2", doc_id, f"{nfd_word} Overview.pptx")])
+    assert identity_mismatch["claims_written"] == 0
+    assert identity_mismatch["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+
+    # Same-form (NFC) quote succeeds via chunk text (control)...
+    chunk_match = repo.ingest_batch(nodes=[_node("e:match1", doc_id, f"{nfc_word} is on schedule")])
+    assert chunk_match["claims_written"] == 1
+
+    # ...and via the identity haystack when the chunk text doesn't cover it.
+    identity_match = repo.ingest_batch(nodes=[_node("e:match2", doc_id, f"{nfc_word} Overview.pptx")])
+    assert identity_match["claims_written"] == 1
+    assert identity_match["claims_accepted_via_identity"] == 1
+
+
+# ---------------------------------------------------------------------------
 # C2 — full_documents replace mode drops a stale claim; union mode doesn't.
 # ---------------------------------------------------------------------------
 
