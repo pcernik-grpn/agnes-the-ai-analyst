@@ -629,6 +629,34 @@ function extractNextActions(markdown) {
   return { text: out.trimEnd(), actions: actions.slice(0, _NEXT_ACTIONS_MAX) };
 }
 
+/** True while the stream sits inside a trailer fence whose closing ``` has
+ *  not arrived yet.
+ *
+ *  This is the window TCRD-213 is actually about. The `next_actions` chips are
+ *  NOT a second LLM call made after streaming — they are a fenced trailer at
+ *  the end of the SAME streamed answer, and `_streamingSafeText` deliberately
+ *  withholds a half-open fence so raw ``` markup never flashes on screen. The
+ *  consequence is that once the prose ends, tokens keep arriving for as long
+ *  as the model spends on `sources` + `next_actions`, while the painted text
+ *  cannot change. The turn is working; the screen cannot show it. A blinking
+ *  caret under finished-looking prose is indistinguishable from a hang, which
+ *  is exactly the "vypadá to, jako by se aplikace zasekla" report.
+ *
+ *  Scans to the LAST opener of either trailer and asks whether a close
+ *  follows it, so a closed `sources` fence ahead of an still-open
+ *  `next_actions` one is judged on the open one. */
+function _inWithheldTrailer(text) {
+  const s = text || "";
+  let last = -1;
+  for (const re of [_SOURCES_OPEN_RE, _NEXT_ACTIONS_OPEN_RE]) {
+    const g = new RegExp(re.source, "gi");
+    let m;
+    while ((m = g.exec(s)) !== null) last = Math.max(last, m.index + m[0].length);
+  }
+  if (last === -1) return false;
+  return s.indexOf("```", last) === -1;
+}
+
 function stripNextActionsFence(markdown) {
   return extractNextActions(markdown).text;
 }
@@ -2809,6 +2837,9 @@ function _renderStreamingMarkdown() {
   _streamLastRender = performance.now();
   if (!currentAssistantBody) return; // finalized (or never started) — nothing to paint
   const visible = _streamingSafeText(currentAssistantText);
+  if (currentAssistantArticle) {
+    currentAssistantArticle.classList.toggle("is-trailing", _inWithheldTrailer(currentAssistantText));
+  }
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
   } catch (_e) {
@@ -2868,7 +2899,7 @@ function _resetStreamingState() {
   _turnSealedText = "";
   _turnSealedArticles = [];
   if (!article || !body) return;
-  article.classList.remove("is-streaming");
+  article.classList.remove("is-streaming", "is-trailing");
   if (!text.trim()) return; // an empty bubble has nothing to finish
   enhanceCodeBlocks(body);
   enhanceTables(body);
@@ -2896,7 +2927,7 @@ function _sealStreamingSegment() {
     currentAssistantArticle.remove();
   } else {
     _flushStreamingTail();
-    currentAssistantArticle.classList.remove("is-streaming");
+    currentAssistantArticle.classList.remove("is-streaming", "is-trailing");
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
     renderMermaidBlocks(currentAssistantBody);
@@ -2979,7 +3010,7 @@ function finalizeAssistantMessage(frame) {
   _turnSealedText = "";
   _turnSealedArticles = [];
   if (currentAssistantArticle && currentAssistantBody) {
-    currentAssistantArticle.classList.remove("is-streaming");
+    currentAssistantArticle.classList.remove("is-streaming", "is-trailing");
     currentAssistantBody.innerHTML = renderAnswerMarkdown(tail);
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);

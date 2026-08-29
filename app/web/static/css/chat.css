@@ -566,6 +566,34 @@ body.chat-page-body main { margin: 0; padding: 0; }
 }
 @keyframes cloudchat-blink { 50% { opacity: 0; } }
 
+/* The tail of a turn, made legible (TCRD-213). Once the answer's prose ends,
+   the model is still emitting its `sources` / `next_actions` trailer — the
+   painter withholds a half-open fence, so tokens keep arriving while the text
+   on screen cannot change. A caret blinking under finished-looking prose is
+   indistinguishable from a stall, so for that window the caret is replaced by
+   a label that says the turn is still going. Same element, so nothing reflows
+   underneath the reader; the compound selector means it disappears the moment
+   `is-streaming` does. */
+.msg.is-streaming.is-trailing .msg-body::after {
+  content: "Finishing\2026";
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  vertical-align: middle;
+  animation: cloudchat-tail-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cloudchat-tail-pulse { 50% { opacity: 0.55; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.is-streaming.is-trailing .msg-body::after { animation: none; }
+}
+
 /* Actions row (timestamp + copy) — revealed on hover or copy-button
    focus. Stays muted so it doesn't compete with the body. */
 .msg-actions {
