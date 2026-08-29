@@ -182,6 +182,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **Every row in the Library's + Add menu says what it makes.** Four of the
+  eight — skill, plugin, agent template, upload — were a verb and nothing else,
+  so the menu told you the shape of the thing only where someone had happened to
+  write a sub-line. Each now carries the builder's own one-line description,
+  compressed, so the menu and the page it opens describe the same object the
+  same way. The menu widens 214px → 320px to fit them on one line each.
 - **The Library filter menu answers more than "who owns it".** It offered
   Owner, Source, Access and a Tags category that is empty for every collection,
   file, app and recipe (`file_corpora` has no tags column), so past a screenful

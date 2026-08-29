@@ -655,18 +655,18 @@
   .lib-new__caret { width: 15px; height: 15px; transition: transform .15s ease; }
   .lib-new__btn[aria-expanded="true"] .lib-new__caret { transform: rotate(180deg); }
   @media (prefers-reduced-motion: reduce) { .lib-new__caret { transition: none; } }
-  .lib-new__menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; min-width: 214px; padding: 6px; background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 12px; box-shadow: var(--ds-shadow-md); }
+  .lib-new__menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; min-width: 320px; max-width: calc(100vw - 32px); padding: 6px; background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 12px; box-shadow: var(--ds-shadow-md); }
   .lib-new__menu[hidden] { display: none; }
-  .lib-new__item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: none; background: none; border-radius: 8px; font: inherit; font-size: 13.5px; font-weight: 500; color: var(--ds-text-primary); text-align: left; text-decoration: none; cursor: pointer; }
+  .lib-new__item { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 9px 10px; border: none; background: none; border-radius: 8px; font: inherit; font-size: 13.5px; font-weight: 500; color: var(--ds-text-primary); text-align: left; text-decoration: none; cursor: pointer; }
   /* The heading is the warning. An item saying "Build a skill" cannot tell you
      that publishing it reaches everyone, and an item saying "Upload a file"
      cannot tell you that it does not — so the two groups are named for who
      ends up seeing the result. */
   .lib-new__cap { padding: 9px 10px 5px; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; font-weight: 700; color: var(--ds-text-muted); }
   .lib-new__sep { border-top: 1px solid var(--ds-border-light); margin: 5px 0; }
-  .lib-new__item small { display: block; font-weight: 400; font-size: 11.5px; color: var(--ds-text-muted); }
+  .lib-new__item small { display: block; margin-top: 1px; font-weight: 400; font-size: 11.5px; line-height: 1.35; color: var(--ds-text-muted); }
   .lib-new__item:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); color: var(--ds-primary); }
-  .lib-new__item svg { width: 17px; height: 17px; flex-shrink: 0; color: var(--ds-text-secondary); }
+  .lib-new__item svg { width: 17px; height: 17px; margin-top: 1px; flex-shrink: 0; color: var(--ds-text-secondary); }
   .lib-new__item:hover svg { color: var(--ds-primary); }
 
   /* ── The toolbar, sticky at the head of the list ──
@@ -2356,18 +2356,18 @@
             {% endif %}
             <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>
-              <span>Build a skill</span>
+              <span>Build a skill<small>A recipe an agent loads on demand</small></span>
             </a>
             <a class="lib-new__item" href="/skills?type=plugin" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg>
-              <span>Build a plugin</span>
+              <span>Build a plugin<small>One install that hands over several things</small></span>
             </a>
             {# An agent TEMPLATE — a Library resource others build their own agent
                from. The agents a user configures for themselves live on /agents
                and are reached from the rail, never from this menu. #}
             <a class="lib-new__item" href="/skills?type=agent" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4M9 13h.01M15 13h.01" stroke-linecap="round"/></svg>
-              <span>Build an agent template</span>
+              <span>Build an agent template<small>A role others build their own agent from</small></span>
             </a>
             {% if user.is_admin %}
             {# Filed under Capabilities on the menu's own reading of it — "tools an
@@ -2384,7 +2384,7 @@
             <div class="lib-new__cap">Just for you</div>
             <button type="button" class="lib-new__item" role="menuitem" data-new-upload>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 16V5M8 9l4-4 4 4" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
-              <span>Upload a file</span>
+              <span>Upload a file<small>Yours alone, and your agents can search it</small></span>
             </button>
         </div>
   

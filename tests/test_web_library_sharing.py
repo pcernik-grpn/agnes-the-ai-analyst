@@ -646,8 +646,10 @@ def test_library_add_actions_live_behind_one_menu(seeded_app):
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
     assert 'id="lib-new-btn"' in text
     assert 'id="lib-new-menu"' in text
+    # `>label<` rather than `<span>label</span>`: each item carries a `<small>`
+    # description after its label, so the label no longer ends the span.
     for label in ("Build a skill", "Build a plugin", "Build an agent template", "Upload a file"):
-        assert f"<span>{label}</span>" in text
+        assert f">{label}<" in text
     assert ">Build an agent<" not in text
     # Every row goes to the one builder at /skills, so no row is marked WIP.
     assert "lib-wip" not in text
