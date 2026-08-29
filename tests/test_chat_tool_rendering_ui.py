@@ -202,6 +202,9 @@ def test_tool_label_executable():
         ["Bash", {"command": "ls -la"}],
         ["Read", {"file_path": "/tmp/x"}],
         ["mcp__agnes__crm_search_accounts", {"q": "acme"}],
+        # Track C7 (@delegation MVP) — the in-sandbox SDK tool
+        # (app/chat/runner.py::_delegation_mcp_server) names itself this way.
+        ["mcp__agnes-delegation__delegate_to_agent", {"agent_slug": "b-agent", "message": "hi"}],
         ["totally_unknown_tool", {}],
         [None, None],
     ]
@@ -212,8 +215,9 @@ def test_tool_label_executable():
     assert res[2] == "Running a command"
     assert res[3] == "Reading a file"
     assert res[4] == "Crm search accounts", "mcp prefix stripped, words humanized"
-    assert res[5] == "Totally unknown tool"
-    assert res[6] == "tool"
+    assert res[5] == "Delegating to another agent"
+    assert res[6] == "Totally unknown tool"
+    assert res[7] == "tool"
     assert not any("mcp__" in r for r in res)
 
 

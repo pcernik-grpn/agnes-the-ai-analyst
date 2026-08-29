@@ -128,6 +128,16 @@ async def _data_apps_git(slug: str, path: str, request: Request):
         if not user:
             return None, None, None
 
+        from app.auth.session_principal import PRINCIPAL_TYPES
+
+        if isinstance(user, PRINCIPAL_TYPES):
+            # A restricted principal (agent session / co-session) is a frozen
+            # dataclass with no single caller identity — the owner/admin
+            # checks below have nothing sound to run against, and used to
+            # raise on `user["id"]` and surface as a raw 500 (#1656). The git
+            # surface is owner-authority; fail closed with a clean 403.
+            return user, data_apps_repo().get_by_slug(slug), False
+
         app_row = data_apps_repo().get_by_slug(slug)
         if not app_row:
             return user, None, None

@@ -1450,6 +1450,7 @@ and `agnes semantic-model schema <type> [<type> ...] [--json]`. MCP:
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
 
@@ -2400,6 +2401,18 @@ Guards, enforced in every mode: empty/whitespace-only `content` → `422` — th
 **Auth binds to the CALLING session, never the path `{id}`.** The in-sandbox agent reaches this route through the secret broker (`app/api/broker.py`), which authenticates as the sandbox's real owner and mints a JWT carrying `chat_session_id` for the session the ticket was minted for. Because the broker replays whatever path the sandboxed agent describes, a prompt-injected agent could otherwise target a DIFFERENT session belonging to the SAME owner but a DIFFERENT agent (with a different, possibly `off`, `memory_write_mode`) — `require_session_principal`'s ownership check alone would allow it, since both sessions share an owner. So whenever a broker-minted `chat_session_id` claim is present, it must equal the path `{id}` or the request is `403 {"code": "session_mismatch"}`, regardless of ownership. An interactive owner session token or an agent PAT (neither goes through the broker) carries no such claim, so the path `{id}` — already ownership/PAT-verified by `require_session_principal` — is trusted as-is.
 
 - /api/v1/sessions/{session_id}/memories
+
+### `POST /api/v1/agents/{slug}/delegate` — @delegation between shared agents (Track C7 MVP)
+
+Server-side handoff: a live, user-driven agent turn (agent A) hands ONE sub-request off to another agent the CALLER may run (agent B, named by `{slug}`), mid-turn, and gets B's answer back into A's turn. `{input: message: str (required)}` → `200 {status: "ok"|"denied"|"degraded", reason: str | null, agent_slug, answer: str | null, message: str | null}` — a denial or degrade is a normal `200` body, never an HTTP error: the caller (agent A's own in-process delegation tool) is expected to read `status`/`reason` and continue the turn on its own judgment.
+
+Same auth binding as `/api/v1/sessions/{id}/memories` above: reached exclusively through the secret broker under A's OWN session-scoped ticket (never a client-supplied session id) — `require_delegating_session` resolves the caller's identity from whatever the broker's JWT minting produced (an `AgentPrincipal` for a restricted/shared agent, or a plain user dict with a stashed `chat_session_id` claim for the "passthrough" optimization on an unrestricted agent run by its own owner), never from a client-shaped field.
+
+`{slug}` is resolved exactly like `require_agent_runtime_principal` resolves a runtime target (`agents_repo().get_runnable_by_slug`) — the CALLER's own runnable set (owned, or reachable via a `ResourceType.AGENT` grant), never A's owner's. THE SECURITY INVARIANT: B is spawned as a fresh CHILD session via `ChatManager.create_session(user_email=<the ORIGINAL caller>, agent_id=B)` — never A's owner, never B's owner — so B's row-level access policies (`src/access_policy.py`) bind to the caller, never a wider identity. Depth-1 only (a session spawned as a delegate target cannot itself delegate, `reason: "depth_exceeded"`) and one delegation per turn (`reason: "already_delegated_this_turn"`). An RBAC denial (`reason: "agent_not_runnable"`), an exhausted monthly budget on B (`status: "degraded"`, `reason: "budget_exhausted"`), the per-user concurrency cap (`reason: "concurrency_cap"`), or B simply not answering in time (`reason: "timeout"`) all degrade the result — none of them raise an HTTP error or crash A's turn.
+
+Sandbox-internal RPC (standing exemption from the triple-surface CLI/MCP ratchet — see `app/api/agent_delegation.py`'s module docstring): its only real caller is agent A's own in-process delegation tool (`app/chat/runner.py`'s `_delegation_mcp_server`), not something an analyst calls directly from a terminal.
+
+- /api/v1/agents/{slug}/delegate
 
 ### `/api/v1/agents/{slug}/webhooks` — outbound agent webhooks (V1b Task 6)
 

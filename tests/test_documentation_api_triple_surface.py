@@ -679,6 +679,29 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/v1/agents/{slug}/delegate": (
+        "Track C7 (@delegation MVP) — sandbox-internal RPC, reachable only "
+        "by a live agent turn's own in-process delegation tool "
+        "(app/chat/runner.py's `_delegation_mcp_server`) under that turn's "
+        "own session-scoped ticket (never a durable user credential an "
+        "analyst would hold at a terminal — see app/api/agent_delegation.py's "
+        "module docstring). A CLI/MCP 'delegate now' command is a plausible "
+        "FUTURE feature, but exposing THIS exact route as a generic "
+        "analyst-facing tool would let a caller puppet another agent's turn "
+        "outside the depth-1/one-per-turn/caller-binding guarantees this "
+        "route enforces for a LIVE delegating turn"
+    ),
+    "/api/admin/upgrade-freeze": (
+        "per-instance auto-upgrade freeze (TCRD-238) — deliberately never "
+        "MCP-exposed per the 'operator security-posture' standing exemption "
+        "in CONTRIBUTING.md: an agent-invokable tool that can suspend a "
+        "fleet's upgrade path (and therefore its security patching) is a "
+        "denial-of-patching seam, not a convenience. No CLI surface either: "
+        "the consumer is the host's own cron tick reading a marker on the "
+        "state disk, and the human who sets it is the operator already in "
+        "/admin before a demo — an `agnes admin` verb would be a third way "
+        "to write one file, with no analyst workflow behind it"
+    ),
     "/api/admin/sso/config": (
         "external SSO login config (design 2026-08-28) — CLI-reachable via "
         "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
