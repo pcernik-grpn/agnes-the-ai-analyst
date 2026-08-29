@@ -1175,6 +1175,7 @@ def test_documents_source_url_is_persisted_onto_corpus_file_sources(pg_env, repo
         nodes=[_node("engagement:url1", "docurl1", "Acme Corp signed the deal.")],
     )
     assert report["claims_written"] == 1
+    assert report["source_urls_rejected"] == []  # a valid url is never itemized as rejected
 
     row = corpus_file_sources_repo().get("cf_url1")
     assert row["source_url"] == url
@@ -1193,25 +1194,36 @@ def test_documents_without_source_url_leaves_it_null(pg_env, repo):
         nodes=[_node("engagement:url2", "docurl2", "Acme Corp signed the deal.")],
     )
     assert report["claims_written"] == 1
+    # An ABSENT source_url is the normal case — never itemized as a
+    # rejection (only a SENT-but-invalid value is, see the hostile-url test
+    # below). A silent NULL here is correct; a silent NULL for a value the
+    # producer actually sent is exactly the bug class this counter fixes.
+    assert report["source_urls_rejected"] == []
 
     row = corpus_file_sources_repo().get("cf_url2")
     assert row["source_url"] is None
 
 
 @pytest.mark.parametrize(
-    "hostile_url",
+    "hostile_url,expected_reason",
     [
-        "javascript:alert(1)",
-        "data:text/html,<script>alert(1)</script>",
-        "http://contoso.sharepoint.com/deal.docx",  # https-only
-        "https://" + "a" * 3000 + ".example.com",  # over the length cap
+        ("javascript:alert(1)", "not_https"),
+        ("data:text/html,<script>alert(1)</script>", "not_https"),
+        ("http://contoso.sharepoint.com/deal.docx", "not_https"),  # https-only
+        ("https:///deal.docx", "no_host"),  # scheme ok, no host
+        ("https://" + "a" * 3000 + ".example.com", "too_long"),  # over the length cap
     ],
 )
-def test_documents_hostile_source_url_is_dropped_not_stored_claim_still_ingests(pg_env, repo, hostile_url):
+def test_documents_hostile_source_url_is_dropped_not_stored_claim_still_ingests(
+    pg_env, repo, hostile_url, expected_reason
+):
     """A hostile/invalid `source_url` must never reach storage (it renders
     as a link's href), but the surrounding claim ingests normally — an
     attacker-controlled producer field must not be able to poison an
-    unrelated write (spec §8.1, security playbook)."""
+    unrelated write (spec §8.1, security playbook). The drop is also no
+    longer SILENT (O7 follow-up): it is itemized on the run report's
+    `source_urls_rejected`, reasoned, so a non-zero count tells an operator
+    their producer is sending urls Agnes won't store."""
     from src.repositories import corpus_file_sources_repo
 
     _seed_collection(collection_id=CORPUS_A)
@@ -1224,6 +1236,7 @@ def test_documents_hostile_source_url_is_dropped_not_stored_claim_still_ingests(
         nodes=[_node("engagement:url3", "docurl3", "Acme Corp signed the deal.")],
     )
     assert report["claims_written"] == 1
+    assert report["source_urls_rejected"] == [{"doc_id": "docurl3", "reason": expected_reason}]
 
     row = corpus_file_sources_repo().get("cf_url3")
     assert row["source_url"] is None

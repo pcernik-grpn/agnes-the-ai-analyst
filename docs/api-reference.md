@@ -1652,8 +1652,10 @@ must be a substring of one chunk of the evidencing document's extracted
 text), union vs `full_documents` replace mode, alias/edge resolution,
 a `documents[]` entry's OPTIONAL `source_url` (§8/O7, e.g. the crawler's
 Graph `webUrl`) persisted onto `corpus_file_sources` for the citation's
-"Open in source" link — validated https-only/length-capped, silently
-dropped (never rejects the surrounding claim) when absent or invalid,
+"Open in source" link — validated https-only/length-capped, dropped (never
+rejects the surrounding claim) when absent or invalid; a SENT-but-invalid
+value is itemized on the response's `source_urls_rejected: [{doc_id,
+reason}]` (never an absent one), same shape as `claims_rejected`,
 `wrong`-correction re-attachment across a subject's delete-then-recreate,
 and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
 `review_items` mixes two self-describing shapes (a `kind` discriminator on

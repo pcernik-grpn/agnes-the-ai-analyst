@@ -654,9 +654,14 @@ carries it (an additive, optional wire field — the crawler's Graph `webUrl`).
 Validated at ingest — https-only, no `javascript:`/`data:`, length-capped —
 so a hostile producer value is dropped (stored `NULL`) rather than reaching
 a rendered link; the claim itself still ingests. A citation with no
-`source_url` names the document only, same as before. The original itself is
-never served by Agnes — it opens in the source under the caller's own
-identity (the TCRD-178 "resolve to the source" decision).
+`source_url` names the document only, same as before. The drop is never
+silent: the ingest run report (and its persisted `facts_ingest_runs` copy)
+itemizes it in `source_urls_rejected: [{doc_id, reason}]`, same shape as
+`claims_rejected`, surfaced as its own badge on the `/admin/data-sources`
+source card — a producer whose values Agnes keeps refusing shows up as a
+non-zero count, not a citation that quietly never got a link. The original
+itself is never served by Agnes — it opens in the source under the caller's
+own identity (the TCRD-178 "resolve to the source" decision).
 
 ### 8.1 The canonical-source contract (ratified 2026-08-28)
 
