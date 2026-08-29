@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Document extraction now actually enqueues (TCRD-226) — the runtime PR #1692 built had nothing to create a job.** `POST /api/admin/sharepoint/connections/{id}/extract` lets an admin trigger the existing `corpus-extraction` job kind on demand — 404s on an unknown connection before any work, refuses cleanly with a typed `409` when `extraction.enabled` is off or no producer is configured (never a job that fails 30 minutes later in a worker), and `409 extraction_already_running` when a run for that connection is already queued. A new `POST /api/admin/sharepoint/extraction/run-due` scheduler sweep (registered only when the new `extraction.schedule` config is set — off by default) applies that single instance-wide cadence independently to each connection's own last-run stamp, same shape as the existing `agents:run-due` sweep. The producer subprocess also gets a credential to call back into Agnes's own API for the first time — `AGNES_API_URL` always, and `AGNES_API_TOKEN` (the scheduler's own shared-secret token) when one is configured — a deliberate, explicitly-documented over-grant (that token is Admin-group god-mode, far more than the producer needs) reused because it's the only credential class a headless subprocess can already present; never on argv, never logged. The SharePoint source card surfaces the in-Agnes schedule's last/next run and a "Run extraction now" action, separate from the external producer's own static crawl-cadence label.
 - **SharePoint connect wizard: subfolder browsing, an instant client filter, and a bounded server-side search** (TCRD-240). `GET .../tree` now takes an `item_id` (with `drive_id`) to browse an arbitrary folder's children — the wizard's step-2 tree can drill past the drive root to any depth, not just sites → drives → root children; `item_id` is structurally validated before it ever reaches a Graph URL path segment. A new `GET .../tree/search` does a bounded breadth-first folder search over the same live tree (never Microsoft Graph's own `/search`, which is known to under-return under app-only auth) — `q` (min 2 chars), `mode` (`prefix`/`contains`/`glob`, case- and NFC-composition-insensitive), an optional `drive_id`+`item_id` subtree root (neither given searches every drive of every reachable site), and `max_depth`/`max_visited` caps (defaults 5/500, clamped rather than rejected at 10/2000) — the response's `truncated` flag is `true` whenever a cap is what stopped the walk, never a silently partial result. In the wizard: a text input above the tree instantly narrows/highlights whatever is already loaded (case- and diacritics-insensitive, no round trip), and a search box with a mode picker lists matching folders with a "Select all (N)" control — each checked result is an ordinary scope confirm, so bulk selection is just N ordinary confirms through the existing `POST .../scopes` contract, never a new bulk endpoint.
 - **SharePoint certificate metadata** — `GET /api/admin/sharepoint/connections/{id}/certificate` and the source card's Certificate row now show the thumbprint the connection's client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t` value — compare it against the identity provider's app registration) plus the conventional uppercase-hex SHA-1 fingerprint, subject/issuer, and a derived `ok`/`expiring_soon` (≤30 days)/`expired` status with days remaining. Derived at request time from the certificate half of the connection's already-stored PEM — no new storage, never the private key; no certificate configured or an unparseable one renders a clean "not configured"/"unreadable" line instead of an error. Catches two real failure modes: a registered certificate that doesn't match what the connection presents (opaque provider auth error), and one expiring silently.
 - **Microsoft Entra ID group sync**, mirroring Google Workspace sync — off by default (`auth.microsoft.group_sync_enabled` / `AGNES_MICROSOFT_GROUP_SYNC_ENABLED`). On sign-in, Agnes calls Microsoft Graph `GET /me/memberOf` with the delegated OAuth token, pages through `@odata.nextLink`, filters to `#microsoft.graph.group` entries, and replaces the user's `source='microsoft_sync'` rows in `user_group_members` (admin/system-seed/other-provider rows untouched). Turning the switch on also widens the requested OAuth scope to the delegated Graph permission `GroupMember.Read.All`, which needs its own admin-consent grant in the Entra app registration and a restart (see `docs/auth-microsoft-oauth.md`); the sync gate itself is read live, so a stale token scope fails soft rather than failing the login. `AGNES_MICROSOFT_GROUP_PREFIX` (env-only, mirrors `AGNES_GOOGLE_GROUP_PREFIX`) narrows which fetched groups are mirrored and, when set, refuses sign-in (`/login?error=microsoft_not_in_allowed_group`) for a user whose non-empty group fetch matched none of it — any other sync failure (feature off, empty fetch, Graph error) never blocks login.
@@ -195,6 +196,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   full chat* link to the same session for the full renderer. Engine failures
   are translated into what the reader can act on instead of surfacing the
   internal kind.
+- **Zip-bundle members are now individually citable in the fact graph**
+  (design §6/§7 citability follow-up). Each member `ingest_bundle` unpacks
+  from an archive gets its own `corpus_file_sources` anchor
+  (`source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>`) — best-effort, silently a no-op on
+  a DuckDB-backed instance — so a fact-graph claim can cite the exact member
+  that contains the evidence instead of only the archive, and a producer can
+  cite a member by its own content doc_id with no `documents[]` entry. A
+  member's identity, and therefore its claims, now also survives a routine
+  re-sync of the archive: the previous behavior purged EVERY member up front
+  the moment the archive's own bytes changed (any single member changing
+  changes the zip's own sha256), re-minting every member's id and cascading
+  every member's claims on every re-sync, not just the changed one's;
+  reconciliation is now left entirely to `ingest_bundle`'s own
+  `(filename, sha256)` member matching, which purges only the members that
+  actually changed or disappeared. A member rename inside the archive is
+  still delete-old + create-new (identity stays keyed on filename+sha256,
+  unchanged by this fix) — only a byte-identical, same-named member across a
+  re-sync now keeps its row, anchor and claims.
 
 ### Changed
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
@@ -744,6 +764,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 - **Security hardening: SharePoint anonymization could fail open silently.** Editing a SharePoint connection through the generic connection editor (`PUT /api/admin/source-connections/{id}`) with a config that omitted `scopes` used to wipe every confirmed scope's `anonymize` flag — `scopes` is server-written by the connect wizard's own endpoints and never rendered by the generic editor, but the editor replaced `config` wholesale. Wiped scopes emptied the `corpus-extraction` job's anonymize map, so neither the anonymize env vars nor the per-instance HMAC key were ever resolved and no error fired; the pipeline then shipped un-anonymized content into a collection an admin believed was anonymized, reported as a normal successful run. Two independent fixes: (1) the connection editor now preserves `scopes` across an update that does not mention it (an explicit `scopes: []`, or the wizard's own unselect endpoint, still clears it deliberately — same "explicit wins" contract already used for Keboola's `project_id`/`project_name`); (2) `POST /api/facts/ingest` now refuses (`403 anonymization_not_declared`) any batch that documents a corpus whose SharePoint scope is anonymize-marked unless that same batch's `anonymization` block declares the corpus — a typed, itemized rejection, enforced at the door before anything is written, so a wiped scope, a misconfigured env var, or a producer that forgets the declaration can no longer ship plaintext into an anonymize-marked collection undetected. A lookup failure while answering "is this corpus marked" is itself refused (`503 anonymization_check_unavailable`) rather than treated as "nothing is marked". See `docs/anonymization.md`.
+- **Local dev: `/library` took minutes to load, because `LOCAL_DEV_MODE`
+  silently switched on the profiling debug toolbar.** `LOCAL_DEV_MODE=1`
+  implied `DEBUG=1`, mounting the FastAPI debug toolbar, whose per-request
+  instrumentation pegs CPU on heavy HTML pages — and every documented
+  local-dev command sets `LOCAL_DEV_MODE`. The heaviest template in the
+  product, `/library`, stopped answering within a request timeout while
+  `/api/version` stayed instant, which reads as a database or template
+  fault rather than a middleware one. Measured on one instance with one
+  variable changed: `>300s` with the toolbar armed, `1.4s` without. The
+  toolbar is now armed only by an explicitly truthy `DEBUG`; local dev
+  with it is `DEBUG=1 LOCAL_DEV_MODE=1`, as `docs/development.md` already
+  documented. Production never set `LOCAL_DEV_MODE`, so no deployed
+  instance was affected.
+- **The fact-graph read path could show a display name minted from a document the caller cannot read.** A subject (e.g. an engagement or organization) becomes visible once the caller can read ANY one of its claims — but its alias/display name (`fact_aliases.natural_key`) was joined with no grant filter at all, so a caller who could see one unrelated, readable claim on a subject would also see a name that was minted purely from a *different*, restricted claim on the same subject. Each alias now carries its own per-corpus provenance (new `fact_alias_sources` table, populated at ingest time from the evidence that actually established it) and is shown only when the caller can read at least one of those corpora, or the subject carries an admin `revealed` correction (same instance-wide bypass `attrs` already gets) — a visible-but-unnamed subject falls back to its opaque id rather than a 404. The free-text `q` search parameter is filtered the same way, so matching against a restricted-only alias can no longer be used to probe for a name's existence via hit count or result ranking.
 - **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote that is a substring of the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The run report now distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
 - **Removed a committed `data` symlink pointing into a contributor's home
 - **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home
@@ -820,6 +854,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the documented strict-deny on a path-shaped literal (`WHERE c =
   'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
   another. `dbx` gates on a parse rather than a regex and was never affected.
+- **One vocabulary for empty vs blocked vs forbidden (TCRD-207).** Nine
+  design reviews independently found the same collapse: a search that ran and
+  matched nothing, an access denial, and a request that never completed all
+  rendered as the same quiet state on different surfaces, in different words.
+  Investigation found most of the nine already patched piecemeal (collections
+  search, `/admin/linked-apps`, `/admin/semantic-layer`, `/chat` sources,
+  `/me/connections`, `/admin/data-sources`, the corporate-memory review
+  queue) — each with its own wording, none sharing a component. One still-live
+  bug remained: `/chat`'s conversation list (both the rail's renderer and the
+  chat page's own boot path) caught a failed `GET /api/chat/sessions` and
+  showed the exact same "No conversations yet." a genuinely empty account
+  gets — indistinguishable from "your account cannot see the conversation
+  list," even though the conversations were still saved. Fixed with a new
+  shared component, `state.panel()` (`app/web/templates/macros/_state.html`,
+  `app/web/static/css/state_panel.css`) covering four states — nothing
+  matched a query, the collection is genuinely empty, a disclosed access
+  block, and a failed request — each visually distinct (neutral / warn /
+  danger tone, distinct icon), applied to the chat conversation list (adding
+  the missing FAILED state with a Retry action) and the admin moderation
+  queues. The remaining surfaces, `/library` among them, follow separately —
+  they already tell their states apart in copy; what they lack is the shared
+  component. Decision + the security tradeoff
+  on acknowledging blocked-vs-absent:
+  `docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md`.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
