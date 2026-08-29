@@ -352,6 +352,40 @@ def _iw_sync_schedule() -> Optional[str]:
     return _IW_SYNC_SCHEDULE_DEFAULT
 
 
+def _extraction_schedule() -> Optional[str]:
+    """Resolve the document-extraction sweep's cadence (TCRD-226): a single
+    instance-wide schedule (``extraction.schedule`` in the ``extraction:``
+    config block, or ``SCHEDULER_EXTRACTION_SCHEDULE`` env override) applied
+    independently to each SharePoint connection's own last-run stamp by
+    ``POST /api/admin/sharepoint/extraction/run-due``.
+
+    Off by default — unlike :func:`_iw_sync_schedule` above, there is no
+    sensible default cadence to fall back to for a producer-dependent
+    feature that is itself off by default (``extraction.enabled``), so
+    absent/null/empty/invalid all mean "disabled" and ``build_jobs()``
+    omits the scheduler row entirely.
+    """
+    from src.scheduler import is_valid_schedule
+
+    raw = os.environ.get("SCHEDULER_EXTRACTION_SCHEDULE", "").strip()
+    if not raw:
+        try:
+            from app.instance_config import get_value
+
+            yaml_val = get_value("extraction", "schedule", default="")
+            raw = (yaml_val or "").strip() if isinstance(yaml_val, str) else ""
+        except Exception:
+            logger.exception("scheduler: failed to read extraction.schedule")
+            return None
+
+    if not raw:
+        return None
+    if is_valid_schedule(raw):
+        return raw
+    logger.warning("scheduler: invalid extraction schedule %r — extraction sweep disabled", raw)
+    return None
+
+
 def _verification_schedule(verify_seconds: int) -> str:
     """Resolve the verification-detector processor's cadence.
 
@@ -772,6 +806,28 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
     # the minute, never more often than configured.
     if _agent_schedules_enabled():
         jobs.append(("agents:run-due", "every 1m", "/api/v1/agents/run-due", "POST", 600))
+
+    # Document extraction sweep (TCRD-226): fires `corpus-extraction` for
+    # every SharePoint connection whose cadence says it's due (see
+    # app/api/admin_sharepoint.py::run_due_extraction). Same shape as
+    # `agents:run-due` above — walk + per-row due-check + enqueue into an
+    # EXISTING job kind, not a second scheduling mechanism. Registered ONLY
+    # when a schedule is actually configured (`_extraction_schedule()` ->
+    # None omits the row entirely) — off by default, mirroring
+    # `extraction.enabled`'s own default posture. A `daily …` value is
+    # deliberately excluded from the tick-guard `smallest`/env-interval
+    # computation, same treatment as `initial-workspace`/`jira-org-refresh`.
+    extraction_sched = _extraction_schedule()
+    if extraction_sched is not None:
+        jobs.append(
+            (
+                "extraction-run-due",
+                extraction_sched,
+                "/api/admin/sharepoint/extraction/run-due",
+                "POST",
+                900,
+            )
+        )
 
     return jobs
 

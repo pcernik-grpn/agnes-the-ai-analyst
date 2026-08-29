@@ -246,6 +246,9 @@
   const pinnedList = document.getElementById("pinned-chat-list");
 
   const emptyEl = document.getElementById("cloud-chat-empty-state");
+  // TCRD-207 (DES-153): the FAILED sibling of emptyEl — a request that never
+  // completed must never render as "no conversations" (see load() below).
+  const failedEl = document.getElementById("cloud-chat-failed-state");
 
   // ---- Fetch helper ---------------------------------------------------
   async function api(path, init) {
@@ -426,12 +429,24 @@
   async function load() {
     try {
       const sessions = await api("/api/chat/sessions");
+      // A retry that succeeds must clear a failed state left over from an
+      // earlier attempt — otherwise a transient blip stays on screen forever.
+      if (failedEl) failedEl.hidden = true;
       render(Array.isArray(sessions) ? sessions : []);
     } catch (_) {
-      // Leave the list empty and reveal the empty-state; a failed fetch here
-      // shouldn't break the page the user actually navigated to.
-      if (emptyEl) emptyEl.hidden = false;
+      // TCRD-207 (DES-153): the fetch did NOT complete — a distinct FAILED
+      // state, never the EMPTY one. The conversations may well still be
+      // there; this page just couldn't confirm it, which used to read as
+      // "you have no conversations" (indistinguishable from an account that
+      // genuinely has none, or one that lost access to the list).
+      if (emptyEl) emptyEl.hidden = true;
+      if (failedEl) failedEl.hidden = false;
     }
+  }
+
+  if (failedEl) {
+    const retryBtn = failedEl.querySelector("[data-state-retry]");
+    if (retryBtn) retryBtn.addEventListener("click", load);
   }
 
   load();

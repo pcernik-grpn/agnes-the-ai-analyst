@@ -997,6 +997,84 @@ class TestCorpusExtractionHandler:
         assert "THE-ONLY-PART-THAT-MATTERS" in tails[0]
         assert "A" * 100 not in tails[0], "the whole 5 KB was logged, not a 32-byte tail"
 
+    # -- producer callback credential (TCRD-226) -----------------------------
+    # The producer calls back into Agnes's own REST API (corpus-map, scopes,
+    # POST /api/facts/ingest) to do its actual work — until this wiring it had
+    # no credential to do so at all. The scheduler shared-secret token is the
+    # natural fit (the only existing credential class a headless subprocess
+    # can already present); see the module docstring for the honest over-grant
+    # note (it resolves to a synthetic Admin-group user, far more than the
+    # producer actually needs).
+
+    def _run_capturing_env(self, monkeypatch):
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        return calls
+
+    def test_agnes_api_url_always_forwarded(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SCHEDULER_API_TOKEN", raising=False)
+        monkeypatch.setenv("SERVER_URL", "https://agnes.example.com")
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls[0]["env"]["AGNES_API_URL"] == "https://agnes.example.com"
+
+    def test_agnes_api_token_forwarded_when_scheduler_secret_configured(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setenv("SCHEDULER_API_TOKEN", "s" * 40)
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert env["AGNES_API_TOKEN"] == "s" * 40
+        # Never on argv — same F7 rule as every other secret this handler
+        # resolves.
+        assert "s" * 40 not in " ".join(calls[0]["argv"])
+
+    def test_agnes_api_token_absent_when_no_scheduler_secret_configured(self, monkeypatch):
+        """No scheduler shared secret configured (e.g. LOCAL_DEV_MODE) →
+        no token to forward — never a placeholder/empty credential."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SCHEDULER_API_TOKEN", raising=False)
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert "AGNES_API_TOKEN" not in calls[0]["env"]
+
+    def test_agnes_api_token_never_logged(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setenv("SCHEDULER_API_TOKEN", "t" * 40)
+        self._stub_connection_and_settings(monkeypatch)
+        self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        with caplog.at_level(logging.DEBUG):
+            handler({"connection_id": "conn1"})
+
+        assert "t" * 40 not in caplog.text
+
 
 class TestJiraWebhookEnqueues:
     """The Jira incremental-transform path must enqueue a ``jira-refresh``
