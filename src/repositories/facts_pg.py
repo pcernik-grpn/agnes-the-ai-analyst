@@ -52,6 +52,9 @@ from urllib.parse import urlsplit
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from src.ingest.member_identity import is_reserved_member_stable_id
+
+
 # Query-surface caps (spec §12) — the repository enforces these itself
 # (defense in depth) even though the REST layer's Pydantic models already
 # cap the request shape; a future CLI/MCP caller reaches the same floor.
@@ -114,6 +117,24 @@ class IngestUnresolvedDocIds(RuntimeError):
     def __init__(self, unresolved: List[str]) -> None:
         self.unresolved = unresolved
         super().__init__(f"unresolved doc_ids: {unresolved}")
+
+
+class IngestReservedStableId(RuntimeError):
+    """A ``documents[].stable_id`` matched the reserved bundle-member anchor
+    shape (``src.ingest.member_identity.is_reserved_member_stable_id`` —
+    ``cf_<hex>!<member path>``, minted only by ``ingest_bundle``). Refused
+    up front, before ANY document in this batch is resolved or upserted: the
+    identical stable-id-first resolve this method's own ``documents[]`` loop
+    performs would otherwise let a caller overwrite a real member's
+    ``corpus_file_sources`` row via ``sources_repo.upsert``'s
+    ``corpus_file_id``-keyed conflict target — hijacking the member's
+    ``source_doc_id`` citation key so a FUTURE claim resolves as if grounded
+    in a different, trusted document. Translated to a `400`, whole batch
+    rejected (no partial write), the offending stable_ids itemized."""
+
+    def __init__(self, stable_ids: List[str]) -> None:
+        self.stable_ids = stable_ids
+        super().__init__(f"reserved stable_ids in documents[]: {stable_ids}")
 
 
 def _decode_jsonb(value: Any) -> Any:
@@ -2005,6 +2026,23 @@ class FactsPgRepository:
             raise IngestBatchTooLarge(
                 {"reason": "too_many_documents", "count": len(documents), "cap": MAX_INGEST_DOCUMENTS}
             )
+
+        # RESERVED SHAPE (security, not a format quirk) — checked BEFORE any
+        # document in this batch is resolved or upserted, same reasoning as
+        # the upload endpoint's identical guard
+        # (`app.api.collections.upload_files`): a `stable_id` on the bundle-
+        # member anchor shape must never reach the `documents[]` resolve/
+        # upsert loop below, which would otherwise let it overwrite a real
+        # member's `corpus_file_sources` row (see `IngestReservedStableId`).
+        _reserved_stable_ids = sorted(
+            {
+                doc["stable_id"]
+                for doc in documents
+                if isinstance(doc.get("stable_id"), str) and is_reserved_member_stable_id(doc["stable_id"])
+            }
+        )
+        if _reserved_stable_ids:
+            raise IngestReservedStableId(_reserved_stable_ids)
 
         per_doc_claims: Dict[str, int] = {}
         for node in nodes:

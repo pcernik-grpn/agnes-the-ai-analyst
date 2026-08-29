@@ -65,6 +65,7 @@ from src.repositories.facts_pg import (
     FactNotFound,
     IngestBatchTooLarge,
     IngestDocumentExceedsClaimCap,
+    IngestReservedStableId,
     IngestUnresolvedDocIds,
 )
 
@@ -309,6 +310,11 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
         )
     except IngestUnresolvedDocIds as exc:
         raise HTTPException(status_code=400, detail={"reason": "unresolved_doc_ids", "doc_ids": exc.unresolved})
+    except IngestReservedStableId as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "reserved_source_stable_id", "stable_ids": exc.stable_ids},
+        )
 
     try:
         corpus_ids = sorted({d.get("corpus_id") for d in body.documents if d.get("corpus_id")})

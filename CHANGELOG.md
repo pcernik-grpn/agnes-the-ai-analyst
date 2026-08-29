@@ -214,7 +214,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   actually changed or disappeared. A member rename inside the archive is
   still delete-old + create-new (identity stays keyed on filename+sha256,
   unchanged by this fix) — only a byte-identical, same-named member across a
-  re-sync now keeps its row, anchor and claims.
+  re-sync now keeps its row, anchor and claims. The member-anchor shape
+  (`cf_<hex>!<member path>`) is RESERVED and refused with a `400` from a
+  caller-supplied `source_stable_id` at both entry points that accept one —
+  the collections upload endpoint's `source_stable_ids` field and the facts
+  ingest `documents[].stable_id` — since the shape is visible to anyone with
+  mere collection READ access and would otherwise let a caller with WRITE
+  access silently retarget (or, via facts ingest, hijack the citation key
+  of) a real member's row. A bundle row re-uploaded at the same identity as
+  a non-bundle file type also now fully purges its old members' rows,
+  chunks, claims and anchors (deciding this from the row's OLD filename
+  alone left them permanently live, attached to a row that is now some
+  other file type); and a concurrent double-mint race on the same member no
+  longer 500s the whole ingest.
 
 ### Changed
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
