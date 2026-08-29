@@ -2626,19 +2626,36 @@ def create_app() -> FastAPI:
 
     app.add_middleware(SecurityHeadersMiddleware)
 
-    # RequestIdMiddleware mounted LAST — Starlette inserts middleware at
-    # index 0, so the last add_middleware call ends up OUTERMOST and runs
-    # FIRST per request. The request_id ContextVar is set before any
-    # downstream middleware or handler runs, and every response gets the
-    # x-request-id header.
-    app.add_middleware(RequestIdMiddleware)
+    # Fallback audit safety net (F1 — audit-full-coverage plan, Task 2) —
+    # writes a generic `http.request` row for any authenticated mutating
+    # request whose handler wrote no audit row of its own. Added BEFORE
+    # AuditTimingMiddleware below so it ends up the more INNER of the two:
+    # by the time its post-response check runs (after `await self.app(...)`
+    # returns), AuditTimingMiddleware's "before" phase has already stamped
+    # the correlation_id contextvar this middleware reads as a tie-break.
+    # See app/middleware/audit_fallback.py for the full mechanism (and why
+    # it does NOT lean on the audit-identity contextvar alone).
+    from app.middleware.audit_fallback import AuditFallbackMiddleware
 
-    # Audit-timing contextvar (pure ASGI, zero hot-path overhead) — lets
-    # audit_repo().log() auto-fill duration_ms for every HTTP-triggered
-    # audit write; see src/audit_context.py.
+    app.add_middleware(AuditFallbackMiddleware)
+
+    # Audit-timing + request-meta contextvars (pure ASGI, zero hot-path
+    # overhead) — lets AuditRepository.log() auto-fill duration_ms,
+    # client_ip and correlation_id for every HTTP-triggered audit write;
+    # see src/audit_context.py. Added BEFORE RequestIdMiddleware below so
+    # RequestIdMiddleware ends up the more OUTER of the two (see the next
+    # comment) and this middleware can read request_id_var already set.
     from app.middleware.audit_timing import AuditTimingMiddleware
 
     app.add_middleware(AuditTimingMiddleware)
+
+    # RequestIdMiddleware mounted LAST (of this pair) — Starlette inserts
+    # middleware at index 0, so the last add_middleware call ends up
+    # OUTERMOST and runs FIRST per request. The request_id ContextVar is
+    # set before any downstream middleware or handler runs (including
+    # AuditTimingMiddleware just above, which reads it for correlation_id),
+    # and every response gets the x-request-id header.
+    app.add_middleware(RequestIdMiddleware)
 
     # HTTP request metrics (three-plane wave 2D, task 1) — registered as an
     # `@app.middleware("http")` function (not add_middleware) so it becomes

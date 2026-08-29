@@ -496,6 +496,46 @@ def test_log_autofills_duration_from_request_context(audit_repo):
     assert by_action["in.scope"] is not None and by_action["in.scope"] >= 0
 
 
+def test_log_autofills_client_ip_correlation_id_and_client_kind(audit_repo):
+    """F0 (audit-full-coverage plan, Task 1): client_ip / correlation_id /
+    client_kind auto-fill from the request-context contextvars in BOTH
+    backends when the caller passes None; an explicit kwarg still wins."""
+    import contextvars
+
+    from src import audit_context
+
+    repo, _, _ = audit_repo
+
+    def _in_fresh_context(fn):
+        return contextvars.copy_context().run(fn)
+
+    def _autofilled():
+        audit_context.set_request_meta(client_ip="203.0.113.7", correlation_id="rid-abc123")
+        audit_context.set_client_kind("mcp")
+        repo.log(user_id="u1", action="autofilled.row")
+
+    def _explicit_wins():
+        audit_context.set_request_meta(client_ip="203.0.113.7", correlation_id="rid-abc123")
+        repo.log(user_id="u1", action="explicit.row", client_ip="198.51.100.9")
+
+    def _no_context():
+        repo.log(user_id="u1", action="no.context.row")
+
+    _in_fresh_context(_autofilled)
+    _in_fresh_context(_explicit_wins)
+    _in_fresh_context(_no_context)
+
+    rows, _ = repo.query(limit=10)
+    by_action = {r["action"]: r for r in rows}
+    assert by_action["autofilled.row"]["client_ip"] == "203.0.113.7"
+    assert by_action["autofilled.row"]["correlation_id"] == "rid-abc123"
+    assert by_action["autofilled.row"]["client_kind"] == "mcp"
+    assert by_action["explicit.row"]["client_ip"] == "198.51.100.9"
+    assert by_action["no.context.row"]["client_ip"] is None
+    assert by_action["no.context.row"]["correlation_id"] is None
+    assert by_action["no.context.row"]["client_kind"] is None
+
+
 # ---------------------------------------------------------------------------
 # B8: prune_older_than — retention-based audit_log pruning
 # ---------------------------------------------------------------------------
