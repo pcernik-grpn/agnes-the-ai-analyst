@@ -9,6 +9,15 @@ ingest — that lands in the write-path follow-up task).
 
 Every S-id below is the literal acceptance test named in spec §15.1;
 docstrings restate the failure mode.
+
+Every visibility/filtering assertion here proves itself through a non-admin
+caller (a plain dict user with a deliberately withheld or scoped grant, or a
+restricted ``AgentPrincipal``) — never through the ``Admin`` god-mode
+short-circuit alone. An admin-sees-everything case is a legitimate, separate
+sibling assertion (e.g. ``test_count_visible_edges_for_collections_admin_
+sees_everything``), not a substitute for the caller-scoped one — see
+CONTRIBUTING.md's "Testing conventions" for why (this module is the reason
+that section exists).
 """
 
 from __future__ import annotations
@@ -2278,3 +2287,182 @@ def test_neighbors_applies_a_statement_timeout(pg_env, repo):
 
     result = repo.neighbors(_dict_user("ivan"), fact_id)
     assert result["nodes"][0]["id"] == fact_id
+
+
+# ---------------------------------------------------------------------------
+# Type map — the Library's node-type counts must obey the same gate as
+# search(), or the aggregate becomes the S1/S2 existence oracle in another
+# shape: a reader counting subjects they are not allowed to read.
+# ---------------------------------------------------------------------------
+
+
+def test_type_map_omits_a_type_the_caller_cannot_see(pg_env, repo):
+    """A type whose every subject sits behind an ungranted collection is
+    ABSENT from the map — not reported with a count of 0, which would
+    itself confirm the type exists and that something occupies it."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:secret-project")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Secret Project kicked off in March.",
+        attrs={"status": "active"},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.count_visible_facts_by_type(_dict_user("alice")) == {}
+
+
+def test_type_map_counts_what_the_caller_can_see(pg_env, repo):
+    """The uploader reaches their own collection, so the type appears with
+    a real count — proving the empty result above is the grant talking and
+    not the query simply never returning anything."""
+    _seed_full_fixture()
+    for slug in ("alpha", "beta"):
+        fact_id = repo.create_fact(type="engagement")
+        repo.add_alias(fact_id=fact_id, type="engagement", natural_key=f"engagement:{slug}")
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"{slug} kicked off in March.",
+            attrs={"status": "active"},
+        )
+    client_id = repo.create_fact(type="client")
+    repo.add_alias(fact_id=client_id, type="client", natural_key="client:parts-authority")
+    repo.add_claim(
+        fact_id=client_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Parts Authority signed.",
+        attrs={},
+    )
+
+    assert repo.count_visible_facts_by_type(_dict_user("uploader1")) == {"client": 1, "engagement": 2}
+
+
+def test_type_map_agrees_with_search_for_the_same_caller(pg_env, repo):
+    """The map's number for a type is exactly what search(type=...) lets
+    the same caller reach — the contract the Knowledge tab relies on when
+    it makes each type a way in."""
+    _seed_full_fixture()
+    for slug in ("alpha", "beta"):
+        fact_id = repo.create_fact(type="engagement")
+        repo.add_alias(fact_id=fact_id, type="engagement", natural_key=f"engagement:{slug}")
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"{slug} kicked off in March.",
+            attrs={},
+        )
+
+    caller = _dict_user("uploader1")
+    mapped = repo.count_visible_facts_by_type(caller)
+    searched = repo.search(caller, type="engagement")
+    assert mapped["engagement"] == len(searched["subjects"])
+
+
+# ---------------------------------------------------------------------------
+# Entity facets — the Library's filter menu (TCRD-250 piece 4). Same gate as
+# search(), plus one extra conservatism: the DOCUMENT tally must not report
+# files sitting in a collection the caller cannot open.
+# ---------------------------------------------------------------------------
+
+
+def test_facets_omit_a_type_the_caller_cannot_see(pg_env, repo):
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="client")
+    repo.add_alias(fact_id=fact_id, type="client", natural_key="client:parts-authority")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Parts Authority signed.",
+        attrs={},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.facet_values(_dict_user("alice"), types=["client"]) == {"client": []}
+
+
+def test_facets_carry_a_label_and_a_document_count(pg_env, repo):
+    _seed_full_fixture()
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2", sha256="sha2")
+    fact_id = repo.create_fact(type="client")
+    # corpus_id is the alias's provenance. Without it the alias stays
+    # admin-only-visible by design (add_alias's own docstring), so a facet
+    # would fall back to the opaque id — see the test below.
+    repo.add_alias(
+        fact_id=fact_id, type="client", natural_key="client:parts-authority", corpus_id=CORPUS_A
+    )
+    for file_id, sha in (("cf_a1", "sha1"), ("cf_a2", "sha2")):
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id=file_id,
+            corpus_id=CORPUS_A,
+            file_sha256=sha,
+            quote=f"Parts Authority appears in {file_id}.",
+            attrs={},
+        )
+
+    out = repo.facet_values(_dict_user("uploader1"), types=["client"])
+    assert len(out["client"]) == 1
+    row = out["client"][0]
+    assert row["subject_id"] == fact_id
+    assert row["label"] == "client:parts-authority"
+    assert row["document_count"] == 2, "two files evidence this client"
+
+
+def test_a_requested_type_with_nothing_in_it_returns_an_empty_list_not_a_missing_key(pg_env, repo):
+    """The filter menu renders a section per requested type; a missing key
+    would make 'nothing here' indistinguishable from 'never asked'."""
+    _seed_full_fixture()
+    out = repo.facet_values(_dict_user("uploader1"), types=["client", "industry"])
+    assert set(out) == {"client", "industry"}
+    assert out["client"] == [] and out["industry"] == []
+
+
+def test_no_facet_types_requested_is_an_empty_result_not_a_full_scan(pg_env, repo):
+    _seed_full_fixture()
+    assert repo.facet_values(_dict_user("uploader1"), types=[]) == {}
+
+
+def test_an_unattributed_alias_falls_back_to_the_opaque_id(pg_env, repo):
+    """An alias with no recorded corpus is admin-only-visible — the same rule
+    `search()` applies. A facet must then show the id rather than invent a
+    label, because the label itself is evidence the caller cannot read."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="client")
+    repo.add_alias(fact_id=fact_id, type="client", natural_key="client:unattributed")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="An unattributed client appears here.",
+        attrs={},
+    )
+
+    (row,) = repo.facet_values(_dict_user("uploader1"), types=["client"])["client"]
+    assert row["label"] == fact_id, "no readable alias — must not leak the natural key"
+    assert row["document_count"] == 1

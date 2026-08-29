@@ -157,3 +157,51 @@ def test_search_accepts_q_field(facts_client):
         "/api/facts/search", json={"type": "person", "q": "Alice"}, headers=_headers(facts_client)
     )
     assert r.status_code == 501, r.text
+
+
+# ---------------------------------------------------------------------------
+# type map — same three HTTP-level contracts as the rest of the router.
+# (Counting/visibility depth lives in tests/db_pg/test_facts_read_pg.py.)
+# ---------------------------------------------------------------------------
+
+
+def test_type_map_404s_when_flag_off(seeded_app):
+    r = seeded_app["client"].get("/api/facts/type-map", headers=_headers(seeded_app))
+    assert r.status_code == 404
+
+
+def test_type_map_requires_authentication(facts_client):
+    r = facts_client["client"].get("/api/facts/type-map")
+    assert r.status_code == 401
+
+
+def test_type_map_fails_clean_on_duckdb(facts_client):
+    r = facts_client["client"].get("/api/facts/type-map", headers=_headers(facts_client))
+    assert r.status_code == 501, r.text
+    body = r.json()
+    assert body["error"] == "requires_postgres_backend"
+    assert body["feature"] == "facts"
+
+
+def test_facets_404s_when_flag_off(seeded_app):
+    r = seeded_app["client"].get("/api/facts/facets", headers=_headers(seeded_app))
+    assert r.status_code == 404
+
+
+def test_facets_requires_authentication(facts_client):
+    r = facts_client["client"].get("/api/facts/facets")
+    assert r.status_code == 401
+
+
+def test_facets_rejects_an_absurd_type_list_before_touching_the_repo(facts_client):
+    """Validation runs ahead of the PG-only repo, so this 422s on DuckDB too
+    rather than reaching the 501."""
+    many = ",".join(f"t{i}" for i in range(13))
+    r = facts_client["client"].get(f"/api/facts/facets?types={many}", headers=_headers(facts_client))
+    assert r.status_code == 422, r.text
+
+
+def test_facets_fails_clean_on_duckdb(facts_client):
+    r = facts_client["client"].get("/api/facts/facets", headers=_headers(facts_client))
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"

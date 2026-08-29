@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -77,6 +78,23 @@ MIN_SEARCH_Q_LENGTH = 2
 # `full_documents`-listed document's COMPLETE claim set to arrive together.
 MAX_INGEST_DOCUMENTS = 500
 MAX_INGEST_CLAIMS = 5000
+
+# Meaningfulness floor for a verbatim quote (spec §8): a plain substring test
+# alone accepts ANY fragment that happens to occur literally in the text or
+# the document's own identity strings, including one with no evidentiary
+# value — a bare file-extension fragment (".pdf") or a lone path separator
+# ("/") both pass whenever the document mentions a filename or a date/
+# fraction/URL anywhere. A raw length floor alone cannot separate these from
+# a legitimate short quote: ".pdf" and "ARR" (a real metric name) are the
+# same length once ".pdf"'s leading punctuation is set aside. What
+# distinguishes them is not length but SHAPE — ".pdf" is a punctuation-
+# fringed fragment, dependent on characters outside the quote, never a
+# complete token on its own; "ARR" is not. A constant, not a
+# `facts.single_valued_edges`-style `get_value` knob: this guards evidence
+# INTEGRITY (can a fabricated/degenerate LLM extraction get past the gate),
+# not a per-instance ontology choice, so it is not something an operator
+# should be able to loosen. See `_is_meaningful_quote`.
+MIN_MEANINGFUL_QUOTE_LENGTH = 2
 
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
@@ -227,6 +245,49 @@ def _identity_candidates(filename: Optional[str], path: Optional[str]) -> Set[st
         _add_path_component_candidates(candidates, path)
     candidates.discard("")
     return candidates
+
+
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
+
+
+def _is_meaningful_quote(quote: str) -> bool:
+    """Verbatim-gate meaningfulness floor (spec §8; see
+    ``MIN_MEANINGFUL_QUOTE_LENGTH`` for the design rationale). Two
+    independent conditions, each closing a different degenerate shape:
+
+    1. **Length** — the trimmed quote must be at least
+       ``MIN_MEANINGFUL_QUOTE_LENGTH`` characters. Closes a bare single
+       character — trivially "starts with a word character" per condition 2
+       below, but still not specific enough to be evidence of anything — and
+       a run of whitespace, which strips to zero.
+    2. **Shape** — the trimmed quote must START with a word character
+       (``\\w``: letter, digit, or underscore, Unicode-aware). Closes a
+       quote that is entirely punctuation (``/``) AND one that is a
+       punctuation-fringed fragment of a longer token (``.pdf`` — the
+       leading "." can never be a complete word's own left edge; a real
+       sentence never begins mid-token) — both shapes a raw length or
+       word-character-count floor cannot tell apart from a short legitimate
+       quote of the same length (an acronym, a ticker, a year, a product
+       name: ".pdf" and "ARR" are the same length once ".pdf"'s leading
+       punctuation is set aside).
+
+       Deliberately checks only the START, not the end: a quote's trailing
+       character is routinely punctuation for an entirely ordinary reason —
+       it is citing a whole sentence or clause ("Acme Corp is the client.",
+       "the engagement is on schedule;") — and requiring a clean end as well
+       rejected that common, legitimate shape outright. A quote beginning
+       mid-token has no such innocent reading; sentence-final punctuation is
+       a closing delimiter of the unit actually quoted, leading punctuation
+       with nothing before it in the quote is not.
+
+    Deliberately does NOT require a minimum number of word characters, or
+    forbid internal/trailing punctuation — "N/A", "3.14", and "Acme Corp is
+    the client." all read fine as evidence.
+    """
+    stripped = quote.strip()
+    if len(stripped) < MIN_MEANINGFUL_QUOTE_LENGTH:
+        return False
+    return bool(_WORD_CHAR_RE.match(stripped[0]))
 
 
 def _single_valued_edge_types() -> frozenset:
@@ -1327,7 +1388,9 @@ class FactsPgRepository:
     # into actually lists.
     # ------------------------------------------------------------------
 
-    def _visible_facts_for_corpus_cte(self, is_admin: bool, all_evidence: bool) -> str:
+    def _visible_facts_for_corpus_cte(
+        self, is_admin: bool, all_evidence: bool, *, all_collections: bool = False
+    ) -> str:
         """SQL for a ``visible(subject_id, is_revealed)`` CTE: facts with at
         least one OWN claim evidenced by ``:corpus_id`` (bound by the
         caller — candidacy is deliberately still OWN-claims-only: "evidenced
@@ -1342,16 +1405,29 @@ class FactsPgRepository:
         be revealed by a readable incident-edge claim. Returned as a
         fragment (no leading ``WITH``) so callers can embed it beside their
         own CTEs; every caller must bind ``:corpus_id`` and, when
-        ``is_admin`` is False, ``:readable``."""
+        ``is_admin`` is False, ``:readable``.
+
+        With ``all_collections=True`` the ONLY change is candidacy: every
+        non-withheld fact instead of the ones evidenced by a bound
+        ``:corpus_id`` (which must then NOT be bound), giving the same
+        population ``search()`` gates with ``type=None``. The visibility
+        rule below is shared verbatim rather than restated for the wider
+        scope — a second copy is how the two drift, and drift in this gate
+        is the S2 existence oracle the spec's rev 1->2 closed."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
         all_ev_sql = "TRUE" if all_evidence else "FALSE"
+        candidate_where = (
+            "c.fact_id IS NOT NULL"
+            if all_collections
+            else "c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL"
+        )
         return f"""
             candidates AS (
                 SELECT DISTINCT c.fact_id AS subject_id
                 FROM claims c
-                WHERE c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL
+                WHERE {candidate_where}
                   AND NOT EXISTS (
                     SELECT 1 FROM corrections co
                     WHERE co.subject_kind = 'fact' AND co.subject_id = c.fact_id
@@ -1400,6 +1476,124 @@ class FactsPgRepository:
                    )
             )
             """
+
+    def count_visible_facts_by_type(self, caller) -> Dict[str, int]:
+        """Caller-scoped ``{type: count}`` over every visible fact — the
+        Library type map's live counts (spec §13.2 "Library"), where each
+        type is a way in to the graph.
+
+        Shares :meth:`_visible_facts_for_corpus_cte`'s gate via
+        ``all_collections=True``, so a type's number counts exactly the
+        subjects this caller could reach through ``search(type=...)`` and
+        never more. A naive ``SELECT type, COUNT(*) FROM facts GROUP BY
+        type`` would be the S2 existence oracle in aggregate form: it would
+        report facts whose every claim sits in a collection the caller
+        cannot read, letting a reader count what they cannot see. A type
+        with no visible subjects is omitted rather than reported as 0 — the
+        caller cannot distinguish "no such type in this ontology" from
+        "none you can see", which is the same non-disclosure
+        ``search()`` makes.
+        """
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        params: Dict[str, Any] = {} if is_admin else {"readable": list(readable)}
+        sql = sa.text(
+            f"WITH {cte} "
+            "SELECT f.type, COUNT(*) AS n FROM visible v JOIN facts f ON f.id = v.subject_id "
+            "GROUP BY f.type ORDER BY f.type"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+        return {r["type"]: int(r["n"]) for r in rows}
+
+    def facet_values(
+        self, caller, *, types: List[str], limit_per_type: int = 50
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Filterable entity values per type, with how many DOCUMENTS each
+        one is evidenced by — the Library's entity facets (spec §13.2
+        "Library", TCRD-250 piece 4).
+
+        This is what "filter by tags" should have meant here: the vocabulary
+        the extraction pass already produces (client, industry, service
+        offering, document type), rather than tags nobody maintains.
+
+        Same visibility gate as :meth:`count_visible_facts_by_type` — shared
+        via ``all_collections=True``, never restated — so a facet lists only
+        subjects this caller could reach through ``search(type=...)``.
+
+        Two deliberate conservatisms, both about not leaking a count:
+
+        * The document tally counts only claims whose collection the caller
+          can READ, even for a subject carrying a ``revealed`` correction.
+          A revealed correction reveals the SUBJECT, not the geography of
+          its evidence (spec §4) — counting its unreadable documents would
+          report how many files exist in a collection the caller cannot
+          open.
+        * A subject whose readable document count is 0 is still listed when
+          it is visible, because visibility may come from an incident edge
+          (endpoint evidence). Its count is an honest 0, not an omission —
+          the caller CAN reach the subject, just not any document naming it.
+
+        ``limit_per_type`` caps each facet's value list; a facet menu is a
+        menu, not a dump.
+        """
+        if not types:
+            return {}
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        vis_claims = self._visibility_predicate("c.corpus_id", is_admin)
+        alias_readable = self._alias_readable_sql(
+            revealed_expr="fa.fact_id IN (SELECT subject_id FROM revealed_ids)", is_admin=is_admin
+        )
+        params: Dict[str, Any] = {"types": list(types)}
+        if not is_admin:
+            params["readable"] = list(readable)
+        sql = sa.text(
+            f"""
+            WITH {cte},
+            readable_claims AS (
+                SELECT c.fact_id, c.corpus_file_id
+                FROM claims c
+                JOIN visible v ON v.subject_id = c.fact_id
+                WHERE {vis_claims}
+            ),
+            labels AS (
+                SELECT fa.fact_id, MIN(fa.natural_key) AS label
+                FROM fact_aliases fa
+                WHERE fa.fact_id IN (SELECT subject_id FROM visible)
+                  AND {alias_readable}
+                GROUP BY fa.fact_id
+            )
+            SELECT f.type AS type, v.subject_id AS subject_id,
+                   l.label AS label,
+                   COUNT(DISTINCT rc.corpus_file_id) AS n
+            FROM visible v
+            JOIN facts f ON f.id = v.subject_id
+            LEFT JOIN readable_claims rc ON rc.fact_id = v.subject_id
+            LEFT JOIN labels l ON l.fact_id = v.subject_id
+            WHERE f.type = ANY(:types)
+            GROUP BY f.type, v.subject_id, l.label
+            ORDER BY f.type, COUNT(DISTINCT rc.corpus_file_id) DESC, v.subject_id
+            """
+        )
+        out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
+        with self._engine.connect() as conn:
+            for r in conn.execute(sql, params).mappings():
+                bucket = out.setdefault(r["type"], [])
+                if len(bucket) >= limit_per_type:
+                    continue
+                bucket.append(
+                    {
+                        "subject_id": r["subject_id"],
+                        "label": r["label"] or r["subject_id"],
+                        "document_count": int(r["n"]),
+                    }
+                )
+        return out
 
     def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
         """Caller-scoped count of facts evidenced by ``corpus_id`` — the
@@ -2512,6 +2706,21 @@ class FactsPgRepository:
                     item_ref = f"{row_ref}.evidence[{ev_idx}]"
                     if not quote:
                         claims_rejected.append({"row": item_ref, "reason": "empty_quote", "doc_id": doc_id})
+                        continue
+                    if not _is_meaningful_quote(quote):
+                        # Applied BEFORE either half of the gate below, so a
+                        # degenerate quote (a bare file-extension fragment, a
+                        # lone separator) cannot fall through the content
+                        # check and be self-certified by the identity
+                        # haystack instead — one check closes the hole on
+                        # both paths. Distinct reason from
+                        # `verbatim_gate_failed`: the quote WAS present
+                        # verbatim (or would be, trivially), it just isn't
+                        # evidence of anything — a different failure an
+                        # operator should be able to tell apart (a producer
+                        # citing junk vs. a producer citing text absent from
+                        # the document).
+                        claims_rejected.append({"row": item_ref, "reason": "quote_not_meaningful", "doc_id": doc_id})
                         continue
                     file_id = _resolve_doc(doc_id, conn)
                     frow = _file_row(file_id) if file_id else None

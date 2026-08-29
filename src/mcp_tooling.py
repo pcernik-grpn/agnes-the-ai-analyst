@@ -87,6 +87,8 @@ def summarize_docstring(doc: str | None) -> tuple[str, bool]:
 # titled two different ways depending on how you connected.
 TITLE_OVERRIDES: dict[str, str] = {
     "catalog": "List Available Tables",
+    "fact_type_map": "List Fact Types With Counts",
+    "fact_facets": "List Filterable Entity Values",
     "schema": "Get Table Schema",
     "skills": "List Skills",
     "chat_skills": "List Chat Skills",

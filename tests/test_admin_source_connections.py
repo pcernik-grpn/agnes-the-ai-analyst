@@ -2189,3 +2189,111 @@ def test_the_wizard_rejects_http_the_way_the_server_does():
     ).read_text(encoding="utf-8")
     assert 'startsWith("https://")' in src
     assert 'startsWith("http")' not in src.replace('startsWith("https://")', "")
+
+
+class TestSharePointScopesSurviveOrdinaryEdits:
+    """Anonymize-fail-closed report (2026-08-29): ``config.scopes`` is
+    server-written via the dedicated ``app/api/admin_sharepoint.py`` scope
+    endpoints (``src.connection_specs._validate_sharepoint``'s docstring),
+    never typed by hand — yet this generic editor REPLACES ``config``
+    wholesale. Editing a SharePoint connection through the normal editor
+    with a config that omits ``scopes`` (as the admin form does — it never
+    renders that field) used to wipe every confirmed scope's ``anonymize``
+    flag, silently disarming the anonymize-in-front pipeline
+    (``app/worker/kinds.py::_anonymize_marked_scope_map`` reads exactly this
+    field). Same "carried forward unless explicitly supplied" contract as
+    Keboola's ``project_id``/``project_name`` above.
+    """
+
+    def _connection_with_scopes(self, c, token, *, name="sp-scopes-preserve"):
+        resp = c.post(
+            BASE,
+            json={
+                "name": name,
+                "source_type": "sharepoint",
+                "config": {
+                    "tenant_id": "tenant-1",
+                    "client_id": "client-1",
+                    "scopes": [
+                        {
+                            "source_scope_id": "site1!drive1",
+                            "display_path": "Contracts",
+                            "anonymize": True,
+                            "collection_id": "col_contracts",
+                        }
+                    ],
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    def test_editing_config_without_scopes_preserves_them(self, seeded_app):
+        """The erasure this report describes — failing before the fix."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        scopes = r.json()["config"].get("scopes")
+        assert scopes == [
+            {
+                "source_scope_id": "site1!drive1",
+                "display_path": "Contracts",
+                "anonymize": True,
+                "collection_id": "col_contracts",
+            }
+        ]
+
+    def test_an_explicit_empty_scopes_still_clears_it(self, seeded_app):
+        """The one deliberate clear stays available — an admin who explicitly
+        sends ``scopes: []`` (or the wizard's own DELETE .../scopes endpoint,
+        exercised elsewhere) still gets to empty it."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-scopes-explicit-clear")
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1", "scopes": []}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("scopes") == []
+
+    def test_editing_config_without_extraction_preserves_it(self, seeded_app):
+        """``config.extraction`` (TCRD-226, ``app/api/admin_sharepoint.py::
+        _record_extraction_dispatch``) is the SAME shape of server-written
+        bookkeeping as ``scopes`` — the in-Agnes extraction schedule's
+        ``last_run_at``/``last_job_id``, never typed by an admin, never
+        rendered by the generic editor's form. An ordinary edit through
+        this endpoint must not silently reset that clock any more than it
+        may wipe ``scopes``."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-extraction-preserve")
+
+        # Simulate a prior extraction dispatch the way
+        # `_record_extraction_dispatch` writes it: a full config
+        # read-modify-write straight through the repo, not through this
+        # endpoint.
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        config = dict(row["config"])
+        config["extraction"] = {"last_run_at": "2026-08-29T00:00:00+00:00", "last_job_id": "job_1"}
+        source_connections_repo().update(conn_id, config=config)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("extraction") == {
+            "last_run_at": "2026-08-29T00:00:00+00:00",
+            "last_job_id": "job_1",
+        }
