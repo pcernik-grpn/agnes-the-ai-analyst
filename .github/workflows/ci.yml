@@ -10,8 +10,10 @@ on:
   pull_request:
     # PRs targeting `integration` must run the full suite too — without
     # this filter GitHub fires no workflow at all for them and the PR shows
-    # a green rollup that asserted nothing.
-    branches: [main, integration]
+    # a green rollup that asserted nothing. Same trap for the long-lived
+    # `mf/semantic-layer-v0` feature base: its PR stack showed empty green
+    # rollups until it was listed here.
+    branches: [main, integration, mf/semantic-layer-v0]
   schedule:
     - cron: "0 3 * * *"  # Nightly at 03:00 UTC — runs docker-e2e
   workflow_dispatch:
