@@ -14,6 +14,35 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 4. Run the full suite before pushing: `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`.
 5. Add a `## [Unreleased]` CHANGELOG bullet for any user-visible behavior change.
 
+## Testing conventions
+
+**A visibility/filtering assertion needs a non-admin caller as its proof.**
+`Admin` is a god-mode short-circuit on every authorization check (see
+`app/auth/access.py`'s module docstring) — a test that asserts what a caller
+can see, which rows are filtered, or which names/values are readable, while
+calling *only* as an admin, passes identically whether the underlying gate
+works or is completely broken. This is not hypothetical: a broken
+alias-visibility migration reached review because every non-admin fixture
+seeded its provenance row explicitly, and every test that omitted it
+happened to assert through an admin token — silently vacuous instead of red.
+
+- The primary assertion for a visibility property must go through a
+  non-admin caller (an ordinary user, a scoped `AgentPrincipal`, a
+  `SessionPrincipal`) that is denied or narrowed by construction — e.g. a
+  fixture uploaded/owned by someone else, a grant deliberately withheld.
+- An admin-sees-everything case is legitimate and worth keeping, but as a
+  **named sibling** ("positive control"), never the only case — see
+  `tests/db_pg/test_facts_read_pg.py` (`test_count_visible_edges_for_
+  collections_admin_sees_everything` next to its caller-scoped sibling) and
+  `tests/test_api_collections.py` (`test_admin_search_sees_all` next to
+  `test_search_fail_closed_excludes_ungranted`) for the pattern.
+- There is deliberately no automated guard for this: a grep for "admin"
+  cannot distinguish an admin-only visibility claim from the many legitimate
+  admin-only tests (admin-gated endpoints, seeding helpers, unrelated
+  assertions) without a false-positive rate that gets the check disabled.
+  Reviewers (`agnes-reviewer-rbac`) apply this by reading the assertion, not
+  a script.
+
 ## Verification loop
 
 Before claiming a change is done, run the checks cheapest-first and fix what

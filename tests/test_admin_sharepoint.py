@@ -616,6 +616,60 @@ class TestTreeSearch:
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "sharepoint_cert_unresolved"
 
+    def _install_tree_with_one_forbidden_site(self, monkeypatch):
+        """`GET .../tree/search` with no ``drive_id`` ("search everywhere")
+        over two sites — one readable, one 403 on its drive listing."""
+        from connectors.sharepoint import graph_client as gc
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            if path == "/v1.0/sites":
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {"id": "s1", "displayName": "Open Site", "webUrl": "https://x/s1"},
+                            {"id": "s2", "displayName": "Blocked Site", "webUrl": "https://x/s2"},
+                        ]
+                    },
+                )
+            if path == "/v1.0/sites/s1/drives":
+                return httpx.Response(
+                    200, json={"value": [{"id": "d1", "name": "Documents", "driveType": "documentLibrary"}]}
+                )
+            if path == "/v1.0/sites/s2/drives":
+                return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+            if path == "/v1.0/drives/d1/root/children":
+                return httpx.Response(
+                    200, json={"value": [{"id": "c1", "name": "Contracts", "folder": {"childCount": 0}}]}
+                )
+            if path == "/v1.0/drives/d1/items/c1/children":
+                return httpx.Response(200, json={"value": []})
+            raise AssertionError(f"unexpected path: {path}")
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+
+    def test_a_forbidden_site_is_skipped_and_the_other_sites_matches_still_come_back(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree_with_one_forbidden_site(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert [m["display_path"] for m in body["matches"]] == ["Open Site / Documents / Contracts"]
+        assert len(body["skipped"]) == 1
+        assert body["skipped"][0]["site_id"] == "s2"
+        assert body["skipped"][0]["reason"] == "forbidden"
+        # A permission gap is not a cap-truncated walk — the two stay distinct.
+        assert body["truncated"] is False
+
 
 class TestScopeConfirmationIdempotency:
     def test_confirming_same_scope_twice_reuses_the_collection(self, seeded_app):

@@ -1927,6 +1927,23 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "ambiguous_cross_collection_doc_id" not in html
         assert "didn't say which" in html
 
+    def test_quote_not_meaningful_reason_gets_its_own_human_subline(self):
+        """spec §8.4: a distinct reason from `verbatim_gate_failed` (the
+        quote WAS found, it just isn't evidence) — surfaced in the SAME
+        `rejected_quotes` drawer, with its own explanatory sentence rather
+        than the raw slug."""
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["rejected_quotes"] = [{"row": 0, "reason": "quote_not_meaningful", "doc_id": "d9", "doc": None}]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "rejected_quotes"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        html = result["innerHTML"]
+        assert "quote_not_meaningful" not in html
+        assert "too short or not a real word/phrase" in html
+
     # -- sharing-state row (rephrased from "Identity matching") ------------
 
     def test_sharing_row_ok_when_every_scope_collection_has_a_group(self):

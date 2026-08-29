@@ -2,9 +2,9 @@
 
 **Date:** 2026-08-27 (rev 3)
 **Status:** buildable draft — revision 3 after a six-way audit (spec internals,
-Agnes code, cuesta-star-graph, evaluation workbook v0.2, licences/services, UI)
+Agnes code, the producer repo, evaluation workbook v0.2, licences/services, UI)
 **Verified against:** Agnes worktree `zs/facts-scope-access` (base `d97e186a8`),
-`keboola/cuesta-star-graph` main `753be22`, `eval_scoring_workbook_v0.2.xlsx`
+the producer repo's main at `753be22`, `eval_scoring_workbook_v0.2.xlsx`
 (FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
 **Scope note:** this spec deliberately contains customer-specific material
 (the evaluation workbook, Kantata, personas, TCRD ticket ids, the 1P vault
@@ -46,7 +46,7 @@ constrains the design.
 **Rev 2 → 3 (full audit against artifacts):**
 
 6. **The evaluation standard is workbook v0.2 in full** (§14) — five arms,
-   five thresholds, 0/1/2 rubric, cadence, protocol. The cuesta repo's eval
+   five thresholds, 0/1/2 rubric, cadence, protocol. The producer repo's eval
    was aligned to v0.2 on 2026-08-27 (commit `753be22`): its 12 sandbox
    questions now map onto the ten workbook prompts (two are sandbox-only
    leftovers and two workbook ids are uncovered — §14.5), and its protocol already
@@ -134,14 +134,14 @@ from documents, where every assertion carries the document it came from, the
 verbatim sentence supporting it, and the date of that document. Built as a
 layer **over the existing Collections subsystem**, not beside it.
 
-It is a general Agnes capability. SharePoint (via the cuesta-star-graph
+It is a general Agnes capability. SharePoint (via the producer
 crawler) is the first contributor of documents; anything that can put files
 into a collection contributes the same way. Agnes owns the schema; producers
 write into it through the contract in §7.
 
 **Out of scope, deliberately** (each is somebody's work, not nobody's):
 
-- the crawler — **adopted** from `keboola/cuesta-star-graph`, with a named
+- the crawler — **adopted** from the producer repo, with a named
   hardening backlog (§7.1), never rewritten;
 - the extraction pass (`extract.py` + `skills/kg-builder-agent.md`) — a
   producer against §7's contract;
@@ -527,7 +527,7 @@ same as any other edge — only the READ path (§4/§5) withholds it.
 
 ### 7.0 Wire format (verbatim from the producing pipeline)
 
-The producer is the cuesta-star-graph pipeline (crawl → convert → anonymize →
+The producer is the external producer pipeline (crawl → convert → anonymize →
 extract → reconcile → gates). Its emitted shapes, which the ingest endpoint
 accepts as-is:
 
@@ -543,7 +543,7 @@ accepts as-is:
 ```
 
 Conventions the pipeline enforces and ingest relies on
-(cuesta-star-graph, verified): node id matches
+(producer repo, verified): node id matches
 `([a-z_]+):([a-z0-9][a-z0-9-]*)` with prefix == type
 (`validate_graph.py:60`); slugs are lowercase ASCII with `&`→`and`; every
 **edge** carries ≥1 evidence entry (`possible_duplicate_of` exempt —
@@ -860,6 +860,51 @@ the loop the two systems previously ran past each other on. (Consuming the
 signal on the producer side is a separate, later change; this section
 defines the contract it will read.)
 
+### 8.4 The meaningfulness floor (ratified 2026-08-29)
+
+A plain substring test has no notion of "meaningful": any character
+sequence that occurs literally in the text, OR (for a quote the content
+check misses) in the document's own identity strings (§8.2), satisfies it —
+including a bare file-extension fragment (`.pdf`) or a lone path separator
+(`/`). Live finding: both were accepted as claims, `claims_accepted_via_
+identity == 0` (i.e. via the content half, not identity), rendering as
+verified evidence for a claim quoting nothing at all.
+
+**The rule.** Before either half of the gate is tried, a quote must be at
+least 2 characters (trimmed) and must START with a word character (letter,
+digit, or underscore, Unicode-aware). Applied once, ahead of both checks, so
+a degenerate quote cannot fail the content half and then be self-certified
+by the identity half instead — one check closes the hole on both paths.
+
+**Why not a length floor alone.** `.pdf` and `ARR` (a real metric name) are
+the same length once `.pdf`'s leading punctuation is set aside — a raw
+character count, or a floor on word-character count, cannot tell them
+apart. What distinguishes them is shape: `.pdf`'s leading `.` can never be a
+complete word's own left edge — a real sentence never begins mid-token —
+while `ARR` is not attached to anything.
+
+**Why only the START, not the end.** A quote citing a whole sentence or
+clause routinely — and legitimately — ends in terminal punctuation ("Acme
+Corp is the client."). Sentence-final punctuation is a closing delimiter of
+the unit actually quoted; leading punctuation with nothing before it in the
+quote is not. An earlier draft of this rule checked both edges and broke
+this common, legitimate shape outright.
+
+**Why a constant, not `facts.single_valued_edges`-style config.** This
+guards evidence integrity — can a fabricated or degenerate extraction get
+past the gate — not a per-instance ontology choice; an operator should not
+be able to loosen it, the way `facts.single_valued_edges` legitimately can
+be (it encodes which edge types an instance's own ontology treats as
+functionally single-valued, a modeling decision, not a security floor). A
+future length floor guarding a *query* (cost/quality) would be a different
+problem and belongs in its own constant, never shared with this one.
+
+**The reason.** A rejected degenerate quote gets `quote_not_meaningful` in
+`claims_rejected`, distinct from `verbatim_gate_failed`: the quote WAS
+present verbatim (or trivially would be), it just isn't evidence of
+anything — a different failure than "cited text absent from the document,"
+which calls for a different fix on the producer side.
+
 ---
 
 ## 9. Anonymization and conversion — services in front of ingestion
@@ -966,6 +1011,26 @@ be granted by mistake — but the decision is not ours alone.
 Anonymization is chosen **at source-connect time, per scope** (a column in
 the wizard, §13.2); on a collection detail it is a state plus a named batch
 task ("Anonymize collection…" over N documents), never a toggle.
+
+**Ingest-time enforcement (2026-08-29 hardening, closing a fail-open gap
+found post-#1715):** the producer's `anonymization` declaration on `POST
+/api/facts/ingest` (§7.2) is no longer merely recorded — Agnes now
+**refuses** (`403 anonymization_not_declared`) any batch that documents a
+corpus whose SharePoint scope is anonymize-marked (`config.scopes[]
+.anonymize`) unless that same batch's `anonymization` block declares the
+corpus. This closes the path where an unrelated edit through the generic
+connection editor silently wiped `config.scopes` (server-written, never
+echoed back by that editor's wholesale config replace), which emptied the
+anonymize map, skipped the HMAC-key resolution, raised no error, and let
+the pipeline ship un-anonymized content into a collection an admin believed
+was anonymized — reported as success. Agnes still cannot verify a
+document's CONTENT was anonymized (§9.2's limits stand), but it can no
+longer accept a claim for a marked corpus with zero declaration, and it
+fails **closed** — refuses, `503 anonymization_check_unavailable` — rather
+than accepts, whenever it cannot itself answer "is this corpus marked"
+(e.g. the connections table is unreadable). See
+`app/api/facts.py::_refuse_undeclared_anonymize_marked_corpora` and
+`docs/anonymization.md`.
 
 ---
 
@@ -1337,7 +1402,7 @@ half and you miss leaks.
 - Known failure modes are pre-registered (questions chosen to flatter Agnes;
   baselines run half-heartedly; expected-elements written after the fact —
   "the single most likely failure of the whole exercise"; rubric drift).
-- **Sandbox state** (cuesta repo main `753be22`): 12 sandbox questions
+- **Sandbox state** (producer repo main `753be22`): 12 sandbox questions
   Q01–Q12 now carry `shan_category` mappings onto the ten v0.2 prompts;
   Q07 (v0.1 S1) and Q09 (v0.1 R1) are **sandbox-only** (dropped upstream);
   **L1 and N1 have no dedicated sandbox question** — eval prep must add them
@@ -1616,7 +1681,7 @@ overclaim).
   anonymizer driver. This widens the build scope: those items are tasks in
   this plan now, not an external dependency.
 - **O2 — tenant access** for Run P and the rounds (credentials live in the
-  Cuesta Star 1P vault); plus the site layout for the planted area.
+  the producer team's password vault); plus the site layout for the planted area.
 - **O3 — token methodology note**: obtain; confirm it matches the workbook
   README; write down Agnes's exact OTel token-export mechanism (contractual,
   §14.6).
