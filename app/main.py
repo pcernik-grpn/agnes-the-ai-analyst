@@ -580,6 +580,7 @@ from app.api.cache_warmup import router as cache_warmup_router
 from app.api.bq_metadata_refresh import router as bq_metadata_refresh_router
 from app.api.keboola_semantic_layer_refresh import router as keboola_semantic_layer_refresh_router
 from app.api.databricks_semantic_layer_refresh import router as databricks_semantic_layer_refresh_router
+from app.api.semantic_sources_refresh import router as semantic_sources_refresh_router
 from app.api.semantic_layer_coverage import router as semantic_layer_coverage_router
 from app.api.semantic_feedback import router as semantic_feedback_router
 from app.api.activity import router as activity_router
@@ -3062,6 +3063,10 @@ def create_app() -> FastAPI:
     # is open to any signed-in caller, only the queue and resolve are admin.
     app.include_router(semantic_feedback_router)
     app.include_router(databricks_semantic_layer_refresh_router)
+    # Block 3 step 2 of #1707: the ONE generic scheduled refresh over
+    # registered `semantic_sources` (git/upload/connection kinds). Legacy
+    # Keboola/Databricks refreshes above are untouched until steps 3-4.
+    app.include_router(semantic_sources_refresh_router)
     app.include_router(activity_router)
     app.include_router(observability_router)
     app.include_router(admin_user_sessions_router)

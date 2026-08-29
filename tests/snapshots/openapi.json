@@ -27846,6 +27846,57 @@
         ]
       }
     },
+    "/api/admin/run-semantic-sources-refresh": {
+      "post": {
+        "description": "Sync every enabled ``semantic_sources`` row through the shared\ngit/upload/connection import pipeline. Disabled sources are skipped and\ncounted, never synced \u2014 manually or on this schedule. See the module\ndocstring for scope versus the legacy Keboola/Databricks endpoints.\n\n409 if a sweep is already in flight.",
+        "operationId": "run_semantic_sources_refresh_api_admin_run_semantic_sources_refresh_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Semantic Sources Refresh"
+      }
+    },
     "/api/admin/run-session-collector": {
       "post": {
         "description": "Trigger the session-collector job from the scheduler.\n\nWalks /home/*/user/sessions/*.jsonl and copies new files into\n/data/user_sessions/<user>/. Idempotent \u2014 already-collected files\nare skipped.",

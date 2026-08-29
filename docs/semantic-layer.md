@@ -89,6 +89,31 @@ than it sounds: an empty document list legitimately means "upstream deleted
 everything", which prunes. A failed clone must never be able to present itself
 as an empty source, so the error is recorded on the source row and re-raised.
 
+### Scheduled refresh
+
+Every registered source — regardless of kind — is also synced automatically by
+`POST /api/admin/run-semantic-sources-refresh`, on a cadence set by
+`SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL` (default 6 h). One failing
+source never stops the sweep over the rest; each source's own
+`last_sync_at`/`last_sync_status`/`last_sync_error` (surfaced on `GET
+/api/admin/semantic-sources` and in Health, below) still reflects only its own
+outcome.
+
+`enabled: false` (`--disabled` on `add`, or `PUT .../sources/{id}` with
+`enabled: false`) excludes a source from **both** this scheduled sweep and the
+manual `agnes admin semantic-source sync <id>` / `POST .../sources/{id}/sync`
+— a disabled source's manual sync now answers `409 source_disabled` instead of
+running. Re-enable it (`enabled: true`) to bring it back into rotation for
+both paths.
+
+This is the generic path for `git`/`upload`/`connection` sources alike. The
+Keboola and Databricks connectors currently also run their own,
+longer-standing scheduled refreshes (`POST
+/api/admin/run-keboola-semantic-layer-refresh` /
+`.../run-databricks-semantic-layer-refresh`, see
+[`DATA_SOURCES.md`](DATA_SOURCES.md)) with their own provenance labels and
+prune scopes; those are a separate migration and unaffected by this one.
+
 ## Adapters — adding a source format
 
 An adapter turns one source's payload into Ossie documents and does nothing

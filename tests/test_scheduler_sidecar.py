@@ -479,6 +479,29 @@ def test_build_jobs_honors_keboola_semantic_layer_refresh_env_override(monkeypat
     assert jobs["keboola-semantic-layer-refresh"] == "every 1h"
 
 
+def test_build_jobs_includes_semantic_sources_refresh_default(monkeypatch):
+    """Block 3 step 2 of #1707 — the ONE generic scheduled refresh over
+    registered `semantic_sources`, distinct from (and running alongside)
+    the legacy Keboola/Databricks refreshes above."""
+    monkeypatch.delenv("SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL", raising=False)
+    from services.scheduler.__main__ import build_jobs
+
+    target = next(j for j in build_jobs() if j[0] == "semantic-sources-refresh")
+    _, schedule, endpoint, method, timeout = target
+    assert schedule == "every 6h"
+    assert endpoint == "/api/admin/run-semantic-sources-refresh"
+    assert method == "POST"
+    assert timeout == 900
+
+
+def test_build_jobs_honors_semantic_sources_refresh_env_override(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL", "3600")  # 1h
+    from services.scheduler.__main__ import build_jobs
+
+    jobs = {name: schedule for name, schedule, *_ in build_jobs()}
+    assert jobs["semantic-sources-refresh"] == "every 1h"
+
+
 # ---------------------------------------------------------------------------
 # Wave-2B job-queue migration (Task 6): data-refresh, marketplaces,
 # session-collector, corporate-memory now enqueue via POST /api/jobs

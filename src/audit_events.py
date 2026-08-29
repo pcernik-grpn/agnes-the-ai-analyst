@@ -472,6 +472,9 @@ CATALOG: dict[str, AuditEvent] = {
     "run_bq_metadata_refresh": AuditEvent(
         "run_bq_metadata_refresh", "system", "The scheduled BigQuery metadata-cache refresh ran."
     ),
+    "run_semantic_sources_refresh": AuditEvent(
+        "run_semantic_sources_refresh", "system", "The scheduled semantic-sources refresh sweep ran."
+    ),
     "run_keboola_semantic_layer_refresh": AuditEvent(
         "run_keboola_semantic_layer_refresh", "system", "The scheduled Keboola semantic-layer refresh ran."
     ),

@@ -183,6 +183,14 @@ _DEFAULTS = {
     # statements per run, syncing the workspace's `connection`-kind semantic
     # source (source='ossie_connection', source_ref='databricks_default').
     "SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL": 6 * 60 * 60,
+    # Generic semantic-sources refresh (Block 3 step 2, issue #1707): the
+    # ONE scheduled sweep over every registered `semantic_sources` row
+    # (git/upload/connection kinds), honoring each row's `enabled` flag.
+    # Same 6 h default and rationale as its Keboola/Databricks siblings
+    # above — this row runs ALONGSIDE them, not instead of them, until a
+    # later, separately-sequenced migration (#1707 steps 3-4) moves their
+    # callers onto this generic path and retires the two legacy endpoints.
+    "SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL": 6 * 60 * 60,
     # Pause between scheduler startup and the first tick. Keeps the
     # scheduler from synchronising its "Table never synced, marking as
     # due" burst with the app's own startup cache_warmup. Set to 0 to
@@ -543,6 +551,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
     bqmeta = _read_positive_int("SCHEDULER_BQ_METADATA_REFRESH_INTERVAL")
     kbsl = _read_positive_int("SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL")
     dbxsl = _read_positive_int("SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL")
+    semsrc = _read_positive_int("SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL")
     usageprune = _read_positive_int("SCHEDULER_USAGE_PRUNE_INTERVAL")
     jirasla = _read_positive_int("SCHEDULER_JIRA_SLA_POLL_INTERVAL")
     jiraconsis = _read_positive_int("SCHEDULER_JIRA_CONSISTENCY_INTERVAL")
@@ -561,6 +570,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         bqmeta,
         kbsl,
         dbxsl,
+        semsrc,
         usageprune,
         jirasla,
         jiraconsis,
@@ -743,6 +753,22 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
             "databricks-semantic-layer-refresh",
             _seconds_to_schedule(dbxsl),
             "/api/admin/run-databricks-semantic-layer-refresh",
+            "POST",
+            900,
+        ),
+        # Generic semantic-sources refresh — Block 3 step 2 of issue #1707.
+        # The ONE scheduled sweep over every registered `semantic_sources`
+        # row (git/upload/connection kinds), skipping `enabled=False` rows.
+        # Runs ALONGSIDE the Keboola/Databricks rows above, not instead of
+        # them: those legacy refreshes keep their own schedules and
+        # provenance labels until a later, separately-sequenced migration
+        # (#1707 steps 3-4) moves their callers onto this path and retires
+        # them — see app/api/semantic_sources_refresh.py for the full
+        # scope note and why scheduling both is safe today.
+        (
+            "semantic-sources-refresh",
+            _seconds_to_schedule(semsrc),
+            "/api/admin/run-semantic-sources-refresh",
             "POST",
             900,
         ),

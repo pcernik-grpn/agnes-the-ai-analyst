@@ -1759,6 +1759,7 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
