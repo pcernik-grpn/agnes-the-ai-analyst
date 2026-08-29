@@ -10,11 +10,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+- The profiler worker subprocess crashed with `TypeError: Object of type
+  Decimal is not JSON serializable` when a profiled table had DECIMAL/NUMERIC
+  columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
+  stdout `json.dumps` now uses the same `default=str` handler as the
+  parent-side profile writer.
+
 ### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -41,11 +46,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
-- The profiler worker subprocess crashed with `TypeError: Object of type
-  Decimal is not JSON serializable` when a profiled table had DECIMAL/NUMERIC
-  columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
-  stdout `json.dumps` now uses the same `default=str` handler as the
-  parent-side profile writer.
 - The group picker on `/admin/users/{id}` ("Add to group") showed only its
   first option under themes that render the custom dropdown: the section
   card's `overflow: hidden` clipped the popover at the card's bottom edge,
@@ -4736,8 +4736,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -4778,8 +4776,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - Domain migrations keep the old hostname working: set `DOMAIN_ALIAS` to the name you are moving away from and Caddy serves it alongside `DOMAIN`, with its own certificate, instead of failing the TLS handshake the moment `DOMAIN` changes — which is what would otherwise break bookmarks, `agnes` CLI configs and MCP connector URLs with a certificate error instead of a path onto the new address. Two audiences, two answers: someone arriving in a browser gets a short notice page naming the new address and what still points at the old one (deep links preserved, auto-forwarding after 15 s), while the CLI, MCP clients and anything else get a plain 308 — a silent redirect for everyone would never prompt a human to update the bookmark, and an HTML notice served to a machine client is just a confusing parse error. The split keys on `Accept: text/html` and is scoped to GET/HEAD, so a POST is never swallowed by the notice page. Unset (the default) the block is inert — it resolves to a non-published localhost port and, carrying no `tls` directive, is served an internal certificate silently rather than retrying a public one once a minute forever. Exposed on the `customer-instance` module as a per-VM `domain_alias` field on `prod_instance` / `dev_instances`; drop it once the old DNS record is retired. Cutover checklist — including the three things that do *not* follow `DOMAIN` (`SERVER_URL`/`public_url`, the Google OAuth client's redirect URIs, and already-connected MCP clients): `docs/DEPLOYMENT.md` → "Migrating to a new domain".
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -4885,8 +4881,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -4941,8 +4935,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - The chat sandbox's `agnes` CLI wheel and restored-conversation transcript are now staged for every sandbox provider, not only for providers that also upload the workspace. Only the workspace tarball itself remains tied to that decision. E2B behavior is unchanged.
 - `/admin/chat/secrets/test` ("Test connections" in server config) reports the sandbox credential for the configured provider: the E2B key on an E2B instance, a Docker daemon + image probe on a self-hosted one, instead of a permanently failing E2B row. The chat readiness list on the same page is provider-aware too — rows render from the server's readiness payload (`APPS_RUNNER_TOKEN`/`chat.docker_image` on a docker instance) instead of a fixed E2B-only set.
-
-### Fixed
 
 ### Removed
 
@@ -5052,8 +5044,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   TLS-terminating reverse proxy's access log (see `docs/DEPLOYMENT.md`).
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -5400,8 +5390,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - `agnes refresh-marketplace` (and the `agnes update` convergence) now prunes plugins that left your stack: an `@agnes` plugin installed in the workspace but absent from a successfully-fetched, non-empty marketplace manifest is uninstalled and its `enabledPlugins` entry dropped (entries from other marketplaces are never touched). A transiently empty or unreadable manifest still never removes anything.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -5431,8 +5419,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **BREAKING** (admins only): session-JWT agent surfaces follow the stack too — the web-chat/E2B runner (`scope="chat"`) and the MCP streamable-HTTP OAuth transport (Claude Desktop / claude.ai connectors) now resolve with the `stack` data-read surface, matching the PAT default. Browser sessions, `/admin`, and non-admins are unchanged.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -5448,8 +5434,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 - `/admin/data-sources`'s semantic-layer card is now a one-line status ("Semantic layer: <status> — manage at /admin/semantic-layer"); the per-project counts, "Sync now" control, and the new orphaned-rows view moved to `/admin/semantic-layer`.
-
-### Fixed
 
 ### Removed
 
@@ -5470,8 +5454,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 - **BREAKING** (admins only): PATs minted by `agnes init` / the CLI login exchange, Cowork setup bundles, and self-service MCP connections now carry `surface='stack'` — an admin's workspace/agent catalog and server-side queries follow their stack (required ∪ subscribed data packages + internal tables) like any analyst, instead of god-mode over every registered table. Existing tokens are grandfathered to `surface='all'`; opt up per-workspace with `agnes init --as-admin`. Parquet distribution was already stack-scoped and is unchanged; session (browser) logins and `/admin` are unchanged.
-
-### Fixed
 
 ### Removed
 
@@ -5621,8 +5603,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   were ignored and the yaml decided). Unset behavior is unchanged, and the
   shipped infra module only ever writes `true`. (#1022)
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -5676,8 +5656,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   appeared in any recent window and read as data loss — on a production
   dataset, 34 of 157 uploads in 30 days were invisible this way. Adoption
   charts stay anchored on `started_at` (usage-over-time semantics).
-
-### Fixed
 
 ### Removed
 
@@ -6086,8 +6064,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   running and it finishes after resume, so "please resend" there would invite
   a duplicate turn. Idle sessions drain silently as before.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -6165,8 +6141,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   with hidden input via `--set-password`, so it never lands on the process argv
   (security audit F14). Scripts passing `--password <secret>` must switch to the
   env var.
-
-### Fixed
 
 ### Removed
 
@@ -6545,8 +6519,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   1,000,000) so a single request can't exhaust worker memory; raise the env var
   if you need larger local result sets.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -6629,8 +6601,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
     may call them); `data_app_deploy`/`data_app_logs` are owner/Admin-only.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -6822,8 +6792,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -6938,8 +6906,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   DB table.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -8385,8 +8351,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -8519,8 +8483,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.74.37] - 2026-07-10### Added
 - Operator toggle to hide individual `/login` feature cards without forking: set `instance.hide_login_features` (a YAML list or comma-separated string of the stable keys `data`, `marketplace`, `mcp`, `memory`, `anywhere`) in `instance.yaml`, or the `AGNES_INSTANCE_HIDE_LOGIN_FEATURES` env override. Empty by default — nothing is hidden.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -8621,8 +8583,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -8633,8 +8593,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -8643,8 +8601,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - `agnes statusline` now surfaces a one-line "what changed" summary after a detached `agnes update` convergence actually changes something (e.g. `Agnes: CLI 0.72.9 -> 0.73.0 (active next session) · +2 plugins · workspace refreshed`), shown once per convergence report; an all-`ok`/`skipped` report renders nothing, and the CLI portion is phrased honestly ("active next session" vs already active) since a freshly-installed binary only takes effect on the next `agnes` invocation (#744)
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -8676,8 +8632,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Security
@@ -8700,8 +8654,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - BigQuery job labels (`workload_type`, `agent_name`, `environment`, `user_id`) on agent-issued BQ jobs. The **hybrid** path labels its billable jobs; the `/api/v2/scan` and remote-`/api/query` paths label only the dry-run cost estimate — their billable execution runs through the DuckDB BigQuery extension, which (like sync/snapshot) cannot carry job labels. Full billable-job attribution for those paths is a follow-up slice (bytes/slot capture).
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -8737,8 +8689,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - Interactive chat turns (web + Slack) now emit a `chat.message` usage event (`source='server'`, surface + session id in props), so `/admin/telemetry` and the adoption dashboard's active-user counts include chat activity — previously `usage_events` only saw desktop CC sessions (`agnes push`) and server product events
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -8784,8 +8734,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 - Manual "Optional: create a one-word shortcut" step removed from `/home` setup wizard — shortcut is now created automatically by `agnes init`.
@@ -8795,8 +8743,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.74.7] - 2026-07-07### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -8819,8 +8765,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -8841,8 +8785,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 - Unused externally-branded icon asset from `app/web/static/` — added in #724 without description or code references; instance branding is driven by instance config (`get_instance_logo_svg()`), and deployment-specific assets belong in the consuming deployment's own repo, not the public distribution.
 
@@ -8851,8 +8793,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.74.2] - 2026-07-02### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -8863,8 +8803,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - `POST /api/admin/validate-gws-credentials` — admin-only format check for the Google Workspace OAuth `client_id` (no network call, no persistence). Powers a new "Test" button on the GWS card of `/admin/datasource-credentials`; the endpoint was documented for #718 but never wired up (previously returned 405 / absent from OpenAPI).
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9033,8 +8971,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - **AI Connector page leads with a "Control Agnes from your AI agent" connector panel.** The page moved to `/me/ai-connector` (the old `/me/cowork` and `/me/mcp` now 301-redirect there). The OAuth 2.1 connector URL (`/api/mcp/http`) is now the primary call to action — a prominent panel with the copy-able connector URL, a 3-step connect flow, and the supported clients (Claude Cowork, Claude web, ChatGPT, Gemini, Cursor, Microsoft Copilot, VS Code). Previously this no-token connect path was undiscoverable: the page surfaced only the setup-bundle download and the legacy SSE endpoint. The setup-bundle UI and the legacy SSE endpoint display were removed from the page (the bundle and SSE backend endpoints are unchanged). The "AI Connector" name is now applied consistently across the profile dropdown menu, the onboarding tour, and the help/onboarding docs (previously still labelled "AI Cowork"); references to the third-party Claude Cowork product are unchanged. The hero subtitle and the connector panel's lead paragraph now span the full content width instead of wrapping early.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9224,8 +9160,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 
 ### Changed
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9249,8 +9183,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   writes now use ZSTD compression (was Snappy) and have `write_statistics=True`
   plus `write_page_index=True` for improved DuckDB query performance.
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -9260,8 +9192,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - **Built-in marketplace** — two vendor-neutral plugins ship with every instance and are seeded automatically (offline, from `src/_builtin_marketplace/`, no git fetch): `agnes-analyst` (how to query/discover/snapshot Agnes data + look up metrics, served to `Everyone`) and `agnes-operator` (how to configure the instance — init prompt, workspace, branding, connectors — backed by a live `config-surface` call so guidance names this instance's real pointers, served to `Admin`). New `marketplace_registry.is_builtin` flag (the nightly git-sync skips built-in rows) and `marketplace_plugins.admin_disabled` flag for per-plugin admin disable, on both the DuckDB (v77→v78) and Postgres ladders.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9454,8 +9384,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
   No-op when the URL is unset. (#397, #648)
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -9705,8 +9633,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - API coverage: the `/api/* → CLI + MCP` triple-surface check (`tests/test_documentation_api_triple_surface.py`) is now a ratchet — a new endpoint must be classified triple-surface (`_COHORT`) or consciously REST-only (`_EXEMPT`); existing endpoints are grandfathered (`tests/api_triple_surface_grandfathered.txt`). Complements the docs-coverage gate from #565.
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
@@ -10906,8 +10832,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 - **Migrated `admin_corporate_memory`, `admin_server_config`, `me_activity`, `admin/news_editor` onto `base_ds.html` (#482, batch 14 — final).** The last four `base.html` leaf pages: `admin_server_config` moves its top `<style>` → `{% block head_extra %}` and keeps its `_page_hero` inside the `.cfg-page` (1260px) wrapper — faithful, not hoisted to a full-width hero; `me_activity` keeps its `{% block layout %}` full-width override (body via `self.content()`) and its in-`content` `<style>`; `admin_corporate_memory` and `news_editor` already carried their CSS in `{% block head_extra %}` (extends-swap only, chip-input `extra_scripts` / `body.news-admin` script preserved). Redundant `_components.html` imports dropped (`base_ds` auto-imports `ds`). Rendered output unchanged. **This completes the #482 leaf-page migration** — only seven intentionally-bespoke templates remain on `base.html` (the catalog/marketplace detail card-heroes, the dead `admin_scheduler_runs` redirect, and the `_message` partial).
 - **`base_ds.html` now carries `data-theme` + the favicon `<link>` like `base.html`.** The DS base set neither, so every page migrated onto `base_ds` / `base_page` fell back to the default **navy** hero gradient instead of the instance's configured theme (**blue** by default — the hero eyebrow + CTA colours flip with it) and lost its tab favicon. A browser before/after of the #482 batch surfaced it — the marker-only render-checks can't see a theme/pixel change. `<html data-theme="{{ instance_theme | default('blue') }}">` + the favicon link restore exact parity, so the page-shell migration is genuinely render-identical; verified in-browser (hero back to blue `#0073D1`, `data-theme=blue`, favicon present) on `me_activity` + `admin_server_config`. Closes the last `base_ds` parity gap from #367 (alongside the operator `custom_scripts` fix).
 
-### Fixed
-
 ### Removed
 
 ### Internal
@@ -10916,8 +10840,6 @@ New operator knobs: `AGNES_TRUSTED_PROXY_HOPS`, `AGNES_REMOTE_ATTACH_HOST_ALLOWL
 ## [0.59.2] — 2026-06-02### Added
 
 ### Changed
-
-### Fixed
 
 ### Removed
 
