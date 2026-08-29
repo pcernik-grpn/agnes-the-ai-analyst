@@ -125,18 +125,20 @@ def _node_run(script: str) -> str:
 
 
 def _sp_step2_slice() -> str:
-    """The shipped step-2 JS (state, tree render/filter, and server
-    search), sliced from the template so these tests run the REAL shipped
-    functions rather than a copy that can drift. Step 1 (connect) and step
-    3 (share) wiring ride along inside the slice too (it's all one
-    contiguous block) but is never exercised — every DOM id it reaches for
-    resolves to a safe no-op stub (see ``_HARNESS_PREAMBLE``), so it costs
-    nothing to include and keeps the slice a single honest contiguous
-    range rather than a hand-picked patchwork.
+    """The shipped SharePoint wizard JS (state, step-1 wiring, step-2 tree
+    render/filter/server search, and step-3 share-preview render), sliced
+    from the template so these tests run the REAL shipped functions rather
+    than a copy that can drift. The slice runs through the END of the
+    wizard's own ``<script>`` block — step 1 and step 3 wiring ride along
+    even for a test that only exercises step 2 (it's all one contiguous
+    block) but every DOM id any of it reaches for resolves to a safe no-op
+    stub (see ``_HARNESS_PREAMBLE``), so it costs nothing to include and
+    keeps the slice a single honest contiguous range rather than a
+    hand-picked patchwork.
     """
     html = TEMPLATE.read_text(encoding="utf-8")
     start = html.index('const SP_CONN_API = "/api/admin/source-connections";')
-    end = html.index("/* ── Step 3: share preview", start)
+    end = html.index("</script>", start)
     return html[start:end]
 
 
@@ -169,7 +171,16 @@ function genericEl() {
 
 const _elements = {};
 function el(id) { return _elements[id] || (_elements[id] = genericEl()); }
-const document = { getElementById(id) { return el(id); } };
+// The tail of the sliced script (step-3 close/cancel wiring) registers a
+// document-level keydown handler and does two `document.querySelectorAll(
+// ...).forEach(...)` close-button sweeps — no-op stubs so the slice can
+// extend through the end of the wizard's <script> block without throwing
+// at load.
+const document = {
+  getElementById(id) { return el(id); },
+  addEventListener() {},
+  querySelectorAll() { return []; },
+};
 
 let _fetchCalls = [];
 let _nextSearchResponse = null;
@@ -483,14 +494,17 @@ class TestSharePointWizardStep2Behavior:
             document.getElementById("spw-search-q").value = "ab";
             document.getElementById("spw-search-mode").value = "prefix";
 
-            _nextSearchResponse = { matches: [], visited: 500, truncated: true };
+            _nextSearchResponse = {
+              matches: [], visited: 500, truncated: true,
+              hint: "Scope the search to a site or folder, or narrow the pattern.",
+            };
             spRunSearch();
             await _settle();
             const truncEl = document.getElementById("spw-search-truncated");
             const truncatedShown = truncEl.style.display === "block";
             const truncatedText = truncEl.textContent;
 
-            _nextSearchResponse = { matches: [], visited: 3, truncated: false };
+            _nextSearchResponse = { matches: [], visited: 3, truncated: false, hint: null };
             spRunSearch();
             await _settle();
             const notTruncatedShown = truncEl.style.display === "block";
@@ -500,4 +514,144 @@ class TestSharePointWizardStep2Behavior:
         )
         assert result["truncatedShown"] is True
         assert "500" in result["truncatedText"]
+        # The enriched banner: the visited count AND the server's own hint,
+        # verbatim — not a client-side guess at what to do next.
+        assert "Scope the search to a site or folder, or narrow the pattern." in result["truncatedText"]
         assert result["notTruncatedShown"] is False
+
+    def test_truncation_banner_falls_back_to_generic_hint_when_response_omits_it(self):
+        """Defensive fallback for a response shape this build has never
+        seen (e.g. an older server) — the banner must still say SOMETHING
+        actionable, never blank."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            document.getElementById("spw-search-q").value = "ab";
+            document.getElementById("spw-search-mode").value = "prefix";
+            _nextSearchResponse = { matches: [], visited: 20000, truncated: true };
+            spRunSearch();
+            await _settle();
+            const truncEl = document.getElementById("spw-search-truncated");
+            process.stdout.write(JSON.stringify({ text: truncEl.textContent }));
+            """
+        )
+        assert "20000" in result["text"]
+        assert len(result["text"]) > len("Stopped after 20000 folder(s) visited. ")
+
+
+class TestUniquePermissionsBadgeUI:
+    """ADVISORY-ONLY badge (Decision #2) rendered by the SHIPPED
+    `spRenderTree` — present only for a bare `true`, absent for `false` AND
+    for "unknown" (unset/`null`) alike, since a probe failure must never
+    read as a reassurance."""
+
+    def test_badge_present_only_for_true_absent_for_false_and_unknown(self):
+        result = _run(
+            """
+            spItems = [
+              { id: "f1", name: "Legal", is_folder: true, child_count: 0 },
+              { id: "f2", name: "Ordinary", is_folder: true, child_count: 0 },
+              { id: "f3", name: "NeverProbed", is_folder: true, child_count: 0 },
+            ];
+            spLevel = { site_id: "s1", drive_id: "d1", item_id: null };
+            spCrumbs = [];
+            spScopes = {};
+            spUniquePerms = { f1: true, f2: false };
+            // f3 deliberately absent from spUniquePerms — the "never even
+            // attempted" unknown, distinct from f2's explicit `false`.
+
+            spRenderTree("items");
+            const html = document.getElementById("spw-tree").innerHTML;
+            process.stdout.write(JSON.stringify({ html }));
+            """
+        )
+        html = result["html"]
+        row_f1 = html[html.index('data-spw-item="f1"') : html.index('data-spw-item="f2"')]
+        row_f2 = html[html.index('data-spw-item="f2"') : html.index('data-spw-item="f3"')]
+        row_f3 = html[html.index('data-spw-item="f3"') :]
+        assert "sp-badge--unique-perms" in row_f1
+        assert "unique permissions" in row_f1
+        # Honesty requirement: the badge text never claims enforcement.
+        assert "enforce" not in row_f1.lower()
+        assert "sp-badge--unique-perms" not in row_f2
+        assert "sp-badge--unique-perms" not in row_f3
+
+    def test_badge_tooltip_text_is_advisory_not_an_enforcement_claim(self):
+        result = _run(
+            """
+            spItems = [{ id: "f1", name: "Legal", is_folder: true, child_count: 0 }];
+            spLevel = { site_id: "s1", drive_id: "d1", item_id: null };
+            spCrumbs = [];
+            spScopes = {};
+            spUniquePerms = { f1: true };
+            spRenderTree("items");
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+        )
+        html = result["html"]
+        assert "people who can't open it there may still see its content once this scope is shared here" in html
+
+
+class TestSharePointWizardStep3AdvisorySummary:
+    """The share step's one-line advisory summary — shown only when at
+    least one confirmed scope was flagged `true` while browsing THIS
+    session (spUniquePerms); silent otherwise. Runs the shipped
+    `spRenderShare` for real."""
+
+    def test_summary_shown_when_a_selected_scope_was_flagged(self):
+        result = _run(
+            """
+            spGroups = [];
+            spPendingGroups = {};
+            spUniquePerms = { "drive:legal": true };
+            const items = [
+              { source_scope_id: "drive:legal", display_path: "Legal", anonymize: false,
+                anonymization_declared: false, collection: { id: "c1", slug: "legal", name: "Legal" },
+                group_ids: [], no_group_warning: true },
+            ];
+            spRenderShare(items);
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-share-rows").innerHTML }));
+            """
+        )
+        html = result["html"]
+        assert "apg-strip--warn" in html
+        assert "unique permissions in the source" in html
+        assert "does not read or enforce" in html
+
+    def test_summary_absent_when_no_selected_scope_was_flagged(self):
+        result = _run(
+            """
+            spGroups = [];
+            spPendingGroups = {};
+            spUniquePerms = {};
+            const items = [
+              { source_scope_id: "drive:ordinary", display_path: "Ordinary", anonymize: false,
+                anonymization_declared: false, collection: { id: "c2", slug: "ordinary", name: "Ordinary" },
+                group_ids: [], no_group_warning: true },
+            ];
+            spRenderShare(items);
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-share-rows").innerHTML }));
+            """
+        )
+        assert "apg-strip--warn" not in result["html"]
+
+    def test_summary_counts_only_flagged_scopes_not_all_selected(self):
+        result = _run(
+            """
+            spGroups = [];
+            spPendingGroups = {};
+            spUniquePerms = { "drive:legal": true, "drive:ordinary": false };
+            const items = [
+              { source_scope_id: "drive:legal", display_path: "Legal", anonymize: false,
+                anonymization_declared: false, collection: { id: "c1", slug: "legal", name: "Legal" },
+                group_ids: [], no_group_warning: true },
+              { source_scope_id: "drive:ordinary", display_path: "Ordinary", anonymize: false,
+                anonymization_declared: false, collection: { id: "c2", slug: "ordinary", name: "Ordinary" },
+                group_ids: [], no_group_warning: true },
+            ];
+            spRenderShare(items);
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-share-rows").innerHTML }));
+            """
+        )
+        html = result["html"]
+        assert "1 of your selected scope" in html

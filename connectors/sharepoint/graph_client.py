@@ -449,3 +449,105 @@ async def search_folders(
         truncated = True
 
     return {"matches": matches, "visited": visited, "truncated": truncated}
+
+
+# ---------------------------------------------------------------------------
+# Unique-permissions advisory probe (design spec §13.1/§13.2). Decision #2
+# stands: Agnes does not derive or enforce anything from SharePoint ACLs —
+# this exists ONLY to warn an admin in the connect wizard that a folder
+# breaks permission inheritance from its parent in the source, never to
+# gate, filter, or imply Agnes reads/respects that inheritance itself.
+# ---------------------------------------------------------------------------
+
+#: Graph's own hard cap on sub-requests in one ``POST /$batch`` call — not a
+#: tuning knob, the actual ceiling Graph enforces.
+_GRAPH_BATCH_SIZE_CAP = 20
+
+
+async def probe_unique_permissions(access_token: str, drive_id: str, item_ids: List[str]) -> Dict[str, Optional[bool]]:
+    """Best-effort, per-item "does this folder break permission inheritance
+    from its parent" signal for the wizard's unique-permissions badge —
+    ADVISORY ONLY (module header + design spec §13.1: Agnes does not derive
+    or enforce anything from SharePoint ACLs today; this exists to warn an
+    admin, never to gate a scope).
+
+    **Graph shape, and the uncertainty around it.** SharePoint's classic API
+    exposes ``ListItem.HasUniqueRoleAssignments`` — a plain boolean, "this
+    item's role assignments are not inherited from its parent" — which the
+    design spec's own §13.1 names as the intended later signal
+    (``per-item only where HasUniqueRoleAssignments``). Microsoft Graph does
+    not document a top-level ``driveItem`` property for it, but the
+    underlying SharePoint list item is reachable by expanding a driveItem's
+    ``listItem`` navigation property and selecting the field:
+    ``GET /drives/{drive}/items/{item}?$expand=listItem($select=
+    hasUniqueRoleAssignments)``. Chosen over enumerating the item's full
+    ``permissions`` collection (``/drives/{drive}/items/{item}/permissions``)
+    and inferring uniqueness from the absence of ``inheritedFrom`` on an
+    entry — that needs no extra scope beyond what browsing the tree already
+    uses, but is a much larger, harder-to-reason-about response per item, for
+    a page of results that already needs to stay cheap and batched. If Graph
+    ever stops returning this field, or returns it under a different shape,
+    every affected item degrades to ``None`` (unknown) below — never a wrong
+    ``False``.
+
+    **Batching.** One ``POST /$batch`` per up-to-:data:`_GRAPH_BATCH_SIZE_CAP`
+    (20, Graph's own limit) items; ``item_ids`` longer than that are split
+    into sequential batches.
+
+    **Never raises.** A failure at the whole-batch level (network error,
+    non-200 on ``/$batch`` itself) or at the per-item level (a missing
+    sub-response, a non-200 sub-status, or a 200 whose body has no
+    ``listItem.hasUniqueRoleAssignments``) maps the affected item id(s) to
+    ``None`` — "unknown", the only honest answer when the probe itself could
+    not run. Callers (the tree endpoint) must never render ``None`` as "no
+    unique permissions" — only a bare ``True`` earns the badge.
+    """
+    result: Dict[str, Optional[bool]] = {}
+    ids = list(item_ids)
+    for start in range(0, len(ids), _GRAPH_BATCH_SIZE_CAP):
+        chunk = ids[start : start + _GRAPH_BATCH_SIZE_CAP]
+        requests = [
+            {
+                "id": str(i),
+                "method": "GET",
+                "url": (
+                    f"/drives/{drive_id}/items/{item_id}?$expand=listItem($select=hasUniqueRoleAssignments)&$select=id"
+                ),
+            }
+            for i, item_id in enumerate(chunk)
+        ]
+        try:
+            async with _http_client() as client:
+                resp = await client.post(
+                    f"{GRAPH_BASE}/$batch",
+                    json={"requests": requests},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=_GRAPH_TIMEOUT_S,
+                )
+            if resp.status_code != 200:
+                logger.warning(
+                    "sharepoint unique-permissions batch probe failed: HTTP %s %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+                for item_id in chunk:
+                    result[item_id] = None
+                continue
+            body = resp.json()
+        except Exception:  # noqa: BLE001 — advisory probe, must never block/fail browsing
+            logger.warning("sharepoint unique-permissions batch probe raised", exc_info=True)
+            for item_id in chunk:
+                result[item_id] = None
+            continue
+
+        by_request_id = {str(entry.get("id")): entry for entry in body.get("responses", []) if isinstance(entry, dict)}
+        for i, item_id in enumerate(chunk):
+            sub = by_request_id.get(str(i))
+            value: Optional[bool] = None
+            if sub is not None and sub.get("status") == 200:
+                list_item = (sub.get("body") or {}).get("listItem") or {}
+                raw = list_item.get("hasUniqueRoleAssignments")
+                if isinstance(raw, bool):
+                    value = raw
+            result[item_id] = value
+    return result

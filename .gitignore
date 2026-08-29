@@ -25,6 +25,9 @@ session-analysis/
 # CLI sync artifacts (local parquets + DuckDB)
 server/
 user/
+# ...and `user` itself: same trailing-slash gap as `/data` below — a
+# symlink named `user` is not a directory, so `user/` never matched it.
+/user
 
 # Environment variables
 .env

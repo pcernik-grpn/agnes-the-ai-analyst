@@ -426,6 +426,112 @@ class TestSearchFolders:
         assert drives_hit == {"d1", "d2"}
 
 
+class _FakeGraphBatch:
+    """A tiny in-memory ``POST /$batch`` server for
+    :func:`gc.probe_unique_permissions` tests. ``items`` maps item id ->
+    ``(status, hasUniqueRoleAssignments-or-None)``; ``None`` for the second
+    element means "200 but no listItem/hasUniqueRoleAssignments in the
+    body" — the malformed-shape case, distinct from a non-200 ``status``."""
+
+    def __init__(self, items: Dict[str, Any]):
+        self.items = items
+        self.batch_calls: List[List[Dict[str, Any]]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1.0/$batch"
+        payload = json.loads(request.content)
+        requests = payload["requests"]
+        self.batch_calls.append(requests)
+        assert len(requests) <= 20, "one $batch call must never exceed Graph's own cap"
+        responses = []
+        for req in requests:
+            # url shape: /drives/{drive}/items/{item}?$expand=listItem($select=hasUniqueRoleAssignments)&...
+            item_id = req["url"].split("/items/")[1].split("?")[0]
+            entry = self.items.get(item_id)
+            if entry is None:
+                responses.append({"id": req["id"], "status": 404, "body": {}})
+                continue
+            status, flag = entry
+            body: Dict[str, Any] = {"id": item_id}
+            if flag is not None:
+                body["listItem"] = {"hasUniqueRoleAssignments": flag}
+            elif status == 200:
+                body["listItem"] = {}  # 200 but the field never came back
+            responses.append({"id": req["id"], "status": status, "body": body})
+        return httpx.Response(200, json={"responses": responses})
+
+
+class TestProbeUniquePermissions:
+    """Batched, best-effort ``hasUniqueRoleAssignments`` probe (module
+    docstring on :func:`gc.probe_unique_permissions` names the Graph-shape
+    uncertainty) — ADVISORY ONLY. A probe failure must always degrade to
+    ``None`` ("unknown"), never raise and never a false ``False``."""
+
+    def test_empty_item_list_returns_empty_dict_without_a_call(self, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            raise AssertionError("must not call Graph for an empty item list")
+
+        _install_transport(monkeypatch, handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", []))
+        assert result == {}
+        assert calls == []
+
+    def test_flags_true_and_false_per_item(self, monkeypatch):
+        fake = _FakeGraphBatch({"f1": (200, True), "f2": (200, False)})
+        _install_transport(monkeypatch, fake.handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", ["f1", "f2"]))
+        assert result == {"f1": True, "f2": False}
+        assert len(fake.batch_calls) == 1
+
+    def test_more_than_graph_batch_cap_splits_into_multiple_batch_calls(self, monkeypatch):
+        item_ids = [f"f{i}" for i in range(45)]
+        fake = _FakeGraphBatch({iid: (200, True) for iid in item_ids})
+        _install_transport(monkeypatch, fake.handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", item_ids))
+        assert result == {iid: True for iid in item_ids}
+        # 45 items at a cap of 20 -> 3 batch calls (20, 20, 5), never one call
+        # over the cap.
+        assert len(fake.batch_calls) == 3
+        assert [len(c) for c in fake.batch_calls] == [20, 20, 5]
+
+    def test_non_200_item_status_degrades_to_unknown_not_raise(self, monkeypatch):
+        fake = _FakeGraphBatch({"f1": (403, None)})
+        _install_transport(monkeypatch, fake.handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", ["f1"]))
+        assert result == {"f1": None}
+
+    def test_missing_item_in_response_degrades_to_unknown(self, monkeypatch):
+        fake = _FakeGraphBatch({})  # nothing registered -> handler answers 404 per item
+        _install_transport(monkeypatch, fake.handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", ["ghost"]))
+        assert result == {"ghost": None}
+
+    def test_200_but_no_hasuniqueroleassignments_field_degrades_to_unknown(self, monkeypatch):
+        fake = _FakeGraphBatch({"f1": (200, None)})
+        _install_transport(monkeypatch, fake.handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", ["f1"]))
+        assert result == {"f1": None}
+
+    def test_whole_batch_call_failing_degrades_every_item_to_unknown_without_raising(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="upstream unavailable")
+
+        _install_transport(monkeypatch, handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", ["f1", "f2"]))
+        assert result == {"f1": None, "f2": None}
+
+    def test_network_error_degrades_to_unknown_without_raising(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("boom", request=request)
+
+        _install_transport(monkeypatch, handler)
+        result = asyncio.run(gc.probe_unique_permissions("tok", "d1", ["f1"]))
+        assert result == {"f1": None}
+
+
 class TestCertificateMetadata:
     """Certificate-metadata surface (no schema, no new storage — derived at
     request time from the same PEM ``build_client_assertion`` already
