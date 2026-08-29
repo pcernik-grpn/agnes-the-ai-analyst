@@ -106,13 +106,51 @@ manual `agnes admin semantic-source sync <id>` / `POST .../sources/{id}/sync`
 running. Re-enable it (`enabled: true`) to bring it back into rotation for
 both paths.
 
-This is the generic path for `git`/`upload`/`connection` sources alike. The
-Keboola and Databricks connectors currently also run their own,
-longer-standing scheduled refreshes (`POST
+This is the path for `git`/`upload`/`connection` sources alike, and since
+#1707 Block 3 it is the ONLY scheduled semantic refresh. The Keboola and
+Databricks connectors used to run their own, longer-standing ones (`POST
 /api/admin/run-keboola-semantic-layer-refresh` /
-`.../run-databricks-semantic-layer-refresh`, see
-[`DATA_SOURCES.md`](DATA_SOURCES.md)) with their own provenance labels and
-prune scopes; those are a separate migration and unaffected by this one.
+`.../run-databricks-semantic-layer-refresh`); both endpoints and both
+scheduler entries are gone.
+
+Their sync logic is not: the same adapters compose the same documents and the
+same central projector writes them. Only the trigger moved, and an operator
+has nothing to do — every sweep first registers the sources those triggers
+implied (`src/semantic/legacy_migration.py`):
+
+| Legacy trigger | Auto-registered as | Provenance of the rows it writes |
+|---|---|---|
+| Keboola Metastore refresh | one `connection` source per Keboola connection holding a master token (`keboola_<connection id>`), or one for the legacy `KEBOOLA_STACK_URL`/`KEBOOLA_STORAGE_TOKEN` pair when no connection has one | unchanged: `source='keboola_metastore'`, `source_ref=<connection id>` — carried by a `config.provenance` override |
+| Databricks metric-view refresh | the workspace, when one is configured (`databricks_default`) | unchanged: `source='ossie_connection'`, `source_ref='databricks_default'` |
+
+The provenance override is why an upgrade is a no-op for what is *stored*:
+every semantic model, metric, glossary term and column description is owned
+by its `(source, source_ref)` pair, and re-importing the same upstream under
+a new label would orphan every existing row and write a duplicate beside it.
+A migrated Keboola source also carries `config.safe_prune: true`, the
+full-wipe guard that sync has always used — an upstream answering with
+nothing usable must not delete an installation's whole metric registry.
+
+Registration is idempotent and never a get-or-*replace*: a source an admin
+renamed, re-scoped or disabled stays exactly as they left it.
+
+**`config.provenance` is Agnes-managed and not admin-writable.** It names the
+`(source, source_ref)` pair a source's rows are written *and pruned* under, so
+a source allowed to claim an arbitrary one could delete another connection's
+models, metrics, glossary terms and column descriptions. `POST`/`PUT
+/api/admin/semantic-sources` refuse a config carrying it (`400
+provenance_not_settable`), and a stored override is validated on every sync:
+the label must be a migrated legacy one, the source must run that label's
+adapter, and the `source_ref` must be the source's own connection (or, for the
+legacy env-credential row, the pair that path has ever stamped).
+
+Two things the sweep skips rather than syncs, both carried over from guards
+the retired triggers had built in:
+
+| Skip | When | Where it shows |
+|---|---|---|
+| `skipped_running` | a Keboola source whose rows the login-triggered sync (`run_semantic_layer_refresh_background`) is writing right now — the two share one single-flight guard, so they can never overlap | the sweep's response only; the row keeps its last real sync state and the next sweep picks it up |
+| `skipped_duplicate_project` | a second source resolving to the SAME upstream Keboola project as one already imported this sweep (two connections may point at one project) — importing both would write one project's rows under two refs that then delete each other's | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
 
 ## Adapters — adding a source format
 
@@ -147,6 +185,23 @@ which is a lie the moment one does.
 
 An adapter name that nothing is registered under is refused at registration
 (`400`, naming the adapters that do exist) rather than at the first sync.
+
+### `keboola_metastore`
+
+A `connection`-kind source whose config carries only scope — never
+credentials. Either `connection_id` (a registered Keboola connection; its
+master (owner) Storage token is read from that connection's own vault slot)
+or `legacy_credentials: true` (the `KEBOOLA_STACK_URL` /
+`KEBOOLA_STORAGE_TOKEN` pair). Registering one by hand is rarely needed: the
+scheduled sweep registers one per master-token connection automatically (see
+*Scheduled refresh* above).
+
+Before each fetch the adapter runs the two preflight checks this sync has
+always run — the token must be a master token (the Metastore rejects anything
+else with an opaque error) and it must open the project its connection is
+bound to. Either failing records the error on the source row and imports
+nothing, rather than filing another project's semantic layer under this
+connection's provenance.
 
 ### `snowflake_semantic`
 
@@ -206,13 +261,13 @@ agnes admin semantic-source add --kind connection --name "Databricks semantics" 
     --adapter databricks_metric_views
 ```
 
-The scheduled refresh (`POST /api/admin/run-databricks-semantic-layer-refresh`,
+The scheduled refresh (`POST /api/admin/run-semantic-sources-refresh`,
 see [`DATA_SOURCES.md`](DATA_SOURCES.md#semantic-layer-sync-unity-catalog-metric-views))
-registers this source automatically under a fixed id (`databricks_default`) if
-it does not already exist — manual registration through the CLI, or the
-connect wizard's "Also sync semantic views" opt-in, is only needed to pin a
-specific `connection_id` or a second, differently-scoped source (e.g. a
-narrower `config.catalogs`).
+registers this source automatically under a fixed id (`databricks_default`)
+if a workspace is configured and it does not already exist — manual
+registration through the CLI, or the connect wizard's "Also sync semantic
+views" opt-in, is only needed to pin a specific `connection_id` or a second,
+differently-scoped source (e.g. a narrower `config.catalogs`).
 
 Optional scope keys in `config`: `catalogs` (a list; or the single `catalog`,
 defaulting to the connection's own catalog / `semantic_layer_catalogs`) and

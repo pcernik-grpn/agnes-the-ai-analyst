@@ -1750,10 +1750,8 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-blocked-purge
 - /api/admin/run-bq-metadata-refresh
 - /api/admin/run-corporate-memory
-- /api/admin/run-databricks-semantic-layer-refresh
 - /api/admin/run-jira-consistency-check
 - /api/admin/run-jira-sla-poll
-- /api/admin/run-keboola-semantic-layer-refresh
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
 - /api/admin/run-knowledge-packaging
@@ -2190,7 +2188,7 @@ analogue) drive the in-chat split-pane preview iframe on top of this grant.
 ### `/api/glossary` — Keboola-imported business-term glossary (user-facing)
 
 Read/search over `glossary_terms`, populated by the Keboola semantic-layer
-importer (`keboola-semantic-layer-refresh` job) — see
+importer (on the `semantic-sources-refresh` sweep) — see
 `docs/superpowers/specs/2026-07-17-keboola-glossary-import-design.md`.
 Relevance-ranked search uses DuckDB FTS BM25 with an ILIKE fallback.
 

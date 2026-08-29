@@ -274,8 +274,6 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/data-packages/{pkg_id}/tables": "data_package.add_table",
     "POST /api/admin/data-packages/{pkg_id}/tools": "data_package.add_tool",
     "PUT /api/admin/data-packages/{pkg_id}": "data_package.update",
-    # -- app.api.databricks_semantic_layer_refresh -----------------------------
-    "POST /api/admin/run-databricks-semantic-layer-refresh": "run_databricks_semantic_layer_refresh",
     # -- app.api.db_state ------------------------------------------------------
     "POST /api/admin/db/cancel/{job_id}": "fallback",
     "POST /api/admin/db/migrate": "fallback",
@@ -304,10 +302,6 @@ POSTURE: dict[str, str] = {
     "POST /api/kai/tickets": "fallback",
     # -- app.api.keboola_login_projects ----------------------------------------
     "POST /api/auth/keboola/projects": "keboola.projects_import",
-    # -- app.api.keboola_semantic_layer_refresh --------------------------------
-    # -- app.api.semantic_sources_refresh --------------------------------------
-    "POST /api/admin/run-semantic-sources-refresh": "run_semantic_sources_refresh",
-    "POST /api/admin/run-keboola-semantic-layer-refresh": "run_keboola_semantic_layer_refresh",
     # -- app.api.knowledge_digests ---------------------------------------------
     "DELETE /api/admin/knowledge-digests/{digest_id}": "knowledge_digest.delete",
     "POST /api/admin/knowledge-digests": "knowledge_digest.create",
@@ -452,6 +446,8 @@ POSTURE: dict[str, str] = {
     "POST /api/semantic-models/validate-query": "fallback",
     "PUT /api/admin/semantic-models/{model_id:path}": "fallback",
     "PUT /api/admin/semantic-sources/{source_id}": "fallback",
+    # -- app.api.semantic_sources_refresh --------------------------------------
+    "POST /api/admin/run-semantic-sources-refresh": "run_semantic_sources_refresh",
     # -- app.api.settings ------------------------------------------------------
     "PUT /api/settings/dataset": "fallback",
     # -- app.api.share_requests_admin ------------------------------------------

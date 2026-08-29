@@ -2809,23 +2809,13 @@ KNOWN_UNTESTED = {
     "POST /api/admin/run-corporate-memory",
     "POST /api/admin/run-jira-consistency-check",
     "POST /api/admin/run-jira-sla-poll",
-    # Keboola semantic layer (Metastore) sync — scheduler-driven admin
-    # maintenance op, mirrors run-bq-metadata-refresh. No dual-backend
-    # contract test needed (no new repo methods/migration). Behaviour
-    # covered in tests/test_keboola_semantic_layer_refresh_endpoint.py.
-    "POST /api/admin/run-keboola-semantic-layer-refresh",
-    # Databricks semantic layer (Unity Catalog metric views) sync — same
-    # shape as the Keboola sibling above: scheduler-driven admin maintenance
-    # op, no new repo methods/migration. Behaviour covered in
-    # tests/test_databricks_semantic_layer_refresh_endpoint.py.
-    # The handler never touches the backend switch itself; the repo calls its
-    # sync drives (metric_repo().create/find_by_name/list/delete, incl. the
-    # source_ref kwarg) are already parity-proven on both backends by
-    # tests/db_pg/test_config_pg.py::test_metric_source_ref_roundtrip and
-    # tests/db_pg/test_ported_methods_contract.py::test_metrics_yaml_reconcile_prunes_on_both_backends
-    # — cited here so this exclusion is self-verifying rather than resting on
-    # "nothing new here".
-    "POST /api/admin/run-databricks-semantic-layer-refresh",
+    # (The per-connector Keboola/Databricks semantic-refresh triggers that
+    # used to be excluded here are gone — #1707 Block 3 step 4. Their
+    # replacement, POST /api/admin/run-semantic-sources-refresh, is
+    # deliberately NOT excluded but COVERED: it is parameter-free and needs no
+    # upstream call for an `upload`-kind source, which makes it exactly the
+    # sweep worth smoking on both backends — see
+    # TestSemanticLayerSmoke.test_scheduled_sweep_syncs_a_registered_source.)
     # K3 local knowledge packaging (#798) — scheduler-driven admin maintenance
     # op, mirrors run-corporate-memory. No dual-backend contract test needed
     # (no new repo methods/migration; state.json lives on disk). Behaviour
@@ -3506,8 +3496,8 @@ class TestSemanticLayerSmoke:
         assert c.delete(f"/api/admin/semantic-sources/{source_id}", headers=h).status_code == 204
 
     def test_scheduled_sweep_syncs_a_registered_source(self, seeded_app_both):
-        """The generic scheduled semantic refresh (#1707 Block 3 step 2; the
-        per-connector triggers are retired separately in steps 3-4). An `upload`-kind source keeps
+        """The ONE scheduled semantic refresh (#1707 Block 3 step 4), which
+        replaced the two per-connector triggers. An `upload`-kind source keeps
         it network-free, so what this smokes is the part that differs per
         backend: reading `semantic_sources` and writing `semantic_models`
         through whichever repo pair is active."""
