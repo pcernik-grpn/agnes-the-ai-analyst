@@ -766,7 +766,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   same explicit refusal `bq.*`/`sf.*` already had. **Operator note:** any
   analyst workflow that queried `kbc.*` directly against an unregistered
   table now gets a 403 with a register-or-use-catalog-name hint — that read
-  was riding the instance token, which is what this closes.
+  was riding the instance token, which is what this closes. The gate covers
+  `/api/query` and `/api/v2/scan`; `POST /api/query/hybrid` runs
+  admin-supplied SQL on the same connection without any of the three
+  prefix guards (pre-existing, equally true of `bq`/`sf`, admin-only) and is
+  left to a follow-up that can decide its registered-BQ sub-query contract.
+- **Security: a SQL comment no longer hides a `bq.*` / `sf.*` / `kbc.*` path
+  from its registry/grant/policy guard.** DuckDB treats `/* … */` as
+  insignificant whitespace — `SELECT * FROM kbc/*x*/."bucket"."table"` parses
+  and reaches the ATTACHed catalog — but the guards' `qualified_path_re` scan
+  matched only literal whitespace between segments, so a comment placed
+  between a prefix and its path (or between the two identifiers) slipped the
+  gate entirely and read an unregistered or ungranted table through the
+  instance-wide connector token. All three now scan comment-masked SQL, the
+  masking `_assert_no_ungranted_catalog_ref` has always applied for exactly
+  this reason. String literals are deliberately still visible to the scan, so
+  the documented strict-deny on a path-shaped literal (`WHERE c =
+  'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
+  another. `dbx` gates on a parse rather than a regex and was never affected.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written

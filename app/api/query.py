@@ -384,7 +384,17 @@ def _local_extract_catalogs(conn) -> set[str]:
     ``sf`` (``_sf_guardrail_inputs``), ``dbx``
     (``connectors.databricks.remote.guardrail_inputs``) and ``kbc``
     (``_kbc_guardrail_inputs``, #1492 — an earlier version of this docstring
-    recorded the kbc gap; it is closed now).
+    recorded the kbc gap).
+
+    Scoped honestly: those guards run on the two raw-SQL entry points that
+    reach this connection through ``/api/query`` and
+    ``run_remote_select_to_arrow`` (``/api/v2/scan``). ``POST /api/query/hybrid``
+    (``app/api/query_hybrid.py``) executes admin-supplied SQL on the same
+    connection via ``RemoteQueryEngine`` and calls NONE of them — pre-existing
+    and equally true of ``bq``/``sf``, and admin-only (``Depends(require_admin)``),
+    so it is a consistency gap rather than a privilege boundary; adding the
+    guards there needs a decision about the endpoint's own registered-BQ
+    sub-query contract, so it is deliberately not made here.
     """
     try:
         default = conn.execute("SELECT current_database()").fetchone()[0]
@@ -970,7 +980,7 @@ class _UnterminatedSqlLiteralError(ValueError):
     """
 
 
-def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
+def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool, mask_literals: bool = True) -> str:
     """One left-to-right, linear-time pass recognizing every span DuckDB
     itself treats as opaque, blanking the ones each caller (``_mask_sql_noise``,
     ``_mask_sql_for_guard``) needs blanked while preserving length and offsets.
@@ -993,6 +1003,14 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
       which would desync the rest of the scan (the same class of bug
       documented on ``connectors/internal/access.py``'s escape-string
       regex).
+      ``mask_literals=False`` keeps every literal span VISIBLE while still
+      stepping over it correctly (so a ``--`` or ``/*`` inside a literal is
+      never mistaken for a comment). The qualified-path guards
+      (``_bq_guardrail_inputs`` / ``_sf_guardrail_inputs`` /
+      ``_kbc_guardrail_inputs``) need exactly that: they must see through a
+      comment, but a path-shaped string literal is deliberately still refused
+      there — strict-deny on a security boundary, pinned by
+      ``tests/test_api_query_rbac_bq_path.py::test_string_literal_matching_bq_path_rejected_403``.
     * ``--`` line comments and nested ``/* */`` block comments — blanked
       only when ``mask_comments`` is true. DuckDB nests block comments
       (verified empirically: ``/* a /* b */ c */`` parses as ONE comment,
@@ -1049,8 +1067,9 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
             if not closed and strict:
                 raise _UnterminatedSqlLiteralError("unterminated E-string literal")
             end = j + 1 if closed else n
-            for k in range(i, end):
-                out[k] = " "
+            if mask_literals:
+                for k in range(i, end):
+                    out[k] = " "
             i = end
         elif ch == "'":
             j = i + 1
@@ -1066,8 +1085,9 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
             if not closed and strict:
                 raise _UnterminatedSqlLiteralError("unterminated string literal")
             end = j + 1 if closed else n
-            for k in range(i, end):
-                out[k] = " "
+            if mask_literals:
+                for k in range(i, end):
+                    out[k] = " "
             i = end
         elif ch == "$" and (m := _DOLLAR_QUOTE_OPEN_RE.match(sql, i)) is not None:
             delim = m.group(0)
@@ -1078,8 +1098,9 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
                 end = n
             else:
                 end = close + len(delim)
-            for k in range(i, end):
-                out[k] = " "
+            if mask_literals:
+                for k in range(i, end):
+                    out[k] = " "
             i = end
         elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
             j = sql.find("\n", i)
@@ -1181,6 +1202,34 @@ def _mask_sql_for_guard(sql: str, *, mask_comments: bool) -> str:
     """
     try:
         return _scan_and_mask_sql(sql, mask_comments=mask_comments, strict=True)
+    except _UnterminatedSqlLiteralError:
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed SQL: an unterminated string literal, quoted identifier, or comment",
+        ) from None
+
+
+def _mask_comments_for_path_scan(sql: str) -> str:
+    """Blank comments, keep literals — the masking the qualified-path guards
+    (``bq``/``sf``/``kbc``) scan through.
+
+    DuckDB treats a comment as insignificant whitespace, so
+    ``SELECT * FROM kbc/*x*/."bucket"."table"`` parses and reaches the ATTACHed
+    catalog — while ``qualified_path_re`` only matches literal whitespace
+    between segments and saw nothing. That gap let a caller read an
+    unregistered/ungranted table through the instance-wide connector token,
+    which is precisely what those guards exist to refuse.
+
+    Literals stay VISIBLE here, unlike ``_mask_sql_for_guard``: a path-shaped
+    string literal (``WHERE c = 'bq.unreg.tbl'``) is a documented, deliberate
+    false positive that these guards strict-deny rather than risk a bypass —
+    masking it would trade a comment evasion for a literal one.
+
+    Offsets and length are preserved, and quoted identifiers are never
+    touched, so a match's groups still carry the real bucket/table names.
+    """
+    try:
+        return _scan_and_mask_sql(sql, mask_comments=True, strict=True, mask_literals=False)
     except _UnterminatedSqlLiteralError:
         raise HTTPException(
             status_code=400,
@@ -2368,7 +2417,11 @@ def _bq_guardrail_inputs(
         is_admin = (
             is_user_admin(user.get("id") or user.get("email") or "", sys_conn) and _credential_surface(user) == "all"
         )
-    for m in BQ_PATH.finditer(sql):
+    # Comment-masked, for the reason spelled out in `_kbc_guardrail_inputs`:
+    # a comment between segments is whitespace to DuckDB but invisible to
+    # `BQ_PATH`, so a raw-text scan let `bq/*x*/."ds"."tbl"` reach BigQuery
+    # with neither the registry check below nor a dry-run cost estimate.
+    for m in BQ_PATH.finditer(_mask_comments_for_path_scan(sql)):
         bucket_raw = m.group(1).strip('"')
         source_table_raw = m.group(2).strip('"')
         row = repo.find_by_bq_path(bucket_raw, source_table_raw)
@@ -2649,7 +2702,11 @@ def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> O
     is_admin = _caller_is_unrestricted_admin(user, sys_conn)
     accessible_set = set(allowed) if allowed is not None else None
 
-    for m in SF_PATH.finditer(sql):
+    # Comment-masked, for the reason spelled out in `_kbc_guardrail_inputs`:
+    # a comment between segments is whitespace to DuckDB but invisible to the
+    # shared `qualified_path_re`, so a raw-text scan let `sf/*x*/."S"."T"`
+    # through to the ATTACHed catalog ungated.
+    for m in SF_PATH.finditer(_mask_comments_for_path_scan(sql)):
         schema_raw = m.group(1).strip('"')
         table_raw = m.group(2).strip('"')
         row = None
@@ -2714,7 +2771,16 @@ def _kbc_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> 
     from connectors.keboola.storage_api import normalize_source_table
     from src.repositories import table_registry_repo
 
-    if not KBC_PATH.search(sql):
+    # Scan comment-masked SQL: DuckDB treats `/* … */` as insignificant
+    # whitespace (`SELECT * FROM s/*x*/.orders` parses and runs), but
+    # `qualified_path_re` only matches literal whitespace between segments, so
+    # a raw-text scan would miss `kbc/*x*/."bucket"."table"` while the ATTACHed
+    # catalog served it — the exact read this gate exists to refuse. Masking
+    # preserves offsets and never touches quoted identifiers, so the match
+    # groups still carry the real bucket/table names. Same reasoning (and the
+    # same helper) as `_assert_no_ungranted_catalog_ref`'s layer-(a) scan.
+    scan_sql = _mask_comments_for_path_scan(sql)
+    if not KBC_PATH.search(scan_sql):
         return None
 
     repo = table_registry_repo()
@@ -2729,7 +2795,7 @@ def _kbc_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> 
         bare = normalize_source_table(row_bucket, (row.get("source_table") or "").lower())
         return bare == table_l
 
-    for m in KBC_PATH.finditer(sql):
+    for m in KBC_PATH.finditer(scan_sql):
         bucket_raw = m.group(1).strip('"')
         table_raw = m.group(2).strip('"')
         bucket_l, table_l = bucket_raw.lower(), table_raw.lower()
