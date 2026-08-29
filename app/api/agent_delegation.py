@@ -94,9 +94,27 @@ def require_delegating_session(request: Request, user=Depends(get_current_user))
     A co-drive `SessionPrincipal` (no single driving identity) or a plain
     token with no stashed chat session is `403` — delegation requires a
     single, session-bound driver.
+
+    FAIL CLOSED on an `AgentPrincipal` missing a resolved caller: every real
+    construction site (`app/auth/pat_resolver.py`'s `typ="agent_session"`
+    branch) always populates both `caller_user_id` and `caller_email` from
+    the session's own stored `user_email`, itself failing closed if that
+    lookup comes up empty — so this should never fire in production. But
+    `AgentPrincipal.caller_user_id`/`caller_email` default to `None` on the
+    dataclass (for callers/tests predating C2.3), and this function must
+    NEVER paper over a missing caller by silently substituting A's OWNER —
+    that would spawn the delegated child session under the owner's identity
+    instead of the caller's, laundering the caller's restricted view into
+    the owner's wider one through B. A future refactor that leaves either
+    field unset must be refused outright, not quietly downgraded.
     """
     if isinstance(user, AgentPrincipal):
-        return user.session_id, (user.caller_user_id or user.owner_user_id), (user.caller_email or user.owner_email)
+        if not user.caller_user_id or not user.caller_email:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "delegation_requires_resolved_caller"},
+            )
+        return user.session_id, user.caller_user_id, user.caller_email
     if isinstance(user, SessionPrincipal):
         raise HTTPException(status_code=403, detail={"code": "delegation_requires_single_driver"})
     session_id: Optional[str] = getattr(request.state, "chat_session_id", None)

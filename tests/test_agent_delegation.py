@@ -516,3 +516,115 @@ class TestDelegationLaundering:
         assert result["reason"] == "agent_not_runnable"
         assert result["answer"] is None
         assert mgr.list_live() == [a_live]
+
+
+class TestDelegationHttpSeam:
+    """Adversarial-review hardening (PR #1742): the tests above all call
+    ``ChatManager.handle_delegation`` DIRECTLY with a hand-supplied
+    ``caller_user_id``/``caller_email`` — they never exercise the actual
+    ``POST /api/v1/agents/{slug}/delegate`` route or its
+    ``require_delegating_session`` dependency, which is what resolves that
+    triple off the REAL auth principal in production. This class closes
+    that gap: a genuine ``AgentPrincipal`` — minted the exact way
+    ``app/auth/pat_resolver.py`` mints one for a live agent session — drives
+    the HTTP route end-to-end, plus the fail-closed guard added to
+    ``require_delegating_session`` (see its docstring)."""
+
+    def test_http_delegate_resolves_the_grantee_not_as_owner(self, delegation_manager, shared_app):
+        """A (a restricted agent OWNED by owner1, but driven right now by
+        grantee1 — the C2.3 shared-agent shape) delegates to B (owned by
+        grantee1) over the REAL HTTP route, authenticated with a REAL
+        ``agent_session`` JWT (``mint_agent_session_jwt`` /
+        ``app.auth.pat_resolver``'s ``typ="agent_session"`` branch — the
+        exact machinery ``app/api/broker.py::_mint_identity_jwt`` uses in
+        production). Proves ``require_delegating_session`` resolves the
+        CALLER (grantee1) off that principal, never A's owner."""
+        from app.auth.access import mint_agent_session_jwt
+        from app.chat.manager import set_current_chat_manager
+        from app.chat.types import Surface
+        from src.repositories import chat_session_repo
+
+        mgr = delegation_manager
+        _seed_user("owner@test.com", "owner1")
+        _seed_user("grantee@test.com", "grantee1")
+
+        a_id = str(uuid.uuid4())
+        _seed_agent(agent_id=a_id, owner_id="owner1", slug="agent-a-http-seam")
+        a_session = chat_session_repo().create_session(
+            user_email="grantee@test.com", surface=Surface.API, agent_id=a_id
+        )
+        _register_a_live_session(mgr, a_session.id, "grantee@test.com")
+
+        b_id = str(uuid.uuid4())
+        _seed_agent(agent_id=b_id, owner_id="grantee1", slug="agent-b-http-seam")
+
+        token = mint_agent_session_jwt(a_session.id)
+
+        set_current_chat_manager(mgr)
+        try:
+
+            async def _run():
+                transport = httpx.ASGITransport(app=shared_app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                    task = asyncio.create_task(
+                        c.post(
+                            "/api/v1/agents/agent-b-http-seam/delegate",
+                            json={"message": "hi from A"},
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                    )
+                    child = await _drive_one_child_to_answer(mgr, a_session.id, "hi from B")
+                    resp = await task
+                    return resp, child
+
+            resp, child = asyncio.run(_run())
+        finally:
+            set_current_chat_manager(None)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["answer"] == "hi from B"
+        assert body["agent_slug"] == "agent-b-http-seam"
+        # THE SEAM: the child B session the real HTTP route spawned is
+        # attributed to the CALLER (grantee1), never A's owner (owner1) —
+        # proves `require_delegating_session` resolved the grantee off a
+        # genuine AgentPrincipal, not a silent owner fallback.
+        assert child.user_email == "grantee@test.com"
+
+    def test_require_delegating_session_fails_closed_on_agent_principal_missing_caller(self):
+        """The hardening fix: an ``AgentPrincipal`` with a missing
+        ``caller_user_id``/``caller_email`` must be refused outright (403),
+        never silently fall back to ``owner_user_id``/``owner_email`` — that
+        fallback would spawn a delegated child session under A's OWNER
+        identity instead of the caller's, letting A launder a wider view of
+        the data through B than the caller actually has. No production
+        construction site produces this shape today (``app/auth
+        /pat_resolver.py`` always resolves both, or fails closed itself) —
+        this proves the route's OWN guard holds regardless."""
+        from unittest.mock import MagicMock
+
+        from fastapi import HTTPException
+
+        from app.api.agent_delegation import require_delegating_session
+        from app.auth.session_principal import AgentPrincipal
+
+        base = dict(
+            session_id="chat_x",
+            agent_id="agent_x",
+            owner_user_id="owner1",
+            owner_email="owner@test.com",
+            intersection={},
+        )
+        fake_request = MagicMock()
+
+        for missing in (
+            {"caller_user_id": None, "caller_email": None},
+            {"caller_user_id": "caller1", "caller_email": None},
+            {"caller_user_id": None, "caller_email": "caller@test.com"},
+        ):
+            principal = AgentPrincipal(**base, **missing)
+            with pytest.raises(HTTPException) as exc:
+                require_delegating_session(fake_request, principal)
+            assert exc.value.status_code == 403
+            assert exc.value.detail == {"code": "delegation_requires_resolved_caller"}
