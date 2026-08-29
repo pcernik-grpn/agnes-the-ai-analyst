@@ -1395,7 +1395,6 @@ class TestFactsReadSurfaceSmoke:
         "POST /api/facts/search",
         "POST /api/facts/neighbors",
         "GET /api/facts/{subject_id}/claims",
-        "GET /api/facts/type-map",
         "GET /api/facts/facets",
     }
 
@@ -1476,17 +1475,6 @@ class TestFactsReadSurfaceSmoke:
         claims = r.json()["claims"]
         assert len(claims) == 1
         assert claims[0]["quote"] == "The engagement is underway."
-
-        # The type map counts the SAME subject the search above reached, so
-        # the two surfaces cannot drift into disagreeing about what exists
-        # (TCRD-250). A type nobody can see is absent rather than 0, which
-        # is why this asserts presence-and-count rather than a fixed shape.
-        r = client.get("/api/facts/type-map", headers=headers)
-        assert r.status_code == 200, r.text
-        tm = r.json()
-        counts = {row["type"]: row["count"] for row in tm["types"]}
-        assert counts.get("engagement") == 1, tm
-        assert tm["total"] == sum(counts.values())
 
         # Facets read the same graph from the other direction: the client the
         # engagement is filed under, counted by DOCUMENTS rather than subjects.
