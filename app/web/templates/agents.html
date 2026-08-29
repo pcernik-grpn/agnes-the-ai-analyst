@@ -575,9 +575,12 @@
   }
 
   function identityBody(a) {
-    return '<label class="ag-field"><span>Name</span>' +
-        '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
-      '<label class="ag-field"><span>Role <em>— one line</em></span>' +
+    /* Role first, name LAST (TCRD-205). The name is the least interesting
+       decision here and the hardest to make before you have said what the
+       agent is for — so the form opens on the thing itself and closes on
+       what to call it. Safe to reorder: the section summary already renders
+       `Unnamed`, so an un-named draft was never gated. */
+    return '<label class="ag-field"><span>Role <em>— one line</em></span>' +
         '<input type="text" data-ag-field="role" value="' + esc(a.role) + '" placeholder="e.g. Answers revenue questions from our governed metrics." maxlength="90" autocomplete="off"></label>' +
       '<label class="ag-field"><span>Instructions <em>— what it should do, and what it should avoid</em></span>' +
         '<textarea rows="4" data-ag-field="instructions" placeholder="e.g. Always use canonical metric definitions. Cite the table you queried. Never invent numbers.">' + esc(a.instructions) + '</textarea></label>' +
@@ -587,6 +590,8 @@
         }).join('') + '</div></div>' +
       '<label class="ag-field"><span>Greeting</span>' +
         '<textarea rows="2" data-ag-field="greeting" placeholder="Hi, I&#39;m …">' + esc(a.greeting) + '</textarea></label>' +
+      '<label class="ag-field"><span>Name <em>— last, once you know what it is</em></span>' +
+        '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
       '<div class="ag-note">Instructions replace the default analyst prompt. Agnes still appends its data-access rails (<code>agnes catalog</code> → <code>schema</code> → <code>query</code>), so you don’t need to restate them — write the persona and its task.</div>';
   }
 

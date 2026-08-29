@@ -236,6 +236,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   longer 500s the whole ingest.
 
 ### Changed
+- **Authoring surfaces no longer open on a name field (TCRD-205).** The agent builder, the skill/plugin/agent-template builder and the data-package drawer each now open on what the thing is for — a role, a description, what the package carries — and ask what to call it last. The name was the least interesting decision on each form and the hardest to make first, and on the data package it was actively harmful: the slug derives from the name as you type, so a placeholder name immediately became a placeholder identifier. The derivation is unchanged and still correct; asked last, it finally has a real name to derive from. Nothing became more or less required — none of the three gated saving on a name (each already rendered `Unnamed`), so this is ordering only.
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
   The old rule — whichever PR happened to land last with content under
   `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
