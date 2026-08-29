@@ -1324,6 +1324,48 @@ def test_dup_doc_id_undeclared_doc_id_resolving_only_outside_batch_corpora_is_re
     assert dana_view["subjects"] == []  # nothing was ever written under col_a either
 
 
+def test_dup_doc_id_documents_present_but_unresolved_entry_does_not_escape_to_global_scan(pg_env, repo):
+    """P1 review finding, follow-up to PR #1736: `documents[]` is PRESENT
+    (not omitted) but its ONLY entry fails to resolve -- a rename race the
+    code tolerates (neither `stable_id` nor `path` matches an existing
+    row, and no PRIOR `corpus_file_sources` row exists for this
+    (corpus_id, doc_id) either). Because that entry never resolved,
+    `batch_corpus_ids` must still be scoped to the corpus THIS batch
+    declared -- it must never fall through to tier 3's unrestricted global
+    scan and resolve the doc_id under some OTHER, undeclared (possibly
+    confidential) collection. Same rejection contract as the
+    documents-omitted case: `ambiguous_cross_collection_doc_id`, nothing
+    ever written."""
+    from src.repositories import users_repo
+
+    corpus_b = "col_b"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_collection(collection_id=corpus_b)
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_b_confidential")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_b_confidential", text="Confidential financials for the deal.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_b_confidential", source_doc_id="renamed_doc")
+
+    report = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": "renamed_doc",
+                "corpus_id": CORPUS_A,
+                "stable_id": "stale-stable-id-from-before-the-rename",
+            }
+        ],
+        nodes=[_node("engagement:rename-race", "renamed_doc", "Confidential financials for the deal.")],
+    )
+    assert report["claims_written"] == 0
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "ambiguous_cross_collection_doc_id"
+    assert report["claims_rejected"][0]["doc_id"] == "renamed_doc"
+
+    users_repo().create(id="carl", email="carl@test.com", name="Carl")
+    _make_group_with_grant(pg_env, group_name="group-b-confidential", collection_id=corpus_b, member_user_id="carl")
+    carl_view = repo.search({"id": "carl", "email": "carl@test.com"}, type="engagement")
+    assert carl_view["subjects"] == []  # nothing was ever written under col_b
+
+
 def test_dup_doc_id_tier2_hit_resolves_within_another_batch_declared_corpus(pg_env, repo):
     """Multi-corpus batch: an UNDECLARED doc_id (no `documents[]` entry of
     its own) resolves inside one of the OTHER corpora this SAME batch's

@@ -1915,6 +1915,17 @@ class FactsPgRepository:
         # the first's resolution.
         doc_id_resolution: Dict[Tuple[str, str], str] = {}
         doc_declared_pairs: Set[Tuple[str, str]] = set()  # {(corpus_id, doc_id)} this batch's documents[] touched
+        # RBAC review follow-up (P1): every corpus a `documents[]` entry
+        # NAMED, regardless of whether that entry actually resolved to a
+        # corpus_file_id. `doc_declared_pairs` alone under-counts this on a
+        # rename race (stable_id/path match nothing yet, no prior
+        # corpus_file_sources row either) — the entry silently fails to
+        # resolve, so its corpus never lands in `doc_declared_pairs`, and a
+        # batch with exactly one such entry would otherwise present as
+        # "documents[] omitted" to `_resolve_doc` and fall through to its
+        # unrestricted tier-3 scan. `declared_corpus_ids` is the batch's
+        # true declared scope: the gate for tier 3 below.
+        declared_corpus_ids: Set[str] = set()
         doc_dates: Dict[str, date] = {}
         # O7 follow-up: a `source_url` the validator dropped — itemized so a
         # non-zero count on the run report tells the operator "your producer
@@ -1930,6 +1941,7 @@ class FactsPgRepository:
                 corpus_id = doc.get("corpus_id")
                 if not doc_id or not corpus_id:
                     continue
+                declared_corpus_ids.add(corpus_id)
                 stable_id = doc.get("stable_id") or None
                 path = doc.get("path") or None
 
@@ -2037,7 +2049,13 @@ class FactsPgRepository:
             if doc_id not in doc_id_to_corpus or corpus_id < doc_id_to_corpus[doc_id]:
                 doc_id_to_corpus[doc_id] = corpus_id
 
-        batch_corpus_ids = sorted({corpus_id for corpus_id, _ in doc_declared_pairs})
+        # P1 review follow-up: gate tier 3 on whether `documents[]` was
+        # DECLARED AT ALL (`declared_corpus_ids`, every corpus a documents[]
+        # entry NAMED, whether or not that entry went on to resolve) —
+        # never on `doc_declared_pairs` alone, which only holds entries that
+        # actually resolved and so silently drops the scope of a rename-race
+        # entry (see the ladder docstring's 3a).
+        batch_corpus_ids = sorted(declared_corpus_ids)
         # RBAC review (PR #1736, TCRD-241 follow-up): a doc_id that resolves
         # ONLY by escaping every corpus THIS batch's `documents[]` declared
         # is rejected, never written — see the ladder docstring below.
@@ -2047,31 +2065,42 @@ class FactsPgRepository:
             """Corpus-scoped, deterministic doc_id -> corpus_file_id
             resolution (TCRD-241). Ladder:
 
-            1. This batch's OWN `documents[]` declared (corpus_id, doc_id) —
-               indexed-preferred among any duplicate copies within it.
-            2. Not declared this batch: scan only the corpora THIS batch's
-               `documents[]` touched — a producer batch is normally scoped
-               to one collection, so an omitted-but-already-resolved doc_id
-               from the SAME crawl run is overwhelmingly likely to live
-               there too.
+            1. This batch's OWN `documents[]` declared (corpus_id, doc_id)
+               AND it resolved — indexed-preferred among any duplicate
+               copies within it.
+            2. Not declared this batch (or declared but unresolved — a
+               rename race the upsert loop tolerates without erroring):
+               scan only the corpora THIS batch's `documents[]` NAMED
+               (`declared_corpus_ids` — every entry's own corpus_id,
+               regardless of whether that entry itself resolved) — a
+               producer batch is normally scoped to one collection, so an
+               omitted-but-already-resolved doc_id from the SAME crawl run
+               is overwhelmingly likely to live there too.
             3a. This batch's `documents[]` declared at LEAST ONE corpus
                 (`batch_corpus_ids` non-empty) but this doc_id isn't
                 anchored in ANY of them: refuse to escape to some OTHER,
                 possibly more broadly-granted corpus — that would grant the
                 claim wider visibility than the producer's batch ever
-                declared (RBAC review PR #1736). A probe checks whether the
-                doc_id resolves ANYWHERE at all, purely to distinguish the
-                rejection reason (`ambiguous_cross_collection_doc_id` — it
-                exists, just outside this batch's scope) from a doc_id that
-                plain doesn't exist (`unresolved_doc_id`, existing
-                behavior) — nothing is ever written on this path.
-            3b. This batch's `documents[]` is EMPTY (no batch-declared scope
-                to escape at all) — the documented "documents may be
-                omitted when every doc_id already resolves" replay flow
-                (spec §7.2). Tier 3 here is the SOLE resolution mechanism by
-                design (dozens of existing callers depend on it), so it
-                still resolves via an unrestricted, deterministically
-                ordered global scan, unchanged from before this review.
+                declared (RBAC review PR #1736). This also covers a
+                documents[] entry that named a corpus but never itself
+                resolved (P1 follow-up) — `declared_corpus_ids` still
+                carries that corpus, so the scoped scan below (not tier 3)
+                runs even though `doc_declared_pairs` has no matching pair.
+                A probe checks whether the doc_id resolves ANYWHERE at all,
+                purely to distinguish the rejection reason
+                (`ambiguous_cross_collection_doc_id` — it exists, just
+                outside this batch's scope) from a doc_id that plain
+                doesn't exist (`unresolved_doc_id`, existing behavior) —
+                nothing is ever written on this path.
+            3b. This batch's `documents[]` is EMPTY — no entry named ANY
+                corpus at all, i.e. `documents` itself was omitted or every
+                entry lacked a `doc_id`/`corpus_id` (no batch-declared scope
+                to escape) — the documented "documents may be omitted when
+                every doc_id already resolves" replay flow (spec §7.2).
+                Tier 3 here is the SOLE resolution mechanism by design
+                (dozens of existing callers depend on it), so it still
+                resolves via an unrestricted, deterministically ordered
+                global scan, unchanged from before this review.
             """
             if not doc_id:
                 return None
