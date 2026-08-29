@@ -59,7 +59,19 @@ class SharePointGraphError(RuntimeError):
     """A Graph/Entra call failed, or the certificate material could not be
     parsed into a signable assertion. Never carries the certificate, the
     signed assertion, or an access token in its message — only status codes
-    and upstream error bodies, which Entra/Graph document as safe to log."""
+    and upstream error bodies, which Entra/Graph document as safe to log.
+
+    ``status_code`` is the upstream HTTP status when known (``None`` for a
+    parse-time failure, e.g. malformed certificate material, that never made
+    a Graph/Entra call). :func:`search_folders` reads it to classify a
+    failure: a 403/404 on one site or folder is a routine permissions fact
+    to skip past, everything else (network failure, 401, 429, 5xx) means the
+    whole walk is broken and must propagate.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _http_client() -> httpx.AsyncClient:
@@ -221,7 +233,7 @@ async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str) ->
             resp.status_code,
             resp.text[:500],
         )
-        raise SharePointGraphError(f"token request failed: HTTP {resp.status_code}")
+        raise SharePointGraphError(f"token request failed: HTTP {resp.status_code}", status_code=resp.status_code)
     body = resp.json()
     token = body.get("access_token")
     if not token:
@@ -238,7 +250,9 @@ async def _graph_get(access_token: str, path: str, *, params: Optional[Dict[str,
         )
     if resp.status_code != 200:
         logger.warning("sharepoint graph call %s failed: HTTP %s %s", path, resp.status_code, resp.text[:500])
-        raise SharePointGraphError(f"Graph request to {path} failed: HTTP {resp.status_code}")
+        raise SharePointGraphError(
+            f"Graph request to {path} failed: HTTP {resp.status_code}", status_code=resp.status_code
+        )
     result: Dict[str, Any] = resp.json()
     return result
 
@@ -376,6 +390,21 @@ def build_folder_matcher(query: str, mode: str) -> Callable[[str], bool]:
     raise ValueError(f"unknown search mode: {mode!r}")
 
 
+#: A 403 (Forbidden) or 404 (Not Found) on one site/folder is a routine
+#: permissions fact — app-only Graph access across a real tenant is never
+#: uniform (`Sites.Selected` grants, departmental sites, restricted
+#: libraries) — so :func:`search_folders` skips past it and keeps walking.
+#: Anything else (network failure, 401 unauthorized, 429 rate-limited, a
+#: 5xx) means the call itself is broken, not merely refused, and must
+#: propagate — swallowing it per-site would turn a broken connection into an
+#: empty, successful-looking search across the whole tenant.
+_PERMISSION_SKIP_STATUS_CODES = frozenset({403, 404})
+
+
+def _skip_reason(status_code: int) -> str:
+    return "forbidden" if status_code == 403 else "not_found"
+
+
 async def search_folders(
     access_token: str,
     *,
@@ -400,15 +429,39 @@ async def search_folders(
     enumerating "every reachable site", plus every folder expansion) — the
     one budget that bounds a walk regardless of how it is rooted.
 
+    **Permissions are not errors.** A site (during "search everywhere" root
+    selection) or a folder (mid-walk) that answers 403/404 is skipped, not
+    fatal — see :data:`_PERMISSION_SKIP_STATUS_CODES`. Skipping a folder
+    never discards matches already found: a folder itself is recorded as a
+    match (if it satisfies ``matcher``) when Graph lists it as a CHILD of
+    its parent, before the walk ever tries to descend into it, so a 403 on
+    its own children listing only stops descent, not the match already on
+    the list. Anything else Graph/`httpx` can raise (network failure, 401,
+    429, 5xx) means the whole walk is broken and propagates uncaught — see
+    :class:`SharePointGraphError`.
+
     Returns ``{"matches": [{"item_id", "drive_id", "display_path"}, ...],
-    "visited": int, "truncated": bool}``. ``truncated`` is ``True`` whenever
-    ``max_depth`` or ``max_visited`` is what stopped the walk short of
-    covering everything reachable from the root(s) — never a silent partial
-    result.
+    "visited": int, "truncated": bool, "skipped": [...]}``.
+
+    - ``truncated`` is ``True`` whenever ``max_depth`` or ``max_visited`` is
+      what stopped the walk short of covering everything reachable from the
+      root(s) — never a silent partial result. Deliberately distinct from
+      permission gaps below: a cap and a permission refusal are different
+      facts to a caller, and conflating them into one flag would make
+      "scope the search narrower" (the cap's fix) look like the right
+      response to "ask for access to this site" (the permission fix).
+    - ``skipped`` lists every site/folder the walk could not enter for
+      permissions reasons, each as ``{"scope": "site"|"folder", "reason":
+      "forbidden"|"not_found", "status_code": int, "site_id", "site_name",
+      "drive_id", "item_id", "display_path"}`` (the fields not known at that
+      scope are ``None``) — so a caller can tell "searched everything" from
+      "searched what it could reach" and name what it skipped, honoring the
+      no-silent-partial-result contract the same way ``truncated`` does.
     """
     roots: List[Tuple[str, Optional[str], List[str]]] = []
     visited = 0
     truncated = False
+    skipped: List[Dict[str, Any]] = []
 
     if drive_id:
         roots.append((drive_id, item_id, []))
@@ -419,7 +472,24 @@ async def search_folders(
             if visited > max_visited:
                 truncated = True
                 break
-            drives = await list_drives(access_token, site["id"])
+            try:
+                drives = await list_drives(access_token, site["id"])
+            except SharePointGraphError as exc:
+                if exc.status_code not in _PERMISSION_SKIP_STATUS_CODES:
+                    raise
+                skipped.append(
+                    {
+                        "scope": "site",
+                        "reason": _skip_reason(exc.status_code),
+                        "status_code": exc.status_code,
+                        "site_id": site["id"],
+                        "site_name": site.get("name"),
+                        "drive_id": None,
+                        "item_id": None,
+                        "display_path": None,
+                    }
+                )
+                continue
             for drv in drives:
                 roots.append((drv["id"], None, [site["name"], drv["name"]]))
 
@@ -432,7 +502,25 @@ async def search_folders(
             truncated = True
             break
         cur_drive, cur_item, depth, prefix = queue.popleft()
-        children = await _list_children(access_token, cur_drive, cur_item)
+        try:
+            children = await _list_children(access_token, cur_drive, cur_item)
+        except SharePointGraphError as exc:
+            visited += 1
+            if exc.status_code not in _PERMISSION_SKIP_STATUS_CODES:
+                raise
+            skipped.append(
+                {
+                    "scope": "folder",
+                    "reason": _skip_reason(exc.status_code),
+                    "status_code": exc.status_code,
+                    "site_id": None,
+                    "site_name": None,
+                    "drive_id": cur_drive,
+                    "item_id": cur_item,
+                    "display_path": " / ".join(prefix) if prefix else None,
+                }
+            )
+            continue
         visited += 1
         for child in children:
             name = child["name"]
@@ -448,7 +536,7 @@ async def search_folders(
     if queue:
         truncated = True
 
-    return {"matches": matches, "visited": visited, "truncated": truncated}
+    return {"matches": matches, "visited": visited, "truncated": truncated, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------

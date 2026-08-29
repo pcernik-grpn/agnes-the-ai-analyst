@@ -1075,6 +1075,88 @@ class TestCorpusExtractionHandler:
 
         assert "t" * 40 not in caplog.text
 
+    # -- loopback callback URL guard (role-split worker, no SERVER_URL) -----
+    # `agnes_server_url()`'s own loopback fallback is harmless for the
+    # default all-in-one process — the producer's parent process IS the
+    # app, so 127.0.0.1:8000 is genuinely reachable. It is NOT harmless for
+    # a role-split `extraction-worker` container (docker-compose.yml): that
+    # fallback would hand the producer THAT WORKER's own loopback address,
+    # not the instance's real callback surface — a misconfiguration that
+    # reads like a producer bug (crawl succeeds, the final callback just
+    # times out or connection-refuses) rather than a clear error naming the
+    # missing config key.
+
+    def _set_role(self, monkeypatch, role):
+        from app.roles import reset_roles_cache
+
+        if role is None:
+            monkeypatch.delenv("AGNES_ROLE", raising=False)
+        else:
+            monkeypatch.setenv("AGNES_ROLE", role)
+        reset_roles_cache()
+
+    @pytest.fixture(autouse=True)
+    def _reset_roles_cache_after(self):
+        from app.roles import reset_roles_cache
+
+        yield
+        reset_roles_cache()
+
+    def test_unconfigured_url_on_role_split_worker_refuses(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SERVER_URL", raising=False)
+        monkeypatch.delenv("AGNES_INTERNAL_URL", raising=False)
+        self._set_role(monkeypatch, "worker")
+        self._stub_connection_and_settings(monkeypatch)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="SERVER_URL"):
+            handler({"connection_id": "conn1"})
+
+    def test_configured_url_on_role_split_worker_is_unaffected(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setenv("SERVER_URL", "https://agnes.example.com")
+        self._set_role(monkeypatch, "worker")
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls[0]["env"]["AGNES_API_URL"] == "https://agnes.example.com"
+
+    def test_agnes_internal_url_on_role_split_worker_also_satisfies_the_guard(self, monkeypatch):
+        """AGNES_INTERNAL_URL is the documented data-rails-only escape hatch
+        for a deployment that cannot set SERVER_URL — the guard must accept
+        either, exactly like `agnes_server_url()`'s own resolution order."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SERVER_URL", raising=False)
+        monkeypatch.setenv("AGNES_INTERNAL_URL", "http://extraction-worker-internal:8000")
+        self._set_role(monkeypatch, "worker")
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls[0]["env"]["AGNES_API_URL"] == "http://extraction-worker-internal:8000"
+
+    def test_unconfigured_url_on_all_in_one_process_is_unaffected(self, monkeypatch):
+        """Single-container deployment (AGNES_ROLE unset, or `all`): the
+        producer's parent process IS the app, so the loopback fallback
+        legitimately reaches it — the guard must not fire here."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.delenv("SERVER_URL", raising=False)
+        monkeypatch.delenv("AGNES_INTERNAL_URL", raising=False)
+        self._set_role(monkeypatch, None)
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls[0]["env"]["AGNES_API_URL"] == "http://127.0.0.1:8000"
+
 
 class TestJiraWebhookEnqueues:
     """The Jira incremental-transform path must enqueue a ``jira-refresh``

@@ -921,6 +921,10 @@
   .sp-search__q { flex: 1 1 240px; min-width: 200px; }
   .sp-search__mode { flex: 0 0 auto; min-width: 160px; }
   .sp-search__selectall { display: flex; align-items: center; gap: 6px; padding: 9px 12px; font-size: 12.5px; font-weight: 600; border-bottom: 1px solid var(--ds-border-light); }
+  /* Permissions are a routine tenant fact, not a failure (TCRD-240 skip
+     hardening) — deliberately quieter than `.ds-wizard-error`'s danger ink:
+     one inaccessible site among several readable ones is not a stop sign. */
+  .sp-search__skipped { display: none; font-size: 12px; color: var(--ds-text-secondary); margin-top: 8px; }
   .sp-badge {
     flex: 0 0 auto; font-size: 11px; font-weight: 600; padding: 2px 8px;
     border-radius: var(--ds-radius-pill); background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
@@ -1571,6 +1575,7 @@
             <button type="button" class="btn btn-secondary" id="spw-search-btn">Search</button>
           </div>
           <div id="spw-search-truncated" class="ds-wizard-error" style="display:none;"></div>
+          <div id="spw-search-skipped" class="sp-search__skipped" style="display:none;"></div>
           <div id="spw-search-error" class="ds-wizard-error"></div>
           <div id="spw-search-results" class="sp-tree" style="display:none; margin-bottom:12px;"></div>
         </div>
@@ -2293,6 +2298,8 @@ function _copySharepointThumbprint(btn) {
 const SP_REJECTION_REASON_TEXT = {
   verbatim_gate_failed:
     "Quote not found in the document's text — the claim was rejected, nothing was stored. Usually the producer cited text outside the uploaded content (e.g. a filename).",
+  quote_not_meaningful:
+    "Quote was too short or not a real word/phrase (e.g. a bare file extension or punctuation) — rejected as evidence, even though it was found in the document.",
   unresolved_doc_id:
     "The cited document isn't registered in any collection — upload it or fix the producer's corpus map.",
   ambiguous_cross_collection_doc_id:
@@ -5565,6 +5572,7 @@ function openSpWizard() {
   document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-search-q").value = "";
   document.getElementById("spw-search-truncated").style.display = "none";
+  document.getElementById("spw-search-skipped").style.display = "none";
   document.getElementById("spw-search-results").style.display = "none";
   document.getElementById("spw-search-results").innerHTML = "";
   document.getElementById("spw-search-error").style.display = "none";
@@ -6008,6 +6016,26 @@ function spSearchErr(msg) {
   el.style.display = "block";
 }
 
+/* A site/folder the app registration cannot read is a routine permissions
+   fact (TCRD-240 skip hardening) — reported here, quietly, never folded
+   into `spw-search-error` (that stays for calls that failed outright) or
+   `spw-search-truncated` (a cap, not a permission refusal — a different
+   fact with a different fix). `textContent` only: skipped names come from
+   the tenant (site display names, folder paths) and are untrusted. */
+function spSkipLabel(s) {
+  if (s.scope === "site") return s.site_name || s.site_id || "a site";
+  return s.display_path || "a folder";
+}
+
+function spRenderSkipped(skipped) {
+  const el = document.getElementById("spw-search-skipped");
+  if (!skipped || !skipped.length) { el.style.display = "none"; el.textContent = ""; return; }
+  const names = skipped.map(spSkipLabel).join(", ");
+  const noun = skipped.length === 1 ? "location was" : "locations were";
+  el.textContent = `${skipped.length} ${noun} not accessible to this connection and skipped: ${names}.`;
+  el.style.display = "block";
+}
+
 function spRenderSearchResults(matches) {
   const host = document.getElementById("spw-search-results");
   if (!matches.length) {
@@ -6070,6 +6098,7 @@ function spOnSearchAnonToggle(cb) {
 function spRunSearch() {
   const q = document.getElementById("spw-search-q").value.trim();
   document.getElementById("spw-search-truncated").style.display = "none";
+  document.getElementById("spw-search-skipped").style.display = "none";
   spSearchErr("");
   if (q.length < 2) {
     spSearchErr("Type at least 2 characters.");
@@ -6086,6 +6115,7 @@ function spRunSearch() {
       btn.textContent = "Search";
       spLastSearchMatches = body.matches || [];
       spRenderSearchResults(spLastSearchMatches);
+      spRenderSkipped(body.skipped);
       if (body.truncated) {
         const el = document.getElementById("spw-search-truncated");
         // `hint` is the server's own next-step wording (admin_sharepoint.py
