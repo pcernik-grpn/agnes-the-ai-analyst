@@ -7656,6 +7656,12 @@ def _source_inventory(user: dict | None = None) -> dict:
 # the producer reports real per-item cost.
 _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
+# Every `claims_rejected` reason the verbatim gate itself produces (spec §8 +
+# §8.4) — both fold into the "rejected quotes" badge, never "protocol
+# errors" (unresolved doc id, malformed edge, …), even though they are
+# distinct reasons an operator can tell apart in the drawer.
+_VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
+
 
 def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
     """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
@@ -7737,13 +7743,15 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     / rejected quote) — those live in the CRAWLER's own per-document error
     log, which Agnes never receives. The badges below are the ones Agnes's
     own ingest run report actually carries: `rejected_quotes` (the verbatim
-    gate, spec §8, doing its job), `deferred` (a claim whose file was not
-    yet `indexed` — free retry once it is), `protocol_errors` (every OTHER
-    `claims_rejected` reason — unresolved doc id, malformed edge, alias type
-    conflict, …), and `source_urls_rejected` (O7 follow-up: a document's
-    `source_url` the ingest validator dropped — the claim itself still
-    wrote, only its citation link is missing; a producer that never sends
-    `source_url` is not in this list at all).
+    gate, spec §8, doing its job — both `verbatim_gate_failed` and the
+    meaningfulness floor's `quote_not_meaningful`, §8.4: two different
+    reasons the SAME gate refuses a quote), `deferred` (a claim whose file
+    was not yet `indexed` — free retry once it is), `protocol_errors` (every
+    OTHER `claims_rejected` reason — unresolved doc id, malformed edge,
+    alias type conflict, …), and `source_urls_rejected` (O7 follow-up: a
+    document's `source_url` the ingest validator dropped — the claim itself
+    still wrote, only its citation link is missing; a producer that never
+    sends `source_url` is not in this list at all).
 
     Every sub-block degrades independently on its own `try/except` — a
     repo call that raises (PG-only `RequiresPostgresBackend` on a
@@ -7816,8 +7824,8 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # a different signal than every `claims_rejected` reason and gets
         # its own badge rather than muddying "why was nothing written".
         source_urls_rejected = last_run.get("source_urls_rejected") or []
-        rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
-        protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
+        rejected_quotes = [r for r in claims_rejected if r.get("reason") in _VERBATIM_GATE_REASONS]
+        protocol_errors = [r for r in claims_rejected if r.get("reason") not in _VERBATIM_GATE_REASONS]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
         cell["cost_estimate"] = {
             "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
@@ -7838,7 +7846,43 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── schedule: static text — the crawl runs externally, so this is
     # honestly a label, never live state (spec §13.2's "hourly delta · 03:00
     # full check · extraction in its own lane" collapsed to one line here).
-    cell["schedule"] = {"text": "external producer · hourly delta"}
+    #
+    # `in_agnes` (TCRD-226) is a SEPARATE, additive sub-object: the
+    # in-Agnes `corpus-extraction` job kind's own schedule state for THIS
+    # connection — whether extraction.enabled is on, the configured cadence
+    # (if any), and this connection's own last/next run (last_run_at is
+    # this connection's own `config.extraction.last_run_at`, the SAME
+    # bookkeeping `app/api/admin_sharepoint.py::_record_extraction_dispatch`
+    # writes; next_run_at is a best-effort display estimate,
+    # `src.scheduler.next_due_at` — see its own docstring for why it is
+    # never the source of truth for an actual dispatch). Never confused
+    # with the static `text` above, which describes the EXTERNAL
+    # producer's own crawl cadence, not Agnes's job queue.
+    in_agnes_schedule: dict[str, Any] = {
+        "enabled": False,
+        "schedule": None,
+        "last_run_at": None,
+        "next_run_at": None,
+    }
+    try:
+        from app.instance_config import feature_enabled, get_value
+        from src.scheduler import next_due_at
+
+        in_agnes_schedule["enabled"] = feature_enabled(
+            "extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False
+        )
+        schedule_cfg = str(get_value("extraction", "schedule", default="") or "").strip() or None
+        in_agnes_schedule["schedule"] = schedule_cfg
+        extraction_state = (conn.get("config") or {}).get("extraction") or {}
+        last_run_at = extraction_state.get("last_run_at")
+        in_agnes_schedule["last_run_at"] = last_run_at
+        if schedule_cfg:
+            next_run = next_due_at(schedule_cfg, last_run_at)
+            in_agnes_schedule["next_run_at"] = next_run.isoformat() if next_run else None
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
+
+    cell["schedule"] = {"text": "external producer · hourly delta", "in_agnes": in_agnes_schedule}
 
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity

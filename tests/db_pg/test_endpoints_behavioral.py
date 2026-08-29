@@ -1395,9 +1395,10 @@ class TestFactsReadSurfaceSmoke:
         "POST /api/facts/search",
         "POST /api/facts/neighbors",
         "GET /api/facts/{subject_id}/claims",
+        "GET /api/facts/facets",
     }
 
-    def test_flag_off_404s_all_three_routes(self, seeded_app_both):
+    def test_flag_off_404s_every_read_route(self, seeded_app_both):
         """facts.enabled defaults off — the whole router disappears, on
         either backend."""
         s = seeded_app_both
@@ -1405,6 +1406,8 @@ class TestFactsReadSurfaceSmoke:
         assert client.post("/api/facts/search", json={}, headers=headers).status_code == 404
         assert client.post("/api/facts/neighbors", json={"subject_id": "f_x"}, headers=headers).status_code == 404
         assert client.get("/api/facts/f_x/claims", headers=headers).status_code == 404
+        assert client.get("/api/facts/type-map", headers=headers).status_code == 404
+        assert client.get("/api/facts/facets", headers=headers).status_code == 404
 
     def test_neighbors_requires_subject_id_on_both_backends(self, seeded_app_both, monkeypatch):
         """422 identically on both backends — Pydantic validation runs
@@ -1472,6 +1475,143 @@ class TestFactsReadSurfaceSmoke:
         claims = r.json()["claims"]
         assert len(claims) == 1
         assert claims[0]["quote"] == "The engagement is underway."
+
+        # Facets read the same graph from the other direction: the client the
+        # engagement is filed under, counted by DOCUMENTS rather than subjects.
+        r = client.get("/api/facts/facets?types=engagement", headers=headers)
+        assert r.status_code == 200, r.text
+        vals = r.json()["facets"]["engagement"]
+        assert [v["subject_id"] for v in vals] == [fact_id]
+        assert vals[0]["document_count"] == 1
+
+    def test_search_and_claims_round_trip_for_a_granted_non_admin_caller_on_pg(
+        self, state_backend, seeded_app_both, monkeypatch
+    ):
+        """The admin-only round trip above proves the endpoint's WIRING; it
+        does not prove the AUTH SEAM. RBAC filtering itself is proven
+        thoroughly at the repository layer by
+        ``tests/db_pg/test_facts_read_pg.py`` — but every one of those tests
+        calls :class:`FactsPgRepository` directly with a hand-built caller
+        dict, bypassing ``get_current_user``/JWT/FastAPI dependency
+        injection entirely. Nothing exercised whether a REAL non-admin
+        HTTP caller's identity actually reaches the repository unmangled
+        through THIS router (`Depends(get_current_user)` passed straight
+        into `facts_repo().search(user, ...)`, see app/api/facts.py) — an
+        endpoint-level regression there (e.g. the dependency silently
+        resolving to the wrong principal) would pass every existing test in
+        this module, all of which use the admin token."""
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client = s["client"]
+
+        from src.repositories import (
+            corpus_files_repo,
+            facts_repo,
+            file_corpora_repo,
+            resource_grants_repo,
+            user_group_members_repo,
+            user_groups_repo,
+        )
+
+        corpus_id = file_corpora_repo().create(
+            name="Granted Smoke", slug="granted-smoke", description=None, created_by="admin1"
+        )
+        file_id = corpus_files_repo().add(
+            corpus_id=corpus_id,
+            filename="a.md",
+            sha256="sha1",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/a.md",
+        )
+        fact_id = facts_repo().create_fact(type="engagement")
+        facts_repo().add_claim(
+            fact_id=fact_id,
+            corpus_file_id=file_id,
+            corpus_id=corpus_id,
+            file_sha256="sha1",
+            quote="Granted engagement.",
+        )
+
+        grp = user_groups_repo().create(name="granted-smoke-group", description="test", created_by="admin1")
+        user_group_members_repo().add_member("analyst1", grp["id"], source="admin", added_by="admin1")
+        resource_grants_repo().create(grp["id"], "collection", corpus_id, "admin1", "available")
+
+        headers = _analyst_headers(s)
+        r = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+        assert r.status_code == 200, r.text
+        assert fact_id in {s_["id"] for s_ in r.json()["subjects"]}
+
+        r = client.get(f"/api/facts/{fact_id}/claims", headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["claims"][0]["quote"] == "Granted engagement."
+
+        r = client.post("/api/facts/neighbors", json={"subject_id": fact_id}, headers=headers)
+        assert r.status_code == 200, r.text
+        assert fact_id in {n["id"] for n in r.json()["nodes"]}
+
+    def test_search_and_claims_exclude_a_non_admin_caller_with_no_grant_on_pg(
+        self, state_backend, seeded_app_both, monkeypatch
+    ):
+        """The fail-closed counterpart, over the SAME real-HTTP seam as the
+        sibling above: a caller who was never granted access — including one
+        whose identity predates any grant row entirely, i.e. no
+        ``resource_grants`` row naming them exists at all, not merely a row
+        naming someone else — sees nothing through the real endpoints. This
+        must hold at the HTTP layer independently of the repository-layer
+        proof (``test_facts_read_pg.py``'s S1) because that suite never
+        touches ``get_current_user``."""
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client = s["client"]
+
+        from src.repositories import corpus_files_repo, facts_repo, file_corpora_repo
+
+        corpus_id = file_corpora_repo().create(
+            name="Ungranted Smoke", slug="ungranted-smoke", description=None, created_by="admin1"
+        )
+        file_id = corpus_files_repo().add(
+            corpus_id=corpus_id,
+            filename="b.md",
+            sha256="sha2",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/b.md",
+        )
+        fact_id = facts_repo().create_fact(type="engagement")
+        facts_repo().add_claim(
+            fact_id=fact_id,
+            corpus_file_id=file_id,
+            corpus_id=corpus_id,
+            file_sha256="sha2",
+            quote="Ungranted engagement.",
+        )
+
+        # analyst1 is a real, authenticated user with NO resource_grants row
+        # naming them at all — no group of theirs holds ANY grant, on this
+        # collection or any other (the "row predates the gate" shape: their
+        # account exists, the grant machinery exists, but nothing connects
+        # the two).
+        headers = _analyst_headers(s)
+        r = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["subjects"] == []
+
+        # claims: 404, never 403 or a 200 with an empty list (spec §5 rule
+        # 2 — "nothing there" and "something you can't see" are the same
+        # response).
+        r = client.get(f"/api/facts/{fact_id}/claims", headers=headers)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"] == "fact_not_found"
+
+        # neighbors: 404 too, same "root subject unreadable" path.
+        r = client.post("/api/facts/neighbors", json={"subject_id": fact_id}, headers=headers)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"] == "fact_not_found"
 
 
 # ---------------------------------------------------------------------------

@@ -140,7 +140,14 @@ POSTURE: dict[str, str] = {
     "PUT /api/admin/mcp-tools/{tool_id}/projection-map": "mcp_tool.projection_map",
     # -- app.api.admin_sharepoint ----------------------------------------------
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_remove",
+    # Landed on `integration` in parallel with this wave, declared "fallback"
+    # under the old contract — given real actions here, since "fallback" no
+    # longer exists. Neither handler audits itself, so the middleware emits
+    # these; `run_` keeps the run-due sweep inside SCHEDULER_ACTION_SQL's
+    # liveness predicate, same reasoning as the other scheduler endpoints.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
+    "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
@@ -785,7 +792,13 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/db/state": "exempt:noise",
     # -- app.api.facts --
     "GET /api/facts/corrections": "exempt:ui_support",
+    # Landed on `integration` in parallel with this wave. Both back the
+    # Library's filter menu and type header: per-caller-visible labels and
+    # counts, never claim text or document content — the content route below
+    # (`/claims`) is the one that carries a real action.
+    "GET /api/facts/facets": "exempt:ui_support",
     "GET /api/facts/ingest-runs": "exempt:ui_support",
+    "GET /api/facts/type-map": "exempt:ui_support",
     "GET /api/facts/{subject_id}/claims": "facts.claims",
     # -- app.api.glossary --
     "GET /api/glossary": "exempt:ui_support",
@@ -819,6 +832,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/knowledge-digests/{digest_id}": "exempt:ui_support",
     # -- app.api.knowledge_search --
     "GET /api/knowledge/artifacts/{corpus_id}/download": "knowledge.artifact_download",
+    # Landed on `integration` in parallel with this wave: the digest LIST
+    # (titles/metadata for the UI); fetching a digest's CONTENT is the
+    # audited route below.
+    "GET /api/knowledge/digests": "exempt:ui_support",
     "GET /api/knowledge/digests/{digest_id}/content": "knowledge.digest_download",
     "GET /api/knowledge/search": "knowledge.search",
     # -- app.api.marketplace --

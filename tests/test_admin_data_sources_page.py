@@ -1412,7 +1412,61 @@ class TestSharePointSourceCard:
         )
         try:
             inv = _source_inventory()
-            assert inv["pipelines"][conn_id]["file_source"]["schedule"] == {"text": "external producer · hourly delta"}
+            schedule = inv["pipelines"][conn_id]["file_source"]["schedule"]
+            assert schedule["text"] == "external producer · hourly delta"
+            # TCRD-226's in-Agnes schedule state is a SEPARATE, additive
+            # sub-object — a fresh connection with no scheduled runs reads
+            # honestly off (never a stale/guessed default).
+            assert schedule["in_agnes"] == {
+                "enabled": False,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+            }
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_in_agnes_schedule_reflects_live_config_and_dispatch_state(self, seeded_app, monkeypatch):
+        """TCRD-226: enabling extraction + configuring a cadence + a
+        recorded dispatch on the connection's own config all show up in the
+        card's `schedule.in_agnes` sub-object — the same state the sweep
+        (`POST .../extraction/run-due`) and the manual trigger
+        (`POST .../extract`) read and write."""
+        import uuid
+        from datetime import datetime, timezone
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "true")
+
+        def _fake_get_value(*keys, default=None):
+            if keys == ("extraction", "schedule"):
+                return "every 4h"
+            return default
+
+        monkeypatch.setattr("app.instance_config.get_value", _fake_get_value)
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        last_run_at = datetime(2026, 8, 29, 8, 0, 0, tzinfo=timezone.utc).isoformat()
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={
+                "tenant_id": "t1",
+                "client_id": "c1",
+                "extraction": {"last_run_at": last_run_at, "last_job_id": "job-1"},
+            },
+        )
+        try:
+            inv = _source_inventory()
+            in_agnes = inv["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
+            assert in_agnes["enabled"] is True
+            assert in_agnes["schedule"] == "every 4h"
+            assert in_agnes["last_run_at"] == last_run_at
+            # next_due_at(every 4h, last_run_at) == last_run_at + 4h.
+            assert in_agnes["next_run_at"] == "2026-08-29T12:00:00+00:00"
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1680,6 +1734,55 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "Protocol errors 2" in html
         assert "Citation links rejected 1" in html
 
+    # -- in-Agnes extraction scheduling + manual trigger (TCRD-226) --------
+
+    def test_run_extraction_now_button_always_renders_and_is_wired(self):
+        """The action is available regardless of whether in-Agnes
+        scheduling is configured — the fixture above carries no
+        `schedule.in_agnes` at all, and the button must still render and
+        call the SAME endpoint."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert "Run extraction now" in html
+        assert "runSpExtraction('sp-conn-1')" in html
+
+    def test_in_agnes_schedule_renders_last_and_next_run(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {
+                "enabled": True,
+                "schedule": "every 4h",
+                "last_run_at": "2026-08-29T08:00:00+00:00",
+                "next_run_at": "2026-08-29T12:00:00+00:00",
+            },
+        }
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        # Never a bare "off" badge when enabled.
+        assert "extraction.enabled is off" not in html
+        assert "8/29/2026" in html or "2026" in html  # locale-rendered date, just prove SOME date landed
+
+    def test_in_agnes_schedule_never_run_reads_honestly(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {"enabled": True, "schedule": "every 4h", "last_run_at": None, "next_run_at": None},
+        }
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        assert "never run" in result["html"].lower()
+
+    def test_in_agnes_schedule_disabled_shows_an_off_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {"enabled": False, "schedule": None, "last_run_at": None, "next_run_at": None},
+        }
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "off" in html.lower()
+        assert "no schedule configured" in html.lower()
+
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
         result = self._run(
             """
@@ -1824,6 +1927,23 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "ambiguous_cross_collection_doc_id" not in html
         assert "didn't say which" in html
 
+    def test_quote_not_meaningful_reason_gets_its_own_human_subline(self):
+        """spec §8.4: a distinct reason from `verbatim_gate_failed` (the
+        quote WAS found, it just isn't evidence) — surfaced in the SAME
+        `rejected_quotes` drawer, with its own explanatory sentence rather
+        than the raw slug."""
+        fs = dict(self._FILE_SOURCE)
+        fs["last_run"] = dict(fs["last_run"])
+        fs["last_run"]["rejected_quotes"] = [{"row": 0, "reason": "quote_not_meaningful", "doc_id": "d9", "doc": None}]
+        result = self._run(
+            'toggleFileSourceDrawer("sp-conn-1", "rejected_quotes"); '
+            'console.log(JSON.stringify(_elements["ds-fs-drawer-sp-conn-1"]));',
+            file_source=fs,
+        )
+        html = result["innerHTML"]
+        assert "quote_not_meaningful" not in html
+        assert "too short or not a real word/phrase" in html
+
     # -- sharing-state row (rephrased from "Identity matching") ------------
 
     def test_sharing_row_ok_when_every_scope_collection_has_a_group(self):
@@ -1964,7 +2084,13 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return proc.stdout
 
-    _SP_ONLY_ITEMS = ["Manage scopes…", "Test connection", "Update certificate…", "Delete source"]
+    _SP_ONLY_ITEMS = [
+        "Manage scopes…",
+        "Test connection",
+        "Run extraction now",
+        "Update certificate…",
+        "Delete source",
+    ]
     _KEBOOLA_ONLY_ITEMS = [
         "Add tables…",
         "Rotate storage token",
@@ -1979,6 +2105,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
             assert item in html, f"missing {item!r} from the SharePoint menu"
         for item in self._KEBOOLA_ONLY_ITEMS:
             assert item not in html, f"Keboola-only item {item!r} leaked into the SharePoint menu"
+        assert "runSpExtraction('sp-conn-1')" in html
         # The wrong "Test connection" (Keboola's storage-token verify) must
         # not be wired — the SharePoint-specific `testSpConn` is.
         assert "testSpConn('sp-conn-1')" in html

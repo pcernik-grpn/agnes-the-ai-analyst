@@ -1,4 +1,5 @@
 {% extends "base_admin_page.html" %}
+{% import "macros/_state.html" as state %}
 {% block title %}Store moderation — {{ config.INSTANCE_NAME }}{% endblock %}
 {% block container_modifier %}container--full{% endblock %}
 
@@ -92,7 +93,11 @@
   </table>
   <div class="mod-share-err" id="mod-share-requests-err" hidden></div>
 {% else %}
-  <div class="empty-state">No agent shares waiting on approval.</div>
+  {# EMPTY on the shared vocabulary (TCRD-207) — the queue ran, there is
+     genuinely nothing in it, distinct from the "not available on this
+     instance" config gate above (which keeps its own plain copy: that is
+     not one of the four states, it is a feature switch). #}
+  {{ state.panel('empty', 'No agent shares waiting on approval.') }}
 {% endif %}
 
 <h2 class="mod-section-title">Verification requests</h2>
@@ -133,7 +138,7 @@
   <p class="mod-more">Showing the first {{ verification_requests|length }} of {{ verification_total }} requests — resolve some to reveal the rest.</p>
   {% endif %}
 {% else %}
-  <div class="empty-state">No verification requests waiting.</div>
+  {{ state.panel('empty', 'No verification requests waiting.') }}
 {% endif %}
 
 <script>

@@ -1043,6 +1043,18 @@ CATALOG: dict[str, AuditEvent] = {
         "system",
         "A live-chat-log stream was refused (invalid or expired ticket).",
     ),
+    # -- Landed on `integration` in parallel with this wave; declared here
+    # because the "fallback" posture value they arrived with no longer exists.
+    "sharepoint_connection.extract": AuditEvent(
+        "sharepoint_connection.extract",
+        "mutation",
+        "A document extraction was started for one SharePoint connection.",
+    ),
+    "run_sharepoint_extraction": AuditEvent(
+        "run_sharepoint_extraction",
+        "system",
+        "The scheduler's SharePoint extraction sweep ran.",
+    ),
 }
 
 

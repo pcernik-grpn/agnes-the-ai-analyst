@@ -53,6 +53,32 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 null`` (plus ``reason``) when no
                                                                 certificate is configured or it
                                                                 cannot be parsed — never a 500.
+  POST   /api/admin/sharepoint/connections/{id}/extract       — one-off admin trigger for the
+                                                                existing ``corpus-extraction`` job
+                                                                kind (TCRD-226). Refuses BEFORE
+                                                                enqueueing (typed 409, never a job
+                                                                that fails 30 minutes later in a
+                                                                worker) when ``extraction.enabled``
+                                                                is off or no producer is configured
+                                                                — the same two gates
+                                                                ``app/worker/kinds.py::
+                                                                _run_corpus_extraction`` itself
+                                                                checks. Deduped on a stable
+                                                                per-connection idempotency key
+                                                                shared with the sweep below.
+  POST   /api/admin/sharepoint/extraction/run-due             — scheduler-driven sweep (TCRD-226):
+                                                                fires ``corpus-extraction`` for
+                                                                every SharePoint connection whose
+                                                                cadence (``extraction.schedule``, a
+                                                                single instance-wide setting applied
+                                                                to each connection's own last-run
+                                                                stamp) says it is due. A clean no-op
+                                                                when the feature isn't usable or no
+                                                                schedule is configured — mirrors
+                                                                ``POST /api/v1/agents/run-due``'s
+                                                                shape (walk + per-row due-check +
+                                                                enqueue into an EXISTING job kind,
+                                                                no second scheduling mechanism).
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -74,7 +100,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -128,6 +155,33 @@ class ConfirmScopeBody(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+#: Keys THIS module writes into a SharePoint connection's ``config`` outside
+#: the generic ``PUT /api/admin/source-connections/{id}`` editor's own
+#: request body: the wizard's confirmed-scope rows (``scopes`` —
+#: :func:`confirm_scope` / :func:`remove_scope`) and the in-Agnes extraction
+#: schedule's own dispatch bookkeeping (``extraction`` —
+#: :func:`_record_extraction_dispatch`, TCRD-226).
+#:
+#: A key earns a place here on ONE test: the server writes it into this
+#: connection's ``config`` and the generic connection-editor FORM never
+#: renders it. ``app/api/admin_source_connections.py::update_connection``
+#: imports this tuple to carry each key forward across an update that omits
+#: it — that endpoint replaces ``config`` wholesale, so without this an
+#: ordinary edit (a rename, a certificate change) silently erases whatever
+#: isn't listed here.
+#:
+#: This is NOT optional bookkeeping — it is a ratcheted list.
+#: ``tests/test_sharepoint_config_carry_forward_ratchet.py`` statically scans
+#: THIS file for every literal key a local writer assigns into the variable
+#: it then passes as ``config=`` to ``source_connections_repo().update(...)``
+#: and fails if that set is not exactly this tuple — so adding a THIRD
+#: server-written key here without adding it to this tuple in the SAME
+#: change fails a test that names the fix, rather than shipping a silent
+#: erasure the way ``scopes`` (2026-08-29 morning) and ``extraction``
+#: (2026-08-29, same day, TCRD-226) both did before this ratchet existed.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction")
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -316,6 +370,126 @@ def _create_scope_collection(*, connection_name: str, display_path: str, source_
         return repo.create(name=name, slug=f"{slug}-{suffix}", description=description, created_by=created_by)
 
 
+def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
+    """Whether the ``corpus-extraction`` job kind can actually run right now
+    — the SAME two gates ``app/worker/kinds.py::_run_corpus_extraction``
+    itself checks (``extraction.enabled`` + a configured producer command/
+    module), read here so an admin (or the scheduled sweep below) finds out
+    BEFORE a job is queued rather than 30 minutes later when a worker claims
+    it and the handler raises.
+
+    Returns ``(True, None)`` when usable, or ``(False, {"error": ...,
+    "message": ...})`` naming the exact fix.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
+        return False, {
+            "error": "extraction_disabled",
+            "message": "extraction.enabled is false — enable it in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
+        }
+
+    from app.worker.kinds import _extraction_producer_argv
+
+    if _extraction_producer_argv() is None:
+        return False, {
+            "error": "extraction_producer_not_configured",
+            "message": (
+                "No producer configured — set extraction.producer.command or "
+                "extraction.producer.module in instance.yaml."
+            ),
+        }
+
+    return True, None
+
+
+def _extraction_idempotency_key(connection_id: str) -> str:
+    """A STABLE per-connection idempotency key, shared by the manual
+    trigger and the scheduled sweep below — ``JobsRepository.enqueue``
+    dedups on it while a matching job is still ``queued``/``running``, so a
+    manual trigger and a scheduled run for the same connection can never
+    both be in flight, and either path's 409/backlog handling reads the
+    SAME existing job."""
+    return f"corpus-extraction:{connection_id}"
+
+
+def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
+    """Persist this connection's own extraction dispatch bookkeeping —
+    ``last_run_at`` (the scheduled sweep's due-check input, see
+    :func:`_dispatch_extraction_if_due`) and ``last_job_id`` — into the
+    connection's own ``config.extraction`` sub-object. No new table: same
+    pattern the connect wizard's ``config.scopes`` already uses on this
+    same JSON column. Called by BOTH the manual trigger and the sweep, so
+    either path resets the "next due" clock — a manual run moments before
+    the schedule would fire must not also queue a second run a tick later.
+    """
+    config = dict(row.get("config") or {})
+    # Writing a NEW key here (or in any other function in this module)?
+    # Add it to SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS above IN THE SAME
+    # CHANGE — the generic connection editor's carry-forward
+    # (app/api/admin_source_connections.py::update_connection) only
+    # preserves keys listed there, and the ratchet test
+    # (tests/test_sharepoint_config_carry_forward_ratchet.py) will fail
+    # otherwise.
+    config["extraction"] = {
+        "last_run_at": datetime.now(timezone.utc).isoformat(),
+        "last_job_id": job_id,
+    }
+    source_connections_repo().update(row["id"], config=config)
+
+
+def _extraction_schedule_config() -> Optional[str]:
+    """The single instance-wide extraction cadence (``extraction.schedule``
+    in ``instance.yaml``'s ``extraction:`` block) — applied independently to
+    each SharePoint connection's own ``last_run_at`` by
+    :func:`_dispatch_extraction_if_due`. Off by default: absent/empty means
+    no scheduled sweep (mirrors ``extraction.enabled``'s own default)."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "schedule", default="")
+    raw = str(raw or "").strip()
+    return raw or None
+
+
+def _dispatch_extraction_if_due(row: Dict[str, Any], schedule: str, now: datetime) -> bool:
+    """Evaluate one SharePoint connection against the extraction cadence
+    and, if due, enqueue ``corpus-extraction`` for it.
+
+    Due-ness reuses :func:`src.scheduler.is_table_due` against THIS
+    connection's own ``config.extraction.last_run_at`` — the same primitive
+    every other cadence in this codebase is evaluated with (no second
+    scheduling mechanism). Returns ``True`` iff this call actually
+    consumed the tick (a fresh enqueue OR a dedup against an already
+    in-flight job for this connection — the "backlog" case, mirroring
+    ``app/api/agent_schedules.py::_dispatch_if_due``'s same-shape guard so
+    a stuck previous run doesn't get re-logged every tick); ``False`` when
+    not due yet.
+    """
+    from src.scheduler import is_table_due
+
+    extraction_state = (row.get("config") or {}).get("extraction") or {}
+    last_run_at = extraction_state.get("last_run_at")
+    if not is_table_due(schedule, last_run_at, now=now):
+        return False
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "corpus-extraction",
+        {"connection_id": row["id"]},
+        idempotency_key=_extraction_idempotency_key(row["id"]),
+    )
+    if job["deduped"]:
+        logger.info(
+            "extraction:run-due — connection %s already has a corpus-extraction job in flight (%s); "
+            "consuming this tick without a second enqueue",
+            row["id"],
+            job["id"],
+        )
+    _record_extraction_dispatch(row, job["id"])
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -433,12 +607,25 @@ async def search_tree(
     every drive of every reachable site. ``item_id`` without ``drive_id``
     is rejected — there is no drive to resolve it against.
 
+    A site or folder the app registration cannot read (Graph 403/404) is
+    skipped, not fatal — app-only permissions are never uniform across a
+    real tenant. It is never silently dropped: see ``skipped`` below.
+
     Response: ``{matches: [{item_id, drive_id, display_path}], visited,
-    truncated, hint}``. ``truncated`` is ``True`` whenever a cap is what
-    stopped the walk — never a silently partial result; ``visited`` is how
-    many "list children" calls it took to get there; ``hint`` is a short,
-    actionable string (scope the search, narrow the pattern) when
-    ``truncated`` is ``True``, else ``null``.
+    truncated, skipped, hint}``.
+
+    - ``truncated`` is ``True`` whenever a cap (``max_depth``/``max_visited``)
+      is what stopped the walk — never a silently partial result.
+    - ``visited`` is how many "list children" calls it took to get there.
+    - ``skipped`` lists every site/folder the walk could not enter for
+      permissions reasons, each as ``{scope: "site"|"folder", reason:
+      "forbidden"|"not_found", status_code, site_id, site_name, drive_id,
+      item_id, display_path}`` — deliberately separate from ``truncated``:
+      a cap and a permission refusal are different facts and call for
+      different admin actions (narrow the search vs. request access).
+    - ``hint`` is a short, actionable string (scope the search, narrow the
+      pattern) when ``truncated`` is ``True``, else ``null`` — unrelated to
+      ``skipped``, which speaks for itself.
     """
     if item_id and not drive_id:
         raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
@@ -539,6 +726,8 @@ async def confirm_scope(
             }
         )
 
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": scopes}
     source_connections_repo().update(connection_id, config=new_config)
 
@@ -584,6 +773,8 @@ async def remove_scope(
     remaining = [s for s in scopes if s.get("source_scope_id") != source_scope_id]
     if len(remaining) == len(scopes):
         raise HTTPException(status_code=404, detail="scope_not_found")
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": remaining}
     source_connections_repo().update(connection_id, config=new_config)
 
@@ -635,3 +826,101 @@ async def certificate(
     except SharePointSettingsError as exc:
         return {"certificate": None, "reason": f"sharepoint_cert_unresolved: {exc}"}
     return certificate_metadata(settings.private_key)
+
+
+@router.post("/connections/{connection_id}/extract", status_code=202)
+async def trigger_extraction(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Admin-triggered one-off extraction run for this connection
+    (TCRD-226) — enqueues the existing ``corpus-extraction`` job kind
+    (``app/worker/kinds.py::_run_corpus_extraction``) with
+    ``{"connection_id": connection_id}``, the exact payload shape that
+    handler documents.
+
+    404 on an unknown/non-sharepoint connection BEFORE any other work.
+    Then refuses cleanly (never a job that fails 30 minutes later in a
+    worker) when the feature isn't usable: ``409 extraction_disabled``
+    (``extraction.enabled`` is false) or ``409
+    extraction_producer_not_configured`` (neither ``extraction.producer
+    .command`` nor ``.module`` is set) — see :func:`_extraction_readiness`.
+
+    Deduped on the STABLE per-connection idempotency key
+    (:func:`_extraction_idempotency_key`) also used by the scheduled sweep
+    below, so a manual trigger and a scheduled run can never both be in
+    flight for the same connection. ``enqueue()``'s own ``"deduped"``
+    return value (not a pre-check peek — see ``app/api/sync.py::
+    trigger_sync``'s docstring for why a peek races a concurrent call)
+    decides 202 vs. ``409 extraction_already_running``.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    usable, error = _extraction_readiness()
+    if not usable:
+        raise HTTPException(status_code=409, detail=error)
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "corpus-extraction",
+        {"connection_id": connection_id},
+        idempotency_key=_extraction_idempotency_key(connection_id),
+    )
+    if job["deduped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "job_id": job["id"]},
+        )
+
+    _record_extraction_dispatch(row, job["id"])
+    logger.info("sharepoint connection %s: extraction job %s enqueued (manual trigger)", connection_id, job["id"])
+    return {"job_id": job["id"], "status": job["status"]}
+
+
+@router.post("/extraction/run-due")
+async def run_due_extraction(
+    _user: dict = Depends(require_admin),
+):
+    """Scheduler-driven sweep (TCRD-226): fires ``corpus-extraction`` for
+    every SharePoint connection whose extraction cadence
+    (``extraction.schedule`` — a single instance-wide setting in the
+    ``extraction:`` config block, applied independently to each
+    connection's own ``last_run_at``) says it is due. Same shape as
+    ``POST /api/v1/agents/run-due`` (walk + per-row due-check + enqueue
+    into an EXISTING job kind) — no second scheduling mechanism.
+    Scheduler row: ``extraction-run-due`` in
+    ``services/scheduler/__main__.py``, registered only when
+    ``extraction.schedule`` is configured (absent/empty = off, same
+    default posture as ``extraction.enabled``).
+
+    A clean, typed no-op (never an error) when the feature isn't usable —
+    ``extraction.enabled`` is false, no producer is configured, or no
+    schedule is configured — since this endpoint, once registered, fires
+    UNCONDITIONALLY on its own cadence; the JOB HANDLER
+    (``_run_corpus_extraction``) raises on the same conditions because a
+    ``corpus-extraction`` job only ever exists because something explicitly
+    enqueued it, but this sweep is what decides whether to enqueue at all.
+    """
+    usable, error = _extraction_readiness()
+    schedule = _extraction_schedule_config()
+    if not usable or not schedule:
+        return {
+            "dispatched": [],
+            "count": 0,
+            "skipped": True,
+            "reason": (error or {}).get("error") if not usable else "no_schedule_configured",
+        }
+
+    now = datetime.now(timezone.utc)
+    dispatched: List[str] = []
+    for row in source_connections_repo().list(source_type="sharepoint"):
+        try:
+            if _dispatch_extraction_if_due(row, schedule, now):
+                dispatched.append(row["id"])
+        except Exception:
+            # Never let one bad connection abort the sweep — mirrors
+            # app/api/agent_schedules.py::run_due_agent_schedules.
+            logger.exception("extraction:run-due — connection %s failed; continuing sweep", row.get("id"))
+
+    return {"dispatched": dispatched, "count": len(dispatched)}

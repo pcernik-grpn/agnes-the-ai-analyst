@@ -57,6 +57,7 @@
    Styles live in app/web/static/css/rail.css (.rail-* prefix),
    activated by html[data-ui-layout="rail"]. #}
 {% import "macros/_agnes_orb.html" as agnes_orb %}
+{% import "macros/_state.html" as state %}
 {% if session.user %}
 {% set _path = request.url.path %}
 {# Collapsed vs. expanded rail width is a PERSISTED USER PREFERENCE
@@ -410,6 +411,19 @@
                        zero sessions, so "No conversations yet" never flashes
                        before the list loads. #}
                     <p id="cloud-chat-empty-state" class="rail-history-empty" hidden>No conversations yet.</p>
+                    {# TCRD-207 (DES-153): a FETCH that never completed is a
+                       DIFFERENT fact than a fetch that resolved with zero rows —
+                       the conversations are still there, the list just couldn't
+                       be read. Both renderers reveal exactly one of these two
+                       elements, never the empty one on a failure (see
+                       js/rail_history.js and js/chat.js's loadSidebar()). Kept
+                       AFTER the empty state so `.cloud-chat-list:not(:empty) +
+                       .rail-history-empty` (rail.css) still matches the ul's
+                       immediate sibling. #}
+                    {{ state.panel('failed', "Couldn't load your conversations",
+                                   cta_label='Retry', cta_attrs='data-state-retry',
+                                   id='cloud-chat-failed-state', hidden=True,
+                                   compact=True) }}
                 </div>
 
             </section>

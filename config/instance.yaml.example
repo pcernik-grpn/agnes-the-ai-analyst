@@ -1230,8 +1230,8 @@ facts:
 # here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
 # NOT editable from /admin/server-config (locked: requires the
 # extraction-worker deployment) — this is operator/deploy-time config, not
-# a runtime toggle. The rest of this block (`producer`, `timeout_s`) is
-# plain instance data, read directly via get_value.
+# a runtime toggle. The rest of this block (`producer`, `schedule`,
+# `timeout_s`) is plain instance data, read directly via get_value.
 extraction:
   enabled: false
   producer:
@@ -1250,6 +1250,21 @@ extraction:
     # by default. Only the NAMES listed here are copied — this is not a way
     # back to forwarding the whole environment.
     env_passthrough: []
+  # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
+  # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
+  # driving a scheduler row (`extraction-run-due`, see
+  # services/scheduler/__main__.py) that fires `POST /api/admin/sharepoint/
+  # extraction/run-due`. That sweep applies this SAME cadence independently
+  # to each SharePoint connection's own last-run stamp, enqueueing the
+  # existing `corpus-extraction` job kind for whichever connections are due
+  # — not a per-connection schedule, one clock applied to every connection.
+  # Empty (the default) disables the sweep entirely — no scheduler row is
+  # registered — same "off unless explicitly turned on" posture as
+  # `enabled` above. An admin can still trigger a one-off run at any time
+  # via `POST /api/admin/sharepoint/connections/{id}/extract` regardless of
+  # this setting (subject to the same `enabled`/producer-configured gate).
+  # SCHEDULER_EXTRACTION_SCHEDULE overrides this at the environment level.
+  schedule: ""
   # Hard ceiling on one producer run, in seconds — the subprocess is killed
   # at this timeout and the job fails (no automatic retry: a failed
   # producer run usually needs an operator to look at it).
@@ -1277,6 +1292,34 @@ extraction:
   # instance's per-instance pseudonym key — different instances must use
   # different keys, or the same person pseudonymizes identically across
   # tenants). Neither var is set when no scope is anonymize-marked.
+  #
+  # Producer callback credential (TCRD-226): the producer calls BACK into
+  # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
+  # its actual work, so the child env ALSO carries AGNES_API_URL (this
+  # instance's own base URL — resolved from SERVER_URL, falling back to
+  # AGNES_INTERNAL_URL, then to this process's own loopback) and, when
+  # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
+  # shared-secret bearer token). On a role-split `extraction-worker`
+  # container (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
+  # `extraction-worker` service in docker-compose.yml) that loopback
+  # fallback would be the WORKER's own address, not the instance's real
+  # callback surface — so on that topology the job refuses cleanly instead
+  # ("neither SERVER_URL nor AGNES_INTERNAL_URL configured") unless one of
+  # the two is set explicitly. A single-container ("all-in-one") deployment
+  # is unaffected: there, the producer's parent process IS the app, so the
+  # loopback fallback is correct and no explicit configuration is required.
+  # The token itself is a DELIBERATE OVER-GRANT, not an
+  # oversight: presenting that token resolves to a synthetic user in the
+  # Admin system group (see app/auth/scheduler_token.py) — god-mode on
+  # every RBAC check — while the producer only ever needs to read its own
+  # connection's scope map, upload into its own scope collections, and
+  # POST to the facts-ingest endpoint. It is reused because it is the only
+  # existing credential class a headless subprocess can already present; a
+  # narrower, producer-scoped credential is the right long-term fix and is
+  # out of scope here. A compromised or merely misbehaving producer under
+  # this token can do anything an admin can, not merely ingest facts —
+  # weigh that before pointing `producer` at anything you have not
+  # reviewed.
   anonymization:
     # Name of the env var holding the per-instance HMAC key — checked
     # against ITS OWN allowlist before the value is read (the name here is
