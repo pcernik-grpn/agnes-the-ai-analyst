@@ -85,6 +85,23 @@ class TestColumnMetadataRead:
         result = repo.get("orders", "nonexistent")
         assert result is None
 
+    def test_list_all_returns_rows_across_every_table(self, repo):
+        """Unlike ``list_for_table``, ``list_all`` is not scoped to one
+        ``table_id`` — needed to find rows whose ``table_id`` no longer
+        names a live ``table_registry`` row at all (Block 5 of #1707), which
+        cannot be looked up by the very id that is missing."""
+        repo.save("orders", "id", basetype="STRING")
+        repo.save("customers", "email", basetype="STRING")
+
+        rows = repo.list_all()
+        assert {(r["table_id"], r["column_name"]) for r in rows} == {
+            ("orders", "id"),
+            ("customers", "email"),
+        }
+
+    def test_list_all_empty_instance_returns_empty_list(self, repo):
+        assert repo.list_all() == []
+
 
 class TestColumnMetadataDelete:
     def test_delete_column(self, repo):

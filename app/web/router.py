@@ -8228,7 +8228,7 @@ async def admin_semantic_layer_page(
     connected sources, so a scope the picker offers is always a scope something
     is actually scored on.
     """
-    from app.api.keboola_semantic_layer_refresh import get_last_refresh_summary
+    from app.api.semantic_sources_refresh import get_last_refresh_summary
     from app.resource_types import RESOURCE_TYPES, ResourceType
     from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
@@ -8304,6 +8304,9 @@ async def admin_semantic_layer_page(
         for source in ctx["tag_sources"]
     ]
 
+    # The whole-sweep status the strip renders, and what its "Sync now"
+    # button triggers: since #1707 Block 3 step 4 there is ONE scheduled
+    # semantic refresh over every registered source, not a per-connector one.
     ctx["semantic_refresh_summary"] = get_last_refresh_summary()
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
 

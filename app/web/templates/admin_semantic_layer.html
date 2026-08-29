@@ -136,7 +136,7 @@
 
 {# No toolbar block: it renders between the head and the tab strip, where a
    lone button floats with no row to belong to. "Sync now" is an action on the
-   Keboola sync strip, so it sits there. #}
+   sync strip, so it sits there. #}
 
 {% block page %}
 {% include "_admin_tabs.html" %}
@@ -144,7 +144,7 @@
   {% set rs = semantic_refresh_summary or {} %}
   <div class="apg-strip {{ 'apg-strip--danger' if rs.last_status == 'error' }}">
     <span>
-      <strong>Keboola semantic-layer sync:</strong>
+      <strong>Semantic sources sync:</strong>
       {% if rs.last_status == 'ok' %}
         Last run {{ rs.last_completed_at }} — OK.
       {% elif rs.last_status == 'error' %}
@@ -410,10 +410,20 @@ document.getElementById("sl-refresh-btn").addEventListener("click", async () => 
   btn.disabled = true;
   btn.textContent = "Syncing…";
   try {
-    const r = await fetch("/api/admin/run-keboola-semantic-layer-refresh", { method: "POST", credentials: "include" });
+    // The ONE refresh: every registered semantic source (git/upload/
+    // connection), including the auto-migrated Keboola/Databricks ones —
+    // the per-connector endpoints this button used to post to are gone
+    // (#1707 Block 3 step 4).
+    const r = await fetch("/api/admin/run-semantic-sources-refresh", { method: "POST", credentials: "include" });
     const body = await r.json().catch(() => ({}));
     if (r.ok) {
-      showToast(`Synced: ${body.created_or_updated ?? 0} updated, ${body.pruned ?? 0} pruned`, true);
+      const failed = body.failed ?? 0;
+      showToast(
+        `Synced ${body.synced ?? 0} source(s)` +
+          (failed ? `, ${failed} failed` : "") +
+          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : ""),
+        failed === 0,
+      );
       setTimeout(() => window.location.reload(), 1200);
       return;
     }
@@ -1104,6 +1114,7 @@ function hlRender(body) {
   const mutedScopes = hlMutedScopes(body.mutes || []);
   const failedSources = (body.sources || []).filter((s) => s.last_sync_status === "error");
   const orphaned = body.orphaned_models || [];
+  const tableBindings = body.orphaned_table_bindings || [];
   const invalid = body.invalid_models || [];
   const missingDesc = body.metrics_missing_description || [];
   const dupes = body.duplicate_metric_names || [];
@@ -1111,7 +1122,13 @@ function hlRender(body) {
   const summary = body.coverage_summary || {};
 
   const nothingWrong =
-    !failedSources.length && !orphaned.length && !invalid.length && !missingDesc.length && !dupes.length && !missingRel.length;
+    !failedSources.length &&
+    !orphaned.length &&
+    !tableBindings.length &&
+    !invalid.length &&
+    !missingDesc.length &&
+    !dupes.length &&
+    !missingRel.length;
 
   const headline = hlEl(
     "p",
@@ -1140,6 +1157,18 @@ function hlRender(body) {
   hlSection(container, "Models whose source is gone", orphaned, (li, m) => {
     li.appendChild(hlEl("span", "sl-mono", m.slug || m.model_id));
     li.appendChild(document.createTextNode(` — source_ref ${m.source_ref} no longer exists`));
+  });
+
+  // Block 5 of #1707: a table delete (or a rename that landed under a new
+  // id/name) left a metric binding or profiled columns pointing at nothing.
+  hlSection(container, "Semantic objects bound to a deleted/renamed table", tableBindings, (li, f) => {
+    if (f.binding === "metric") {
+      li.appendChild(hlEl("span", "sl-mono", f.name || f.metric_id));
+      li.appendChild(document.createTextNode(` — missing table(s): ${(f.missing_tables || []).join(", ")}`));
+    } else {
+      li.appendChild(hlEl("span", "sl-mono", f.table_id));
+      li.appendChild(document.createTextNode(` — ${f.column_count} profiled column(s) orphaned`));
+    }
   });
 
   hlSection(container, "Documents that failed validation", invalid, (li, m) => {

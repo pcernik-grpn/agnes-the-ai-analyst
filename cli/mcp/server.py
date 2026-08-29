@@ -44,7 +44,7 @@ from cli.config import get_server_url, get_token
 from cli.query_hints import missing_table, remote_table_hint
 from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
 from src.duckdb_conn import _open_duckdb
-from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
 from src.remote_engines import strip_one_trailing_semicolon
 
 mcp = FastMCP(
@@ -362,11 +362,20 @@ def query(sql: str, limit: int = 1000) -> dict:
         limit: Maximum rows to return (default 1000).
 
     Returns ``{"columns": [...], "rows": [[...], ...], "truncated": bool,
-    "row_scope": {"policied_tables": [...], "note": str} | None}``.
+    "row_scope": {"policied_tables": [...], "note": str} | None,
+    "semantic_validation": {...} | None}``.
     ``row_scope`` is present when a table this query touched has an access
     policy applied — the result is YOUR scoped slice, not the whole table.
     When present, state that qualification in your answer; never present an
     aggregate over the result as an organisation-wide figure.
+
+    ``semantic_validation`` is present only when the server's semantic layer
+    has something to say about the statement — an error-severity constraint
+    violation, or a used metric with no expression for the engine that ran
+    it. Enforcement is SOFT: the rows are unaffected. Its ``warnings`` list
+    is the human-readable form; say the qualification out loud rather than
+    reporting the number alone. Check a statement up front with
+    ``agnes semantic-model validate-query "<SQL>"``.
 
     Tips:
     - Always run ``catalog()`` first to know what tables exist.
@@ -379,7 +388,11 @@ def query(sql: str, limit: int = 1000) -> dict:
         result = api_post_json("/api/query", {"sql": sql, "limit": limit})
     except V2ClientError as exc:
         raise ValueError(_mcp_error("query", exc)) from exc
-    return ensure_output_size(result, "query")
+    # Advisory-aware cap: `semantic_validation` is shortened, then dropped,
+    # before the rows are — an advisory must never fail a query that would
+    # otherwise have returned. Same helper the HTTP foundation tool uses, so
+    # a borderline result behaves identically on both transports.
+    return ensure_query_output_size(result)
 
 
 @tool(read_only=True)

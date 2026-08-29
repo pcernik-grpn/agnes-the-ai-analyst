@@ -74,6 +74,15 @@ class ColumnMetadataPgRepository(ColumnMetadataImportMixin):
             ).mappings().all()
         return [dict(r) for r in rows]
 
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Mirrors ``ColumnMetadataRepository.list_all`` — every row, across
+        every table, for orphan detection (Block 5 of #1707)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT * FROM column_metadata ORDER BY table_id, column_name")
+            ).mappings().all()
+        return [dict(r) for r in rows]
+
     def delete(self, table_id: str, column_name: str) -> bool:
         with self._engine.begin() as conn:
             row = conn.execute(

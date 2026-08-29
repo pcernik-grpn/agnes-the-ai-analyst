@@ -824,9 +824,11 @@ def project_document(
                     description=column.get("description"),
                     source=column_source,
                     # Recorded, not yet scoped on: `_prune_columns` still
-                    # prunes on `(table_id, source)` alone (see its
-                    # docstring) — this is the "small housekeeping" of
-                    # capturing the value, not a prune-scope change.
+                    # prunes on `(table_id, source)` alone, and the
+                    # precedence guard above compares `source` alone — see
+                    # `_prune_columns`'s docstring for the collision that
+                    # leaves open and why closing it is a follow-up (the
+                    # column is Postgres-only; DuckDB app-state is frozen).
                     source_ref=source_ref,
                 )
                 field_names.add(column_name)
@@ -1113,16 +1115,30 @@ def _prune_columns(
 ) -> None:
     """Prune fields dropped from a table this document still mentions.
 
-    ``column_metadata`` has no ``source_ref`` column (schema predates this
-    task and Task 7 does not migrate it), so this can only scope on
-    ``(table_id, source)`` — the finest boundary the current schema
-    supports. Two source_refs of the same ``source`` describing the exact
-    same ``table_id`` can still prune each other's fields here; that gap
-    pre-dates this task and needs a schema change to close, not a projector
-    change. It also only prunes tables the document still lists — a dataset
-    dropped from the document entirely (not just emptied of fields) leaves
-    its old columns in place, since there is no ``column_metadata`` read
-    that enumerates "every table a given source has ever written to".
+    Scoped on ``(table_id, source)`` — NOT on ``source_ref``, even though
+    Postgres now has the column (``migrations/versions/
+    0075_column_meta_source_ref.py``) and :func:`project_document` records
+    it. Reading it here would fix a live collision and open a backend
+    divergence at the same time, so it is a deliberate follow-up rather
+    than a drive-by: the frozen DuckDB app-state schema (A3) has no such
+    column and cannot gain one, so a source_ref-scoped prune only exists on
+    one backend.
+
+    The collision it leaves open, verified against this code: two writers
+    sharing a ``source`` value but not a ``source_ref`` — two registered
+    ``semantic_sources`` of the same kind (both ``ossie_git``,
+    ``src/semantic/transports.py``) or two Keboola connections (both
+    ``keboola_metastore``, ``connectors/keboola/semantic_layer.py``) —
+    whose documents describe datasets resolving to the SAME ``table_id``
+    delete each other's field rows on every sync. Same-source_ref sibling
+    models are already spared (:func:`_sibling_column_claims`); this is
+    the cross-source_ref case that read cannot see.
+
+    ``keep_by_table`` aside, this also only prunes tables the document
+    still lists — a dataset dropped from the document entirely (not just
+    emptied of fields) leaves its old columns in place, since there is no
+    ``column_metadata`` read that enumerates "every table a given source
+    has ever written to".
 
     ``keep_by_table`` spares additional columns per table — the claims of
     SIBLING models sharing this scope (:func:`_sibling_column_claims`),

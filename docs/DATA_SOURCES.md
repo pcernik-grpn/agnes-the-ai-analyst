@@ -101,7 +101,7 @@ All Keboola table names, bucket names, and source table identifiers are validate
 
 ### Semantic-layer sync (metrics & glossary)
 
-Separately from table sync, Agnes can import Keboola's business-semantic layer — metric definitions and glossary terms — into `metric_definitions` and `glossary_terms` (the `keboola-semantic-layer-refresh` job, `POST /api/admin/run-keboola-semantic-layer-refresh`).
+Separately from table sync, Agnes can import Keboola's business-semantic layer — metric definitions and glossary terms — into `metric_definitions` and `glossary_terms`. It rides the one scheduled semantic refresh (the `semantic-sources-refresh` job, `POST /api/admin/run-semantic-sources-refresh`): each connection holding a master token is registered as a `connection`-kind [semantic source](semantic-layer.md) automatically, and synced on that sweep. Rows keep the provenance they have always carried (`source='keboola_metastore'`, `source_ref=<connection id>`), so an upgrade changes nothing about what is stored — only what triggers the sync.
 
 - **Master token requirement.** This sync calls Keboola's Metastore API, which rejects any token that isn't a master (owner) Storage API token — a regular read-scoped token 400s with an opaque error. Because of this, the master token is a *separate* vault slot from the plain storage token used for table pulls.
 - **Where to set it.** Either the "Master token (semantic layer)" control on a Keboola connection's card at `/admin/data-sources`, or `agnes admin connection secret <connection_id> --kind master` (prompts for the token; never pass it on the command line). Saving runs a live `verify_token` preflight and rejects a non-master token immediately rather than failing later during sync.
@@ -462,11 +462,11 @@ Unity Catalog metric views import into the [semantic layer](semantic-layer.md)
 through the `databricks_metric_views` adapter
 (`connectors/databricks/semantic_ossie.py`), the same
 git/upload/connection pipeline every other semantic source uses — not a
-direct `metric_definitions` writer. `POST
-/api/admin/run-databricks-semantic-layer-refresh` (scheduler default: every
-6 h, `SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL`) registers the
-workspace as a `connection`-kind semantic source the first time it runs
-(fixed id `databricks_default`) and syncs it:
+direct `metric_definitions` writer. The scheduled semantic
+refresh (`POST /api/admin/run-semantic-sources-refresh`, scheduler default:
+every 6 h, `SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL`) registers a
+configured workspace as a `connection`-kind semantic source the first time it
+runs (fixed id `databricks_default`) and syncs it on every sweep after that:
 
 - enumerates metric views per configured catalog
   (`information_schema.tables`, `table_type='METRIC_VIEW'`), reads each

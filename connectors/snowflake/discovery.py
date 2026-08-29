@@ -11,9 +11,14 @@ resulting row cannot heal itself either — only a re-save re-runs the remote
 extract build — so a typo is a permanent registry entry pointing at nothing.
 
 This module is deliberately read-only and stateless: it attaches, reads
-``information_schema.tables``, and hands back a schema-grouped listing. It
-writes no extract, touches no registry, and stores no credential — the write
-side stays in ``extract_init``/the admin API.
+``information_schema``, and hands back what it found. It writes no extract,
+touches no registry, and stores no credential — the write side stays in
+``extract_init``/the admin API.
+
+Two entry points, same session shape: :func:`list_tables` (the picker's
+schema-grouped catalog listing) and :func:`probe_connection` (one row of
+metadata — the connectivity check behind
+``POST /api/admin/source-connections/{id}/test``).
 """
 
 from __future__ import annotations
@@ -40,6 +45,26 @@ logger = logging.getLogger(__name__)
 _EXCLUDED_SCHEMAS = ("INFORMATION_SCHEMA",)
 
 
+class RemoteAttachHostNotAllowed(ValueError):
+    """The resolved Snowflake host is outside
+    ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` — an operator misconfiguration,
+    raised BEFORE any session is opened, so no credential left the process.
+
+    Its own type rather than a bare ``ValueError`` because callers treat
+    this one differently from every other failure: the message names the
+    env var to fix and is passed to the admin verbatim, where a driver
+    error is classified into one generic sentence first. ``except
+    ValueError`` catches far more than this — the connector path also
+    raises ``ValueError`` for a rejected identifier and for a key that will
+    not parse, and echoing those unclassified leaks library text (and, for
+    a PEM failure, text derived from the credential itself).
+
+    Subclasses ``ValueError`` on purpose: the browse endpoint
+    (``app/api/admin_source_discovery.py``) has caught ``ValueError`` for
+    this refusal since before the type existed, and keeps working unchanged.
+    """
+
+
 def list_tables(
     schema: Optional[str] = None,
     *,
@@ -54,9 +79,10 @@ def list_tables(
     configured user can see is returned. ``attach_fn`` is a test seam mirroring
     ``extract_init.init_extract``'s.
 
-    Raises ``ValueError`` when the resolved host is outside
-    ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` — the same egress gate the extract
-    build applies, since this path ships the same credential. Any driver /
+    Raises :class:`RemoteAttachHostNotAllowed` (a ``ValueError``) when the
+    resolved host is outside ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` — the
+    same egress gate the extract build applies, since this path ships the
+    same credential. Any driver /
     catalog failure propagates to the caller (which maps it to a 502): a
     swallowed failure here would render as an empty account, and "your account
     has no tables" is a worse lie than "listing failed".
@@ -74,7 +100,7 @@ def list_tables(
         settings.get("role") or "",
     )
     if not is_attach_host_allowed(url):
-        raise ValueError(
+        raise RemoteAttachHostNotAllowed(
             f"Snowflake host {url!r} is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST; "
             "refusing to send credential while listing tables"
         )
@@ -115,6 +141,77 @@ def list_tables(
     return {
         "database": database,
         "schemas": [{"name": name, "tables": tables} for name, tables in sorted(grouped.items())],
+    }
+
+
+def probe_connection(
+    connection: Optional[dict[str, Any]] = None,
+    *,
+    attach_fn: Optional[Callable[..., None]] = None,
+) -> Optional[dict[str, str]]:
+    """Open a session against one connection's account and read one row of
+    metadata — the cheapest honest answer to "does this connection work".
+
+    ``None`` when the connection is not configured enough to open a session
+    (missing account/user/database/warehouse, or no resolvable credential)
+    — the same "nothing to talk to" answer :func:`list_tables` gives, which
+    the caller turns into a setup hint rather than an error.
+
+    ``connection`` is a ``source_connections`` row; passing it is what makes
+    "Test" report on the connection the admin clicked rather than on
+    whichever row happens to be this type's default (:func:`resolve_
+    snowflake_settings` falls back to the default row, then to the legacy
+    ``data_source.snowflake.*`` instance config, when given ``None``). No
+    new credential path: resolution, the attach URL and the egress gate are
+    the ones the extract build and the table picker already use.
+
+    Raises :class:`RemoteAttachHostNotAllowed` when the resolved host is
+    outside ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST``; any driver/auth failure
+    propagates to the caller, which classifies it. Returns the coordinates
+    the session actually reached (``account``/``database``/``warehouse``)
+    so the caller can echo WHICH account answered — a green check against
+    an account nobody meant to reach is the failure mode worth ruling out.
+
+    ``information_schema.schemata`` rather than ``.tables``: it is one row
+    per schema (bounded by tens) where ``tables`` can be millions, and
+    reading it proves the same three things — the driver loaded, the
+    credential authenticated, and the warehouse ran a query.
+    """
+    settings = resolve_snowflake_settings(connection)
+    if settings is None:
+        return None
+
+    database = settings["database"]
+    url = build_remote_attach_url(
+        settings["account"],
+        database,
+        settings["warehouse"],
+        settings["user"],
+        settings.get("role") or "",
+    )
+    if not is_attach_host_allowed(url):
+        raise RemoteAttachHostNotAllowed(
+            f"Snowflake host {url!r} is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST; "
+            "refusing to send credential while testing the connection"
+        )
+
+    attach = attach_fn or _default_attach_fn
+    conn = _open_duckdb(":memory:", read_only=False)
+    try:
+        attach(
+            conn,
+            url=url,
+            token=settings.get("password") or settings.get("private_key") or "",
+            passphrase=settings.get("private_key_passphrase") or None,
+        )
+        conn.execute(f"SELECT 1 FROM {SF_ALIAS}.information_schema.schemata LIMIT 1").fetchall()
+    finally:
+        conn.close()
+
+    return {
+        "account": settings["account"],
+        "database": database,
+        "warehouse": settings["warehouse"],
     }
 
 

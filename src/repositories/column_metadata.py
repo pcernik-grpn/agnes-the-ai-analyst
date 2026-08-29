@@ -66,6 +66,21 @@ class ColumnMetadataRepository(ColumnMetadataImportMixin):
         columns = [desc[0] for desc in self.conn.description]
         return [dict(zip(columns, row)) for row in results]
 
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Every column_metadata row, across every table — not scoped to one
+        ``table_id`` like :meth:`list_for_table`.
+
+        Needed to find rows whose ``table_id`` no longer names a live
+        ``table_registry`` row at all (Block 5 of #1707, orphaned-column
+        detection): that question cannot be asked by ``table_id``, since the
+        very id that is missing is what makes the row orphaned.
+        """
+        results = self.conn.execute("SELECT * FROM column_metadata ORDER BY table_id, column_name").fetchall()
+        if not results:
+            return []
+        columns = [desc[0] for desc in self.conn.description]
+        return [dict(zip(columns, row)) for row in results]
+
     def delete(self, table_id: str, column_name: str) -> bool:
         """Delete column metadata. Returns True if a row was deleted."""
         before = self.conn.execute(

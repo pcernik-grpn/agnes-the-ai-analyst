@@ -1122,6 +1122,13 @@ Tables in `table_registry` can be pinned to a specific connection via `connectio
 `GET …/{connection_id}/tables` lists the project's buckets with nested tables (admin-UI
 discovery helper for the /admin/data-sources add-project wizard, #755).
 
+`POST …/{connection_id}/test` branches on the row's `source_type`: `keboola` verifies
+the storage token against the stack, `snowflake` opens a session against the account
+and reads one row of metadata, and every other type answers
+`{"ok": false, "status": "unsupported", "detail": "connection test is not implemented
+for <type> yet"}`. Failure is HTTP 200 with `ok: false` throughout; only an unknown
+connection is a status code (404).
+
 - /api/admin/source-connections
 - /api/admin/source-connections/{connection_id}
 - /api/admin/source-connections/{connection_id}/secret
@@ -1419,8 +1426,7 @@ CLI: `agnes admin semantic coverage tables [--limit N] [--json]`. MCP:
 
 `POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every
 55 minutes) drafts a semantic model for up to a handful of uncovered tables
-(`tables_without_semantic_coverage`, filtered on `table_registry.
-semantic_draft_pending_at IS NULL`) per tick via a headless
+(`tables_without_semantic_coverage`) per tick via a headless
 `semantic-model-builder` chat session, authenticated as the non-admin
 `semantic-drafter@system.local` system identity so every draft lands in the
 `authoring_suggestions` moderation queue exactly like a human-submitted
@@ -1428,19 +1434,32 @@ proposal — never applied directly. Each selected table's
 `semantic_draft_pending_at` is stamped before its session is invoked (not
 after), so a table can never be double-picked by an overlapping tick; the
 flag clears when an admin resolves the resulting suggestion, approve or
-reject alike. A session hitting the chat manager's concurrency cap is
-counted and skipped, never a 500 — and its stamp is cleared again on the
-way out, since the cap is enforced before the session starts, so no
-suggestion would ever exist to clear it and the table would otherwise be
-excluded from every future sweep permanently. Any OTHER failure from a
-table's session is handled the same way and for the same reason (counted
-in `errored`): the table is un-stamped, logged, and the sweep continues to
-the next table rather than letting one transient error 500 the whole tick
-and abandon the rest of the batch.
+reject alike.
 
-Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
-"errored", "remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
-same class as the `/api/admin/run-*` jobs below.
+A table is a candidate again once its stamp is **older than 7 days**
+(`_SWEEP_STAMP_RETRY_AFTER_S`), and never-stamped tables are drafted ahead
+of stale-stamped ones. So a session that ran but filed nothing keeps its
+stamp and retries about once a week instead of on the very next tick — a
+handful of repeatedly-declined tables can no longer hold the whole batch
+and starve everything behind them. A session whose wait hits the per-table
+timeout also keeps its stamp (counted in `timed_out`, not `no_apply_call`):
+the sandbox keeps working on that turn after the sweep stops waiting, so the
+suggestion may still arrive, and un-stamping would re-draft the same table
+on every following tick.
+
+A session hitting the chat manager's concurrency cap is counted and
+skipped, never a 500 — and its stamp *is* cleared again on the way out,
+since the cap is enforced before the session starts, so that session
+provably never ran and cannot file anything later. Any OTHER failure from a
+table's session is handled the same way (counted in `errored`): the table is
+un-stamped, logged, and the sweep continues to the next table rather than
+letting one transient error 500 the whole tick and abandon the rest of the
+batch.
+
+Returns `{"triggered", "applied", "no_apply_call", "timed_out",
+"skipped_cap", "errored", "remaining"}`. No CLI/MCP surface —
+scheduler/admin maintenance trigger, same class as the `/api/admin/run-*`
+jobs below.
 
 Postgres app-state only (A3 PG-first ratchet — the dedup column is a
 Postgres-only addition, no DuckDB migration step exists for it): on a
@@ -1703,7 +1722,8 @@ search/export) via the pure `src.semantic_validation.validate_query` engine:
 an `error`-severity constraint violation sets `valid: false`; a rule that
 cannot be checked statically degrades to `post_execution_checks`, never a
 guessed violation; a used metric whose only expressions target another
-engine sets `locally_executable: false`. With zero accessible valid models
+engine sets `locally_executable: false` and is named in
+`not_executable_metrics`. With zero accessible valid models
 the response is `{"available": false, "error": "no_semantic_model", ...}`
 rather than a misleading all-clear. CLI: `agnes semantic-model
 validate-query "<SQL>" [--expect JSON] [--target-engine duckdb] [--json]`
@@ -1755,15 +1775,14 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-blocked-purge
 - /api/admin/run-bq-metadata-refresh
 - /api/admin/run-corporate-memory
-- /api/admin/run-databricks-semantic-layer-refresh
 - /api/admin/run-jira-consistency-check
 - /api/admin/run-jira-sla-poll
-- /api/admin/run-keboola-semantic-layer-refresh
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
@@ -2194,7 +2213,7 @@ analogue) drive the in-chat split-pane preview iframe on top of this grant.
 ### `/api/glossary` — Keboola-imported business-term glossary (user-facing)
 
 Read/search over `glossary_terms`, populated by the Keboola semantic-layer
-importer (`keboola-semantic-layer-refresh` job) — see
+importer (on the `semantic-sources-refresh` sweep) — see
 `docs/superpowers/specs/2026-07-17-keboola-glossary-import-design.md`.
 Relevance-ranked search uses DuckDB FTS BM25 with an ILIKE fallback.
 
