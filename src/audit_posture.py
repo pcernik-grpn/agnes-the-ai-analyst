@@ -767,6 +767,15 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.data_apps_proxy --
     "GET /api/data-apps-tls-check": "exempt:health",
     "GET /apps/{slug}": "exempt:ui_support",
+    # High-frequency asset-fetch catch-all — stays exempt on purpose, even
+    # though a subdomain-routed request lands on this SAME route template
+    # after `DataAppSubdomainMiddleware` rewrites the path. That middleware
+    # already writes its own windowed `data_app.access` row directly (Wave 2
+    # — Task 3, see app/data_apps_subdomain.py) BEFORE routing, independent
+    # of this map. Declaring "data_app.access" here instead would make the
+    # read-path fallback re-emit an UNWINDOWED row on every within-window
+    # repeat and on every direct (non-subdomain) `/apps/<slug>/...` hit,
+    # defeating the whole point of the TTL dedup.
     "GET /apps/{slug}/{path:path}": "exempt:noise",
     # -- app.api.data_packages --
     "GET /api/admin/data-packages": "exempt:ui_support",
@@ -1168,11 +1177,12 @@ READ_SELF_AUDITING: frozenset[str] = frozenset(
 # WebSocket would mean either wiring generic ASGI interception here (risky to
 # get right for 5 disparate handlers sight-unseen) or editing each handler
 # directly (out of this task's file list; Task 3 does exactly this for
-# `notifications.ws_connect`/`ws_rejected` on `app/api/notifications_ws.py`).
-# So every entry below is `exempt:<reason>` even where the underlying traffic
-# would, by the policy above, deserve a real action -- most notably
-# `/admin/chat/{chat_id}/tail`, which streams ANOTHER user's live chat debug
-# log to an admin and currently writes nothing for the content-viewing event
+# `notifications.ws_connect`/`ws_rejected` on `app/api/notifications_ws.py` --
+# that entry below carries the real action since the handler emits it itself,
+# independent of this map). Every OTHER entry is `exempt:<reason>` even where
+# the underlying traffic would, by the policy above, deserve a real action --
+# most notably `/admin/chat/{chat_id}/tail`, which streams ANOTHER user's live
+# chat debug log to an admin and currently writes nothing for the content-viewing event
 # itself (only the ticket ISSUANCE, a separate POST, is audited, as
 # `chat.session.tail_ticket_issue`). Flagged here rather than silently folded
 # into "noise" -- a real follow-up (generic WS-aware middleware, or a bespoke
@@ -1195,8 +1205,10 @@ WS_POSTURE: dict[str, str] = {
     "WS /api/mcp": "exempt:noise",
     "WS /api/mcp/http": "exempt:noise",
     # -- app.api.notifications_ws -------------------------------------------------
-    # Caller's own notification channel; Task 3 adds real connect/reject actions.
-    "WS /api/notifications/ws": "exempt:self",
+    # Caller's own notification channel. Task 3 wired the real connect/reject
+    # emission (`notifications.ws_connect` / `notifications.ws_rejected`) directly
+    # in the handler, so this is a declared action, not an exemption.
+    "WS /api/notifications/ws": "notifications.ws_connect",
     # -- app.api.data_apps_proxy --------------------------------------------------
     # Proxied data-app traffic bridge. Task 3's throttled `data_app.access` at the
     # SUBDOMAIN ingress (`app/data_apps_subdomain.py`) is the intended
