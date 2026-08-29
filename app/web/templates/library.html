@@ -132,6 +132,14 @@
                    into this went with the three-way segment it fed.) #}
                 data-stack="{{ c.stack_state }}"
                 data-tag="{{ c.tags | join('|') }}"
+                {# Cumulative recency buckets as a SET, so "Last 30 days" matches
+                   everything inside 30 days rather than a 23-day slice (see
+                   `age_buckets` in the router). Empty when we do not know when
+                   the row arrived, which is never a match — better than guessing. #}
+                data-age="{{ c.age_buckets | join('|') }}"
+                {# Rendered on file rows since the Type column was retired; a
+                   facet reads it now instead of it being decoration. #}
+                data-format="{{ c.file_format or '' }}"
                 data-owner="{{ c.owner_key }}"
                 data-name="{{ c.title|lower }}"
                 data-added="{{ c.added_iso or '' }}"
@@ -291,7 +299,7 @@
                          `file_format` is "" for a file with no readable extension,
                          which falls through to the description rather than leaving
                          the line blank. #}
-                      <span class="lib-name-desc">{% if c.is_folder %}{{ c.meta_text }}{% elif c.file_format %}{{ c.file_format }}{% else %}{{ c.description }}{% endif %}</span>
+                      <span class="lib-name-desc">{% if c.is_folder %}{{ c.meta_text }}{% elif c.file_format %}{{ c.file_format }}{% else %}{{ c.description }}{% endif %}</span>{% if c.ingest_label %}<span class="lib-ingest">{{ c.ingest_label }}</span>{% endif %}
                     </span>
                   </a>
                   {% if c.is_folder %}
@@ -627,11 +635,13 @@
      header, with the notices then keeping their own tighter 10px rhythm. */
   /* Contextual guidance, so it sits at the weight of a note rather than of a
      hero: the same banner, scaled back and pulled in tight. */
-  .lib-connect--head { margin: 10px 0 0; padding-bottom: 0; }
-  .library-page .lib-connect--head .cbn { padding: 10px 14px; border-radius: 10px; }
-  .library-page .lib-connect--head .cbn h3,
-  .library-page .lib-connect--head .cbn strong { font-size: 13.5px; }
-  .library-page .lib-connect--head .cbn p { font-size: 12.5px; }
+  /* Below the list, with room above it so it reads as a separate offer rather
+     than as the last row of the table. */
+  .lib-connect--foot { margin: 28px 0 0; }
+  .library-page .lib-connect--foot .cbn { padding: 10px 14px; border-radius: 10px; }
+  .library-page .lib-connect--foot .cbn h3,
+  .library-page .lib-connect--foot .cbn strong { font-size: 13.5px; }
+  .library-page .lib-connect--foot .cbn p { font-size: 12.5px; }
   .lib-head h1 { font-size: 22px; margin: 0 0 2px; display: flex; align-items: center; gap: 10px; }
   /* Metadata, not a subtitle: it states the size of the thing and gets out of
      the way. */
@@ -754,6 +764,18 @@
      do to a row" line up instead of both floating mid-row. The hairline is
      gone with it: the gap does that job now. */
   .library-page .lib-new { margin-left: auto; }
+
+    /* A file whose text the extraction pass could not read. It sits on the
+       second line because it answers the same question as the format ("what is
+       this row, really") and because a file nobody can search is worth seeing
+       without opening the collection — but it is a NOTE, not a status pill:
+       the row is still a normal row, only one of its promises is unmet. */
+    .lib-ingest {
+      margin-left: 0.5rem;
+      padding-left: 0.5rem;
+      border-left: 1px solid var(--ds-border);
+      color: var(--ds-warn-ink);
+    }
   .library-page .lib-new__btn { height: 32px; font-size: 13px; }
 
   /* Chips: the detail behind the Filter badge, so they read as a caption on the
@@ -1994,16 +2016,6 @@
          moved here whole rather than being duplicated. #}
     </div>
   </div>
-  {# The connect invitation sits between the page title and the tabs — above the
-     split, because it is about the Library as a whole rather than about either
-     half of it. It rides INSIDE the sticky header, so it is also the one part of
-     that header a reader keeps on screen while scrolling; if that ever costs too
-     much viewport, the fix is to pin only the controls-and-tabs row and let the
-     title and this banner scroll away. #}
-  <div class="lib-connect lib-connect--head">
-    {{ connect_banner('bar', cta_href='/how-it-works#connect',
-         copy='Connect your AI tools to give them access to the same knowledge.') }}
-  </div>
 
   {# ── The two questions this page answers ──────────────────────────────
      "What does this organization know" and "what can my agent do" were one
@@ -2157,11 +2169,17 @@
           {% if library_available_count %}
           <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not in stack yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
           {% endif %}
-          {% set _cats = [
-               ('requirement', 'Access', library_requirements),
+          {# Ordered by the question each answers, commonest first. A category with
+               fewer than two values does not render at all, so this list is the
+               menu's ceiling rather than its content. #}
+            {% set _cats = [
                ('tag', 'Tags', library_tags),
+               ('age', 'Added', library_ages),
+               ('ownership', 'Yours or shared', library_ownerships),
                ('owner', 'Owner', library_owners),
                ('origin', 'Source', library_origins),
+               ('format', 'File format', library_formats),
+               ('requirement', 'Access', library_requirements),
              ] %}
           {% for facet_key, cat_label, options in _cats %}
           {% if options %}
@@ -2668,6 +2686,17 @@
     </div>
   </div>
 </div>
+
+
+  {# The connect invitation closes the page. It is a standing call to action,
+     not a step in reading the Library — above the list it was ~90px of promo
+     between the title and the first row on every visit, and it out-ranked the
+     page's own subject. Here it is the thing you meet once you have finished
+     looking, which is when "take this with you" is worth reading. #}
+  <div class="lib-connect lib-connect--foot">
+    {{ connect_banner('bar', cta_href='/how-it-works#connect',
+         copy='Connect your AI tools to give them access to the same knowledge.') }}
+  </div>
 
 {% endblock %}
 
@@ -3285,6 +3314,10 @@
         { key: 'availability', attr: 'data-stack', label: 'Not in stack yet', toggle: true },
         { key: 'requirement', attr: 'data-requirement', label: 'Access' },
         { key: 'tag', attr: 'data-tag', label: 'Tag', multi: true },
+        // `multi` because the recency buckets are cumulative sets on the row.
+        { key: 'age', attr: 'data-age', label: 'Added', multi: true },
+        { key: 'ownership', attr: 'data-ownership', label: 'Yours or shared' },
+        { key: 'format', attr: 'data-format', label: 'File format' },
         { key: 'owner', attr: 'data-owner', label: 'Owner' },
         { key: 'origin', attr: 'data-origin', label: 'Source' },
       ],

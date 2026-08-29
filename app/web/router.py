@@ -2466,6 +2466,7 @@ async def library_page(
             # description every file shared word for word. A collection prints its
             # file count there instead, so it needs none.
             row["file_format"] = "" if is_folder else _artefact_format(first_file)
+            row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2516,6 +2517,12 @@ async def library_page(
                     # nested rows are files too, and the retired Type column is
                     # where their format used to show.
                     child["file_format"] = _artefact_format(f)
+                    # Whether the extraction pass actually got text out of this
+                    # file. Only surfaced when it is NOT `indexed`: a healthy
+                    # file saying "indexed" on every row is noise, but a file
+                    # nobody can search is worth knowing about without opening
+                    # the collection page to find it.
+                    child["ingest_label"] = _ingest_label(f)
                     child["file_id"] = f["id"]
                     child["file_name"] = f.get("filename") or ""
                     child["slug"] = slug or ""
@@ -3342,6 +3349,52 @@ async def library_page(
     # addable. Zero means the toggle doesn't render: no dead filters.
     library_available_count = sum(1 for c in items if c.get("stack_state") == "available")
 
+    #: Recency, as a facet rather than only a sort. "What arrived this week" is
+    #: the question a growing library gets asked most, and `data-added` could
+    #: only ever answer it by sorting — which shows you the newest row but not
+    #: how many are new. The buckets are CUMULATIVE and stored as a set on the
+    #: row (`7d|30d|90d`), so picking "Last 30 days" matches everything inside
+    #: 30 days rather than a 23-day slice; the engine's `multi` mode does the
+    #: containment test. A row with no date carries nothing and is simply never
+    #: matched, which is honest — we do not know when it arrived.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _now = _dt.now(_tz.utc)
+    _age_labels = [("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30), ("90d", "Last 90 days", 90)]
+    _age_counts: dict = {}
+    for c in items:
+        iso = c.get("added_iso")
+        buckets = []
+        if iso:
+            try:
+                when = _dt.fromisoformat(iso)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_tz.utc)
+                age = _now - when
+                buckets = [key for key, _lbl, days in _age_labels if age <= _td(days=days)]
+            except ValueError:
+                buckets = []
+        c["age_buckets"] = buckets
+        for b in buckets:
+            _age_counts[b] = _age_counts.get(b, 0) + 1
+    library_ages = [(k, lbl, _age_counts[k]) for k, lbl, _d in _age_labels if _age_counts.get(k)]
+
+    #: How the caller relates to the row, which is a different question from
+    #: Owner (a *who*). Retired with the three-way Scope segment; it was the one
+    #: part of that control worth keeping, because "things I made" and "things
+    #: shared with me" are separate piles in everyone's head.
+    _OWNERSHIP_LABELS = {
+        "mine": "Created by you",
+        "shared_by_me": "Shared by you",
+        "shared_with_me": "Shared with you",
+    }
+    _own_counts: dict = {}
+    for c in items:
+        k = c.get("ownership")
+        if k in _OWNERSHIP_LABELS:
+            _own_counts[k] = _own_counts.get(k, 0) + 1
+    library_ownerships = [(k, lbl, _own_counts[k]) for k, lbl in _OWNERSHIP_LABELS.items() if _own_counts.get(k)]
+
     # Tags are multi-valued per row, so they need their own tally.
     tag_counts: dict = {}
     for c in items:
@@ -3560,6 +3613,15 @@ async def library_page(
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
+        #: The kind. Left out for a long time because "the list is already
+        #: GROUPED by type into these very sections" — true of one flat list of
+        #: eight kinds, but a tab now holds several and grouping is not
+        #: filtering: it tells you where a kind is, not how to see only it.
+        #: File formats, from the rows that have one. Rendered on every file row
+        #: already and filterable by nothing until now.
+        library_formats=_present("file_format", "file_format"),
+        library_ownerships=library_ownerships,
+        library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
         # Band to open on arrival — a detail page's back link returns here as
@@ -4629,6 +4691,25 @@ async def catalog_recipe_detail(
         related_tables=related_tables,
     )
     return templates.TemplateResponse(request, "catalog_recipe_detail.html", ctx)
+
+
+# What a file's extraction state is CALLED on a Library row. `indexed` is
+# deliberately absent: a healthy file is the overwhelming majority, and a row
+# that says "indexed" on every line spends the slot on the one value that
+# carries no information. Absence means fine; a label means look.
+_INGEST_LABELS = {
+    "pending": "Not indexed yet",
+    "processing": "Indexing",
+    "needs_review": "Needs review",
+    "rejected": "Not indexed",
+}
+
+
+def _ingest_label(f: dict | None) -> str:
+    """The row-level note for a file whose text your agents cannot search yet."""
+    if not f:
+        return ""
+    return _INGEST_LABELS.get(f.get("processing_status") or "", "")
 
 
 def _human_size(n: int) -> str:

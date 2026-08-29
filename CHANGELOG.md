@@ -182,6 +182,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The Library filter menu answers more than "who owns it".** It offered
+  Owner, Source, Access and a Tags category that is empty for every collection,
+  file, app and recipe (`file_corpora` has no tags column), so past a screenful
+  the only working narrowing was search. Three categories join it, each read off
+  data the rows already carry: **Added** (last 7 / 30 / 90 days, cumulative, so
+  the buckets nest instead of excluding each other), **Yours or shared**
+  (created by you · shared by you · shared with you) and **File format**. A
+  category with fewer than two distinct values still does not render, so the
+  menu grows only where the data does. A file whose text the extraction pass
+  could not read now says so on its own row — *Not indexed yet* / *Indexing* /
+  *Needs review* / *Not indexed*, and nothing at all when it is indexed, which
+  is the majority — instead of only being discoverable by opening its
+  collection.
 - **The Library is two tabs, and every row's button says what it does.**
   `/library` was one flat list answering two different questions — *what does
   this organization know* and *what can my agent do* — and a single control
