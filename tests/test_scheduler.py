@@ -1,7 +1,6 @@
 """Tests for src.scheduler - schedule parsing and sync-due evaluation."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import pytest
 
@@ -11,6 +10,7 @@ from src.scheduler import (
     _parse_timestamp,
     is_table_due,
     is_valid_schedule,
+    next_due_at,
     parse_interval_minutes,
 )
 
@@ -427,49 +427,57 @@ class TestLLMPipelineCadenceEnvVars:
         """Defaults are 10m / 15m / 17m so the three jobs don't fire on the same tick."""
         _clear_scheduler_env(monkeypatch)
         from services.scheduler.__main__ import build_jobs
+
         jobs = {name: schedule for name, schedule, *_ in build_jobs()}
-        assert jobs["session-collector"]     == "every 10m"
+        assert jobs["session-collector"] == "every 10m"
         assert jobs["session-processor:verification"] == "every 15m"
-        assert jobs["corporate-memory"]      == "every 17m"
+        assert jobs["corporate-memory"] == "every 17m"
 
     def test_session_collector_env_override_changes_cadence(self, monkeypatch) -> None:
         _clear_scheduler_env(monkeypatch)
         monkeypatch.setenv("SCHEDULER_SESSION_COLLECTOR_INTERVAL", "300")  # 5m
         from services.scheduler.__main__ import build_jobs
+
         jobs = {name: schedule for name, schedule, *_ in build_jobs()}
         assert jobs["session-collector"] == "every 5m"
         # Other LLM jobs must be unaffected.
         assert jobs["session-processor:verification"] == "every 15m"
-        assert jobs["corporate-memory"]      == "every 17m"
+        assert jobs["corporate-memory"] == "every 17m"
 
     def test_verification_detector_env_override_changes_cadence(self, monkeypatch) -> None:
         _clear_scheduler_env(monkeypatch)
         monkeypatch.setenv("SCHEDULER_VERIFICATION_DETECTOR_INTERVAL", "600")  # 10m
         from services.scheduler.__main__ import build_jobs
+
         jobs = {name: schedule for name, schedule, *_ in build_jobs()}
         assert jobs["session-processor:verification"] == "every 10m"
         assert jobs["session-collector"] == "every 10m"
-        assert jobs["corporate-memory"]  == "every 17m"
+        assert jobs["corporate-memory"] == "every 17m"
 
     def test_corporate_memory_env_override_changes_cadence(self, monkeypatch) -> None:
         _clear_scheduler_env(monkeypatch)
         monkeypatch.setenv("SCHEDULER_CORPORATE_MEMORY_INTERVAL", "1800")  # 30m
         from services.scheduler.__main__ import build_jobs
+
         jobs = {name: schedule for name, schedule, *_ in build_jobs()}
-        assert jobs["corporate-memory"]      == "every 30m"
-        assert jobs["session-collector"]     == "every 10m"
+        assert jobs["corporate-memory"] == "every 30m"
+        assert jobs["session-collector"] == "every 10m"
         assert jobs["session-processor:verification"] == "every 15m"
 
-    @pytest.mark.parametrize("var", [
-        "SCHEDULER_SESSION_COLLECTOR_INTERVAL",
-        "SCHEDULER_VERIFICATION_DETECTOR_INTERVAL",
-        "SCHEDULER_CORPORATE_MEMORY_INTERVAL",
-    ])
+    @pytest.mark.parametrize(
+        "var",
+        [
+            "SCHEDULER_SESSION_COLLECTOR_INTERVAL",
+            "SCHEDULER_VERIFICATION_DETECTOR_INTERVAL",
+            "SCHEDULER_CORPORATE_MEMORY_INTERVAL",
+        ],
+    )
     @pytest.mark.parametrize("bad", ["0", "-5", "abc", ""])
     def test_invalid_llm_env_rejected(self, monkeypatch, var, bad) -> None:
         _clear_scheduler_env(monkeypatch)
         monkeypatch.setenv(var, bad)
         from services.scheduler.__main__ import build_jobs
+
         with pytest.raises(ValueError):
             build_jobs()
 
@@ -494,6 +502,7 @@ class TestVerificationDetectorGraceFollowsCadence:
     def test_grace_uses_default_cadence_when_env_unset(self, monkeypatch) -> None:
         _clear_scheduler_env(monkeypatch)
         from app.api.health import _verification_detector_grace_seconds
+
         # Default cadence 900s -> grace 1800s.
         assert _verification_detector_grace_seconds() == 2 * 900
 
@@ -511,18 +520,26 @@ class TestRunJobBookkeeping:
 
     def _setup(self):
         import threading
+
         last_run: dict[str, str | None] = {"verification": None}
         in_flight: set[str] = {"verification"}
         return last_run, in_flight, threading.Lock()
 
     def test_advances_last_run_on_success(self, monkeypatch):
         from services.scheduler import __main__ as sched
+
         last_run, in_flight, lock = self._setup()
         monkeypatch.setattr(sched, "_call_api", lambda *a, **kw: True)
 
         sched._run_job(
-            "verification", "/api/admin/run-x", "POST", 60, "2026-01-01T00:00:00",
-            last_run, in_flight, lock,
+            "verification",
+            "/api/admin/run-x",
+            "POST",
+            60,
+            "2026-01-01T00:00:00",
+            last_run,
+            in_flight,
+            lock,
         )
         assert last_run["verification"] == "2026-01-01T00:00:00"
         assert "verification" not in in_flight
@@ -531,12 +548,19 @@ class TestRunJobBookkeeping:
         """Permanently-failing jobs must NOT hot-loop every tick — last_run
         advances even when _call_api returns False."""
         from services.scheduler import __main__ as sched
+
         last_run, in_flight, lock = self._setup()
         monkeypatch.setattr(sched, "_call_api", lambda *a, **kw: False)
 
         sched._run_job(
-            "verification", "/api/admin/run-x", "POST", 60, "2026-01-01T00:00:00",
-            last_run, in_flight, lock,
+            "verification",
+            "/api/admin/run-x",
+            "POST",
+            60,
+            "2026-01-01T00:00:00",
+            last_run,
+            in_flight,
+            lock,
         )
         assert last_run["verification"] == "2026-01-01T00:00:00"
         assert "verification" not in in_flight
@@ -547,6 +571,7 @@ class TestRunJobBookkeeping:
         could still bubble. The finally block must release in_flight either
         way, otherwise the processor wedges until container restart."""
         from services.scheduler import __main__ as sched
+
         last_run, in_flight, lock = self._setup()
 
         def _boom(*a, **kw):
@@ -556,8 +581,14 @@ class TestRunJobBookkeeping:
 
         with pytest.raises(RuntimeError):
             sched._run_job(
-                "verification", "/api/admin/run-x", "POST", 60, "2026-01-01T00:00:00",
-                last_run, in_flight, lock,
+                "verification",
+                "/api/admin/run-x",
+                "POST",
+                60,
+                "2026-01-01T00:00:00",
+                last_run,
+                in_flight,
+                lock,
             )
         # Even on raise, bookkeeping ran.
         assert last_run["verification"] == "2026-01-01T00:00:00"
@@ -594,7 +625,8 @@ class TestRunLoopParallelism:
         monkeypatch.setattr(sched, "_call_api", slow_call)
         # Force a single short-cadence job + short tick.
         monkeypatch.setattr(
-            sched, "build_jobs",
+            sched,
+            "build_jobs",
             lambda: [("test-job", "every 1m", "/api/test", "POST", 60)],
         )
         monkeypatch.setattr(sched, "resolved_tick_seconds", lambda: 0)
@@ -730,10 +762,13 @@ class TestJiraSelfHealingJobs:
         assert jobs["jira-consistency-check"] == "every 1h"
         assert jobs["jira-sla-poll"] == "every 45m"
 
-    @pytest.mark.parametrize("var", [
-        "SCHEDULER_JIRA_SLA_POLL_INTERVAL",
-        "SCHEDULER_JIRA_CONSISTENCY_INTERVAL",
-    ])
+    @pytest.mark.parametrize(
+        "var",
+        [
+            "SCHEDULER_JIRA_SLA_POLL_INTERVAL",
+            "SCHEDULER_JIRA_CONSISTENCY_INTERVAL",
+        ],
+    )
     @pytest.mark.parametrize("bad", ["0", "-5", "abc", ""])
     def test_invalid_jira_env_rejected(self, monkeypatch, var, bad) -> None:
         _clear_scheduler_env(monkeypatch)
@@ -928,3 +963,56 @@ class TestIsTableDueCron:
         now = datetime(2030, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
         last_sync = datetime(2028, 2, 29, 0, 0, 0, tzinfo=timezone.utc).isoformat()
         assert is_table_due("cron 0 0 29 2 *", last_sync_iso=last_sync, now=now) is False
+
+
+# ---------------------------------------------------------------------------
+# next_due_at — display-only "next scheduled run" estimate (TCRD-226).
+# Never used to gate an actual dispatch decision (is_table_due, called fresh
+# at dispatch time, stays the single source of truth for that); this is a UI
+# hint only.
+# ---------------------------------------------------------------------------
+
+
+class TestNextDueAtInterval:
+    def test_never_run_is_due_now(self) -> None:
+        assert next_due_at("every 15m", None, now=NOW) == NOW
+
+    def test_adds_the_interval_to_last_run(self) -> None:
+        last = (NOW - timedelta(minutes=5)).isoformat()
+        assert next_due_at("every 15m", last, now=NOW) == NOW + timedelta(minutes=10)
+
+    def test_hour_interval(self) -> None:
+        last = NOW.isoformat()
+        assert next_due_at("every 2h", last, now=NOW) == NOW + timedelta(hours=2)
+
+
+class TestNextDueAtDaily:
+    def test_next_time_today_when_still_ahead(self) -> None:
+        # NOW is 12:00 UTC; "daily 18:00" hasn't fired yet today.
+        assert next_due_at("daily 18:00", NOW.isoformat(), now=NOW) == NOW.replace(
+            hour=18, minute=0, second=0, microsecond=0
+        )
+
+    def test_rolls_to_tomorrow_when_today_already_passed(self) -> None:
+        # "daily 03:00" already passed at 12:00 — next fire is tomorrow.
+        expected = (NOW + timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
+        assert next_due_at("daily 03:00", NOW.isoformat(), now=NOW) == expected
+
+    def test_multiple_times_picks_the_earliest_upcoming(self) -> None:
+        # 12:00 now; "daily 03:00,15:00,20:00" → the next is 15:00 today.
+        expected = NOW.replace(hour=15, minute=0, second=0, microsecond=0)
+        assert next_due_at("daily 03:00,15:00,20:00", NOW.isoformat(), now=NOW) == expected
+
+
+class TestNextDueAtUnsupported:
+    def test_cron_returns_none(self) -> None:
+        """No general next-occurrence solver for cron — display degrades to
+        "no estimate" rather than a wrong guess; is_table_due is unaffected."""
+        assert next_due_at("cron 0 5 * * 1", None, now=NOW) is None
+
+    def test_invalid_schedule_returns_none(self) -> None:
+        assert next_due_at("not-a-schedule", None, now=NOW) is None
+
+    def test_empty_schedule_returns_none(self) -> None:
+        assert next_due_at("", None, now=NOW) is None
+        assert next_due_at(None, None, now=NOW) is None

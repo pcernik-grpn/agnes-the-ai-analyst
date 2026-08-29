@@ -2182,17 +2182,23 @@ def _is_truthy_env(name: str) -> bool:
 
 
 def _debug_enabled() -> bool:
-    """Whether the FastAPI debug toolbar is mounted.
+    """Whether the FastAPI debug toolbar is mounted. Opt-in via ``DEBUG`` only.
 
-    LOCAL_DEV_MODE (auth-bypassed dev) implies DEBUG so operators needn't set
-    both. But an *explicit* DEBUG env wins either way — set ``DEBUG=0`` to run
-    local-dev WITHOUT the toolbar, whose per-request instrumentation
-    (incl. the compose healthcheck) can peg CPU on heavy HTML pages.
+    ``LOCAL_DEV_MODE`` (auth-bypassed dev) used to imply DEBUG, so an operator
+    needn't set both. That convenience cost far more than it saved: the
+    toolbar's per-request instrumentation (incl. the compose healthcheck) pegs
+    CPU on heavy HTML pages, and the local-dev command everyone runs sets
+    LOCAL_DEV_MODE. ``/library`` — the heaviest template in the product — took
+    MINUTES to answer while ``/api/version`` stayed instant, which reads as a
+    database or template fault rather than a middleware one (TCRD-247 was
+    filed, and first diagnosed, against schema healing on that evidence).
+
+    A profiler that attaches itself because a *different* flag is set is a trap
+    whatever its default, so the toolbar is now armed only by ``DEBUG`` being
+    explicitly truthy. Local dev with the toolbar is ``DEBUG=1 LOCAL_DEV_MODE=1``
+    — which is what ``docs/development.md`` has always documented.
     """
-    raw = os.environ.get("DEBUG")
-    if raw is not None and raw.strip() != "":
-        return _is_truthy_env("DEBUG")
-    return _is_truthy_env("LOCAL_DEV_MODE")
+    return _is_truthy_env("DEBUG")
 
 
 DEBUG = _debug_enabled()
