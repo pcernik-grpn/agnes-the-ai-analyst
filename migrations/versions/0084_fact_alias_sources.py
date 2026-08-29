@@ -27,8 +27,8 @@ both operations), so this table needs no matching UPDATE — it stays
 correctly associated for free. A fully orphaned fact (``sweep_orphans``)
 cascades away its aliases and, through this FK, their provenance too.
 
-Revision ID: 0083_fact_alias_sources
-Revises: 0082_session_revoked_before
+Revision ID: 0084_fact_alias_sources
+Revises: 0083_ingest_runs_source_urls
 Create Date: 2026-08-29
 """
 
@@ -39,8 +39,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0083_fact_alias_sources"
-down_revision: Union[str, None] = "0082_session_revoked_before"
+revision: str = "0084_fact_alias_sources"
+down_revision: Union[str, None] = "0083_ingest_runs_source_urls"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
