@@ -866,6 +866,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "a silent publish."
             ),
         },
+        "store_moderation_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "store_moderation_enabled", False),
+            "hint": (
+                "The Moderation & Trust hub (/admin/store), its nav row, its "
+                "command-palette row and the `g v` shortcut. OFF by default: each "
+                "of its three zones has a nearer door — Submissions is its own nav "
+                "row, curation is /admin/marketplaces, and verification has its own "
+                "store.verification_enabled — so the hub was a landing page for "
+                "links the column already carries. Hides UI only: the store APIs "
+                "and /api/admin/share-requests* keep serving, so a queued agent "
+                "share stays decidable by API."
+            ),
+        },
     },
     "mcp": {
         "allow_query_param_token": {
@@ -7746,6 +7760,7 @@ def run_corporate_memory(
     audit_params: dict = {
         "items_new": stats.get("items_new", 0),
         "items_filtered": stats.get("items_filtered", 0),
+        "items_duplicate_skipped": stats.get("items_duplicate_skipped", 0),
         "items_db_inserted": stats.get("items_db_inserted", 0),
         "items_db_updated": stats.get("items_db_updated", 0),
         "items_db_errors": stats.get("items_db_errors", 0),

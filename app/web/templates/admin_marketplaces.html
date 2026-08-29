@@ -1,8 +1,8 @@
 {% extends "base_admin_page.html" %}
-{% block title %}Curated Marketplaces — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}Marketplaces — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% set page_hero_eyebrow = "Agent Experience" %}
-{% set page_hero_title = "Curated Marketplaces" %}
+{% set page_hero_title = "Marketplaces" %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = "Admin-managed git repos cloned nightly. Synced plugins surface in the Claude Code marketplace feed." %}
 
@@ -599,7 +599,17 @@ function renderMarketplaces() {
             : `<span class="mp-muted">0</span>`}</td>
       <td class="date-cell">${lastSync}</td>
       <td class="mp-sha">${m.last_commit_sha ? esc(shortSha(m.last_commit_sha)) : `<span class="mp-muted">—</span>`}</td>
-      <td><span class="mp-token-dot ${m.has_token ? "has-token" : ""}" title="${m.has_token ? "Authenticated (PAT present in environment)" : "Public / no token"}"></span></td>
+      <td>
+        {# TCRD-230: a bare yes/no dot made a PAT rotation an unattributable
+           fleet-wide sync failure — show the env var name and who saved the
+           token, when the audit trail still remembers. Never the value. #}
+        <span class="mp-token-dot ${m.has_token ? "has-token" : ""}" title="${m.has_token
+            ? esc(`Authenticated via ${m.token_env || "PAT"}${m.token_set_by ? ` — set by ${m.token_set_by}` : ""}${m.token_set_at ? ` on ${fmtDate(m.token_set_at)}` : ""}`)
+            : "Public / no token"}"></span>
+        ${m.has_token && m.token_set_by
+            ? `<div class="mp-muted" style="font-size:11px;white-space:nowrap;">${esc(m.token_set_by.split("@")[0])} · ${esc(fmtDate(m.token_set_at))}</div>`
+            : ""}
+      </td>
       <td>
         <div class="row-actions">
           ${m.is_builtin

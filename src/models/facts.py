@@ -161,6 +161,13 @@ class IngestRun(Base):
     claims_written: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     claims_rejected_count: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     claims_rejected: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
+    #: Same shape as `claims_rejected_count`/`claims_rejected`, one column
+    #: pair over — a document's `source_url` Agnes dropped as invalid
+    #: (O7, `_validate_source_url`). The claim itself still writes; only the
+    #: citation link is missing, and this is the operator-visible record of
+    #: why (see migrations/versions/0083_ingest_runs_source_urls.py).
+    source_urls_rejected_count: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
+    source_urls_rejected: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
     deferred: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"), nullable=False)
     subjects_created: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)
     subjects_deleted: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)

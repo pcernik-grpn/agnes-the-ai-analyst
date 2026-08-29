@@ -42,6 +42,17 @@ Assignment:    on the app's Enterprise Application, set Properties →
                unassigned users — any account in the tenant could
                authenticate (Agnes's domain allowlist still applies, but
                the tenant-side gate would be open)
+Consent:       grant admin consent once for the organization (Enterprise
+               applications → Permissions → "Grant admin consent for
+               <tenant>"). Do this even though the scopes above are not
+               admin-restricted: without the grant, first sign-in either
+               shows every user a consent prompt (default policy) or
+               fails outright (tenants that disable user consent), and
+               Entra requires administrator consent regardless of policy
+               once "Assignment required" is on — which the line above
+               asks for. Application Administrator or Cloud Application
+               Administrator suffices for these delegated scopes;
+               Application Developer does not
 ```
 
 **Customer IdP admin → you** (entered into the admin panel or `agnes admin sso set`):
@@ -54,7 +65,16 @@ Assignment:    on the app's Enterprise Application, set Properties →
 - **Client secret value** + its expiry date (calendar the rotation — an
   expired secret surfaces as `/login?error=sso_oauth_failed` only).
 - **The email domain(s) to permit** — the customer's own domains only. See
-  the trust model below; this list is the whole game.
+  the trust model below; this list is the whole game. The domain is taken
+  from the identity Agnes *resolves* — the `email` claim when the token
+  carries one, otherwise a mail-shaped `preferred_username`
+  (`resolve_identity`, shared with the `microsoft` provider) — and that
+  address need not sit on the organization's public domain: a tenant
+  without a verified vanity domain typically asserts
+  `<user>@<tenant>.onmicrosoft.com`. Deriving the list from the customer's
+  website, or from the address you exchange mail with, fails closed as
+  `domain_not_allowed`. The test sign-in in step 4 below prints the
+  resolved identity, so run it before you settle the list.
 
 ## Configure, prove, enable
 
@@ -125,10 +145,25 @@ them; the domain allowlist does. The authorize redirect forces
 session) gets the account picker instead of a silent SSO into a
 domain-allowlist refusal.
 
-**Both login doors stay open.** A user who links an external identity keeps
-every other way in (password, Google, magic link — whatever the instance
-offers). There is no SSO enforcement or lockout; the external IdP's
-MFA/conditional-access posture protects only the SSO door.
+**Allowlisted domains are forced off the local credential doors.** While
+the config is enabled (and `sso` is offered under `auth.providers`), the
+password and magic-link doors — login, `/auth/token`, forgot-password,
+invite and magic-link legs alike, including redemption of links minted
+before the domain joined the allowlist — refuse every address whose domain
+is in `allowed_email_domains`. This is what makes the delegation real: when
+the customer tenant offboards someone, no previously set password or
+bookmarked link keeps their Agnes access alive. Browser forms redirect such
+addresses to `/auth/sso/login`; JSON credential endpoints answer their
+usual generic refusal (no domain oracle). Existing password hashes are left
+in place, just unusable — remove the domain from the allowlist (or disable
+SSO) and those doors open again; nothing is destroyed. The scope is the
+**local credential doors only**: the OAuth providers (google, microsoft,
+keboola) are separate doors with their own domain policies, unchanged by
+the forcing — if one of them is enabled and its policy admits an
+allowlisted domain, it remains a way in, so keep those policies from
+overlapping the SSO allowlist if the offboarding guarantee is to be
+complete. Within its scope the external IdP's MFA/conditional-access
+posture protects the only door these domains have.
 
 **Accepted risks (v1), documented rather than mitigated:** first-login email
 attach itself (same semantics as every Agnes provider); no session revocation
@@ -162,6 +197,12 @@ is the detective control.
   for an admin, or widen `auth.providers`. Break-glass with server access:
   the `AGNES_AUTH_PROVIDERS` env override (env wins over instance.yaml) plus
   the registry's password/email rescue.
+- **Domain forcing follows the live config** — it applies exactly while the
+  provider is enabled, complete and offered, with no persistent state of its
+  own. Each of the guarded operations above also lifts the forcing, which is
+  why a password holder inside a forced domain still satisfies the guard:
+  their password door is the one that reopens the moment the operation
+  lands.
 - **Deleting the config keeps the identity rows** — they are historically
   true links, inert unless the same tenant is configured again, purgeable
   per-user via `unlink`.
@@ -200,3 +241,8 @@ is the detective control.
   *Assignment required = Yes* on their Enterprise Application (see the
   checklist); Agnes's allowlist still refuses foreign domains, but the
   tenant-side gate should be closed too.
+- **A permitted-domain user reports password login / forgot-password
+  bouncing them to the SSO sign-in** → working as designed: their domain is
+  in `allowed_email_domains`, so the SSO door is the only one that opens
+  (see the trust model). If that user genuinely should not be federated,
+  their domain does not belong on the allowlist.

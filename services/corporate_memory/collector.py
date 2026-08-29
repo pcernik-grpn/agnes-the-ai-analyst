@@ -26,11 +26,14 @@ import hashlib
 import json
 import logging
 import os
+import re
+import string
 import sys
 import tempfile
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from app.logging_config import setup_logging
 from app.utils import local_md_filename, uploaded_local_md_dir
@@ -45,6 +48,91 @@ from .prompts import (
     neutralize_untrusted,
 )
 from .tagger import auto_tag_items
+
+# TCRD-233: deterministic dedup guard, run at propose time before a new item
+# is accepted. difflib.SequenceMatcher.ratio() and token-Jaccard >= this
+# threshold are both treated as "the same fact, reworded" — either signal is
+# sufficient. 0.9 is stricter than the verification detector's fuzzy-merge
+# thresholds (services/verification_detector/duplicates.py, 0.65-0.82)
+# because there the entity-tag overlap already corroborates the match; here
+# there is no entity signal, so the text similarity bar alone has to be high
+# enough to avoid dropping a real, distinct finding. When in doubt this
+# module always says "not a duplicate" — a false positive silently discards
+# a real finding, which is worse than a duplicate landing in the human
+# triage queue.
+DEDUP_NEAR_DUPLICATE_THRESHOLD = 0.9
+
+# difflib.SequenceMatcher.ratio() is noisy on very short strings — skip the
+# similarity check below this length and rely on the exact-match check only.
+_DEDUP_MIN_TEXT_LENGTH = 20
+
+
+def _normalize_dedup_text(text: Optional[str]) -> str:
+    """Casefold, collapse internal whitespace, strip edge punctuation.
+
+    Deliberately loose — no stemming, no stopword removal — so it stays
+    cheap and predictable. Comparing on this normalized form is what makes
+    "Always add indexes." and "always add indexes" match as the same fact.
+    """
+    if not text:
+        return ""
+    collapsed = re.sub(r"\s+", " ", text.casefold()).strip()
+    return collapsed.strip(string.punctuation)
+
+
+def _dedup_token_jaccard(a: str, b: str) -> float:
+    """Jaccard ratio over whitespace-split tokens of two normalized strings."""
+    tokens_a, tokens_b = set(a.split()), set(b.split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
+
+def _is_duplicate_content(candidate: str, existing: str) -> bool:
+    """True when two normalized content strings describe the same fact.
+
+    1. Exact match — always a duplicate.
+    2. Near-duplicate — normalized-token Jaccard OR
+       ``difflib.SequenceMatcher`` ratio >= ``DEDUP_NEAR_DUPLICATE_THRESHOLD``.
+    """
+    if not candidate or not existing:
+        return False
+    if candidate == existing:
+        return True
+    if len(candidate) < _DEDUP_MIN_TEXT_LENGTH or len(existing) < _DEDUP_MIN_TEXT_LENGTH:
+        return False
+    if _dedup_token_jaccard(candidate, existing) >= DEDUP_NEAR_DUPLICATE_THRESHOLD:
+        return True
+    return SequenceMatcher(None, candidate, existing).ratio() >= DEDUP_NEAR_DUPLICATE_THRESHOLD
+
+
+def _find_duplicate_in_category(
+    content: str,
+    category: Optional[str],
+    catalog_items: dict[str, dict],
+) -> Optional[str]:
+    """Return the id of a same-category catalog item that ``content``
+    duplicates, or ``None``.
+
+    ``catalog_items`` is the ``knowledge.json`` ``items`` dict as loaded —
+    it holds BOTH already-approved items and items still ``status="pending"``
+    (a suggestion still sitting in the triage queue), so comparing against
+    it catches a duplicate of either. The comparison set is filtered to
+    ``category`` only: cheap (no cross-category scan on a big catalog) and
+    more accurate (unrelated facts in different categories routinely share
+    generic wording that would otherwise false-positive).
+    """
+    normalized_candidate = _normalize_dedup_text(content)
+    if not normalized_candidate:
+        return None
+    for item_id, item in catalog_items.items():
+        if item.get("category") != category:
+            continue
+        normalized_existing = _normalize_dedup_text(item.get("content"))
+        if _is_duplicate_content(normalized_candidate, normalized_existing):
+            return item_id
+    return None
+
 
 # Fields preserved across re-collections when item already exists
 GOVERNANCE_FIELDS = (
@@ -579,6 +667,7 @@ def collect_all(dry_run: bool = False) -> dict:
         "items_filtered": 0,
         "items_preserved": 0,
         "items_new": 0,
+        "items_duplicate_skipped": 0,
         "items_pending": 0,
         "items_pending_new": 0,
         "items_pending_queued": 0,
@@ -692,6 +781,26 @@ def collect_all(dry_run: bool = False) -> dict:
             final_items[item_id] = item
             stats["items_preserved"] += 1
         else:
+            # New item per the LLM's own existing_id=null verdict. That
+            # verdict is a judgment call the LLM can miss — a paraphrase of
+            # an already-known fact gets reported as brand new. TCRD-233:
+            # re-check mechanically against the catalog (same category only)
+            # before spending an LLM sensitivity-check call on it. The
+            # catalog dict holds both approved items and items still
+            # status="pending", so this also catches a duplicate of a
+            # suggestion still sitting in the triage queue.
+            duplicate_of = _find_duplicate_in_category(
+                item.get("content", ""), item.get("category"), existing.get("items", {})
+            )
+            if duplicate_of is not None:
+                stats["items_duplicate_skipped"] += 1
+                logger.info(
+                    "Skipped duplicate knowledge item (matches existing %s): title=%r",
+                    duplicate_of,
+                    item.get("title"),
+                )
+                continue
+
             # New item - run sensitivity check
             if check_sensitivity(extractor, item):
                 final_items[item_id] = item
@@ -926,6 +1035,7 @@ def main() -> int:
     print(f"  Items preserved: {stats['items_preserved']}")
     print(f"  Items new: {stats['items_new']}")
     print(f"  Items filtered (sensitive): {stats['items_filtered']}")
+    print(f"  Items skipped (duplicate): {stats.get('items_duplicate_skipped', 0)}")
     if stats.get("items_pending"):
         print(f"  Items pending review: {stats['items_pending']}")
         print(f"    ...of which new this run: {stats.get('items_pending_new', 0)}")

@@ -11,8 +11,10 @@ order the work happens — the shape decided by the admin redesign
     Data                         sources · tables · packages · semantics
     Access                       who can use what · simulate a person
     ── maintain ──
-    Library                      what analysts can find: curation + moderation
-    Instance                     the machine: config, secrets, connections
+    Library                      what analysts can find: curation, moderation,
+                                 and the sources it arrives from (marketplaces,
+                                 MCP, linked apps)
+    Instance                     the machine: config + secrets
     Activity                     what's happening: audit, telemetry, adoption
 
 Three intent sections under MANAGE (get people in, get data in, get the data
@@ -85,10 +87,11 @@ exist for that reason and carry constraints worth knowing before editing:
     the old hub grid applied. `can_studio` is `get_studio_enabled()`, set on
     every context by `_build_context`.
 
-    Four more rows use `when` since the admin cleanup retired their surfaces
+    Five more rows use `when` since the admin cleanup retired their surfaces
     by default — Studio (and its suggestions queue) on `can_studio`, Knowledge
     digests on `can_knowledge_digests`, News on `can_news`, Contribute a skill
-    on `can_contribute_skill`. The rows STAY in this inventory on purpose:
+    on `can_contribute_skill`, Store moderation on `can_store_moderation`.
+    The rows STAY in this inventory on purpose:
     it is what `tests/test_web_admin_nav.py` walks to prove every admin page
     has a home in the column, and the pages are hidden, not deleted. Add a new
     flag in BOTH places — here and `_nav_flags` in `_admin_nav.html`, which
@@ -294,13 +297,60 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             # What analysts can find — curation and moderation are the same
             # job from two directions, so the old Moderation + Content
             # sections merge here.
-            {"label": "Marketplaces", "href": "/admin/marketplaces", "match": ["/admin/marketplaces"]},
-            {"label": "Store moderation", "href": "/admin/store", "match": ["/admin/store"]},
+            #
+            # Read in two runs: first WHERE things arrive from (Marketplaces,
+            # MCP sources, Linked apps), then what is done with what arrived
+            # (moderation, submissions, lint) and the rest.
+            {
+                "label": "Marketplaces",
+                "href": "/admin/marketplaces",
+                "gloss": "Git repos of plugins, cloned nightly",
+                "match": ["/admin/marketplaces"],
+            },
+            # The other two SOURCES of things an analyst ends up with, next to
+            # Marketplaces rather than under Instance: a marketplace supplies
+            # skills and plugins, an MCP source supplies tools, a linked app
+            # supplies an app. Same question — what can analysts reach — so
+            # they are read together. (Both were under Instance, filed as
+            # "outbound connections"; see the note on that section.)
+            {
+                "label": "MCP sources",
+                "href": "/admin/mcp-sources",
+                "gloss": "MCP servers whose tools analysts can use",
+                "match": ["/admin/mcp-sources", "/admin/mcp-tools"],
+            },
+            {
+                "label": "Linked apps",
+                "href": "/admin/linked-apps",
+                "gloss": "Hosted elsewhere, granted from here",
+                "match": ["/admin/linked-apps"],
+            },
+            # Conditional — the hub is off by default (see the module
+            # docstring). `match` stays the bare prefix: Submissions and Store
+            # lint are their own rows below and win on longest-prefix, so the
+            # hub never lights while you stand on one of them.
+            {
+                "label": "Store moderation",
+                "href": "/admin/store",
+                "gloss": "Verification, submissions, curation",
+                "match": ["/admin/store"],
+                "when": "can_store_moderation",
+            },
             # "Submissions", not "Flea submissions": the trust vocabulary
             # moved to Organization/Verified/Community and the seam spec's
             # decision 8 retires the WORD flea, never the URLs.
-            {"label": "Submissions", "href": "/admin/store/submissions", "match": ["/admin/store/submissions"]},
-            {"label": "Store lint", "href": "/admin/store/lint", "match": ["/admin/store/lint"]},
+            {
+                "label": "Submissions",
+                "href": "/admin/store/submissions",
+                "gloss": "Plugins, skills and agents awaiting review",
+                "match": ["/admin/store/submissions"],
+            },
+            {
+                "label": "Store lint",
+                "href": "/admin/store/lint",
+                "gloss": "Advisory quality findings on skills",
+                "match": ["/admin/store/lint"],
+            },
             # Conditional too, on the SAME flag as the Studio row below: the
             # route reads `get_studio_enabled()` and redirects home when it is
             # off, so an unconditional row here would have shipped a link to
@@ -308,20 +358,39 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {
                 "label": "Studio suggestions",
                 "href": "/admin/studio/suggestions",
+                "gloss": "Proposals submitted by non-admins",
                 "match": ["/admin/studio/suggestions"],
                 "when": "can_studio",
             },
-            {"label": "Corporate memory", "href": "/admin/corporate-memory", "match": ["/admin/corporate-memory"]},
+            {
+                "label": "Corporate memory",
+                "href": "/admin/corporate-memory",
+                "gloss": "Approve knowledge from analyst sessions",
+                "match": ["/admin/corporate-memory"],
+            },
             {
                 "label": "Knowledge digests",
                 "href": "/admin/knowledge-digests",
+                "gloss": "Regenerated when their sources change",
                 "match": ["/admin/knowledge-digests"],
                 "when": "can_knowledge_digests",
             },
-            {"label": "News", "href": "/admin/news", "match": ["/admin/news"], "when": "can_news"},
+            # "News editor", not "News" — the ONE row where the page's name wins
+            # over the nav's. `/admin/news` (authoring) and `/news` (reading) are
+            # two different surfaces, and calling both "News" put the same word
+            # on two entries an admin sees at once (DES-63). The page already
+            # called itself the editor; this makes the column agree.
+            {
+                "label": "News editor",
+                "href": "/admin/news",
+                "gloss": "The intro shown at the bottom of /home",
+                "match": ["/admin/news"],
+                "when": "can_news",
+            },
             {
                 "label": "Contribute a skill",
                 "href": "/admin/contribute-skill",
+                "gloss": "Paste a SKILL.md into the marketplace",
                 "match": ["/admin/contribute-skill"],
                 "when": "can_contribute_skill",
             },
@@ -331,6 +400,7 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {
                 "label": "Studio",
                 "href": "/admin/studio",
+                "gloss": "Chat-assisted builders for content",
                 "match": ["/admin/studio"],
                 "when": "can_studio",
             },
@@ -341,24 +411,46 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         "label": "Instance",
         "icon": "tools",
         "items": [
-            # The machine itself — configuration, secrets, and outbound
-            # connections (the old Connections section was Instance plumbing
-            # wearing its own heading).
-            {"label": "Server config", "href": "/admin/server-config", "match": ["/admin/server-config"]},
-            {"label": "Database backend", "href": "/admin/database", "match": ["/admin/database"]},
-            {"label": "Initial workspace", "href": "/admin/initial-workspace", "match": ["/admin/initial-workspace"]},
+            # The machine itself — configuration and secrets.
+            #
+            # MCP sources and Linked apps USED to sit here, on the reasoning
+            # that they are "outbound connections" and therefore plumbing. That
+            # confused how a thing is wired with what it is FOR: an MCP source
+            # ends as tools in an analyst's chat and a linked app ends as an
+            # app they open, so both answer "what can analysts reach" — which
+            # is Content's question, not this section's. What is left here is
+            # the set an admin touches to change the INSTANCE, never to change
+            # what a colleague can find.
+            {
+                "label": "Server config",
+                "href": "/admin/server-config",
+                "gloss": "Edit instance.yaml from the browser",
+                "match": ["/admin/server-config"],
+            },
+            {
+                "label": "Database backend",
+                "href": "/admin/database",
+                "gloss": "Move app state between DuckDB and Postgres",
+                "match": ["/admin/database"],
+            },
+            {
+                "label": "Initial workspace",
+                "href": "/admin/initial-workspace",
+                "gloss": "Git repo seeding analyst workspaces",
+                "match": ["/admin/initial-workspace"],
+            },
             {
                 "label": "Prompts",
                 "href": "/admin/prompts",
+                "gloss": "The install prompt and workspace CLAUDE.md",
                 "match": ["/admin/prompts", "/admin/agent-prompt", "/admin/workspace-prompt"],
             },
             {
                 "label": "Instance secrets",
                 "href": "/admin/datasource-credentials",
+                "gloss": "Encrypted, in the server vault",
                 "match": ["/admin/datasource-credentials"],
             },
-            {"label": "MCP sources", "href": "/admin/mcp-sources", "match": ["/admin/mcp-sources", "/admin/mcp-tools"]},
-            {"label": "Linked apps", "href": "/admin/linked-apps", "match": ["/admin/linked-apps"]},
         ],
     },
     {
@@ -366,11 +458,36 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         "label": "Activity",
         "icon": "rows",
         "items": [
-            {"label": "Audit log", "href": "/admin/activity", "match": ["/admin/activity"]},
-            {"label": "Telemetry", "href": "/admin/telemetry", "match": ["/admin/telemetry", "/admin/usage"]},
-            {"label": "Analyst sessions", "href": "/admin/sessions", "match": ["/admin/sessions"]},
-            {"label": "Chat runners", "href": "/admin/chat", "match": ["/admin/chat"]},
-            {"label": "Adoption", "href": "/admin/adoption", "match": ["/admin/adoption"]},
+            {
+                "label": "Audit log",
+                "href": "/admin/activity",
+                "gloss": "Every admin and user-mutating action",
+                "match": ["/admin/activity"],
+            },
+            {
+                "label": "Telemetry",
+                "href": "/admin/telemetry",
+                "gloss": "Tool, skill and agent use across users",
+                "match": ["/admin/telemetry", "/admin/usage"],
+            },
+            {
+                "label": "Analyst sessions",
+                "href": "/admin/sessions",
+                "gloss": "Collected transcripts and a viewer",
+                "match": ["/admin/sessions"],
+            },
+            {
+                "label": "Chat runners",
+                "href": "/admin/chat",
+                "gloss": "Tail or kill a running session",
+                "match": ["/admin/chat"],
+            },
+            {
+                "label": "Adoption",
+                "href": "/admin/adoption",
+                "gloss": "Who is really using it, and how much",
+                "match": ["/admin/adoption"],
+            },
         ],
     },
 ]

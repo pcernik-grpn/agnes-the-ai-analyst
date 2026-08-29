@@ -43,7 +43,9 @@ class TestServerConfigPageAuth:
 
         # Page-shell markers the JS targets.
         assert 'data-page="server-config"' in body
-        assert "Instance settings" in body
+        # Heading matches the sidebar row ("Server config") — the page used to
+        # call itself "Instance settings", which named the same place twice.
+        assert "Server config" in body
         # Form skeleton: loader + per-section container.
         assert 'id="cfg-loading"' in body
         assert 'id="cfg-sections"' in body

@@ -167,14 +167,37 @@ def is_builtin_extension(extension: str) -> bool:
 
 
 def get_allowed_token_envs() -> set[str]:
-    """Return the effective token-env allowlist.
+    """Return the effective token-env allowlist — the INBOUND connector-ATTACH
+    boundary (``is_token_env_allowed`` / ``src/orchestrator.py`` /
+    ``src/db.py``).
 
     Operator override AGNES_REMOTE_ATTACH_TOKEN_ENVS *replaces* the default
     set (so an operator can shrink it as well as expand it). The startup
     code logs the effective set so a typo is visible.
+
+    Defense-in-depth: every :data:`_CONFIG_SECRET_ONLY_ENVS` and
+    :data:`_PRODUCER_KEY_ENVS` member is ALWAYS subtracted back out, even
+    from the override. Neither is ever a legitimate ``_remote_attach.
+    token_env`` value, so an operator listing one in
+    ``AGNES_REMOTE_ATTACH_TOKEN_ENVS`` (typo, or a misguided attempt to "add"
+    a name to the effective set — the override REPLACES, it does not add)
+    must not resurrect the exact exfiltration path the consumer-class split
+    exists to close.
     """
     override = _parse_csv_env("AGNES_REMOTE_ATTACH_TOKEN_ENVS")
-    return override if override else set(_DEFAULT_TOKEN_ENVS)
+    base = override if override else set(_DEFAULT_TOKEN_ENVS)
+    other_boundaries = _CONFIG_SECRET_ONLY_ENVS | _PRODUCER_KEY_ENVS
+    blocked = base & other_boundaries
+    if blocked:
+        logger.warning(
+            "remote_attach: ignoring name(s) %s from the effective token-env "
+            "allowlist — these belong to a different consumer class "
+            "(config-resolution-only secret or the anonymization producer "
+            "key) and can never legitimately be a connector _remote_attach "
+            "token_env",
+            sorted(blocked),
+        )
+    return base - other_boundaries
 
 
 def is_token_env_allowed(token_env: str) -> bool:
@@ -218,6 +241,7 @@ def is_config_secret_env_allowed(name: str) -> bool:
     if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
         return False
     return name in get_allowed_config_secret_envs()
+
 
 def is_producer_key_env_allowed(name: str) -> bool:
     """Return True if ``name`` may be read and forwarded to an EXTERNAL
