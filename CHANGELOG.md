@@ -822,6 +822,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   following tick and file a duplicate pending suggestion each time. A session
   refused by the chat concurrency cap is still un-stamped immediately, since
   that one provably never started.
+- **Security: the cloud-chat approval gate now covers mutating MCP tools, not
+  just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
+  mutating MCP tool the in-chat agent can call — deleting a data-app draft,
+  deploying one, `pull` — executed without the approve/deny round-trip its own
+  contract asks for. Approval is now routed from each tool's own behaviour
+  annotation (`readOnlyHint`) rather than its name, so it covers future tools
+  by construction: a read-only tool still runs unasked, and everything else —
+  including a tool with no annotation the runner knows, such as a per-caller
+  passthrough tool or one from a workspace-configured MCP server — raises the
+  same approval card, showing the call's arguments. Fail-closed posture is
+  preserved end to end: on an SDK too old to arm the gate safely, mutating MCP
+  tools are DENIED with an actionable message rather than silently allowed, and
+  "allow for session" remembers the exact tool + arguments approved, never the
+  tool as a family. Read-only built-in tools (`Read`/`Grep`/…) are unaffected.
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser
