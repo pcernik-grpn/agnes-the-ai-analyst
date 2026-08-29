@@ -197,6 +197,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+- **The Library says what your agents get, not what the server does.** Every
+  control in the Access column named a mechanism — *Install*, *Add to stack*,
+  *In stack*, *Required by your admin*, *Granted to your group* — which told a
+  reader what happens internally and left them to infer what they get. Each now
+  names the outcome: **Add to my agents** (was Install / Add to stack), *Agents
+  can use this* (was Installed / In stack), and one state for governed data,
+  *Agents can query this*, replacing the pair of pills that promised two
+  different things about removal for what is a single, identical capability —
+  the tier survives in the tooltip, where it explains why rather than posing as
+  a different power. The two toolbar toggles follow (*Agents use it*, *Not added
+  yet*), so the page no longer says "stack" anywhere, and a permanent one-line
+  lede under the title states the rule the whole page turns on: your admin
+  decides what data you can reach, you choose what your agents can do with it.
 - **Every row in the Library's + Add menu says what it makes.** Four of the
   eight — skill, plugin, agent template, upload — were a verb and nothing else,
   so the menu told you the shape of the thing only where someone had happened to

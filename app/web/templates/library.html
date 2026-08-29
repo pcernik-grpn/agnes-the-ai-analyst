@@ -423,14 +423,14 @@
                             {% if c.stack_remove_endpoint %}data-stack-remove-endpoint="{{ c.stack_remove_endpoint }}"{% endif %}
                             {% if c.stack_body %}data-stack-body="{{ c.stack_body }}"{% endif %}
                             title="{{ c.stack_title }}"
-                            aria-label="{{ c.title }}: {{ c.stack_pill or 'In stack' }}. {{ c.stack_undo or 'Remove from stack' }}">
+                            aria-label="{{ c.title }}: {{ c.stack_pill or 'Your agents use this' }}. {{ c.stack_undo or 'Remove' }}">
                       <span class="lib-stackpill__rest">
                         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                        {{ c.stack_pill or 'In stack' }}
+                        {{ c.stack_pill or 'Your agents use this' }}
                       </span>
                       <span class="lib-stackpill__alt">
                         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
-                        {{ c.stack_undo or 'Remove from stack' }}
+                        {{ c.stack_undo or 'Remove' }}
                       </span>
                     </button>
                     {% else %}
@@ -477,7 +477,7 @@
                     <span class="lib-stackpill lib-instack lib-instack--fixed {% if _locked %}lib-instack--locked{% endif %}"
                           data-stack-badge="{{ c.id }}" role="img"
                           data-tip="{{ c.stack_title }}"
-                          aria-label="{{ c.stack_pill or 'In stack' }}. {{ c.stack_title }}">
+                          aria-label="{{ c.stack_pill or 'Your agents use this' }}. {{ c.stack_title }}">
                       <span class="lib-stackpill__rest">
                         {% if _locked %}
                         {# A lock, not a checkmark: the checkmark says "done, and
@@ -486,7 +486,7 @@
                         {% else %}
                         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
                         {% endif %}
-                        {{ c.stack_pill or 'In stack' }}
+                        {{ c.stack_pill or 'Your agents use this' }}
                       </span>
                     </span>
                     {% endif %}
@@ -505,10 +505,10 @@
                             {% if c.stack_body %}data-stack-body="{{ c.stack_body }}"{% endif %}
                             {% if c.stack_remove_endpoint %}data-stack-remove-endpoint="{{ c.stack_remove_endpoint }}"{% endif %}
                             title="{{ c.stack_title }}"
-                            aria-label="{{ c.stack_action or 'Add to stack' }}: {{ c.title }}">
+                            aria-label="{{ c.stack_action or 'Add to my agents' }}: {{ c.title }}">
                       <span class="lib-stackpill__rest">
                         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
-                        {{ c.stack_action or 'Add to stack' }}
+                        {{ c.stack_action or 'Add to my agents' }}
                       </span>
                     </button>
                     {% endif %}
@@ -584,6 +584,7 @@
      list a third of the way down the page. */
   .lib-head__bar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   .lib-head__titles { min-width: 0; }
+  .lib-lede { margin: 3px 0 0; max-width: 68ch; font-size: 13px; line-height: 1.45; color: var(--ds-text-muted); }
   /* The controls left the title row for the browsing block above the list —
      `.lib-head__controls` is kept as their class so the page-scoped `.fbar`
      rules below still address exactly this toolbar and not /chats's. */
@@ -2011,9 +2012,18 @@
   <div class="lib-head__bar">
     <div class="lib-head__titles">
       <h1>Library</h1>
-      {# The count line, where a paragraph explaining what a library is used to
-         sit. `#lib-item-count` is the element the filter engine rewrites, so it
-         moved here whole rather than being duplicated. #}
+      {# ONE sentence, permanent, not a dismissible banner. The page has two
+         rules that look arbitrary until they are stated together — granted
+         data needs no button while a skill does — and this is the whole of
+         why. Deliberately NOT the paragraph that used to sit here: prose
+         explaining what a library is taught nobody anything, where the
+         asymmetry above is the one thing a first-time reader gets wrong. The
+         page's other banner sits BELOW the list, so this is the only prose
+         above row one. #}
+      <p class="lib-lede">Everything here is what your agents can draw on. Your admin decides
+        what data you can reach; you choose what your agents can do with it.</p>
+      {# The count line. `#lib-item-count` is the element the filter engine
+         rewrites, so it moved here whole rather than being duplicated. #}
     </div>
   </div>
 
@@ -2167,7 +2177,7 @@
              also where the retired Catalog/Marketplace browse pages land:
              their ?scope=available redirects arrive with this box checked. #}
           {% if library_available_count %}
-          <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not in stack yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
+          <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not added yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
           {% endif %}
           {# Ordered by the question each answers, commonest first. A category with
                fewer than two values does not render at all, so this list is the
@@ -2235,7 +2245,7 @@
               data-facet-value="in_stack" aria-pressed="false"
               title="Only what's in your stack — the set your default agent can use">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 4.9-9 4.9-9-4.9L12 2Z"></path><path d="m3 11.9 9 4.9 9-4.9"></path><path d="m3 16.9 9 4.9 9-4.9"></path></svg>
-        In stack only<span class="fbar-toggle__n" data-stack-count>{{ library_in_stack_count }}</span>
+        Agents use it<span class="fbar-toggle__n" data-stack-count>{{ library_in_stack_count }}</span>
       </button>
       {% endif %}
   
@@ -3308,11 +3318,11 @@
         // "In stack only" — a binary condition worth seeing at rest, so it
         // rides the bar as the #lib-stack-toggle button (`control`) rather
         // than a menu row; slices the row's strict Stack membership.
-        { key: 'stack', attr: 'data-stack', label: 'In stack only',
+        { key: 'stack', attr: 'data-stack', label: 'Agents use it',
           toggle: true, control: '#lib-stack-toggle' },
         // "Not in stack yet" — one condition, so a TOGGLE: a single checkbox
         // in the menu (value="available"), a chip that states the condition.
-        { key: 'availability', attr: 'data-stack', label: 'Not in stack yet', toggle: true },
+        { key: 'availability', attr: 'data-stack', label: 'Not added yet', toggle: true },
         { key: 'requirement', attr: 'data-requirement', label: 'Access' },
         { key: 'tag', attr: 'data-tag', label: 'Tag', multi: true },
         // `multi` because the recency buckets are cumulative sets on the row.

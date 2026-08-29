@@ -370,9 +370,17 @@ def _row_for(body: str, title: str) -> str:
 
 #: The locked-membership tooltips, verbatim. A test that paraphrases them would
 #: let the shipped copy drift from the spec, so the exact sentences are asserted.
-#: Both tiers are locked; only the wording differs.
-LOCKED_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-GRANTED_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
+#: Both tiers are locked, and the ROW now says so identically — one pill,
+#: "Agents can query this" — because the caller can do exactly the same thing
+#: with either tier: query it, and not remove it. The old pair of pills promised
+#: two different things about removal ("cannot be removed" vs "only an admin can
+#: remove it") for one state, which is what made a single state read as two. The
+#: tier survives here, in the tooltip, where it explains WHY rather than
+#: pretending to be a different capability.
+LOCKED_TOOLTIP = "Required by your admin — your agents get this automatically, and you cannot remove it."
+GRANTED_TOOLTIP = (
+    "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
+)
 
 
 def test_library_required_grant_is_locked_in_stack(seeded_app):
@@ -388,10 +396,12 @@ def test_library_required_grant_is_locked_in_stack(seeded_app):
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Mandated Package")
-    # The pill states the TIER. A granted package is queryable the moment it is
-    # granted (auto-membership), so "In stack" described a membership the caller
-    # could neither create nor drop; "Required by your admin" is the fact.
-    assert "Required by your admin" in row
+    # The pill states the OUTCOME, not the tier and not the mechanism. A granted
+    # package is queryable the moment it is granted (auto-membership), so "In
+    # stack" described a membership the caller could neither create nor drop —
+    # and naming the tier instead just moved the problem, since the two tiers
+    # are one capability. What the reader needs is what their agents can do.
+    assert "Agents can query this" in row
     assert "lib-instack--locked" in row  # locked → lock glyph + info tint
     assert LOCKED_TOOLTIP in row
     # Not a button, and not addable — nothing to click either way.
@@ -424,7 +434,8 @@ def test_library_available_grant_reads_in_stack_and_offers_no_toggle(seeded_app,
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Offered Package")
-    assert "Granted to your group" in row
+    # Same pill as the required tier — deliberately. See LOCKED_TOOLTIP above.
+    assert "Agents can query this" in row
     assert "lib-instack--fixed" in row
     assert "lib-instack--locked" in row  # not the removable pill's rest state
     assert "data-add-to-stack" not in row

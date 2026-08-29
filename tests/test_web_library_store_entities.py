@@ -238,7 +238,7 @@ def test_admin_required_grant_is_locked_in_stack(seeded_app):
     row = _row(text, "Mandated Data")
     assert row
     assert 'data-stack="in_stack"' in row
-    assert "Required by your admin and cannot be removed from your stack." in row
+    assert "Required by your admin — your agents get this automatically, and you cannot remove it." in row
     # No control: neither Add nor Remove is the caller's to press.
     assert "data-add-to-stack=" not in row
     assert "data-remove-from-stack=" not in row

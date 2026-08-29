@@ -2096,8 +2096,34 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: rather than literals at each site because they are the same sentence
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
-_LOCKED_STACK_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-_GRANTED_STACK_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
+_LOCKED_STACK_TOOLTIP = (
+    "Required by your admin — your agents get this automatically, and you cannot remove it."
+)
+_GRANTED_STACK_TOOLTIP = (
+    "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
+)
+
+#: The Access column asks ONE question — *can my agent use this* — and the
+#: three kinds answer it differently, which is the honest shape of the
+#: product rather than an inconsistency to paper over: a capability is the
+#: caller's to add, granted data is the admin's to give. The old copy named
+#: the MECHANISM instead ("Install", "Add to stack", "In stack"), which said
+#: what the server does and left the reader to infer what they get. Named
+#: once, because this column has already collected four spellings of one
+#: state and every extra literal is how a fifth arrives.
+_AGENT_ADD = "Add to my agents"
+_AGENT_REMOVE = "Remove"
+# The resting states drop the possessive the ACTION keeps ("Add to my
+# agents"): the action is a sentence about you, the state is a fact about the
+# row, and repeating "your agents" on every line both clipped the 142px cell
+# and said nothing the lede above the list has not already said.
+_AGENT_HAS = "Agents can use this"
+_AGENT_CAN_QUERY = "Agents can query this"
+_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
+_AGENT_HAS_TOOLTIP = (
+    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
+    "sees what that scope allows."
+)
 
 
 def _library_row_base(
@@ -2439,17 +2465,15 @@ async def library_page(
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
-            row["stack_title"] = (
-                "The default agent can use this artefact"
-                if row["in_stack"]
-                else "You can reach this, but the default agent can't until you add it"
-            )
+            row["stack_title"] = _AGENT_HAS_TOOLTIP if row["in_stack"] else _AGENT_ADD_TOOLTIP
             # An artefact is the one kind whose membership IS the caller's to
             # set (no admin grant tier exists for a personal upload), so its
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
             # a folder shows its folder's state as a plain badge.
-            row["stack_pill"] = "In stack"
+            row["stack_pill"] = _AGENT_HAS
+            row["stack_action"] = _AGENT_ADD
+            row["stack_undo"] = _AGENT_REMOVE
             # Membership here is a `user_stack_subscriptions` row, and it is the
             # caller's to add or drop either way. Children deliberately inherit
             # neither flag: Stack membership is per collection, so a file inside a
@@ -2674,20 +2698,21 @@ async def library_page(
             # The endpoint is ``/install`` and a store entity was never a stack
             # member (``/api/stack`` takes only data_package and memory_domain),
             # so the row says what the click actually does.
-            items[-1]["stack_action"] = "Install"
-            items[-1]["stack_undo"] = "Uninstall"
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             if _inst:
                 items[-1]["stack_state"] = "in_stack"
-                items[-1]["stack_pill"] = "Installed"
+                items[-1]["stack_pill"] = _AGENT_HAS
                 items[-1]["stack_removable"] = True
-                items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+                items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
             else:
                 items[-1]["stack_state"] = "available"
                 items[-1]["stack_addable"] = True
+                # An author looking at their own unadded skill needs the extra
+                # fact that authoring it did not add it; everyone else needs
+                # only the general one.
                 items[-1]["stack_title"] = (
-                    "Yours, but not part of your Stack"
-                    if owned
-                    else "Available to you, but the default agent can't use it until you add it"
+                    "You wrote this, but your agents cannot use it until you add it." if owned else _AGENT_ADD_TOOLTIP
                 )
 
     # ── Everything else the caller has ACCESS to ──────────────────────────
@@ -2812,7 +2837,12 @@ async def library_page(
             # tooltip and the Optional/Required facet.
             # Granted, therefore already queryable: the pill states the tier
             # rather than claiming a membership the caller could add.
-            items[-1]["stack_pill"] = "Required by your admin" if requirement == "required" else "Granted to your group"
+            # ONE pill for both tiers, because the caller can do exactly the
+            # same thing with either: query it, and not remove it. The tiers
+            # differed only in WHY, which is what the tooltip is for — two
+            # pills promising two different things about removal is what made
+            # a single state read as two.
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
             if requirement == "required":
                 items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
@@ -3051,20 +3081,20 @@ async def library_page(
                 # are precisely the two cases `curated_uninstall` answers 409
                 # to, so the lock promises exactly what the API enforces.
                 locked = bool(pl.get("is_system")) or key in plugin_required
+                row["stack_action"] = _AGENT_ADD
+                row["stack_undo"] = _AGENT_REMOVE
                 if key in plugin_in_stack:
                     row["stack_state"] = "in_stack"
-                    row["stack_pill"] = "Installed"
+                    row["stack_pill"] = _AGENT_HAS
                     row["stack_locked"] = locked
                     row["stack_removable"] = not locked
-                    row["stack_title"] = (
-                        _LOCKED_STACK_TOOLTIP if locked else "The default agent can use this — click to remove it"
-                    )
+                    row["stack_title"] = _LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP
                 else:
                     row["stack_state"] = "available"
                     row["stack_pill"] = ""
                     row["stack_locked"] = False
                     row["stack_addable"] = True
-                    row["stack_title"] = "Granted to you, but the default agent can't use it until you add it"
+                    row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
         logger.warning("/library: could not resolve marketplace plugins: %s", e)
 
@@ -3095,12 +3125,12 @@ async def library_page(
             # Installing a store item IS its Stack membership, and the caller may
             # undo it — the same install endpoint, removed.
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "Installed"
-            items[-1]["stack_action"] = "Install"
-            items[-1]["stack_undo"] = "Uninstall"
+            items[-1]["stack_pill"] = _AGENT_HAS
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
-            items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
     except Exception as e:
         logger.warning("/library: could not resolve installed agents: %s", e)
 
