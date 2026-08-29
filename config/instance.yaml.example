@@ -277,6 +277,23 @@ auth:
   #   allow_token_header: false     # X-StorageApi-Token API auth; see docs/feature-flags.md
   #   multi_project_mode: disabled  # disabled | select | auto; see docs/feature-flags.md
 
+  # --- Microsoft Entra ID group sync (optional) ---
+  # Mirrors the signed-in user's Entra ID group memberships into
+  # user_group_members (source='microsoft_sync') on every Microsoft
+  # sign-in, the way Google sync mirrors Workspace groups. Off by default:
+  # enabling it also widens the OAuth consent scope requested at
+  # /auth/microsoft/login to the delegated Graph permission
+  # GroupMember.Read.All, which needs its own admin-consent grant in the
+  # Entra app registration — see docs/auth-microsoft-oauth.md before
+  # turning this on.
+  # microsoft:
+  #   group_sync_enabled: false     # AGNES_MICROSOFT_GROUP_SYNC_ENABLED env override
+  #
+  # AGNES_MICROSOFT_GROUP_PREFIX (env-only, like Google's
+  # AGNES_GOOGLE_GROUP_PREFIX — neither has an instance.yaml key): when set,
+  # only mirror/allow groups whose identifier starts with this
+  # (case-insensitive) prefix.
+
 # --- Security (optional) ---
 # security:
 #   # Hostnames exempt from the private/reserved-network SSRF guard on admin-
@@ -383,10 +400,11 @@ auth:
 #                                    # redesign` above. Env override:
 #                                    # AGNES_STACK_AUTO_MEMBERSHIP.
 #
-#   # Three surfaces the admin cleanup retired. All default false — the pages
+#   # Four surfaces the admin cleanup retired. All default false — the pages
 #   # and their APIs are intact, so setting one to true brings the surface
 #   # back exactly as it was. Env overrides: AGNES_NEWS_ENABLED,
-#   # AGNES_KNOWLEDGE_DIGESTS_ENABLED, AGNES_CONTRIBUTE_SKILL_ENABLED.
+#   # AGNES_KNOWLEDGE_DIGESTS_ENABLED, AGNES_CONTRIBUTE_SKILL_ENABLED,
+#   # AGNES_STORE_MODERATION_ENABLED.
 #   news_enabled: true               # In-product news: the /admin/news editor, the
 #                                    # /news reader, the /home "What's new" strip and
 #                                    # their nav + palette entries. UI only —
@@ -404,6 +422,14 @@ auth:
 #                                    # The Library's skill builder is the supported
 #                                    # path; both POST handlers are gated with the
 #                                    # page, so a stale button cannot publish past it.
+#   store_moderation_enabled: true   # The Moderation & Trust hub (/admin/store) and
+#                                    # its nav + palette entries. Its zones each have
+#                                    # a better door already: Submissions is its own
+#                                    # nav row, curation is /admin/marketplaces, and
+#                                    # verification has store.verification_enabled.
+#                                    # UI only — the store APIs and
+#                                    # /api/admin/share-requests* keep serving, so a
+#                                    # queued agent share is still decidable by API.
 
 # --- Library & Store trust vocabulary (optional, opt-in) ---
 # Both default to false so a routine upgrade never changes what existing
@@ -733,14 +759,17 @@ ai:
 # a hint, so use it to discover the schema if this comment block has aged.
 #
 # corporate_memory:
-#   # How knowledge reaches users:
-#   # "mandatory_only" — admin controls everything, no user voting
-#   # "admin_curated" — admin controls, users vote as feedback signal
-#   # "hybrid" — mandatory from admin + optional from user voting (default)
-#   #
-#   # NOT YET ENFORCED (#1573): GET /api/memory/bundle currently ships every
-#   # approved item to every user regardless of this value — changing it has
-#   # no effect on distribution yet.
+#   # Which OPTIONAL (approved, non-required) items are distributed to a
+#   # user's bundle (GET /api/memory/bundle, the per-domain markdown
+#   # `agnes pull` writes, and the matching sync-manifest md5). Required
+#   # (mandatory) items always reach their target audience regardless of
+#   # this setting — it only ever narrows the optional channel, never it.
+#   # "mandatory_only" — no optional channel at all; approved items stay
+#   #   catalog-browsable but are never bundled/synced
+#   # "admin_curated"  — same distribution as mandatory_only; voting is a
+#   #   feedback signal for admins only, it never triggers distribution
+#   # "hybrid"          — approved items are personally opt-in: only items
+#   #   the caller has upvoted (vote > 0) join their bundle (default)
 #   distribution_mode: "hybrid"
 #
 #   # How new AI-extracted items enter the system:
@@ -1079,6 +1108,21 @@ chat:
   #     project_id: my-gcp-project
   #     region: europe-west1      # or "global"
 
+# --- Session archive / analyst-sessions bridge (optional) ---
+# Web-chat sessions (`chat_messages`, the `chat:` block above) materialize
+# into the same jsonl shape the CLI/analyst session pipeline already reads
+# (SESSION_DATA_DIR -> services/session_pipeline), so the usage rollups and
+# the /admin/sessions transcript viewer pick up chat conversations exactly
+# like any other session (audit-full-coverage plan, F4).
+sessions:
+  # ON by default: a chat session is exported (best-effort, atomic write)
+  # when it ends (archive/delete/idle-reaper kill) and by a bounded
+  # pipeline sweep for any still-active session. Set false to keep chat
+  # transcripts out of the filesystem session store entirely — the prior
+  # behavior, where chat_messages was the only copy and had no admin
+  # transcript viewer. Env override: AGNES_SESSIONS_INCLUDE_CHAT.
+  include_chat: true
+
 # --- Hosted Data Apps (optional) ---
 # Hosted data apps (user web applications run next to the data)
 data_apps:
@@ -1166,8 +1210,8 @@ facts:
 # here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
 # NOT editable from /admin/server-config (locked: requires the
 # extraction-worker deployment) — this is operator/deploy-time config, not
-# a runtime toggle. The rest of this block (`producer`, `timeout_s`) is
-# plain instance data, read directly via get_value.
+# a runtime toggle. The rest of this block (`producer`, `schedule`,
+# `timeout_s`) is plain instance data, read directly via get_value.
 extraction:
   enabled: false
   producer:
@@ -1186,6 +1230,21 @@ extraction:
     # by default. Only the NAMES listed here are copied — this is not a way
     # back to forwarding the whole environment.
     env_passthrough: []
+  # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
+  # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
+  # driving a scheduler row (`extraction-run-due`, see
+  # services/scheduler/__main__.py) that fires `POST /api/admin/sharepoint/
+  # extraction/run-due`. That sweep applies this SAME cadence independently
+  # to each SharePoint connection's own last-run stamp, enqueueing the
+  # existing `corpus-extraction` job kind for whichever connections are due
+  # — not a per-connection schedule, one clock applied to every connection.
+  # Empty (the default) disables the sweep entirely — no scheduler row is
+  # registered — same "off unless explicitly turned on" posture as
+  # `enabled` above. An admin can still trigger a one-off run at any time
+  # via `POST /api/admin/sharepoint/connections/{id}/extract` regardless of
+  # this setting (subject to the same `enabled`/producer-configured gate).
+  # SCHEDULER_EXTRACTION_SCHEDULE overrides this at the environment level.
+  schedule: ""
   # Hard ceiling on one producer run, in seconds — the subprocess is killed
   # at this timeout and the job fails (no automatic retry: a failed
   # producer run usually needs an operator to look at it).
@@ -1202,6 +1261,49 @@ extraction:
   # non-secret allowlist (+ any `env_passthrough` above) plus the four vars
   # named above. No other instance secret (vault key, LLM API key, DB DSN,
   # OAuth client secrets, ...) is ever forwarded to it.
+  #
+  # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
+  # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
+  # scopes must be pseudonymized by the producer before upload. When at
+  # least one confirmed scope on a connection is anonymize=true, the
+  # producer subprocess ALSO receives AGNES_EXTRACTION_ANONYMIZE_SCOPES (a
+  # JSON object, {source_scope_id: collection_id}, covering only the
+  # anonymize-marked scopes) and AGNES_ANONYMIZATION_HMAC_KEY (this
+  # instance's per-instance pseudonym key — different instances must use
+  # different keys, or the same person pseudonymizes identically across
+  # tenants). Neither var is set when no scope is anonymize-marked.
+  #
+  # Producer callback credential (TCRD-226): the producer calls BACK into
+  # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
+  # its actual work, so the child env ALSO carries AGNES_API_URL (this
+  # instance's own base URL — always set, no secret) and, when
+  # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
+  # shared-secret bearer token). This is a DELIBERATE OVER-GRANT, not an
+  # oversight: presenting that token resolves to a synthetic user in the
+  # Admin system group (see app/auth/scheduler_token.py) — god-mode on
+  # every RBAC check — while the producer only ever needs to read its own
+  # connection's scope map, upload into its own scope collections, and
+  # POST to the facts-ingest endpoint. It is reused because it is the only
+  # existing credential class a headless subprocess can already present; a
+  # narrower, producer-scoped credential is the right long-term fix and is
+  # out of scope here. A compromised or merely misbehaving producer under
+  # this token can do anything an admin can, not merely ingest facts —
+  # weigh that before pointing `producer` at anything you have not
+  # reviewed.
+  anonymization:
+    # Name of the env var holding the per-instance HMAC key — checked
+    # against ITS OWN allowlist before the value is read (the name here is
+    # admin-writable config, so an unlisted name is refused rather than
+    # silently read). This is a SEPARATE, narrower allowlist from the
+    # SharePoint certificate's above (AGNES_REMOTE_ATTACH_TOKEN_ENVS) —
+    # deliberately, so this key can never be referenced as a `token_env` on
+    # a connector-written `_remote_attach` row (see
+    # src/orchestrator_security.py's `_PRODUCER_KEY_ENVS`). Empty (or the
+    # default name itself) uses AGNES_ANONYMIZATION_HMAC_KEY; any other
+    # name is refused. A connection with an anonymize-marked scope and no
+    # resolvable key fails the extraction job clean rather than running the
+    # producer without a key.
+    hmac_key_env: ""
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,

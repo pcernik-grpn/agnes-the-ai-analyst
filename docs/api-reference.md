@@ -1169,15 +1169,58 @@ client id, certificate via vault secret or `config.cert_private_key_env`);
 these three routes are the wizard's own steps 2/3.
 
 - /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
+- /api/admin/sharepoint/connections/{connection_id}/certificate
+- /api/admin/sharepoint/connections/{connection_id}/extract
+- /api/admin/sharepoint/extraction/run-due
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
-libraries; both → the drive's root children) using the connection's resolved
-certificate. A missing/unresolvable certificate is a typed `409
-sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
-rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+libraries; `drive_id` → the drive's root children; `drive_id` + `item_id` →
+that folder's own children, at any depth — TCRD-240) using the connection's
+resolved certificate. `item_id` is structurally validated before it ever
+reaches a Graph URL path segment, and is rejected (`422
+item_id_requires_drive_id`) without a `drive_id`. A missing/unresolvable
+certificate is a typed `409 sharepoint_cert_unresolved` (surface absence
+rather than fail the crawl); a rejected/failed Graph call is a typed `502
+sharepoint_graph_error`.
+
+`?with_permissions=1` (default off) additionally probes each listed FOLDER
+for `hasUniqueRoleAssignments` (batched via Graph's `POST /$batch`, capped
+at 20 sub-requests per batch and at 200 folders per browse click) and adds
+`unique_permissions: true|false|null` to each folder item — `null` covers
+both "never probed" (beyond the 200-folder cap) and "the probe itself
+failed", collapsed into one honest "unknown". This is an **advisory-only**
+signal for the wizard's own unique-permissions badge (see below) — Agnes
+does not derive or enforce anything from a SharePoint ACL today (design
+spec §13.1, "Decision #2"); a Phase-2 design for actually deriving and
+mirroring source permissions exists as a separate, not-yet-merged spec
+("SharePoint ACL mirroring design") and is out of scope for this endpoint.
+Off by default so plain browsing never pays the extra Graph round trip; a
+probe failure never fails the browse itself, only degrades the affected
+folders to `null`.
+
+`GET …/tree/search` (TCRD-240) is a bounded breadth-first folder search over
+the same live tree — Graph's own `/search` is known to silently under-return
+under app-only auth, so this module never calls it. Params: `q` (required,
+`min_length=2`), `mode` (`prefix` default, `contains`, or `glob` —
+`fnmatch` syntax, case/composition-insensitive; a malformed glob, defined as
+unbalanced `[`/`]`, is a typed `422 invalid_search_pattern`), an optional
+`drive_id` + `item_id` subtree root (neither given searches every drive of
+every reachable site; `item_id` without `drive_id` is `422`), and
+`max_depth`/`max_visited` (defaults `5`/`2000`, CLAMPED to caps `12`/`20000`
+rather than rejected — raised from the original `10`/`2000` once a real
+library measured at 443k files / 97,899 folders made the old visited cap
+truncate almost every whole-library search at the very top; each visited
+folder is one *sequential* Graph call, never fanned out concurrently, which
+is what keeps the raised cap from turning into a throttling risk). Response:
+`{matches: [{item_id, drive_id, display_path}], visited, truncated, hint}`
+— `truncated` is `true` whenever a cap is what stopped the walk, never a
+silently partial result; `hint` is a short next-step string ("scope the
+search to a site or folder, or narrow the pattern") when `truncated` is
+`true`, else `null`.
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
@@ -1195,6 +1238,43 @@ exclusion — without touching its already-created collection.
 `GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
 collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
 crawling moves inside Agnes.
+
+`GET …/certificate` returns read-only certificate metadata — the thumbprint
+the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`
+header value) plus the conventional uppercase-hex SHA-1 fingerprint
+(`thumbprint_sha1_hex`), `subject`/`issuer`, `not_before`/`not_after`, and a
+derived `expires_in_days` (may be negative) / `status`
+(`ok`/`expiring_soon` at ≤30 days/`expired`) — derived at request time from
+the connection's already-stored PEM, no new schema. Catches two real
+failure modes: a registered certificate that doesn't match what the
+connection presents (opaque provider auth error), and a certificate
+expiring silently. Never returns the private key. No certificate configured
+or an unparseable one is a typed absence — `{"certificate": null, "reason":
+"..."}` — not an error status.
+
+**Extraction enqueue wiring (TCRD-226).** `POST …/extract` is a one-off
+admin trigger for the existing `corpus-extraction` job kind
+(`app/worker/kinds.py::_run_corpus_extraction`) — enqueues
+`{"connection_id": connection_id}` and returns `202
+{"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
+any other work; refuses cleanly (never a job that fails 30 minutes later in
+a worker) with `409 extraction_disabled` (`extraction.enabled` is false) or
+`409 extraction_producer_not_configured` (no `extraction.producer.command`/
+`.module` set); a run already queued/running for the same connection is
+`409 extraction_already_running` — deduped on a stable per-connection
+idempotency key shared with the sweep below.
+
+`POST /api/admin/sharepoint/extraction/run-due` is the scheduler-driven
+sweep: fires `corpus-extraction` for every SharePoint connection whose
+cadence (`extraction.schedule`, a single instance-wide setting in the
+`extraction:` config block, applied independently to each connection's own
+last-run stamp) says it is due — same shape as `POST /api/v1/agents/run-due`
+(walk + per-row due-check + enqueue into an existing job kind, no second
+scheduling mechanism). Scheduler row `extraction-run-due` in
+`services/scheduler/__main__.py`, registered only when `extraction.schedule`
+is configured (absent/empty = off). A clean, typed no-op (`{"dispatched":
+[], "count": 0, "skipped": true, "reason": ...}`), never an error, when the
+feature isn't usable or no schedule is configured.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
@@ -1249,6 +1329,22 @@ Admin-only, write-only vault for datasource secrets (`KEBOOLA_STORAGE_TOKEN`, `B
 
 - /api/admin/slack-secrets
 - /api/admin/slack-secrets/{name}
+
+### `/api/admin/sso` — External SSO login (runtime-configured Entra ID OIDC)
+
+Singleton runtime config for the optional external-identity login (`sso`
+provider slot): tenant/client IDs, a write-only Fernet-encrypted client
+secret, the mandatory email-domain allowlist, button label and enable flag,
+plus the captured external-identity bindings. `PUT`/`DELETE` on the config
+and secret are guarded by the last-login-door rule (422 `last_login_door`
+when the operation would leave no usable sign-in method). Postgres app-state
+backend required (typed 501 on DuckDB). See `docs/auth-sso-entra.md`.
+
+- /api/admin/sso/config
+- /api/admin/sso/client-secret
+- /api/admin/sso/test-config
+- /api/admin/sso/identities
+- /api/admin/sso/identities/{user_id}
 
 ### `/api/admin/db` — Database state and migration
 
@@ -1663,6 +1759,7 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
 
@@ -1750,8 +1847,57 @@ Shareable resource types are `collection` and `agent` — skills are excluded
 because an approved store entity is already readable by every authenticated
 user.
 
+**Track C6 — agent-sharing needs admin approval (Postgres-backed instances).**
+A user may build agents freely, but when a NON-ADMIN actor shares an `agent`
+with a group it has not already reached, the grant is not written
+immediately: it is queued in `share_requests` and `PUT /api/sharing/agent/{id}`
+answers `202` (not `200`), with `pending_group_ids` naming what's awaiting a
+decision. An admin actor (regardless of who owns the agent) and any un-share
+(revoking a group) both stay instant and answer `200`, matching every other
+resource type. `GET /api/sharing/agent/{id}` always echoes the current
+`pending_group_ids` so a page reload still shows "pending approval". The
+queue (`share_requests`) is Postgres-only (A3 ratchet) — see
+`/api/admin/share-requests` below — but sharing itself never regresses: on a
+DuckDB-backed instance the approval step simply isn't active, so a
+non-admin's agent share falls back to the pre-C6 instant grant instead of a
+`501`. Only the admin queue endpoints answer `501` there.
+
 - /api/sharing/groups
 - /api/sharing/{resource_type}/{resource_id}
+
+### `/api/admin/share-requests` — Agent-sharing approval queue (Track C6, PG-only)
+
+These endpoints are NOT gated by `features.store_moderation_enabled` — that flag
+hides the `/admin/store` WEB PAGE (off by default), which is the only UI that
+renders this queue. While it is hidden, a queued request is still listed and
+decided here. See [feature-flags.md](feature-flags.md).
+
+Every route requires admin. `GET` lists queued requests, optionally filtered by
+comma-separated `status` (`pending`/`approved`/`rejected`; omitted returns every
+decision, newest first — the queue doubles as its own audit trail). Each row
+carries resolved display fields (`resource_name`, `requested_group_name`,
+`requested_by_email`) alongside the raw ids. `PATCH /api/admin/share-requests/{id}`
+takes `{"decision": "approve" | "reject"}` — the decision rides in the body
+rather than a verb path segment, the same shape as
+`PATCH /api/v1/agents/{agent_id}/memories/{memory_id}`'s `{"action": ...}`
+(`tests/test_api_design_rules.py::test_no_new_verbs_in_path` forbids a new
+verb segment in a path). `decision: "approve"` writes the grant via the same
+`resource_grants_repo().ensure_grant` the admin-curated `/admin/access` layer
+uses — an approved share reaches the grantee through the identical mechanism
+the shared-agent runtime already honors — and marks the request `approved`
+with `decided_by`/`decided_at`. `decision: "reject"` leaves no grant and marks
+it `rejected`. An unrecognized `decision` is `400`. The PATCH is a clean `404`
+on an unknown id OR a request that was already decided (an atomic
+`WHERE status = 'pending'` guard — a double-click can never double-write the
+grant or flip an already-decided verdict). Every decision writes an
+`audit_log` row (`share_request.approved` / `share_request.rejected`).
+PG-only (A3 ratchet): on a DuckDB-backed instance every route here answers
+`501 requires_postgres_backend`. Web-only by design — see the triple-surface
+ratchet's `_SHARE_REQUESTS_ADMIN_REASON` for why no CLI/MCP vocabulary was
+added.
+
+- /api/admin/share-requests
+- /api/admin/share-requests/{request_id}
 
 ### `/api/collections` — File collections (bring-your-files)
 
@@ -1766,6 +1912,21 @@ server-side plus `nosniff`; anything else — notably an uploaded `.html` — is
 inline on this origin. Both read-gate on the parent collection's access OR a
 grant on the `corpus_file` itself, so a file shared out of a folder stays
 viewable by the person it was shared with.
+
+Uploading (`POST .../files`) returns one `{file_id, filename, path,
+processing_status, …, claims_purged}` per file. `claims_purged` (spec §8) is
+the count of fact-graph claims dropped for that file because its content
+changed in place (§6) — 0 for a brand-new file, an unchanged-content resync
+or rename, or when the `facts` flag is off — so a producer's ingest
+idempotence can tell "content changed, re-ingest is genuinely needed" apart
+from "already shipped". The optional `source_stable_ids` field refuses any
+value matching the RESERVED zip-bundle member-anchor shape
+(`cf_<hex>!<member path>`, only `ingest_bundle` may mint one) with a `400`
+(`reason: "reserved_source_stable_id"`) before any file in the batch is
+stored — otherwise a caller with mere collection READ access (enough to see
+a real member's id and filename in this same listing) could re-upload an
+unrelated file under a member's own anchor and have it silently resolve to
+(and overwrite) that member's row.
 
 - /api/collections
 - /api/collections/search
@@ -1791,12 +1952,21 @@ admin gate; visibility is enforced entirely server-side, per caller, from
 readable collection grants (§4/§5). `search` and `neighbors` project
 attributes and traverse edges from readable claims only; `claims` returns
 the caller's readable evidence for one subject, `404` (never `403`) when it
-does not exist or has no readable claim. Triple-surface: `agnes facts
-search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/
-`fact_claims` (MCP foundation tools) call the same repository directly —
-facts have no local scope, so every result is labeled `[server]` on the
-CLI's stderr, a deliberate deviation from the `--scope auto|local|server`
-convention (spec §12).
+does not exist or has no readable claim. `search` also accepts an OPTIONAL
+`q` — a free-text name lookup matched against `fact_aliases.natural_key`
+ONLY (never a claim's quote or attrs, so it cannot reopen the §5 attribute
+oracle): the query is normalized (casefolded, spaces -> hyphens) and matched
+as a substring, filtering candidates before `limit` applies, then ranked —
+an exact match on the alias's slug first, a prefix match second, any other
+substring match last (no `pg_trgm`/extension similarity ranking; this
+schema does not enable one). All three request models are `extra="forbid"`
+— an unrecognized field `422`s rather than being silently ignored. Triple-
+surface: `agnes facts search|neighbors|claims` (CLI; `search` takes an
+optional second positional `[query]` for `q`) and `fact_search`/
+`fact_neighbors`/`fact_claims` (MCP foundation tools) call the same
+repository directly — facts have no local scope, so every result is labeled
+`[server]` on the CLI's stderr, a deliberate deviation from the `--scope
+auto|local|server` convention (spec §12).
 
 **Write surface** (build order step 4) — scheduler token or admin PAT, no
 CLI/MCP by design (a producer contract, not an analyst command). `ingest`
@@ -1804,7 +1974,15 @@ is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `413`; a single document's evidence alone over the claim cap is a `422`
 `document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
 must be a substring of one chunk of the evidencing document's extracted
-text), union vs `full_documents` replace mode, alias/edge resolution,
+text OR of the document's own SERVER-STORED `filename`/`path` — never a
+producer-supplied identity string off the wire, which would let a producer
+self-certify an invented quote), union vs `full_documents` replace mode,
+alias/edge resolution, a `documents[]` entry's OPTIONAL `source_url` (§8/O7,
+e.g. the crawler's Graph `webUrl`) persisted onto `corpus_file_sources` for
+the citation's "Open in source" link — validated https-only/length-capped,
+dropped (never rejects the surrounding claim) when absent or invalid; a
+SENT-but-invalid value is itemized on the response's `source_urls_rejected:
+[{doc_id, reason}]` (never an absent one), same shape as `claims_rejected`,
 `wrong`-correction re-attachment across a subject's delete-then-recreate,
 and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
 `review_items` mixes two self-describing shapes (a `kind` discriminator on
@@ -1818,12 +1996,29 @@ dst's claims are gone. Same detection re-runs at read time in
 caller-scoped: a dst the caller cannot independently read (its own claim
 AND the edge's own claim both readable, the same discipline
 `possible_duplicate_of` review items get) never appears. Response is the
-run report: `{claims_written, claims_rejected: [{row,
-reason}], deferred: [...], subjects_created, subjects_deleted,
-corrections_active: [...], review_items: [...]}`. `documents` may be
+run report: `{claims_written, claims_accepted_via_identity,
+claims_rejected: [{row, reason}], deferred: [...], subjects_created,
+subjects_deleted, corrections_active: [...], review_items: [...]}`.
+`claims_accepted_via_identity` is the subset of `claims_written` whose
+quote passed the gate ONLY via the document's filename/path — surfaced so
+an operator can see how much evidence is filename- rather than
+content-grounded (weaker evidence still, per §8's own honesty note that the
+gate validates the quote, not the fact). `documents` may be
 omitted only when every evidence `doc_id` already resolves through a prior
 upload's `corpus_file_sources` mapping — otherwise `400` with the
-unresolved ids itemized. Corrections management
+unresolved ids itemized. A **zip-bundle member is citable exactly like a
+top-level file**: `src.ingest.bundle.ingest_bundle` writes each member's own
+`corpus_file_sources` anchor at unpack time (`source_doc_id` = the member's
+own content `sha256[:16]`, `source_stable_id` = `"<archive
+corpus_files.id>!<member path>"`), so a claim referencing that `doc_id`
+resolves to the member's `corpus_file_id`, never the archive's — no
+`documents[]` entry is required once the archive has been ingested once.
+That shape is RESERVED: a `documents[].stable_id` matching it is refused
+with a `400` (`reason: "reserved_source_stable_id"`) before any document in
+the batch is resolved — the identical guard the collections upload endpoint
+enforces on `source_stable_ids` (see the Collections section below); only
+`ingest_bundle` may mint an anchor on that shape.
+Corrections management
 (`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
 `wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
@@ -2182,6 +2377,7 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 - /api/me/display-name
 - /api/me/effective-access
 - /api/me/elevation
+- /api/me/external-identity
 - /api/me/home-stats
 - /api/me/onboarded
 - /api/me/stats/queries
@@ -2437,6 +2633,7 @@ fanned out into group members' installs and cannot be uninstalled
 ### `/api/upload` — Session and artifact upload
 
 - /api/upload/artifacts
+- /api/upload/audit-events
 - /api/upload/local-md
 - /api/upload/sessions
 
@@ -2554,6 +2751,18 @@ Guards, enforced in every mode: empty/whitespace-only `content` → `422` — th
 **Auth binds to the CALLING session, never the path `{id}`.** The in-sandbox agent reaches this route through the secret broker (`app/api/broker.py`), which authenticates as the sandbox's real owner and mints a JWT carrying `chat_session_id` for the session the ticket was minted for. Because the broker replays whatever path the sandboxed agent describes, a prompt-injected agent could otherwise target a DIFFERENT session belonging to the SAME owner but a DIFFERENT agent (with a different, possibly `off`, `memory_write_mode`) — `require_session_principal`'s ownership check alone would allow it, since both sessions share an owner. So whenever a broker-minted `chat_session_id` claim is present, it must equal the path `{id}` or the request is `403 {"code": "session_mismatch"}`, regardless of ownership. An interactive owner session token or an agent PAT (neither goes through the broker) carries no such claim, so the path `{id}` — already ownership/PAT-verified by `require_session_principal` — is trusted as-is.
 
 - /api/v1/sessions/{session_id}/memories
+
+### `POST /api/v1/agents/{slug}/delegate` — @delegation between shared agents (Track C7 MVP)
+
+Server-side handoff: a live, user-driven agent turn (agent A) hands ONE sub-request off to another agent the CALLER may run (agent B, named by `{slug}`), mid-turn, and gets B's answer back into A's turn. `{input: message: str (required)}` → `200 {status: "ok"|"denied"|"degraded", reason: str | null, agent_slug, answer: str | null, message: str | null}` — a denial or degrade is a normal `200` body, never an HTTP error: the caller (agent A's own in-process delegation tool) is expected to read `status`/`reason` and continue the turn on its own judgment.
+
+Same auth binding as `/api/v1/sessions/{id}/memories` above: reached exclusively through the secret broker under A's OWN session-scoped ticket (never a client-supplied session id) — `require_delegating_session` resolves the caller's identity from whatever the broker's JWT minting produced (an `AgentPrincipal` for a restricted/shared agent, or a plain user dict with a stashed `chat_session_id` claim for the "passthrough" optimization on an unrestricted agent run by its own owner), never from a client-shaped field.
+
+`{slug}` is resolved exactly like `require_agent_runtime_principal` resolves a runtime target (`agents_repo().get_runnable_by_slug`) — the CALLER's own runnable set (owned, or reachable via a `ResourceType.AGENT` grant), never A's owner's. THE SECURITY INVARIANT: B is spawned as a fresh CHILD session via `ChatManager.create_session(user_email=<the ORIGINAL caller>, agent_id=B)` — never A's owner, never B's owner — so B's row-level access policies (`src/access_policy.py`) bind to the caller, never a wider identity. Depth-1 only (a session spawned as a delegate target cannot itself delegate, `reason: "depth_exceeded"`) and one delegation per turn (`reason: "already_delegated_this_turn"`). An RBAC denial (`reason: "agent_not_runnable"`), an exhausted monthly budget on B (`status: "degraded"`, `reason: "budget_exhausted"`), the per-user concurrency cap (`reason: "concurrency_cap"`), or B simply not answering in time (`reason: "timeout"`) all degrade the result — none of them raise an HTTP error or crash A's turn.
+
+Sandbox-internal RPC (standing exemption from the triple-surface CLI/MCP ratchet — see `app/api/agent_delegation.py`'s module docstring): its only real caller is agent A's own in-process delegation tool (`app/chat/runner.py`'s `_delegation_mcp_server`), not something an analyst calls directly from a terminal.
+
+- /api/v1/agents/{slug}/delegate
 
 ### `/api/v1/agents/{slug}/webhooks` — outbound agent webhooks (V1b Task 6)
 

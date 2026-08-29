@@ -179,7 +179,7 @@ class SemanticModelsRepository:
 
     def detach(self, model_id: str, *, by: str, base_hash: str) -> Dict[str, Any]:
         """F3 detach is Postgres-only (A3 ratchet — migrations/versions/
-        0077_semantic_models_detach.py has no DuckDB counterpart); this
+        0090_semantic_models_detach.py has no DuckDB counterpart); this
         DuckDB repo gains no capability that depends on it."""
         from src.repositories import RequiresPostgresBackend
 

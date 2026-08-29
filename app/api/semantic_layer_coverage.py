@@ -298,7 +298,8 @@ async def create_mute(
     names a source connection that does not exist — a mute pointing at nothing
     silences nothing, forever, while looking like it works.
     """
-    from src.repositories import audit_repo, source_connections_repo
+    from src.audit_helpers import log_safe
+    from src.repositories import source_connections_repo
 
     scope, source_id = _parsed_scope(body.scope)
 
@@ -337,7 +338,7 @@ async def create_mute(
         expires_at=expires_at,
     )
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         action="semantic_health_mute.create",
         resource=row["id"],
@@ -379,7 +380,7 @@ async def delete_mute(
     unmute that unmuted nothing and then wonders why the warning is still
     quiet.
     """
-    from src.repositories import audit_repo
+    from src.audit_helpers import log_safe
 
     if not mutes_repo.delete(mute_id):
         raise HTTPException(
@@ -387,7 +388,7 @@ async def delete_mute(
             detail={"error": "unknown_mute", "message": f"no semantic-layer mute {mute_id!r}"},
         )
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         action="semantic_health_mute.delete",
         resource=mute_id,

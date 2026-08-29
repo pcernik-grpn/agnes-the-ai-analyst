@@ -14,6 +14,7 @@ import duckdb
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
+from src.audit_helpers import log_safe
 from src.scheduler import is_valid_schedule, is_table_due
 
 from src.repositories import (
@@ -94,6 +95,13 @@ async def deploy_script(
         schedule=request.schedule,
         source=request.source,
     )
+    # Content never: the script SOURCE never enters the audit record.
+    log_safe(
+        user_id=user["id"],
+        action="script.deploy",
+        resource=f"script:{script_id}",
+        params={"name": request.name, "schedule": request.schedule},
+    )
     return ScriptResponse(
         id=script_id,
         name=request.name,
@@ -113,7 +121,15 @@ async def run_deployed_script(
     script = repo.get(script_id)
     if not script:
         raise HTTPException(status_code=404, detail="Script not found")
-    return _execute_script(script["source"], script["name"])
+    result = _execute_script(script["source"], script["name"])
+    log_safe(
+        user_id=user["id"],
+        action="script.run",
+        resource=f"script:{script_id}",
+        params={"name": script["name"], "adhoc": False},
+        result="success" if result.get("exit_code") == 0 else "error",
+    )
+    return result
 
 
 @router.post("/run")
@@ -124,7 +140,17 @@ async def run_adhoc_script(
     """Run an ad-hoc Python script (not deployed). Admin-only."""
     if not request.source:
         raise HTTPException(status_code=400, detail="Script source required")
-    return _execute_script(request.source, request.name or "adhoc")
+    name = request.name or "adhoc"
+    result = _execute_script(request.source, name)
+    # Content never: the script SOURCE never enters the audit record.
+    log_safe(
+        user_id=user["id"],
+        action="script.run",
+        resource=f"script:{name}",
+        params={"name": name, "adhoc": True},
+        result="success" if result.get("exit_code") == 0 else "error",
+    )
+    return result
 
 
 @router.delete("/{script_id}", status_code=204)
@@ -134,9 +160,16 @@ async def undeploy_script(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     repo = notifications_script_repo()
-    if not repo.get(script_id):
+    script = repo.get(script_id)
+    if not script:
         raise HTTPException(status_code=404, detail="Script not found")
     repo.undeploy(script_id)
+    log_safe(
+        user_id=user["id"],
+        action="script.delete",
+        resource=f"script:{script_id}",
+        params={"name": script.get("name")},
+    )
 
 
 @router.post("/run-due")

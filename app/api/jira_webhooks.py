@@ -20,6 +20,7 @@ import re
 from app.auth.access import require_admin as _require_admin
 from connectors.jira.service import Config, get_jira_service
 from connectors.jira.validation import is_valid_issue_key, safe_join_under
+from src.audit_helpers import log_safe
 
 # webhookEvent is attacker-controlled; sanitize before using as a filename
 # component. Real Jira webhookEvent values are like "jira:issue_updated" —
@@ -113,6 +114,12 @@ async def receive_jira_webhook(request: Request) -> Response:
     signature = request.headers.get("X-Hub-Signature-256") or request.headers.get("X-Hub-Signature")
     if not _verify_signature(payload, signature):
         logger.warning("Invalid webhook signature from %s", request.client.host if request.client else "unknown")
+        log_safe(
+            user_id=None,
+            action="webhook.jira_rejected",
+            resource="webhooks/jira",
+            result="denied",
+        )
         return JSONResponse({"detail": "Invalid signature"}, status_code=401)
 
     # Parse JSON
@@ -129,6 +136,12 @@ async def receive_jira_webhook(request: Request) -> Response:
         return JSONResponse({"detail": "Empty payload"}, status_code=400)
 
     webhook_event = event_data.get("webhookEvent", "unknown")
+    log_safe(
+        user_id=None,
+        action="webhook.jira_received",
+        resource="webhooks/jira",
+        params={"event": webhook_event},
+    )
     # Defensive: some webhook senders pass `"issue": null` rather than
     # omitting the key. Normalise to {} so the next .get() doesn't
     # raise AttributeError on None.

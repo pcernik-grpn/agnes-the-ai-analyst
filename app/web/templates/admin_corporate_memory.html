@@ -1,6 +1,6 @@
 {% extends "base_admin.html" %}
 
-{% block title %}Memory Review - Data Analyst Portal{% endblock %}
+{% block title %}Corporate memory — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1031,7 +1031,7 @@
    can't reach — the swap approach keeps the rendering uniform across
    the static and JS-string contexts. #}
     {% set page_hero_eyebrow = "Agent Experience" %}
-    {% set page_hero_title = "Memory Review" %}
+    {% set page_hero_title = "Corporate memory" %}
     {% set page_hero_plain = True %}
     {% set page_hero_subtitle = "Review pending knowledge items from analyst sessions — approve, mandate, or reject — and resolve contradictions and duplicate candidates. Approved items flow to the user-facing <a href=\"/corporate-memory\" style=\"color:inherit;text-decoration:underline;\">Curated Memory</a> page." %}
     {% include "_page_hero.html" %}

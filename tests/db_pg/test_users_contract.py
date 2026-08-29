@@ -238,6 +238,42 @@ def test_any_password_holder_excludes_the_given_email(users_repo):
     assert repo.any_password_holder(exclude_email="scheduler@internal.invalid") is True
 
 
+# ---------------------------------------------------------------------------
+# revoke_sessions — server-side session revocation (issue #1676)
+#
+# PG-only capability (A3 ratchet): the DuckDB sibling has no
+# `session_revoked_before` column, so `revoke_sessions()` is a documented
+# no-op there. Both outcomes are asserted explicitly per backend rather than
+# skipping the DuckDB half — the asymmetry is the whole point of this test.
+# ---------------------------------------------------------------------------
+
+
+def test_revoke_sessions_sets_a_recent_floor_on_pg_and_is_a_noop_on_duckdb(users_repo):
+    repo, _, backend = users_repo
+    _make_user(repo)
+    before = repo.get_by_id("user-1")
+    assert before.get("session_revoked_before") is None
+
+    repo.revoke_sessions("user-1")  # must not raise on either backend
+
+    after = repo.get_by_id("user-1")
+    if backend == "pg":
+        assert after["session_revoked_before"] is not None
+        floor = after["session_revoked_before"]
+        if floor.tzinfo is None:
+            floor = floor.replace(tzinfo=timezone.utc)
+        assert (datetime.now(timezone.utc) - floor) < timedelta(minutes=5)
+    else:
+        assert after.get("session_revoked_before") is None, "DuckDB has no such column — must stay unset"
+
+
+def test_revoke_sessions_on_unknown_user_does_not_raise(users_repo):
+    """No matching row is a legitimate no-op on both backends (e.g. a stale
+    cookie for an already-deleted user posting the logout form)."""
+    repo, _, _ = users_repo
+    repo.revoke_sessions("no-such-user")
+
+
 def test_delete_removes_user(users_repo):
     repo, _, _ = users_repo
     _make_user(repo)

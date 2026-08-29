@@ -998,6 +998,104 @@ def _agnes_mcp_servers() -> dict:
     }
 
 
+async def _call_delegation_endpoint(agent_slug: str, message: str) -> dict:
+    """POST one delegation request through the in-sandbox relay's main-scope
+    leg (Track C7 MVP, @delegation).
+
+    ``AGNES_SERVER`` is already rewritten by ``_start_relay`` to the relay's
+    own loopback address before any subprocess spawn — the SAME env this
+    process's own outbound calls use, so this rides the identical envelope-
+    replay path (``app/chat/relay.py``, ``app/api/broker.py::_replay``)
+    every other Agnes MCP tool call already rides: the request runs
+    server-side under THIS chat session's own identity, minted fresh by the
+    broker (``_mint_identity_jwt``) — never a credential this process holds
+    directly (AC-F2b).
+
+    Never raises: a missing/broken relay, a malformed target, or an HTTP
+    error all degrade to a denial-shaped dict so the model's tool call
+    always gets SOMETHING to reason about, rather than the whole turn
+    crashing on a delegation attempt.
+    """
+    if not agent_slug or not message:
+        return {"status": "denied", "reason": "invalid_request", "agent_slug": agent_slug, "answer": None}
+    server = os.environ.get("AGNES_SERVER", "").strip()
+    if not server:
+        return {
+            "status": "denied",
+            "reason": "delegation_unavailable",
+            "agent_slug": agent_slug,
+            "answer": None,
+            "message": "no AGNES_SERVER in this environment — delegation is unavailable",
+        }
+    import urllib.parse
+
+    import httpx
+
+    url = f"{server.rstrip('/')}/api/v1/agents/{urllib.parse.quote(agent_slug, safe='')}/delegate"
+    # Bound generously under `_DELEGATION_TIMEOUT_S` (`app/chat/manager.py`,
+    # 180s) — the manager's own wait for B's turn is the tighter,
+    # authoritative bound, so this client timeout only needs to comfortably
+    # outlive it, not add a second race. Built lazily (not module-level):
+    # httpx may not be importable yet at THIS module's own import time (see
+    # the module docstring's `app.chat.relay` lazy-import note).
+    timeout = httpx.Timeout(connect=15.0, read=200.0, write=30.0, pool=15.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json={"message": message})
+        resp.raise_for_status()
+        result = resp.json()
+        return result if isinstance(result, dict) else {"status": "denied", "reason": "bad_response"}
+    except Exception as exc:  # noqa: BLE001 — a delegation failure must not crash the turn
+        return {
+            "status": "denied",
+            "reason": "delegation_request_failed",
+            "agent_slug": agent_slug,
+            "answer": None,
+            "message": f"delegation request failed: {exc}",
+        }
+
+
+def _delegation_mcp_server():
+    """Build the in-process SDK MCP server exposing ``delegate_to_agent`` to
+    the model (Track C7 MVP, @delegation) — ``None`` when the installed
+    ``claude-agent-sdk`` predates ``create_sdk_mcp_server``/``tool`` (the
+    sandbox image's SDK is outside the wheel's pin, see the HookMatcher/
+    can_use_tool feature probes above for the same degrade-not-crash
+    posture on an older template).
+
+    Unlike ``ApprovalGate``/``QuestionGate`` (which intercept an EXISTING
+    SDK-builtin tool's permission check), this registers a brand-new tool
+    the model can choose to call — the documented ``claude_agent_sdk.tool``
+    + ``create_sdk_mcp_server`` mechanism for app-defined in-process tools.
+    The handler makes one HTTP round-trip (:func:`_call_delegation_endpoint`)
+    and returns the server's JSON result verbatim as the tool's text
+    output — all of the RBAC gate, the depth-1 guard, the one-delegation-
+    per-turn guard, and the caller-bound child-session spawn live
+    server-side in ``ChatManager.handle_delegation``.
+    """
+    try:
+        from claude_agent_sdk import create_sdk_mcp_server, tool  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+
+    @tool(
+        "delegate_to_agent",
+        (
+            "Delegate this request to another Agnes agent you are permitted to run, "
+            "identified by its slug. The delegate answers under YOUR CALLER's own "
+            "data access (never yours) and returns control to you once it answers. "
+            "Depth-1 only: the delegate cannot itself delegate, and you may delegate "
+            "at most once per turn."
+        ),
+        {"agent_slug": str, "message": str},
+    )
+    async def _delegate_to_agent(args: dict) -> dict:
+        result = await _call_delegation_endpoint(str(args.get("agent_slug", "")), str(args.get("message", "")))
+        return {"content": [{"type": "text", "text": json.dumps(result)}]}
+
+    return create_sdk_mcp_server("agnes-delegation", tools=[_delegate_to_agent])
+
+
 def _register_workspace_marketplace(workdir: Path) -> None:
     """Install the workspace's shipped marketplace plugins into this project.
 
@@ -1330,6 +1428,19 @@ async def _real_agent_loop(
     # a local Claude Code / Cowork install gets. Empty dict when unconfigured
     # (fake-agent tests) so the agent still runs with built-in tools.
     mcp_servers = _agnes_mcp_servers()
+    # Track C7 (@delegation MVP): an in-process SDK MCP server exposing
+    # `delegate_to_agent` — a distinct mechanism from `_agnes_mcp_servers()`
+    # above (that one spawns the `agnes mcp` STDIO subprocess; this one runs
+    # in THIS process, per claude_agent_sdk.create_sdk_mcp_server). Merged
+    # into the same `mcp_servers` dict under its own key so it costs no
+    # extra `allowed_tools` wiring (bypassPermissions already admits every
+    # registered server's tools). `None` when the installed SDK predates
+    # `create_sdk_mcp_server`/`tool` — degrade to no delegation capability
+    # rather than crash the runner (same posture as the HookMatcher/
+    # can_use_tool feature probes above).
+    delegation_server = _delegation_mcp_server()
+    if delegation_server is not None:
+        mcp_servers = {**mcp_servers, "agnes-delegation": delegation_server}
     options_kwargs: dict = dict(
         permission_mode="bypassPermissions",
         cwd=str(workdir),
