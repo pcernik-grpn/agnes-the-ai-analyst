@@ -114,3 +114,43 @@ def test_no_writer_emits_http_request_any_more():
     ).stdout
     offenders = [ln for ln in out.splitlines() if "audit_events.py" not in ln and "audit_fallback.py" not in ln]
     assert not offenders, offenders
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-row regression: the write counter must survive BaseHTTPMiddleware
+# ---------------------------------------------------------------------------
+
+
+def test_write_counter_survives_a_context_copy():
+    """A handler's audit write must be visible to the outer middleware.
+
+    Starlette's BaseHTTPMiddleware runs the downstream app in its own task,
+    and a new task gets a COPY of the context — so a counter stored as a
+    plain int in a ContextVar loses the handler's increment on the way back
+    out, and AuditFallbackMiddleware writes a second, generic row next to
+    the handler's real one. Simulating the copy here is what pins the fix:
+    the counter is a shared mutable box, not a value.
+    """
+    import contextvars
+
+    from src.audit_context import audit_written_count, begin_request_write_tracking, mark_audit_written
+
+    begin_request_write_tracking()
+    # A copied context is exactly what BaseHTTPMiddleware hands the handler.
+    contextvars.copy_context().run(mark_audit_written)
+    assert audit_written_count() == 1, (
+        "the handler's write was lost across a context copy — the fallback "
+        "middleware would now emit a duplicate row for this request"
+    )
+
+
+def test_self_auditing_read_route_gets_exactly_one_row(seeded_app, tmp_path, monkeypatch):
+    """GET /api/initial-workspace.zip audits itself; the middleware must
+    stay silent for it — a real duplicate this wave shipped and then fixed."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from src.repositories import audit_repo
+
+    seeded_app["client"].get("/api/initial-workspace.zip")
+    rows, _ = audit_repo().query(action="initial_workspace.fetch_started", limit=10)
+    generic = [r for r in rows if (r.get("params") or "").find('"status"') != -1]
+    assert not generic, f"middleware duplicated a self-audited row: {generic}"

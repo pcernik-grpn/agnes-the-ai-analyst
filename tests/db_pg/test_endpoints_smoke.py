@@ -2074,6 +2074,13 @@ KNOWN_UNTESTED = {
     # Sandboxed data-apps authoring replay (Task 7, wave 3B) — same
     # ticket-authed, never parameter-free shape as the broker routes above.
     "POST /api/broker/data-apps",
+    # apps-runner audit report-back: shared-secret (X-Runner-Token) header
+    # auth, not a user session, so this parameter-free sweep can only ever
+    # 401 here uninformatively. Behaviour — token floor, constant-time
+    # compare, action whitelist, params cap, and the audit row it writes —
+    # is covered on both backends' shared code path in
+    # tests/test_audit_gap_surfaces.py.
+    "POST /api/data-apps/runner-events",
     # Git smart-HTTP transport for that same authoring agent — ticket-authed
     # like its siblings, and additionally never reachable with parameter-free
     # inputs: the client is `git` speaking the wire protocol (its first call
