@@ -299,19 +299,26 @@ def test_verbatim_gate_accepts_whole_identity_units(pg_env, repo, quote):
 
 
 @pytest.mark.parametrize(
-    "quote",
+    "quote,reason",
     [
-        ".pptx",  # bare extension — a substring of the filename, not a unit
-        "/",  # bare path separator
-        "ho",  # 2-char fragment (from "Authority"), absent from the chunk text
-        "rts Authority — Overvi",  # mid-word slice of the filename
+        # Degenerate SHAPES — the meaningfulness floor runs ahead of both halves
+        # of the gate, so these never reach the identity comparison at all and
+        # carry its own reason.
+        (".pptx", "quote_not_meaningful"),  # bare extension: starts with punctuation
+        ("/", "quote_not_meaningful"),  # bare path separator
+        # Meaningful shapes that are nonetheless only FRAGMENTS of the identity.
+        # These pass the floor and DO reach the identity gate, which is what this
+        # test exists to prove — if every case here were degenerate, the identity
+        # gate would silently stop being exercised.
+        ("ho", "verbatim_gate_failed"),  # 2-char fragment of "Authority", absent from the chunk text
+        ("rts Authority — Overvi", "verbatim_gate_failed"),  # mid-word slice of the filename
     ],
 )
-def test_verbatim_gate_rejects_partial_identity_fragments(pg_env, repo, quote):
+def test_verbatim_gate_rejects_partial_identity_fragments(pg_env, repo, quote, reason):
     doc_id = _seed_identity_doc()
     report = _identity_edge_report(repo, doc_id, quote)
     assert report["claims_written"] == 0
-    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+    assert report["claims_rejected"][0]["reason"] == reason
     assert report["claims_accepted_via_identity"] == 0
 
 
@@ -329,7 +336,11 @@ def test_verbatim_gate_counter_only_counts_identity_accepted_claims(pg_env, repo
                 "evidence": [
                     {"doc_id": doc_id, "quote": "Nothing about the filename appears"},  # chunk-grounded
                     {"doc_id": doc_id, "quote": "Parts Authority — Overview.pptx"},  # identity-grounded
-                    {"doc_id": doc_id, "quote": ".pptx"},  # fabricated fragment
+                    # A MEANINGFUL fabrication, not a degenerate one: it has to
+                    # reach the identity gate for this test to prove anything
+                    # about the identity counter. A bare ".pptx" is now stopped
+                    # by the meaningfulness floor before it ever gets there.
+                    {"doc_id": doc_id, "quote": "Overview"},  # fabricated fragment
                 ],
             }
         ],
