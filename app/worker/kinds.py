@@ -111,10 +111,16 @@ distribution mirror, and the api-role write conversions) map onto:
   via the CHILD PROCESS ENVIRONMENT — never argv, never logged (security
   playbook F7). That child env is NOT the full parent environment: only a
   curated non-secret allowlist (+ any operator-opted-in
-  ``extraction.producer.env_passthrough``) plus the named SharePoint
-  credentials and the corpus id are forwarded — see
-  ``_EXTRACTION_PRODUCER_ENV_ALLOWLIST``. No other instance secret ever
-  reaches this subprocess. The producer itself
+  ``extraction.producer.env_passthrough``), the named SharePoint
+  credentials, the corpus id, and (TCRD-226) the producer's OWN callback
+  credential for calling back into Agnes's REST API are forwarded — see
+  ``_EXTRACTION_PRODUCER_ENV_ALLOWLIST`` and
+  ``_agnes_producer_callback_env``. That callback credential is a
+  DELIBERATE, EXPLICITLY-NOTED OVER-GRANT (the scheduler shared-secret
+  token, which resolves to a synthetic ``Admin``-group user — see
+  ``_agnes_producer_callback_env``'s own docstring for the full argument);
+  every OTHER instance secret (vault key, LLM API key, DB DSN, ...) still
+  never reaches this subprocess. The producer itself
   is a separate project the operator supplies, adopted rather than
   ported into this repo (spec §1 "Out of scope") — see
   ``_run_corpus_extraction`` below for exactly where that boundary is.
@@ -1312,6 +1318,56 @@ def _resolve_anonymization_key() -> str:
     return value
 
 
+def _agnes_producer_callback_env() -> dict[str, str]:
+    """The credential the producer subprocess needs to call BACK into
+    Agnes's own REST API (TCRD-226) — ``GET .../corpus-map``,
+    ``GET .../scopes``, the collections upload, ``POST /api/facts/ingest``.
+    Before this wiring the child env carried SharePoint credentials but
+    nothing to authenticate a callback with at all — the part the design
+    doc flagged as undecided.
+
+    ``AGNES_API_URL`` — this instance's own base URL, resolved the same
+    ``SERVER_URL`` -> ``AGNES_INTERNAL_URL`` -> loopback chain the chat
+    sandbox rails already use (:func:`app.chat.manager.agnes_server_url`,
+    deferred-imported here so this module keeps its "no heavyweight
+    subsystem at import time" posture — see the module docstring). Always
+    forwarded; it names no secret.
+
+    ``AGNES_API_TOKEN`` — the scheduler sidecar's own shared-secret bearer
+    token (:func:`app.auth.scheduler_token.get_scheduler_secret`), forwarded
+    ONLY when one is actually configured (an instance with no
+    ``SCHEDULER_API_TOKEN`` set — e.g. ``LOCAL_DEV_MODE`` — forwards no
+    token, never a placeholder). This is a genuine, DELIBERATE OVER-GRANT,
+    surfaced rather than hidden: presenting that token resolves to a
+    synthetic user in the ``Admin`` system group — god-mode on every RBAC
+    check in this instance (``app/auth/scheduler_token.py``) — while the
+    producer only ever needs to read THIS connection's own scope map,
+    upload into its own scope collections, and POST to the facts-ingest
+    endpoint (itself already scheduler-token-or-admin gated). It is reused
+    here because it is the only existing credential class in this codebase
+    a headless subprocess can already present without a live login session;
+    a narrower, producer-scoped credential (e.g. a PAT pinned to this one
+    connection's collections) is the right long-term fix and is explicitly
+    out of scope for this change — a compromised or merely misbehaving
+    producer under this token can do anything an admin can, not merely
+    ingest facts.
+
+    Security (playbook F7, same rule as every other secret this handler
+    resolves): the token reaches the producer ONLY via the child process
+    environment, never on argv, never logged.
+    """
+    from app.chat.manager import agnes_server_url
+
+    env: dict[str, str] = {"AGNES_API_URL": agnes_server_url()}
+
+    from app.auth.scheduler_token import get_scheduler_secret
+
+    secret = get_scheduler_secret()
+    if secret:
+        env["AGNES_API_TOKEN"] = secret
+    return env
+
+
 def _run_corpus_extraction(payload: dict) -> dict:
     """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
     §7.5 / §16 step 7). See the module docstring's entry for the wider
@@ -1352,18 +1408,22 @@ def _run_corpus_extraction(payload: dict) -> dict:
     forwards a key it does not need.
 
     Security (playbook F7): every secret this handler resolves —
-    tenant id, client id, certificate private key, and (when needed) the
-    anonymization HMAC key — reaches the producer ONLY via the child
-    process's environment, never on argv (readable via `ps`/
+    tenant id, client id, certificate private key, the anonymization HMAC
+    key (when needed), and the producer's own Agnes-API callback token (see
+    :func:`_agnes_producer_callback_env`) — reaches the producer ONLY via
+    the child process's environment, never on argv (readable via `ps`/
     `/proc/<pid>/cmdline`) and never logged. That child env is NOT
     `{**os.environ}` — `extraction.producer` names an EXTERNAL,
     admin-configurable binary, so it starts from a curated non-secret
     allowlist (`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`) plus any operator-
     opted-in `extraction.producer.env_passthrough`, then adds only the
     three named credentials + the corpus id + (conditionally) the two
-    anonymization vars above. No other instance secret (vault key, LLM API
-    key, DB DSN, ...) is ever forwarded, no matter what happens to be
-    sitting in this process's own environment. The producer's own
+    anonymization vars + the callback URL/token above. No OTHER instance
+    secret (vault key, LLM API key, DB DSN, ...) is ever forwarded, no
+    matter what happens to be sitting in this process's own environment —
+    the callback token is a deliberate, separately-justified exception, not
+    a crack in this rule (see `_agnes_producer_callback_env`'s docstring
+    for the honest over-grant it carries). The producer's own
     stdout/stderr are logged at DEBUG only, and only on failure, in case a
     misbehaving producer echoes something it shouldn't at INFO-visible
     levels.
@@ -1435,6 +1495,18 @@ def _run_corpus_extraction(payload: dict) -> dict:
     if anonymize_scopes:
         child_env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"] = json.dumps(anonymize_scopes, sort_keys=True)
         child_env["AGNES_ANONYMIZATION_HMAC_KEY"] = _resolve_anonymization_key()
+
+    # Producer callback credential (TCRD-226): the crawl -> convert ->
+    # anonymize -> extract -> ingest pipeline calls BACK into Agnes's own
+    # REST API (corpus-map, scopes, POST /api/facts/ingest) to do its actual
+    # work — until this wiring, the child env carried SharePoint credentials
+    # and nothing to authenticate a callback with at all. `AGNES_API_URL` is
+    # always forwarded (harmless, no secret); `AGNES_API_TOKEN` only when a
+    # scheduler shared secret is actually configured — see
+    # `_agnes_producer_callback_env`'s docstring for the deliberate,
+    # explicitly-noted OVER-GRANT this reuses (the scheduler token resolves
+    # to a synthetic Admin-group user, far more than the producer needs).
+    child_env.update(_agnes_producer_callback_env())
 
     timeout_s = _extraction_timeout_seconds()
 

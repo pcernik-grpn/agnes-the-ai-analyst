@@ -1038,6 +1038,20 @@ _EXEMPT: dict[str, str] = {
         "wizard's source card, derived at request time from the connection's own "
         "stored PEM — admin-only display primitive, no analyst CLI/MCP analogue"
     ),
+    # Extraction enqueue wiring (TCRD-226) — admin/scheduler job-trigger
+    # endpoints, same exemption class as run-corporate-memory/
+    # run-knowledge-digests/reap-idle below: an admin action and a
+    # scheduler sweep, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extract": (
+        "admin-triggered one-off run of the existing corpus-extraction job kind — "
+        "admin/scheduler maintenance op, mirrors the run-corporate-memory exemption; "
+        "no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/extraction/run-due": (
+        "scheduler-driven sweep firing corpus-extraction for every due SharePoint "
+        "connection — admin/scheduler maintenance op, mirrors the "
+        "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.

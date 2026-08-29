@@ -700,10 +700,25 @@ def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
 
 
 def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> int:
-    """Purge a matched row's zip-bundle children (fully — they are
-    regenerated on the next ingest) plus the row's OWN chunks, derived
-    tables and fact claims, ahead of an in-place content update that reuses
-    ``row``'s id.
+    """Purge the row's OWN chunks, derived tables and fact claims ahead of an
+    in-place content update that reuses ``row``'s id — plus, for a
+    NON-bundle row, its (non-existent in practice, but walked defensively)
+    children.
+
+    A bundle (zip archive) row is the deliberate exception: its zip-bundle
+    children are left ALONE here. Reconciling them is ``ingest_bundle``'s own
+    job — it matches each member to its existing row by ``(filename,
+    sha256)`` and purges only the ones that actually changed or disappeared
+    (``src/ingest/bundle.py``, "Prune children from a prior run"), which is
+    what lets a routine re-upload of an N-member zip with one changed member
+    keep the other N-1 members' rows, anchors and claims intact. Purging
+    every child here unconditionally was the previous behavior, and it
+    defeated that: the archive's OWN content-changed branch always fires on ANY
+    member change (the zip's bytes differ), so every re-sync re-minted every
+    member's id and cascaded every member's claims, not just the changed
+    one's. The needs_processing reschedule below still runs
+    ``ingest_bundle`` right after, so the members ARE reconciled — just
+    narrowly, not by nuking the lot first.
 
     ``row`` itself, and its own blob, are left for the caller
     (``_upsert_corpus_file``): ``row`` still carries its OLD ``storage_path``
@@ -714,10 +729,10 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
 
     ``defer_row_purge`` withholds ONLY the row's own derived-table purge, for
     a caller that is going to re-ingest this same row and must therefore run
-    purge-then-ingest as one ordered unit (see ``upload_files``). The
-    bundle-children purges above are unaffected: those child rows are
-    hard-deleted here, so the next ingest mints fresh child ids and fresh
-    ``table_id``s — there is nothing for a later purge to collide with.
+    purge-then-ingest as one ordered unit (see ``upload_files``). For a
+    NON-bundle row with (defensively-walked) children, those child rows are
+    still hard-deleted here, so the next ingest mints fresh child ids and
+    fresh ``table_id``s — there is nothing for a later purge to collide with.
 
     Returns the number of fact claims purged for ``row`` itself (0 when the
     ``facts`` flag is off, which is the default) — the caller threads this
@@ -728,12 +743,15 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
     cf_repo = corpus_files_repo()
     chunks_repo = corpus_chunks_repo()
 
+    is_bundle = classify(row.get("filename") or "") == "bundle"
+
     children: list[dict] = []
-    stack = [row["id"]]
-    while stack:
-        for child in cf_repo.list_children(stack.pop()):
-            children.append(child)
-            stack.append(child["id"])
+    if not is_bundle:
+        stack = [row["id"]]
+        while stack:
+            for child in cf_repo.list_children(stack.pop()):
+                children.append(child)
+                stack.append(child["id"])
 
     child_blob_paths = {c.get("storage_path") for c in children if c.get("storage_path")}
     for child in children:
