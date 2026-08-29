@@ -690,6 +690,7 @@ _EXEMPT: dict[str, str] = {
         "analyst-facing tool would let a caller puppet another agent's turn "
         "outside the depth-1/one-per-turn/caller-binding guarantees this "
         "route enforces for a LIVE delegating turn"
+    ),
     "/api/admin/upgrade-freeze": (
         "per-instance auto-upgrade freeze (TCRD-238) — deliberately never "
         "MCP-exposed per the 'operator security-posture' standing exemption "
