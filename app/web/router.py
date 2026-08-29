@@ -48,6 +48,7 @@ from app.instance_config import (
     get_news_enabled,
     get_knowledge_digests_ui_enabled,
     get_contribute_skill_enabled,
+    get_store_moderation_enabled,
     get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
     feature_enabled,
@@ -4970,6 +4971,11 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         "can_news": get_news_enabled(),
         "can_knowledge_digests": get_knowledge_digests_ui_enabled(),
         "can_contribute_skill": get_contribute_skill_enabled(),
+        # The Moderation & Trust hub, retired on the same pattern: its three
+        # zones each have a better door already in the column (Submissions,
+        # Marketplaces, and verification's own switch), so the page was a
+        # landing spot for links you can reach directly.
+        "can_store_moderation": get_store_moderation_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -8870,7 +8876,22 @@ async def admin_moderation_hub_page(
     submission queue and marketplace curation are surfaced as links (count +
     jump-off), not rebuilt here. ``/admin/store`` is the natural parent of the
     ``/admin/store/submissions`` review queue.
+
+    Hidden by default (``features.store_moderation_enabled``): the two links
+    it surfaces are their own nav rows, and verification has its own switch,
+    so the page was a landing spot for doors already in the column. Redirect
+    rather than 404 — its entry points were a sidebar row and a palette shortcut,
+    and a bookmark from before the flip should land somewhere useful.
+
+    NOTE: this page is the only UI that renders the queued agent-share
+    approvals (Track C6). While it is hidden they are decided through
+    ``GET/PATCH /api/admin/share-requests`` only, which is deliberate — owner-
+    initiated agent sharing is itself V2-deferred in the agent-profiles spec,
+    so on a default instance the queue this page would show is empty.
     """
+    if not get_store_moderation_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from app.instance_config import get_store_verification_enabled
 
     verification_enabled = get_store_verification_enabled()

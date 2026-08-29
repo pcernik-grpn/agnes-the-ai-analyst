@@ -1557,6 +1557,11 @@ non-admin's agent share falls back to the pre-C6 instant grant instead of a
 
 ### `/api/admin/share-requests` — Agent-sharing approval queue (Track C6, PG-only)
 
+These endpoints are NOT gated by `features.store_moderation_enabled` — that flag
+hides the `/admin/store` WEB PAGE (off by default), which is the only UI that
+renders this queue. While it is hidden, a queued request is still listed and
+decided here. See [feature-flags.md](feature-flags.md).
+
 Every route requires admin. `GET` lists queued requests, optionally filtered by
 comma-separated `status` (`pending`/`approved`/`rejected`; omitted returns every
 decision, newest first — the queue doubles as its own audit trail). Each row
