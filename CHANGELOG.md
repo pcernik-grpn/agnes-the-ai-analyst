@@ -639,6 +639,73 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **MCP sources and Linked apps move from Instance to Content in the admin sidebar.** They were filed as "outbound connections" and therefore instance plumbing, which confused how a thing is wired with what it is *for*: an MCP source ends as tools in an analyst's chat and a linked app ends as an app they open, so both answer Content's question — what can analysts reach — not Instance's. Content now reads in two runs: where things arrive from (Marketplaces · MCP sources · Linked apps), then what is done with what arrived (moderation · submissions · lint) and the rest. Instance is left with only what an admin touches to change the instance itself — config, database backend, initial workspace, prompts, secrets. URLs, page content and permissions are unchanged; this is which heading the row sits under.
 - **Every admin sidebar row and the page it opens now call the place the same thing.** Eleven rows had drifted: "Marketplaces" opened *Curated Marketplaces*, "Store lint" opened *Skill Lint*, "Corporate memory" opened *Memory Review*, "Knowledge digests" opened *Maintained digests*, "Server config" opened *Instance settings*, "Initial workspace" opened *Initial Workspace Template*, "Linked apps" opened *Link Keboola apps* (noun vs verb), "Submissions" opened *Flea Submissions* — finishing the rename decision 8 of the authoring-seam spec started, which retired the word *flea* from user-visible labels and had reached the nav row but not the page — plus Title-Case-vs-sentence-case on *Studio Suggestions* and *MCP Sources*. Browser `<title>`s were reconciled with their headings in the same pass, which removed a third name for the submissions queue (*Store submissions*), an "Activity" title over the *Audit log* page, and the stale product name in `Memory Review - Data Analyst Portal`. The rule applied throughout: the sidebar row is the name and the page matches it. **One deliberate exception** — the row "News" became **"News editor"**, because there the page was right and the column was wrong: `/admin/news` authors news and `/news` reads it, and calling both "News" put one word on two entries an admin sees at once (DES-63). A new guard, `tests/test_admin_nav_label_matches_page.py`, renders every gated row's page and fails when a row and its page disagree — this class of drift was invisible page-by-page and nothing compared the two, since the design-system contract tests police colour and layout but not language.
 - **The Moderation & Trust hub (`/admin/store`) is hidden behind a flag, joining the four surfaces the admin cleanup already retired.** `features.store_moderation_enabled` / `AGNES_STORE_MODERATION_ENABLED`, default `false`, on the same both-halves pattern: no entry point is drawn — the Content sidebar row, the command-palette row, its `g v` shortcut, and both `/admin` dashboard signal cards that pointed at it (store verification and the C6 agent-share queue) — and the route redirects home. The hub was a landing page for doors the column already carries: submission review is its own nav row, marketplace curation is `/admin/marketplaces`, and entity verification has its own `store.verification_enabled`. Nothing is deleted — the page, its template and every API behind it are intact, and the flag brings the surface back exactly as it was. Hides UI only: the store APIs and `/api/admin/share-requests*` keep serving, so a queued agent share stays decidable by API. Note that this page is the only UI that renders those queued agent-share approvals (Track C6); that is acceptable while owner-initiated agent sharing remains V2-deferred in the agent-profiles design spec, so the queue is empty on a default instance.
+- **The Library filter menu answers more than "who owns it".** It offered
+  Owner, Source, Access and a Tags category that is empty for every collection,
+  file, app and recipe (`file_corpora` has no tags column), so past a screenful
+  the only working narrowing was search. Three categories join it, each read off
+  data the rows already carry: **Added** (last 7 / 30 / 90 days, cumulative, so
+  the buckets nest instead of excluding each other), **Yours or shared**
+  (created by you · shared by you · shared with you) and **File format**. A
+  category with fewer than two distinct values still does not render, so the
+  menu grows only where the data does. A file whose text the extraction pass
+  could not read now says so on its own row — *Not indexed yet* / *Indexing* /
+  *Needs review* / *Not indexed*, and nothing at all when it is indexed, which
+  is the majority — instead of only being discoverable by opening its
+  collection.
+- **The Library is two tabs, and every row's button says what it does.**
+  `/library` was one flat list answering two different questions — *what does
+  this organization know* and *what can my agent do* — and a single control
+  label, "Add to stack", sat on rows whose click posted to four different
+  endpoints meaning four different things.
+  - **Knowledge / Capabilities tabs**, deep-linkable as `?tab=`. Knowledge
+    holds documents, governed data, memory, recipes and apps; Capabilities
+    holds skills, plugins and agent templates. A detail page's `?section=`
+    back link selects the tab that owns the section, so returning from an item
+    can no longer land on a page where that item is filtered out. The tabs are
+    the shared `FilterToolbar` segmented control reading `data-tab` off each
+    row, so switching tabs shares one code path with search, the facets and the
+    empty-section hiding.
+  - **Data apps are their own band** rather than a trailing block inside
+    Artefacts, whose hint had to call an app a file the caller had uploaded.
+  - **Per-kind action verbs.** `Install` / `Installed` for skills, plugins and
+    agent templates (they post to `/install` and were never stack members —
+    `/api/stack` accepts only `data_package` and `memory_domain`);
+    `Keep a local copy` / `Local copy` for governed data, because
+    `features.stack_auto_membership` has been default-on since Wave 0, so the
+    grant already *is* the membership and the only remaining choice is what
+    `agnes pull` downloads — the wording `StackResolver.browse()` already used
+    internally. A granted row now states its tier — `Required by your admin`,
+    `Granted to your group` — instead of claiming a membership the caller could
+    neither create nor drop, with the reason available only in a tooltip. The
+    grid card no longer overwrites the row's label with the stack vocabulary,
+    so table and card cannot drift.
+  - **`+ Add` follows the tab** — sources on Knowledge (data package, connect a
+    source, link an external app, upload), builders on Capabilities (skill,
+    plugin, agent template, MCP source). The blast-radius headings survive
+    inside each half. The menu is bounded to the room below its button, so its
+    last entries stay reachable.
+  - **One browsing block, sitting on the list.** Search, the filters, the view
+    switch, "+ Add", the item count and the active-filter chips are one job, so
+    they are one block directly above what they act on; the page header keeps
+    the title, the connect banner and the tabs. They used to be spread over
+    four bands — you pressed Filter in the page header and read what it did two
+    bands lower, past a promo panel, while the count sat in a third place. The
+    Library spent its first screen not listing anything. The group bands keep
+    the viewport top, which is the thing worth pinning on a long list; no header
+    pins, because one carrying all of that runs ~270px and leaves a band no room
+    to travel in. The shared floating dock (`.fbar-dock`) is untouched and still
+    `/chats`'s.
+  - **Status stopped looking like a control.** "Shared with you", "Required by
+    your admin" and "Granted to your group" all answer *why you have this* and
+    were drawn as pills in the same slot the row's buttons use, under a column
+    headed **Actions** — which is what "Required by your admin" is precisely
+    not. They read as text now; only a control keeps a box, and the trailing
+    column drops its misleading label (keeping an accessible name). Controls
+    themselves went quiet at rest: five 38px bordered boxes across the toolbar
+    gave nothing rank, so search is a field, Filter/stack/view are borderless
+    utilities that tint when on, and "+ Add" is the only filled control.
+  - **Bands open on arrival**, and an empty tab says so in its own words rather
+    than offering a "Clear filters" button for filters that are not applied.
 - **The SharePoint wizard and source card no longer render "anonymized" from the checkbox alone.** `anonymize=true` on a scope is a *request*; the badge only reads "anonymized" (ok tone) once the latest persisted ingest run actually *declares* that collection anonymized (`anonymization_declared`, new field on `GET /connections/{id}/scopes`) — otherwise it reads "anonymization requested" (warn tone). Applies to the connect wizard's step-2 tree badge, the step-3 share preview, and a new "Anonymization" row on the `/admin/data-sources` source card.
 - **Vocabulary pass (D5, v1): the same concept now has one name across UI,
   CLI and MCP help text — the old name keeps working as a deprecated

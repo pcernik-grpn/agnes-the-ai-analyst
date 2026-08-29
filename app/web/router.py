@@ -2150,6 +2150,15 @@ def _library_row_base(
         # the wording can differ from the filtered value. Empty → the template
         # falls back to "In stack".
         "stack_pill": "",
+        # The VERB, per kind. One label ("Add to stack") used to sit on every
+        # row while the click posted to four different endpoints meaning four
+        # different things — install a skill, install a plugin, ask for a local
+        # copy of granted data, pin a collection. A control has to name what it
+        # does, so each kind supplies its own three words: the action, the
+        # resting state once done, and the undo. Blank falls back to the old
+        # stack vocabulary, which is still right for a collection.
+        "stack_action": "",
+        "stack_undo": "",
         # Membership the caller cannot drop — any group grant, whichever tier.
         # It reads the SAME "In stack" as any other member (it is one) and is
         # marked by a LOCK plus a tooltip naming who *can* remove it. The tier
@@ -2458,6 +2467,7 @@ async def library_page(
             # description every file shared word for word. A collection prints its
             # file count there instead, so it needs none.
             row["file_format"] = "" if is_folder else _artefact_format(first_file)
+            row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2508,6 +2518,12 @@ async def library_page(
                     # nested rows are files too, and the retired Type column is
                     # where their format used to show.
                     child["file_format"] = _artefact_format(f)
+                    # Whether the extraction pass actually got text out of this
+                    # file. Only surfaced when it is NOT `indexed`: a healthy
+                    # file saying "indexed" on every row is noise, but a file
+                    # nobody can search is worth knowing about without opening
+                    # the collection page to find it.
+                    child["ingest_label"] = _ingest_label(f)
                     child["file_id"] = f["id"]
                     child["file_name"] = f.get("filename") or ""
                     child["slug"] = slug or ""
@@ -2655,9 +2671,14 @@ async def library_page(
             # caller either way — including on their own entity.
             _inst = installed_store.get(s["id"])
             items[-1]["stack_endpoint"] = f"/api/store/entities/{s['id']}/install"
+            # The endpoint is ``/install`` and a store entity was never a stack
+            # member (``/api/stack`` takes only data_package and memory_domain),
+            # so the row says what the click actually does.
+            items[-1]["stack_action"] = "Install"
+            items[-1]["stack_undo"] = "Uninstall"
             if _inst:
                 items[-1]["stack_state"] = "in_stack"
-                items[-1]["stack_pill"] = "In stack"
+                items[-1]["stack_pill"] = "Installed"
                 items[-1]["stack_removable"] = True
                 items[-1]["stack_title"] = "The default agent can use this — click to remove it"
             else:
@@ -2762,7 +2783,14 @@ async def library_page(
             import json as _json
 
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In stack"
+            # Not a membership: auto-membership (default since Wave 0) means the
+            # GRANT already put this in the stack. All that is left to the caller
+            # is whether `agnes pull` keeps a copy on disk — which is exactly what
+            # `StackResolver.browse()` calls the Download / Remove-local-copy
+            # affordance.
+            items[-1]["stack_pill"] = "Local copy"
+            items[-1]["stack_action"] = "Keep a local copy"
+            items[-1]["stack_undo"] = "Remove local copy"
             items[-1]["stack_removable"] = True
             # Remove is a path-param DELETE; re-add (after a remove, without
             # a reload) POSTs the generic subscribe endpoint with a body —
@@ -2782,7 +2810,9 @@ async def library_page(
             # left an optional grant rendering the success-tinted check that
             # a REMOVABLE row wears at rest. The tier stays legible in the
             # tooltip and the Optional/Required facet.
-            items[-1]["stack_pill"] = "In stack"
+            # Granted, therefore already queryable: the pill states the tier
+            # rather than claiming a membership the caller could add.
+            items[-1]["stack_pill"] = "Required by your admin" if requirement == "required" else "Granted to your group"
             items[-1]["stack_locked"] = True
             if requirement == "required":
                 items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
@@ -2801,6 +2831,8 @@ async def library_page(
 
             items[-1]["stack_state"] = "available"
             items[-1]["stack_addable"] = True
+            items[-1]["stack_action"] = "Keep a local copy"
+            items[-1]["stack_undo"] = "Remove local copy"
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
@@ -3011,6 +3043,9 @@ async def library_page(
                 # (`curated_install` / `curated_uninstall`). The Library's toggle
                 # is kind-agnostic — it POSTs/DELETEs whatever the row names.
                 row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
+                # Same verb as a store entity, and for the same reason.
+                row["stack_action"] = "Install"
+                row["stack_undo"] = "Uninstall"
                 # Droppable unless an admin pinned it globally (`is_system`) or
                 # required-tier-granted it to one of the caller's groups. Those
                 # are precisely the two cases `curated_uninstall` answers 409
@@ -3018,7 +3053,7 @@ async def library_page(
                 locked = bool(pl.get("is_system")) or key in plugin_required
                 if key in plugin_in_stack:
                     row["stack_state"] = "in_stack"
-                    row["stack_pill"] = "In stack"
+                    row["stack_pill"] = "Installed"
                     row["stack_locked"] = locked
                     row["stack_removable"] = not locked
                     row["stack_title"] = (
@@ -3060,7 +3095,9 @@ async def library_page(
             # Installing a store item IS its Stack membership, and the caller may
             # undo it — the same install endpoint, removed.
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In stack"
+            items[-1]["stack_pill"] = "Installed"
+            items[-1]["stack_action"] = "Install"
+            items[-1]["stack_undo"] = "Uninstall"
             items[-1]["stack_removable"] = True
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
             items[-1]["stack_title"] = "The default agent can use this — click to remove it"
@@ -3313,6 +3350,52 @@ async def library_page(
     # addable. Zero means the toggle doesn't render: no dead filters.
     library_available_count = sum(1 for c in items if c.get("stack_state") == "available")
 
+    #: Recency, as a facet rather than only a sort. "What arrived this week" is
+    #: the question a growing library gets asked most, and `data-added` could
+    #: only ever answer it by sorting — which shows you the newest row but not
+    #: how many are new. The buckets are CUMULATIVE and stored as a set on the
+    #: row (`7d|30d|90d`), so picking "Last 30 days" matches everything inside
+    #: 30 days rather than a 23-day slice; the engine's `multi` mode does the
+    #: containment test. A row with no date carries nothing and is simply never
+    #: matched, which is honest — we do not know when it arrived.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _now = _dt.now(_tz.utc)
+    _age_labels = [("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30), ("90d", "Last 90 days", 90)]
+    _age_counts: dict = {}
+    for c in items:
+        iso = c.get("added_iso")
+        buckets = []
+        if iso:
+            try:
+                when = _dt.fromisoformat(iso)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_tz.utc)
+                age = _now - when
+                buckets = [key for key, _lbl, days in _age_labels if age <= _td(days=days)]
+            except ValueError:
+                buckets = []
+        c["age_buckets"] = buckets
+        for b in buckets:
+            _age_counts[b] = _age_counts.get(b, 0) + 1
+    library_ages = [(k, lbl, _age_counts[k]) for k, lbl, _d in _age_labels if _age_counts.get(k)]
+
+    #: How the caller relates to the row, which is a different question from
+    #: Owner (a *who*). Retired with the three-way Scope segment; it was the one
+    #: part of that control worth keeping, because "things I made" and "things
+    #: shared with me" are separate piles in everyone's head.
+    _OWNERSHIP_LABELS = {
+        "mine": "Created by you",
+        "shared_by_me": "Shared by you",
+        "shared_with_me": "Shared with you",
+    }
+    _own_counts: dict = {}
+    for c in items:
+        k = c.get("ownership")
+        if k in _OWNERSHIP_LABELS:
+            _own_counts[k] = _own_counts.get(k, 0) + 1
+    library_ownerships = [(k, lbl, _own_counts[k]) for k, lbl in _OWNERSHIP_LABELS.items() if _own_counts.get(k)]
+
     # Tags are multi-valued per row, so they need their own tally.
     tag_counts: dict = {}
     for c in items:
@@ -3340,24 +3423,49 @@ async def library_page(
     # Unlisted types fall to the end, alphabetically.
     _SECTION_ORDER = [
         "data_package",
-        "data_app",
         "plugin",
         "skill",
         "agent",
         "recipe",
-        # Loose files + collections-as-folders (and hosted data apps).
+        # Loose files + collections-as-folders.
         "files",
+        # Apps read AFTER the caller's own files — the same reading order they
+        # had as a trailing block inside the Artefacts band, now carried by the
+        # section order instead of by row order within one band.
+        "data_app",
         "memory_domain",
     ]
-    #: Kinds that land INSIDE another kind's section instead of getting their
-    #: own. Data apps live among the caller's artifacts in Files — the
-    #: original "Data apps coming soon" badge on that band promised exactly
-    #: this — while their rows keep ``type_key="data_app"`` so the Type facet
-    #: and the row's own label stay honest.
-    _SECTION_OF = {"data_app": "files"}
+    #: Which TAB a section belongs to. The Library answers two questions that
+    #: a single flat list served badly: "what does this organization know"
+    #: (documents, governed data, memory, recipes, and the apps built on that
+    #: data — everything you read, query or open) and "what can my agent do"
+    #: (the three kinds that actually change an agent's behaviour). Anything
+    #: unlisted falls to Knowledge, which is the browse half.
+    _TAB_KNOWLEDGE = "knowledge"
+    _TAB_CAPABILITIES = "capabilities"
+    _SECTION_TAB = {
+        "data_package": _TAB_KNOWLEDGE,
+        "data_app": _TAB_KNOWLEDGE,
+        "recipe": _TAB_KNOWLEDGE,
+        "files": _TAB_KNOWLEDGE,
+        "memory_domain": _TAB_KNOWLEDGE,
+        "plugin": _TAB_CAPABILITIES,
+        "skill": _TAB_CAPABILITIES,
+        "agent": _TAB_CAPABILITIES,
+    }
+    #: Data apps used to land INSIDE the Files band (``_SECTION_OF``). They
+    #: have their own band now: an app is not an artefact the caller uploaded,
+    #: and the Files hint had to claim it was one. Their rows keep
+    #: ``type_key="data_app"`` either way, so the Type facet and the row label
+    #: are unaffected.
     grouped: dict = {}
     for c in items:
-        grouped.setdefault(_SECTION_OF.get(c["type_key"], c["type_key"]), []).append(c)
+        # The tab rides the ROW, not just the section: the filter engine's
+        # segmented control reads it off `data-tab` (see library.html), which
+        # is what makes tab switching share one code path with search, the
+        # facets and the empty-section hiding instead of growing a second one.
+        c["tab"] = _SECTION_TAB.get(c["type_key"], _TAB_KNOWLEDGE)
+        grouped.setdefault(c["type_key"], []).append(c)
 
     def _section_rank(type_key: str) -> tuple:
         try:
@@ -3389,7 +3497,7 @@ async def library_page(
     #: it to explain itself. Kept to a short clause; a group with no hint simply
     #: renders none.
     _SECTION_HINTS = {
-        "files": "Files you upload, outputs your agent generates, and your hosted data apps.",
+        "files": "Files you upload and the outputs your agent generates.",
         "skill": "Skills built here.",
         "plugin": "Bundles of skills and commands.",
         "agent": "Assistants you installed.",
@@ -3433,16 +3541,16 @@ async def library_page(
         share it, so the folders come FIRST as their own block — the reader sees
         the containers before the loose contents, and the drop targets are all
         in one place. Everything else keeps the global recency order.
+
+        Data apps had a third block here while they lived inside this band;
+        they have their own section now, so folders-then-loose is the whole
+        rule.
         """
         if key != "files":
             return rows
-        # Three stable blocks: folders (containers first, drop targets in one
-        # place), then loose files, then data apps — the sub-kinds of the
-        # Artefacts umbrella stay grouped instead of interleaving by recency.
         folders = [r for r in rows if r.get("is_folder")]
-        apps = [r for r in rows if r.get("type_key") == "data_app"]
-        loose = [r for r in rows if not r.get("is_folder") and r.get("type_key") != "data_app"]
-        return folders + loose + apps
+        loose = [r for r in rows if not r.get("is_folder")]
+        return folders + loose
 
     library_sections = []
     for key, rows in sorted(grouped.items(), key=lambda kv: _section_rank(kv[0])):
@@ -3450,6 +3558,7 @@ async def library_page(
         library_sections.append(
             {
                 "key": key,
+                "tab": _SECTION_TAB.get(key, _TAB_KNOWLEDGE),
                 "label": _SECTION_LABELS.get(key) or (rows[0]["type_label"] + "s"),
                 "hint": _SECTION_HINTS.get(key, ""),
                 "soon": _SECTION_SOON.get(key, ""),
@@ -3463,6 +3572,31 @@ async def library_page(
             }
         )
 
+    #: The tab bar itself — one entry per tab, in reading order, each with the
+    #: number of top-level rows behind it (a folder counts once, matching the
+    #: section counts). A tab with nothing in it still renders: the pair is the
+    #: page's structure, and hiding one would make the remaining tab look like
+    #: a stray control. The labels are the two questions the page answers.
+    _TAB_LABELS = [(_TAB_KNOWLEDGE, "Knowledge"), (_TAB_CAPABILITIES, "Capabilities")]
+    _tab_counts: dict[str, int] = {_TAB_KNOWLEDGE: 0, _TAB_CAPABILITIES: 0}
+    for _sec in library_sections:
+        _tab_counts[_sec["tab"]] = _tab_counts.get(_sec["tab"], 0) + _sec["count"]
+    library_tabs = [{"key": k, "label": lbl, "count": _tab_counts.get(k, 0)} for k, lbl in _TAB_LABELS]
+
+    # Which tab opens. `?tab=` is the explicit form; a detail page's back link
+    # arrives as `?section=<type_key>` instead (router._detail_back) and must
+    # land on the tab that HOLDS that section, or the reader follows "back" to
+    # a page where their row is filtered out. Validated against our own keys,
+    # so what reaches the page's JS is never caller text.
+    _requested_tab = request.query_params.get("tab")
+    _requested_section = request.query_params.get("section")
+    if _requested_tab in _tab_counts:
+        library_active_tab = _requested_tab
+    elif _requested_section in _SECTION_TAB:
+        library_active_tab = _SECTION_TAB[_requested_section]
+    else:
+        library_active_tab = _TAB_KNOWLEDGE
+
     from app.instance_config import feature_enabled
 
     ctx = _build_context(
@@ -3470,6 +3604,8 @@ async def library_page(
         user=user,
         library_items=items,
         library_sections=library_sections,
+        library_tabs=library_tabs,
+        library_active_tab=library_active_tab,
         definitions_footer=definitions_footer,
         library_origins=library_origins,
         library_requirements=library_requirements,
@@ -3478,6 +3614,15 @@ async def library_page(
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
+        #: The kind. Left out for a long time because "the list is already
+        #: GROUPED by type into these very sections" — true of one flat list of
+        #: eight kinds, but a tab now holds several and grouping is not
+        #: filtering: it tells you where a kind is, not how to see only it.
+        #: File formats, from the rows that have one. Rendered on every file row
+        #: already and filterable by nothing until now.
+        library_formats=_present("file_format", "file_format"),
+        library_ownerships=library_ownerships,
+        library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
         # Band to open on arrival — a detail page's back link returns here as
@@ -4547,6 +4692,25 @@ async def catalog_recipe_detail(
         related_tables=related_tables,
     )
     return templates.TemplateResponse(request, "catalog_recipe_detail.html", ctx)
+
+
+# What a file's extraction state is CALLED on a Library row. `indexed` is
+# deliberately absent: a healthy file is the overwhelming majority, and a row
+# that says "indexed" on every line spends the slot on the one value that
+# carries no information. Absence means fine; a label means look.
+_INGEST_LABELS = {
+    "pending": "Not indexed yet",
+    "processing": "Indexing",
+    "needs_review": "Needs review",
+    "rejected": "Not indexed",
+}
+
+
+def _ingest_label(f: dict | None) -> str:
+    """The row-level note for a file whose text your agents cannot search yet."""
+    if not f:
+        return ""
+    return _INGEST_LABELS.get(f.get("processing_status") or "", "")
 
 
 def _human_size(n: int) -> str:
