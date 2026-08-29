@@ -1129,3 +1129,197 @@ class TestNotifyFollowsTheDatabaseNotTheCatalog:
         assert stats["items_db_inserted"] == 1
         assert stats["items_pending_queued"] == 0
         assert published == []
+
+
+# ---------------------------------------------------------------------------
+# TCRD-233: deterministic dedup guard at propose time.
+#
+# The catalog-refresh LLM call is asked to match a restated fact back to its
+# ``existing_id``, but that's a judgment call it can miss — a paraphrase gets
+# reported as brand new (``existing_id: null``). ``_find_duplicate_in_category``
+# is a mechanical, stdlib-only re-check against the catalog (approved items
+# AND items still ``status="pending"`` — both live in the same
+# ``knowledge.json`` dict) that runs before an "existing_id: null" item is
+# accepted, so a duplicate the LLM missed doesn't reach the review queue.
+# ---------------------------------------------------------------------------
+
+
+class TestFindDuplicateInCategory:
+    """Unit tests for the pure matching helper — no collect_all() plumbing."""
+
+    @staticmethod
+    def _existing(content: str, *, category: str = "performance", status: str = "approved") -> dict:
+        return {
+            "km_existing": {
+                "id": "km_existing",
+                "title": "Existing tip",
+                "content": content,
+                "category": category,
+                "tags": [],
+                "source_users": ["alice"],
+                "status": status,
+            }
+        }
+
+    def test_exact_match_after_normalization_is_duplicate(self):
+        """Casefold + collapsed whitespace + edge punctuation differences
+        don't matter — the underlying fact is identical."""
+        from services.corporate_memory.collector import _find_duplicate_in_category
+
+        existing = self._existing("Always add indexes for frequent query columns.")
+        candidate = "  always add INDEXES for frequent   query columns  "
+        assert _find_duplicate_in_category(candidate, "performance", existing) == "km_existing"
+
+    def test_near_duplicate_above_threshold_is_duplicate(self):
+        """A reworded restatement of the same fact (ratio >= 0.9) is caught
+        even though it is not byte-identical."""
+        from services.corporate_memory.collector import _find_duplicate_in_category
+
+        existing = self._existing("Always add indexes for frequently queried columns to speed up reads.")
+        candidate = "Always add an index for frequently queried columns to speed up reads."
+        assert _find_duplicate_in_category(candidate, "performance", existing) == "km_existing"
+
+    def test_distinct_item_is_not_a_duplicate(self):
+        from services.corporate_memory.collector import _find_duplicate_in_category
+
+        existing = self._existing("Always add indexes for frequent query columns.")
+        candidate = "Rotate the staging API key every 90 days."
+        assert _find_duplicate_in_category(candidate, "performance", existing) is None
+
+    def test_sub_threshold_similarity_is_not_a_duplicate(self):
+        """Related, same-topic, but a materially different claim must pass
+        through. When in doubt, don't skip — a false 'duplicate' silently
+        drops a real finding, which is worse than a duplicate landing in the
+        human triage queue."""
+        from services.corporate_memory.collector import _find_duplicate_in_category
+
+        existing = self._existing("Always add indexes for frequent query columns to speed up dashboard reads.")
+        candidate = "Consider adding indexes on columns that show up in WHERE clauses to speed up dashboard reads."
+        assert _find_duplicate_in_category(candidate, "performance", existing) is None
+
+    def test_different_category_is_not_compared(self):
+        """The comparison set is same-category only — cheap, and avoids
+        cross-domain false positives on generic wording."""
+        from services.corporate_memory.collector import _find_duplicate_in_category
+
+        existing = self._existing("Always add indexes for frequent query columns.", category="performance")
+        candidate = "Always add indexes for frequent query columns."
+        assert _find_duplicate_in_category(candidate, "debugging", existing) is None
+
+    def test_pending_suggestion_also_counts_as_existing(self):
+        """A duplicate of an item still awaiting review (status='pending')
+        must be caught too, not only duplicates of already-approved items."""
+        from services.corporate_memory.collector import _find_duplicate_in_category
+
+        existing = self._existing("Always add indexes for frequent query columns.", status="pending")
+        candidate = "always add indexes for frequent query columns"
+        assert _find_duplicate_in_category(candidate, "performance", existing) == "km_existing"
+
+
+class TestDuplicateProposalGuardIntegration:
+    """End-to-end through collect_all(): the LLM reports ``existing_id:
+    null`` (it failed to recognize a paraphrase), but the mechanical guard
+    catches it against the catalog before an LLM sensitivity-check call or a
+    DB insert happens."""
+
+    _EXISTING_CATALOG = {
+        "items": {
+            "km_existing": {
+                "id": "km_existing",
+                "title": "Use indexes",
+                "content": "Always add indexes for frequent query columns.",
+                "category": "performance",
+                "tags": ["sql"],
+                "source_users": ["alice"],
+                "extracted_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "status": "pending",
+                "confidence": 0.5,
+                "approved_by": None,
+                "approved_at": None,
+                "mandatory_reason": None,
+                "audience": "all",
+                "review_by": None,
+                "edited_by": None,
+                "edited_at": None,
+            }
+        },
+        "metadata": {},
+    }
+
+    # The LLM mis-judges this as a brand new item (existing_id=None) even
+    # though it restates the fact already in the catalog above.
+    _RESPONSE_WITH_UNRECOGNIZED_DUPLICATE = {
+        "items": [
+            {
+                "existing_id": None,
+                "title": "Add indexes",
+                "content": "always add indexes for frequent query columns",
+                "category": "performance",
+                "tags": ["sql", "indexes"],
+                "source_users": ["alice"],
+            }
+        ]
+    }
+
+    def test_duplicate_proposal_is_skipped_counted_and_logged(self, tmp_path, monkeypatch, caplog):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, self._RESPONSE_WITH_UNRECOGNIZED_DUPLICATE)
+        _write_json(tmp_path / "knowledge.json", self._EXISTING_CATALOG)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"notify_on_new_items": False}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True) as mock_sensitivity,
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            caplog.at_level("INFO"),
+        ):
+            stats = collector.collect_all(dry_run=False)
+
+        assert stats["items_new"] == 0
+        assert stats["items_duplicate_skipped"] == 1
+        assert stats["items_db_inserted"] == 0
+        mock_repo.create.assert_not_called()
+        # Never burn an LLM sensitivity-check call on an item the mechanical
+        # guard already rejected.
+        mock_sensitivity.assert_not_called()
+        assert any("duplicate" in rec.message.lower() for rec in caplog.records)
+
+    def test_distinct_new_item_in_same_category_is_not_skipped(self, tmp_path, monkeypatch):
+        """Regression guard: a genuinely new item in the same category must
+        still be created."""
+        response = {
+            "items": [
+                {
+                    "existing_id": None,
+                    "title": "Rotate keys",
+                    "content": "Rotate the staging API key every 90 days.",
+                    "category": "performance",
+                    "tags": [],
+                    "source_users": ["alice"],
+                }
+            ]
+        }
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        _write_json(tmp_path / "knowledge.json", self._EXISTING_CATALOG)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"notify_on_new_items": False}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+        ):
+            stats = collector.collect_all(dry_run=False)
+
+        assert stats["items_new"] == 1
+        assert stats["items_duplicate_skipped"] == 0
+        mock_repo.create.assert_called_once()

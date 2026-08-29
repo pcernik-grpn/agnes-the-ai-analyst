@@ -85,6 +85,9 @@
     <link rel="stylesheet" href="{{ static_url('css/design-tokens.css') }}">
     <link rel="stylesheet" href="{{ static_url('css/components.css') }}">
     <link rel="stylesheet" href="{{ static_url('css/stack_card.css') }}">
+    {# The shared empty/blocked/failed component (macros/_state.html) — no
+       theme scoping needed, every rule is a --ds-* token. #}
+    <link rel="stylesheet" href="{{ static_url('css/state_panel.css') }}">
     {# Rail chrome (ui_layout=rail) + paper component skin
        (data-theme=paper). Both sheets are scoped to their activation
        attribute on <html>, so default topnav/blue instances load them

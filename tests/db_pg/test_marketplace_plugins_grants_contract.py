@@ -787,3 +787,36 @@ class TestListDistinctNames:
         _seed_plugin(repos, "mp-names-2b", "shared")
         names = repos["plugins"].list_distinct_names()
         assert names == ["shared"]
+
+
+class TestClearSyncError:
+    """Contract for ``clear_sync_error`` (TCRD-219) — both backends must
+    null a stamped ``last_error`` without touching the sync timestamps,
+    and leave other rows alone."""
+
+    def test_clears_only_the_named_rows_error(self, repos):
+        reg = _make_registry_repo(repos)
+        reg.register(id="bundled-1", name="Bundled 1", url="builtin://bundled-1", is_builtin=True)
+        reg.register(id="normal-2", name="Normal 2", url="https://example.test/n2.git")
+        reg.update_sync_status("bundled-1", error="fatal: 'builtin' helper not found")
+        reg.update_sync_status("normal-2", error="clone timed out")
+
+        reg.clear_sync_error("bundled-1")
+
+        assert reg.get("bundled-1")["last_error"] is None
+        assert reg.get("normal-2")["last_error"] == "clone timed out", (
+            "clearing one row's error must not touch another row"
+        )
+
+    def test_does_not_fabricate_a_sync(self, repos):
+        reg = _make_registry_repo(repos)
+        reg.register(id="bundled-2", name="Bundled 2", url="builtin://bundled-2", is_builtin=True)
+        reg.update_sync_status("bundled-2", error="boom")
+
+        reg.clear_sync_error("bundled-2")
+
+        row = reg.get("bundled-2")
+        assert row["last_synced_at"] is None, (
+            "clear_sync_error must not stamp a sync that never ran"
+        )
+        assert row["last_commit_sha"] is None

@@ -87,7 +87,7 @@ server surface is required for v1.
 | **fetch** | download bytes for T1 candidates whose hash/etag changed since the worker's cursor. Prefer direct/pre-signed download URLs over inline base64 payloads. |
 | **anonymize** | detect → deterministic pseudonymization (§4) → emit `full` and `redacted` text variants. |
 | **convert** | layout-aware extraction to Markdown as the canonical text representation (Docling-class tooling; same family Agnes uses server-side). |
-| **package** | deterministic zip batches, member paths = source-relative paths. Respect ingest caps: ≤1000 members, ≤1 GiB uncompressed per bundle, ≤100 MiB per upload (`src/ingest/bundle.py`, `src/corpus_allowlist.py`). |
+| **package** | deterministic zip batches, member paths = source-relative paths. Bundles carry the **converted Markdown variants, not original bytes** — originals stay in the source system (a 10⁴–10⁵-doc corpus is ~100+ GB of originals but only single-digit GB of converted text). Respect ingest caps: ≤1000 members, ≤1 GiB uncompressed per bundle, ≤100 MiB per upload (`src/ingest/bundle.py`, `src/corpus_allowlist.py`). |
 | **upload** | bundle upload to the two collections via the existing `POST /api/collections/{id}/files` flow, PAT-authenticated. |
 | **verify** | reconcile counts (enumerated / selected / uploaded / indexed / rejected) against the collection's ingest stats; emit a JSON run report. |
 
@@ -153,6 +153,27 @@ full text is a copy of the full text.
   (`docs/table-access-policies.md`) remain the mechanism for tables; this
   spec's anonymizer applies to document text only.
 
+### 4.1 Inference boundary (external-LLM exposure)
+
+Professional-services deployments commonly constrain what may reach an
+external LLM API at all. The pipeline is ordered so this is a guarantee, not
+a hope:
+
+- **The ingest path is LLM-free by construction.** Detection/pseudonymization
+  (dictionary + NER, Presidio-class), Docling conversion, chunking, BM25/FTS,
+  and embeddings (self-hosted `bge-small`, per `src/ingest/embeddings.py`)
+  all run locally. No document content leaves the deployment during intake.
+- **External models see redacted text only.** LLM enrichment (digest pass,
+  metadata extraction) and chat/agent inference run over the redacted
+  variant. The full variant gets no external-LLM enrichment; if enrichment is
+  needed there, it uses a locally-hosted model.
+- **Where external inference is required**, prefer frontier models under
+  enterprise terms in the customer's cloud perimeter (Bedrock/Vertex-class,
+  zero-data-retention), rather than public API endpoints. This is a
+  deployment-config concern, not an architecture change.
+- The worker's run report includes an **egress statement** (which tier was
+  processed by which model class) so the operator can evidence the boundary.
+
 ## 5. Landing contract in Agnes — what exists, what changes
 
 Already sufficient (no change): bundle ingest with path preservation and
@@ -170,10 +191,16 @@ Additive changes (small, ordered):
    console rather than a file listing. `list_for_corpus` is unpaginated today;
    at T1 scale (hundreds) that holds, and the stats endpoint removes the
    temptation to list thousands.
-3. *(later, scale-triggered)* reranker stage and a VSS/HNSW index behind the
-   existing `search()` interface (`src/ingest/retrieval.py` documents the
-   brute-force design scale), and visual-retrieval (ColPali-class) for
-   deck-heavy corpora as a roadmap item.
+3. **Scale threshold:** brute-force retrieval
+   (`src/ingest/retrieval.py` documents its "dozens of files" design scale)
+   holds for content-ingested corpora up to roughly thousands of documents.
+   At ≥~10⁴ content-ingested documents (≈10⁶ chunks) two items move from
+   "later" into the ingest milestone itself: an ANN index behind the existing
+   `search()` interface (DuckDB `vss` is experimental — persistent HNSW behind
+   a flag; **pgvector on the Postgres backend is the production-grade path**,
+   and the dual-backend rules apply either way), and near-duplicate collapse
+   (version churn at that scale actively poisons ranking). Reranking and
+   visual retrieval (ColPali-class) for deck-heavy corpora remain roadmap.
 
 Consumption surfaces (all existing): answers with citations in chat;
 T2 as a SQL-queryable table for agents; artifacts/data apps as *generated

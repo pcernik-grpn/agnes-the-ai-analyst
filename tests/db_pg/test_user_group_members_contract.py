@@ -14,6 +14,7 @@ used for the synced-only filter) across both engines.
 
 Pattern matches test_users_contract.py / test_audit_contract.py.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -22,6 +23,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # repo construction helpers — one per backend
 # ---------------------------------------------------------------------------
+
 
 def _make_duckdb_repos(tmp_path):
     """Returns ``(ug_repo, members_repo, users_repo, conn)``."""
@@ -59,6 +61,7 @@ def _make_pg_repos(pg_engine, monkeypatch):
 
     monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
     import src.db_pg as db_pg
+
     db_pg.dispose()
     db_pg.get_engine()
 
@@ -95,6 +98,7 @@ def repos(request, tmp_path, pg_engine, monkeypatch):
 # helpers
 # ---------------------------------------------------------------------------
 
+
 def _seed_user_and_two_groups(ug_repo, members_repo, users_repo):
     """Common seed: one user in one google_sync group + one admin group."""
     users_repo.create(id="u-1", email="alice@example.com", name="Alice")
@@ -111,6 +115,7 @@ def _seed_user_and_two_groups(ug_repo, members_repo, users_repo):
 # ---------------------------------------------------------------------------
 # contract tests — same calls, same answers from both engines
 # ---------------------------------------------------------------------------
+
 
 def test_list_groups_with_meta_for_user_returns_rows_for_both_engines(repos):
     """Empty user → empty list on both backends."""
@@ -134,8 +139,14 @@ def test_list_groups_with_meta_for_user_shape(repos):
 
     for row in rows:
         assert set(row.keys()) == {
-            "group_id", "id", "name", "description", "is_system",
-            "created_by", "source", "added_at",
+            "group_id",
+            "id",
+            "name",
+            "description",
+            "is_system",
+            "created_by",
+            "source",
+            "added_at",
         }, f"row keys drifted: {row.keys()}"
         assert isinstance(row["group_id"], str) and row["group_id"]
         # `id` aliases the group's own id — same value as group_id.
@@ -237,9 +248,65 @@ def test_replace_google_sync_groups_diff_membership(repos):
 
     rows = members.list_groups_with_meta_for_user("u-4")
     synced = {r["name"] for r in rows if r["source"] == "google_sync"}
-    assert synced == {"new@example.com"}, (
-        f"old@example.com should have been removed, got: {synced}"
-    )
+    assert synced == {"new@example.com"}, f"old@example.com should have been removed, got: {synced}"
+
+
+def test_replace_microsoft_sync_groups_is_idempotent(repos):
+    """The Microsoft OAuth callback write path can run repeatedly — same
+    contract as replace_google_sync_groups above, distinct source."""
+    ug, members, users, _, _ = repos
+    users.create(id="u-3b", email="erin@example.com", name="Erin")
+    g1 = ug.ensure("g1-ms@example.com", created_by="system:microsoft-sync")
+    g2 = ug.ensure("g2-ms@example.com", created_by="system:microsoft-sync")
+
+    members.replace_microsoft_sync_groups("u-3b", [g1["id"], g2["id"]])
+    members.replace_microsoft_sync_groups("u-3b", [g1["id"], g2["id"]])  # same set
+
+    rows = members.list_groups_with_meta_for_user("u-3b")
+    synced = {r["name"] for r in rows if r["source"] == "microsoft_sync"}
+    assert synced == {"g1-ms@example.com", "g2-ms@example.com"}
+
+
+def test_replace_microsoft_sync_groups_diff_membership(repos):
+    """Removing a group from the synced set drops the row on both engines."""
+    ug, members, users, _, _ = repos
+    users.create(id="u-4b", email="frank@example.com", name="Frank")
+    g_old = ug.ensure("old-ms@example.com")
+    g_new = ug.ensure("new-ms@example.com")
+
+    members.replace_microsoft_sync_groups("u-4b", [g_old["id"], g_new["id"]])
+    members.replace_microsoft_sync_groups("u-4b", [g_new["id"]])  # drop g_old
+
+    rows = members.list_groups_with_meta_for_user("u-4b")
+    synced = {r["name"] for r in rows if r["source"] == "microsoft_sync"}
+    assert synced == {"new-ms@example.com"}, f"old-ms@example.com should have been removed, got: {synced}"
+
+
+def test_google_and_microsoft_sync_sources_are_isolated(repos):
+    """`replace_google_sync_groups` and `replace_microsoft_sync_groups` are
+    both thin wrappers over the shared `replace_synced_groups` primitive —
+    this pins that a refresh scoped to one `source` never touches the
+    other's rows, on both engines. A user signed into both providers (or
+    matched to the same account by address) keeps both snapshots."""
+    ug, members, users, _, _ = repos
+    users.create(id="u-dual", email="dual@example.com", name="Dual")
+    g_google = ug.ensure("g-google@example.com", created_by="system:google-sync")
+    g_ms = ug.ensure("g-microsoft@example.com", created_by="system:microsoft-sync")
+
+    members.replace_google_sync_groups("u-dual", [g_google["id"]])
+    members.replace_microsoft_sync_groups("u-dual", [g_ms["id"]])
+
+    rows = members.list_groups_with_meta_for_user("u-dual")
+    by_name = {r["name"]: r["source"] for r in rows}
+    assert by_name == {
+        "g-google@example.com": "google_sync",
+        "g-microsoft@example.com": "microsoft_sync",
+    }
+
+    # Refreshing the Google side to empty must not touch the Microsoft row.
+    members.replace_google_sync_groups("u-dual", [])
+    rows = members.list_groups_with_meta_for_user("u-dual")
+    assert {r["name"]: r["source"] for r in rows} == {"g-microsoft@example.com": "microsoft_sync"}
 
 
 def test_list_google_sync_groups_for_user_shape_and_filter(repos):
@@ -259,9 +326,7 @@ def test_list_google_sync_groups_for_user_shape_and_filter(repos):
 
     assert [r["name"] for r in rows] == ["eng-data@example.com"]
     for r in rows:
-        assert set(r.keys()) == {"name", "external_id"}, (
-            f"row keys drifted: {r.keys()}"
-        )
+        assert set(r.keys()) == {"name", "external_id"}, f"row keys drifted: {r.keys()}"
         # external_id is None on PG (no column) and on the DuckDB contract
         # schema (column absent → NULL fallback).
         assert r["external_id"] is None

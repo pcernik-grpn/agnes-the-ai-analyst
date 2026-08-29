@@ -20,9 +20,12 @@ the same way a request body is. Without a guard an admin could point it at an
 unrelated secret in the environment (``ANTHROPIC_API_KEY``, ``JWT_SECRET_KEY``,
 a database DSN) and have Agnes read that value out as "the SharePoint
 credential". Every named lookup in this module therefore funnels through
-:func:`src.orchestrator_security.is_token_env_allowed`, the same shared
+:func:`src.orchestrator_security.is_config_secret_env_allowed`, the same shared
 allowlist the Snowflake and Databricks resolvers use — one choke point, so a
-future consumer cannot reintroduce the hole by calling something else.
+future consumer cannot reintroduce the hole by calling something else. It is
+the CONFIG-RESOLUTION allowlist, deliberately not ``is_token_env_allowed``:
+the certificate key must never be a legal ``token_env`` on a connector-written
+``_remote_attach`` row (see ``_CONFIG_SECRET_ONLY_ENVS``).
 """
 
 from __future__ import annotations
@@ -33,7 +36,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from src.orchestrator_security import is_token_env_allowed
+from src.orchestrator_security import is_config_secret_env_allowed
+
 
 logger = logging.getLogger(__name__)
 
@@ -126,10 +130,10 @@ def _vault_secret_updated_at(connection_id: str) -> Optional[datetime]:
 
 def _env_secret(env_name: str) -> str:
     """Read a named env var, refusing any name outside the shared allowlist."""
-    if not is_token_env_allowed(env_name):
+    if not is_config_secret_env_allowed(env_name):
         raise SharePointSettingsError(
             f"cert_private_key_env={env_name!r} is not an allowed credential variable. "
-            "Add it to AGNES_REMOTE_ATTACH_TOKEN_ENVS if the deployment really injects "
+            "Add it to AGNES_CONFIG_SECRET_ENVS if the deployment really injects "
             "the SharePoint certificate under that name, or upload the certificate to "
             "the connection instead."
         )

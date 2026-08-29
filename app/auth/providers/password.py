@@ -19,6 +19,7 @@ from app.auth.access import is_user_admin
 from app.auth.dependencies import _get_db, is_local_dev_mode, require_session_token
 from app.auth.login_audit import ACCOUNT_ACTIVATED, SETUP_LINK_REQUESTED, audit_auth_event, audit_login_success
 from app.auth.provider_registry import require_provider
+from app.auth.providers.sso import sso_forced_for_email
 from app.auth.token_hash import hash_token
 from app.auth.rate_limit import limiter as _rate_limiter
 
@@ -346,8 +347,13 @@ async def password_login(
     # Strip only — case is folded by the lookup (SQL). Resolved by the
     # credential rather than the oldest-row tie-break: see
     # `_row_verifying_password`.
+    email = (body.email or "").strip()
+    if sso_forced_for_email(email):
+        # Forced to the sso door. Same 401 as a wrong credential — the
+        # credential endpoints stay free of a domain oracle.
+        raise HTTPException(status_code=401, detail="Invalid email or password")
     try:
-        user, any_hash = _row_verifying_password(repo, (body.email or "").strip(), body.password)
+        user, any_hash = _row_verifying_password(repo, email, body.password)
     except Exception:
         logger.exception("Unexpected error during password verification")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -385,6 +391,16 @@ async def password_login_web(
 ):
     """Web form login — sets cookie and redirects to `next` (or /dashboard)."""
     email = (email or "").strip()
+    if sso_forced_for_email(email):
+        # Browser leg: the person already typed their address, so send them
+        # to the door that actually opens instead of a dead-end error.
+        from app.auth._common import safe_next_path
+
+        target = safe_next_path(next, default="")
+        return RedirectResponse(
+            url="/auth/sso/login" + (f"?next={quote(target, safe='')}" if target else ""),
+            status_code=303,
+        )
     repo = users_repo()
     # Resolved by the credential, not the oldest-row tie-break — see
     # `_row_verifying_password`.
@@ -420,12 +436,13 @@ async def password_login_web(
             status_code=303,
         )
 
-    if next.startswith("/") and not next.startswith("//"):
-        target = next
-    else:
-        from app.instance_config import get_home_route
+    # The shared rule, not a fourth copy of it: `safe_next_path` carries the
+    # same open-redirect guard PLUS the `_is_own_data_app_origin` exception,
+    # without which signing in with a password lands on the home route while
+    # OAuth and magic-link return you to the app you came from.
+    from app.auth._common import safe_next_path
 
-        target = get_home_route()
+    target = safe_next_path(next)
     response = RedirectResponse(url=target, status_code=302)
     _set_login_cookie(response, user["id"], user["email"], request)
     audit_login_success(user["id"], provider="password", request=request)
@@ -451,6 +468,16 @@ async def password_setup(
     """
     repo = users_repo()
     email = (request_body.email or "").strip()
+    if sso_forced_for_email(email):
+        # Forced to the sso door — a pre-minted invite must not redeem once
+        # the domain is in the allowlist. The refusal mirrors this
+        # endpoint's existing response pair so an arbitrary string learns
+        # nothing about the allowlist: unknown addresses keep the same 404
+        # they get outside the forced domains, known ones get the same copy
+        # an unknown token gets.
+        if not repo.get_by_email_ci(email):
+            raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=400, detail="Invalid setup token")
     # The invitation is minted by user id, so it can sit on a case variant the
     # oldest-wins lookup does not return — resolve by the token it carries.
     user, identity_active = _row_holding_setup_token(repo, email, request_body.token)
@@ -519,6 +546,10 @@ async def reset_page(
     password", and first-time users reasonably conclude their password was
     rejected.
     """
+    if email and sso_forced_for_email(email):
+        # Emailed-link arrival for a forced address (the link predates the
+        # domain joining the allowlist): route to the door that opens.
+        return RedirectResponse(url="/auth/sso/login", status_code=302)
     if not email or not token:
         return _render_reset_request_form(request, email=email)
     return _render_reset_form(request, email=email, token=token, reason=reason)
@@ -547,6 +578,11 @@ async def reset_request(
         # would be false — re-ask for the address instead. An empty submission
         # reveals nothing, so anti-enumeration does not apply to this branch.
         return _render_reset_request_form(request, error="Enter your email address.")
+    if sso_forced_for_email(email):
+        # Forced to the sso door: no reset token may be minted for this
+        # address (it would re-open the password door for an account whose
+        # access control the operator delegated to the external tenant).
+        return RedirectResponse(url="/auth/sso/login", status_code=303)
     repo = users_repo()
     user = repo.get_by_email_ci(email)
     if user and bool(user.get("active", True)):
@@ -621,6 +657,10 @@ async def reset_confirm(
     reason to allow unbounded attempts.
     """
     email = (email or "").strip()
+    if sso_forced_for_email(email):
+        # The redemption leg too, not just the request leg: a link minted
+        # BEFORE the domain joined the allowlist must not still redeem.
+        return RedirectResponse(url="/auth/sso/login", status_code=303)
     repo = users_repo()
 
     # Anti-enumeration: validate the token BEFORE deriving any
@@ -762,6 +802,8 @@ async def setup_page(
     (anti-enumeration). Token validity is checked at POST /setup/confirm."""
     if not email or not token:
         return RedirectResponse(url="/login/password", status_code=302)
+    if sso_forced_for_email(email):
+        return RedirectResponse(url="/auth/sso/login", status_code=302)
     return _render_setup_form(request, email=email, token=token)
 
 
@@ -782,6 +824,10 @@ async def setup_request(
     # mixed-case row an admin stored as-is is still found when the person types
     # their address in lower case.
     email = (email or "").strip()
+    if email and sso_forced_for_email(email):
+        # Forced to the sso door — never mint a setup token that would give
+        # this address a password.
+        return RedirectResponse(url="/auth/sso/login", status_code=303)
     if email:
         repo = users_repo()
         user = repo.get_by_email_ci(email)
@@ -839,6 +885,10 @@ async def setup_confirm(
     unbounded RPS in case a partial token leaks via logs / referer.
     """
     email = (email or "").strip()
+    if sso_forced_for_email(email):
+        # The redemption leg: an invite minted before the domain joined the
+        # allowlist must not still redeem.
+        return RedirectResponse(url="/auth/sso/login", status_code=303)
     if password != confirm_password:
         return _render_setup_form(request, email=email, token=token, name=name, error="Passwords do not match.")
     if len(password) < MIN_PASSWORD_LEN:
@@ -927,9 +977,14 @@ def _render_password_change_form(
 
 @router.get("/change", response_class=HTMLResponse)
 async def password_change_page(request: Request, user: dict = Depends(require_session_token)):
-    """Self-serve change-password page, linked from the account menu."""
+    """Self-serve change-password page, linked from the account menu.
+
+    A forced-to-SSO account renders the same single-sign-on state a
+    hash-less account gets, even when it still holds a hash — the password
+    door is shut for it, so offering the change form would be a lie."""
     row = users_repo().get_by_id(user["id"]) or {}
-    return _render_password_change_form(request, user, has_password=bool(row.get("password_hash")))
+    has_password = bool(row.get("password_hash")) and not sso_forced_for_email(str(row.get("email") or ""))
+    return _render_password_change_form(request, user, has_password=has_password)
 
 
 @router.post("/change")
@@ -971,7 +1026,10 @@ async def password_change(
 
     repo = users_repo()
     row = repo.get_by_id(user["id"])
-    if not row or not row.get("password_hash"):
+    # A forced-to-SSO account is refused with the same shape as a hash-less
+    # one — the two account states stay indistinguishable to a same-site
+    # caller, matching the response-shape rule above.
+    if not row or not row.get("password_hash") or sso_forced_for_email(str(row.get("email") or "")):
         raise HTTPException(
             status_code=400,
             detail="This account signs in through single sign-on and has no password to change.",

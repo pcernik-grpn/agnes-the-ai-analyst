@@ -14,19 +14,19 @@
  * owned by chat.css's empty-state rules — this sheet styles the dashboard
  * widgets. */
 
-/* Suggested-actions column below the hero — the shared --rdb-col definition
+/* Suggested-actions column between the hero and the composer — the shared
+ * --rdb-col definition
  * (declared on the empty-state .cloud-chat-main in chat.css) keeps it on
  * the exact same grid as the hero, composer, and context line. */
 html[data-ui-layout="rail"] .rdb {
     width: var(--rdb-col-narrow, 60%);
     min-width: 0;
-    /* Part of the ASK region: suggestions for the input directly above. `block`,
-       not `inner`, because the group has a LABEL again — the gap above the label
-       must exceed the 10px between label and chips, or the label reads as the
-       composer's caption rather than the chips' heading. The retired
-       "Using N … from your Stack" row used to sit in this gap, so the chips are
-       still higher than when they were last labelled. The page's one `section`
-       break falls below them, before the ways out. See chat.css. */
+    /* Block gap above the group. In #chat-empty-extras (the ways out) this is
+       the whole separation from the composer above them. In #chat-suggested it
+       is zeroed — the page's one `section` break lands on that container
+       instead, so the gap above the "Suggested for you" label comes from there
+       and still far exceeds the 10px between label and chips, which is what
+       keeps the label reading as the chips' heading. See chat.css. */
     margin-top: var(--cld-gap-block, 26px);
     font-family: var(--ds-font);
 }
@@ -35,15 +35,15 @@ html[data-ui-layout="rail"] .rdb {
    reported a number the reader could not act on, in the one row between the
    composer and its suggestions. */
 
-/* ── Suggested next actions — a labelled row of CHIPS under the composer.
+/* ── Suggested next actions — a labelled row of CHIPS above the composer.
  *    Each chip is one guided task: icon · title.
  *
- *    It used to be a vertical list, which at four items built a column directly
- *    below the input and pushed everything after it a screen down — and a stack
- *    of full-width rows under a text field reads as results, not as things you
- *    could ask. A wrapping row of chips is the shape that says "pick one of
- *    these", takes one line instead of four, and leaves the cards below it above
- *    the fold. ─────────────────────────────────────────────────────────────── */
+ *    It used to be a vertical list, which at four items built a column and
+ *    pushed everything after it a screen down — and a stack of full-width rows
+ *    beside a text field reads as results, not as things you could ask. A
+ *    wrapping row of chips is the shape that says "pick one of these", takes one
+ *    line instead of four, and keeps the composer above the fold now that the
+ *    chips precede it. ──────────────────────────────────────────────────────── */
 
 .rdb-actions {
     min-width: 0;

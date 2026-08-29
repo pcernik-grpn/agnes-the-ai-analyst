@@ -44,6 +44,7 @@ ResolutionReason = Literal[
     "agent_pat_agent_deleted",
     "pat_scope_forbidden",
     "pat_parent_revoked",
+    "session_revoked",
 ]
 
 # Path prefixes an agent PAT (typ="agent_pat") is allowed to authenticate
@@ -406,6 +407,50 @@ def resolve_token_to_user(
         # short-circuit in src/rbac.py).
         if payload.get("scope") in ("chat", "mcp-oauth"):
             user["credential_surface"] = "stack"
+        if payload.get("scope") == "mcp-oauth":
+            # F0 audit-context (Task 1): stamp so
+            # src.audit_helpers.client_kind_from_user classifies every
+            # request authenticated by an MCP-OAuth connector token (Claude
+            # Desktop / claude.ai, minted by
+            # app.auth.mcp_oauth.AgnesMCPOAuthProvider's exchange_* methods)
+            # as client_kind='mcp', not 'web'.
+            user["token_type"] = "mcp_oauth"
+
+        # Issue #1676: server-side session revocation. `session_revoked_before`
+        # (PG-only column — A3 ratchet, see
+        # migrations/versions/0082_session_revoked_before.py) is a
+        # per-user timestamp floor: a `typ="session"` token whose `iat`
+        # predates it is refused here even though its signature and `exp`
+        # are both still fine. `POST /auth/logout` bumps it to "now" via
+        # `users_repo().revoke_sessions(...)`, so a captured cookie stops
+        # working the moment the owner logs out instead of staying valid for
+        # the rest of its 30-day `exp`.
+        #
+        # Rides the `user` row already loaded above for the `active` check on
+        # EVERY authenticated request — no additional query. On a DuckDB-
+        # backed instance the column doesn't exist (frozen post-A3 schema),
+        # so `session_revoked_before` is simply absent from the dict and this
+        # never fires there (documented trade-off, not a silent gap — see
+        # CHANGELOG.md).
+        if payload.get("typ") == "session":
+            revoked_before = user.get("session_revoked_before")
+            iat = payload.get("iat")
+            if revoked_before is not None and iat is not None:
+                if isinstance(revoked_before, str):
+                    revoked_before = datetime.fromisoformat(revoked_before)
+                if revoked_before.tzinfo is None:
+                    revoked_before = revoked_before.replace(tzinfo=timezone.utc)
+                # `iat` is whole-SECOND precision (PyJWT floors a datetime to
+                # int() on encode); `revoked_before` is a DB timestamp with
+                # sub-second precision. Floor both to the same granularity
+                # before comparing (strict `<`), or a session re-minted in the
+                # SAME second as the revoke call — a plain logout-then-
+                # log-back-in — would spuriously compare "before" the floored
+                # revoke timestamp and get rejected.
+                token_iat = datetime.fromtimestamp(iat, tz=timezone.utc)
+                if token_iat < revoked_before.replace(microsecond=0):
+                    return None, "session_revoked"
+
         _stash_payload(request, payload)
         return user, None
 

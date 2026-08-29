@@ -52,7 +52,7 @@ class SemanticModel(Base):
         server_default=text("CURRENT_TIMESTAMP"),
     )
     # F3 detach/override (PG-only, A3 ratchet — migrations/versions/
-    # 0077_semantic_models_detach.py). DuckDB gains no capability that
+    # 0090_semantic_models_detach.py). DuckDB gains no capability that
     # depends on these columns.
     sync_mode: Mapped[str] = mapped_column(String, server_default=text("'synced'"), nullable=False)
     detached_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
