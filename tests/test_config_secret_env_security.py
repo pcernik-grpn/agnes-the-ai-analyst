@@ -193,6 +193,51 @@ class TestOrchestratorRefusesConfigOnlySecrets:
         assert any("token_env" in r.message and "not in the allowlist" in r.message for r in caplog.records)
 
 
+class TestOperatorOverrideCannotResurrectOtherBoundaries:
+    """Defense-in-depth ratchet: AGNES_REMOTE_ATTACH_TOKEN_ENVS *replaces*
+    the default inbound set (``get_allowed_token_envs``), so an operator
+    listing a name that belongs to a DIFFERENT consumer class there — a
+    typo, or a misguided attempt to "add" a name (the override REPLACES, it
+    does not add) — must not resurrect it as a legal connector-ATTACH
+    ``token_env``. Covers both other boundaries this module defines:
+    ``_CONFIG_SECRET_ONLY_ENVS`` (the SharePoint certificate / Snowflake
+    passphrase) and ``_PRODUCER_KEY_ENVS`` (the anonymization HMAC key)."""
+
+    @pytest.mark.parametrize("name", CONFIG_ONLY_SECRETS)
+    def test_config_only_secret_in_the_override_is_scrubbed(self, monkeypatch, name):
+        from src.orchestrator_security import get_allowed_token_envs
+
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", f"{name},KBC_TOKEN")
+        allowed = get_allowed_token_envs()
+        assert name not in allowed
+        assert "KBC_TOKEN" in allowed
+
+    def test_producer_key_in_the_override_is_scrubbed(self, monkeypatch):
+        from src.orchestrator_security import get_allowed_token_envs
+
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "AGNES_ANONYMIZATION_HMAC_KEY,KBC_TOKEN")
+        allowed = get_allowed_token_envs()
+        assert "AGNES_ANONYMIZATION_HMAC_KEY" not in allowed
+        assert "KBC_TOKEN" in allowed
+
+    @pytest.mark.parametrize("name", CONFIG_ONLY_SECRETS)
+    def test_remote_attach_row_naming_an_overridden_config_only_secret_is_still_refused(
+        self, captured_conn, monkeypatch, caplog, name
+    ):
+        """End-to-end: even with the operator override explicitly naming it
+        (not just the compiled-in default), a connector ``_remote_attach``
+        row asking for it as ``token_env`` must be refused before ATTACH."""
+        secret_value = f"real-{name.lower()}-pem-material"
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", name)
+        monkeypatch.setenv(name, secret_value)
+        conn, sql_calls, set_rows = captured_conn
+        set_rows([("alias1", "keboola", "https://attacker.example", name)])
+        with caplog.at_level(logging.ERROR):
+            SyncOrchestrator()._attach_remote_extensions(conn, "src1")
+        assert _attach_call_count(sql_calls) == 0
+        assert not any(secret_value in s for s in sql_calls)
+
+
 def _make_extract_with_remote_attach(path: Path, alias: str, extension: str, url: str, token_env: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     c = duckdb.connect(str(path))

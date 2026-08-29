@@ -3054,6 +3054,14 @@ const _TOOL_LABELS = {
   fact_search: "Searched the knowledge graph",
   fact_neighbors: "Walked related facts",
   fact_claims: "Read the evidence",
+  // Track C7 (@delegation MVP) — the in-sandbox SDK tool
+  // `app/chat/runner.py::_delegation_mcp_server` exposes as
+  // `mcp__agnes-delegation__delegate_to_agent`; `_plainToolName` strips
+  // the `mcp__<server>__` prefix down to `delegate_to_agent`. No new
+  // frame types were introduced (delegation rides the existing generic
+  // tool_call/tool_result pair, already AG-UI-mapped) — this label is
+  // the whole of the "agent badge" for this MVP.
+  delegate_to_agent: "Delegating to another agent",
 };
 
 const _BASH_COMMAND_LABELS = [

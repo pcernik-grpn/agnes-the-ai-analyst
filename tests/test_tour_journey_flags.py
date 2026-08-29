@@ -78,8 +78,8 @@ def test_tour_marks_only_the_step_it_walks():
 
 
 def test_connect_button_marks_use_anywhere():
-    """ "Connect my AI tools" navigates to the AI Connector, which is what the
-    journey panel's `use_anywhere` step does — so it marks the same flag."""
+    """ "Take Agnes to my tools" navigates to #connect, which is what the
+    journey panel's step of the same name does — so it marks the same flag."""
     js = _js()
     assert "markUseAnywhereDone" in js
     assert "use_anywhere: true" in js

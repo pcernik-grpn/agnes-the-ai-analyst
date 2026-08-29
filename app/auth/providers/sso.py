@@ -139,6 +139,41 @@ def login_offering() -> Optional[str]:
     return None
 
 
+def sso_forced_for_email(email: str) -> bool:
+    """True when this address must use the SSO door — its domain is in the
+    ENABLED config's allowlist and the door is actually offered.
+
+    The predicate behind force-SSO: ``allowed_email_domains`` names the
+    domains whose access control the operator delegated to the external
+    tenant, so the password and magic-link doors consult this before
+    opening. Every call site is on the unauthenticated login path, so this
+    fails OPEN — no Postgres backend (``_config_state`` swallows
+    ``RequiresPostgresBackend``), no config, config disabled, empty
+    allowlist, undecryptable secret, or ``sso`` excluded from
+    ``auth.providers`` all answer ``False`` and leave the other doors alone.
+    The ``provider_allowed`` leg matters: forcing while the sso routes 404
+    would leave these addresses with no door at all, and it pairs with
+    ``is_available`` exactly the way the admin API's last-login-door guard
+    defines "sso is a usable door".
+
+    Domain comparison matches :func:`evaluate_claims` (``resolve_identity``
+    lower-cases; the stored allowlist is ``normalize_domains``-lowercased;
+    membership is exact, after the LAST ``@``) — an address is forced here
+    iff the callback would accept its domain there.
+    """
+    normalized = (email or "").strip().lower()
+    if "@" not in normalized:
+        return False
+    cfg, secret = _config_state()
+    if not (cfg and cfg["enabled"] and cfg["allowed_email_domains"] and secret):
+        return False
+    from app.auth.provider_registry import provider_allowed
+
+    if not provider_allowed("sso"):
+        return False
+    return normalized.split("@")[-1] in cfg["allowed_email_domains"]
+
+
 def startup_warnings() -> list[str]:
     """Operator-facing boot messages, emitted from ``app.main``'s lifespan.
 

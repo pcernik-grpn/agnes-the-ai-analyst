@@ -821,6 +821,7 @@ def register_foundation_tools(
     async def fact_search(
         type: str | None = None,
         filters: dict[str, Any] | None = None,
+        q: str | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict:
         """Search typed facts extracted from documents — entities (people,
@@ -849,6 +850,9 @@ def register_foundation_tools(
             filters: Attribute equality filters, e.g. {"status": "active"} —
                 evaluated against the PROJECTED value, so a filter on a
                 conflicted key never matches.
+            q: Optional free-text name lookup (e.g. a person or org name),
+                matched against alias names only, never claim text. An
+                exact or prefix match ranks first.
             limit: Max results (server caps at 100).
 
         Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
@@ -861,7 +865,7 @@ def register_foundation_tools(
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, limit=limit)
+        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
 
     @tool(read_only=True)
     async def fact_neighbors(

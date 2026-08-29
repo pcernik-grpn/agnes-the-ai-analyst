@@ -550,7 +550,7 @@
        with the nav collapsed. #}
     <div class="rail-foot">
 
-        {# "Use {brand} elsewhere" — straight to the section of How-it-works
+        {# "Take {brand} to your tools" — straight to the section of How-it-works
            that hands you the MCP endpoint and the CLI install, rather than to
            the top of a long page you then have to scan.
 
@@ -564,19 +564,35 @@
         {# Plain `rail-i`, not `--muted`: that modifier italicises the label
            and exists for the "Admin paused" state, which is a condition being
            reported rather than a place to go. This is a place to go. #}
+        {# One label, one destination. Every clickable route to
+           /how-it-works#connect says "take {brand} to your tools" — the chat
+           landing's door, the onboarding checklist's step, the tour's closing
+           button and this row — because they are one door, and a reader who
+           met three names for it had no way to know that. The phrasing is the
+           one that survived the hero: it names the DIRECTION ({brand} travels
+           out to your editor), where "connect your tools" read as sending data
+           the other way.
+
+           It is the longest label in the rail and it was measured, not
+           guessed: the label box is 169px (240 rail − 2×12 rail padding −
+           2×11 row padding − 16 icon − 9 gap) and "Take Agnes to your tools"
+           renders 152px at 13px/500, so the default brand clears it by 17px.
+           A brand short-name past ~7 characters does not — hence `title`, so
+           the ellipsis the label already had is recoverable on hover. #}
         <a class="rail-i{% if _path == '/how-it-works' %} is-active{% endif %}"
-           href="/how-it-works#connect">
+           href="/how-it-works#connect"
+           title="Take {{ instance_brand_short }} to your tools">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 13.5a4 4 0 0 0 5.7.4l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.5 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M14 10.5a4 4 0 0 0-5.7-.4l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.5-1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-            <span class="rail-i-label">Use {{ instance_brand_short }} elsewhere</span>
+            <span class="rail-i-label">Take {{ instance_brand_short }} to your tools</span>
         </a>
 
-        {# Onboarding sits BELOW "Use {brand} elsewhere" and above the profile.
+        {# Onboarding sits BELOW "Take {brand} to your tools" and above the profile.
            It moved out of .rail-collapsible to get here, which also makes it
            reachable in the ≤1024px bar for the same reason the profile is —
            a setup card you cannot reach while the nav is collapsed is a
            reminder you cannot act on. #}
-    {# NOT on an admin page. This is the ANALYST's journey — connect your tools,
-       ask your first question, five steps of learning to use the chat product —
+    {# NOT on an admin page. This is the ANALYST's journey — take {brand} to your
+       tools, ask your first question, five steps of learning the chat product —
        and it is the only element in the rail carrying a coloured progress arc,
        so it pulls the eye hardest of anything on screen while you are registering
        a table or editing a grant. Whose progress it measures is the point: an
@@ -587,7 +603,7 @@
 
        Unlike the conversation region above, nothing is lost by its absence: the
        checklist is also reachable from the account menu's "Start over
-       onboarding" and from the chat dashboard's own hero. #}
+       onboarding" and from the chat dashboard's "Set up {brand}" door. #}
     {% if can_chat and not _admin_page %}
     {# Onboarding row — the last thing in the bottom zone, under Admin and
        directly above the profile; that zone's position/order is unchanged

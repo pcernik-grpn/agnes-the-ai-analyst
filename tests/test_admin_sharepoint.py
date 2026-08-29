@@ -238,6 +238,140 @@ class TestSubfolderBrowsing:
         assert r.json()["detail"]["error"] == "invalid_item_id"
 
 
+class TestUniquePermissionsAdvisory:
+    """`GET .../tree?with_permissions=1` — ADVISORY-ONLY unique-permissions
+    signal (spec §13.1/§13.2, Decision #2: Agnes never derives or enforces
+    anything from SharePoint ACLs). Off by default, batched, never blocks or
+    fails ordinary browsing even when the probe itself fails."""
+
+    def _connect(self, seeded_app, monkeypatch, name="perm-conn"):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        return c, _create_connection(c, seeded_app["admin_token"], name=name)
+
+    def _install(self, monkeypatch, *, batch_handler=None):
+        from connectors.sharepoint import graph_client as gc
+
+        calls = {"batch": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            if path == "/v1.0/drives/d1/items/f1/children":
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {"id": "sub1", "name": "Unique folder", "folder": {"childCount": 0}},
+                            {"id": "sub2", "name": "Ordinary folder", "folder": {"childCount": 0}},
+                            {"id": "doc1", "name": "report.pdf", "file": {}},
+                        ]
+                    },
+                )
+            if path == "/v1.0/$batch":
+                calls["batch"] += 1
+                if batch_handler:
+                    return batch_handler(request)
+                payload = request.content
+                import json as _json
+
+                requests = _json.loads(payload)["requests"]
+                responses = []
+                for req in requests:
+                    item_id = req["url"].split("/items/")[1].split("?")[0]
+                    flag = {"sub1": True, "sub2": False}.get(item_id)
+                    responses.append(
+                        {"id": req["id"], "status": 200, "body": {"listItem": {"hasUniqueRoleAssignments": flag}}}
+                    )
+                return httpx.Response(200, json={"responses": responses})
+            raise AssertionError(f"unexpected path: {path}")
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+        return calls
+
+    def test_off_by_default_never_calls_batch(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        calls = self._install(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"drive_id": "d1", "item_id": "f1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert calls["batch"] == 0
+        for item in r.json()["items"]:
+            assert "unique_permissions" not in item
+
+    def test_with_permissions_flags_folders_true_false(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        calls = self._install(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"drive_id": "d1", "item_id": "f1", "with_permissions": "1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert calls["batch"] == 1
+        by_id = {item["id"]: item for item in r.json()["items"]}
+        assert by_id["sub1"]["unique_permissions"] is True
+        assert by_id["sub2"]["unique_permissions"] is False
+
+    def test_files_are_never_probed_or_flagged_true(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"drive_id": "d1", "item_id": "f1", "with_permissions": "1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        by_id = {item["id"]: item for item in r.json()["items"]}
+        # Files are never scoped by the wizard, so they are never probed and
+        # never carry the key at all — not even as `null`.
+        assert "unique_permissions" not in by_id["doc1"]
+
+    def test_probe_failure_degrades_to_unknown_never_fails_the_browse(self, seeded_app, monkeypatch):
+        def failing_batch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="upstream unavailable")
+
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        calls = self._install(monkeypatch, batch_handler=failing_batch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"drive_id": "d1", "item_id": "f1", "with_permissions": "1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert calls["batch"] == 1
+        by_id = {item["id"]: item for item in r.json()["items"]}
+        assert by_id["sub1"]["unique_permissions"] is None
+        assert by_id["sub2"]["unique_permissions"] is None
+
+    def test_sites_level_ignores_with_permissions_no_batch_call(self, seeded_app, monkeypatch):
+        from connectors.sharepoint import graph_client as gc
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            if request.url.path == "/v1.0/$batch":
+                raise AssertionError("sites level has no folder items to probe")
+            assert request.url.path == "/v1.0/sites"
+            return httpx.Response(200, json={"value": [{"id": "s1", "displayName": "Corp", "webUrl": "https://x/s1"}]})
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="perm-sites-conn")
+        r = c.get(f"{BASE}/{conn_id}/tree", params={"with_permissions": "1"}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+
+
 class TestTreeSearch:
     """TCRD-240: `GET .../tree/search` — bounded BFS folder search, never
     Graph's own `/search` (module docstring in `graph_client`)."""
@@ -390,6 +524,84 @@ class TestTreeSearch:
             headers=_auth(seeded_app["admin_token"]),
         )
         assert r.status_code == 200, r.text
+
+    def test_out_of_range_caps_clamp_to_the_raised_real_library_scale_caps(self, seeded_app, monkeypatch):
+        """443k files / 97,899 folders in one real library (task context) is
+        what motivated raising the ceiling from depth 10 / visited 2000 to
+        depth 12 / visited 20000 — assert the endpoint actually clamps to
+        the NEW numbers, not the old ones."""
+        import app.api.admin_sharepoint as admin_sp
+
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        captured = {}
+        real_search_folders = admin_sp.search_folders
+
+        async def spy(*args, **kwargs):
+            captured["max_depth"] = kwargs["max_depth"]
+            captured["max_visited"] = kwargs["max_visited"]
+            return await real_search_folders(*args, **kwargs)
+
+        monkeypatch.setattr(admin_sp, "search_folders", spy)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains", "drive_id": "d1", "max_depth": 999, "max_visited": 999999},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert captured == {"max_depth": 12, "max_visited": 20000}
+
+    def test_default_max_visited_is_raised_to_2000(self, seeded_app, monkeypatch):
+        import app.api.admin_sharepoint as admin_sp
+
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        captured = {}
+        real_search_folders = admin_sp.search_folders
+
+        async def spy(*args, **kwargs):
+            captured["max_visited"] = kwargs["max_visited"]
+            return await real_search_folders(*args, **kwargs)
+
+        monkeypatch.setattr(admin_sp, "search_folders", spy)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert captured["max_visited"] == 2000
+
+    def test_truncated_response_carries_visited_count_and_a_hint(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        # `max_visited=1` clamps to 1 (the floor) — the walk stops after the
+        # very first "list children" call, guaranteed to leave the fixture's
+        # tree short of fully covered, i.e. `truncated: true`.
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains", "drive_id": "d1", "max_visited": 1},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["truncated"] is True
+        assert isinstance(body["visited"], int)
+        assert body["hint"]
+        assert "scope" in body["hint"].lower() or "narrow" in body["hint"].lower()
+
+    def test_non_truncated_response_hint_is_null(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["truncated"] is False
+        assert body["hint"] is None
 
     def test_missing_certificate_is_a_typed_409(self, seeded_app, monkeypatch):
         monkeypatch.delenv("SHAREPOINT_CERT_PRIVATE_KEY", raising=False)

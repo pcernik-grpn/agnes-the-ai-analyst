@@ -699,7 +699,7 @@ def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
         return 0
 
 
-def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> None:
+def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> int:
     """Purge a matched row's zip-bundle children (fully — they are
     regenerated on the next ingest) plus the row's OWN chunks, derived
     tables and fact claims, ahead of an in-place content update that reuses
@@ -718,6 +718,12 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
     bundle-children purges above are unaffected: those child rows are
     hard-deleted here, so the next ingest mints fresh child ids and fresh
     ``table_id``s — there is nothing for a later purge to collide with.
+
+    Returns the number of fact claims purged for ``row`` itself (0 when the
+    ``facts`` flag is off, which is the default) — the caller threads this
+    into the upload response's purge signal (spec §8 coupled bug: a
+    producer's ingest idempotence has no way to tell a purge happened
+    without it).
     """
     cf_repo = corpus_files_repo()
     chunks_repo = corpus_chunks_repo()
@@ -759,6 +765,7 @@ def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purg
             row["id"],
             purged,
         )
+    return purged
 
 
 def _ingest_incomplete(row: dict) -> bool:
@@ -799,7 +806,7 @@ def _upsert_corpus_file(
     storage_path: str | None,
     sources_repo: Any,
     defer_row_purge: bool = False,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int]:
     """Match-then-insert-or-update-in-place for one uploaded file.
 
     Match order (fact-graph-over-Collections design §6, "Prerequisite change
@@ -826,9 +833,14 @@ def _upsert_corpus_file(
     DuckDB-backed instance fails clean with a 501 before any file is
     touched, never partway through a batch).
 
-    Returns ``(file_id, needs_processing)`` — ``needs_processing`` is False
-    only for the unchanged-content short-circuit on an already-``indexed``
-    row, so the caller knows whether to (re)schedule ingestion.
+    Returns ``(file_id, needs_processing, claims_purged)`` — ``needs_processing``
+    is False only for the unchanged-content short-circuit on an already-
+    ``indexed`` row, so the caller knows whether to (re)schedule ingestion.
+    ``claims_purged`` is the count `_purge_children_and_content` dropped for
+    THIS row on a content change (0 otherwise, incl. when the ``facts`` flag
+    is off) — the caller surfaces it in the upload response so a producer's
+    ingest idempotence knows a re-ingest is genuinely needed, not merely
+    "already shipped" (spec §8 coupled bug).
     """
     cf_repo = corpus_files_repo()
 
@@ -840,12 +852,13 @@ def _upsert_corpus_file(
     if existing is None and path:
         existing = cf_repo.get_by_path(collection_id, path)
 
+    claims_purged = 0
     if existing is not None:
         file_id = existing["id"]
         content_changed = existing.get("sha256") != sha256
         old_blob = existing.get("storage_path")
         if content_changed:
-            _purge_children_and_content(collection_id, existing, defer_row_purge=defer_row_purge)
+            claims_purged = _purge_children_and_content(collection_id, existing, defer_row_purge=defer_row_purge)
         cf_repo.update_in_place(
             file_id,
             filename=filename,
@@ -892,7 +905,7 @@ def _upsert_corpus_file(
             source_sha256=source_sha256_meta,
         )
 
-    return file_id, needs_processing
+    return file_id, needs_processing, claims_purged
 
 
 def _nth_field(values: Optional[List[str]], idx: int) -> str | None:
@@ -1054,8 +1067,16 @@ async def upload_files(
     compatibility with the doc-sync wire format but is not yet persisted
     here — it belongs to a claim, written by the (future) fact-ingest API.
 
-    Returns a list of ``{file_id, filename, path, processing_status, …}`` for
-    every uploaded file (in upload order).
+    Returns a list of ``{file_id, filename, path, processing_status, …,
+    claims_purged}`` for every uploaded file (in upload order).
+    ``claims_purged`` (spec §8 coupled bug) is the count of fact-graph claims
+    dropped for THIS file because its content changed in place (§6) — 0 for
+    a brand-new file, an unchanged-content resync/rename, or when the
+    ``facts`` feature flag is off. A producer that ingested claims for this
+    file should treat a non-zero count as "re-ingest is needed", not
+    "already shipped" — the purge and the producer's own idempotence
+    otherwise disagree silently (live-verified: a rename recomputing a
+    provenance header purged claims that were never re-sent).
     """
     # Verify the collection exists (grant check already done by the dependency).
     corpus = file_corpora_repo().get(collection_id)
@@ -1175,7 +1196,7 @@ async def upload_files(
             # path/source anchor.
             effective_path = path if storage_path is not None else None
             effective_stable_id = stable_id if storage_path is not None else None
-            file_id, _ = _upsert_corpus_file(
+            file_id, _, claims_purged = _upsert_corpus_file(
                 collection_id,
                 path=effective_path,
                 stable_id=effective_stable_id,
@@ -1194,7 +1215,7 @@ async def upload_files(
                 detail={"reason": "unsupported_type", "filename": fname},
             )
             row = cf_repo.get(file_id)
-            results.append(_file_out(row))
+            results.append({**_file_out(row), "claims_purged": claims_purged})
             any_rejected = True
 
         else:
@@ -1218,14 +1239,14 @@ async def upload_files(
                     detail={"reason": f"storage_error:{exc.detail}"},
                 )
                 row = cf_repo.get(file_id)
-                results.append(_file_out(row))
+                results.append({**_file_out(row), "claims_purged": 0})
                 any_rejected = True
                 continue
 
             # Match-then-insert-or-update-in-place. `needs_processing` is
             # False only for the unchanged-content short-circuit (rename/
             # move) — that row keeps whatever chunks/status it already had.
-            file_id, needs_processing = _upsert_corpus_file(
+            file_id, needs_processing, claims_purged = _upsert_corpus_file(
                 collection_id,
                 path=path,
                 stable_id=stable_id,
@@ -1240,7 +1261,7 @@ async def upload_files(
                 defer_row_purge=_defer_purge_to_ordered_job,
             )
             row = cf_repo.get(file_id)
-            results.append(_file_out(row))
+            results.append({**_file_out(row), "claims_purged": claims_purged})
             if needs_processing:
                 _to_ingest.append(file_id)
             logger.info(

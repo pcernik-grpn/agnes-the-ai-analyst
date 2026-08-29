@@ -128,12 +128,18 @@ def _now() -> datetime:
 
 
 def _resolve_store_verification() -> Optional[Signal]:
-    from app.instance_config import get_store_verification_enabled
+    from app.instance_config import get_store_moderation_enabled, get_store_verification_enabled
     from src.repositories import store_entities_repo
 
     if not get_store_verification_enabled():
         # Feature off on this instance — not "zero waiting", but "not a thing
         # here". Either way the row must not render (rule 1).
+        return None
+    # The hub this card links to is hidden by default, and it is where the
+    # Verify / Request changes actions are reached from. A count pointing at
+    # a redirect is worse than no card — same posture as
+    # `_resolve_studio_suggestions`.
+    if not get_store_moderation_enabled():
         return None
     # limit=1: we want the repo's real total, not the rows.
     _, total = store_entities_repo().list(verification_state=["requested"], limit=1)
@@ -171,9 +177,15 @@ def _resolve_agent_share_requests() -> Optional[Signal]:
     letting `RequiresPostgresBackend` degrade the row to "could not be
     checked" forever — same posture as `_resolve_studio_suggestions`'s
     feature-flag early-return."""
+    from app.instance_config import get_store_moderation_enabled
     from src.repositories import share_requests_repo, use_pg
 
     if not use_pg():
+        return None
+    # `/admin/store` is the ONLY page that renders this queue, and it is hidden
+    # by default — so with the hub off there is nowhere for this card to send
+    # anyone. Checked before the count, like the flag guards above.
+    if not get_store_moderation_enabled():
         return None
     _, total = share_requests_repo().list_for_admin(status=["pending"], limit=1)
     if not total:
@@ -294,7 +306,10 @@ def _resolve_marketplace_sync() -> Optional[Signal]:
 
     cutoff = _now() - timedelta(hours=STALE_MARKETPLACE_SYNC_HOURS)
     broken = 0
-    for row in marketplace_registry_repo().list_all():
+    # list_non_builtin: a bundled row never syncs (no git remote), so its
+    # NULL last_synced_at would read as "broken" forever on every instance
+    # — the same permanent-red wound TCRD-219 closes in the admin table.
+    for row in marketplace_registry_repo().list_non_builtin():
         if row.get("last_error"):
             broken += 1
             continue

@@ -350,6 +350,13 @@ BQ_PATH = re.compile(
 # the master-view RBAC layer and must be registry-gated like `bq.*`.
 SF_PATH = qualified_path_re("sf")
 
+# Keboola direct path guard (#1492). Every Keboola sync writes a
+# `_remote_attach` row aliased `kbc`, re-ATTACHed onto the read-only analytics
+# connection with the *instance* storage token — so an ungated
+# `kbc."bucket"."table"` read reaches whatever that token can see, which is
+# typically wider than any single analyst's grants.
+KBC_PATH = qualified_path_re("kbc")
+
 
 # Issue #201 — full backtick BQ path `<project>.<dataset>.<table>` in user
 # SQL. Used by the registry-gating pass and (via `_mask_backticks`) to keep
@@ -373,18 +380,21 @@ def _local_extract_catalogs(conn) -> set[str]:
     set.
 
     That exclusion is only safe for a prefix that has a gate of its own, and
-    the two are not equal. ``bq`` does (``_bq_guardrail_inputs``), as do ``sf``
-    (``_sf_guardrail_inputs``) and ``dbx``
-    (``connectors.databricks.remote.guardrail_inputs``). **``kbc`` does not** —
-    ``_bq_guardrail_inputs`` scans ``BQ_PATH`` only, Keboola is not registered
-    in ``src.remote_engines._ENGINES``, and no ``_kbc_guardrail_inputs``
-    exists. An earlier version of this docstring asserted the opposite. So on
-    an instance whose Keboola extract wrote a ``_remote_attach`` row (every
-    Keboola sync does — ``connectors/keboola/extractor.py``), a
-    ``kbc."bucket"."table"`` path is gated by neither this catalog check nor a
-    registry/grant/policy one. Pre-existing and tracked separately from the
-    engine-path policy gates; recorded here so the next reader does not infer
-    coverage from the exclusion.
+    every remote-extension prefix now has one: ``bq`` (``_bq_guardrail_inputs``),
+    ``sf`` (``_sf_guardrail_inputs``), ``dbx``
+    (``connectors.databricks.remote.guardrail_inputs``) and ``kbc``
+    (``_kbc_guardrail_inputs``, #1492 — an earlier version of this docstring
+    recorded the kbc gap).
+
+    Scoped honestly: those guards run on the two raw-SQL entry points that
+    reach this connection through ``/api/query`` and
+    ``run_remote_select_to_arrow`` (``/api/v2/scan``). ``POST /api/query/hybrid``
+    (``app/api/query_hybrid.py``) executes admin-supplied SQL on the same
+    connection via ``RemoteQueryEngine`` and calls NONE of them — pre-existing
+    and equally true of ``bq``/``sf``, and admin-only (``Depends(require_admin)``),
+    so it is a consistency gap rather than a privilege boundary; adding the
+    guards there needs a decision about the endpoint's own registered-BQ
+    sub-query contract, so it is deliberately not made here.
     """
     try:
         default = conn.execute("SELECT current_database()").fetchone()[0]
@@ -970,7 +980,7 @@ class _UnterminatedSqlLiteralError(ValueError):
     """
 
 
-def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
+def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool, mask_literals: bool = True) -> str:
     """One left-to-right, linear-time pass recognizing every span DuckDB
     itself treats as opaque, blanking the ones each caller (``_mask_sql_noise``,
     ``_mask_sql_for_guard``) needs blanked while preserving length and offsets.
@@ -993,6 +1003,14 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
       which would desync the rest of the scan (the same class of bug
       documented on ``connectors/internal/access.py``'s escape-string
       regex).
+      ``mask_literals=False`` keeps every literal span VISIBLE while still
+      stepping over it correctly (so a ``--`` or ``/*`` inside a literal is
+      never mistaken for a comment). The qualified-path guards
+      (``_bq_guardrail_inputs`` / ``_sf_guardrail_inputs`` /
+      ``_kbc_guardrail_inputs``) need exactly that: they must see through a
+      comment, but a path-shaped string literal is deliberately still refused
+      there — strict-deny on a security boundary, pinned by
+      ``tests/test_api_query_rbac_bq_path.py::test_string_literal_matching_bq_path_rejected_403``.
     * ``--`` line comments and nested ``/* */`` block comments — blanked
       only when ``mask_comments`` is true. DuckDB nests block comments
       (verified empirically: ``/* a /* b */ c */`` parses as ONE comment,
@@ -1049,8 +1067,9 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
             if not closed and strict:
                 raise _UnterminatedSqlLiteralError("unterminated E-string literal")
             end = j + 1 if closed else n
-            for k in range(i, end):
-                out[k] = " "
+            if mask_literals:
+                for k in range(i, end):
+                    out[k] = " "
             i = end
         elif ch == "'":
             j = i + 1
@@ -1066,8 +1085,9 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
             if not closed and strict:
                 raise _UnterminatedSqlLiteralError("unterminated string literal")
             end = j + 1 if closed else n
-            for k in range(i, end):
-                out[k] = " "
+            if mask_literals:
+                for k in range(i, end):
+                    out[k] = " "
             i = end
         elif ch == "$" and (m := _DOLLAR_QUOTE_OPEN_RE.match(sql, i)) is not None:
             delim = m.group(0)
@@ -1078,8 +1098,9 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
                 end = n
             else:
                 end = close + len(delim)
-            for k in range(i, end):
-                out[k] = " "
+            if mask_literals:
+                for k in range(i, end):
+                    out[k] = " "
             i = end
         elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
             j = sql.find("\n", i)
@@ -1181,6 +1202,34 @@ def _mask_sql_for_guard(sql: str, *, mask_comments: bool) -> str:
     """
     try:
         return _scan_and_mask_sql(sql, mask_comments=mask_comments, strict=True)
+    except _UnterminatedSqlLiteralError:
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed SQL: an unterminated string literal, quoted identifier, or comment",
+        ) from None
+
+
+def _mask_comments_for_path_scan(sql: str) -> str:
+    """Blank comments, keep literals — the masking the qualified-path guards
+    (``bq``/``sf``/``kbc``) scan through.
+
+    DuckDB treats a comment as insignificant whitespace, so
+    ``SELECT * FROM kbc/*x*/."bucket"."table"`` parses and reaches the ATTACHed
+    catalog — while ``qualified_path_re`` only matches literal whitespace
+    between segments and saw nothing. That gap let a caller read an
+    unregistered/ungranted table through the instance-wide connector token,
+    which is precisely what those guards exist to refuse.
+
+    Literals stay VISIBLE here, unlike ``_mask_sql_for_guard``: a path-shaped
+    string literal (``WHERE c = 'bq.unreg.tbl'``) is a documented, deliberate
+    false positive that these guards strict-deny rather than risk a bypass —
+    masking it would trade a comment evasion for a literal one.
+
+    Offsets and length are preserved, and quoted identifiers are never
+    touched, so a match's groups still carry the real bucket/table names.
+    """
+    try:
+        return _scan_and_mask_sql(sql, mask_comments=True, strict=True, mask_literals=False)
     except _UnterminatedSqlLiteralError:
         raise HTTPException(
             status_code=400,
@@ -1661,11 +1710,12 @@ def execute_query(
         if (
             BQ_PATH.search(_mask_backticks(request.sql))
             or SF_PATH.search(_mask_backticks(request.sql))
+            or KBC_PATH.search(_mask_backticks(request.sql))
             or _BACKTICK_FULL_PATH.search(request.sql)
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Internal tables can't be combined with `bq.*` or `sf.*` paths in a single SELECT (v1 limitation).",
+                detail="Internal tables can't be combined with `bq.*`, `sf.*` or `kbc.*` paths in a single SELECT (v1 limitation).",
             )
         # Reject if user SQL also references any non-internal registry id —
         # that would be a mixed query against analytics.duckdb views. Matched
@@ -1785,6 +1835,19 @@ def execute_query(
         )
         if blocked_sf_path is not None:
             raise HTTPException(status_code=403, detail=blocked_sf_path)
+
+        # Keboola direct-path guard (#1492) — same shape as sf: the extension
+        # resolves locally, but `kbc."bucket"."table"` rides the instance
+        # storage token and bypasses master-view RBAC.
+        blocked_kbc_path = _kbc_guardrail_inputs(
+            request.sql,
+            sql_lower,
+            conn,
+            user,
+            allowed,
+        )
+        if blocked_kbc_path is not None:
+            raise HTTPException(status_code=403, detail=blocked_kbc_path)
 
         # Issue #160 §4.3.3 — concurrent-slot guard MUST wrap the actual
         # `analytics.execute(request.sql)` call (which is what triggers the
@@ -2354,7 +2417,11 @@ def _bq_guardrail_inputs(
         is_admin = (
             is_user_admin(user.get("id") or user.get("email") or "", sys_conn) and _credential_surface(user) == "all"
         )
-    for m in BQ_PATH.finditer(sql):
+    # Comment-masked, for the reason spelled out in `_kbc_guardrail_inputs`:
+    # a comment between segments is whitespace to DuckDB but invisible to
+    # `BQ_PATH`, so a raw-text scan let `bq/*x*/."ds"."tbl"` reach BigQuery
+    # with neither the registry check below nor a dry-run cost estimate.
+    for m in BQ_PATH.finditer(_mask_comments_for_path_scan(sql)):
         bucket_raw = m.group(1).strip('"')
         source_table_raw = m.group(2).strip('"')
         row = repo.find_by_bq_path(bucket_raw, source_table_raw)
@@ -2635,7 +2702,11 @@ def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> O
     is_admin = _caller_is_unrestricted_admin(user, sys_conn)
     accessible_set = set(allowed) if allowed is not None else None
 
-    for m in SF_PATH.finditer(sql):
+    # Comment-masked, for the reason spelled out in `_kbc_guardrail_inputs`:
+    # a comment between segments is whitespace to DuckDB but invisible to the
+    # shared `qualified_path_re`, so a raw-text scan let `sf/*x*/."S"."T"`
+    # through to the ATTACHed catalog ungated.
+    for m in SF_PATH.finditer(_mask_comments_for_path_scan(sql)):
         schema_raw = m.group(1).strip('"')
         table_raw = m.group(2).strip('"')
         row = None
@@ -2676,6 +2747,89 @@ def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> O
                         "This Snowflake table carries an access policy, which is "
                         f"enforced under its registered name. Query {policied['name']!r} "
                         "instead of the direct sf.* path."
+                    ),
+                }
+    return None
+
+
+def _kbc_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> Optional[dict]:
+    """Registry + RBAC gate for direct ``kbc."bucket"."table"`` paths (#1492).
+
+    The Keboola DuckDB extension resolves locally (like Snowflake's), but the
+    ``kbc`` catalog is ATTACHed with the *instance* storage token, so a
+    qualified path bypasses the master-view RBAC layer with credentials wider
+    than the caller's own grants. The same registration/admin/RBAC rules as
+    ``sf.*`` apply. Returns ``None`` when the statement contains no ``kbc.*``
+    path or every path is registered and accessible.
+
+    Matching normalizes ``source_table`` through ``normalize_source_table``:
+    rows registered by the pre-fix Data-sources wizard stored the full
+    ``<bucket>.<table>`` id while the live extension exposes the bare in-bucket
+    name (#1189), and a gate that missed those rows would refuse legitimately
+    registered tables as unregistered.
+    """
+    from connectors.keboola.storage_api import normalize_source_table
+    from src.repositories import table_registry_repo
+
+    # Scan comment-masked SQL: DuckDB treats `/* … */` as insignificant
+    # whitespace (`SELECT * FROM s/*x*/.orders` parses and runs), but
+    # `qualified_path_re` only matches literal whitespace between segments, so
+    # a raw-text scan would miss `kbc/*x*/."bucket"."table"` while the ATTACHed
+    # catalog served it — the exact read this gate exists to refuse. Masking
+    # preserves offsets and never touches quoted identifiers, so the match
+    # groups still carry the real bucket/table names. Same reasoning (and the
+    # same helper) as `_assert_no_ungranted_catalog_ref`'s layer-(a) scan.
+    scan_sql = _mask_comments_for_path_scan(sql)
+    if not KBC_PATH.search(scan_sql):
+        return None
+
+    repo = table_registry_repo()
+    is_admin = _caller_is_unrestricted_admin(user, sys_conn)
+    accessible_set = set(allowed) if allowed is not None else None
+    rows = repo.list_by_source("keboola")
+
+    def _matches(row: dict, bucket_l: str, table_l: str) -> bool:
+        row_bucket = (row.get("bucket") or "").lower()
+        if row_bucket != bucket_l:
+            return False
+        bare = normalize_source_table(row_bucket, (row.get("source_table") or "").lower())
+        return bare == table_l
+
+    for m in KBC_PATH.finditer(scan_sql):
+        bucket_raw = m.group(1).strip('"')
+        table_raw = m.group(2).strip('"')
+        bucket_l, table_l = bucket_raw.lower(), table_raw.lower()
+        path = f"kbc.{quote_ident(bucket_raw)}.{quote_ident(table_raw)}"
+        row = next((r for r in rows if _matches(r, bucket_l, table_l)), None)
+        if row is None:
+            return {
+                "reason": "kbc_path_not_registered",
+                "path": path,
+                "hint": (
+                    "Direct Keboola paths must point to a registered table. "
+                    "Register via `agnes admin register-table` or use the registered name from `agnes catalog`."
+                ),
+            }
+        if not is_admin:
+            if accessible_set is None or row["id"] not in accessible_set:
+                return {
+                    "reason": "kbc_path_access_denied",
+                    "path": path,
+                    "registered_as": row["name"],
+                }
+            policied = next(
+                (r for r in rows if r.get("access_policy_sql") and _matches(r, bucket_l, table_l)),
+                None,
+            )
+            if policied is not None:
+                return {
+                    "reason": "kbc_path_policied",
+                    "path": path,
+                    "registered_as": policied["name"],
+                    "hint": (
+                        "This Keboola table carries an access policy, which is "
+                        f"enforced under its registered name. Query {policied['name']!r} "
+                        "instead of the direct kbc.* path."
                     ),
                 }
     return None
@@ -4299,6 +4453,13 @@ def run_remote_select_to_arrow(conn, user, sql, bq, quota, *, policy_info: dict 
         blocked_sf_path = _sf_guardrail_inputs(sql, sql_lower, conn, user, allowed)
         if blocked_sf_path is not None:
             raise HTTPException(status_code=403, detail=blocked_sf_path)
+
+        # Keboola direct-path guard (#1492) — the `kbc` catalog is re-ATTACHed
+        # on the same read-only analytics connection, for the same reason as
+        # `sf` above, and `resolve_single_engine` does not know Keboola either.
+        blocked_kbc_path = _kbc_guardrail_inputs(sql, sql_lower, conn, user, allowed)
+        if blocked_kbc_path is not None:
+            raise HTTPException(status_code=403, detail=blocked_kbc_path)
 
         # See _identity_for_audit — a restricted principal has no ".get".
         _audit_uid, _audit_email = _identity_for_audit(user)
