@@ -6,6 +6,12 @@ from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
 
 logger = logging.getLogger(__name__)
 
+# Every value ``client_kind_from_user`` / ``src.audit_context.set_client_kind``
+# may produce, and every surface a caller can stamp explicitly (F0 —
+# audit-full-coverage plan, Task 1). Kept as the single source of truth so a
+# new surface doesn't invent its own ad-hoc string.
+CLIENT_KINDS = ("web", "cli", "mcp", "slack", "telegram", "agent", "broker", "scheduler")
+
 
 def log_safe(**kwargs) -> None:
     """``audit_repo().log(**kwargs)``, never raising.
@@ -72,17 +78,23 @@ def classify_result(value: "str | None") -> str:
 
 
 def client_kind_from_user(user) -> str:
-    """Detect CLI vs web vs scheduler from the auth state.
+    """Detect CLI vs web vs mcp vs scheduler from the auth state.
 
     Order of precedence:
     1. scheduler user → 'scheduler'
-    2. PAT-authenticated (token_type='pat' set by get_current_user), or the
+    2. an MCP-OAuth session JWT (token_type='mcp_oauth', stamped by
+       ``app.auth.pat_resolver.resolve_token_to_user`` when the JWT's
+       ``scope`` claim is ``mcp-oauth`` — see
+       ``app.auth.mcp_oauth.AgnesMCPOAuthProvider``'s ``exchange_*`` mints)
+       → 'mcp'. Checked before the PAT check below since an MCP connector
+       token is not a PAT and must not be misclassified as one.
+    3. PAT-authenticated (token_type='pat' set by get_current_user), or the
        X-StorageApi-Token header credential (token_type='keboola_token',
        Task 7) → 'cli'. Both are non-interactive, programmatic credentials —
        an audit trail that read the header path as an interactive browser
        session ('web') would misrepresent a stack credential as a human
        clicking through the UI.
-    3. anything else → 'web'
+    4. anything else → 'web'
 
     ``user`` is a plain dict for almost every caller, but a restricted
     principal (``SessionPrincipal`` / ``AgentPrincipal`` — co-session or
@@ -97,6 +109,8 @@ def client_kind_from_user(user) -> str:
         return "web"
     if user.get("email") == SCHEDULER_USER_EMAIL:
         return "scheduler"
+    if user.get("token_type") == "mcp_oauth":
+        return "mcp"
     if user.get("token_type") in ("pat", "keboola_token"):
         return "cli"
     return "web"
