@@ -22,7 +22,7 @@ correct for both populations — a fresh instance that ran the corrected
 gains exactly its missing edge-anchor rows. No new visibility is granted
 that the corrected 0084 would not already have granted on a fresh install.
 
-Revision ID: 0085_fact_alias_sources_edge_backfill
+Revision ID: 0085_alias_edge_backfill
 Revises: 0084_fact_alias_sources
 """
 
@@ -31,7 +31,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0085_fact_alias_sources_edge_backfill"
+revision: str = "0085_alias_edge_backfill"
 down_revision: Union[str, None] = "0084_fact_alias_sources"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
