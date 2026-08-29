@@ -1173,6 +1173,8 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
 - /api/admin/sharepoint/connections/{connection_id}/certificate
+- /api/admin/sharepoint/connections/{connection_id}/extract
+- /api/admin/sharepoint/extraction/run-due
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1249,6 +1251,30 @@ connection presents (opaque provider auth error), and a certificate
 expiring silently. Never returns the private key. No certificate configured
 or an unparseable one is a typed absence — `{"certificate": null, "reason":
 "..."}` — not an error status.
+
+**Extraction enqueue wiring (TCRD-226).** `POST …/extract` is a one-off
+admin trigger for the existing `corpus-extraction` job kind
+(`app/worker/kinds.py::_run_corpus_extraction`) — enqueues
+`{"connection_id": connection_id}` and returns `202
+{"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
+any other work; refuses cleanly (never a job that fails 30 minutes later in
+a worker) with `409 extraction_disabled` (`extraction.enabled` is false) or
+`409 extraction_producer_not_configured` (no `extraction.producer.command`/
+`.module` set); a run already queued/running for the same connection is
+`409 extraction_already_running` — deduped on a stable per-connection
+idempotency key shared with the sweep below.
+
+`POST /api/admin/sharepoint/extraction/run-due` is the scheduler-driven
+sweep: fires `corpus-extraction` for every SharePoint connection whose
+cadence (`extraction.schedule`, a single instance-wide setting in the
+`extraction:` config block, applied independently to each connection's own
+last-run stamp) says it is due — same shape as `POST /api/v1/agents/run-due`
+(walk + per-row due-check + enqueue into an existing job kind, no second
+scheduling mechanism). Scheduler row `extraction-run-due` in
+`services/scheduler/__main__.py`, registered only when `extraction.schedule`
+is configured (absent/empty = off). A clean, typed no-op (`{"dispatched":
+[], "count": 0, "skipped": true, "reason": ...}`), never an error, when the
+feature isn't usable or no schedule is configured.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
