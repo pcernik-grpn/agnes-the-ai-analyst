@@ -679,6 +679,17 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/upgrade-freeze": (
+        "per-instance auto-upgrade freeze (TCRD-238) — deliberately never "
+        "MCP-exposed per the 'operator security-posture' standing exemption "
+        "in CONTRIBUTING.md: an agent-invokable tool that can suspend a "
+        "fleet's upgrade path (and therefore its security patching) is a "
+        "denial-of-patching seam, not a convenience. No CLI surface either: "
+        "the consumer is the host's own cron tick reading a marker on the "
+        "state disk, and the human who sets it is the operator already in "
+        "/admin before a demo — an `agnes admin` verb would be a third way "
+        "to write one file, with no analyst workflow behind it"
+    ),
     "/api/admin/sso/config": (
         "external SSO login config (design 2026-08-28) — CLI-reachable via "
         "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
