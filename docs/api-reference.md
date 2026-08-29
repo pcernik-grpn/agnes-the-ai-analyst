@@ -1650,6 +1650,10 @@ is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
 must be a substring of one chunk of the evidencing document's extracted
 text), union vs `full_documents` replace mode, alias/edge resolution,
+a `documents[]` entry's OPTIONAL `source_url` (§8/O7, e.g. the crawler's
+Graph `webUrl`) persisted onto `corpus_file_sources` for the citation's
+"Open in source" link — validated https-only/length-capped, silently
+dropped (never rejects the surrounding claim) when absent or invalid,
 `wrong`-correction re-attachment across a subject's delete-then-recreate,
 and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
 `review_items` mixes two self-describing shapes (a `kind` discriminator on

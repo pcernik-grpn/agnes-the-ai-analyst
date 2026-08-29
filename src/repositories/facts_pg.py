@@ -47,6 +47,7 @@ import json
 import secrets
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -1902,6 +1903,7 @@ class FactsPgRepository:
                             source_stable_id=stable_id,
                             source_doc_id=doc_id,
                             source_sha256=doc.get("sha256") or None,
+                            source_url=_validate_source_url(doc.get("source_url")),
                         )
                     # A path-only match (no `stable_id`) never gets a
                     # `corpus_file_sources` row above — this direct write is
@@ -2569,6 +2571,34 @@ class FactsPgRepository:
             },
         )
         return new_id
+
+
+# O7 (spec §8/§8.1): a citation deep link the caller renders as a clickable
+# href — never dialed by Agnes itself (the canonical-source contract). This
+# is display-safety validation, not a reachability check: https-only blocks
+# `javascript:`/`data:`/plain `http:` outright, and a length cap bounds an
+# otherwise-unbounded producer string before it reaches storage.
+_MAX_SOURCE_URL_LEN = 2048
+
+
+def _validate_source_url(value: Any) -> Optional[str]:
+    """Best-effort validation of a producer-supplied ``source_url`` (spec
+    §8, O7). Returns ``None`` for anything absent, oversized, or not an
+    ``https`` URL with a host — same tolerant-input contract as
+    :func:`_parse_document_date`: an invalid value is dropped silently, the
+    surrounding document/claims still ingest, never raises."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s or len(s) > _MAX_SOURCE_URL_LEN:
+        return None
+    try:
+        parsed = urlsplit(s)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        return None
+    return s
 
 
 def _parse_document_date(value: Any) -> Optional[date]:
