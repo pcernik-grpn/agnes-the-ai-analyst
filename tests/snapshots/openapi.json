@@ -29512,7 +29512,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/tree": {
       "get": {
-        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). ``drive_id`` -> the drive's root children.\n``drive_id`` + ``item_id`` -> that folder's own children (TCRD-240:\nsubfolder browsing at any depth \u2014 ``item_id`` is the previous call's own\nitem id, never a path, and is structurally validated before it reaches\na Graph URL).",
+        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). ``drive_id`` -> the drive's root children.\n``drive_id`` + ``item_id`` -> that folder's own children (TCRD-240:\nsubfolder browsing at any depth \u2014 ``item_id`` is the previous call's own\nitem id, never a path, and is structurally validated before it reaches\na Graph URL).\n\n``with_permissions=1`` (default off) additionally probes each listed\nFOLDER for ``hasUniqueRoleAssignments`` \u2014 an ADVISORY-ONLY signal\n(Decision #2: Agnes never derives or enforces anything from a\nSharePoint ACL; see :func:`connectors.sharepoint.graph_client.\nprobe_unique_permissions`) \u2014 and adds ``unique_permissions:\ntrue|false|null`` to each folder item. Off by default so plain browsing\nnever pays for it; batched and bounded\n(:data:`_MAX_PERMISSION_PROBE_ITEMS`) when on, and a probe failure never\nfails the browse itself \u2014 affected folders just come back ``null``\n(\"unknown\").",
         "operationId": "browse_tree_api_admin_sharepoint_connections__connection_id__tree_get",
         "parameters": [
           {
@@ -29573,6 +29573,16 @@
             }
           },
           {
+            "in": "query",
+            "name": "with_permissions",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "With Permissions",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -29623,7 +29633,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/tree/search": {
       "get": {
-        "description": "Bounded breadth-first folder search (TCRD-240) \u2014 the server-side\nstand-in for Graph's own ``/search``, which silently under-returns\nunder app-only auth (``connectors.sharepoint.graph_client`` module\ndocstring). Never a single call: it walks ``.../root/children`` and\n``.../items/{id}/children`` the same way the tree browser does, capped\nby ``max_depth``/``max_visited`` \u2014 CLAMPED to their caps rather than\nrejected, so asking for more than the server allows still returns the\nbest bounded answer instead of a 422.\n\nRoot: ``drive_id`` + ``item_id`` scopes to that folder's subtree;\n``drive_id`` alone scopes to the whole drive; neither given searches\nevery drive of every reachable site. ``item_id`` without ``drive_id``\nis rejected \u2014 there is no drive to resolve it against.\n\nResponse: ``{matches: [{item_id, drive_id, display_path}], visited,\ntruncated}``. ``truncated`` is ``True`` whenever a cap is what stopped\nthe walk \u2014 never a silently partial result.",
+        "description": "Bounded breadth-first folder search (TCRD-240) \u2014 the server-side\nstand-in for Graph's own ``/search``, which silently under-returns\nunder app-only auth (``connectors.sharepoint.graph_client`` module\ndocstring). Never a single call: it walks ``.../root/children`` and\n``.../items/{id}/children`` the same way the tree browser does, capped\nby ``max_depth``/``max_visited`` \u2014 CLAMPED to their caps\n(:data:`_SEARCH_MAX_DEPTH_CAP` / :data:`_SEARCH_MAX_VISITED_CAP`) rather\nthan rejected, so asking for more than the server allows still returns\nthe best bounded answer instead of a 422.\n\nRoot: ``drive_id`` + ``item_id`` scopes to that folder's subtree;\n``drive_id`` alone scopes to the whole drive; neither given searches\nevery drive of every reachable site. ``item_id`` without ``drive_id``\nis rejected \u2014 there is no drive to resolve it against.\n\nResponse: ``{matches: [{item_id, drive_id, display_path}], visited,\ntruncated, hint}``. ``truncated`` is ``True`` whenever a cap is what\nstopped the walk \u2014 never a silently partial result; ``visited`` is how\nmany \"list children\" calls it took to get there; ``hint`` is a short,\nactionable string (scope the search, narrow the pattern) when\n``truncated`` is ``True``, else ``null``.",
         "operationId": "search_tree_api_admin_sharepoint_connections__connection_id__tree_search_get",
         "parameters": [
           {
@@ -29707,7 +29717,7 @@
             "name": "max_visited",
             "required": false,
             "schema": {
-              "default": 500,
+              "default": 2000,
               "title": "Max Visited",
               "type": "integer"
             }
