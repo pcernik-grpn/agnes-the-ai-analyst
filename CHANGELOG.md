@@ -201,6 +201,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `docs/RELEASING.md` for the full ritual and the train-driver operating
   rule.
 
+- **SharePoint source card: humanized rejection rows, a source-type-aware Actions menu, and one-click scope management** (TCRD-240/241 live-use follow-up). The "Last run" drawer no longer shows a bare rejection row like `6a8e0bc93c07c56a — verbatim_gate_failed` — the doc_id resolves (server-side, via `corpus_file_sources`) to the corpus file's name and collection, the raw sha16 is demoted to a tooltip, duplicate `(doc_id, reason)` rows collapse into one with a "N×" count badge, and known reason slugs (`verbatim_gate_failed`, `unresolved_doc_id`, `ambiguous_cross_collection_doc_id`) get a plain-language subline; an unknown slug still shows verbatim, never hidden. The "Identity matching" row is rephrased as a sharing-state sentence ("all scope collections have a group" / "N collections have no group — only admins see them"). The Actions menu is now source-type-aware: a SharePoint connection gets its own verb set (Manage scopes…, Test connection, Update certificate…, Delete source) instead of the meaningless-for-SharePoint Keboola items (Add tables, Rotate storage token, Semantic-layer token, chat tools, Make default project); its own "Test connection" checks the certificate + a live Graph tree call instead of Keboola's token-verify endpoint. A new "Manage scopes" button sits directly on the collapsed card next to Actions, and the expanded card lists each confirmed scope as a clickable row — both open the connect wizard bound to that connection (never a duplicate), landing on the scope step or, for a specific scope row, the share step with that row highlighted (a stored scope carries no site/drive id to drive the tree browser to). The wizard's own "Continue an existing connection" picker pre-selects the sole option when only one connection exists.
 - **The SharePoint wizard and source card no longer render "anonymized" from the checkbox alone.** `anonymize=true` on a scope is a *request*; the badge only reads "anonymized" (ok tone) once the latest persisted ingest run actually *declares* that collection anonymized (`anonymization_declared`, new field on `GET /connections/{id}/scopes`) — otherwise it reads "anonymization requested" (warn tone). Applies to the connect wizard's step-2 tree badge, the step-3 share preview, and a new "Anonymization" row on the `/admin/data-sources` source card.
 - **Vocabulary pass (D5, v1): the same concept now has one name across UI,
   CLI and MCP help text — the old name keeps working as a deprecated
@@ -735,6 +736,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 - **The fact-graph search API silently ignored an unrecognized request field instead of rejecting it.** `POST /api/facts/search` and `POST /api/facts/neighbors` now reject an unknown field with `422` (`extra="forbid"` on both request models) rather than pydantic's default of silently dropping it — a caller that (reasonably) guessed at an undocumented `q` parameter previously got back an unfiltered, id-ordered dump with no error, which is exactly the shape of a convincing wrong answer.
+- **The SharePoint source card no longer shows "(no connection URL)".** The
+  generic card subtitle rendered a connection's `stack_url`/host, which a
+  SharePoint connection has none of (Graph auth is tenant + app
+  registration, not a host) — every SharePoint card read as broken. It now
+  shows the tenant (shortened GUID) and a scope summary, e.g. `a1b2c3d4… ·
+  2 scopes · Communication site`, or `N sites` when the selected scopes span
+  more than one site.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written

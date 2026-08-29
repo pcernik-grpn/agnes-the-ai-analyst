@@ -57,6 +57,34 @@ class CorpusFileSourcesPgRepository:
             )
         return dict(row) if row else None
 
+    def get_by_source_doc_id(self, source_doc_id: str) -> Optional[Dict[str, Any]]:
+        """Look up the mapping row for a producer's ``source_doc_id`` (the
+        crawler's ``sha256[:16]`` citation key), regardless of which
+        collection it currently maps into.
+
+        Read-only display helper for the source card's "Last run" drawer
+        (TCRD-240/241 live-use feedback: a bare sha16 "told nobody
+        anything") — mirrors the arbitrary ``LIMIT 1`` semantics the ingest
+        write path itself already resolves through (``facts_pg.py``'s
+        ``_resolve_doc``): a ``source_doc_id`` is not schema-guaranteed
+        unique across collections, only ``(corpus_id, source_stable_id)``
+        is, so a doc_id that somehow landed in two collections resolves to
+        whichever row ``LIMIT 1`` picks. Never used for a write decision.
+        """
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    sa.text(
+                        "SELECT corpus_file_id, corpus_id FROM corpus_file_sources "
+                        "WHERE source_doc_id = :doc_id LIMIT 1"
+                    ),
+                    {"doc_id": source_doc_id},
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row else None
+
     def upsert(
         self,
         *,
