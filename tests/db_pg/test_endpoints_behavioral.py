@@ -1396,6 +1396,7 @@ class TestFactsReadSurfaceSmoke:
         "POST /api/facts/neighbors",
         "GET /api/facts/{subject_id}/claims",
         "GET /api/facts/type-map",
+        "GET /api/facts/facets",
     }
 
     def test_flag_off_404s_every_read_route(self, seeded_app_both):
@@ -1407,6 +1408,7 @@ class TestFactsReadSurfaceSmoke:
         assert client.post("/api/facts/neighbors", json={"subject_id": "f_x"}, headers=headers).status_code == 404
         assert client.get("/api/facts/f_x/claims", headers=headers).status_code == 404
         assert client.get("/api/facts/type-map", headers=headers).status_code == 404
+        assert client.get("/api/facts/facets", headers=headers).status_code == 404
 
     def test_neighbors_requires_subject_id_on_both_backends(self, seeded_app_both, monkeypatch):
         """422 identically on both backends — Pydantic validation runs
@@ -1485,6 +1487,14 @@ class TestFactsReadSurfaceSmoke:
         counts = {row["type"]: row["count"] for row in tm["types"]}
         assert counts.get("engagement") == 1, tm
         assert tm["total"] == sum(counts.values())
+
+        # Facets read the same graph from the other direction: the client the
+        # engagement is filed under, counted by DOCUMENTS rather than subjects.
+        r = client.get("/api/facts/facets?types=engagement", headers=headers)
+        assert r.status_code == 200, r.text
+        vals = r.json()["facets"]["engagement"]
+        assert [v["subject_id"] for v in vals] == [fact_id]
+        assert vals[0]["document_count"] == 1
 
 
 # ---------------------------------------------------------------------------

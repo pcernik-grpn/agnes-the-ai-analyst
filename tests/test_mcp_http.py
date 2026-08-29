@@ -334,6 +334,7 @@ class TestToolRegistration:
             # `agnes facts search/neighbors/claims`.
             "fact_search",
             "fact_type_map",
+            "fact_facets",
             "fact_neighbors",
             "fact_claims",
             # Node-type counts for the Library's Knowledge tab (TCRD-250).

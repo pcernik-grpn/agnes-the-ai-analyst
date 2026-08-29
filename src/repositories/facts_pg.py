@@ -1376,6 +1376,93 @@ class FactsPgRepository:
             rows = conn.execute(sql, params).mappings().all()
         return {r["type"]: int(r["n"]) for r in rows}
 
+    def facet_values(
+        self, caller, *, types: List[str], limit_per_type: int = 50
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Filterable entity values per type, with how many DOCUMENTS each
+        one is evidenced by — the Library's entity facets (spec §13.2
+        "Library", TCRD-250 piece 4).
+
+        This is what "filter by tags" should have meant here: the vocabulary
+        the extraction pass already produces (client, industry, service
+        offering, document type), rather than tags nobody maintains.
+
+        Same visibility gate as :meth:`count_visible_facts_by_type` — shared
+        via ``all_collections=True``, never restated — so a facet lists only
+        subjects this caller could reach through ``search(type=...)``.
+
+        Two deliberate conservatisms, both about not leaking a count:
+
+        * The document tally counts only claims whose collection the caller
+          can READ, even for a subject carrying a ``revealed`` correction.
+          A revealed correction reveals the SUBJECT, not the geography of
+          its evidence (spec §4) — counting its unreadable documents would
+          report how many files exist in a collection the caller cannot
+          open.
+        * A subject whose readable document count is 0 is still listed when
+          it is visible, because visibility may come from an incident edge
+          (endpoint evidence). Its count is an honest 0, not an omission —
+          the caller CAN reach the subject, just not any document naming it.
+
+        ``limit_per_type`` caps each facet's value list; a facet menu is a
+        menu, not a dump.
+        """
+        if not types:
+            return {}
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        vis_claims = self._visibility_predicate("c.corpus_id", is_admin)
+        alias_readable = self._alias_readable_sql(
+            revealed_expr="fa.fact_id IN (SELECT subject_id FROM revealed_ids)", is_admin=is_admin
+        )
+        params: Dict[str, Any] = {"types": list(types)}
+        if not is_admin:
+            params["readable"] = list(readable)
+        sql = sa.text(
+            f"""
+            WITH {cte},
+            readable_claims AS (
+                SELECT c.fact_id, c.corpus_file_id
+                FROM claims c
+                JOIN visible v ON v.subject_id = c.fact_id
+                WHERE {vis_claims}
+            ),
+            labels AS (
+                SELECT fa.fact_id, MIN(fa.natural_key) AS label
+                FROM fact_aliases fa
+                WHERE fa.fact_id IN (SELECT subject_id FROM visible)
+                  AND {alias_readable}
+                GROUP BY fa.fact_id
+            )
+            SELECT f.type AS type, v.subject_id AS subject_id,
+                   l.label AS label,
+                   COUNT(DISTINCT rc.corpus_file_id) AS n
+            FROM visible v
+            JOIN facts f ON f.id = v.subject_id
+            LEFT JOIN readable_claims rc ON rc.fact_id = v.subject_id
+            LEFT JOIN labels l ON l.fact_id = v.subject_id
+            WHERE f.type = ANY(:types)
+            GROUP BY f.type, v.subject_id, l.label
+            ORDER BY f.type, COUNT(DISTINCT rc.corpus_file_id) DESC, v.subject_id
+            """
+        )
+        out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
+        with self._engine.connect() as conn:
+            for r in conn.execute(sql, params).mappings():
+                bucket = out.setdefault(r["type"], [])
+                if len(bucket) >= limit_per_type:
+                    continue
+                bucket.append(
+                    {
+                        "subject_id": r["subject_id"],
+                        "label": r["label"] or r["subject_id"],
+                        "document_count": int(r["n"]),
+                    }
+                )
+        return out
+
     def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
         """Caller-scoped count of facts evidenced by ``corpus_id`` — the
         Library collection card's "M facts" number (spec §13.2 "Library").

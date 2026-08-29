@@ -1763,6 +1763,18 @@ Corrections management
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
 
+`GET /api/facts/facets` answers "what can I filter documents by" —
+`{"facets": {type: [{"subject_id", "label", "document_count"}]}}`, defaulting
+to `client`, `industry`, `service_offering` and `doc_type`. The vocabulary
+comes from the extraction pass rather than hand-entered tags, so it is
+maintained by ingestion. Same gate as `search()`; `document_count` tallies
+only documents in collections the caller can READ, and deliberately does not
+tally a `revealed` subject's unreadable evidence — a revealed correction
+reveals the subject, not the geography of its evidence (§4), and counting
+those files would report how many sit in a collection the caller cannot
+open. Triple-surface with `agnes facts facets` and the `fact_facets` MCP
+tool.
+
 `GET /api/facts/type-map` answers "what is in the graph at all" —
 `{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
 through the SAME visibility gate as `search()` with no `type` (shared via
@@ -1786,6 +1798,7 @@ not an analyst query (no CLI/MCP analogue).
 
 - /api/facts/search
 - /api/facts/type-map
+- /api/facts/facets
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
