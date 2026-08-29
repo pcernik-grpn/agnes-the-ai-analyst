@@ -9,6 +9,15 @@ ingest — that lands in the write-path follow-up task).
 
 Every S-id below is the literal acceptance test named in spec §15.1;
 docstrings restate the failure mode.
+
+Every visibility/filtering assertion here proves itself through a non-admin
+caller (a plain dict user with a deliberately withheld or scoped grant, or a
+restricted ``AgentPrincipal``) — never through the ``Admin`` god-mode
+short-circuit alone. An admin-sees-everything case is a legitimate, separate
+sibling assertion (e.g. ``test_count_visible_edges_for_collections_admin_
+sees_everything``), not a substitute for the caller-scoped one — see
+CONTRIBUTING.md's "Testing conventions" for why (this module is the reason
+that section exists).
 """
 
 from __future__ import annotations
