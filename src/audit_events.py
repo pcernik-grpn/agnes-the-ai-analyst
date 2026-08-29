@@ -300,6 +300,13 @@ CATALOG: dict[str, AuditEvent] = {
         "Generic fallback row written by AuditFallbackMiddleware for a mutating "
         "request whose handler wrote no audit row of its own.",
     ),
+    # Task 3 (F2a — auth remainder: token reads, project import, posture flips)
+    "token.list": AuditEvent("token.list", "read", "A personal access token list/detail was read (own/one/admin_all)."),
+    "keboola.projects_import": AuditEvent(
+        "keboola.projects_import",
+        "mutation",
+        "Selected discovered Keboola projects were connected (select-mode multi-project login).",
+    ),
 }
 
 

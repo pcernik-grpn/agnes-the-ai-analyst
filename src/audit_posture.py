@@ -296,7 +296,7 @@ POSTURE: dict[str, str] = {
     "POST /api/kai/sessions": "fallback",
     "POST /api/kai/tickets": "fallback",
     # -- app.api.keboola_login_projects ----------------------------------------
-    "POST /api/auth/keboola/projects": "fallback",
+    "POST /api/auth/keboola/projects": "keboola.projects_import",
     # -- app.api.keboola_semantic_layer_refresh --------------------------------
     "POST /api/admin/run-keboola-semantic-layer-refresh": "fallback",
     # -- app.api.knowledge_digests ---------------------------------------------
