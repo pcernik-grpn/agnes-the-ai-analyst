@@ -388,10 +388,7 @@ def test_library_required_grant_is_locked_in_stack(seeded_app):
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Mandated Package")
-    # The pill states the TIER. A granted package is queryable the moment it is
-    # granted (auto-membership), so "In stack" described a membership the caller
-    # could neither create nor drop; "Required by your admin" is the fact.
-    assert "Required by your admin" in row
+    assert "In stack" in row
     assert "lib-instack--locked" in row  # locked → lock glyph + info tint
     assert LOCKED_TOOLTIP in row
     # Not a button, and not addable — nothing to click either way.
@@ -424,7 +421,7 @@ def test_library_available_grant_reads_in_stack_and_offers_no_toggle(seeded_app,
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Offered Package")
-    assert "Granted to your group" in row
+    assert "In stack" in row
     assert "lib-instack--fixed" in row
     assert "lib-instack--locked" in row  # not the removable pill's rest state
     assert "data-add-to-stack" not in row
@@ -483,9 +480,7 @@ def test_library_available_grant_classic_is_not_claimed_in_stack(seeded_app, mon
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Classic Offered Package")
     assert 'data-stack="in_stack"' in row
-    # Classic (opt-in) mode: the caller subscribed, so this is a real local copy
-    # they can drop again.
-    assert "Local copy" in row
+    assert "In stack" in row
 
 
 def test_library_lists_granted_curated_plugins(seeded_app):

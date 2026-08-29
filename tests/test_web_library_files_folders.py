@@ -212,15 +212,7 @@ def test_grid_view_keeps_the_sticky_header_and_veils_it(seeded_app):
     grid_on = ":has(> .fbar-grid:not([hidden]))"
     # ONE sticky rule, both views — grid never unpins the band.
     assert ".lib-band { position: sticky; top: 0;" in text
-    # Nothing unpins the BAND. (The blanket ban this used to be also caught the
-    # narrow-viewport rule that unpins the column HEADER, which is a different
-    # element solving a different problem: below the shell's breakpoint the
-    # scrollport that header resolves against changes and it lands a band-height
-    # below where it belongs, covering the first row of its own group.)
-    for rule in css.split("}"):
-        if "position: static" in rule:
-            assert ".lib-band" not in rule, f"the band must never be unpinned: {rule.strip()}"
-            assert "thead th" in rule, f"unexpected `position: static`: {rule.strip()}"
+    assert "position: static" not in css
     # Both gaps sit inside the grid, so the group's content box runs right up to
     # the next group's band and the handoff is exact.
     assert f".lib-group{grid_on} > .fbar-grid" in text
@@ -260,27 +252,24 @@ def test_group_header_carries_label_count_and_hint(seeded_app):
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
     head = re.search(r'<button type="button" class="fbar-grouptoggle".*?</button>', text, re.S).group(0)
     assert 'data-sec-toggle="files"' in head  # keyed, so both hosts fold together
-    # Rendered OPEN — the page's default since the tabs landed. A tab holds two
-    # or three bands, so folding them produced three grey bars and an empty
-    # screen; the script re-folds whatever the caller has stored, and rendering
-    # folded would now flash an empty list first.
-    assert 'aria-expanded="true"' in head
+    # Rendered folded — the page's default. The script re-opens whatever the
+    # caller has stored; rendering open would flash the unfolded list first.
+    assert 'aria-expanded="false"' in head
     assert "fbar-group__caret" in head
     assert "lib-sec-icon" in head  # the per-type glyph
     assert ">Artefacts<" in head
     assert "data-sec-count" in head
-    assert "Files you upload and the outputs your agent generates." in head
+    assert "Files you upload, outputs your agent generates, and your hosted data apps." in head
 
 
-def test_groups_render_open_in_a_fixed_order(seeded_app):
-    """Every group arrives OPEN, and they arrive in one canonical order.
+def test_groups_render_folded_in_a_fixed_order(seeded_app):
+    """Every group arrives FOLDED, and they arrive in one canonical order.
 
-    The order still runs outward from what an agent is built on — governed
-    data, then the capabilities acting on it, then the caller's own files and
-    the apps built on them, with curated Memory last — but it is now the order
-    of the ROWS a caller reads, not of a folded index. Folding was the whole
-    point of the ordering while one flat list carried eight kinds; a tab holds
-    two or three, and folding those left the reader an empty screen.
+    Folded is the whole point of the ordering: the first screen is the list of
+    sections itself, so their sequence is what a caller reads on arrival rather
+    than an incidental detail below the fold. The order runs outward from what
+    an agent is built on — governed data, then the capabilities acting on it,
+    then the caller's own files, with curated Memory last.
 
     Asserted as a SUBSEQUENCE so the test doesn't depend on which kinds the
     fixture happens to seed: whatever renders must appear in this relative
@@ -292,20 +281,16 @@ def test_groups_render_open_in_a_fixed_order(seeded_app):
     _folder(seeded_app, "Ordered Deck", tok)
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
 
-    canonical = ["data_package", "plugin", "skill", "agent", "recipe", "files", "data_app", "memory_domain"]
+    canonical = ["data_package", "plugin", "skill", "agent", "recipe", "files", "memory_domain"]
     rendered = re.findall(r'<section class="fbar-group lib-group[^"]*" data-lib-sec="([^"]+)"', text)
     assert rendered, "no groups rendered"
     assert rendered == [k for k in canonical if k in rendered]
 
-    # …and every one of them is open, class and ARIA agreeing.
+    # …and every one of them is folded, class and ARIA agreeing.
     sections = re.findall(r'<section class="(fbar-group lib-group[^"]*)" data-lib-sec=', text)
-    assert all("is-collapsed" not in cls for cls in sections)
+    assert all("is-collapsed" in cls for cls in sections)
     assert text.count('class="fbar-grouptoggle" data-sec-toggle') == len(rendered)
-    # Scoped to the BAND toggles: a folder row inside a band keeps its own
-    # collapsed disclosure, and that one is meant to start shut.
-    band_toggles = re.findall(r'<button type="button" class="fbar-grouptoggle"[^>]*>', text)
-    assert band_toggles
-    assert all('aria-expanded="true"' in b for b in band_toggles)
+    assert 'aria-expanded="true"' not in text.split('<div class="lib-list">', 1)[1]
 
 
 def test_folder_row_is_a_drop_target_and_expands(seeded_app):
