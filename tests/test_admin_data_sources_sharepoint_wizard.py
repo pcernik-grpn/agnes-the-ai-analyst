@@ -108,6 +108,7 @@ class TestStep2MarkupTCRD240:
         assert 'id="spw-search-btn"' in body
         assert 'id="spw-search-results"' in body
         assert 'id="spw-search-truncated"' in body
+        assert 'id="spw-search-skipped"' in body
         for opt in ('"prefix"', '"contains"', '"glob"'):
             assert opt in body
 
@@ -537,6 +538,63 @@ class TestSharePointWizardStep2Behavior:
         )
         assert "20000" in result["text"]
         assert len(result["text"]) > len("Stopped after 20000 folder(s) visited. ")
+
+    def test_skipped_sites_and_folders_are_reported_quietly_alongside_matches(self):
+        """A site/folder this app registration cannot read (TCRD-240 skip
+        hardening) must be visible to the admin, distinct from a real error
+        AND from the truncation banner — matches from the readable sites
+        still render normally."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            document.getElementById("spw-search-q").value = "contract";
+            document.getElementById("spw-search-mode").value = "contains";
+
+            _nextSearchResponse = {
+              matches: [{ item_id: "c1", drive_id: "d1", display_path: "Open Site / Docs / Contracts" }],
+              visited: 3, truncated: false,
+              skipped: [
+                { scope: "site", reason: "forbidden", status_code: 403,
+                  site_id: "s2", site_name: "Blocked Site", drive_id: null, item_id: null, display_path: null },
+              ],
+            };
+            spRunSearch();
+            await _settle();
+            const skipEl = document.getElementById("spw-search-skipped");
+            const truncEl = document.getElementById("spw-search-truncated");
+            const resultsHtml = document.getElementById("spw-search-results").innerHTML;
+
+            process.stdout.write(JSON.stringify({
+              skippedShown: skipEl.style.display === "block",
+              skippedText: skipEl.textContent,
+              truncatedShown: truncEl.style.display === "block",
+              resultsHtml,
+            }));
+            """
+        )
+        assert result["skippedShown"] is True
+        assert "Blocked Site" in result["skippedText"]
+        # Quiet and factual, not an alarm — never labeled "error"/"failed".
+        assert "error" not in result["skippedText"].lower()
+        assert "fail" not in result["skippedText"].lower()
+        # A permission gap is not a cap-truncated walk.
+        assert result["truncatedShown"] is False
+        assert "Open Site / Docs / Contracts" in result["resultsHtml"]
+
+    def test_skipped_notice_is_absent_when_nothing_was_skipped(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            document.getElementById("spw-search-q").value = "contract";
+            document.getElementById("spw-search-mode").value = "contains";
+            _nextSearchResponse = { matches: [], visited: 3, truncated: false, skipped: [] };
+            spRunSearch();
+            await _settle();
+            const skipEl = document.getElementById("spw-search-skipped");
+            process.stdout.write(JSON.stringify({ skippedShown: skipEl.style.display === "block" }));
+            """
+        )
+        assert result["skippedShown"] is False
 
 
 class TestUniquePermissionsBadgeUI:

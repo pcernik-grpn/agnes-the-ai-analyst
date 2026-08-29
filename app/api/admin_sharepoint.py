@@ -607,12 +607,25 @@ async def search_tree(
     every drive of every reachable site. ``item_id`` without ``drive_id``
     is rejected — there is no drive to resolve it against.
 
+    A site or folder the app registration cannot read (Graph 403/404) is
+    skipped, not fatal — app-only permissions are never uniform across a
+    real tenant. It is never silently dropped: see ``skipped`` below.
+
     Response: ``{matches: [{item_id, drive_id, display_path}], visited,
-    truncated, hint}``. ``truncated`` is ``True`` whenever a cap is what
-    stopped the walk — never a silently partial result; ``visited`` is how
-    many "list children" calls it took to get there; ``hint`` is a short,
-    actionable string (scope the search, narrow the pattern) when
-    ``truncated`` is ``True``, else ``null``.
+    truncated, skipped, hint}``.
+
+    - ``truncated`` is ``True`` whenever a cap (``max_depth``/``max_visited``)
+      is what stopped the walk — never a silently partial result.
+    - ``visited`` is how many "list children" calls it took to get there.
+    - ``skipped`` lists every site/folder the walk could not enter for
+      permissions reasons, each as ``{scope: "site"|"folder", reason:
+      "forbidden"|"not_found", status_code, site_id, site_name, drive_id,
+      item_id, display_path}`` — deliberately separate from ``truncated``:
+      a cap and a permission refusal are different facts and call for
+      different admin actions (narrow the search vs. request access).
+    - ``hint`` is a short, actionable string (scope the search, narrow the
+      pattern) when ``truncated`` is ``True``, else ``null`` — unrelated to
+      ``skipped``, which speaks for itself.
     """
     if item_id and not drive_id:
         raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})

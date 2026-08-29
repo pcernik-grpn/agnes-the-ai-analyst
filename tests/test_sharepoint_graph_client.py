@@ -204,6 +204,19 @@ class TestBrowseLevels:
         with pytest.raises(gc.SharePointGraphError, match="403"):
             asyncio.run(gc.list_sites("tok"))
 
+    def test_non_200_error_carries_the_status_code_for_callers_to_classify(self, monkeypatch):
+        """`search_folders` needs to tell "this one site/folder is
+        forbidden, skip it" apart from "the whole call is broken, stop" —
+        that classification reads ``status_code`` off the raised error."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "Forbidden"}})
+
+        _install_transport(monkeypatch, handler)
+        with pytest.raises(gc.SharePointGraphError) as excinfo:
+            asyncio.run(gc.list_sites("tok"))
+        assert excinfo.value.status_code == 403
+
 
 class TestListItemChildren:
     def test_list_item_children(self, monkeypatch):
@@ -286,7 +299,14 @@ class _FakeGraphTree:
     """A tiny in-memory Graph server for :func:`gc.search_folders` tests —
     routes ``/sites``, ``/sites/{id}/drives``, ``/drives/{id}/root/children``
     and ``/drives/{id}/items/{id}/children`` off one hand-built tree, so the
-    BFS walk can be exercised without a live tenant."""
+    BFS walk can be exercised without a live tenant.
+
+    ``fail_drives``/``fail_children`` let a test force one specific site's
+    drive listing (or one specific folder's children listing) to answer with
+    a non-200 status instead of the tree data — the seam that exercises
+    ``search_folders``' skip-vs-propagate classification without a live
+    tenant that actually has an inaccessible site.
+    """
 
     def __init__(self):
         self.sites = [{"id": "s1", "displayName": "Corp Site", "webUrl": "https://x/s1"}]
@@ -294,9 +314,17 @@ class _FakeGraphTree:
         # (drive_id, item_id_or_None) -> Graph `value` list
         self.children: Dict[Any, List[Dict[str, Any]]] = {}
         self.calls: List[str] = []
+        self.fail_drives: Dict[str, int] = {}  # site_id -> status code
+        self.fail_children: Dict[Any, int] = {}  # (drive_id, item_id_or_None) -> status code
 
     def set_children(self, drive_id: str, item_id: Optional[str], items: List[Dict[str, Any]]) -> None:
         self.children[(drive_id, item_id)] = items
+
+    def fail_drives_for(self, site_id: str, status_code: int) -> None:
+        self.fail_drives[site_id] = status_code
+
+    def fail_children_for(self, drive_id: str, item_id: Optional[str], status_code: int) -> None:
+        self.fail_children[(drive_id, item_id)] = status_code
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -305,12 +333,21 @@ class _FakeGraphTree:
             return httpx.Response(200, json={"value": self.sites})
         m = re.match(r"^/v1\.0/sites/([^/]+)/drives$", path)
         if m:
+            status = self.fail_drives.get(m.group(1))
+            if status is not None:
+                return httpx.Response(status, json={"error": {"code": "forbidden-or-not-found"}})
             return httpx.Response(200, json={"value": self.drives.get(m.group(1), [])})
         m = re.match(r"^/v1\.0/drives/([^/]+)/root/children$", path)
         if m:
+            status = self.fail_children.get((m.group(1), None))
+            if status is not None:
+                return httpx.Response(status, json={"error": {"code": "forbidden-or-not-found"}})
             return httpx.Response(200, json={"value": self.children.get((m.group(1), None), [])})
         m = re.match(r"^/v1\.0/drives/([^/]+)/items/([^/]+)/children$", path)
         if m:
+            status = self.fail_children.get((m.group(1), m.group(2)))
+            if status is not None:
+                return httpx.Response(status, json={"error": {"code": "forbidden-or-not-found"}})
             return httpx.Response(200, json={"value": self.children.get((m.group(1), m.group(2)), [])})
         raise AssertionError(f"unexpected path in fake Graph tree: {path}")
 
@@ -424,6 +461,173 @@ class TestSearchFolders:
         assert paths == ["Site One / Docs / Contracts", "Site Two / Docs2 / Contracts EU"]
         drives_hit = {m["drive_id"] for m in result["matches"]}
         assert drives_hit == {"d1", "d2"}
+
+    def test_one_forbidden_site_is_skipped_and_the_others_still_return_matches(self, monkeypatch):
+        """The bug under test: one inaccessible site used to abort the
+        entire "search everywhere" walk (`list_drives` raised, unguarded).
+        It must instead be skipped, with the other reachable sites still
+        searched and their matches returned."""
+        tree = _FakeGraphTree()
+        tree.sites = [
+            {"id": "s1", "displayName": "Site One", "webUrl": "https://x/s1"},
+            {"id": "s2", "displayName": "Blocked Site", "webUrl": "https://x/s2"},
+            {"id": "s3", "displayName": "Site Three", "webUrl": "https://x/s3"},
+        ]
+        tree.drives = {
+            "s1": [{"id": "d1", "name": "Docs", "driveType": "documentLibrary"}],
+            "s3": [{"id": "d3", "name": "Docs3", "driveType": "documentLibrary"}],
+        }
+        tree.set_children("d1", None, [_folder("a1", "Contracts")])
+        tree.set_children("d3", None, [_folder("c1", "Contracts EU")])
+        tree.fail_drives_for("s2", 403)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+
+        paths = sorted(m["display_path"] for m in result["matches"])
+        assert paths == ["Site One / Docs / Contracts", "Site Three / Docs3 / Contracts EU"]
+        assert result["truncated"] is False
+
+    def test_forbidden_site_is_named_in_the_skipped_list(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.sites = [
+            {"id": "s1", "displayName": "Site One", "webUrl": "https://x/s1"},
+            {"id": "s2", "displayName": "Blocked Site", "webUrl": "https://x/s2"},
+        ]
+        tree.drives = {"s1": [{"id": "d1", "name": "Docs", "driveType": "documentLibrary"}]}
+        tree.set_children("d1", None, [_folder("a1", "Contracts")])
+        tree.fail_drives_for("s2", 403)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+
+        assert result["skipped"] == [
+            {
+                "scope": "site",
+                "reason": "forbidden",
+                "status_code": 403,
+                "site_id": "s2",
+                "site_name": "Blocked Site",
+                "drive_id": None,
+                "item_id": None,
+                "display_path": None,
+            }
+        ]
+
+    def test_a_missing_site_404_is_also_skipped_not_propagated(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.sites = [{"id": "s1", "displayName": "Gone Site", "webUrl": "https://x/s1"}]
+        tree.fail_drives_for("s1", 404)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+
+        assert result["matches"] == []
+        assert result["skipped"] == [
+            {
+                "scope": "site",
+                "reason": "not_found",
+                "status_code": 404,
+                "site_id": "s1",
+                "site_name": "Gone Site",
+                "drive_id": None,
+                "item_id": None,
+                "display_path": None,
+            }
+        ]
+
+    def test_a_forbidden_folder_mid_walk_is_skipped_without_losing_earlier_matches(self, monkeypatch):
+        """Worse than a whole-site 403: an inaccessible folder discovered
+        DURING the walk used to blow up a walk that had already found
+        matches, throwing that work away. The match for the forbidden
+        folder itself (found as a child of its parent, before descending
+        into it) and any sibling matches must both survive."""
+        tree = _FakeGraphTree()
+        tree.set_children(
+            "d1",
+            None,
+            [_folder("ok", "Contracts OK"), _folder("blocked", "Contracts Blocked")],
+        )
+        tree.set_children("d1", "ok", [_folder("okx", "Contracts OK sub")])
+        tree.fail_children_for("d1", "blocked", 403)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=5, max_visited=500))
+
+        paths = sorted(m["display_path"] for m in result["matches"])
+        assert paths == ["Contracts Blocked", "Contracts OK", "Contracts OK / Contracts OK sub"]
+        assert result["truncated"] is False
+        assert result["skipped"] == [
+            {
+                "scope": "folder",
+                "reason": "forbidden",
+                "status_code": 403,
+                "site_id": None,
+                "site_name": None,
+                "drive_id": "d1",
+                "item_id": "blocked",
+                "display_path": "Contracts Blocked",
+            }
+        ]
+
+    def test_skipped_permission_gaps_do_not_set_truncated(self, monkeypatch):
+        """`truncated` means a depth/visited CAP stopped the walk short of
+        covering everything reachable — a permission-caused gap is a
+        different fact and must not flip it."""
+        tree = _FakeGraphTree()
+        tree.sites = [
+            {"id": "s1", "displayName": "Site One", "webUrl": "https://x/s1"},
+            {"id": "s2", "displayName": "Blocked Site", "webUrl": "https://x/s2"},
+        ]
+        tree.drives = {"s1": [{"id": "d1", "name": "Docs", "driveType": "documentLibrary"}]}
+        tree.set_children("d1", None, [_folder("a1", "Contracts")])
+        tree.fail_drives_for("s2", 403)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        result = asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+        assert result["truncated"] is False
+        assert len(result["skipped"]) == 1
+
+    def test_unauthorized_401_on_a_site_propagates_instead_of_being_swallowed(self, monkeypatch):
+        """A 401 means the token itself is bad — that breaks the WHOLE
+        search, not just one site. Swallowing it per-site would turn a
+        broken connection into an empty, successful-looking search."""
+        tree = _FakeGraphTree()
+        tree.sites = [{"id": "s1", "displayName": "Site One", "webUrl": "https://x/s1"}]
+        tree.fail_drives_for("s1", 401)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        with pytest.raises(gc.SharePointGraphError) as excinfo:
+            asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+        assert excinfo.value.status_code == 401
+
+    def test_rate_limited_429_on_a_site_propagates(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.sites = [{"id": "s1", "displayName": "Site One", "webUrl": "https://x/s1"}]
+        tree.fail_drives_for("s1", 429)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        with pytest.raises(gc.SharePointGraphError) as excinfo:
+            asyncio.run(gc.search_folders("tok", matcher=matcher, max_depth=5, max_visited=500))
+        assert excinfo.value.status_code == 429
+
+    def test_server_error_500_mid_walk_propagates(self, monkeypatch):
+        tree = _FakeGraphTree()
+        tree.set_children("d1", None, [_folder("a1", "Contracts")])
+        tree.fail_children_for("d1", "a1", 500)
+        _install_transport(monkeypatch, tree.handler)
+
+        matcher = gc.build_folder_matcher("contract", "contains")
+        with pytest.raises(gc.SharePointGraphError) as excinfo:
+            asyncio.run(gc.search_folders("tok", matcher=matcher, drive_id="d1", max_depth=5, max_visited=500))
+        assert excinfo.value.status_code == 500
 
 
 class _FakeGraphBatch:
