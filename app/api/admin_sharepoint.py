@@ -157,6 +157,33 @@ class ConfirmScopeBody(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Keys THIS module writes into a SharePoint connection's ``config`` outside
+#: the generic ``PUT /api/admin/source-connections/{id}`` editor's own
+#: request body: the wizard's confirmed-scope rows (``scopes`` —
+#: :func:`confirm_scope` / :func:`remove_scope`) and the in-Agnes extraction
+#: schedule's own dispatch bookkeeping (``extraction`` —
+#: :func:`_record_extraction_dispatch`, TCRD-226).
+#:
+#: A key earns a place here on ONE test: the server writes it into this
+#: connection's ``config`` and the generic connection-editor FORM never
+#: renders it. ``app/api/admin_source_connections.py::update_connection``
+#: imports this tuple to carry each key forward across an update that omits
+#: it — that endpoint replaces ``config`` wholesale, so without this an
+#: ordinary edit (a rename, a certificate change) silently erases whatever
+#: isn't listed here.
+#:
+#: This is NOT optional bookkeeping — it is a ratcheted list.
+#: ``tests/test_sharepoint_config_carry_forward_ratchet.py`` statically scans
+#: THIS file for every literal key a local writer assigns into the variable
+#: it then passes as ``config=`` to ``source_connections_repo().update(...)``
+#: and fails if that set is not exactly this tuple — so adding a THIRD
+#: server-written key here without adding it to this tuple in the SAME
+#: change fails a test that names the fix, rather than shipping a silent
+#: erasure the way ``scopes`` (2026-08-29 morning) and ``extraction``
+#: (2026-08-29, same day, TCRD-226) both did before this ratchet existed.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction")
+
+
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
     row = source_connections_repo().get(connection_id)
     if row is None or row.get("source_type") != "sharepoint":
@@ -397,6 +424,13 @@ def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
     the schedule would fire must not also queue a second run a tick later.
     """
     config = dict(row.get("config") or {})
+    # Writing a NEW key here (or in any other function in this module)?
+    # Add it to SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS above IN THE SAME
+    # CHANGE — the generic connection editor's carry-forward
+    # (app/api/admin_source_connections.py::update_connection) only
+    # preserves keys listed there, and the ratchet test
+    # (tests/test_sharepoint_config_carry_forward_ratchet.py) will fail
+    # otherwise.
     config["extraction"] = {
         "last_run_at": datetime.now(timezone.utc).isoformat(),
         "last_job_id": job_id,
@@ -679,6 +713,8 @@ async def confirm_scope(
             }
         )
 
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": scopes}
     source_connections_repo().update(connection_id, config=new_config)
 
@@ -724,6 +760,8 @@ async def remove_scope(
     remaining = [s for s in scopes if s.get("source_scope_id") != source_scope_id]
     if len(remaining) == len(scopes):
         raise HTTPException(status_code=404, detail="scope_not_found")
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": remaining}
     source_connections_repo().update(connection_id, config=new_config)
 

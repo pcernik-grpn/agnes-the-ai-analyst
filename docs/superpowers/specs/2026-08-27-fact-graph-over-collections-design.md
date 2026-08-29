@@ -967,6 +967,26 @@ Anonymization is chosen **at source-connect time, per scope** (a column in
 the wizard, §13.2); on a collection detail it is a state plus a named batch
 task ("Anonymize collection…" over N documents), never a toggle.
 
+**Ingest-time enforcement (2026-08-29 hardening, closing a fail-open gap
+found post-#1715):** the producer's `anonymization` declaration on `POST
+/api/facts/ingest` (§7.2) is no longer merely recorded — Agnes now
+**refuses** (`403 anonymization_not_declared`) any batch that documents a
+corpus whose SharePoint scope is anonymize-marked (`config.scopes[]
+.anonymize`) unless that same batch's `anonymization` block declares the
+corpus. This closes the path where an unrelated edit through the generic
+connection editor silently wiped `config.scopes` (server-written, never
+echoed back by that editor's wholesale config replace), which emptied the
+anonymize map, skipped the HMAC-key resolution, raised no error, and let
+the pipeline ship un-anonymized content into a collection an admin believed
+was anonymized — reported as success. Agnes still cannot verify a
+document's CONTENT was anonymized (§9.2's limits stand), but it can no
+longer accept a claim for a marked corpus with zero declaration, and it
+fails **closed** — refuses, `503 anonymization_check_unavailable` — rather
+than accepts, whenever it cannot itself answer "is this corpus marked"
+(e.g. the connections table is unreadable). See
+`app/api/facts.py::_refuse_undeclared_anonymize_marked_corpora` and
+`docs/anonymization.md`.
+
 ---
 
 ## 10. Time

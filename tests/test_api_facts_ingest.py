@@ -229,3 +229,106 @@ def test_ingest_omitted_anonymization_is_fine_pre_pg(facts_client):
     same as every other bare ingest request against the DuckDB backend."""
     r = facts_client["client"].post("/api/facts/ingest", json={}, headers=_auth(facts_client["admin_token"]))
     assert r.status_code == 501, r.text
+
+
+# ---------------------------------------------------------------------------
+# anonymize-fail-closed gate: refuse a batch that carries claims for a
+# corpus whose SharePoint scope is anonymize-marked unless the batch's own
+# `anonymization` block declares it. Runs BEFORE the PG-only `facts_repo()`
+# call, keyed off `source_connections` (a DuckDB<->PG frozen pair) — so the
+# whole gate is provable on the DuckDB backend without a real Postgres.
+# ---------------------------------------------------------------------------
+
+
+def _create_sharepoint_connection(client, admin_token, *, name: str, corpus_id: str, anonymize: bool = True) -> None:
+    r = client.post(
+        "/api/admin/source-connections",
+        json={
+            "name": name,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "tenant-1",
+                "client_id": "client-1",
+                "scopes": [
+                    {
+                        "source_scope_id": "site1!drive1",
+                        "display_path": "Contracts",
+                        "anonymize": anonymize,
+                        "collection_id": corpus_id,
+                    }
+                ],
+            },
+        },
+        headers=_auth(admin_token),
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_ingest_refuses_anonymize_marked_corpus_without_declaration(facts_client):
+    """The report's exact failure mode: a corpus whose SharePoint scope is
+    anonymize=true, ingested with no `anonymization` block at all — refused
+    with a typed reason, itemizing the offending corpus, before the PG-only
+    repo (and therefore any write) is ever reached."""
+    client, token = facts_client["client"], facts_client["admin_token"]
+    _create_sharepoint_connection(client, token, name="sp-gate-1", corpus_id="col_marked")
+
+    r = client.post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_marked", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "anonymization_not_declared"
+    assert detail["corpus_ids"] == ["col_marked"]
+
+
+def test_ingest_accepts_when_declaration_covers_the_corpus(facts_client):
+    """Same shape, but the batch declares the corpus — the gate must let it
+    through to the PG-only repo call (proven by the 501, not a 403)."""
+    client, token = facts_client["client"], facts_client["admin_token"]
+    _create_sharepoint_connection(client, token, name="sp-gate-2", corpus_id="col_declared")
+
+    r = client.post(
+        "/api/facts/ingest",
+        json={
+            "documents": [{"doc_id": "d1", "corpus_id": "col_declared", "path": "f.md"}],
+            "anonymization": {"declared": True, "scopes": {"col_declared": {"docs_anonymized": 1}}},
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_ingest_unmarked_corpus_is_unaffected(facts_client):
+    """No SharePoint connection at all marks this corpus — the gate must be
+    a no-op (proven by the 501 falling through unchanged, exactly like the
+    pre-existing `test_ingest_omitted_anonymization_is_fine_pre_pg`)."""
+    client, token = facts_client["client"], facts_client["admin_token"]
+    r = client.post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_unmarked", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_lookup_failure_refuses_never_falls_through_to_accept(facts_client, monkeypatch):
+    """A broken `source_connections` lookup must not be read as "nothing is
+    marked" — that would silently accept plaintext into a corpus this
+    instance cannot prove is safe. Fails closed: refused, not 501/200."""
+    client, token = facts_client["client"], facts_client["admin_token"]
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("connections table unreadable")
+
+    monkeypatch.setattr("src.repositories.source_connections_repo", _boom)
+
+    r = client.post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_x", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"]["reason"] == "anonymization_check_unavailable"
