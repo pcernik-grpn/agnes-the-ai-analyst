@@ -1286,9 +1286,19 @@ extraction:
   # Producer callback credential (TCRD-226): the producer calls BACK into
   # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
   # its actual work, so the child env ALSO carries AGNES_API_URL (this
-  # instance's own base URL — always set, no secret) and, when
+  # instance's own base URL — resolved from SERVER_URL, falling back to
+  # AGNES_INTERNAL_URL, then to this process's own loopback) and, when
   # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
-  # shared-secret bearer token). This is a DELIBERATE OVER-GRANT, not an
+  # shared-secret bearer token). On a role-split `extraction-worker`
+  # container (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
+  # `extraction-worker` service in docker-compose.yml) that loopback
+  # fallback would be the WORKER's own address, not the instance's real
+  # callback surface — so on that topology the job refuses cleanly instead
+  # ("neither SERVER_URL nor AGNES_INTERNAL_URL configured") unless one of
+  # the two is set explicitly. A single-container ("all-in-one") deployment
+  # is unaffected: there, the producer's parent process IS the app, so the
+  # loopback fallback is correct and no explicit configuration is required.
+  # The token itself is a DELIBERATE OVER-GRANT, not an
   # oversight: presenting that token resolves to a synthetic user in the
   # Admin system group (see app/auth/scheduler_token.py) — god-mode on
   # every RBAC check — while the producer only ever needs to read its own

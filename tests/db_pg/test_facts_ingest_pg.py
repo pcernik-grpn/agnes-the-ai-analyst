@@ -340,6 +340,97 @@ def test_unicode_normalization_is_consistent_between_identity_and_chunk_paths(pg
 
 
 # ---------------------------------------------------------------------------
+# Meaningfulness floor — a substring test alone accepts ANY fragment that
+# happens to occur literally in the text, including one that carries no
+# evidentiary value: a bare file-extension fragment (".pdf") or a lone path
+# separator ("/") pass the plain `quote in text` check whenever the document
+# happens to mention a filename or a date/fraction/URL anywhere. Live finding:
+# both were accepted as claims, `claims_accepted_via_identity == 0`, i.e. via
+# the CONTENT half of the gate, not the identity half.
+# ---------------------------------------------------------------------------
+
+
+def test_verbatim_gate_rejects_a_bare_file_extension_quote(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="See the attached report.pdf for details.")
+    report = repo.ingest_batch(nodes=[_node("engagement:ext", doc_id, ".pdf")])
+    assert report["claims_written"] == 0
+    assert len(report["claims_rejected"]) == 1
+    # Distinct from `verbatim_gate_failed` on purpose (design decision): the
+    # quote WAS found verbatim in the text, so calling this "not found" would
+    # mislead an operator. It failed a different check.
+    assert report["claims_rejected"][0]["reason"] == "quote_not_meaningful"
+
+
+def test_verbatim_gate_rejects_a_lone_separator_quote(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Filed under Project/Reports for review.")
+    report = repo.ingest_batch(nodes=[_node("engagement:sep", doc_id, "/")])
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "quote_not_meaningful"
+
+
+def test_verbatim_gate_accepts_a_short_legitimate_acronym_quote(pg_env, repo):
+    """The important case: the rule must DISCRIMINATE, not merely be
+    strict. "ARR" is a real 3-character metric name (the same shape a bare
+    file-extension fragment like "pdf" has once its leading "." is
+    stripped) and must still be accepted when it genuinely names something
+    in the text."""
+    doc_id = _seed_ready_doc(pg_env, text="ARR grew 20% year over year.")
+    report = repo.ingest_batch(nodes=[_node("engagement:arr", doc_id, "ARR")])
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+
+def test_meaningfulness_floor_rejects_a_single_character_quote(pg_env, repo):
+    """Boundary, low side: a lone word character is technically bounded by
+    word characters on both ends (trivially — start and end are the same
+    character) but is still too weak to be evidence of anything specific;
+    any single letter appears constantly in real text."""
+    doc_id = _seed_ready_doc(pg_env, text="Grade A performance across the board.")
+    report = repo.ingest_batch(nodes=[_node("engagement:single", doc_id, "A")])
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "quote_not_meaningful"
+
+
+def test_meaningfulness_floor_accepts_a_two_character_quote(pg_env, repo):
+    """Boundary, high side: two characters is the floor — a real two-letter
+    token (a status code, a country code, a ticker) must still pass."""
+    doc_id = _seed_ready_doc(pg_env, text="The deal closed as OK per the review.")
+    report = repo.ingest_batch(nodes=[_node("engagement:two", doc_id, "OK")])
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+
+def test_meaningfulness_floor_rejects_a_whitespace_only_quote(pg_env, repo):
+    """A run of spaces is truthy (not caught by the pre-existing
+    ``empty_quote`` check, which only tests falsiness) and is trivially a
+    substring of any multi-word text — closed by the same floor."""
+    doc_id = _seed_ready_doc(pg_env, text="Multiple   spaces   appear   here.")
+    report = repo.ingest_batch(nodes=[_node("engagement:blank", doc_id, "   ")])
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "quote_not_meaningful"
+
+
+def test_meaningfulness_gate_also_closes_the_identity_path(pg_env, repo):
+    """The identity haystack (filename/path) is checked with the exact same
+    plain substring test as the chunk text, so a degenerate quote that fails
+    the content half would otherwise fall through and be self-certified by
+    the document's own filename — nearly every file whose quote is its own
+    extension satisfies that trivially. The meaningfulness floor is applied
+    ONCE, before either half is tried, so both are covered by one check."""
+    file_id = "cf_meaningful1"
+    doc_id = "doc_meaningful1"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id, filename="Report.pdf", path="Docs/Report.pdf")
+    _seed_chunk(file_id=file_id, text="Nothing about the extension appears in the extracted text.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(nodes=[_node("engagement:identity_ext", doc_id, ".pdf")])
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "quote_not_meaningful"
+    assert report["claims_accepted_via_identity"] == 0
+
+
+# ---------------------------------------------------------------------------
 # C2 — full_documents replace mode drops a stale claim; union mode doesn't.
 # ---------------------------------------------------------------------------
 
@@ -1595,6 +1686,120 @@ def test_http_anonymization_block_persists_into_the_run_report(tmp_path, monkeyp
         "declared": True,
         "scopes": {corpus_id: {"docs_anonymized": 1, "docs_skipped": 0}},
     }
+
+
+# ---------------------------------------------------------------------------
+# anonymize-fail-closed gate — end-to-end proof over a real Postgres backend
+# that a refused batch writes nothing at all (not merely that the HTTP
+# response says 403; tests/test_api_facts_ingest.py already proves the gate
+# itself on the DuckDB backend, since it runs before facts_repo() is ever
+# reached).
+# ---------------------------------------------------------------------------
+
+
+def _mark_anonymize(client, headers, *, corpus_id: str, name: str) -> None:
+    r = client.post(
+        "/api/admin/source-connections",
+        json={
+            "name": name,
+            "source_type": "sharepoint",
+            "config": {
+                "tenant_id": "tenant-1",
+                "client_id": "client-1",
+                "scopes": [
+                    {
+                        "source_scope_id": "site1!drive1",
+                        "display_path": "Contracts",
+                        "anonymize": True,
+                        "collection_id": corpus_id,
+                    }
+                ],
+            },
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_http_anonymize_marked_corpus_without_declaration_writes_nothing(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Anon Gate E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+    _mark_anonymize(client, headers, corpus_id=corpus_id, name="sp-gate-pg")
+
+    content = b"Acme Rollout is sponsored by Alice Adams."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-gate", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout-gate",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-gate", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+        # No `anonymization` block — the exact failure mode from the report.
+    }
+    r = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert r.status_code == 403, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "anonymization_not_declared"
+    assert detail["corpus_ids"] == [corpus_id]
+
+    # The plaintext content never lands: no subject, no run report either —
+    # the refusal happens before FactsPgRepository.ingest_batch is called.
+    search_resp = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+    assert search_resp.status_code == 200, search_resp.text
+    assert search_resp.json()["subjects"] == []
+
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.json()["runs"] == []
+
+
+def test_http_anonymize_marked_corpus_with_declaration_is_accepted(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Anon Gate Declared E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+    _mark_anonymize(client, headers, corpus_id=corpus_id, name="sp-gate-pg-declared")
+
+    content = b"Acme Rollout is sponsored by Alice Adams."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-gate-2", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout-gate-2",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-gate-2", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+        "anonymization": {"declared": True, "scopes": {corpus_id: {"docs_anonymized": 1, "docs_skipped": 0}}},
+    }
+    r = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["claims_written"] == 1
 
 
 def test_http_verbatim_gate_rejects_a_fabricated_quote(tmp_path, monkeypatch, pg_engine):

@@ -3151,6 +3151,18 @@ KNOWN_UNTESTED = {
     # covered by tests/db_pg/test_facts_ingest_runs_pg.py + the source-card
     # PG test; the write happens post-ingest in tests/db_pg/test_facts_ingest_pg.py.
     "GET /api/facts/ingest-runs",
+    # Node-type counts for the Library's Knowledge tab (TCRD-250) — covered
+    # by tests/test_api_facts.py (flag-off 404, auth, DuckDB typed-501) and
+    # tests/db_pg/test_facts_read_pg.py (per-caller counts, a type the
+    # caller cannot see is absent, agreement with search()); not duplicated
+    # here.
+    "GET /api/facts/type-map",
+    # The maintained digests a caller can read (TCRD-250) — covered by
+    # tests/test_api_knowledge_digests_distribution.py::TestAnalystDigestList
+    # (401, RBAC both ways, never-generated omitted, staleness, no markdown
+    # in the list, and agreement with the sync manifest for the same
+    # caller); not duplicated here.
+    "GET /api/knowledge/digests",
 }
 
 

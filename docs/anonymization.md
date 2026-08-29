@@ -144,6 +144,38 @@ against `file_corpora` — see "Current limits" below). Malformed shapes
 (wrong types) are rejected with `422`; the block itself is entirely
 optional — a producer that never anonymizes omits it.
 
+## Ingest-time enforcement: undeclared is refused, not silently accepted
+
+`POST /api/facts/ingest` (spec §7.2/§9) **refuses** a batch that documents a
+corpus whose SharePoint scope is anonymize-marked (`config.scopes[]
+.anonymize`) when that same batch's `anonymization` block does not declare
+the corpus — `403`, `{"reason": "anonymization_not_declared", "corpus_ids":
+[...]}`, itemizing exactly which collection(s) are missing a declaration.
+Nothing from that batch is written: the check runs before the ingest
+transaction, so a refused batch leaves no claim, no subject, and no run
+report behind.
+
+This closes a real fail-open path: an admin's confirmed scopes
+(`config.scopes`) live on the connection row and are server-written by the
+connect wizard's own endpoints — never typed by hand, and never rendered by
+the generic connection editor. Editing that connection through the ordinary
+editor (a rename, a certificate change, anything that replaces `config`
+without echoing `scopes` back) used to wipe them silently, which in turn
+emptied the `corpus-extraction` job's anonymize map, skipped the HMAC-key
+resolution, raised no error anywhere, and let the pipeline ship
+un-anonymized content into a collection an admin believed was anonymized —
+reported as a normal, successful run. The generic editor now preserves
+`scopes` across an update that does not mention them (an explicit
+`scopes: []`, or the wizard's own unselect endpoint, still clears them
+deliberately), and this ingest-time gate is the second, independent
+backstop: even if config, an env var, or the producer itself misbehaves,
+an anonymize-marked corpus with no declaration is refused at the door.
+
+A lookup failure while answering "is this corpus marked" (e.g. the
+`source_connections` table is unreadable) is **not** treated as "nothing is
+marked" — it is refused the same way (`503`,
+`anonymization_check_unavailable`), never waved through as a silent accept.
+
 ## Current limits — read this before trusting the badge
 
 **Agnes cannot verify that content was actually anonymized.** The
@@ -152,7 +184,12 @@ self-reported declaration, persisted and surfaced, never independently
 checked against document content. The enforcement — actually redacting and
 pseudonymizing entities before upload — lives entirely in the producer.
 Agnes's contribution is: mark intent, hand the producer what it needs
-(scopes + key), and honestly label the two states as *requested* and
-*declared* rather than collapsing them into one unverified "anonymized"
-claim. If your producer is unreliable or misconfigured, "declared" can be
-wrong; there is currently no mechanism in Agnes to catch that.
+(scopes + key), refuse an ingest batch that skips the declaration entirely
+for a marked corpus (above), and honestly label the two states as
+*requested* and *declared* rather than collapsing them into one unverified
+"anonymized" claim. If your producer *sends* the declaration but is
+unreliable or misconfigured — it claims to have anonymized a document it
+did not — "declared" can still be wrong; there is currently no mechanism in
+Agnes to catch that. What Agnes now refuses is the declaration being
+*absent* for a corpus it knows was supposed to get one, not a false
+declaration.
