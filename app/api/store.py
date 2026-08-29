@@ -70,6 +70,7 @@ from app.instance_config import (
     get_guardrails_review_model,
 )
 from app.utils import get_store_dir
+from src.audit_helpers import log_safe
 from src.db import get_system_db
 from src.store_categories import STORE_CATEGORIES, normalize_category
 from src.store_guardrails import InlineResult, run_inline_checks, run_llm_review
@@ -4610,6 +4611,12 @@ async def export_bundle(
         skip += page
 
     payload = _build_bundle_zip(conn, items)
+    log_safe(
+        user_id=user["id"],
+        action="store.bundle_download",
+        resource="store:bundle.zip",
+        params={"count": len(items), "type": type, "owner": owner},
+    )
     return Response(
         content=payload,
         media_type="application/zip",

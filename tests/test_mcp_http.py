@@ -335,6 +335,10 @@ class TestToolRegistration:
             "fact_search",
             "fact_neighbors",
             "fact_claims",
+            # Node-type counts for the Library's Knowledge tab (TCRD-250).
+            # Triple-surface with GET /api/facts/type-map and
+            # `agnes facts type-map`.
+            "fact_type_map",
             # Config-surface introspection — an operator's Claude reads this
             # instance's live configurable surface (knobs + sources, registered
             # IWT, marketplaces, infra_repo_url). Triple-surface with

@@ -506,6 +506,45 @@
         "title": "ArchiveSessionBody",
         "type": "object"
       },
+      "AuditEventIn": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "observed_at": {
+            "title": "Observed At",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "observed_at"
+        ],
+        "title": "AuditEventIn",
+        "type": "object"
+      },
+      "AuditEventsUploadRequest": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventIn"
+            },
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "title": "AuditEventsUploadRequest",
+        "type": "object"
+      },
       "BannerResponse": {
         "properties": {
           "content": {
@@ -12573,7 +12612,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.91.0"
+    "version": "0.92.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -29407,6 +29446,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/extract": {
+      "post": {
+        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``extraction.enabled`` is false) or ``409\nextraction_producer_not_configured`` (neither ``extraction.producer\n.command`` nor ``.module`` is set) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
+        "operationId": "trigger_extraction_api_admin_sharepoint_connections__connection_id__extract_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Extraction",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/scopes": {
       "delete": {
         "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).",
@@ -29862,6 +29964,60 @@
           }
         },
         "summary": "Search Tree",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/extraction/run-due": {
+      "post": {
+        "description": "Scheduler-driven sweep (TCRD-226): fires ``corpus-extraction`` for\nevery SharePoint connection whose extraction cadence\n(``extraction.schedule`` \u2014 a single instance-wide setting in the\n``extraction:`` config block, applied independently to each\nconnection's own ``last_run_at``) says it is due. Same shape as\n``POST /api/v1/agents/run-due`` (walk + per-row due-check + enqueue\ninto an EXISTING job kind) \u2014 no second scheduling mechanism.\nScheduler row: ``extraction-run-due`` in\n``services/scheduler/__main__.py``, registered only when\n``extraction.schedule`` is configured (absent/empty = off, same\ndefault posture as ``extraction.enabled``).\n\nA clean, typed no-op (never an error) when the feature isn't usable \u2014\n``extraction.enabled`` is false, no producer is configured, or no\nschedule is configured \u2014 since this endpoint, once registered, fires\nUNCONDITIONALLY on its own cadence; the JOB HANDLER\n(``_run_corpus_extraction``) raises on the same conditions because a\n``corpus-extraction`` job only ever exists because something explicitly\nenqueued it, but this sweep is what decides whether to enqueue at all.",
+        "operationId": "run_due_extraction_api_admin_sharepoint_extraction_run_due_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Due Extraction",
         "tags": [
           "admin"
         ]
@@ -39119,6 +39275,64 @@
           }
         },
         "summary": "Facts Search",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/type-map": {
+      "get": {
+        "description": "Live counts per node type over everything the caller can see \u2014 the\nhead of the Library's Knowledge tab, where each type is a way in.\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach. A type nobody can see\nis absent rather than reported as ``0``, so the response never\ndistinguishes \"no such type here\" from \"none you may read\" \u2014 the same\nnon-disclosure ``search()`` makes. Response: ``{\"types\": [{\"type\",\n\"count\"}], \"total\"}``, ordered by type.",
+        "operationId": "facts_type_map_api_facts_type_map_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Type Map Api Facts Type Map Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Type Map",
         "tags": [
           "facts"
         ]
@@ -51217,6 +51431,70 @@
         ]
       }
     },
+    "/api/upload/audit-events": {
+      "post": {
+        "description": "Batch-ingest client-reported audit events from `agnes push`.\n\nThe server never trusts the client's chosen action string: only actions\nin `CLIENT_REPORTED_ACTIONS` are accepted; anything else is REJECTED\n(counted, not raised) so one bad event in a batch doesn't drop the rest.\nOversized params (>2KB serialized) are rejected the same way \u2014 content\nnever crosses this endpoint by construction, the CLI spool only ever\nwrites metadata (see `cli/lib/audit_spool.py`), but the cap still bounds\na misbehaving or future client.",
+        "operationId": "upload_audit_events_api_upload_audit_events_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditEventsUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Audit Events",
+        "tags": [
+          "upload"
+        ]
+      }
+    },
     "/api/upload/local-md": {
       "post": {
         "description": "Upload CLAUDE.local.md content for corporate memory processing.",
@@ -52962,6 +53240,7 @@
     },
     "/api/v1/agents/{slug}/responses": {
       "post": {
+        "description": "Audit wrapper around `_create_agent_response_impl` (F2b \u2014 audit-\nfull-coverage plan, Task 4): writes one `agent.invoke` row right after\nauth/scope resolution (`require_agent_runtime_principal` above already\nran) and BEFORE the actual run/enqueue starts \u2014 so a crash inside\n`run_one_shot`/the background enqueue still leaves a row behind. A\nsecond row, with `result=\"error:<class>\"`, is written only when the\ncall fails (mirrors the `query.remote` error-path precedent,\n`app/api/query.py`). `client_ip`/`correlation_id`/`client_kind` are\nleft to autofill (`src.audit_context`) \u2014 this is a plain HTTP handler.",
         "operationId": "create_agent_response_api_v1_agents__slug__responses_post",
         "parameters": [
           {

@@ -578,12 +578,33 @@ def _reset_module_caches():
         _q_mod._ORACLE_HEALTHY = None
     except (ImportError, AttributeError):
         pass
+    # Audit request-context contextvars (F0 — audit-full-coverage plan,
+    # Task 1): tests/test_audit_context_autofill.py's own tests (and any
+    # later test file exercising set_request_meta / set_client_kind /
+    # set_audit_identity directly, not through a request) mutate these in
+    # the SAME context pytest keeps running subsequent tests in on this
+    # worker — without a reset here, "client_kind='mcp'" set by one test
+    # silently autofills into an unrelated later test's audit_repo().log()
+    # call. Reset both before (clean slate regardless of what leaked in)
+    # and after (don't hand the leak to whatever runs next either).
+    try:
+        from src.audit_context import _reset_for_tests as _reset_audit_context
+
+        _reset_audit_context()
+    except ImportError:
+        pass
     yield
     try:
         from app.api import v2_catalog as _vc
 
         _vc._table_rows_cache.clear()
     except (ImportError, AttributeError):
+        pass
+    try:
+        from src.audit_context import _reset_for_tests as _reset_audit_context
+
+        _reset_audit_context()
+    except ImportError:
         pass
     # Schema TTL cache — keyed on table_id (plus the policy identity for a
     # policied table) with a 1h TTL, so two suites registering the SAME id

@@ -1,5 +1,7 @@
-"""Upload endpoints — sessions, artifacts, CLAUDE.local.md."""
+"""Upload endpoints — sessions, artifacts, CLAUDE.local.md, client-reported
+audit events."""
 
+import json
 import logging
 import re
 import shutil
@@ -8,14 +10,15 @@ import uuid
 import zlib
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from pydantic import BaseModel, Field
 
 from app.auth.dependencies import get_current_user
+from app.auth.rate_limit import limiter as _rate_limiter
 from app.utils import get_data_dir as _get_data_dir
 from app.utils import local_md_filename as _local_md_filename
 from app.utils import uploaded_local_md_dir as _uploaded_local_md_dir
-from src.audit_helpers import client_kind_from_user
+from src.audit_helpers import client_kind_from_user, log_safe
 
 from src.repositories import (
     audit_repo,
@@ -209,6 +212,13 @@ async def upload_artifact(
     except Exception:
         Path(tmp.name).unlink(missing_ok=True)
         raise
+    log_safe(
+        user_id=user_id,
+        action="artifact.upload",
+        params={"filename": filename[:256], "bytes": size},
+        result="success",
+        client_kind=client_kind_from_user(user),
+    )
     return {"status": "ok", "filename": filename, "size": size}
 
 
@@ -232,8 +242,101 @@ async def upload_local_md(
     # (or the directory) written here.
     target = md_dir / _local_md_filename(user_email)
     target.write_text(request.content, encoding="utf-8")
+    # NEVER the content — only its byte length enters the audit record.
+    log_safe(
+        user_id=user.get("id"),
+        action="local_md.upload",
+        params={"bytes": len(request.content)},
+        result="success",
+        client_kind=client_kind_from_user(user),
+    )
     return {
         "status": "ok",
         "user": user_email,
         "size": len(request.content),
     }
+
+
+# ---------------------------------------------------------------------------
+# Client-reported CLI audit events (F3 — audit-full-coverage plan, Task 9)
+# ---------------------------------------------------------------------------
+
+# The server-side allowlist of actions a client is permitted to self-report.
+# NOT the same as `src.audit_events.CATALOG` (which is "every action Agnes
+# ever writes") — this is a narrower "actions a client may MINT" gate. A
+# client can never write an arbitrary action string; only these two, both
+# emitted for offline local-DuckDB runs the CLI itself could not audit
+# server-side (`cli/lib/audit_spool.py`).
+CLIENT_REPORTED_ACTIONS = frozenset({"query.local_offline", "explore.local_offline"})
+
+_MAX_AUDIT_EVENTS_PER_BATCH = 500
+_MAX_AUDIT_EVENT_PARAMS_BYTES = 2048
+
+
+class AuditEventIn(BaseModel):
+    action: str
+    params: dict = Field(default_factory=dict)
+    observed_at: str
+
+
+class AuditEventsUploadRequest(BaseModel):
+    events: list[AuditEventIn]
+
+
+@router.post("/audit-events")
+@_rate_limiter.limit("30/minute")
+async def upload_audit_events(
+    request: Request,
+    body: AuditEventsUploadRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Batch-ingest client-reported audit events from `agnes push`.
+
+    The server never trusts the client's chosen action string: only actions
+    in `CLIENT_REPORTED_ACTIONS` are accepted; anything else is REJECTED
+    (counted, not raised) so one bad event in a batch doesn't drop the rest.
+    Oversized params (>2KB serialized) are rejected the same way — content
+    never crosses this endpoint by construction, the CLI spool only ever
+    writes metadata (see `cli/lib/audit_spool.py`), but the cap still bounds
+    a misbehaving or future client.
+    """
+    if len(body.events) > _MAX_AUDIT_EVENTS_PER_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"at most {_MAX_AUDIT_EVENTS_PER_BATCH} events per batch",
+        )
+
+    user_id = user.get("id") if isinstance(user, dict) else None
+    accepted = 0
+    rejected = 0
+    for event in body.events:
+        if event.action not in CLIENT_REPORTED_ACTIONS:
+            rejected += 1
+            continue
+        try:
+            params_size = len(json.dumps(event.params, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            rejected += 1
+            continue
+        if params_size > _MAX_AUDIT_EVENT_PARAMS_BYTES:
+            rejected += 1
+            continue
+        log_safe(
+            user_id=user_id,
+            action=event.action,
+            params={**event.params, "observed_at": event.observed_at, "client_reported": True},
+            result="success",
+            client_kind="cli",
+        )
+        accepted += 1
+
+    # One extra row for the batch itself — lets an admin see "a CLI pushed
+    # N offline-query events" without counting individual rows.
+    log_safe(
+        user_id=user_id,
+        action="audit_events.upload",
+        params={"accepted": accepted, "rejected": rejected},
+        result="success",
+        client_kind="cli",
+    )
+    return {"accepted": accepted, "rejected": rejected}
