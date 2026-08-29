@@ -556,6 +556,7 @@
 {% block body_attrs %}class="library-page"{% endblock %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/type_map.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
@@ -2083,6 +2084,15 @@
 {% endblock %}
 
 {% block page_surface %}
+{# Type map — the head of the Knowledge tab (TCRD-250). Self-contained
+   macro + its own CSS; renders nothing when the graph is empty or the
+   facts feature is off, so the Library is unchanged without it. #}
+{% from "macros/_type_map.html" import type_map %}
+{% if library_type_map %}
+<div id="lib-typemap" hidden>
+  {{ type_map(library_type_map, library_type_map | sum(attribute="count"), base_url="/library") }}
+</div>
+{% endif %}
 <section class="lib-section">
   {# ── Toolbar — a FLOATING DOCK pinned to the bottom of the viewport rather
        than a strip between the header and the list. The Library is a scrolling
@@ -3424,7 +3434,7 @@
         buttons: '.fbar-view__btn', tableWrap: '.lib-tablewrap',
         grid: '.fbar-grid', storageKey: 'lib-view', card: buildCard,
       },
-      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
+      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); syncTypeMap(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
     });
 
     // The engine's segment value starts at the `all` wildcard, which is not a
@@ -3646,6 +3656,18 @@
   //: while a match sat in Capabilities, and the page gave no sign of it. The
   //: badge now counts matches under everything EXCEPT the tab itself, so with
   //: nothing narrowing it still reads as the inventory.
+  //: The type map describes what the KNOWLEDGE tab holds, so it follows the
+  //: active tab. The filter engine slices ROWS by `data-tab`; a non-row
+  //: element has no such hook, so this rides `onApply` like every other
+  //: cross-cutting refresh rather than inventing a second mechanism.
+  //: Starts `hidden` in the markup so it never flashes on Capabilities
+  //: before the engine's first apply().
+  function syncTypeMap() {
+    const el = document.getElementById('lib-typemap');
+    if (!el) return;
+    const seg = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
+    el.hidden = !seg || seg.getAttribute('data-own') !== 'knowledge';
+  }
   function refreshTabCounts() {
     const base = libRowsMatching(null, true);
     document.querySelectorAll('#lib-tabs [data-seg-count]').forEach(badge => {

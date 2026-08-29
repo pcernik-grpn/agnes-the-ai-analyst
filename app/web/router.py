@@ -2261,6 +2261,30 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
         return False
 
 
+def _library_type_map(user: dict) -> list[dict]:
+    """Node types with caller-scoped counts for the Knowledge tab's head.
+
+    Fails soft on every axis, because this is a decoration on a page that
+    must render without it: the `facts` feature can be off, the app-state
+    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
+    and the graph can simply be empty. Any of those renders the Library
+    exactly as it does today, with no type map — never a 500 on the
+    caller's main inventory page.
+    """
+    try:
+        from app.instance_config import feature_enabled
+
+        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+            return []
+        from src.repositories import facts_repo
+
+        counts = facts_repo().count_visible_facts_by_type(user)
+    except Exception:  # noqa: BLE001 - decoration must never break the page
+        logger.debug("library: type map unavailable", exc_info=True)
+        return []
+    return [{"type": t, "count": n} for t, n in counts.items()]
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -3749,6 +3773,9 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
+        # TCRD-250: node types with live, caller-scoped counts at the head
+        # of the Knowledge tab. Empty list = render nothing, see helper.
+        library_type_map=_library_type_map(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
