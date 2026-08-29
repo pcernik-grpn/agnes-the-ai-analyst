@@ -836,6 +836,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   prompt with the shipped default — no confirmation, nothing recoverable. The
   reset now goes through the design-system confirm dialog (same idiom as every
   other destructive admin action), naming what will be lost.
+- **Password managers can now fill and save on every auth form.** The login
+  identifier fields said `autocomplete="email"` — managers key saved logins on
+  `username` (the spec's token for the account identifier, even when it is an
+  email address), which is why the same login page offered credentials to one
+  person and nothing to another. And the setup/reset forms carried the account
+  email only as a hidden input, so a manager watching the `new-password` field
+  had no username to associate the credential with and never saved it; the
+  email is now a visible, readonly field in the same form (readonly inputs
+  still submit — the POST contract is unchanged).
 - **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
   values.** Vertex validates the `anthropic-beta` header and refuses the whole
   request on any value it does not recognize (the first-party API ignores
