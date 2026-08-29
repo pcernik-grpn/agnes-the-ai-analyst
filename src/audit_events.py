@@ -495,6 +495,25 @@ CATALOG: dict[str, AuditEvent] = {
         "A web-chat session was materialized as a session jsonl under SESSION_DATA_DIR "
         "(admin transcript viewer + usage rollups now cover it, same as any CLI session).",
     ),
+    # Task 9 (F3 — client-reported CLI audit events)
+    "query.local_offline": AuditEvent(
+        "query.local_offline",
+        "read",
+        "`agnes query` ran against the local DuckDB with no server round-trip; "
+        "client-reported after the fact via POST /api/upload/audit-events.",
+    ),
+    "explore.local_offline": AuditEvent(
+        "explore.local_offline",
+        "read",
+        "`agnes explore` ran against the local DuckDB with no server round-trip; "
+        "client-reported after the fact via POST /api/upload/audit-events.",
+    ),
+    "audit_events.upload": AuditEvent(
+        "audit_events.upload",
+        "system",
+        "A CLI's batch of client-reported audit events was ingested "
+        "(one row per batch; params carry accepted/rejected counts).",
+    ),
 }
 
 

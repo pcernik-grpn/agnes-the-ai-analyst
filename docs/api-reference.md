@@ -2269,6 +2269,7 @@ fanned out into group members' installs and cannot be uninstalled
 ### `/api/upload` — Session and artifact upload
 
 - /api/upload/artifacts
+- /api/upload/audit-events
 - /api/upload/local-md
 - /api/upload/sessions
 
