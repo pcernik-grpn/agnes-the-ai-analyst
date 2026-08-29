@@ -117,6 +117,82 @@ def test_list_analyst_sees_only_granted(seeded_app):
     assert ids == {"test-upstream.lookup"}, f"unexpected tools: {ids}"
 
 
+# ── /tools (list) — ResourceType.MCP_SOURCE gate (TCRD-236) ────────────────
+
+
+def _narrow_source_to_group(source_id: str, group_id: str) -> None:
+    """Give ``source_id`` its FIRST mcp_source grant, restricted to
+    ``group_id`` — the admin action that flips a source from "ungated
+    (visible to everyone)" to "gated"."""
+    from src.repositories import resource_grants_repo
+
+    resource_grants_repo().ensure_grant(group_id=group_id, resource_type="mcp_source", resource_id=source_id)
+
+
+def test_list_ungated_source_stays_visible_by_default(seeded_app):
+    """A source nobody has ever granted at the mcp_source level (today's
+    common case, and every already-registered source once the boot seed
+    ran) stays visible — the backward-compat default the feature exists to
+    preserve."""
+    _seed_two_tools_two_groups()
+    client = seeded_app["client"]
+    r = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+    )
+    assert {t["tool_id"] for t in r.json()} == {"test-upstream.lookup"}
+
+
+def test_list_analyst_loses_tool_when_source_narrowed_to_other_group(seeded_app):
+    """The mcp_source gate is ANDed with tool_grants: narrowing the SOURCE
+    to a group the analyst is not in hides the tool even though the
+    tool-level grant still matches their group."""
+    seeded = _seed_two_tools_two_groups()
+    conn = get_system_db()
+    other_grp = UserGroupsRepository(conn).create(name="other-src-narrow-grp", description=None)
+    conn.close()
+    _narrow_source_to_group("src_test", other_grp["id"])
+
+    client = seeded_app["client"]
+    r = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+    )
+    assert r.json() == []
+    assert seeded["granted_gid"]  # sanity: the tool grant itself is untouched
+
+
+def test_list_analyst_keeps_tool_when_source_narrowed_to_their_own_group(seeded_app):
+    seeded = _seed_two_tools_two_groups()
+    _narrow_source_to_group("src_test", seeded["granted_gid"])
+
+    client = seeded_app["client"]
+    r = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+    )
+    assert {t["tool_id"] for t in r.json()} == {"test-upstream.lookup"}
+
+
+def test_list_admin_sees_narrowed_source_too(seeded_app):
+    """Admin god-mode bypasses the mcp_source gate exactly like it bypasses
+    tool_grants."""
+    _seed_two_tools_two_groups()
+    conn = get_system_db()
+    other_grp = UserGroupsRepository(conn).create(name="other-src-narrow-admin-grp", description=None)
+    conn.close()
+    _narrow_source_to_group("src_test", other_grp["id"])
+
+    client = seeded_app["client"]
+    r = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+    )
+    ids = {t["tool_id"] for t in r.json()}
+    assert "test-upstream.lookup" in ids
+    assert "test-upstream.private" in ids
+
+
 # ── /tools/{tool_id}/call (invoke) ─────────────────────────────────────────
 
 
@@ -589,6 +665,32 @@ def test_list_tools_hides_ungranted_passthrough_for_analyst(seeded_app):
 
 def test_list_tools_admin_sees_all_passthrough(seeded_app):
     _seed_two_tools_two_groups()
+    names = _list_names("admin1")
+    assert {"lookup", "private"} <= names
+
+
+def test_list_tools_hides_tool_when_source_narrowed_to_other_group(seeded_app):
+    """tools/list mirrors the REST listing's mcp_source gate (TCRD-236): a
+    caller whose group holds the tool grant still loses the tool once the
+    SOURCE is narrowed to a different group."""
+    seeded = _seed_two_tools_two_groups()
+    conn = get_system_db()
+    other_grp = UserGroupsRepository(conn).create(name="other-src-narrow-transport-grp", description=None)
+    conn.close()
+    _narrow_source_to_group("src_test", other_grp["id"])
+
+    names = _list_names("analyst1")
+    assert "lookup" not in names
+    assert seeded["granted_gid"]  # sanity: the tool grant itself is untouched
+
+
+def test_list_tools_admin_still_sees_narrowed_source(seeded_app):
+    _seed_two_tools_two_groups()
+    conn = get_system_db()
+    other_grp = UserGroupsRepository(conn).create(name="other-src-narrow-transport-admin-grp", description=None)
+    conn.close()
+    _narrow_source_to_group("src_test", other_grp["id"])
+
     names = _list_names("admin1")
     assert {"lookup", "private"} <= names
 

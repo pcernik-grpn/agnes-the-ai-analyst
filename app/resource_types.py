@@ -54,6 +54,7 @@ class ResourceType(StrEnum):
     AGENT = "agent"
     CORPUS_FILE = "corpus_file"
     STORE_ENTITY = "store_entity"
+    MCP_SOURCE = "mcp_source"
 
 
 # Shape returned by ``list_blocks`` delegates. Kept as plain ``dict`` to keep
@@ -732,6 +733,61 @@ def _knowledge_digest_blocks() -> List[Block]:
 
 
 # ---------------------------------------------------------------------------
+# MCP source projection (TCRD-236)
+# ---------------------------------------------------------------------------
+
+
+def _mcp_source_blocks() -> List[Block]:
+    """Project ``mcp_sources`` into the (block -> items) shape rendered by
+    the admin /access page.
+
+    MCP sources (admin-registered external MCP servers, ``app/api/
+    admin_mcp.py``) predate a grantable resource type of their own —
+    visibility was governed only by the per-TOOL ``tool_grants`` table
+    (Universal MCP, RFC #461 M5): every user who could see one tool of a
+    source could discover the source existed, and there was no way to hide
+    a whole server from a group in one action. This resource type adds
+    that coarser, source-wide knob.
+
+    The gate this powers (``app/api/mcp_policy.py::visible_mcp_source_ids``)
+    is ANDed with the existing per-tool grant, never replaces it — granting
+    a source here does not widen which TOOLS a group can see, it only
+    controls whether the group can see the source at all. A source with no
+    MCP_SOURCE grant of its own is treated as visible-to-everyone (the
+    backward-compat default every already-registered source is grandfathered
+    onto at boot — see ``src/mcp_source_grants.py``), so this ships as a
+    no-op until an admin deliberately narrows a specific source here.
+
+    One synthetic block ``"MCP servers"`` holds every registered source
+    (enabled and disabled — an admin narrowing access to a currently-off
+    source is still a legitimate action); ``resource_id`` is
+    ``mcp_sources.id``.
+    """
+    from src.repositories import mcp_sources_repo
+
+    rows = mcp_sources_repo().list_all()
+    if not rows:
+        return []
+    return [
+        {
+            "id": "mcp_sources",
+            "name": "MCP servers",
+            "items": [
+                {
+                    "resource_id": r["id"],
+                    "name": r["name"],
+                    "category": "mcp_source",
+                    "description": r.get("connect_hint"),
+                    "transport": r.get("transport"),
+                    "enabled": bool(r.get("enabled", True)),
+                }
+                for r in rows
+            ],
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Registry — the one place that gets edited when adding a new resource type
 # ---------------------------------------------------------------------------
 
@@ -891,6 +947,20 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         ),
         id_format="<store_entity_id>",
         list_blocks=_store_entity_blocks,
+    ),
+    ResourceType.MCP_SOURCE: ResourceTypeSpec(
+        key=ResourceType.MCP_SOURCE,
+        display_name="MCP servers",
+        description=(
+            "An admin-registered MCP server. Controls whether a group can see "
+            "the server AT ALL — ANDed with the existing per-tool tool_grants "
+            "(Universal MCP), never widening it. Every already-registered "
+            "server is grandfathered onto Everyone at boot, and a newly "
+            "registered one at creation time, so this ships as a no-op until "
+            "an admin narrows a specific server here."
+        ),
+        id_format="<mcp_source_id>",
+        list_blocks=_mcp_source_blocks,
     ),
 }
 
