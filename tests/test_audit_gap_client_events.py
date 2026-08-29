@@ -140,3 +140,26 @@ class TestAuth:
         c = seeded_app["client"]
         resp = c.post(ENDPOINT, json={"events": [_event()]})
         assert resp.status_code in (401, 403)
+
+
+class TestRateLimit:
+    """The endpoint is meant to be hit ~once per `agnes push`; a stolen PAT
+    or rewritten CLI must not be able to grow audit_log unboundedly by
+    looping the batch endpoint (review finding, 2026-08-29)."""
+
+    def test_burst_beyond_limit_is_throttled(self, seeded_app, analyst_user):
+        from app.auth.rate_limit import limiter
+
+        limiter.enabled = True
+        limiter.reset()
+        try:
+            c = seeded_app["client"]
+            statuses = [
+                c.post(ENDPOINT, json={"events": []}, headers=analyst_user).status_code
+                for _ in range(31)
+            ]
+            assert all(s == 200 for s in statuses[:30])
+            assert statuses[30] == 429
+        finally:
+            limiter.enabled = False
+            limiter.reset()

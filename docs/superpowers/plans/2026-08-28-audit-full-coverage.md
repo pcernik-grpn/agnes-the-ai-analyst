@@ -416,7 +416,7 @@ def test_posture_values_are_valid():
 **Interfaces:**
 - Consumes: `chat_message_repo().list_messages(chat_id)` rows (`role`, `content`, `tool_calls`, `parts`, `tokens_in/out`, `model`, `sender_email` — `src/repositories/chat_messages_pg.py:47`), `chat_sessions` rows for owner email/user; `resolve_user_identity` conventions from `services/session_pipeline/runner.py:34`; `SESSION_DATA_DIR` default from `services/session_pipeline/runner.py:83`.
 - Produces: `export_chat_session_jsonl(chat_id: str) -> pathlib.Path | None` — returns None when the flag is off, the session has no messages, or the owner can't be resolved to a `users.id`; otherwise writes `${SESSION_DATA_DIR}/<users.id>/chat-<chat_id>.jsonl` (atomic: write `.tmp`, `os.replace`) and returns the path. Idempotent: re-export overwrites; the pipeline's byte-size dedup handles re-processing.
-- **PG-only reality check:** `chat_messages` is a PG-only repo. On a DuckDB app-state instance the repo factory raises `RequiresPostgresBackend` — `export_chat_session_jsonl` must catch it and return None (chat itself doesn't run on those instances, fail clean per the A3 rule).
+- **PG-only reality check:** `chat_messages`/`chat_sessions` are full DuckDB+PG pairs today, but the export must still fail clean per the A3 rule if any repo in its call path resolves PG-only on a DuckDB app-state instance — `export_chat_session_jsonl` catches `RequiresPostgresBackend` and returns None (defensive; correction from review: the original text misstated `chat_messages` as PG-only).
 
 **Steps:**
 

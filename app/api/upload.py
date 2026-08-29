@@ -10,10 +10,11 @@ import uuid
 import zlib
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.auth.dependencies import get_current_user
+from app.auth.rate_limit import limiter as _rate_limiter
 from app.utils import get_data_dir as _get_data_dir
 from app.utils import local_md_filename as _local_md_filename
 from app.utils import uploaded_local_md_dir as _uploaded_local_md_dir
@@ -283,8 +284,10 @@ class AuditEventsUploadRequest(BaseModel):
 
 
 @router.post("/audit-events")
+@_rate_limiter.limit("30/minute")
 async def upload_audit_events(
-    request: AuditEventsUploadRequest,
+    request: Request,
+    body: AuditEventsUploadRequest,
     user: dict = Depends(get_current_user),
 ):
     """Batch-ingest client-reported audit events from `agnes push`.
@@ -297,7 +300,7 @@ async def upload_audit_events(
     writes metadata (see `cli/lib/audit_spool.py`), but the cap still bounds
     a misbehaving or future client.
     """
-    if len(request.events) > _MAX_AUDIT_EVENTS_PER_BATCH:
+    if len(body.events) > _MAX_AUDIT_EVENTS_PER_BATCH:
         raise HTTPException(
             status_code=400,
             detail=f"at most {_MAX_AUDIT_EVENTS_PER_BATCH} events per batch",
@@ -306,7 +309,7 @@ async def upload_audit_events(
     user_id = user.get("id") if isinstance(user, dict) else None
     accepted = 0
     rejected = 0
-    for event in request.events:
+    for event in body.events:
         if event.action not in CLIENT_REPORTED_ACTIONS:
             rejected += 1
             continue
