@@ -150,15 +150,6 @@ every other way in (password, Google, magic link — whatever the instance
 offers). There is no SSO enforcement or lockout; the external IdP's
 MFA/conditional-access posture protects only the SSO door.
 
-That cuts both ways: a JIT-created SSO user holds no password, but nothing
-stops them from *acquiring* one. The password-reset and magic-link doors
-resolve an account by address and check only that it is active — neither asks
-whether the account has a password today, nor whether it carries an external
-identity. A user who sets a password before leaving the customer's tenant
-therefore keeps a way in that survives their offboarding there, and closing it
-is the Agnes operator's move (`users.active`), not the customer admin's.
-Narrow `auth.providers` if that matters more than the convenience.
-
 **Accepted risks (v1), documented rather than mitigated:** first-login email
 attach itself (same semantics as every Agnes provider); no session revocation
 on unlink/disable (sessions are 30-day stateless JWTs — `users.active` is the
