@@ -488,6 +488,25 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "Selected discovered Keboola projects were connected (select-mode multi-project login).",
     ),
+    # Task 9 (F3 — client-reported CLI audit events)
+    "query.local_offline": AuditEvent(
+        "query.local_offline",
+        "read",
+        "`agnes query` ran against the local DuckDB with no server round-trip; "
+        "client-reported after the fact via POST /api/upload/audit-events.",
+    ),
+    "explore.local_offline": AuditEvent(
+        "explore.local_offline",
+        "read",
+        "`agnes explore` ran against the local DuckDB with no server round-trip; "
+        "client-reported after the fact via POST /api/upload/audit-events.",
+    ),
+    "audit_events.upload": AuditEvent(
+        "audit_events.upload",
+        "system",
+        "A CLI's batch of client-reported audit events was ingested "
+        "(one row per batch; params carry accepted/rejected counts).",
+    ),
 }
 
 

@@ -476,6 +476,7 @@ POSTURE: dict[str, str] = {
     "POST /auth/tokens": "token.create",
     # -- app.api.upload --------------------------------------------------------
     "POST /api/upload/artifacts": "artifact.upload",
+    "POST /api/upload/audit-events": "audit_events.upload",
     "POST /api/upload/local-md": "local_md.upload",
     "POST /api/upload/sessions": "session.upload",
     # -- app.api.uploads -------------------------------------------------------

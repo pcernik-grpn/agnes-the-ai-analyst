@@ -506,6 +506,45 @@
         "title": "ArchiveSessionBody",
         "type": "object"
       },
+      "AuditEventIn": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "observed_at": {
+            "title": "Observed At",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "observed_at"
+        ],
+        "title": "AuditEventIn",
+        "type": "object"
+      },
+      "AuditEventsUploadRequest": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventIn"
+            },
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "title": "AuditEventsUploadRequest",
+        "type": "object"
+      },
       "BannerResponse": {
         "properties": {
           "content": {
@@ -50929,6 +50968,70 @@
         ]
       }
     },
+    "/api/upload/audit-events": {
+      "post": {
+        "description": "Batch-ingest client-reported audit events from `agnes push`.\n\nThe server never trusts the client's chosen action string: only actions\nin `CLIENT_REPORTED_ACTIONS` are accepted; anything else is REJECTED\n(counted, not raised) so one bad event in a batch doesn't drop the rest.\nOversized params (>2KB serialized) are rejected the same way \u2014 content\nnever crosses this endpoint by construction, the CLI spool only ever\nwrites metadata (see `cli/lib/audit_spool.py`), but the cap still bounds\na misbehaving or future client.",
+        "operationId": "upload_audit_events_api_upload_audit_events_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditEventsUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Audit Events",
+        "tags": [
+          "upload"
+        ]
+      }
+    },
     "/api/upload/local-md": {
       "post": {
         "description": "Upload CLAUDE.local.md content for corporate memory processing.",
@@ -52597,6 +52700,7 @@
     },
     "/api/v1/agents/{slug}/responses": {
       "post": {
+        "description": "Audit wrapper around `_create_agent_response_impl` (F2b \u2014 audit-\nfull-coverage plan, Task 4): writes one `agent.invoke` row right after\nauth/scope resolution (`require_agent_runtime_principal` above already\nran) and BEFORE the actual run/enqueue starts \u2014 so a crash inside\n`run_one_shot`/the background enqueue still leaves a row behind. A\nsecond row, with `result=\"error:<class>\"`, is written only when the\ncall fails (mirrors the `query.remote` error-path precedent,\n`app/api/query.py`). `client_ip`/`correlation_id`/`client_kind` are\nleft to autofill (`src.audit_context`) \u2014 this is a plain HTTP handler.",
         "operationId": "create_agent_response_api_v1_agents__slug__responses_post",
         "parameters": [
           {
