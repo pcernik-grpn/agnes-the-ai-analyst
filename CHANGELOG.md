@@ -1069,6 +1069,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   nuance (only `required_filter` is statically checkable today, so any other
   type is advisory regardless of severity) moved to a short note under the
   table/panel instead.
+- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
+  admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+  knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+  their table in `<div class="data-table-wrap">`, but no CSS rule ever
+  backed the class — so a wide table dragged the whole page into horizontal
+  scroll in a narrow window instead of just itself. Fixing the overflow
+  naively would have broken sticky table headers on all ten pages —
+  `overflow-x: auto` makes the wrap a nearer scrolling ancestor than the
+  viewport, and with no height cap the header would silently stop sticking
+  at all instead of visibly failing — so sticky is now consciously disabled
+  for any thead inside `.data-table-wrap` rather than left in that
+  ambiguous, silently-broken state. Also replaced seven admin pages' inline
+  `style="text-align:right"` on a header (semantic sources, marketplaces,
+  mcp_sources, mcp_source_detail, knowledge_digests, initial_workspace,
+  access) with the existing `.num` class.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
