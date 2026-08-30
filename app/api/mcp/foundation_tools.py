@@ -133,6 +133,8 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "store_rate",
     "store_status",
     "store_publish_markdown",
+    "store_read_markdown",
+    "store_edit_markdown",
     "store_compose_plugin",
     # Full agent/skill lifecycle parity (REST × CLI × MCP): discover, inspect,
     # install/remove, edit, delete — an agent can manage its own store
@@ -1400,6 +1402,76 @@ def register_foundation_tools(
         async with httpx.AsyncClient() as c:
             r = await c.post(
                 f"{base_url}/api/store/entities/from-markdown",
+                json=payload,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def store_read_markdown(entity_id: str) -> dict:
+        """Read back the Markdown of a skill or agent template you own.
+
+        The other half of ``store_publish_markdown``: revising something you
+        published starts by reading what it currently says. Owner or admin
+        only, and a bundle-authored entity answers 409 ``not_markdown_
+        authored`` — there is no single document behind it. Mirrors ``GET
+        /api/store/entities/{id}/markdown`` and ``agnes store show-md``.
+
+        Args:
+            entity_id: The store entity id (from ``store_publish_markdown``
+                       output or ``marketplace_search``).
+
+        Returns ``{"id", "type", "name", "description", "category",
+        "skill_md", "editable", "blocked_reason"}`` — ``editable`` is false
+        while a previous version is still under review.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/store/entities/{entity_id}/markdown",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def store_edit_markdown(
+        entity_id: str,
+        name: str,
+        skill_md: str,
+        description: str | None = None,
+        category: str | None = None,
+    ) -> dict:
+        """Revise a skill or agent template you own from its Markdown.
+
+        ``store_update`` edits the metadata around an entity; this replaces
+        what it SAYS. The server rebuilds the bundle from the document and
+        runs the same guardrail + review pipeline as publishing, so the result
+        may be held for review. Refused with 409 ``prior_version_pending``
+        while an earlier version is still being reviewed. Mirrors ``PUT
+        /api/store/entities/{id}/from-markdown`` and ``agnes store edit-md``.
+
+        Args:
+            entity_id:   The store entity id.
+            name:        Name — lowercase letters, digits, dashes. Pass the
+                         current name to leave it alone; a different one
+                         renames the entity.
+            skill_md:    The full replacement Markdown (frontmatter optional).
+            description: One-line *use when …* trigger.
+            category:    Optional store category (case-insensitive).
+
+        Returns the updated entity — ``{"id", "version", "visibility_status", …}``.
+        """
+        payload: dict = {"name": name, "skill_md": skill_md}
+        if description:
+            payload["description"] = description
+        if category:
+            payload["category"] = category
+        async with httpx.AsyncClient() as c:
+            r = await c.put(
+                f"{base_url}/api/store/entities/{entity_id}/from-markdown",
                 json=payload,
                 headers=headers_fn(),
                 timeout=60,

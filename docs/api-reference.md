@@ -2352,7 +2352,9 @@ reason.
 - /api/store/entities/{entity_id}
 - /api/store/entities/{entity_id}/docs/{filename}
 - /api/store/entities/{entity_id}/files
+- /api/store/entities/{entity_id}/from-markdown
 - /api/store/entities/{entity_id}/install
+- /api/store/entities/{entity_id}/markdown
 - /api/store/entities/{entity_id}/photo
 - /api/store/entities/{entity_id}/publisher
 - /api/store/entities/{entity_id}/rate

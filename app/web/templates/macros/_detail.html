@@ -629,6 +629,18 @@
 {%- if edit_in_flight -%}
   {%- set _ = items.append({'label': 'Edit', 'icon': 'edit', 'disabled': True,
       'title': 'Wait for the in-flight review to finish before editing.'}) -%}
+{%- elif entity.type in ('skill', 'agent') -%}
+  {# A skill or agent template was AUTHORED as a document, and the builder is
+     the only surface that can open one: /marketplace/flea/<id>/edit changes
+     the listing around it and takes a replacement .zip, so the body — the one
+     thing the builder wrote — was the one thing nothing could edit. Bundles
+     keep that page, because there is no single document behind them. #}
+  {%- set _ = items.append({'label': 'Edit', 'icon': 'edit',
+      'href': '/skills?edit=' ~ entity.id,
+      'title': 'Open it in the builder — its text, description and category.'}) -%}
+  {%- set _ = items.append({'label': 'Edit listing', 'icon': 'edit',
+      'href': '/marketplace/flea/' ~ entity.id ~ '/edit',
+      'title': 'Cover photo, tagline and demo video — how it looks in the marketplace.'}) -%}
 {%- else -%}
   {%- set _ = items.append({'label': 'Edit', 'icon': 'edit',
       'href': '/marketplace/flea/' ~ entity.id ~ '/edit',

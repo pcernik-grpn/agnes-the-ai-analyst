@@ -4136,6 +4136,61 @@
         "title": "EntityDraft",
         "type": "object"
       },
+      "EntityMarkdownResponse": {
+        "description": "The authored document behind a markdown-first entity, plus the fields\nthe builder edits beside it.",
+        "properties": {
+          "blocked_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocked Reason"
+          },
+          "category": {
+            "default": "",
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "editable": {
+            "default": true,
+            "title": "Editable",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_md": {
+            "title": "Skill Md",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "name",
+          "skill_md"
+        ],
+        "title": "EntityMarkdownResponse",
+        "type": "object"
+      },
       "EntityRating": {
         "description": "#398: per-user thumbs up/down tally for a store entity.\n\n``up`` / ``down`` are global counts; ``my_vote`` is the caller's own\nvote (``1`` up, ``-1`` down, ``0`` = not voted).",
         "properties": {
@@ -10976,6 +11031,47 @@
           }
         },
         "title": "UpdateDataPackageRequest",
+        "type": "object"
+      },
+      "UpdateFromMarkdownBody": {
+        "description": "The editing sibling of ``CreateFromMarkdownBody``.\n\nDeliberately narrower: type is locked on an edit (``update_entity``\nrefuses a change with 400 ``type_locked``), and access, publisher and the\npre-check token belong to publishing, not to revising.",
+        "properties": {
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_md": {
+            "title": "Skill Md",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "skill_md"
+        ],
+        "title": "UpdateFromMarkdownBody",
         "type": "object"
       },
       "UpdateGrantRequirementRequest": {
@@ -49975,6 +50071,81 @@
         ]
       }
     },
+    "/api/store/entities/{entity_id}/from-markdown": {
+      "put": {
+        "description": "Revise a markdown-authored entity from its text, as the builder holds it.\n\nThe JSON sibling of ``PUT /entities/{id}``, standing in the same relation\nto it that ``POST /entities/from-markdown`` stands to ``POST /entities``:\nit synthesizes the document into a ZIP and delegates, so versioning,\nguardrails, review, renaming and the block-while-pending rule all apply\nidentically. Nothing about the edit pipeline is reimplemented here.\n\nWhy it has to exist: the builder authors a document, and the only edit\nsurface took a replacement bundle. An author who wanted to change one\nsentence of their own skill had to reconstruct a ``.zip`` by hand.",
+        "operationId": "update_entity_from_markdown_api_store_entities__entity_id__from_markdown_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "title": "Entity Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFromMarkdownBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreEntityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Entity From Markdown",
+        "tags": [
+          "store"
+        ]
+      }
+    },
     "/api/store/entities/{entity_id}/install": {
       "delete": {
         "operationId": "uninstall_entity_api_store_entities__entity_id__install_delete",
@@ -50089,6 +50260,71 @@
           }
         },
         "summary": "Install Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/{entity_id}/markdown": {
+      "get": {
+        "description": "The entity's own markdown, so the builder that wrote it can reopen it.\n\nEditing a saved skill used to mean a different page with a different\nvocabulary that could not touch the body at all: ``/marketplace/flea/\n{id}/edit`` edits metadata and takes a replacement ``.zip``, so the one\nthing the builder authored was the one thing no surface could change.\nReading it back is the missing half of that.\n\nOwner or admin only \u2014 this is the editing path, not a public read, and\nthe 404 mirrors ``_enforce_visibility``'s no-leak refusal rather than\nadmitting the row exists.",
+        "operationId": "get_entity_markdown_api_store_entities__entity_id__markdown_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "title": "Entity Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityMarkdownResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Entity Markdown",
         "tags": [
           "store"
         ]

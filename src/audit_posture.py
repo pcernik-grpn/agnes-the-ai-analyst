@@ -490,6 +490,7 @@ POSTURE: dict[str, str] = {
     "POST /api/store/entities/{entity_id}/versions/{version_no}/restore": "store.entity.restore",
     "POST /api/store/import-bundle": "store.bundle.import",
     "PUT /api/store/entities/{entity_id}": "store.entity.update",
+    "PUT /api/store/entities/{entity_id}/from-markdown": "store.entity.update",
     "PUT /api/store/entities/{entity_id}/publisher": "store.entity.publisher",
     "PUT /api/store/entities/{entity_id}/verification": "store.entity.verification",
     # -- app.api.store_lint_admin ----------------------------------------------
@@ -957,6 +958,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/store/entities/{entity_id}": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/docs/{filename}": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/files": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}/markdown": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/photo": "exempt:static",
     "GET /api/store/entities/{entity_id}/status": "exempt:ui_support",
     "GET /api/store/owners": "exempt:ui_support",

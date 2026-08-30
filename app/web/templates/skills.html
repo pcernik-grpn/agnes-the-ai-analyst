@@ -144,6 +144,9 @@
   /* Mirrors .ag-build-head h2, minus the overflow clip — the ellipsis moved
      to the button so the menu can escape the heading. */
   .sk-titleh2 { font-size: 19px; margin: 0; min-width: 0; }
+  /* Which mode the header is in, said quietly beside the item's name. */
+  .sk-title-mode { color: var(--ds-text-muted); font-weight: 400; }
+  .sk-opening { color: var(--ds-text-muted); padding: 40px 0; }
   .sk-titlebtn { display: inline-flex; align-items: center; gap: 6px; border: none; background: none; padding: 2px 6px 2px 0;
                  font: inherit; font-size: inherit; font-weight: inherit; color: inherit; cursor: pointer; border-radius: 8px;
                  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -621,6 +624,14 @@
     'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
   var type = null;        // null → step 1 expanded, nothing below it yet
+  /* Set when this page was opened on something already saved
+     (`/skills?edit=<id>`): `{id, type, name, blockedReason}`. Editing used to
+     live on a different page in a different vocabulary that could not touch
+     the body at all — it edits listing metadata and takes a replacement .zip
+     — so the one thing this builder authors was the one thing no surface
+     could change. Everything below that reads `editing` is about keeping the
+     two modes the SAME surface: same panes, same sections, same assistant. */
+  var editing = null;
   var draft = null;       // the in-progress item in the builder
   /* Which configuration sections are folded away. Content is what an author
      is here to write, so it opens; Identity opens because it gates saving.
@@ -723,6 +734,7 @@
   /* Problems the author has to fix: [{field, text}] from the last refused
      save. Not receipts — those are toasts (see the feedback note in the CSS). */
   var problems = [];
+  var problemsAdvisory = false;
   var problemsLead = '';   // "Couldn’t save"; the count is derived, see alertsHtml
 
   /* Delegated, not duplicated — see builder_shell.js on why there is one
@@ -773,6 +785,10 @@
     // Emptying the last field is a way of throwing work away too — leaving the
     // old slot behind would resurrect the removed content on the next visit,
     // which is exactly what someone who just hit Remove did not ask for.
+    /* An edit is not a draft. Parking it under `drafts[type]` would overwrite
+       whatever new skill the author had in flight, and offer to "resume" a
+       published item on their next visit. */
+    if (editing) return 'skipped';
     if (isBlank()) { if (drafts[type]) discardDraft(type); return 'cleared'; }
     drafts[type] = JSON.parse(JSON.stringify(draft));
     drafts[type].saved_at = new Date().toISOString();
@@ -1314,7 +1330,14 @@
     document.body.classList.toggle('ag-building', !!type);
 
     if (!type) {
-      view.innerHTML = '<div class="sk-bgrid sk-bgrid--solo"><div>' + typeSectionHtml() + '</div></div>';
+      /* The alerts host belongs here too. Without it, a failure that happens
+         BEFORE a type exists — an `?edit=` id that is gone, or an entity with
+         no document behind it — set its reason and then rendered a type
+         picker with nothing above it, which reads as "your click did
+         nothing". */
+      view.innerHTML = '<div class="sk-bgrid sk-bgrid--solo"><div>' +
+        '<div id="sk-alerts">' + alertsHtml() + '</div>' +
+        typeSectionHtml() + '</div></div>';
       return;
     }
 
@@ -1778,6 +1801,13 @@
      that is what the heading is for; the MENU is always the three types. */
   function titleMenuHtml(c) {
     var label = (draft && (draft.name || '').trim()) || c.newTitle;
+    /* Editing: the type is locked (the API refuses a change with
+       `type_locked`), so a menu that offers three of them would be offering
+       something that cannot happen. */
+    if (editing) {
+      return '<span class="sk-titlewrap"><h2 id="sk-build-title" class="sk-titleh2">' +
+        esc(label) + ' <span class="sk-title-mode">— editing</span></h2></span>';
+    }
     var items = TYPE_ORDER.map(function (k) {
       var t = TYPES[k];
       return '<button type="button" role="menuitem" class="sk-typemenu-item' + (k === type ? ' is-current' : '') + '" ' +
@@ -1825,6 +1855,15 @@
     if (justSaved) {
       return '<a class="cc-btn" href="/library?new=' + encodeURIComponent(justSaved.id) + '">Open in Library</a>' +
         '<button type="button" class="cc-btn cc-btn--primary" id="sk-again">Build another ' + esc(justSaved.label) + '</button>';
+    }
+    /* Editing something saved: no draft controls (there is no draft), and the
+       primary says what it does to the thing that already exists. */
+    if (editing) {
+      var why = editing.blockedReason || blocked;
+      var eattrs = why ? ' disabled title="' + esc(why) + '" aria-label="Save changes — ' + esc(why) + '"' : '';
+      return '<a class="cc-btn" href="/library?new=' + encodeURIComponent(editing.id) + '">Cancel</a>' +
+        '<button type="button" class="cc-btn" id="sk-check"' + attrs + '>' + esc(c.checkLabel) + '</button>' +
+        '<button type="button" class="cc-btn cc-btn--primary" id="sk-save"' + eattrs + '>Save changes</button>';
     }
     return (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
           '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
@@ -2243,6 +2282,14 @@
       body: JSON.stringify(body),
     }).then(readJson);
   }
+  function putJson(url, body) {
+    return fetch(url, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(readJson);
+  }
   function postForm(url, form) {
     return fetch(url, { method: 'POST', credentials: 'same-origin', body: form }).then(readJson);
   }
@@ -2414,9 +2461,14 @@
     return out;
   }
 
-  function setProblems(lead, list) {
+  /* `advisory` marks a state the author cannot fix by editing a field — an
+     id that is gone, a review still running. The count suffix below is right
+     for a refused save ("3 things to fix") and wrong here: it would tell
+     someone to fix two sentences that are a reason and a suggestion. */
+  function setProblems(lead, list, advisory) {
     problemsLead = lead;
     problems = list || [];
+    problemsAdvisory = !!advisory;
   }
 
   function alertsHtml() {
@@ -2425,7 +2477,9 @@
     // them, and a header still claiming "2 things to fix" over one row is the
     // page arguing with itself.
     var n = problems.length;
-    var title = problemsLead + ' — ' + (n === 1 ? 'one thing to fix' : n + ' things to fix');
+    var title = problemsAdvisory
+      ? problemsLead
+      : problemsLead + ' — ' + (n === 1 ? 'one thing to fix' : n + ' things to fix');
     return '<div class="sk-alert" id="sk-alert" role="alert" tabindex="-1">' +
       '<span class="sk-alert-ico" aria-hidden="true">!</span>' +
       '<div class="sk-alert-body">' +
@@ -2488,6 +2542,7 @@
   function clearProblems() {
     if (!problems.length) return;
     problems = [];
+    problemsAdvisory = false;
     syncProblems();
   }
 
@@ -2610,6 +2665,27 @@
       if (el && el.focus) el.focus();
       inFlight = false;
       done();
+    }
+
+    /* Editing something already saved. One request: the endpoint rebuilds
+       the bundle from the document and runs the same guardrails, so there is
+       no second "publish" step to reproduce here. */
+    if (editing) {
+      putJson('/api/store/entities/' + encodeURIComponent(editing.id) + '/from-markdown', {
+        name: name,
+        description: (draft.description || '').trim(),
+        category: draft.category || null,
+        skill_md: draft.body || '',
+      })
+        .then(function (updated) {
+          var pending = updated && updated.visibility_status === 'pending';
+          toast(pending
+            ? 'Saved — the new version is with the automated review.'
+            : 'Saved.', 'success', 6000);
+          window.location.href = '/library?new=' + encodeURIComponent(editing.id);
+        })
+        .catch(fail);
+      return;
     }
 
     /* Plugins: POST the contents — the .zip itself, or the ids the server
@@ -3355,8 +3431,14 @@
      "+ Add" menu deep-links this way — the menu item already made the choice,
      so re-asking would be redundant). Otherwise step 1 leads, expanded.
      Either way a saved draft for that type is resumed rather than blanked. */
+  /* `?edit=<id>` reopens something already saved, in this builder rather than
+     on the metadata form that could not touch its body. Everything else about
+     the page is unchanged — same sections, same assistant, same Check. */
+  var editId = new URLSearchParams(window.location.search).get('edit');
   var wanted = new URLSearchParams(window.location.search).get('type');
-  if (wanted && TYPES[wanted]) {
+  if (editId) {
+    openEdit(editId);
+  } else if (wanted && TYPES[wanted]) {
     chooseType(wanted);
   } else {
     // No type yet: if exactly one draft is in flight, resume it — the author
@@ -3367,6 +3449,49 @@
     else render();
   }
   maybeSpotlightNew();
+
+  /* Load a saved item into the builder. Order matters: `chooseType` resets
+     the draft (it is how a type switch works), so `editing` is set BEFORE it
+     — persist() reads it to keep an edit out of the author's draft slots —
+     and the loaded values are written after. */
+  function openEdit(id) {
+    // Something between the click and the first paint, so the type picker
+    // does not flash up under an author who already chose what to open.
+    view.innerHTML = '<p class="sk-opening">Opening…</p>';
+    fetch('/api/store/entities/' + encodeURIComponent(id) + '/markdown', { credentials: 'same-origin' })
+      .then(readJson)
+      .then(function (body) {
+        var k = TYPES[body.type] ? body.type : 'skill';
+        editing = {
+          id: String(body.id), type: k, name: String(body.name || ''),
+          blockedReason: body.editable === false ? (body.blocked_reason || 'This item is with the reviewer.') : '',
+        };
+        chooseType(k);
+        draft.name = String(body.name || '');
+        draft.description = String(body.description || '');
+        draft.category = String(body.category || '');
+        draft.body = String(body.skill_md || '');
+        draft.source_mode = 'write';
+        // A pending review is not a mistake the author made, so it is stated
+        // once, where every other refusal lands, and the primary carries the
+        // same sentence as its tooltip.
+        if (editing.blockedReason) setProblems('Saving is closed for now', [{ text: editing.blockedReason }], true);
+        render();
+      })
+      .catch(function (e) {
+        /* A bundle-authored entity has no single document to open, and a
+           stranger's id is a 404. Say which, and offer the page that CAN act
+           on it, rather than dropping the author into an empty builder that
+           would publish a second copy. */
+        var msg = (e && e.message) || 'That item could not be opened here.';
+        editing = null;
+        setProblems('Could not open it for editing', [
+          { text: msg },
+          { text: 'Open it from the Library to see what can be changed there.' },
+        ], true);
+        render();
+      });
+  }
 })();
 </script>
 {% endblock %}

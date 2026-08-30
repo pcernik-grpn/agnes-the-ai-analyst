@@ -1634,6 +1634,83 @@ async def get_entity(
     )
 
 
+class EntityMarkdownResponse(BaseModel):
+    """The authored document behind a markdown-first entity, plus the fields
+    the builder edits beside it."""
+
+    id: str
+    type: str
+    name: str
+    description: str = ""
+    category: str = ""
+    skill_md: str
+    editable: bool = True
+    #: Set when a prior version is still under review — the update endpoint
+    #: refuses in that window (409 ``prior_version_pending``), so the builder
+    #: can say so before the author retypes their work.
+    blocked_reason: Optional[str] = None
+
+
+@router.get("/entities/{entity_id}/markdown", response_model=EntityMarkdownResponse)
+async def get_entity_markdown(
+    entity_id: str,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The entity's own markdown, so the builder that wrote it can reopen it.
+
+    Editing a saved skill used to mean a different page with a different
+    vocabulary that could not touch the body at all: ``/marketplace/flea/
+    {id}/edit`` edits metadata and takes a replacement ``.zip``, so the one
+    thing the builder authored was the one thing no surface could change.
+    Reading it back is the missing half of that.
+
+    Owner or admin only — this is the editing path, not a public read, and
+    the 404 mirrors ``_enforce_visibility``'s no-leak refusal rather than
+    admitting the row exists.
+    """
+    entity = store_entities_repo().get(entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="entity_not_found")
+    if entity["owner_user_id"] != user["id"] and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="entity_not_found")
+
+    type_ = str(entity.get("type") or "")
+    plugin_dir = _plugin_dir(entity_id)
+    doc = _find_skill_md(plugin_dir) if type_ == "skill" else _find_agent_md(plugin_dir)
+    if doc is None:
+        # A plugin assembled from a .zip has no single authored document, so
+        # there is nothing for the builder to open. Say which it is rather
+        # than returning an empty body the author would then "edit" into a
+        # replacement for their whole bundle.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_markdown_authored",
+                "message": (
+                    "This entity was published as a bundle, so there is no single document to edit. "
+                    "Upload a new version from its detail page instead."
+                ),
+            },
+        )
+
+    blocked_reason = None
+    latest = store_submissions_repo().latest_for_entity(entity_id)
+    if latest and latest.get("status") in ("pending_inline", "pending_llm"):
+        blocked_reason = "A previous version is still under review. Saving is refused until it resolves."
+
+    return EntityMarkdownResponse(
+        id=str(entity["id"]),
+        type=type_,
+        name=str(entity.get("name") or ""),
+        description=str(entity.get("description") or ""),
+        category=str(entity.get("category") or ""),
+        skill_md=doc.read_text(encoding="utf-8", errors="replace"),
+        editable=blocked_reason is None,
+        blocked_reason=blocked_reason,
+    )
+
+
 @router.get("/entities/{entity_id}/files")
 async def list_entity_files(
     entity_id: str,
@@ -2361,6 +2438,104 @@ async def create_entity_from_markdown(
     finally:
         _precheck_verdict_ctx.reset(ctx_tok)
     return created
+
+
+class UpdateFromMarkdownBody(BaseModel):
+    """The editing sibling of ``CreateFromMarkdownBody``.
+
+    Deliberately narrower: type is locked on an edit (``update_entity``
+    refuses a change with 400 ``type_locked``), and access, publisher and the
+    pre-check token belong to publishing, not to revising.
+    """
+
+    name: str
+    description: Optional[str] = None
+    category: Optional[str] = None
+    skill_md: str
+
+
+@router.put("/entities/{entity_id}/from-markdown", response_model=StoreEntityResponse)
+async def update_entity_from_markdown(
+    entity_id: str,
+    body: UpdateFromMarkdownBody,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Revise a markdown-authored entity from its text, as the builder holds it.
+
+    The JSON sibling of ``PUT /entities/{id}``, standing in the same relation
+    to it that ``POST /entities/from-markdown`` stands to ``POST /entities``:
+    it synthesizes the document into a ZIP and delegates, so versioning,
+    guardrails, review, renaming and the block-while-pending rule all apply
+    identically. Nothing about the edit pipeline is reimplemented here.
+
+    Why it has to exist: the builder authors a document, and the only edit
+    surface took a replacement bundle. An author who wanted to change one
+    sentence of their own skill had to reconstruct a ``.zip`` by hand.
+    """
+    entity = store_entities_repo().get(entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="entity_not_found")
+    if entity["owner_user_id"] != user["id"] and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="entity_not_found")
+
+    type_ = str(entity.get("type") or "")
+    if type_ not in ("skill", "agent"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_markdown_authored",
+                "message": (
+                    "This entity was published as a bundle, so it cannot be revised from a document. "
+                    "Upload a new version from its detail page instead."
+                ),
+            },
+        )
+
+    name = body.name.strip()
+    if not _NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid_name_format")
+
+    # Same normalization as the create sibling: synthesize frontmatter only
+    # when the author's text does not already carry it, anchored the way
+    # parse_frontmatter anchors.
+    text = body.skill_md.lstrip()
+    if not _FRONTMATTER_RE.match(text):
+        import yaml
+
+        fm = yaml.safe_dump(
+            {"name": name, "description": body.description or ""},
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        text = f"---\n{fm}---\n\n{text}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if type_ == "agent":
+            zf.writestr(f"{name}.md", text)
+        else:
+            zf.writestr(f"{name}/SKILL.md", text)
+    buf.seek(0)
+    upload = UploadFile(file=buf, filename=f"{name}.zip")
+
+    return await update_entity(
+        entity_id,
+        background_tasks,
+        file=upload,
+        name=name,
+        type=None,  # locked server-side; sending it can only earn a 400
+        description=body.description,
+        category=body.category,
+        video_url=None,
+        title=None,
+        tagline=None,
+        photo=None,
+        user=user,
+        conn=conn,
+    )
 
 
 # ---------------------------------------------------------------------------
