@@ -97,6 +97,18 @@ async def create_token(
     if not canonical:
         raise HTTPException(status_code=401, detail="User not found")
 
+    from app.auth.providers.sso import sso_forced_for_email
+
+    if sso_forced_for_email(email):
+        # Forced to the sso door — the copy this endpoint already answers
+        # for accounts with no password hash. Judged AFTER the existence
+        # lookup so an unknown address answers the same 401 on both sides
+        # of the allowlist (no domain oracle for arbitrary strings).
+        raise HTTPException(
+            status_code=401,
+            detail="This account uses external authentication. Please log in via your configured provider.",
+        )
+
     # `canonical` answers "which account is this address" (oldest wins), which
     # is the wrong resolution for a credential: where two case variants of one
     # address coexist, the password hash may sit on the newer row. So the

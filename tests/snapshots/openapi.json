@@ -506,6 +506,45 @@
         "title": "ArchiveSessionBody",
         "type": "object"
       },
+      "AuditEventIn": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "observed_at": {
+            "title": "Observed At",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "observed_at"
+        ],
+        "title": "AuditEventIn",
+        "type": "object"
+      },
+      "AuditEventsUploadRequest": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventIn"
+            },
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "title": "AuditEventsUploadRequest",
+        "type": "object"
+      },
       "BannerResponse": {
         "properties": {
           "content": {
@@ -858,6 +897,17 @@
           "file"
         ],
         "title": "Body_import_metrics_api_admin_metrics_import_post",
+        "type": "object"
+      },
+      "Body_logout_submit_auth_logout_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          }
+        },
+        "title": "Body_logout_submit_auth_logout_post",
         "type": "object"
       },
       "Body_password_login_web_auth_password_login_web_post": {
@@ -1309,6 +1359,72 @@
           "email"
         ],
         "title": "BootstrapRequest",
+        "type": "object"
+      },
+      "BuilderMessage": {
+        "description": "One turn of the transcript, as the page replays it.",
+        "properties": {
+          "role": {
+            "maxLength": 16,
+            "title": "Role",
+            "type": "string"
+          },
+          "text": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "BuilderMessage",
+        "type": "object"
+      },
+      "BuilderTurnRequest": {
+        "properties": {
+          "apply": {
+            "default": true,
+            "title": "Apply",
+            "type": "boolean"
+          },
+          "config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          },
+          "plugin_candidates": {
+            "items": {
+              "$ref": "#/components/schemas/PluginCandidate"
+            },
+            "title": "Plugin Candidates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "BuilderTurnRequest",
         "type": "object"
       },
       "BulkUpdateRequest": {
@@ -2528,6 +2644,73 @@
         "title": "CreateDraftRequest",
         "type": "object"
       },
+      "CreateFromComponentsBody": {
+        "description": "JSON contract for composing a plugin out of Library entities.\n\nDeliberately the same metadata fields as ``CreateFromMarkdownBody`` \u2014 the\nbuilder posts one shape or the other depending on which source the author\npicked, and both delegate to ``create_entity`` so quota, guardrails, LLM\nreview, naming and versioning apply identically.",
+        "properties": {
+          "access": {
+            "default": "everyone",
+            "enum": [
+              "private",
+              "everyone"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "components": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "publisher_kind": {
+            "default": "user",
+            "enum": [
+              "user",
+              "organization"
+            ],
+            "title": "Publisher Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateFromComponentsBody",
+        "type": "object"
+      },
       "CreateFromMarkdownBody": {
         "description": "JSON contract for markdown-first publishing (studio Skill Builder /\nAgent Builder).",
         "properties": {
@@ -3208,6 +3391,16 @@
             ],
             "title": "Agent Slug"
           },
+          "preview_skill": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviewSkill"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "profile": {
             "anyOf": [
               {
@@ -3614,6 +3807,19 @@
         "title": "DatasourceSecretBody",
         "type": "object"
       },
+      "DelegateRequest": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "DelegateRequest",
+        "type": "object"
+      },
       "DeployRequest": {
         "properties": {
           "mode": {
@@ -3904,6 +4110,37 @@
         "title": "EnqueueJobRequest",
         "type": "object"
       },
+      "EntityDraft": {
+        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "category": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "EntityDraft",
+        "type": "object"
+      },
       "EntityRating": {
         "description": "#398: per-user thumbs up/down tally for a store entity.\n\n``up`` / ``down`` are global counts; ``my_vote`` is the caller's own\nvote (``1`` up, ``-1`` down, ``0`` = not voted).",
         "properties": {
@@ -3926,7 +4163,45 @@
         "title": "EntityRating",
         "type": "object"
       },
+      "EntityTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EntityDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 16,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "message"
+        ],
+        "title": "EntityTurnRequest",
+        "type": "object"
+      },
       "FactsCorrectionRequest": {
+        "additionalProperties": false,
         "properties": {
           "reason": {
             "maxLength": 2000,
@@ -3947,9 +4222,57 @@
         "title": "FactsCorrectionRequest",
         "type": "object"
       },
-      "FactsIngestRequest": {
-        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.",
+      "FactsIngestAnonymizationReport": {
+        "description": "OPTIONAL producer declaration that (some of) this batch went through\nthe anonymize-in-front pipeline (spec \u00a79: source -> crawl -> convert ->\nanonymize -> Agnes) before ingestion. Additive to the wire contract \u2014 a\nproducer that never anonymizes omits this field entirely.\n\n``scopes`` is keyed by ``corpus_id`` (the collection id, matching the\nconnect wizard's own scope-row shape); a key that does not resolve to a\nreal collection is KEPT, not rejected \u2014 this is a self-reported tally,\nnot a join against ``file_corpora`` (spec \u00a79.2's \"current limits\": Agnes\nrecords the declaration, it cannot verify the content was anonymized).",
         "properties": {
+          "declared": {
+            "default": false,
+            "title": "Declared",
+            "type": "boolean"
+          },
+          "scopes": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FactsIngestAnonymizationScope"
+            },
+            "title": "Scopes",
+            "type": "object"
+          }
+        },
+        "title": "FactsIngestAnonymizationReport",
+        "type": "object"
+      },
+      "FactsIngestAnonymizationScope": {
+        "description": "One corpus's anonymization tally within this batch (spec \u00a79.2). A\nself-reported COUNT, never independently verified by Agnes \u2014 see\n``docs/anonymization.md``'s \"current limits\".",
+        "properties": {
+          "docs_anonymized": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Docs Anonymized",
+            "type": "integer"
+          },
+          "docs_skipped": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Docs Skipped",
+            "type": "integer"
+          }
+        },
+        "title": "FactsIngestAnonymizationScope",
+        "type": "object"
+      },
+      "FactsIngestRequest": {
+        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.\n\n``anonymization`` is the one exception: a small, OPTIONAL, strictly\ntyped block (spec \u00a79.2) \u2014 malformed input there is a real protocol\nerror (422), not tolerated crawler noise.",
+        "properties": {
+          "anonymization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactsIngestAnonymizationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "documents": {
             "items": {
               "additionalProperties": true,
@@ -3986,6 +4309,7 @@
         "type": "object"
       },
       "FactsNeighborsRequest": {
+        "additionalProperties": false,
         "properties": {
           "depth": {
             "default": 1,
@@ -4034,6 +4358,7 @@
         "type": "object"
       },
       "FactsSearchRequest": {
+        "additionalProperties": false,
         "properties": {
           "filters": {
             "anyOf": [
@@ -4053,6 +4378,18 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "q": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Q"
           },
           "type": {
             "anyOf": [
@@ -4086,6 +4423,56 @@
           "size"
         ],
         "title": "FileEntry",
+        "type": "object"
+      },
+      "FreezeRequest": {
+        "properties": {
+          "hours": {
+            "maximum": 72.0,
+            "minimum": 1.0,
+            "title": "Hours",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "hours"
+        ],
+        "title": "FreezeRequest",
+        "type": "object"
+      },
+      "FreezeStatus": {
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until"
+          },
+          "until_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until Epoch"
+          }
+        },
+        "required": [
+          "active"
+        ],
+        "title": "FreezeStatus",
         "type": "object"
       },
       "GrantResponse": {
@@ -5586,6 +5973,11 @@
             "title": "Id",
             "type": "string"
           },
+          "is_builtin": {
+            "default": false,
+            "title": "Is Builtin",
+            "type": "boolean"
+          },
           "last_commit_sha": {
             "anyOf": [
               {
@@ -5661,6 +6053,39 @@
             ],
             "title": "Registered By"
           },
+          "token_env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Env"
+          },
+          "token_set_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Set At"
+          },
+          "token_set_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Set By"
+          },
           "url": {
             "title": "Url",
             "type": "string"
@@ -5714,6 +6139,79 @@
         "title": "MaterializeRequest",
         "type": "object"
       },
+      "McpDraft": {
+        "description": "The panel as it stands. Untrusted; used only to build the prompt.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "auth_decided": {
+            "default": false,
+            "title": "Auth Decided",
+            "type": "boolean"
+          },
+          "auth_method": {
+            "default": "",
+            "maxLength": 32,
+            "title": "Auth Method",
+            "type": "string"
+          },
+          "auth_secret_env": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Auth Secret Env",
+            "type": "string"
+          },
+          "command": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Command",
+            "type": "string"
+          },
+          "introspected": {
+            "default": false,
+            "title": "Introspected",
+            "type": "boolean"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "scope": {
+            "default": "shared",
+            "maxLength": 16,
+            "title": "Scope",
+            "type": "string"
+          },
+          "tool_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tool Names",
+            "type": "array"
+          },
+          "transport": {
+            "default": "http",
+            "maxLength": 16,
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "default": "",
+            "maxLength": 2048,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "title": "McpDraft",
+        "type": "object"
+      },
       "McpEntry": {
         "properties": {
           "description": {
@@ -5747,6 +6245,35 @@
           "name"
         ],
         "title": "McpEntry",
+        "type": "object"
+      },
+      "McpTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "title": "McpTurnRequest",
         "type": "object"
       },
       "MemberResponse": {
@@ -6364,6 +6891,70 @@
         "title": "OwnerOption",
         "type": "object"
       },
+      "PackageDraft": {
+        "description": "The drawer's unsaved state. Used only to build the prompt.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "tables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tables",
+            "type": "array"
+          }
+        },
+        "title": "PackageDraft",
+        "type": "object"
+      },
+      "PackageTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PackageDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "PackageTurnRequest",
+        "type": "object"
+      },
       "PassthroughToolDTO": {
         "description": "Slimmed-down tool_registry row for the stdio client's tool list.",
         "properties": {
@@ -6589,6 +7180,33 @@
           "pinned"
         ],
         "title": "PinSessionBody",
+        "type": "object"
+      },
+      "PluginCandidate": {
+        "description": "A capability the page is offering in its picker.\n\nSent by the client because the marketplace ids the picker uses are\nassembled there (curated \u222a store, with their display prefixes); the\nserver validates the model's choices against this same list. Safe as a\ncandidate set for the reason in the module docstring: a declared scope id\ngrants nothing on its own.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 400,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 200,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PluginCandidate",
         "type": "object"
       },
       "PluginDetailResponse": {
@@ -7158,6 +7776,25 @@
         "title": "PolicyPreviewRequest",
         "type": "object"
       },
+      "PreviewAgentRequest": {
+        "description": "The draft template to try out. Body only \u2014 a template carries no data\naccess of its own, and the preview must not invent any.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "PreviewAgentRequest",
+        "type": "object"
+      },
       "PreviewComponent": {
         "properties": {
           "description": {
@@ -7231,6 +7868,92 @@
           "message"
         ],
         "title": "PreviewFieldIssue",
+        "type": "object"
+      },
+      "PreviewIntrospectRequest": {
+        "description": "A connection the admin has typed but not yet registered.",
+        "properties": {
+          "args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Args"
+          },
+          "auth_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Method"
+          },
+          "auth_secret_env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Secret Env"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env"
+          },
+          "transport": {
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "transport"
+        ],
+        "title": "PreviewIntrospectRequest",
         "type": "object"
       },
       "PreviewRequest": {
@@ -7308,6 +8031,25 @@
           "type"
         ],
         "title": "PreviewResponse",
+        "type": "object"
+      },
+      "PreviewSkill": {
+        "description": "A draft skill to make invokable for one session. Both fields are\nuntrusted; see the note on CreateSessionBody.preview_skill.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "PreviewSkill",
         "type": "object"
       },
       "ProjectionMapRequest": {
@@ -8157,6 +8899,25 @@
         "title": "RunScriptRequest",
         "type": "object"
       },
+      "RunnerEventPayload": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Params",
+            "type": "object"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "RunnerEventPayload",
+        "type": "object"
+      },
       "SampleInteraction": {
         "description": "Example dialog shown in the \"Sample interaction\" section.\n\n``assistant`` is markdown \u2014 the API pre-renders to safe HTML in\n``assistant_html`` so the template can inject without a client-side\nmarkdown lib. ``assistant`` stays as the source for copy-paste / future\nre-rendering needs.",
         "properties": {
@@ -8642,6 +9403,19 @@
         "title": "SetupTokenItem",
         "type": "object"
       },
+      "ShareRequestDecisionRequest": {
+        "properties": {
+          "decision": {
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "ShareRequestDecisionRequest",
+        "type": "object"
+      },
       "ShareStateResponse": {
         "properties": {
           "group_ids": {
@@ -8649,6 +9423,13 @@
               "type": "string"
             },
             "title": "Group Ids",
+            "type": "array"
+          },
+          "pending_group_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pending Group Ids",
             "type": "array"
           },
           "resource_id": {
@@ -8792,6 +9573,55 @@
           "mode"
         ],
         "title": "SourceRequest",
+        "type": "object"
+      },
+      "SsoConfigBody": {
+        "properties": {
+          "allowed_email_domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Email Domains",
+            "type": "array"
+          },
+          "client_id": {
+            "title": "Client Id",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "client_id",
+          "display_name",
+          "allowed_email_domains"
+        ],
+        "title": "SsoConfigBody",
+        "type": "object"
+      },
+      "SsoSecretBody": {
+        "properties": {
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "SsoSecretBody",
         "type": "object"
       },
       "StoreEntityListResponse": {
@@ -11801,7 +12631,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.90.0"
+    "version": "0.91.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -12470,9 +13300,9 @@
       }
     },
     "/admin/chat/{chat_id}/tail-ticket": {
-      "get": {
-        "description": "Issue a short-TTL one-shot ticket for the tail WebSocket.\n\nThe WebSocket itself can't carry the admin's session cookie/Authorization\nreliably across browsers (Safari in particular strips cookies on WS\nupgrades from `fetch`), so we mint a ticket here under the normal admin\nauth flow and the JS hands it to the WS as a query parameter.",
-        "operationId": "tail_ticket_admin_chat__chat_id__tail_ticket_get",
+      "post": {
+        "description": "Issue a short-TTL one-shot ticket for the tail WebSocket.\n\nThe WebSocket itself can't carry the admin's session cookie/Authorization\nreliably across browsers (Safari in particular strips cookies on WS\nupgrades from `fetch`), so we mint a ticket here under the normal admin\nauth flow and the JS hands it to the WS as a query parameter.\n\nPOST, not GET, for two reasons that are the same reason: minting a\ncredential is a state change, and the brokered admin-READ surface\n(``app/api/broker.py``) replays every ``GET``/``HEAD`` admin route under\nthe caller's resolved identity precisely BECAUSE \"never mutate on GET\" is\nsupposed to hold. As a GET this route was the counterexample \u2014 a chat\nsandbox could ask the broker for it and get back a live ticket for\n``/admin/chat/{any_chat_id}/tail``, i.e. read another user's live session.\nThe sandbox runs an agent that any document it reads can prompt-inject, so\nthat is a real path, not a theoretical one. Guarded by\n``tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential``.",
+        "operationId": "tail_ticket_admin_chat__chat_id__tail_ticket_post",
         "parameters": [
           {
             "in": "path",
@@ -12506,7 +13336,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": true,
-                  "title": "Response Tail Ticket Admin Chat  Chat Id  Tail Ticket Get",
+                  "title": "Response Tail Ticket Admin Chat  Chat Id  Tail Ticket Post",
                   "type": "object"
                 }
               }
@@ -12801,6 +13631,56 @@
           }
         },
         "summary": "Admin Data Packages",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/data-packages/new": {
+      "get": {
+        "description": "Author a data package, in the same builder shell /agents and /skills use.\n\nA PAGE, not the drawer. The drawer is right where it is used \u2014 mid-sentence\non /admin/tables, assigning a table to a package that does not exist yet \u2014\nbecause it opens over the lens you are standing on and gives it back. A\nworkspace is the opposite: it is where you have gone to do the thing, and\nit should look like the other two places you go to do the thing.\n\nThe FORM is still the drawer component's; this route only gives it a page\nto render into (`mount`), so there is one implementation of a package's\nfields and grants rather than two that drift.",
+        "operationId": "admin_package_builder_admin_data_packages_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Package Builder",
         "tags": [
           "web"
         ]
@@ -13324,6 +14204,56 @@
         ]
       }
     },
+    "/admin/linked-apps/new": {
+      "get": {
+        "description": "Publish externally-hosted apps into the Library, in the builder shell.\n\n/admin/linked-apps stays as the wizard for now; this is the path the\nLibrary's \"+ Add\" reaches. What it fixes is the two things that made the\nwizard an operator-hostile surface: step 1 asked which MCP source to read\napps from, with a dead end under it (\"Not registered yet? Register one\nfirst, then come back\"), and step 2 asked for a projection map \u2014 which\nresponse field is the app's name, which is its URL.\n\nA projection map is an integration author's artifact. The adapter already\nfalls back to alias guesses (src/data_apps/keboola_adapter.py), so the\nmapping is an escape hatch shown only when a row came back that the aliases\ncould not read, and the source and its lister tool are detected rather than\nchosen.",
+        "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Linked Apps Builder",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/marketplaces": {
       "get": {
         "description": "Admin page for marketplace git repositories (register / sync / delete).",
@@ -13419,6 +14349,56 @@
           }
         },
         "summary": "Admin Mcp Sources Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/mcp-sources/new": {
+      "get": {
+        "description": "Connect a tool server, in the same builder shell the other four use.\n\n/admin/mcp-sources stays the LIST. What moved here is the create path,\nwhich was the least builder-shaped surface in the product: a modal with\neleven fields, then a second page to introspect, curate the tools and grant\nthem \u2014 an order the admin was expected to know, with no way to find out\nwhether the server was even reachable until step three.\n\nIt suits the shell better than it looks. The procedure is fixed, so the\nconversation sequences work and reports what the server said rather than\ninventing anything; the exact values still arrive by paste, into fields,\nbecause a URL and an env var name are values from another system.",
+        "operationId": "admin_mcp_builder_admin_mcp_sources_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Mcp Builder",
         "tags": [
           "web"
         ]
@@ -13960,7 +14940,7 @@
     },
     "/admin/store": {
       "get": {
-        "description": "Moderation & Trust \u2014 one admin surface for entity verification,\nsubmission review, and marketplace curation.\n\nLists Store entities awaiting verification (``verification_state='requested'``)\nwith a direct link to each entity's detail page, where the Verify /\nRequest changes / Archive / Override actions live. The pre-publish\nsubmission queue and marketplace curation are surfaced as links (count +\njump-off), not rebuilt here. ``/admin/store`` is the natural parent of the\n``/admin/store/submissions`` review queue.",
+        "description": "Moderation & Trust \u2014 one admin surface for entity verification,\nsubmission review, and marketplace curation.\n\nLists Store entities awaiting verification (``verification_state='requested'``)\nwith a direct link to each entity's detail page, where the Verify /\nRequest changes / Archive / Override actions live. The pre-publish\nsubmission queue and marketplace curation are surfaced as links (count +\njump-off), not rebuilt here. ``/admin/store`` is the natural parent of the\n``/admin/store/submissions`` review queue.\n\nHidden by default (``features.store_moderation_enabled``): the two links\nit surfaces are their own nav rows, and verification has its own switch,\nso the page was a landing spot for doors already in the column. Redirect\nrather than 404 \u2014 its entry points were a sidebar row and a palette shortcut,\nand a bookmark from before the flip should land somewhere useful.\n\nNOTE: this page is the only UI that renders the queued agent-share\napprovals (Track C6). While it is hidden they are decided through\n``GET/PATCH /api/admin/share-requests`` only, which is deliberate \u2014 owner-\ninitiated agent sharing is itself V2-deferred in the agent-profiles spec,\nso on a default instance the queue this page would show is empty.",
         "operationId": "admin_moderation_hub_page_admin_store_get",
         "parameters": [
           {
@@ -14838,7 +15818,7 @@
     },
     "/agents": {
       "get": {
-        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nWork-in-progress surface (rail item carries a WIP badge). The builder's\ningredient lists are REAL and RBAC-scoped: knowledge sources are the data\npackages + memory domains resolved from the caller's stack (same\n``StackResolver`` reads as /stack), and capabilities hydrate client-side\nfrom ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).\nAgent definitions themselves persist in the browser for now \u2014 a server\nregistry is the next iteration, so the page states that plainly rather\nthan pretending drafts are shared.",
+        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artefact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
         "operationId": "agents_page_agents_get",
         "parameters": [
           {
@@ -15086,6 +16066,24 @@
                 }
               ],
               "title": "Source"
+            }
+          },
+          {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+              "title": "Trail"
             }
           },
           {
@@ -16916,6 +17914,70 @@
         "summary": "Create Data Package",
         "tags": [
           "data-packages"
+        ]
+      }
+    },
+    "/api/admin/data-packages/builder/turn": {
+      "post": {
+        "description": "Run one turn of the data-package builder. Proposes; never writes.\n\nReturns ``{reply, patch, suggestions}``. Nothing here creates a package\nor writes a grant \u2014 see the module docstring for why that is a rule\nrather than a default.",
+        "operationId": "package_builder_turn_api_admin_data_packages_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Package Builder Turn",
+        "tags": [
+          "admin"
         ]
       }
     },
@@ -19796,6 +20858,134 @@
           }
         },
         "summary": "Create Mcp Source",
+        "tags": [
+          "admin-mcp"
+        ]
+      }
+    },
+    "/api/admin/mcp-sources/builder/turn": {
+      "post": {
+        "description": "Run one turn of the MCP builder. Proposes into the panel; writes nothing.\n\nRegistering the source, storing its secret and granting its tools are all\nthe admin's own button presses, made against a panel they can read.",
+        "operationId": "mcp_builder_turn_api_admin_mcp_sources_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mcp Builder Turn",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/mcp-sources/preview-introspect": {
+      "post": {
+        "description": "Dial a connection the admin has typed and list its tools. Writes nothing.\n\nThe builder needs to show what a server exposes BEFORE the admin presses\nSave \u2014 you cannot sensibly choose which tools to grant, or name the source,\nwithout seeing them. The alternative was registering a disabled row first\nand introspecting that, which puts a source in the list that the admin\nnever agreed to create.\n\nSame shape as ``POST /entities/preview``: the values that would be saved\ngo in, a verdict comes back, and the temp state is gone before the response\nis. It builds a row-shaped dict and runs the SAME guard and the SAME\nintrospection the registered path does \u2014 a probe dials with a credential\nattached, so it takes the configuration-time url check whether or not a row\nexists yet.\n\nThe secret is NOT in this payload and never should be: ``auth_secret_env``\nnames an environment variable, and the credential resolves out of the vault\nexactly as it does for a registered source. A connection whose secret is not\nstored yet fails here with the reason, which is the truthful answer \u2014 store\nit, then check.\n\nAudited like its registered sibling above, and for the same reason rather\nthan for symmetry: writing nothing is what would make this endpoint the\nexception. It dials a network endpoint with a credential attached, or \u2014 on\n``stdio`` \u2014 launches a subprocess with a command the caller supplied. That\nis the same authority the registered path has, held by the same principal,\nbut the registered path always leaves a row behind and this one leaves\nnothing, so the audit entry is the only trace that it happened.",
+        "operationId": "preview_introspect_mcp_source_api_admin_mcp_sources_preview_introspect_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewIntrospectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Introspect Mcp Source",
         "tags": [
           "admin-mcp"
         ]
@@ -22967,7 +24157,7 @@
     },
     "/api/admin/observability/facets": {
       "get": {
-        "description": "Return the distinct facet values present in `audit_log` for the\nselected window, each with a count \u2014 under the SAME filters the\ntimeline uses, so dropdown counts always describe rows the table can\nactually show. `include_self_reads` defaults to False: the Activity\nCenter's own `activity.read` audit rows are hidden unless asked for.\n\nCounts are capped at 50 per facet (largest first). 50 is comfortable in\na dropdown; tighter windows usually have <20 anyway.",
+        "description": "Return the distinct facet values present across the unified timeline\n(audit_log + sync_history + llm_usage + agent_scope_snapshots) for the\nselected window, each with a count \u2014 under the SAME filters the\ntimeline uses, so dropdown counts always describe rows the table can\nactually show. `include_self_reads` defaults to False: the Activity\nCenter's own `activity.read` audit rows are hidden unless asked for.\n\nCounts are capped at 50 per facet (largest first). 50 is comfortable in\na dropdown; tighter windows usually have <20 anyway.",
         "operationId": "facets_api_admin_observability_facets_get",
         "parameters": [
           {
@@ -23095,6 +24285,24 @@
             }
           },
           {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+              "title": "Trail"
+            }
+          },
+          {
             "in": "query",
             "name": "include_self_reads",
             "required": false,
@@ -23155,7 +24363,7 @@
     },
     "/api/admin/observability/kpis": {
       "get": {
-        "description": "KPIs for the top-bar cards \u2014 same filter surface as the timeline, so\nthe cards and the table can never tell different stories. `active_users`\ncounts people (scheduler/system actors excluded); `errors` counts\nresult_class='error'; `duration_coverage` says what fraction of rows\ncarry a measured duration (feeds the p95 card's honesty sub-label).",
+        "description": "KPIs for the top-bar cards \u2014 same filter surface as the (unified)\ntimeline, so the cards and the table can never tell different stories.\n`active_users` counts people (scheduler/system actors excluded);\n`errors` counts result_class='error'; `duration_coverage` says what\nfraction of rows carry a measured duration (feeds the p95 card's\nhonesty sub-label).",
         "operationId": "kpis_api_admin_observability_kpis_get",
         "parameters": [
           {
@@ -23280,6 +24488,24 @@
                 }
               ],
               "title": "Source"
+            }
+          },
+          {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+              "title": "Trail"
             }
           },
           {
@@ -27951,9 +29177,234 @@
         ]
       }
     },
+    "/api/admin/share-requests": {
+      "get": {
+        "description": "Comma-separated ``status`` (``pending``/``approved``/``rejected``),\ne.g. ``?status=pending``. Omitted returns every decision, newest first \u2014\nthe queue is also the audit trail of past approve/reject calls.",
+        "operationId": "list_share_requests_api_admin_share_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "skip",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Skip",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Share Requests",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
+    "/api/admin/share-requests/{request_id}": {
+      "patch": {
+        "operationId": "decide_share_request_api_admin_share_requests__request_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRequestDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Decide Share Request",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/certificate": {
+      "get": {
+        "description": "Read-only certificate metadata for the connection's already-stored\nPEM \u2014 thumbprint (the ``x5t`` value the client actually presents, plus\nthe conventional uppercase-hex fingerprint), subject/issuer, validity\nwindow, and a derived ``ok``/``expiring_soon``/``expired`` status. Two\nreal failure modes this closes: a registered certificate that does not\nmatch what the connection actually presents (opaque provider auth\nerror), and a certificate expiring silently (crawl/sync fails with no\nwarning).\n\nNever the private key \u2014 only :func:`connectors.sharepoint.graph_client.\ncertificate_metadata`'s CERTIFICATE-block parse reaches the response.\nNo certificate configured, or a certificate that fails to resolve or\nparse, is a typed absence (``certificate: null`` plus ``reason``) \u2014\nnever a 500.",
+        "operationId": "certificate_api_admin_sharepoint_connections__connection_id__certificate_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Certificate",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
-        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.\n\nDeliberately does NOT carry ``anonymize`` \u2014 that would break this\nendpoint's flat, backward-compatible shape. A producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).",
         "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
         "parameters": [
           {
@@ -28009,6 +29460,69 @@
           }
         },
         "summary": "Corpus Map",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/extract": {
+      "post": {
+        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``extraction.enabled`` is false) or ``409\nextraction_producer_not_configured`` (neither ``extraction.producer\n.command`` nor ``.module`` is set) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
+        "operationId": "trigger_extraction_api_admin_sharepoint_connections__connection_id__extract_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Extraction",
         "tags": [
           "admin"
         ]
@@ -28215,7 +29729,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/tree": {
       "get": {
-        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). Both -> the drive's root children. Exactly\n\"sites -> drives -> root children, one level per call\" (spec \u00a713.2) \u2014\nthere is no deeper recursive browse; a folder's own children are not\nfetched until the admin picks it.",
+        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). ``drive_id`` -> the drive's root children.\n``drive_id`` + ``item_id`` -> that folder's own children (TCRD-240:\nsubfolder browsing at any depth \u2014 ``item_id`` is the previous call's own\nitem id, never a path, and is structurally validated before it reaches\na Graph URL).\n\n``with_permissions=1`` (default off) additionally probes each listed\nFOLDER for ``hasUniqueRoleAssignments`` \u2014 an ADVISORY-ONLY signal\n(Decision #2: Agnes never derives or enforces anything from a\nSharePoint ACL; see :func:`connectors.sharepoint.graph_client.\nprobe_unique_permissions`) \u2014 and adds ``unique_permissions:\ntrue|false|null`` to each folder item. Off by default so plain browsing\nnever pays for it; batched and bounded\n(:data:`_MAX_PERMISSION_PROBE_ITEMS`) when on, and a probe failure never\nfails the browse itself \u2014 affected folders just come back ``null``\n(\"unknown\").",
         "operationId": "browse_tree_api_admin_sharepoint_connections__connection_id__tree_get",
         "parameters": [
           {
@@ -28257,6 +29771,32 @@
                 }
               ],
               "title": "Drive Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "item_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Item Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "with_permissions",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "With Permissions",
+              "type": "boolean"
             }
           },
           {
@@ -28303,6 +29843,200 @@
           }
         },
         "summary": "Browse Tree",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/tree/search": {
+      "get": {
+        "description": "Bounded breadth-first folder search (TCRD-240) \u2014 the server-side\nstand-in for Graph's own ``/search``, which silently under-returns\nunder app-only auth (``connectors.sharepoint.graph_client`` module\ndocstring). Never a single call: it walks ``.../root/children`` and\n``.../items/{id}/children`` the same way the tree browser does, capped\nby ``max_depth``/``max_visited`` \u2014 CLAMPED to their caps\n(:data:`_SEARCH_MAX_DEPTH_CAP` / :data:`_SEARCH_MAX_VISITED_CAP`) rather\nthan rejected, so asking for more than the server allows still returns\nthe best bounded answer instead of a 422.\n\nRoot: ``drive_id`` + ``item_id`` scopes to that folder's subtree;\n``drive_id`` alone scopes to the whole drive; neither given searches\nevery drive of every reachable site. ``item_id`` without ``drive_id``\nis rejected \u2014 there is no drive to resolve it against.\n\nA site or folder the app registration cannot read (Graph 403/404) is\nskipped, not fatal \u2014 app-only permissions are never uniform across a\nreal tenant. It is never silently dropped: see ``skipped`` below.\n\nResponse: ``{matches: [{item_id, drive_id, display_path}], visited,\ntruncated, skipped, hint}``.\n\n- ``truncated`` is ``True`` whenever a cap (``max_depth``/``max_visited``)\n  is what stopped the walk \u2014 never a silently partial result.\n- ``visited`` is how many \"list children\" calls it took to get there.\n- ``skipped`` lists every site/folder the walk could not enter for\n  permissions reasons, each as ``{scope: \"site\"|\"folder\", reason:\n  \"forbidden\"|\"not_found\", status_code, site_id, site_name, drive_id,\n  item_id, display_path}`` \u2014 deliberately separate from ``truncated``:\n  a cap and a permission refusal are different facts and call for\n  different admin actions (narrow the search vs. request access).\n- ``hint`` is a short, actionable string (scope the search, narrow the\n  pattern) when ``truncated`` is ``True``, else ``null`` \u2014 unrelated to\n  ``skipped``, which speaks for itself.",
+        "operationId": "search_tree_api_admin_sharepoint_connections__connection_id__tree_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "minLength": 2,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "default": "prefix",
+              "enum": [
+                "prefix",
+                "contains",
+                "glob"
+              ],
+              "title": "Mode",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "drive_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Drive Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "item_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Item Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_depth",
+            "required": false,
+            "schema": {
+              "default": 5,
+              "title": "Max Depth",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_visited",
+            "required": false,
+            "schema": {
+              "default": 2000,
+              "title": "Max Visited",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Tree",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/extraction/run-due": {
+      "post": {
+        "description": "Scheduler-driven sweep (TCRD-226): fires ``corpus-extraction`` for\nevery SharePoint connection whose extraction cadence\n(``extraction.schedule`` \u2014 a single instance-wide setting in the\n``extraction:`` config block, applied independently to each\nconnection's own ``last_run_at``) says it is due. Same shape as\n``POST /api/v1/agents/run-due`` (walk + per-row due-check + enqueue\ninto an EXISTING job kind) \u2014 no second scheduling mechanism.\nScheduler row: ``extraction-run-due`` in\n``services/scheduler/__main__.py``, registered only when\n``extraction.schedule`` is configured (absent/empty = off, same\ndefault posture as ``extraction.enabled``).\n\nA clean, typed no-op (never an error) when the feature isn't usable \u2014\n``extraction.enabled`` is false, no producer is configured, or no\nschedule is configured \u2014 since this endpoint, once registered, fires\nUNCONDITIONALLY on its own cadence; the JOB HANDLER\n(``_run_corpus_extraction``) raises on the same conditions because a\n``corpus-extraction`` job only ever exists because something explicitly\nenqueued it, but this sweep is what decides whether to enqueue at all.",
+        "operationId": "run_due_extraction_api_admin_sharepoint_extraction_run_due_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Due Extraction",
         "tags": [
           "admin"
         ]
@@ -28747,7 +30481,7 @@
         ]
       },
       "put": {
-        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.",
+        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.\n\nSharePoint connections: ``config.scopes`` (the connect wizard's\nserver-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and\n``config.extraction`` (the in-Agnes extraction schedule's own\n``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried\nforward when the request's ``config`` omits the key \u2014 the same\n\"explicit wins\" contract as Keboola's ``project_id``/``project_name``\nabove \u2014 since this endpoint's wholesale ``config`` replace would\notherwise let an ordinary edit through the generic connection editor\n(which renders neither field) silently erase every confirmed scope's\n``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or\nreset the extraction schedule's clock. An explicit ``scopes: []`` (or\n``extraction: null``) in the request still clears it deliberately. The\nfull set of keys is ``app.api.admin_sharepoint.\nSHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by\n``tests/test_sharepoint_config_carry_forward_ratchet.py``.",
         "operationId": "update_connection_api_admin_source_connections__connection_id__put",
         "parameters": [
           {
@@ -29194,6 +30928,463 @@
         "summary": "Test Connection",
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/api/admin/sso/client-secret": {
+      "delete": {
+        "description": "Clear the stored secret (the provider becomes unavailable).",
+        "operationId": "clear_sso_client_secret_api_admin_sso_client_secret_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Sso Client Secret",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "put": {
+        "description": "Store (or rotate) the client secret. Write-only.",
+        "operationId": "set_sso_client_secret_api_admin_sso_client_secret_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoSecretBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Sso Client Secret",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/config": {
+      "delete": {
+        "description": "Delete the config row + secret. KEEPS ``user_external_identities``\nrows \u2014 they are historically true links, inert unless the same tenant is\nconfigured again; purgeable per-user via the identities endpoint.",
+        "operationId": "delete_sso_config_api_admin_sso_config_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "get": {
+        "description": "Config status for the admin panel. Never returns the secret.",
+        "operationId": "get_sso_config_api_admin_sso_config_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "put": {
+        "description": "Upsert the singleton config. Validates the tenant via the imported\nsingle-tenant validator; ``enabled=true`` additionally requires a stored,\ndecryptable secret (and the always-required non-empty domain list).",
+        "operationId": "put_sso_config_api_admin_sso_config_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoConfigBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/identities": {
+      "get": {
+        "description": "Paginated list of linked external identities, newest link first.",
+        "operationId": "list_sso_identities_api_admin_sso_identities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Sso Identities",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/identities/{user_id}": {
+      "delete": {
+        "description": "Admin unlink \u2014 hard delete of the identity row; the recovery tool for\na mis-attach. Does not touch the user row itself.",
+        "operationId": "unlink_sso_identity_api_admin_sso_identities__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Sso Identity",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/test-config": {
+      "post": {
+        "description": "Server-side reachability probe: tenant validation, secret presence +\ndecryptability, then the tenant's OIDC discovery document. No SSRF\nsurface: fixed host, tenant validated and quoted into a single path\nsegment (the ``microsoft.py`` discovery-URL pattern).",
+        "operationId": "test_sso_config_api_admin_sso_test_config_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Sso Config",
+        "tags": [
+          "admin-sso"
         ]
       }
     },
@@ -30784,6 +32975,173 @@
         ]
       }
     },
+    "/api/admin/upgrade-freeze": {
+      "delete": {
+        "description": "Lift the freeze immediately (idempotent). 204 per the API design\nrules \u2014 the post-delete state is a GET away and always \"no freeze\".",
+        "operationId": "lift_freeze_api_admin_upgrade_freeze_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Lift Freeze",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "description": "Whether an upgrade freeze is currently in force, and until when.",
+        "operationId": "get_freeze_api_admin_upgrade_freeze_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreezeStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Freeze",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Freeze auto-upgrades for ``hours`` from now (1\u201372).\n\nSetting a new freeze replaces any existing one \u2014 the freeze window is\nabsolute, not additive, so repeated clicks don't stack.",
+        "operationId": "set_freeze_api_admin_upgrade_freeze_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreezeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreezeStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Freeze",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/uploads/cover-image": {
       "post": {
         "description": "Persist an admin-uploaded cover image and return its public URL.\n\nContent-addresses the file under ``${DATA_DIR}/uploads/covers/<sha>.<ext>``\nso duplicate uploads collapse to one write. The response shape\n``{url, content_type, size}`` is what the admin modals stash on\nSave into ``data_packages.cover_image_url`` /\n``memory_domains.cover_image_url``.",
@@ -32012,6 +34370,79 @@
         "summary": "Admin Preview Workspace Template",
         "tags": [
           "claude_md"
+        ]
+      }
+    },
+    "/api/agents/{agent_id}/builder/turn": {
+      "post": {
+        "description": "Run one builder turn against an agent the caller owns.",
+        "operationId": "builder_turn_api_agents__agent_id__builder_turn_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuilderTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Builder Turn",
+        "tags": [
+          "agents"
         ]
       }
     },
@@ -34495,7 +36926,7 @@
         ]
       },
       "post": {
-        "description": "Upload one or more files into a collection.\n\nEach file passes through the extension allowlist:\n\n* **tier1** (txt, pdf, docx, \u2026) \u2192 content-addressed write +\n  ``processing_status='pending'``.\n* **tier2** (png, jpg, tiff, \u2026) \u2192 same write + ``'pending'``\n  (vision/OCR ingestion deferred to Slice 5).\n* **bundle** (zip) \u2192 same write + ``'pending'``; the background task\n  unpacks it and ingests every supported member as its own child row\n  (``parent_file_id`` \u2192 the archive row).\n* **unsupported** (.dwg, .exe, \u2026) \u2192 stored raw +\n  ``processing_status='rejected'`` with ``processing_detail`` describing\n  the reason. The *whole response* returns **422** when any file is\n  rejected (all results are still returned so the caller sees which\n  files succeeded and which were rejected).\n\n**Upsert:** an optional ``paths`` form field (repeated, paired positionally\nwith ``files``) gives each file a caller-supplied logical identity. When a\nfile with the same ``(collection_id, path)`` already exists, its row is\nupdated IN PLACE (id preserved) \u2014 chunks/derived tables purged and\n``processing_status`` reset only when the content actually changed;\nunchanged content against an ``indexed`` row just refreshes filename/path\n(a rename/move) and skips re-chunking entirely. Unchanged content against\na row whose ingest never completed (``rejected``, ``needs_review``, or\n``pending``) is treated as a **retry**: the row resets to ``pending`` and\ningestion is re-scheduled, so re-uploading the same bytes after fixing\nthe cause works without a separate ``\u2026/reingest`` call. Files without a\n``path`` keep the legacy plain-insert behavior. The update runs only\nafter the replacement blob is safely stored, so a failed re-upload never\ndestroys the existing file. When ``paths`` is supplied it MUST have\nexactly one entry per file (positional pairing), else the request is\nrejected with **400** \u2014 a short/misaligned list would silently assign\npaths to the wrong files; two files sharing a non-blank ``path`` in one\nbatch are likewise rejected (**400** ``duplicate_path_in_batch``). The\n``(corpus_id, path)`` invariant is also enforced by a unique index.\n\n**Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+\noptional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,\neach paired positionally with ``files`` exactly like ``paths``) lets a\ndoc-sync client supply the producer's own delta key (e.g.\n``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``\nis tried FIRST, before the ``path`` match \u2014 and, like a path match, ANY\nmatch preserves the row's id, including a manual (no-``source_stable_ids``)\npath re-upload of a file a crawler previously anchored, so a hand upload\ncan no longer cascade a document's derived data away. Two files sharing a\nnon-blank ``source_stable_id`` in one batch are rejected with **400**\n``duplicate_source_stable_id_in_batch`` \u2014 the second would otherwise\noverwrite the first's row in place and silently drop its bytes \u2014 and a\nread-only pre-flight resolves every file's target row before anything is\nstored to catch the two collisions that cross the two key spaces: two\nfiles landing on the SAME existing row through different anchors (**400**\n``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is\nalready held by another row, which would otherwise violate the\n``(corpus_id, path)`` unique index and 500 mid-batch (**409**\n``path_owned_by_another_file``). The mapping table\nis Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed\ninstance answers **501** before any file is touched; omitting the field\nkeeps this endpoint byte-identical to the plain ``paths`` behavior above.\n``document_dates`` is accepted and pairing-validated for forward\ncompatibility with the doc-sync wire format but is not yet persisted\nhere \u2014 it belongs to a claim, written by the (future) fact-ingest API.\n\nReturns a list of ``{file_id, filename, path, processing_status, \u2026}`` for\nevery uploaded file (in upload order).",
+        "description": "Upload one or more files into a collection.\n\nEach file passes through the extension allowlist:\n\n* **tier1** (txt, pdf, docx, \u2026) \u2192 content-addressed write +\n  ``processing_status='pending'``.\n* **tier2** (png, jpg, tiff, \u2026) \u2192 same write + ``'pending'``\n  (vision/OCR ingestion deferred to Slice 5).\n* **bundle** (zip) \u2192 same write + ``'pending'``; the background task\n  unpacks it and ingests every supported member as its own child row\n  (``parent_file_id`` \u2192 the archive row).\n* **unsupported** (.dwg, .exe, \u2026) \u2192 stored raw +\n  ``processing_status='rejected'`` with ``processing_detail`` describing\n  the reason. The *whole response* returns **422** when any file is\n  rejected (all results are still returned so the caller sees which\n  files succeeded and which were rejected).\n\n**Upsert:** an optional ``paths`` form field (repeated, paired positionally\nwith ``files``) gives each file a caller-supplied logical identity. When a\nfile with the same ``(collection_id, path)`` already exists, its row is\nupdated IN PLACE (id preserved) \u2014 chunks/derived tables purged and\n``processing_status`` reset only when the content actually changed;\nunchanged content against an ``indexed`` row just refreshes filename/path\n(a rename/move) and skips re-chunking entirely. Unchanged content against\na row whose ingest never completed (``rejected``, ``needs_review``, or\n``pending``) is treated as a **retry**: the row resets to ``pending`` and\ningestion is re-scheduled, so re-uploading the same bytes after fixing\nthe cause works without a separate ``\u2026/reingest`` call. Files without a\n``path`` keep the legacy plain-insert behavior. The update runs only\nafter the replacement blob is safely stored, so a failed re-upload never\ndestroys the existing file. When ``paths`` is supplied it MUST have\nexactly one entry per file (positional pairing), else the request is\nrejected with **400** \u2014 a short/misaligned list would silently assign\npaths to the wrong files; two files sharing a non-blank ``path`` in one\nbatch are likewise rejected (**400** ``duplicate_path_in_batch``). The\n``(corpus_id, path)`` invariant is also enforced by a unique index.\n\n**Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+\noptional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,\neach paired positionally with ``files`` exactly like ``paths``) lets a\ndoc-sync client supply the producer's own delta key (e.g.\n``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``\nis tried FIRST, before the ``path`` match \u2014 and, like a path match, ANY\nmatch preserves the row's id, including a manual (no-``source_stable_ids``)\npath re-upload of a file a crawler previously anchored, so a hand upload\ncan no longer cascade a document's derived data away. Two files sharing a\nnon-blank ``source_stable_id`` in one batch are rejected with **400**\n``duplicate_source_stable_id_in_batch`` \u2014 the second would otherwise\noverwrite the first's row in place and silently drop its bytes \u2014 and a\nread-only pre-flight resolves every file's target row before anything is\nstored to catch the two collisions that cross the two key spaces: two\nfiles landing on the SAME existing row through different anchors (**400**\n``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is\nalready held by another row, which would otherwise violate the\n``(corpus_id, path)`` unique index and 500 mid-batch (**409**\n``path_owned_by_another_file``). The mapping table\nis Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed\ninstance answers **501** before any file is touched; omitting the field\nkeeps this endpoint byte-identical to the plain ``paths`` behavior above.\n``document_dates`` is accepted and pairing-validated for forward\ncompatibility with the doc-sync wire format but is not yet persisted\nhere \u2014 it belongs to a claim, written by the (future) fact-ingest API.\n\nReturns a list of ``{file_id, filename, path, processing_status, \u2026,\nclaims_purged}`` for every uploaded file (in upload order).\n``claims_purged`` (spec \u00a78 coupled bug) is the count of fact-graph claims\ndropped for THIS file because its content changed in place (\u00a76) \u2014 0 for\na brand-new file, an unchanged-content resync/rename, or when the\n``facts`` feature flag is off. A producer that ingested claims for this\nfile should treat a non-zero count as \"re-ingest is needed\", not\n\"already shipped\" \u2014 the purge and the producer's own idempotence\notherwise disagree silently (live-verified: a rename recomputing a\nprovenance header purged claims that were never re-sent).",
         "operationId": "upload_files_api_collections__collection_id__files_post",
         "parameters": [
           {
@@ -35303,6 +37734,65 @@
           }
         },
         "summary": "Reap Idle Data Apps",
+        "tags": [
+          "data-apps"
+        ]
+      }
+    },
+    "/api/data-apps/runner-events": {
+      "post": {
+        "description": "Receive a best-effort container-lifecycle event report from\napps-runner (Wave 2 \u2014 audit-coverage plan, Task 3).\n\napps-runner holds the Docker socket but no database access \u2014 see\n``services/apps_runner/audit_report.py`` \u2014 so this is its ONLY path to\nan ``audit_log`` row. Authenticated with the SAME shared\n``X-Runner-Token`` the control plane already presents TO the runner\n(``APPS_RUNNER_TOKEN``), just in the reverse direction. Not gated by\n``_feature_gate()``/user auth \u2014 this is a system-to-system channel, not\na user-facing route, and a report about a container that could only\nexist if the feature were on is harmless to accept either way.",
+        "operationId": "record_runner_event_api_data_apps_runner_events_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-runner-token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Runner-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerEventPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Runner Event",
         "tags": [
           "data-apps"
         ]
@@ -36594,9 +39084,98 @@
         ]
       }
     },
+    "/api/facts/facets": {
+      "get": {
+        "description": "Filterable entity values per type, with a document count each \u2014 what\nthe Library's filter menu offers instead of hand-entered tags.\n\nThe vocabulary comes from the extraction pass (client, industry, service\noffering, document type), so it is maintained by ingestion rather than by\nsomebody remembering to tag a file.\n\nGated exactly as :func:`facts_search` is: a facet lists only subjects\nthis caller could reach, and each `document_count` counts only documents\nin collections they can read \u2014 a `revealed` subject's unreadable evidence\nis not tallied, since that would report how many files sit in a\ncollection they cannot open. Response: ``{\"facets\": {type: [{\"subject_id\",\n\"label\", \"document_count\"}]}}``.",
+        "operationId": "facts_facets_api_facts_facets_get",
+        "parameters": [
+          {
+            "description": "Comma-separated fact types to facet on. Defaults to the Library's four.",
+            "in": "query",
+            "name": "types",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated fact types to facet on. Defaults to the Library's four.",
+              "title": "Types"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit_per_type",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit Per Type",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Facets Api Facts Facets Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Facets",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -36802,7 +39381,7 @@
     },
     "/api/facts/search": {
       "post": {
-        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). Response:\n``{\"subjects\": [{\"id\", \"type\", \"aliases\", \"attrs\", \"claim_count\",\n\"quote_count\", \"revealed\"}], \"limit_applied\"}`` \u2014 `limit_applied` is\nTrue only when the CALLER'S OWN readable result set exceeds `limit`,\nnever a signal that grants hid additional matches.",
+        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). ``q`` is an\nOPTIONAL free-text name lookup matched against alias natural keys ONLY\n(never claim text) \u2014 see :meth:`FactsPgRepository.search` for the\nnormalization and ranking rules. Response: ``{\"subjects\": [{\"id\",\n\"type\", \"aliases\", \"attrs\", \"claim_count\", \"quote_count\", \"revealed\"}],\n\"limit_applied\"}`` \u2014 `limit_applied` is True only when the CALLER'S OWN\nreadable result set exceeds `limit`, never a signal that grants hid\nadditional matches.",
         "operationId": "facts_search_api_facts_search_post",
         "parameters": [
           {
@@ -36863,6 +39442,64 @@
           }
         },
         "summary": "Facts Search",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/type-map": {
+      "get": {
+        "description": "Live counts per node type over everything the caller can see \u2014 the\nhead of the Library's Knowledge tab, where each type is a way in.\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach. A type nobody can see\nis absent rather than reported as ``0``, so the response never\ndistinguishes \"no such type here\" from \"none you may read\" \u2014 the same\nnon-disclosure ``search()`` makes. Response: ``{\"types\": [{\"type\",\n\"count\"}], \"total\"}``, ordered by type.",
+        "operationId": "facts_type_map_api_facts_type_map_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Type Map Api Facts Type Map Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Type Map",
         "tags": [
           "facts"
         ]
@@ -37827,6 +40464,64 @@
           }
         },
         "summary": "Download Knowledge Artifact",
+        "tags": [
+          "knowledge"
+        ]
+      }
+    },
+    "/api/knowledge/digests": {
+      "get": {
+        "description": "The maintained digests THIS caller can read (K4, #799).\n\nThe one missing piece of the analyst-facing digest surface. A digest's\nmarkdown has been readable at ``/digests/{id}/content`` since K4, and\n``agnes pull`` already writes every granted one to\n``.claude/rules/ka_<slug>.md`` \u2014 but nothing could ENUMERATE them, so a\nweb surface had no way to show a reader which digests exist without\nalready knowing an id. The Library's distillate (TCRD-250) needs exactly\nthat list.\n\nFiltered with ``_caller_can_read_digest`` \u2014 the same fail-closed\npredicate the manifest builder uses (``app.api.sync._digest_entries``),\nso the web list and the pulled files can never disagree about what a\ncaller is entitled to. A digest that has never generated (``pending``,\nempty ``output_md``) is omitted, matching the manifest: there is nothing\nto read, and listing it would promise a page that 404s.\n\nStaleness travels per row rather than being hidden, same contract as the\ncontent endpoint \u2014 a stale digest still ships its last-good markdown, so\na reader must be able to see that it is stale.\n\nResponse: ``{\"digests\": [{\"id\", \"slug\", \"title\", \"status\",\n\"status_reason\", \"generated_at\"}]}``, sorted by slug.",
+        "operationId": "list_knowledge_digests_for_caller_api_knowledge_digests_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Knowledge Digests For Caller Api Knowledge Digests Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Knowledge Digests For Caller",
         "tags": [
           "knowledge"
         ]
@@ -40795,6 +43490,60 @@
         ]
       }
     },
+    "/api/me/external-identity": {
+      "get": {
+        "description": "The calling user's linked external identity (design 2026-08-28).\n\nLive repo lookup, deliberately NOT a JWT claim: link state must stay\nrevocable (an admin unlink takes effect on the next call, not after a\n30-day stateless token expires). None of the returned fields is a\nsecret \u2014 the ``subject`` is the Entra directory object ID the admin\nidentities list shows too. Postgres-only feature: on a DuckDB-backed\ninstance the repo factory raises ``RequiresPostgresBackend`` and the\napp-wide handler answers the typed 501.",
+        "operationId": "get_external_identity_api_me_external_identity_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get External Identity",
+        "tags": [
+          "me"
+        ]
+      }
+    },
     "/api/me/home-stats": {
       "get": {
         "description": "Return the five counters rendered in the /home status frame for\nthe calling user, over a 24-hour or 7-day window.\n\nMissing rows (new user, no telemetry yet) surface as zeros / null\nrather than 404 \u2014 the frame still renders cleanly for first-day\nanalysts.",
@@ -42869,7 +45618,7 @@
     },
     "/api/memory/bundle": {
       "get": {
-        "description": "Token-budgeted bundle of knowledge items for AI agent injection.\n\nMandatory items are always included regardless of the token budget.\nApproved items are confidence\u00d7recency-ranked and included until the budget\nis exhausted. Audience-filtered by the caller's group memberships (admins\nsee everything).\n\nv49: when ``?domain=<slug>`` is supplied the response shape switches\nto ``text/markdown`` containing a deterministic per-domain bundle \u2014\nthat's what ``agnes pull`` writes to ``~/.claude/memory/<slug>/bundle.md``.\nRBAC: the caller must have a ``MEMORY_DOMAIN`` grant on the domain\n(admins bypass per ``can_access``). The markdown body sorts items\nalphabetically by title and includes both required and approved\nitems (required first, with a marker) so the bundle md5 in the\nmanifest matches what the CLI re-renders.",
+        "description": "Token-budgeted bundle of knowledge items for AI agent injection.\n\nMandatory items are always included regardless of the token budget.\nApproved items are first narrowed to whichever ones\n``corporate_memory.distribution_mode`` grants this caller\n(``select_distributable_items``, #1573 \u2014 the same predicate the\nper-domain markdown and manifest md5 use), then confidence\u00d7recency-ranked\nand included until the budget is exhausted. Audience-filtered by the\ncaller's group memberships (admins see everything RBAC-wise; distribution\nmode narrows on top of that for everyone, admins included).\n\nv49: when ``?domain=<slug>`` is supplied the response shape switches\nto ``text/markdown`` containing a deterministic per-domain bundle \u2014\nthat's what ``agnes pull`` writes to ``~/.claude/memory/<slug>/bundle.md``.\nRBAC: the caller must have a ``MEMORY_DOMAIN`` grant on the domain\n(admins bypass per ``can_access``). The markdown body sorts items\nalphabetically by title and includes both required and approved\nitems (required first, with a marker) so the bundle md5 in the\nmanifest matches what the CLI re-renders.",
         "operationId": "get_bundle_api_memory_bundle_get",
         "parameters": [
           {
@@ -45436,7 +48185,7 @@
         ]
       },
       "put": {
-        "description": "Set which groups a Library item is shared with (idempotent).\n\n``group_ids: []`` makes the item private again. Grants to groups outside\nthe caller's shareable set are preserved \u2014 see ``set_shares``.",
+        "description": "Set which groups a Library item is shared with (idempotent).\n\n``group_ids: []`` makes the item private again. Grants to groups outside\nthe caller's shareable set are preserved \u2014 see ``set_shares``.\n\nTrack C6: for an approval-gated type (``agent``) shared by a non-admin\nactor, a newly-requested group is queued instead of granted \u2014 this is\nNOT an error, so the status is ``202`` (queued) rather than ``200``,\nand ``pending_group_ids`` names what's awaiting an admin decision.",
         "operationId": "put_share_state_api_sharing__resource_type___resource_id__put",
         "parameters": [
           {
@@ -46509,6 +49258,134 @@
         ]
       }
     },
+    "/api/store/entities/builder/preview-agent": {
+      "post": {
+        "description": "Point the caller's scratch agent at this draft template and return its\nslug, so the page can open a normal chat session against it.\n\nAn agent template IS a system prompt, so previewing one means running an\nagent with that prompt. That needs a row, because a session runs as an\nagent id \u2014 hence a scratch agent rather than some parallel un-agent path\nthat would drift from how templates actually behave once installed.\n\nDeliberately inherits NOTHING from the author's own agents: default\nscope modes, no knowledge, no plugins. A template carries no data access,\nso a preview that quietly ran with the author's would flatter it \u2014\nsomeone would install a template that worked in the preview and does\nnothing for them.",
+        "operationId": "preview_agent_api_store_entities_builder_preview_agent_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Agent",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/builder/turn": {
+      "post": {
+        "description": "Run one builder turn for a Library entity draft.\n\nReturns ``{reply, patch, suggestions}``. Writes nothing: the draft is the\ncaller's, and only *Save to Library* creates anything.",
+        "operationId": "entity_builder_turn_api_store_entities_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EntityTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Entity Builder Turn",
+        "tags": [
+          "store"
+        ]
+      }
+    },
     "/api/store/entities/dryrun": {
       "post": {
         "description": "Run the full guardrail pipeline against a candidate bundle WITHOUT\npersisting anything.\n\nSame multipart payload as ``POST /entities`` (``file``, ``type``,\n``description``). The submitter sees exactly what would block the\nreal upload \u2014 inline checks plus the LLM verdict \u2014 and can iterate\nbefore spending an LLM token budget / admin-queue slot on a real\nsubmission (#317).\n\nNO DB writes: no ``store_entities``, no ``store_submissions``, no\n``audit_log``. The bundle bytes are extracted to a scratch dir,\nbaked into a throwaway plugin tree, checked, and wiped in ``finally``\nexactly like :func:`preview_entity`.\n\nPer-submitter dry-run quota + identical-bundle verdict caching are\ndeferred (tracked on #317) \u2014 the auth gate plus HTTP-level rate\nlimiting bound abuse until they land.\n\n``lint_only=true`` returns ``inline`` + ``lint`` and SKIPS the LLM\nsecurity review entirely (no ``verdict``, and ``would_publish`` is not\nmeaningful). The advisory-lint panels use it so previewing findings never\nbills a security-review round-trip the caller would discard.",
@@ -46570,6 +49447,70 @@
           }
         },
         "summary": "Dryrun Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/from-components": {
+      "post": {
+        "description": "Compose a plugin from Library entities the caller can already see.\n\nMerges each selected entity's baked subtree into one plugin tree, zips it\nin memory, and delegates to ``create_entity`` \u2014 so a composite is\nindistinguishable downstream from an uploaded ``.zip`` of the same bytes,\nand pays the same guardrail review.\n\n``dry_run=True`` returns a ``PreviewResponse`` (the shape the ``.zip``\nCheck path returns) and writes nothing.",
+        "operationId": "create_entity_from_components_api_store_entities_from_components_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFromComponentsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Entity From Components",
         "tags": [
           "store"
         ]
@@ -48715,6 +51656,70 @@
         ]
       }
     },
+    "/api/upload/audit-events": {
+      "post": {
+        "description": "Batch-ingest client-reported audit events from `agnes push`.\n\nThe server never trusts the client's chosen action string: only actions\nin `CLIENT_REPORTED_ACTIONS` are accepted; anything else is REJECTED\n(counted, not raised) so one bad event in a batch doesn't drop the rest.\nOversized params (>2KB serialized) are rejected the same way \u2014 content\nnever crosses this endpoint by construction, the CLI spool only ever\nwrites metadata (see `cli/lib/audit_spool.py`), but the cap still bounds\na misbehaving or future client.",
+        "operationId": "upload_audit_events_api_upload_audit_events_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditEventsUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Audit Events",
+        "tags": [
+          "upload"
+        ]
+      }
+    },
     "/api/upload/local-md": {
       "post": {
         "description": "Upload CLAUDE.local.md content for corporate memory processing.",
@@ -50381,8 +53386,86 @@
         ]
       }
     },
+    "/api/v1/agents/{slug}/delegate": {
+      "post": {
+        "description": "Delegate the current turn's ``message`` to agent ``slug``.\n\nReturns ``ChatManager.handle_delegation``'s result dict verbatim \u2014\n``{\"status\": \"ok\"|\"denied\"|\"degraded\", \"reason\": str | None,\n\"agent_slug\": str, \"answer\": str | None, \"message\": str | None}``. A\ndenial or degrade is a normal `200` response body, not an HTTP error:\nthe caller (agent A's own delegation tool) is expected to read\n``status``/``reason`` and continue the turn on its own judgment \u2014 see\nthe module docstring.",
+        "operationId": "delegate_to_agent_api_v1_agents__slug__delegate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delegate To Agent Api V1 Agents  Slug  Delegate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delegate To Agent",
+        "tags": [
+          "agent-runtime"
+        ]
+      }
+    },
     "/api/v1/agents/{slug}/responses": {
       "post": {
+        "description": "Audit wrapper around `_create_agent_response_impl` (F2b \u2014 audit-\nfull-coverage plan, Task 4): writes one `agent.invoke` row right after\nauth/scope resolution (`require_agent_runtime_principal` above already\nran) and BEFORE the actual run/enqueue starts \u2014 so a crash inside\n`run_one_shot`/the background enqueue still leaves a row behind. A\nsecond row, with `result=\"error:<class>\"`, is written only when the\ncall fails (mirrors the `query.remote` error-path precedent,\n`app/api/query.py`). `client_ip`/`correlation_id`/`client_kind` are\nleft to autofill (`src.audit_context`) \u2014 this is a plain HTTP handler.",
         "operationId": "create_agent_response_api_v1_agents__slug__responses_post",
         "parameters": [
           {
@@ -52810,6 +55893,113 @@
         ]
       }
     },
+    "/auth/logout": {
+      "get": {
+        "description": "Logout CONFIRMATION page (no state change) \u2014 issue #1675.\n\nThe Logout menu item used to be a plain ``GET`` link to ``/login``,\nwhich neither cleared the ``access_token`` cookie nor ended the session\n\u2014 it just LOOKED like sign-out (the app happily reopened on the next\nvisit). Ending a session is a mutation, so it cannot happen on a GET\n(security playbook #10, F2); this route only renders a confirm form\nwith a double-submit CSRF token. The actual cookie-clear + server-side\nrevocation is :func:`logout_submit` (POST) \u2014 same GET-confirms /\nPOST-mutates shape this codebase already uses for :func:`slack_bind` /\n:func:`slack_bind_confirm`.\n\nAn already-signed-out visitor has nothing to confirm \u2014 straight to\n``/login``.",
+        "operationId": "logout_page_auth_logout_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Page",
+        "tags": [
+          "web"
+        ]
+      },
+      "post": {
+        "description": "End the session \u2014 clear the cookie AND revoke it server-side.\n\nIssue #1675 (clear the browser's ``access_token`` cookie) and #1676\n(revoke the token so a copy captured before logout \u2014 a synced browser\nprofile, host malware, a shared machine \u2014 stops working too, not only\nthe browser that clicked Logout) land together: a client-side-only fix\nleaves every other copy of the token valid for the rest of its 30-day\n``exp``.\n\nRequires the double-submit ``web_csrf`` token minted by the GET\nconfirmation above (F2) \u2014 a state-changing action reachable from a menu\nitem on every page must not fire on ambient cookie auth alone, the same\nreasoning the F2 security review applied to :func:`slack_bind_confirm`.",
+        "operationId": "logout_submit_auth_logout_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_logout_submit_auth_logout_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Submit",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/auth/microsoft/callback": {
       "get": {
         "description": "Handle Microsoft Entra ID OAuth callback.",
@@ -52852,7 +56042,7 @@
     },
     "/auth/password/change": {
       "get": {
-        "description": "Self-serve change-password page, linked from the account menu.",
+        "description": "Self-serve change-password page, linked from the account menu.\n\nA forced-to-SSO account renders the same single-sign-on state a\nhash-less account gets, even when it still holds a hash \u2014 the password\ndoor is shut for it, so offering the change form would be a lie.",
         "operationId": "password_change_page_auth_password_change_get",
         "parameters": [
           {
@@ -53393,6 +56583,102 @@
           }
         },
         "summary": "Refresh Groups",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/callback": {
+      "get": {
+        "description": "Code exchange -> claims -> identity -> bind -> JWT cookie.\n\nThe test-mode leg (this flow's ``state`` matches the stashed test state)\nre-verifies the CURRENT session user is an admin, completes the exchange,\nand renders the result page \u2014 without ``ensure_user``, without an\nidentity row, without a cookie.",
+        "operationId": "sso_callback_auth_sso_callback_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/login": {
+      "get": {
+        "description": "Redirect to the configured tenant's Entra authorize endpoint.\n\n``?mode=test`` (admin-only, works pre-enable and outside the allowlist)\nstashes THIS flow's OAuth ``state`` so the callback renders the\nside-effect-free result page instead of signing anyone in \u2014 a concurrent\nnormal sign-in carries a different ``state`` and follows the normal path\nuntouched.",
+        "operationId": "sso_login_auth_sso_login_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Login",
         "tags": [
           "auth"
         ]

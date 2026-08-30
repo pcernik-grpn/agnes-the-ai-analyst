@@ -100,6 +100,17 @@ _VERB_PATH_ALLOWLIST = frozenset(
         # state-machine (approve also replays the payload into the real resource).
         "/api/admin/authoring-suggestions/{sid}/approve",
         "/api/admin/authoring-suggestions/{sid}/reject",
+        # NOTE: share-request lifecycle (C6) deliberately does NOT join the
+        # three entries above. It was allowlisted here for one round, then
+        # reworked instead to PATCH /api/admin/share-requests/{id} with
+        # {"decision": "approve"|"reject"} in the body — the state-changing
+        # side effect (writing resource_grants via ensure_grant) still lands
+        # atomically inside that one PATCH request, exactly like the sibling
+        # PATCH /api/v1/agents/{agent_id}/memories/{memory_id} precedent
+        # (app/api/agents_admin.py's MemoryActionRequest) also does a
+        # non-trivial side effect ("approve" activates a memory) through a
+        # body field rather than a verb segment. See
+        # app/api/share_requests_admin.py for the endpoint.
         # Corporate-memory mining — fire-and-forget admin batch trigger (v81).
         "/api/admin/memory-mining/run",
         # User lifecycle — activate/deactivate map to a boolean field (acceptable PATCH candidate)
@@ -232,6 +243,10 @@ _CREATOR_POST_ALLOWLIST = frozenset(
         # Consent toggle upsert — sets the caller's own opt-in flag (200), not
         # a resource create. GET on the same path returns the current state.
         "/api/studio/memory-mining/consent",
+        # Logout (#1675) — GET renders the CSRF confirm form, POST ends the
+        # session and redirects (303). Nothing is created; the path only has
+        # both verbs because mutating on a GET is forbidden here.
+        "/auth/logout",
         # Subscription upsert — sets per-table enabled flags, not a pure create
         "/api/sync/table-subscriptions",
         # Auth flows — 200 is conventional for token/session responses

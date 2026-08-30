@@ -606,6 +606,20 @@ client, via an owner-scoped token injected as `AGNES_TOKEN` — never through a
 mounted parquet. See spec §8 for the full rationale and the owner-inherited
 access model this implies for sharing.
 
+That token's `data-app:<slug>` scope is enforced fail-closed in
+`app/auth/pat_resolver.py`: it is admitted only on the app data surface —
+`/api/query`, `/api/data`, the `/api/catalog` read routes, `/api/metrics`,
+`/api/glossary`, the read-only `/api/semantic-models` members, and the
+`/api/v2` catalog/schema/sample/scan routes the `agnes` CLI calls from inside
+a container — and refused everywhere else, notably `/api/admin/*` and the
+credential-minting routes. The allowlist is exact paths plus narrow subtrees,
+not one entry per router, so a route added later under an allowed path is not
+admitted by accident; a test walks the real route table to keep that honest.
+
+The scope narrows which **endpoints** the app may call; it does not narrow
+**which rows** it sees — inside that surface the app still reads with the
+owner's grants, evaluated live per request.
+
 **Container hardening** (spec §10): every data-app container runs
 `cap_drop: ALL`, `no-new-privileges` and a `pids_limit`
 (`data_apps.container_pids_limit`, default 512) — never applied to the
@@ -693,9 +707,10 @@ partial-index support) and via a partial unique index + `ON CONFLICT` on
 Postgres — same dedup behavior, different mechanism per backend.
 
 **Worker loop** (`app/worker/runtime.py`, started from `app/main.py`'s
-lifespan when the process's `AGNES_ROLE` includes the worker plane): two
-lanes share one asyncio loop — heavy (concurrency 1) and light
-(concurrency 2). Each lane slot repeats `claim_next()` → runs the kind's
+lifespan when the process's `AGNES_ROLE` includes the worker plane): up to
+three lanes share one asyncio loop — heavy (concurrency 1), light
+(concurrency 2), and extraction (concurrency 1, spec §7.5 — see below).
+Each lane slot repeats `claim_next()` → runs the kind's
 handler in a thread while a heartbeat extends the lease →
 `complete()`/`fail()`. A fresh-per-claim `lease_token` (not just
 `worker_id`) guards every call so a stale slot can't clobber a fresh
@@ -704,12 +719,58 @@ sweep task reclaims exhausted/expired leases (`reap_exhausted()`), and
 shutdown drains in-flight jobs within a bound instead of hard-killing
 them.
 
+**Which lanes a process spawns** is controlled by `AGNES_WORKER_LANES`
+(`app/worker/runtime.py::selected_lanes()`) — comma-separated lane names,
+unset defaulting to heavy+light exactly as before this env var existed
+(the extraction lane is opt-in; see below). Mirrors `AGNES_ROLE`'s
+env-var convention, including failing loudly on an unknown token.
+
 **Kinds registry** (`app/worker/kinds.py::register_all_kinds()`,
-`app/worker/registry.py`): five kinds today — `data-refresh` and
+`app/worker/registry.py`): `data-refresh` and
 `jira-refresh` (heavy lane), `marketplaces-sync`, `session-collector`,
-and `corporate-memory` (light lane). Each handler is a thin adapter over
+and `corporate-memory` (light lane), among others. Each handler is a thin adapter over
 the function already backing the equivalent HTTP endpoint — no logic is
 duplicated between the queued and HTTP-triggered call sites.
+
+**Extraction lane** (spec §7.5 "Extraction inside Agnes (later)" / §16
+step 7 of `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
+design.md`): a lane of its own, not sharing heavy, because a corpus
+re-extraction sitting in heavy's concurrency-1 slot would block every
+table sync for its whole duration. Its one kind, `corpus-extraction`, is
+the producer-invocation seam — it does not crawl/convert/anonymize/
+extract itself; it resolves a `sharepoint` connection's credentials the
+same way the admin UI does (`connectors.sharepoint.settings
+.resolve_sharepoint_settings`, vault-first then the server's
+`SHAREPOINT_CERT_PRIVATE_KEY` env var) and shells out to the
+operator-configured `extraction.producer.command`/`.module`
+(`instance.yaml`, off by default via `extraction.enabled` — a registered
+switch, `AGNES_EXTRACTION_ENABLED`) under a bounded timeout, with the
+resolved credentials reaching the subprocess only via its child
+environment — never argv, never logged. That child env is a curated
+non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus
+any operator-opted-in `extraction.producer.env_passthrough`, plus the
+three named SharePoint credentials and the corpus id — never the full
+parent environment, so no other instance secret (vault key, LLM API key,
+DB DSN, ...) reaches an external, admin-configurable binary. The producer
+itself (the operator's own producer, adopted per spec §7.1) is not
+vendored into this repo. Off by default and additive: an instance that
+never sets `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
+
+Deployment: the `worker` Dockerfile build target (an extension point,
+`EXTRACTION_PRODUCER_INSTALL` build-arg, for bundling a producer's runtime
+deps — never built by default; `docker build .` with no `--target` still
+produces the ordinary `app` image) and the `extraction-worker` compose
+service (`docker-compose.yml`, profile-gated, `AGNES_WORKER_LANES
+=extraction`) let a deployment run extraction in its own process/container
+instead of adding it to the main `app` service's lanes. That service sets
+`AGNES_ROLE=worker`, which is a role split — running it makes the
+deployment multi-process, requiring Postgres app-state, explicit
+`JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis` (same
+as any other role-split process; see
+[`DEPLOYMENT.md#multi-process`](DEPLOYMENT.md#multi-process)). Flipping
+`extraction.enabled` and starting the profile is not sufficient on its
+own — `app/startup_guards.py::validate_deployment` refuses to boot
+otherwise.
 
 **Cross-process rebuild lease**: `SyncOrchestrator`'s `_rebuild_lock` is
 an in-process `threading.Lock` — invisible across processes. In a

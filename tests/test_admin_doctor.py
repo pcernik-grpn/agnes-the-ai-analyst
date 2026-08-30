@@ -307,7 +307,7 @@ class TestProbeProviders:
 
         rows = {r["name"]: r for r in probe_providers()}
         assert rows["password"]["available"] is True
-        assert set(rows) == {"google", "email", "password", "keboola", "microsoft"}
+        assert set(rows) == {"google", "email", "password", "keboola", "microsoft", "sso"}
 
     def test_rows_carry_allowed_and_available(self):
         from app.auth.provider_registry import probe_providers

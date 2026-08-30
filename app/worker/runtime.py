@@ -1,10 +1,29 @@
 """Worker runtime loop: claims jobs off the ``jobs`` queue and runs their
 registered handlers (spec §3.3 / plan wave-2B Task 3).
 
-Two independent lanes share one asyncio loop:
+Up to three independent lanes share one asyncio loop:
 
 - **heavy** — concurrency 1 (one slot/task)
 - **light** — concurrency 2 (two slots/tasks)
+- **extraction** — concurrency 1 (one slot/task; spec §7.5 / §16 step 7 of
+  docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md —
+  document extraction gets its OWN lane rather than sharing HEAVY, because a
+  corpus re-extraction sitting in HEAVY's concurrency-1 slot would block
+  every table sync for its whole duration)
+
+**Which lanes THIS process spawns slots for** is controlled by the
+``AGNES_WORKER_LANES`` env var (comma-separated lane names — see
+:func:`selected_lanes`). Unset (the default) spawns HEAVY + LIGHT only —
+exactly what every process spawned before the extraction lane existed —
+so no existing single-process/all-in-one deployment is affected by its
+addition: it neither polls for ``corpus-extraction`` nor pays for a third
+idle lane slot unless asked to. A deployment that wants extraction running
+(after enabling ``extraction.enabled`` in ``instance.yaml``) either adds
+``extraction`` to this process's own ``AGNES_WORKER_LANES`` list, or runs
+the dedicated ``extraction-worker`` compose service (which sets
+``AGNES_WORKER_LANES=extraction``, isolating it onto its own
+process/container) — see that service in ``docker-compose.yml`` and the
+``worker`` Dockerfile build target.
 
 Each lane slot repeats: ``claim_next(kinds=<lane's registered kinds>)`` ->
 if nothing eligible, sleep ``poll_interval_s`` and retry -> otherwise run
@@ -112,12 +131,43 @@ from app.job_correlation import bind_request_id, unbind_request_id
 from app.api.health_probes import to_thread_drain_on_cancel
 from app.observability import metrics as obs_metrics
 from app.worker import wakeup
-from app.worker.registry import HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind
+from app.worker.kinds import dispatch_job
+from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind
 
 logger = logging.getLogger(__name__)
 
 _HEAVY_CONCURRENCY = 1
 _LIGHT_CONCURRENCY = 2
+#: Extraction lane concurrency (spec §7.5 / §16 step 7) — deliberately 1,
+#: same ceiling as HEAVY: extraction is exactly the kind of long-running,
+#: resource-heavy work HEAVY's concurrency-1 slot already protects against
+#: piling up, just on a lane of its own so it can't block table syncs.
+_EXTRACTION_CONCURRENCY = 1
+
+#: Every lane this build knows about, in spawn order — the valid-token set
+#: ``selected_lanes()`` checks an ``AGNES_WORKER_LANES`` token against.
+_ALL_LANES: tuple[str, ...] = (HEAVY_LANE, LIGHT_LANE, EXTRACTION_LANE)
+
+#: What ``selected_lanes()`` returns when ``AGNES_WORKER_LANES`` is unset —
+#: deliberately HEAVY+LIGHT only, NOT ``_ALL_LANES``. This is the exact set
+#: ``worker_loop`` always spawned before the extraction lane existed, so an
+#: instance that never sets the env var (every deployment today, and the
+#: default single-container/all-in-one topology) is byte-for-byte
+#: unaffected: it neither polls for ``corpus-extraction`` nor pays for a
+#: third idle lane slot. Extraction is opt-in the same way the feature
+#: itself is (``extraction.enabled: false`` by default,
+#: config/instance.yaml.example) — a deployment that wants it running
+#: enables the config block AND either runs the dedicated
+#: ``extraction-worker`` compose service (which sets
+#: ``AGNES_WORKER_LANES=extraction``) or adds ``extraction`` to this
+#: process's own ``AGNES_WORKER_LANES`` list.
+_DEFAULT_LANES: tuple[str, ...] = (HEAVY_LANE, LIGHT_LANE)
+
+_LANE_CONCURRENCY: dict[str, int] = {
+    HEAVY_LANE: _HEAVY_CONCURRENCY,
+    LIGHT_LANE: _LIGHT_CONCURRENCY,
+    EXTRACTION_LANE: _EXTRACTION_CONCURRENCY,
+}
 
 #: Floor on the heartbeat cadence so a misconfigured/very short
 #: ``lease_seconds`` (e.g. in a test) can't spin the heartbeat loop.
@@ -138,6 +188,49 @@ def default_worker_id() -> str:
     (minted fresh per claim) instead.
     """
     return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def selected_lanes() -> tuple[str, ...]:
+    """Parse ``AGNES_WORKER_LANES`` into the lanes THIS process's
+    ``worker_loop`` should spawn slots for (spec §16 step 7's "per-process
+    lane-selection env var").
+
+    Mirrors :func:`app.roles.active_roles`'s env-var convention for the
+    fail-loud-on-typo part: an unknown token raises ``ValueError`` naming
+    every valid lane, rather than silently spawning no slot for it (whose
+    registered kinds would then sit ``'queued'`` forever with no signal
+    beyond an eventually-noticed backlog).
+
+    Unlike ``active_roles()``, unset does NOT mean "every known lane" —
+    it means :data:`_DEFAULT_LANES` (heavy + light), the exact set
+    ``worker_loop`` always spawned before the extraction lane existed. The
+    extraction lane is opt-in the same way the feature it serves is
+    (``extraction.enabled: false`` by default): a deployment that never
+    sets this env var is byte-for-byte unaffected by its addition, and one
+    that wants extraction running adds it explicitly — either to this
+    process's own list, or by running the dedicated ``extraction-worker``
+    compose service (which sets ``AGNES_WORKER_LANES=extraction``).
+
+    Order is preserved and de-duplicated (``"light,heavy,light"`` spawns
+    each lane's slots exactly once); an empty or all-whitespace value is
+    treated the same as unset.
+    """
+    raw = os.environ.get("AGNES_WORKER_LANES")
+    if raw is None:
+        return _DEFAULT_LANES
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return _DEFAULT_LANES
+    unknown = [t for t in tokens if t not in _LANE_CONCURRENCY]
+    if unknown:
+        raise ValueError(f"Invalid AGNES_WORKER_LANES token(s) {unknown!r} — valid tokens: {', '.join(_ALL_LANES)}")
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return tuple(result)
 
 
 def _drain_timeout_s() -> float:
@@ -321,7 +414,12 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
             _heartbeat_loop(job["id"], worker_id, lease_token, kind.lease_seconds),
             name=f"worker-heartbeat-{job['id']}",
         )
-        handler_future = asyncio.ensure_future(asyncio.to_thread(kind.handler, job["payload_json"]))
+        # `dispatch_job` (F2b — audit-full-coverage plan, Task 4) is the ONE
+        # dispatch-level entry point that runs a claimed job's handler and
+        # writes its `job.run` audit row — every kind funnels through it
+        # instead of this module calling `kind.handler(...)` directly, so
+        # audit coverage lives in exactly one place regardless of kind.
+        handler_future = asyncio.ensure_future(asyncio.to_thread(dispatch_job, job))
         handed_off = False
         obs_metrics.begin_job_running(job["kind"], kind.lane)
         started_at = time.monotonic()
@@ -648,28 +746,32 @@ async def _drain_in_flight(
 async def worker_loop(*, worker_id: str, poll_interval_s: float = 5.0) -> None:
     """Run the worker runtime until cancelled.
 
-    Starts the reaper task, ``_HEAVY_CONCURRENCY`` heavy-lane slots and
-    ``_LIGHT_CONCURRENCY`` light-lane slots, and waits on all of them.
-    Cancelling the enclosing task (the ``canary_loop`` task-create/cancel
-    pattern in ``app/main.py``'s lifespan) cancels every child task too —
+    Starts the reaper task, then — for every lane :func:`selected_lanes`
+    returns (default: heavy + light only, extraction is opt-in; see the
+    module docstring and ``AGNES_WORKER_LANES``) — that lane's own
+    concurrency worth of slots, and waits on all of them. Cancelling the
+    enclosing task (the ``canary_loop`` task-create/cancel pattern in
+    ``app/main.py``'s lifespan) cancels every child task too —
     ``asyncio.gather`` propagates cancellation of its own awaiter to every
-    task it's gathering. Before returning, performs one bounded drain of
-    any handler still mid-flight (see module docstring).
+    task it's gathering. Before
+    returning, performs one bounded drain of any handler still mid-flight
+    (see module docstring).
+
+    Raises ``ValueError`` (from :func:`selected_lanes`) before spawning
+    anything if ``AGNES_WORKER_LANES`` names an unknown lane.
     """
+    lanes = selected_lanes()
     in_flight: dict[str, _InFlightJob] = {}
     tasks = [asyncio.create_task(_reap_loop(poll_interval_s), name="worker-reaper")]
     # Best-effort PG LISTEN loop that wakes idle lane slots on a fresh
     # enqueue (see app.worker.wakeup). A clean no-op on DuckDB / if it can't
     # connect — the lane slots keep polling regardless.
     tasks.append(asyncio.create_task(wakeup.notify_listener(), name="worker-notify-listener"))
-    tasks += [
-        asyncio.create_task(_lane_slot(HEAVY_LANE, worker_id, poll_interval_s, in_flight), name=f"worker-heavy-{i}")
-        for i in range(_HEAVY_CONCURRENCY)
-    ]
-    tasks += [
-        asyncio.create_task(_lane_slot(LIGHT_LANE, worker_id, poll_interval_s, in_flight), name=f"worker-light-{i}")
-        for i in range(_LIGHT_CONCURRENCY)
-    ]
+    for lane in lanes:
+        tasks += [
+            asyncio.create_task(_lane_slot(lane, worker_id, poll_interval_s, in_flight), name=f"worker-{lane}-{i}")
+            for i in range(_LANE_CONCURRENCY[lane])
+        ]
     try:
         await asyncio.gather(*tasks)
     finally:
@@ -702,9 +804,7 @@ async def worker_loop(*, worker_id: str, poll_interval_s: float = 5.0) -> None:
         # and the in-flight drain after it run back to back, so giving each
         # its own full bound would stack past the container's grace period.
         shutdown_deadline = time.monotonic() + _drain_timeout_s()
-        finished, still_running = await asyncio.wait(
-            tasks, timeout=max(shutdown_deadline - time.monotonic(), 0.0)
-        )
+        finished, still_running = await asyncio.wait(tasks, timeout=max(shutdown_deadline - time.monotonic(), 0.0))
         for t in finished:
             # asyncio.wait, unlike gather(return_exceptions=True), does not
             # retrieve results — an unconsumed exception would be dropped

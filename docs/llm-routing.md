@@ -271,6 +271,56 @@ Each client controls their own provider, model, and API gateway independently.
 - Claude on Google Vertex AI (`provider: vertex`) — VertexExtractor subclasses
   AnthropicExtractor, so the whole retry/structured-output loop is shared.
 
+### Which call sites honor `ai.provider: vertex` (TCRD-242 sweep)
+
+Every consumer that builds an extractor through `connectors/llm/factory.py`
+(`create_extractor`, `create_extractor_from_env_or_config`,
+`vertex_config_or_none` + `create_vertex_extractor`) is Vertex-capable with no
+further code changes — that's the whole point of routing through the factory
+instead of constructing `anthropic.Anthropic(...)` directly. As of this sweep
+that covers: `services/corporate_memory/collector.py` and its downstream
+callers (`tagger.py`, `entities.py`, `contradiction.py`, `governance.py`,
+`confidence.py` — all take an injected `StructuredExtractor`),
+`services/verification_detector` (via `build_verification_processor`),
+`src/store_guardrails/` (guardrails LLM review — see `llm_review.py` /
+`craft_review.py` / `runner.py::default_api_key_loader`),
+`src/table_autodoc.py` + `cli/commands/admin_autodoc.py`,
+`src/knowledge_digests.py`, `app/api/admin_usage.py` (`/admin/usage/ask`),
+and the admin builder endpoints (`app/api/package_builder.py`,
+`app/api/mcp_builder.py`, `app/api/entity_builder.py`,
+`app/api/agent_builder.py`, `app/api/memory.py`). `src/ingest/vision.py`
+(Tier-2 image OCR) and the offline eval harness's `--llm-assist` grading pass
+(`scripts/eval/grade.py::llm_assist_grade`) build a raw `AnthropicVertex`
+client via `vertex_config_or_none()` + `connectors.llm.vertex_provider
+.create_vertex_client()` instead — same fallback, no `StructuredExtractor`
+involved because both need free-form `messages.create()` rather than
+`extract_json()`.
+
+**Interactive chat and the agent-as-API runtime use a *separate* config
+surface** — `chat.llm.provider: vertex` / `chat.llm.vertex.*`, not `ai:` —
+documented in `docs/cloud-chat.md` under *LLM provider: Google Vertex AI*.
+That path already covers `app/chat/auto_title.py` (auto-title generation),
+`app/chat/readiness.py`'s admin diagnostics probe, and
+`POST /api/v1/agents/{slug}/responses` (the agent-as-API runtime spawns a
+headless chat session through the same `app/api/broker.py` forwarding path
+live chat uses, so pinned-model and token-budget enforcement already apply to
+a Vertex-shaped model path there too). Two config blocks exist because they
+gate genuinely different surfaces (server-side structured extraction vs. the
+sandbox's interactive LLM traffic) — this sweep did not introduce a third.
+
+**Deliberately excluded:** `scripts/eval/arms.py::AnthropicArm` (eval arm A0)
+calls the first-party Anthropic API directly, on purpose — it measures the
+"bare Claude, no tools" baseline the vendor's own hosted API produces,
+independent of Agnes's provider routing; routing it through Vertex would
+change what the baseline measures.
+
+**Ops note before flipping a production instance to Vertex:** verify Claude
+model availability in the target region's Vertex AI Model Garden (not every
+region carries every model, and availability lags first-party release day),
+and verify prompt-caching behavior/pricing parity for the specific model —
+Vertex's cache semantics have historically trailed the first-party API and
+should not be assumed identical without a live check.
+
 **Explicitly NOT in scope (future):**
 - Azure OpenAI, OpenRouter, Gemini — listed as "untested" until verified per-provider
 - General-purpose AI chat/generation interface

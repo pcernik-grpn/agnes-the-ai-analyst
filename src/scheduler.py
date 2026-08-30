@@ -367,6 +367,63 @@ def is_valid_schedule(schedule: Optional[str]) -> bool:
     return False
 
 
+def next_due_at(
+    schedule: Optional[str],
+    last_sync_iso: Optional[str],
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Best-effort "when will this next fire" — DISPLAY ONLY (TCRD-226's
+    source-card "last/next scheduled run" line). Never the source of truth
+    for an actual dispatch decision — that stays :func:`is_table_due`,
+    called fresh at dispatch time; this only estimates a hint for a human.
+
+    Supports the two forms with a well-defined single next occurrence:
+
+    - ``"every Nm"`` / ``"every Nh"`` — ``last_sync + N`` (or ``now`` when
+      never run, since :func:`is_table_due` already treats "never run" as
+      due immediately).
+    - ``"daily HH:MM[,HH:MM,...]"`` — the earliest listed time strictly
+      after ``now``, rolling to tomorrow when every listed time today has
+      already passed.
+
+    Returns ``None`` for a ``"cron ..."`` schedule (a general
+    next-occurrence solver is out of scope for a one-line UI hint —
+    ``is_table_due`` still evaluates cron schedules correctly, only this
+    display estimate degrades) and for ``None``/empty/invalid input.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if not is_valid_schedule(schedule):
+        return None
+    assert schedule is not None  # is_valid_schedule(None) is False, so unreachable below
+
+    interval_minutes = parse_interval_minutes(schedule)
+    if interval_minutes is not None:
+        if not last_sync_iso:
+            return now
+        last_sync = _parse_timestamp(last_sync_iso)
+        if last_sync is None:
+            return now
+        if last_sync.tzinfo is None:
+            last_sync = last_sync.replace(tzinfo=timezone.utc)
+        return last_sync + timedelta(minutes=interval_minutes)
+
+    match = DAILY_PATTERN.match(schedule)
+    if match:
+        target_times = _parse_daily_times(match.group(1))
+        candidates = []
+        for hour, minute in target_times:
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += timedelta(days=1)
+            candidates.append(candidate)
+        return min(candidates) if candidates else None
+
+    # Valid cron (is_valid_schedule already confirmed it parses) — no
+    # next-occurrence estimate.
+    return None
+
+
 def filter_due_tables(
     table_configs: list[dict],
     sync_state_repo,

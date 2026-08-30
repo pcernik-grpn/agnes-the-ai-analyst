@@ -1062,6 +1062,11 @@ class TestBundle:
         conn = get_system_db()
         self._seed_item(conn, "bnd_m1", "Mandatory Fact", "mandatory", confidence=0.9)
         self._seed_item(conn, "bnd_a1", "Approved Fact", "approved", confidence=0.8)
+        # #1573: distribution_mode default (hybrid) gates optional/approved
+        # items behind a personal upvote — vote so this test still exercises
+        # "mandatory always included regardless of what's approved", not an
+        # empty approved set.
+        KnowledgeRepository(conn).vote("bnd_a1", "admin1", 1)
         conn.close()
 
         r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
@@ -1092,6 +1097,10 @@ class TestBundle:
             confidence=1.0,
         )
         repo.update_status("bnd_huge", "approved")
+        # #1573: make the item distribution_mode-eligible (hybrid default
+        # requires an opt-in upvote) so the assertion below actually
+        # exercises the token-budget truncation, not the distribution gate.
+        repo.vote("bnd_huge", "admin1", 1)
         conn.close()
 
         r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
@@ -1138,6 +1147,11 @@ class TestBundle:
             confidence=0.9,
         )
         repo.update_status("bnd_high", "approved")
+        # #1573: both items need to clear the distribution_mode gate
+        # (hybrid default: opt-in via upvote) to reach the ranking step
+        # this test exercises.
+        repo.vote("bnd_zero", "admin1", 1)
+        repo.vote("bnd_high", "admin1", 1)
         conn.close()
 
         r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))

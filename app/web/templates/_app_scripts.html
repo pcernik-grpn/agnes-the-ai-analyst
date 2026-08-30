@@ -7,6 +7,12 @@
          See app/web/static/js/datetime.js and the design spec at
          docs/superpowers/specs/2026-05-26-frontend-timezone-fix-design.md. -->
     <script src="{{ static_url('js/datetime.js') }}" defer></script>
+    <!-- window.AgnesKindGlyph — THE per-kind glyph set for client-rendered
+         rows, a transcription of the `kind_glyph()` Jinja macro. Loaded
+         globally (not per page) because three surfaces render kinds in JS and
+         each was otherwise keeping its own copy — one of which had already
+         fallen six kinds behind the macro. See js/kind_glyph.js. -->
+    <script src="{{ static_url('js/kind_glyph.js') }}"></script>
     <!-- window.AgnesIdentity — shared avatar initials + stable color hash, so
          the user circle renders identically across /admin/users, /admin/adoption,
          etc. See app/web/static/js/identity.js. -->
@@ -269,7 +275,9 @@
           'c': '/admin/marketplaces',     // (curated)
           'k': '/admin/tokens',           // (keys/tokens)
           'r': '/admin/store/submissions', // (review queue)
+          {% if can_store_moderation %}
           'v': '/admin/store',            // (verification / moderation & trust)
+          {% endif %}
         };
         let pending = false;
         let pendingTimer = null;
@@ -361,7 +369,9 @@
           { label: 'Studio · Suggestions queue',  hint: 'admin',        href: '/admin/studio/suggestions' },
           {% endif %}
           { label: 'Tokens',                      hint: 'admin · g k',  href: '/admin/tokens' },
+          {% if can_store_moderation %}
           { label: 'Moderation & trust',          hint: 'admin · g v',  href: '/admin/store' },
+          {% endif %}
           { label: 'Flea submissions',            hint: 'admin · g r',  href: '/admin/store/submissions' },
           { label: 'Prompts',                     hint: 'admin',        href: '/admin/prompts' },
           { label: '— User-facing —',             hint: 'separator',    href: null },
@@ -377,7 +387,9 @@
           { label: 'My agents',                   hint: 'user',         href: '/agents' },
           {% endif %}
           {% if can_mcp_connector_ui %}
-          { label: 'AI Connector',                hint: 'user',         href: '/me/ai-connector' },
+          {# `tojson` supplies its own quotes and escapes them: a brand short-name
+             containing an apostrophe would otherwise terminate the JS string. #}
+          { label: 'Take ' + {{ (instance_brand_short or 'Agnes') | tojson }} + ' to your tools', hint: 'user', href: '/me/ai-connector' },
           { label: 'Connect editor (token)',      hint: 'user',         href: '/mcp-connect' },
           {% endif %}
           {# /news is linked from /home's "What's new" strip, which only
@@ -387,7 +399,9 @@
           {# Label is "News", not the page's "What's new" heading copy —
              tests/test_web_news_page.py asserts that phrase is absent from
              /home when no version is published. #}
+          {% if can_news %}
           { label: 'News',                        hint: 'user',         href: '/news' },
+          {% endif %}
         ];
 
         let overlay = null;

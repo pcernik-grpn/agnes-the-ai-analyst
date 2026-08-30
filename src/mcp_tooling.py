@@ -87,6 +87,8 @@ def summarize_docstring(doc: str | None) -> tuple[str, bool]:
 # titled two different ways depending on how you connected.
 TITLE_OVERRIDES: dict[str, str] = {
     "catalog": "List Available Tables",
+    "fact_type_map": "List Fact Types With Counts",
+    "fact_facets": "List Filterable Entity Values",
     "schema": "Get Table Schema",
     "skills": "List Skills",
     "chat_skills": "List Chat Skills",
@@ -96,6 +98,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "stack_artefacts_candidates": "List Artefact Candidates",
     "admin_config_surface": "Get Config Surface",
     "admin_register_table": "Register Source Table",
+    "store_compose_plugin": "Publish A Plugin Bundling Existing Items",
     "admin_semantic_layer_coverage": "Get Semantic Layer Coverage",
     "apply_semantic_model": "Apply Semantic Model Document",
     "data_app_git_credential": "Get Data App Git Credential",
@@ -108,6 +111,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "data_app_logs": "Get Data App Logs",
     "fact_neighbors": "Get Fact Neighbors",
     "fact_claims": "Get Fact Claims",
+    "activity": "Get Activity Timeline",
 }
 
 

@@ -46,6 +46,9 @@
 {# The card and its icon tile are shared components; this page links their
    sheets and adds nothing to them. `.cc-icon` (the 38px kind-coloured tile)
    lives in catalog_card.css, `.fbar-card` and its grid in filter_toolbar.css. #}
+{# The builder workspace's rules — package_drawer grows into it when
+   opened from "+ New". Without the sheet the two panes stack. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 {# Creating a package happens HERE, in the shared right-side drawer — see the
@@ -134,7 +137,10 @@
   {% if shares %}
   <span class="fbar-card__access fbar-card__access--fixed"
         title="{{ shares | map(attribute='group_name') | join(', ') }}">
-    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="18" cy="6" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="6" cy="12" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="18" cy="18" r="2.6" stroke="currentColor" stroke-width="1.9"/><path d="M8.4 10.8l7.2-3.6M8.4 13.2l7.2 3.6" stroke="currentColor" stroke-width="1.9"/></svg>
+    {# The shared group mark, not a share/network glyph of its own: what
+       this slot names IS a group, and it is the same shape a group wears
+       on every other page. #}
+    {{ ds.group_mark('inline') }}
     {# One group is named; several are counted. A list of five group names in a
        26px slot ellipsises after the first anyway, and the count is the fact
        the reader is scanning for — the names ride the title attribute. #}
@@ -289,6 +295,9 @@
    sharing and delivery joins behind it, so the page reloads rather than
    inventing a card client-side — the same choice the package's own page makes
    after a grant change, and for the same reason. #}
+{# package_drawer builds the shared builder workspace when opened
+   from "+ New", so the shell has to be defined before it runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}" defer></script>
 <script>
   document.addEventListener("click", function (e) {

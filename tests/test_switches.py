@@ -137,7 +137,9 @@ class TestPortedFlagsAreUnchanged:
     flags' identity fields against the values they shipped with."""
 
     EXPECTED = {
-        "studio": (("studio", "enabled"), "AGNES_STUDIO_ENABLED", True),
+        # `default` is False since the admin cleanup retired the surface; the
+        # config key and env var are what this class pins as unchanged.
+        "studio": (("studio", "enabled"), "AGNES_STUDIO_ENABLED", False),
         "guardrails": (("guardrails", "enabled"), "AGNES_GUARDRAILS_ENABLED", True),
         "chat_approvals": (("chat", "approvals_enabled"), "AGNES_CHAT_APPROVALS_ENABLED", True),
         "chat": (("chat", "enabled"), "AGNES_CHAT_ENABLED", False),
@@ -210,6 +212,35 @@ class TestDataAppsAllowSameOriginSwitch:
         assert sw.switch_value("data_apps_allow_same_origin") is True
 
 
+class TestExtractionSwitch:
+    """`extraction.enabled` (spec §7.5 / §16 step 7) gates the
+    `corpus-extraction` job kind's handler — locked in the panel because it
+    depends on deployment machinery the settings panel cannot satisfy (a
+    producer bundled into the `worker` image + the `extraction-worker`
+    compose service actually running), same rationale as `data_apps`."""
+
+    def test_identity_and_lock(self):
+        s = get_switch("extraction")
+        assert s.config_keys == ("extraction", "enabled")
+        assert s.env_var == "AGNES_EXTRACTION_ENABLED"
+        assert s.kind == "bool"
+        assert s.default is False
+        assert s.editable is False
+        assert s.lock_reason.strip()
+
+    def test_handler_gate_reads_the_registry(self, monkeypatch):
+        """The `corpus-extraction` handler's enabled-check goes through
+        `feature_enabled` with this switch's own config keys/env var — not
+        a hand-rolled `get_value` pair (sync-map: "new user-visible switch")."""
+        from app.instance_config import feature_enabled
+
+        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is False
+        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "1")
+        assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is True
+
+
 class TestGetSwitch:
     def test_returns_the_entry(self):
         assert get_switch("chat").name == "chat"
@@ -254,10 +285,13 @@ class TestSwitchValueResolution:
 
     @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off", ""])
     def test_falsy_env_spellings(self, monkeypatch, raw):
+        """Read through `guardrails` (default True), so a spelling the parser
+        failed to recognize as falsy shows up as a failure. On a default-False
+        switch this whole class of test passes without parsing anything."""
         import app.switches as sw
 
-        monkeypatch.setenv("AGNES_STUDIO_ENABLED", raw)
-        assert sw.switch_value("studio") is False
+        monkeypatch.setenv("AGNES_GUARDRAILS_ENABLED", raw)
+        assert sw.switch_value("guardrails") is False
 
     @pytest.mark.parametrize("raw", ["1", "true", "YES", "on", "enabled", "banana"])
     def test_permissive_truthy_env_spellings(self, monkeypatch, raw):
@@ -298,10 +332,15 @@ class TestSwitchValueRefusesRuntimeViewSwitches:
 
     def test_non_runtime_view_switch_is_unaffected(self):
         """Sanity check that the guard is scoped to `runtime_view` switches,
-        not a blanket regression on `switch_value`."""
+        not a blanket regression on `switch_value`.
+
+        Reads `guardrails`, not `studio`: this assertion is only meaningful if
+        the value it expects is not also what a swallowed failure would return,
+        and `studio` defaults to False since the admin cleanup retired it.
+        """
         import app.switches as sw
 
-        assert sw.switch_value("studio") is True
+        assert sw.switch_value("guardrails") is True
 
 
 class TestBackwardCompatibility:

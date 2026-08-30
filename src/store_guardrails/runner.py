@@ -399,6 +399,9 @@ def run_llm_review(
                     },
                     result="success",
                 )
+                from app.api.store import _notify_submitter
+
+                _notify_submitter(sub, decision="approved")
         else:
             written = subs_repo.update_status(
                 submission_id,
@@ -446,6 +449,9 @@ def run_llm_review(
                 },
                 result="blocked",
             )
+            from app.api.store import _notify_submitter
+
+            _notify_submitter(sub, decision="blocked_llm")
 
         return LlmResult(verdict=verdict, reviewed_by_model=model)
     finally:

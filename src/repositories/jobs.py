@@ -111,9 +111,14 @@ class JobsRepository:
     #: Worker-runtime lane identifiers (Task 3 registers job kinds against
     #: one of these). Plain string constants — duplicated (not imported)
     #: on ``JobsPgRepository`` per the method/attribute-mirroring rule so
-    #: neither backend module depends on the other.
+    #: neither backend module depends on the other. ``EXTRACTION_LANE``
+    #: (spec §7.5 / §16 step 7) joined HEAVY/LIGHT later — see
+    #: ``app/worker/registry.py`` for the actual source of truth these
+    #: mirror; there is no ``lane`` column on this table, so adding it here
+    #: is a values-only constant, not a schema change.
     HEAVY_LANE = "heavy"
     LIGHT_LANE = "light"
+    EXTRACTION_LANE = "extraction"
 
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn

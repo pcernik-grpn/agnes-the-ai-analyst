@@ -410,12 +410,22 @@ def test_library_card_shows_fact_count_caller_scoped(seeded_app_both, state_back
     assert "1 fact" in r.text
 
 
-def test_library_card_fact_counts_resolve_the_readable_set_once(seeded_app_both, state_backend, monkeypatch):
+def test_library_card_fact_counts_do_not_grow_with_the_number_of_collections(
+    seeded_app_both, state_backend, monkeypatch
+):
     """The Library renders one card per collection, and the singular count
     re-resolved the caller's readable set every time — `accessible_collection_ids`
     runs a grants query plus a full owned-collections scan, so the page cost
     grew with the number of collections a caller can see. The batch call
     resolves it once no matter how many cards render (Devin Review on #1652).
+
+    Asserts that invariant directly — the call count is IDENTICAL for four
+    collections and for eight — rather than pinning a magic total. The page
+    legitimately has more than one page-level consumer of the readable set
+    (the card counts here, and the Knowledge tab's type map via
+    ``count_visible_facts_by_type``), and each resolving once is fine; what
+    must never come back is a resolution per CARD, which this catches
+    whatever the constant happens to be.
     """
     if state_backend != "pg":
         pytest.skip("PG-only assertion")
@@ -428,15 +438,6 @@ def test_library_card_fact_counts_resolve_the_readable_set_once(seeded_app_both,
     users_repo().create(id="erin1", email="erin1@test.com", name="Erin")
     erin_token = _issue_token("erin1", "erin1@test.com")
 
-    for i in range(4):
-        cid = _new_corpus(f"Batch {i}", f"batch-{i}", created_by="owner9")
-        fid = _new_file(cid, f"b{i}.md")
-        fact_id = facts_repo().create_fact(type="engagement")
-        facts_repo().add_claim(
-            fact_id=fact_id, corpus_file_id=fid, corpus_id=cid, file_sha256=f"sha_b{i}.md", quote=f"E{i}."
-        )
-        _grant_collection(f"g-erin-{i}", cid, "erin1")
-
     import app.auth.access as access
 
     calls = {"n": 0}
@@ -448,13 +449,34 @@ def test_library_card_fact_counts_resolve_the_readable_set_once(seeded_app_both,
 
     monkeypatch.setattr(access, "accessible_collection_ids", _counting)
 
-    r = s["client"].get("/library", headers=_headers(erin_token))
-    assert r.status_code == 200
-    assert r.text.count("1 fact") >= 4, "all four cards must still carry their own count"
-    assert calls["n"] == 1, (
-        f"the readable set must be resolved once for the whole page, not once per card (got {calls['n']})"
-    )
+    def _add_collections(lo, hi):
+        for i in range(lo, hi):
+            cid = _new_corpus(f"Batch {i}", f"batch-{i}", created_by="owner9")
+            fid = _new_file(cid, f"b{i}.md")
+            fact_id = facts_repo().create_fact(type="engagement")
+            facts_repo().add_claim(
+                fact_id=fact_id, corpus_file_id=fid, corpus_id=cid, file_sha256=f"sha_b{i}.md", quote=f"E{i}."
+            )
+            _grant_collection(f"g-erin-{i}", cid, "erin1")
 
+    def _render():
+        calls["n"] = 0
+        r = s["client"].get("/library", headers=_headers(erin_token))
+        assert r.status_code == 200
+        return r, calls["n"]
+
+    _add_collections(0, 4)
+    r4, n4 = _render()
+    assert r4.text.count("1 fact") >= 4, "all four cards must still carry their own count"
+
+    _add_collections(4, 8)
+    r8, n8 = _render()
+    assert r8.text.count("1 fact") >= 8, "all eight cards must still carry their own count"
+
+    assert n8 == n4, (
+        "the readable set must be resolved a fixed number of times per page, "
+        f"not once per card (4 collections -> {n4} resolutions, 8 -> {n8})"
+    )
 
 def test_library_card_fact_count_zero_for_ungranted_caller(seeded_app_both, state_backend, monkeypatch):
     """A caller who cannot reach a collection at all never sees its row —

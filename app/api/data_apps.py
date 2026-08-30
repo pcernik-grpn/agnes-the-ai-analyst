@@ -48,6 +48,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import hmac
 import os
 import re as _re
 import shutil
@@ -58,7 +59,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -76,6 +77,7 @@ from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX, PARENT_TOKEN_ID
 from app.instance_config import feature_enabled, get_data_apps_config, get_public_url
 from app.resource_types import ResourceType
 from app.secrets_vault import VaultKeyNotConfiguredError, decrypt_secret, encrypt_secret
+from src.audit_helpers import log_safe
 from src.data_apps.git_repos import fast_forward_live, init_app_repo
 from src.data_apps.runner_client import RunnerClient, RunnerError, RunnerUnavailable, up_timeout
 from src.data_apps.spec import AGNES_INTERNAL_URL, RESERVED_SLUGS, SLUG_RE, build_config_json, build_container_spec
@@ -567,14 +569,19 @@ def _mint_service_token(slug: str, owner: dict) -> tuple[str, str]:
     """Mint a PAT for this app's owner, store it via `access_token_repo().create`,
     and return the new token id.
 
-    The `scope: "data-app:<slug>"` claim is a label for `agnes admin token
-    list`/audit purposes only — no code path enforces it, so this is
-    functionally a full-privilege PAT for `owner`, not one actually confined
-    to this app's API surface. Any code running inside the hosted container
-    (including an externally-cloned, less-trusted repo) can use it against
-    the whole Agnes REST API. This mirrors the documented trade-off in
-    docs/DEPLOYMENT.md ("granting access to view/open an app is an act of
-    publication") — narrowing it to a real per-app scope is a follow-up.
+    The `scope: "data-app:<slug>"` claim is ENFORCED: `app/auth/pat_resolver.py`
+    admits it only on the data surface an app actually uses (see
+    `_DATA_APP_ALLOWED_EXACT` / `_DATA_APP_ALLOWED_SUBTREES` there) and
+    fail-closed refuses it everywhere else. Before that gate existed, code
+    running in the container — including an externally-cloned, less-trusted
+    repo — reached `/api/admin/*` whenever the owner was an Admin, and could
+    call `POST /cli/auth/rescope-surface` to trade this token (minted WITHOUT
+    expiry, see `omit_exp` below) for a fresh 90-day full-surface PAT.
+
+    What the gate does NOT change: within that surface the app still reads
+    with the OWNER's grants, evaluated live per request. That is the
+    documented trade-off in docs/DEPLOYMENT.md ("granting access to view/open
+    an app is an act of publication"), not something a scope can narrow.
 
     Mirrors `app/api/tokens.py::create_token`'s minting lines exactly (JWT +
     sha256 hash + prefix) — the raw JWT is only handed to `build_config_json`
@@ -2053,6 +2060,74 @@ async def get_data_app_readiness(slug: str, request: Request, response: Response
         state = "running"
 
     return {"state": state, "ready": ready}
+
+
+# Actions apps-runner may report through `record_runner_event` below — a
+# server-side whitelist so a compromised/buggy sidecar can't write an
+# arbitrary action string, no matter what its token can authenticate.
+RUNNER_REPORTED_ACTIONS = frozenset({"data_app.container_up", "data_app.container_stop", "data_app.container_resume"})
+
+
+class RunnerEventPayload(BaseModel):
+    action: str
+    params: dict[str, Any] = {}
+
+
+# Mirrors app/auth/scheduler_token.py: a secret shorter than this is treated
+# as "auth disabled" rather than as a weak secret, so an operator typo can
+# never leave a guessable token standing in front of this route.
+RUNNER_TOKEN_MIN_LENGTH = 32
+
+# Same cap the sibling client-reported audit endpoint applies to its params
+# (app/api/upload.py) — this route also ingests a semi-trusted caller's dict.
+_MAX_RUNNER_EVENT_PARAMS_BYTES = 2048
+
+
+def _check_runner_token(x_runner_token: Optional[str]) -> None:
+    """Constant-time shared-secret check.
+
+    This route sits on the public ``/api/data-apps`` router, not a
+    compose-internal one, so the token is internet-reachable and a plain
+    ``!=`` would leak it a byte at a time under timing analysis. Same
+    contract as ``app.auth.scheduler_token.is_scheduler_token``.
+    """
+    expected = os.environ.get("APPS_RUNNER_TOKEN", "").strip()
+    if not expected or len(expected) < RUNNER_TOKEN_MIN_LENGTH:
+        raise HTTPException(status_code=401, detail="bad_runner_token")
+    if not x_runner_token or not hmac.compare_digest(x_runner_token, expected):
+        raise HTTPException(status_code=401, detail="bad_runner_token")
+
+
+@router.post("/runner-events", status_code=204)
+async def record_runner_event(
+    payload: RunnerEventPayload,
+    x_runner_token: Optional[str] = Header(default=None),
+) -> Response:
+    """Receive a best-effort container-lifecycle event report from
+    apps-runner (Wave 2 — audit-coverage plan, Task 3).
+
+    apps-runner holds the Docker socket but no database access — see
+    ``services/apps_runner/audit_report.py`` — so this is its ONLY path to
+    an ``audit_log`` row. Authenticated with the SAME shared
+    ``X-Runner-Token`` the control plane already presents TO the runner
+    (``APPS_RUNNER_TOKEN``), just in the reverse direction. Not gated by
+    ``_feature_gate()``/user auth — this is a system-to-system channel, not
+    a user-facing route, and a report about a container that could only
+    exist if the feature were on is harmless to accept either way.
+    """
+    _check_runner_token(x_runner_token)
+    if payload.action not in RUNNER_REPORTED_ACTIONS:
+        raise HTTPException(status_code=400, detail="unknown_action")
+    try:
+        params_size = len(json.dumps(payload.params, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="params_not_serializable")
+    if params_size > _MAX_RUNNER_EVENT_PARAMS_BYTES:
+        raise HTTPException(status_code=400, detail="params_too_large")
+    slug = payload.params.get("slug")
+    resource = f"data_app:{slug}" if slug else None
+    log_safe(action=payload.action, resource=resource, params=payload.params, client_kind="system")
+    return Response(status_code=204)
 
 
 @router.post("/reap-idle")

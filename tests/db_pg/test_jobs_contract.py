@@ -242,6 +242,7 @@ def test_list_respects_limit(repo):
 def test_lane_constants(repo):
     assert type(repo).HEAVY_LANE == "heavy"
     assert type(repo).LIGHT_LANE == "light"
+    assert type(repo).EXTRACTION_LANE == "extraction"
 
 
 def test_claim_next_returns_none_when_nothing_eligible(repo):

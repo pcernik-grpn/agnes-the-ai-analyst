@@ -190,6 +190,72 @@ services:
     # WAL-corruption risk on SIGKILL during recreate.
     stop_grace_period: 60s
 
+  # Extraction worker lane (spec §7.5 "Extraction inside Agnes (later)" /
+  # §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
+  # collections-design.md) — a SEPARATE process/container running ONLY the
+  # `extraction` lane (AGNES_WORKER_LANES=extraction), so the
+  # `corpus-extraction` job kind's producer subprocess (crawl -> convert ->
+  # anonymize -> extract, potentially long-running) can never compete with
+  # the `app` service's heavy/light lanes for CPU/memory, and a corpus
+  # re-extraction never has a chance to block a table sync (the reason the
+  # extraction lane exists at all — see app/worker/registry.py).
+  #
+  # Built from the `worker` Dockerfile target — see that stage's comment for
+  # the EXTRACTION_PRODUCER_INSTALL build-arg extension point; this repo does
+  # NOT vendor the producer (a separate project of the operator's, adopted per spec
+  # §7.1). Off by default (`extraction.enabled: false`,
+  # config/instance.yaml.example) AND behind its own compose profile — a
+  # deployment that wants it running does ALL THREE, in order:
+  #   1. Satisfy the multi-process prerequisites FIRST. This service sets
+  #      AGNES_ROLE=worker below, which is a role split — the deployment as
+  #      a whole becomes "multi-process" the moment this container starts,
+  #      requiring Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET,
+  #      and `coordination.backend: redis` (instance.yaml). Without these,
+  #      `app/startup_guards.py::validate_deployment` refuses to boot — see
+  #      docs/DEPLOYMENT.md#multi-process.
+  #   2. Flip `extraction.enabled: true` with a configured producer
+  #      (config/instance.yaml.example's `extraction:` block).
+  #   3. Start this service with `--profile extraction-worker`.
+  extraction-worker:
+    build:
+      context: .
+      target: worker
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'
+    profiles: ["extraction-worker"]
+    volumes:
+      - data:/data
+      - ./config:/app/config:ro
+    env_file: .env
+    environment:
+      - DATA_DIR=/data
+      - AGNES_TEMP_DIR=${AGNES_TEMP_DIR:-/data/tmp}
+      # Runs ONLY the extraction lane on this process — see
+      # app/worker/runtime.py::selected_lanes(). The `app` service's own
+      # heavy+light lanes are untouched; this is additive capacity, not a
+      # replacement for it.
+      - AGNES_ROLE=worker
+      - AGNES_WORKER_LANES=extraction
+      - AGNES_SKIP_LEGACY_COLLECTOR=1
+      - CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    # A producer subprocess (crawl/convert/anonymize/extract, possibly with
+    # docling/embeddings-class deps if the operator's producer image needs
+    # them) can be considerably heavier than the scheduler's own HTTP calls —
+    # default sized like the app service, not the scheduler. Override via
+    # .env on a deployment whose producer needs more.
+    mem_limit: ${AGNES_EXTRACTION_WORKER_MEM_LIMIT:-4g}
+    cpus: ${AGNES_EXTRACTION_WORKER_CPUS:-2.0}
+    # Same WAL-corruption-on-SIGKILL rationale as the app/scheduler services.
+    stop_grace_period: 60s
+
   # The only process holding the Docker socket. Deliberately dumb: no
   # registry access, no RBAC — the app decides *what* runs, this sidecar
   # only translates to `docker run`/stop/status calls, token-gated over

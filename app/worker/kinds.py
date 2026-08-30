@@ -96,10 +96,54 @@ distribution mirror, and the api-role write conversions) map onto:
   it's a plain outbound HTTP POST with no dependency on the live
   ``ChatManager``/chat event loop, so it runs fine on a worker-only,
   gateway-less process too.
+- ``corpus-extraction``    (EXTRACTION — its own lane, spec §7.5 / §16
+  step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
+  design.md) — the producer-invocation SEAM for document extraction. Off
+  by default (``extraction.enabled: false``, ``config/instance.yaml
+  .example``). Unlike every other handler in this module, this one is
+  NOT a thin adapter over an in-process function: it resolves this
+  connection's SharePoint/tenant credentials from config/vault
+  (``connectors.sharepoint.settings.resolve_sharepoint_settings`` — the
+  SAME resolution path the SharePoint admin UI uses) and shells out to
+  the operator-configured producer (crawl -> convert -> anonymize ->
+  extract -> ingest against ``POST /api/facts/ingest``, spec §7.2) as a
+  subprocess, under a bounded timeout, with the resolved credentials passed
+  via the CHILD PROCESS ENVIRONMENT — never argv, never logged (security
+  playbook F7). That child env is NOT the full parent environment: only a
+  curated non-secret allowlist (+ any operator-opted-in
+  ``extraction.producer.env_passthrough``), the named SharePoint
+  credentials, the corpus id, and (TCRD-226) the producer's OWN callback
+  credential for calling back into Agnes's REST API are forwarded — see
+  ``_EXTRACTION_PRODUCER_ENV_ALLOWLIST`` and
+  ``_agnes_producer_callback_env``. That callback credential is a
+  DELIBERATE, EXPLICITLY-NOTED OVER-GRANT (the scheduler shared-secret
+  token, which resolves to a synthetic ``Admin``-group user — see
+  ``_agnes_producer_callback_env``'s own docstring for the full argument);
+  every OTHER instance secret (vault key, LLM API key, DB DSN, ...) still
+  never reaches this subprocess. On a role-split ``extraction-worker``
+  container (``AGNES_ROLE=worker``, a SEPARATE container from ``app`` —
+  ``docker-compose.yml``), ``_agnes_producer_callback_env`` also refuses to
+  resolve the callback URL's own loopback fallback: that fallback would
+  point the producer at the WORKER's own loopback rather than the
+  instance's real callback surface, so an unconfigured ``SERVER_URL``/
+  ``AGNES_INTERNAL_URL`` there fails the job clean instead of shipping a
+  URL nothing outside that container answers. The producer itself
+  is a separate project the operator supplies, adopted rather than
+  ported into this repo (spec §1 "Out of scope") — see
+  ``_run_corpus_extraction`` below for exactly where that boundary is.
+  Registered UNCONDITIONALLY (its own no-op guard on
+  ``extraction.enabled`` makes an accidental claim on a process that
+  never opted into the ``extraction`` lane harmless, mirroring
+  ``webhook-deliver``'s posture above) but only ever CLAIMED by a lane
+  slot that opted into ``AGNES_WORKER_LANES=extraction`` — see
+  ``app/worker/runtime.py``'s ``selected_lanes()``.
 
 Every handler below is a THIN ADAPTER — it imports and calls the existing
-function/method and does not reimplement any of its logic. Each import is
-deferred (inside the handler, not at module import time) for the same
+function/method and does not reimplement any of its logic — EXCEPT
+``corpus-extraction``, whose "existing function" is an external subprocess
+rather than an in-process call; see its own docstring for where the seam
+sits. Each import is deferred (inside the handler, not at module import
+time) for the same
 reason ``app/worker/runtime.py``'s ``_jobs_repo()`` and
 ``_sweep_stale_scratch()`` defer theirs: this module must not carry an
 import-time dependency on heavyweight subsystems (LLM clients, the
@@ -132,6 +176,15 @@ Lease/retry tuning:
   ``corporate-memory``) default to 300s — bulk git clones / LLM catalog
   refresh / filesystem walks, but bounded by their own internal
   timeouts, not multi-minute by design.
+- ``corpus-extraction``'s lease tracks its own ``extraction.timeout_s``
+  config (default 3600s) plus a margin — the producer subprocess is
+  killed at that timeout regardless (``subprocess.run(..., timeout=...)``),
+  so the lease only has to outlast it long enough for the timeout itself
+  to fire and finalize the job, same "generous ceiling, not the actual
+  bound" reasoning as ``data-refresh`` above. No retry by default: a
+  failed producer run (bad credentials, crawl error, timeout) usually
+  needs an operator to look at it, not an automatic re-run against the
+  same corpus a few minutes later.
 """
 
 from __future__ import annotations
@@ -139,8 +192,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
+import subprocess
+import tempfile
+import time
+from typing import Optional
 
-from app.worker.registry import HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
+from app.worker.registry import JOB_KINDS, EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
+from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +218,50 @@ _DEFAULT_LIGHT_LEASE_S = 300
 # heartbeat keeps the lease alive every lease_seconds/3 while the handler
 # thread runs).
 _DEFAULT_DUCKLAKE_MAINTENANCE_LEASE_S = 900
+# Hard ceiling on one producer subprocess run (extraction.timeout_s in
+# instance.yaml overrides this) — a full crawl+convert+anonymize+extract
+# pass over a real SharePoint site can legitimately run for a while.
+_DEFAULT_EXTRACTION_TIMEOUT_S = 3600
+# The job's own lease outlives the subprocess timeout by a margin so a
+# heartbeat tick never expires the lease out from under a still-running
+# (not-yet-timed-out) producer call — same pattern as _agent_response_job
+# _timeout_seconds()'s lease_seconds below.
+_EXTRACTION_LEASE_MARGIN_S = 120
+
+# Non-secret operational env vars forwarded to the producer subprocess from
+# THIS process's own environment, when present. Deliberately a NARROW
+# allowlist, never `{**os.environ}`: `extraction.producer.command`/`.module`
+# names an EXTERNAL, admin-configurable binary — unlike the in-repo Keboola
+# extractor subprocess `app/api/sync.py` spawns (which legitimately inherits
+# the full parent env because it IS this codebase, reviewed and trusted the
+# same way the rest of the process is), a producer an admin can point
+# anywhere must not receive this instance's secrets (JWT_SECRET_KEY,
+# AGNES_VAULT_KEY, ANTHROPIC_API_KEY, POSTGRES_PASSWORD/DATABASE_URL,
+# SLACK_BOT_TOKEN, KEBOOLA_STORAGE_TOKEN, ...) just because they happen to
+# sit in os.environ. Only what a well-behaved subprocess needs to run at
+# all (PATH), plus locale/timezone/tempdir/TLS/proxy settings — nothing an
+# attacker (or a merely careless producer) could exfiltrate for profit.
+_EXTRACTION_PRODUCER_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 
 def _data_refresh_lease_seconds() -> int:
@@ -1048,6 +1151,504 @@ def _run_webhook_deliver(payload: dict) -> None:
         raise RuntimeError(f"webhook-deliver: POST to webhook {webhook_id} failed")
 
 
+#: How much of a failed producer's stderr to keep for the DEBUG line. Enough
+#: for a Python traceback plus context, small enough that it can never be the
+#: reason a worker dies.
+_PRODUCER_STDERR_TAIL_BYTES = 64 * 1024
+
+
+def _tail_text(fh, limit: int) -> str:
+    """Last ``limit`` bytes of an open binary file, decoded leniently.
+
+    Seeks rather than reads forward, so a multi-gigabyte producer log costs
+    one seek. ``errors="replace"`` because the cut can land mid-codepoint and
+    a diagnostic must never raise on its way to the log.
+    """
+    try:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - limit))
+        return fh.read().decode("utf-8", errors="replace")
+    except Exception:  # pragma: no cover - a diagnostic must not mask the failure it describes
+        return "<unreadable>"
+
+
+def _extraction_timeout_seconds() -> int:
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "timeout_s", default=_DEFAULT_EXTRACTION_TIMEOUT_S)
+    try:
+        return max(int(raw), 1)
+    except (TypeError, ValueError):
+        return _DEFAULT_EXTRACTION_TIMEOUT_S
+
+
+def _extraction_producer_argv() -> list[str] | None:
+    """Build the producer's argv from ``extraction.producer`` config
+    (``config/instance.yaml.example``).
+
+    ``command`` (a full command line — either a YAML list, taken verbatim,
+    or a string split with ``shlex.split``) wins when both are set;
+    ``module`` is the ``python -m <module>`` shorthand for a producer the
+    ``worker`` image installed as a package (see the Dockerfile's
+    ``EXTRACTION_PRODUCER_INSTALL`` build-arg). Returns ``None`` when
+    neither is configured — the caller turns that into a clear "not
+    configured" failure rather than a confusing subprocess error.
+    """
+    from app.instance_config import get_value
+
+    command = get_value("extraction", "producer", "command", default=None)
+    if command:
+        if isinstance(command, list):
+            return [str(c) for c in command]
+        return shlex.split(str(command))
+
+    module = get_value("extraction", "producer", "module", default=None)
+    if module:
+        import sys
+
+        return [sys.executable, "-m", str(module)]
+
+    return None
+
+
+def _extraction_producer_env_passthrough() -> list[str]:
+    """Extra env var NAMES an operator explicitly opted into forwarding to
+    the producer, beyond :data:`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`
+    (``extraction.producer.env_passthrough``, default empty). A per-name
+    opt-in, not a way back to `{**os.environ}` — only the names listed here
+    are copied, and only when they actually exist in this process's
+    ``os.environ``."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "producer", "env_passthrough", default=[])
+    if isinstance(raw, list):
+        return [str(v) for v in raw]
+    if raw:
+        return [str(raw)]
+    return []
+
+
+def _extraction_producer_env() -> dict[str, str]:
+    """The non-secret base env for the producer subprocess: the curated
+    allowlist plus whatever :func:`_extraction_producer_env_passthrough`
+    names — each copied from ``os.environ`` only when present. Callers add
+    the resolved SharePoint credentials + corpus id on top of this."""
+    names = list(_EXTRACTION_PRODUCER_ENV_ALLOWLIST) + _extraction_producer_env_passthrough()
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+class AnonymizationKeyError(RuntimeError):
+    """At least one selected scope is ``anonymize=true`` but no per-instance
+    HMAC key resolves (design spec §9.2's pseudonym scheme —
+    ``PERSON_<hmac(key, ...)>`` etc., never a fixed marker). Raised rather
+    than silently omitting the key: a producer falling back to a shared or
+    absent key defeats the "tokens never correlate across tenants"
+    guarantee the key exists for, so the job fails clean instead of running
+    with a weaker guarantee than the wizard promised."""
+
+
+_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT = "AGNES_ANONYMIZATION_HMAC_KEY"
+
+
+def _anonymize_marked_scope_map(connection: dict) -> dict[str, str]:
+    """``{source_scope_id: collection_id}`` for exactly the scopes THIS
+    connection's wizard marked ``anonymize=true`` (spec §9's
+    anonymize-in-front pipeline: source -> crawl -> convert -> anonymize ->
+    Agnes) — the producer handoff for which scopes it must run through the
+    anonymizer before uploading.
+
+    Reads the connection row's own ``config.scopes`` directly (the shape
+    ``app/api/admin_sharepoint.py`` writes and reads:
+    ``{source_scope_id, display_path, anonymize, collection_id}``) rather
+    than importing that admin router — this worker handler must not gain a
+    dependency on the admin API surface. ``GET .../corpus-map`` stays the
+    flat ``{source_scope_id: collection_id}`` producers already consume;
+    this is the SAME mapping, narrowed to anonymize-marked rows, used only
+    internally to build the child env below.
+    """
+    scopes = (connection.get("config") or {}).get("scopes")
+    if not isinstance(scopes, list):
+        return {}
+    out: dict[str, str] = {}
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        if scope.get("anonymize") and scope.get("source_scope_id") and scope.get("collection_id"):
+            out[str(scope["source_scope_id"])] = str(scope["collection_id"])
+    return out
+
+
+def _resolve_anonymization_key() -> str:
+    """Resolve this instance's per-instance anonymization HMAC key (spec
+    §9.2): an admin-configurable env var NAME
+    (``extraction.anonymization.hmac_key_env``, default
+    ``AGNES_ANONYMIZATION_HMAC_KEY``), checked against
+    :func:`src.orchestrator_security.is_producer_key_env_allowed` BEFORE the
+    value is read. The env var NAME is admin-writable config, so without a
+    gate an admin could point ``hmac_key_env`` at an unrelated instance
+    secret (``ANTHROPIC_API_KEY``, ``JWT_SECRET_KEY``, ...) and have it
+    forwarded to the external producer as if it were the anonymization key.
+
+    Deliberately uses ``is_producer_key_env_allowed`` — a SEPARATE, narrower
+    allowlist from ``is_token_env_allowed`` (the connector-ATTACH `token_env`
+    gate) — NOT the same function the SharePoint certificate resolver uses.
+    Sharing the certificate's allowlist would additionally make this key a
+    legal `token_env` for a connector-written `_remote_attach` row (a
+    SECOND, unrelated consumer of that allowlist in ``src/orchestrator.py``
+    / ``src/db.py``), letting a malicious connector exfiltrate the resolved
+    key value via ``ATTACH ... TOKEN`` to a connector-chosen URL (RBAC
+    review, 2026-08-28). See ``_PRODUCER_KEY_ENVS``'s docstring in
+    ``src/orchestrator_security.py`` for the full trust-boundary argument.
+
+    Raises :class:`AnonymizationKeyError` (never returns a fallback/empty
+    key) when the name is disallowed or unset — see that class's docstring
+    for why.
+    """
+    from app.instance_config import get_value
+    from src.orchestrator_security import is_producer_key_env_allowed
+
+    env_name = str(get_value("extraction", "anonymization", "hmac_key_env", default="") or "").strip()
+    env_name = env_name or _ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
+
+    if not is_producer_key_env_allowed(env_name):
+        raise AnonymizationKeyError(
+            f"extraction.anonymization.hmac_key_env={env_name!r} is not an allowed anonymization "
+            f"key variable. Use the default name, {_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT}, or leave "
+            "hmac_key_env empty."
+        )
+
+    value = os.environ.get(env_name)
+    if not value:
+        raise AnonymizationKeyError(
+            f"{env_name} is not set on the server, so the per-instance anonymization key cannot "
+            "be resolved. At least one selected scope is marked anonymize=true — set "
+            f"{env_name} (see docs/anonymization.md) or unmark the scope in the connect wizard."
+        )
+    return value
+
+
+def _agnes_producer_callback_env() -> dict[str, str]:
+    """The credential the producer subprocess needs to call BACK into
+    Agnes's own REST API (TCRD-226) — ``GET .../corpus-map``,
+    ``GET .../scopes``, the collections upload, ``POST /api/facts/ingest``.
+    Before this wiring the child env carried SharePoint credentials but
+    nothing to authenticate a callback with at all — the part the design
+    doc flagged as undecided.
+
+    ``AGNES_API_URL`` — this instance's own base URL, resolved the same
+    ``SERVER_URL`` -> ``AGNES_INTERNAL_URL`` -> loopback chain the chat
+    sandbox rails already use (:func:`app.chat.manager.agnes_server_url`,
+    deferred-imported here so this module keeps its "no heavyweight
+    subsystem at import time" posture — see the module docstring). Always
+    forwarded; it names no secret.
+
+    Loopback guard: that chain's own fallback (``http://127.0.0.1:8000``)
+    is correct for the default ALL-IN-ONE process — the producer's parent
+    process IS the app, so its own loopback genuinely answers. It is WRONG
+    for the ``extraction-worker`` compose service (a role-split
+    ``AGNES_ROLE=worker`` container, separate from ``app``): the fallback
+    would then hand the producer THAT WORKER's own loopback, where the
+    corpus-map/scopes/facts-ingest routes it needs are not the instance's
+    real callback surface — a misconfiguration that reads like a producer
+    bug (crawl succeeds, only the final callback fails) rather than a named
+    config error. So when neither ``SERVER_URL`` nor ``AGNES_INTERNAL_URL``
+    is set AND this process is NOT all-in-one (:func:`app.roles.
+    is_all_in_one`), this function raises instead of resolving the
+    fallback — the same "refuse before running the producer" posture as
+    the ``extraction.enabled`` / no-producer-configured checks in
+    :func:`_run_corpus_extraction`. Checking the unconfigured DEFAULT
+    (both env vars empty) rather than "is the resolved URL a loopback
+    address" is deliberate: an operator who explicitly points
+    ``SERVER_URL``/``AGNES_INTERNAL_URL`` at a loopback-looking address on
+    purpose (e.g. a local network-namespace-sharing setup) made a real
+    choice this function has no basis to second-guess — only the silent,
+    unconfigured fallback is refused.
+
+    ``AGNES_API_TOKEN`` — the scheduler sidecar's own shared-secret bearer
+    token (:func:`app.auth.scheduler_token.get_scheduler_secret`), forwarded
+    ONLY when one is actually configured (an instance with no
+    ``SCHEDULER_API_TOKEN`` set — e.g. ``LOCAL_DEV_MODE`` — forwards no
+    token, never a placeholder). This is a genuine, DELIBERATE OVER-GRANT,
+    surfaced rather than hidden: presenting that token resolves to a
+    synthetic user in the ``Admin`` system group — god-mode on every RBAC
+    check in this instance (``app/auth/scheduler_token.py``) — while the
+    producer only ever needs to read THIS connection's own scope map,
+    upload into its own scope collections, and POST to the facts-ingest
+    endpoint (itself already scheduler-token-or-admin gated). It is reused
+    here because it is the only existing credential class in this codebase
+    a headless subprocess can already present without a live login session;
+    a narrower, producer-scoped credential (e.g. a PAT pinned to this one
+    connection's collections) is the right long-term fix and is explicitly
+    out of scope for this change — a compromised or merely misbehaving
+    producer under this token can do anything an admin can, not merely
+    ingest facts.
+
+    Security (playbook F7, same rule as every other secret this handler
+    resolves): the token reaches the producer ONLY via the child process
+    environment, never on argv, never logged.
+    """
+    from app.roles import is_all_in_one
+
+    if not (os.environ.get("SERVER_URL") or os.environ.get("AGNES_INTERNAL_URL")) and not is_all_in_one():
+        raise RuntimeError(
+            "corpus-extraction: this is a role-split worker process (AGNES_ROLE != all) with neither "
+            "SERVER_URL nor AGNES_INTERNAL_URL configured — refusing to hand the producer this worker's "
+            "own loopback address instead of a reachable callback URL. Set SERVER_URL (or "
+            "AGNES_INTERNAL_URL) in the extraction-worker's environment."
+        )
+
+    from app.chat.manager import agnes_server_url
+
+    env: dict[str, str] = {"AGNES_API_URL": agnes_server_url()}
+
+    from app.auth.scheduler_token import get_scheduler_secret
+
+    secret = get_scheduler_secret()
+    if secret:
+        env["AGNES_API_TOKEN"] = secret
+    return env
+
+
+def _run_corpus_extraction(payload: dict) -> dict:
+    """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
+    §7.5 / §16 step 7). See the module docstring's entry for the wider
+    picture; this is the mechanics.
+
+    THIS HANDLER DOES NOT CRAWL, CONVERT, ANONYMIZE, OR EXTRACT ANYTHING
+    ITSELF — it resolves credentials, builds a command line, runs one
+    subprocess, and reports what happened. The crawl -> convert ->
+    anonymize -> extract -> ingest pipeline behind that subprocess is the
+    external producer (a separate project of the operator's, adopted per spec
+    §7.1); porting its internals into this repo is explicitly out of scope
+    (spec §1 "Out of scope") — this handler is the seam a future producer
+    integration plugs into, not a place to grow pipeline logic.
+
+    ``payload``:
+      - ``connection_id`` (required) — a ``source_connections`` row,
+        ``source_type='sharepoint'``. Credentials are resolved from ITS
+        vault slot or the server's ``SHAREPOINT_CERT_PRIVATE_KEY`` env var
+        via :func:`connectors.sharepoint.settings.resolve_sharepoint_settings`
+        — the SAME resolution the SharePoint admin UI uses
+        (``app/api/admin_sharepoint.py``). Never hardcoded, never read from
+        this payload directly.
+      - ``corpus_id`` (optional, ``scope`` accepted as an alias) — which
+        collection the producer should write into. Passed through to the
+        producer verbatim; this handler does not interpret it.
+
+    Anonymize-in-front handoff (spec §9/§9.2): this connection's own
+    ``config.scopes`` rows carry a per-scope ``anonymize`` flag (the connect
+    wizard's step-2 column, ``app/api/admin_sharepoint.py``) — the ONLY
+    place that flag is real is here. When at least one confirmed scope is
+    ``anonymize=true``, the child env additionally carries
+    ``AGNES_EXTRACTION_ANONYMIZE_SCOPES`` (a JSON object,
+    ``{source_scope_id: collection_id}``, covering ONLY the anonymize-marked
+    scopes — see :func:`_anonymize_marked_scope_map`) and
+    ``AGNES_ANONYMIZATION_HMAC_KEY`` (the per-instance pseudonym key, see
+    :func:`_resolve_anonymization_key`). Neither var is set when no scope is
+    anonymize-marked — an instance that never anonymizes never resolves or
+    forwards a key it does not need.
+
+    Security (playbook F7): every secret this handler resolves —
+    tenant id, client id, certificate private key, the anonymization HMAC
+    key (when needed), and the producer's own Agnes-API callback token (see
+    :func:`_agnes_producer_callback_env`) — reaches the producer ONLY via
+    the child process's environment, never on argv (readable via `ps`/
+    `/proc/<pid>/cmdline`) and never logged. That child env is NOT
+    `{**os.environ}` — `extraction.producer` names an EXTERNAL,
+    admin-configurable binary, so it starts from a curated non-secret
+    allowlist (`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`) plus any operator-
+    opted-in `extraction.producer.env_passthrough`, then adds only the
+    three named credentials + the corpus id + (conditionally) the two
+    anonymization vars + the callback URL/token above. No OTHER instance
+    secret (vault key, LLM API key, DB DSN, ...) is ever forwarded, no
+    matter what happens to be sitting in this process's own environment —
+    the callback token is a deliberate, separately-justified exception, not
+    a crack in this rule (see `_agnes_producer_callback_env`'s docstring
+    for the honest over-grant it carries). The producer's own
+    stdout/stderr are logged at DEBUG only, and only on failure, in case a
+    misbehaving producer echoes something it shouldn't at INFO-visible
+    levels.
+
+    No-op guard: raises (so the job fails cleanly, not with a confusing
+    subprocess error) when ``extraction.enabled`` is false, no producer
+    command/module is configured, or (see :func:`_agnes_producer_callback_env`)
+    this is a role-split worker with no callback URL configured — the same
+    "off unless explicitly turned on" posture as ``ducklake-maintenance``'s
+    backend check, just failing instead of silently returning, since a
+    `corpus-extraction` job only ever exists because something explicitly
+    enqueued it.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction: extraction.enabled is false — refusing to run")
+
+    argv = _extraction_producer_argv()
+    if not argv:
+        raise RuntimeError(
+            "corpus-extraction: no producer configured — set extraction.producer.command "
+            "or extraction.producer.module in instance.yaml"
+        )
+
+    connection_id = payload.get("connection_id")
+    if not connection_id:
+        raise RuntimeError("corpus-extraction: payload missing connection_id")
+
+    from src.repositories import source_connections_repo
+
+    connection = source_connections_repo().get(connection_id)
+    if connection is None or connection.get("source_type") != "sharepoint":
+        raise RuntimeError(f"corpus-extraction: connection {connection_id!r} not found or not a sharepoint connection")
+
+    from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+
+    try:
+        settings = resolve_sharepoint_settings(connection)
+    except SharePointSettingsError as exc:
+        # Named cause, not a bare 500-class traceback — mirrors
+        # app/api/admin_sharepoint.py::_resolved_token's typed handling of
+        # the identical error.
+        raise RuntimeError(f"corpus-extraction: {exc}") from exc
+
+    corpus_id = payload.get("corpus_id") or payload.get("scope")
+
+    # Secrets go in the CHILD process env, never on argv (security playbook
+    # F7) — but NOT the full parent environment. `extraction.producer`
+    # names an EXTERNAL, admin-configurable binary, so this starts from the
+    # curated non-secret allowlist (+ any operator-opted-in
+    # `env_passthrough`) — see `_EXTRACTION_PRODUCER_ENV_ALLOWLIST`'s
+    # comment for why `{**os.environ}` would leak every instance secret
+    # (vault key, LLM API key, DB DSN, ...) to whatever the admin pointed
+    # this at — and adds only the resolved credentials and the corpus id.
+    child_env = {
+        **_extraction_producer_env(),
+        "AGNES_SHAREPOINT_TENANT_ID": settings.tenant_id,
+        "AGNES_SHAREPOINT_CLIENT_ID": settings.client_id,
+        "AGNES_SHAREPOINT_PRIVATE_KEY": settings.private_key,
+    }
+    if corpus_id:
+        child_env["AGNES_EXTRACTION_CORPUS_ID"] = str(corpus_id)
+
+    # Anonymize-in-front handoff (spec §9/§9.2): which of THIS connection's
+    # scopes the producer must run through the anonymizer before uploading,
+    # plus the per-instance pseudonym key — env only (never argv), and only
+    # added when at least one scope actually needs it, so an instance that
+    # never anonymizes never resolves/forwards the key at all.
+    anonymize_scopes = _anonymize_marked_scope_map(connection)
+    if anonymize_scopes:
+        child_env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"] = json.dumps(anonymize_scopes, sort_keys=True)
+        child_env["AGNES_ANONYMIZATION_HMAC_KEY"] = _resolve_anonymization_key()
+
+    # Producer callback credential (TCRD-226): the crawl -> convert ->
+    # anonymize -> extract -> ingest pipeline calls BACK into Agnes's own
+    # REST API (corpus-map, scopes, POST /api/facts/ingest) to do its actual
+    # work — until this wiring, the child env carried SharePoint credentials
+    # and nothing to authenticate a callback with at all. `AGNES_API_URL` is
+    # always forwarded (harmless, no secret); `AGNES_API_TOKEN` only when a
+    # scheduler shared secret is actually configured — see
+    # `_agnes_producer_callback_env`'s docstring for the deliberate,
+    # explicitly-noted OVER-GRANT this reuses (the scheduler token resolves
+    # to a synthetic Admin-group user, far more than the producer needs).
+    child_env.update(_agnes_producer_callback_env())
+
+    timeout_s = _extraction_timeout_seconds()
+
+    logger.info(
+        "corpus-extraction: invoking producer for connection %s (corpus=%s, timeout=%ds)",
+        connection_id,
+        corpus_id,
+        timeout_s,
+    )
+    # NOT `capture_output=True`: that holds every byte the producer writes in
+    # THIS process's memory for the whole run, and the run may legitimately
+    # last `extraction.timeout_s` (default an hour) crawling a real site. The
+    # captured text is used for exactly one thing — a DEBUG line on failure —
+    # so an hour of a chatty producer's progress output would buy a diagnostic
+    # tail at the price of OOM-killing a worker whose container memory limit is
+    # 4g by default (Devin Review on this PR). stdout goes to /dev/null (this
+    # handler never reads it — the producer reports through the ingest API, not
+    # through its own stdout), and stderr streams to a temp file from which
+    # only the last `_PRODUCER_STDERR_TAIL_BYTES` are read back on failure.
+    # Trading unbounded RSS for bounded RSS plus scratch disk is the right way
+    # round: the memory limit is what kills the worker, and the tail is the
+    # part of a stack trace anyone reads anyway.
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as stderr_buf:
+            result = subprocess.run(
+                argv,
+                env=child_env,
+                timeout=timeout_s,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_buf,
+                check=False,
+            )
+            stderr_tail = _tail_text(stderr_buf, _PRODUCER_STDERR_TAIL_BYTES) if result.returncode != 0 else ""
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"corpus-extraction: producer timed out after {timeout_s}s") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"corpus-extraction: producer command not found: {argv[0]!r}") from exc
+
+    if result.returncode != 0:
+        logger.debug("corpus-extraction: producer stderr tail (connection %s): %s", connection_id, stderr_tail)
+        raise RuntimeError(f"corpus-extraction: producer exited {result.returncode} for connection {connection_id}")
+
+    logger.info("corpus-extraction: producer completed for connection %s", connection_id)
+    return {
+        "connection_id": connection_id,
+        "corpus_id": corpus_id,
+        "returncode": result.returncode,
+    }
+
+
+def dispatch_job(job: dict) -> Optional[dict]:
+    """THE single dispatch-level entry point for running one claimed job's
+    handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
+    up in the process-wide ``JOB_KINDS`` registry, runs its handler, and
+    writes exactly one ``job.run`` audit row regardless of outcome — no
+    individual ``_run_*`` handler above calls ``log_safe`` itself, so a
+    future kind gets audit coverage for free just by registering through
+    ``register_kind``.
+
+    ``app/worker/runtime.py``'s ``_run_one`` calls this (via
+    ``asyncio.to_thread``) INSTEAD OF ``kind.handler(job["payload_json"])``
+    directly — the one place in the whole worker that actually executes a
+    claimed job, so this is also the one place audit coverage needs to
+    live (one dispatch-level wrapper, not one per kind).
+
+    Runs outside any HTTP request — there is no ASGI scope for
+    ``src.audit_context``'s autofill to read, so ``duration_ms`` is
+    measured explicitly here and ``client_kind="scheduler"`` is always
+    passed. ``user_id=None``: a scheduled/worker job has no human caller to
+    attribute the row to.
+    """
+    kind = JOB_KINDS[job["kind"]]
+    t0 = time.monotonic()
+    try:
+        result = kind.handler(job["payload_json"])
+    except Exception as exc:
+        log_safe(
+            user_id=None,
+            action="job.run",
+            resource=f"job:{job['kind']}",
+            params={"kind": job["kind"], "outcome": "error", "job_id": job.get("id")},
+            result=f"error:{type(exc).__name__}",
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            client_kind="scheduler",
+        )
+        raise
+    log_safe(
+        user_id=None,
+        action="job.run",
+        resource=f"job:{job['kind']}",
+        params={"kind": job["kind"], "outcome": "success", "job_id": job.get("id")},
+        result="success",
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        client_kind="scheduler",
+    )
+    return result
+
+
 def register_all_kinds() -> None:
     """Register the real job kinds. Idempotent — safe to call more than
     once (e.g. across test re-imports); ``register_kind`` replaces any
@@ -1218,6 +1819,21 @@ def register_all_kinds() -> None:
             # class as the other analytics writers, so HEAVY (concurrency 1).
             lease_seconds=_DEFAULT_LIGHT_LEASE_S,
             retry_in_seconds=300,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="corpus-extraction",
+            handler=_run_corpus_extraction,
+            lane=EXTRACTION_LANE,
+            # Tracks the producer subprocess's own timeout (extraction.timeout_s,
+            # default 3600s) plus a margin — see the module docstring's
+            # lease/retry tuning note.
+            lease_seconds=_extraction_timeout_seconds() + _EXTRACTION_LEASE_MARGIN_S,
+            # No automatic retry: a failed producer run (bad credentials,
+            # crawl error, timeout) needs an operator to look at it, not an
+            # unattended re-run against the same corpus a few minutes later.
+            retry_in_seconds=None,
         )
     )
     from app.chat.manager import get_current_chat_manager

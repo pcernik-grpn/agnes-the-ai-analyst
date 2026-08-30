@@ -18,14 +18,11 @@
     return d.innerHTML;
   }
 
-  const KIND_GLYPH = {
-    data: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="3" stroke="currentColor" stroke-width="1.7"/><path d="M5 6v6c0 1.66 3.13 3 7 3s7-1.34 7-3V6" stroke="currentColor" stroke-width="1.7"/><path d="M5 12v6c0 1.66 3.13 3 7 3s7-1.34 7-3v-6" stroke="currentColor" stroke-width="1.7"/></svg>',
-    plugins: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 4a2 2 0 1 1 4 0v2h3a1 1 0 0 1 1 1v3h2a2 2 0 1 1 0 4h-2v3a1 1 0 0 1-1 1h-3v-2a2 2 0 1 0-4 0v2H7a1 1 0 0 1-1-1v-3H4a2 2 0 1 1 0-4h2V7a1 1 0 0 1 1-1h3V4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
-    memory: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3c-1.7 0-3 1.3-3 3-1.6.2-3 1.5-3 3.2 0 .6.2 1.2.5 1.7-.6.6-1 1.4-1 2.4 0 1.5.9 2.7 2.2 3.2 0 1.7 1.4 3 3.1 3 .8 0 1.5-.3 2-.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3c1.7 0 3 1.3 3 3 1.6.2 3 1.5 3 3.2 0 .6-.2 1.2-.5 1.7.6.6 1 1.4 1 2.4 0 1.5-.9 2.7-2.2 3.2 0 1.7-1.4 3-3.1 3-.8 0-1.5-.3-2-.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3v18" stroke="currentColor" stroke-width="1.6"/></svg>',
-    recipes: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 3v4h4M8.5 12h7M8.5 16h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
-    library: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 7h6l4 4v9a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M15 7v4h4" stroke="currentColor" stroke-width="1.6"/><path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6l1 1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-    app: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 9h17" stroke="currentColor" stroke-width="1.6"/><circle cx="6.6" cy="6.8" r="0.9" fill="currentColor"/></svg>',
-  };
+  /* The glyph set moved to js/kind_glyph.js — the copy that lived here had
+     fallen six kinds behind the `kind_glyph()` macro it was supposed to be in
+     lockstep with, which is what a second copy does. */
+  const KIND_GLYPH = { get: (k) => (window.AgnesKindGlyph ? window.AgnesKindGlyph.get(k) : '') };
+
   const META_GLYPH = {
     tables: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 9.5h17M3.5 14.5h17M9 4.5v15" stroke="currentColor" stroke-width="1.6"/></svg>',
     items: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3 3 7.5 12 12l9-4.5L12 3Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="m3 12 9 4.5L21 12M3 16.5 12 21l9-4.5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
@@ -119,7 +116,7 @@
     if (c.category) eyebrow += '<span class="cc-sep">·</span><span>' + esc(c.category) + '</span>';
     return '<article class="cc-card" data-search="' + esc((c.title + ' ' + (c.description || '')).toLowerCase()) + '">' +
       '<div class="cc-head">' +
-        '<span class="cc-icon cc-icon--' + c.kind + '">' + (KIND_GLYPH[c.kind] || '') + '</span>' +
+        '<span class="cc-icon cc-icon--' + c.kind + '">' + KIND_GLYPH.get(c.kind) + '</span>' +
         '<div class="cc-titlewrap"><h3 class="cc-title"><a href="' + esc(c.href) + '">' + esc(c.title) + '</a></h3>' +
         '<div class="cc-eyebrow">' + eyebrow + '</div></div>' +
       '</div>' +

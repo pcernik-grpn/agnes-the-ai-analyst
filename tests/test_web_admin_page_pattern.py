@@ -86,9 +86,16 @@ def test_head_title_is_the_section_not_the_lens(section: str, name: str) -> None
     assert f'page_hero_title = "{section}"' in src, (
         f"{name} is a {section} page, so its h1 must say {section!r} — the tab strip below it is what names the lens."
     )
-    assert '{% include "_admin_tabs.html" %}' in src, (
-        f"{name} carries a section-level head but no tab strip, so nothing on "
-        "the page says which lens the reader is on."
+    # The guarantee is that SOMETHING on the page names the lens, not that it
+    # is the section-tab include. Access reads one set of grants three ways
+    # (`?by=group|bundle|person`) and its switch is a `.tab-strip` on the list
+    # itself, because switching changes what the list is of rather than which
+    # page you are on — so the nav has no sub-tabs for it to include.
+    has_section_tabs = '{% include "_admin_tabs.html" %}' in src
+    has_own_tabs = 'class="tab-strip' in src and 'role="tablist"' in src
+    assert has_section_tabs or has_own_tabs, (
+        f"{name} carries a section-level head but nothing that names the lens — "
+        "no section tab strip, and no tab strip of its own."
     )
 
 

@@ -11,6 +11,7 @@ during bursts makes libcurl's CA-file ``fopen`` fail with the same
 error code.
 """
 
+import re
 from pathlib import Path
 
 import yaml
@@ -18,6 +19,7 @@ import yaml
 COMPOSE = Path(__file__).resolve().parents[1] / "docker-compose.yml"
 COMPOSE_PROD = Path(__file__).resolve().parents[1] / "docker-compose.prod.yml"
 COMPOSE_HOST_MOUNT = Path(__file__).resolve().parents[1] / "docker-compose.host-mount.yml"
+DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 CA_PATH = "/etc/ssl/certs/ca-certificates.crt"
 
 
@@ -265,7 +267,6 @@ def test_apps_runner_env_knobs_are_actually_reachable():
     silently unreachable on a real deployment. (`app` is the opposite case — it
     does carry `env_file: .env`, so its own knobs need no listing.)
     """
-    import re
 
     src = Path(__file__).resolve().parents[1] / "services" / "apps_runner"
     read_by_code = set()
@@ -313,3 +314,23 @@ def test_egress_proxy_declares_a_liveness_probe():
         "the proxy serves no health path — an HTTP probe reports a healthy proxy as unhealthy"
     )
     assert health.get("start_period"), "without start_period the first probes race the proxy's own boot"
+
+
+def test_dockerfile_default_build_target_is_still_app():
+    """``docker build .`` with no ``--target`` builds whichever stage is
+    LAST in the Dockerfile — that is how both CI
+    (``docker build -t data-analyst:test .`` in ``.github/workflows/ci.yml``)
+    and the release workflow (``docker/build-push-action@v7``, which sets no
+    ``target:``) build the shipped image. The `worker` stage (extraction
+    worker lane, spec §7.5) is deliberately built FROM `base`, not chained
+    after `app` — appending any stage after `app` would silently flip what
+    a plain, no-flags build produces. This ratchet fails the moment `app`
+    stops being the last ``FROM ... AS <name>`` stage, so a stage added
+    later has to go before `app`, not after it.
+    """
+    stage_names = re.findall(r"(?im)^FROM\s+\S+\s+AS\s+(\S+)", DOCKERFILE.read_text())
+    assert stage_names, "no named build stages found in Dockerfile — did the multi-stage split get removed?"
+    assert stage_names[-1] == "app", (
+        f"the LAST Dockerfile stage is {stage_names[-1]!r}, not 'app' — `docker build .` with no --target "
+        f"would now produce a different image than before the multi-stage split (stages found: {stage_names})"
+    )

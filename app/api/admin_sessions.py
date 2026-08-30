@@ -29,6 +29,7 @@ from src.repositories import (
     audit_repo,
     usage_repo,
 )
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/sessions", tags=["admin-sessions"])
@@ -37,6 +38,7 @@ router = APIRouter(prefix="/api/admin/sessions", tags=["admin-sessions"])
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _window_since(since_minutes: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
@@ -49,7 +51,7 @@ def _window_since(since_minutes: int) -> datetime:
 
 @router.get("/list")
 def list_sessions(
-    since_minutes: int = Query(default=10080, ge=1, le=525600),   # default 7d
+    since_minutes: int = Query(default=10080, ge=1, le=525600),  # default 7d
     username: Optional[str] = None,
     model: Optional[str] = None,
     only_errors: bool = False,
@@ -64,8 +66,12 @@ def list_sessions(
     # anchor=uploaded (default) windows on ARRIVAL, so late queue catch-ups
     # stay visible in recent windows; anchor=started restores the old view.
     filters = {
-        "since": since, "username": username, "model": model,
-        "only_errors": only_errors, "q": q, "anchor": anchor,
+        "since": since,
+        "username": username,
+        "model": model,
+        "only_errors": only_errors,
+        "q": q,
+        "anchor": anchor,
     }
     sort_col, _, sort_dir = sort.partition(":")
     direction = "ASC" if (sort_dir or "desc").lower() == "asc" else "DESC"
@@ -73,7 +79,11 @@ def list_sessions(
     repo = usage_repo()
     total = repo.sessions_count(filters)
     rows = repo.sessions_list(
-        filters, sort_col=sort_col, direction=direction, limit=limit, offset=offset,
+        filters,
+        sort_col=sort_col,
+        direction=direction,
+        limit=limit,
+        offset=offset,
     )
     out = []
     for d in rows:
@@ -92,10 +102,10 @@ def list_sessions(
         d["session_dir"] = sf.split("/", 1)[0] if "/" in sf else ""
         out.append(d)
     return {
-        "rows":        out,
-        "total":       int(total or 0),
-        "limit":       limit,
-        "offset":      offset,
+        "rows": out,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
         "next_offset": offset + limit if (offset + limit) < (total or 0) else None,
     }
 
@@ -103,6 +113,7 @@ def list_sessions(
 # ---------------------------------------------------------------------------
 # GET /api/admin/sessions/kpis  +  /facets
 # ---------------------------------------------------------------------------
+
 
 @router.get("/kpis")
 def kpis(
@@ -115,16 +126,22 @@ def kpis(
     _user: dict = Depends(require_admin),
 ):
     since = _window_since(since_minutes)
-    k = usage_repo().sessions_kpis({
-        "since": since, "username": username, "model": model,
-        "only_errors": only_errors, "q": q, "anchor": anchor,
-    })
+    k = usage_repo().sessions_kpis(
+        {
+            "since": since,
+            "username": username,
+            "model": model,
+            "only_errors": only_errors,
+            "q": q,
+            "anchor": anchor,
+        }
+    )
     tool_calls_total = k["tool_calls_total"]
     error_rate = (k["tool_errors_total"] / tool_calls_total) if tool_calls_total else 0.0
     return {
-        "sessions_total":  k["sessions_total"],
-        "distinct_users":  k["distinct_users"],
-        "error_sessions":  k["error_sessions"],
+        "sessions_total": k["sessions_total"],
+        "distinct_users": k["distinct_users"],
+        "error_sessions": k["error_sessions"],
         "tool_calls_total": tool_calls_total,
         "tool_errors_total": k["tool_errors_total"],
         "tool_error_rate": round(error_rate, 4),
@@ -147,6 +164,7 @@ def facets(
 # Username constraint: same allowlist as the session-file regex (alnums + `._-`).
 # Filesystem username is the local-part of an email today, so no `@` etc.
 import re as _re
+
 _USERNAME_RE = _re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 
 
@@ -213,10 +231,15 @@ def _render_transcript(turns: list[dict]) -> list[dict]:
         content = msg.get("content")
 
         if isinstance(content, str):
-            events.append({
-                "kind": "text", "role": role, "text": content,
-                "ts": ts, "uuid": uuid,
-            })
+            events.append(
+                {
+                    "kind": "text",
+                    "role": role,
+                    "text": content,
+                    "ts": ts,
+                    "uuid": uuid,
+                }
+            )
             continue
         if not isinstance(content, list):
             continue
@@ -225,27 +248,37 @@ def _render_transcript(turns: list[dict]) -> list[dict]:
                 continue
             btype = block.get("type")
             if btype == "text":
-                events.append({
-                    "kind": "text", "role": role,
-                    "text": block.get("text") or "",
-                    "ts": ts, "uuid": uuid,
-                })
+                events.append(
+                    {
+                        "kind": "text",
+                        "role": role,
+                        "text": block.get("text") or "",
+                        "ts": ts,
+                        "uuid": uuid,
+                    }
+                )
             elif btype == "tool_use":
-                events.append({
-                    "kind": "tool_use",
-                    "tool_name": block.get("name"),
-                    "input": block.get("input"),
-                    "tool_use_id": block.get("id"),
-                    "ts": ts, "uuid": uuid,
-                })
+                events.append(
+                    {
+                        "kind": "tool_use",
+                        "tool_name": block.get("name"),
+                        "input": block.get("input"),
+                        "tool_use_id": block.get("id"),
+                        "ts": ts,
+                        "uuid": uuid,
+                    }
+                )
             elif btype == "tool_result":
-                events.append({
-                    "kind": "tool_result",
-                    "tool_use_id": block.get("tool_use_id"),
-                    "is_error": bool(block.get("is_error", False)),
-                    "text":     _flatten_text_content(block.get("content")),
-                    "ts": ts, "uuid": uuid,
-                })
+                events.append(
+                    {
+                        "kind": "tool_result",
+                        "tool_use_id": block.get("tool_use_id"),
+                        "is_error": bool(block.get("is_error", False)),
+                        "text": _flatten_text_content(block.get("content")),
+                        "ts": ts,
+                        "uuid": uuid,
+                    }
+                )
     return events
 
 
@@ -258,6 +291,7 @@ def download(
     """Stream a single JSONL straight from disk. Path-safety guarded the
     same way as ``/transcript``. Audit-logged."""
     from fastapi.responses import StreamingResponse
+
     path = _safe_session_path(username, session_file)
 
     def _iter():
@@ -275,7 +309,8 @@ def download(
             resource=f"{username}/{session_file}",
             params={"bytes": path.stat().st_size},
             result="success",
-            client_kind="web",
+            # client_kind intentionally omitted (F0 audit-context autofill,
+            # Task 1) — this admin read isn't necessarily browser-only.
         )
     except Exception:
         logger.exception("audit_log write failed for session_download")
@@ -287,6 +322,43 @@ def download(
     )
 
 
+def _sum_usage_from_turns(turns: list[dict]) -> Optional[dict]:
+    """Sum ``message.usage`` across assistant turns (TCRD-222).
+
+    Same field mapping the UsageProcessor uses (``usage_lib``), computed
+    inline from the file this request already parsed — so the detail view is
+    exact for the transcript being read, independent of whether the
+    processor has ticked yet (a fresh upload's summary row is missing or
+    zeroed until it does).
+
+    Returns None when no turn carried a usage block at all: an old-format
+    JSONL predates the field, and "we don't know" must not be spelled
+    "0 tokens" — a zero reads as a measurement.
+    """
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    saw_usage = False
+    for t in turns:
+        if t.get("type") != "assistant":
+            continue
+        usage = (t.get("message", {}) or {}).get("usage") or {}
+        if not isinstance(usage, dict) or not usage:
+            continue
+        saw_usage = True
+        for src_key, out_key in (
+            ("input_tokens", "input"),
+            ("output_tokens", "output"),
+            ("cache_read_input_tokens", "cache_read"),
+            ("cache_creation_input_tokens", "cache_creation"),
+        ):
+            v = usage.get(src_key, 0)
+            if isinstance(v, int):
+                totals[out_key] += v
+    if not saw_usage:
+        return None
+    totals["total"] = sum(totals.values())
+    return totals
+
+
 @router.get("/{username}/{session_file}/transcript")
 def transcript(
     username: str,
@@ -296,6 +368,7 @@ def transcript(
     path = _safe_session_path(username, session_file)
     turns = parse_jsonl(path)
     events = _render_transcript(turns)
+    tokens = _sum_usage_from_turns(turns)
 
     summary_data = usage_repo().get_session_summary(f"{username}/{session_file}")
     summary: dict[str, Any] = {}
@@ -315,14 +388,16 @@ def transcript(
             resource=f"{username}/{session_file}",
             params={"events": len(events)},
             result="success",
-            client_kind="web",
+            # client_kind intentionally omitted (F0 audit-context autofill,
+            # Task 1) — this admin read isn't necessarily browser-only.
         )
     except Exception:
         logger.exception("audit_log write failed for session.transcript_view")
 
     return {
-        "username":     username,
+        "username": username,
         "session_file": session_file,
-        "summary":      summary,
-        "events":       events,
+        "summary": summary,
+        "tokens": tokens,
+        "events": events,
     }

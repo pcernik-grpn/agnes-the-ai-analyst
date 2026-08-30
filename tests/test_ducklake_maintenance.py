@@ -147,6 +147,7 @@ class TestRegistration:
             "webhook-deliver",
             "analytics-rebuild",
             "collections-purge",
+            "corpus-extraction",
         }
 
 

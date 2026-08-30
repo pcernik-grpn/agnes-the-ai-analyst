@@ -570,6 +570,289 @@ def test_consent_post_still_accepts_browser_cookie_session(seeded_app):
     assert "code=" in r.headers["location"], "the real browser consent flow must keep working"
 
 
+def test_consent_page_describes_write_access_not_the_raw_scope(seeded_app):
+    """The only scope Agnes issues is the coarse ``read``, but the connection
+    exposes the write/delete MCP tools too. Listing the raw scope token made the
+    consent screen claim read-only access the client immediately contradicted."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    r = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "not read-only" in body, "consent must say the connection can write, not just 'read'"
+    assert "create, update and delete" in body
+    assert "your own Agnes permissions allow" in body
+    assert "<li>read</li>" not in body, "the raw scope token must not be the whole story"
+
+
+def test_consent_replay_after_allow_reports_success_not_expiry(seeded_app):
+    """A consent link is single-use, but the tab that submitted it stays on the
+    consent URL, so a reload, a double-clicked Allow, or Back-then-Allow re-issues
+    it. That replay must explain the connection succeeded instead of reporting
+    "Authorization request expired" on a connection that actually worked."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    first = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert first.status_code in (302, 307), first.text
+
+    replay = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert replay.status_code == 200, f"a replayed consent must not read as an error (got {replay.status_code})"
+    assert "Connected to Agnes" in replay.text
+    assert "expired" not in replay.text.lower()
+
+    reload_get = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+    assert reload_get.status_code == 200
+    assert "Connected to Agnes" in reload_get.text
+
+
+def test_consent_replay_after_deny_reports_denial(seeded_app):
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    first = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "deny"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert first.status_code in (302, 307)
+    assert "error=access_denied" in first.headers["location"]
+
+    replay = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+    assert replay.status_code == 200
+    assert "Access denied" in replay.text
+
+
+def test_unauthenticated_deny_cannot_burn_someone_elses_pending_link(seeded_app):
+    """Deny is destructive now — it deletes the pending row — so it is the
+    user's decision to make, not something a caller without an Agnes session
+    can do to a link they merely hold."""
+    from src.repositories import oauth_clients_repo
+
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    denied = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "deny"},
+        headers={"Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    assert denied.status_code == 401, f"an unauthenticated deny must not be honoured (got {denied.status_code})"
+    assert oauth_clients_repo().get_auth_code(pending) is not None, (
+        "the pending authorization was destroyed by an unauthenticated caller"
+    )
+
+    # And the link still works for its owner.
+    allowed = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert allowed.status_code in (302, 307), allowed.text
+    assert "code=" in allowed.headers["location"]
+
+
+def test_unknown_pending_token_still_reports_an_invalid_link(seeded_app):
+    """No outcome marker → the link really is unusable: keep the 4xx, but say
+    what to do about it."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+
+    r = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": "pending_never-existed"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 400
+    assert "no longer valid" in r.text
+    assert "start the connection again" in r.text
+
+
+def test_consent_outcome_marker_cannot_be_exchanged_for_a_token(seeded_app):
+    """The replay marker is stored as an auth-code row, so prove it is inert as
+    a grant by actually presenting it at ``/token`` — not merely by asserting
+    the shape of the row this same module wrote."""
+    from app.auth.mcp_oauth import _CONSENT_OUTCOME_PREFIX
+    from src.repositories import oauth_clients_repo
+
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+
+    reg = _register_client(client)
+    verifier, challenge = _pkce()
+    r = client.get(
+        f"{MCP_MOUNT}/authorize",
+        params={
+            "response_type": "code",
+            "client_id": reg["client_id"],
+            "redirect_uri": "http://localhost:9999/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "xyz",
+            "scope": "read",
+        },
+        follow_redirects=False,
+    )
+    pending = parse_qs(urlparse(r.headers["location"]).query)["pending"][0]
+    client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    marker = oauth_clients_repo().get_auth_code(_CONSENT_OUTCOME_PREFIX + pending)
+    assert marker is not None, "the allow outcome must be remembered for the replay page"
+    assert marker.get("subject") is None, "a subject on the marker would make it exchangeable for a token"
+    assert marker.get("client_id") == ""
+
+    # The part that matters: presenting the marker's key as an authorization
+    # code must not yield a token.
+    exchanged = client.post(
+        f"{MCP_MOUNT}/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": _CONSENT_OUTCOME_PREFIX + pending,
+            "redirect_uri": "http://localhost:9999/callback",
+            "client_id": reg["client_id"],
+            "client_secret": reg.get("client_secret", ""),
+            "code_verifier": verifier,
+        },
+    )
+    assert exchanged.status_code != 200, "the consent outcome marker was accepted as a grant"
+    assert "access_token" not in exchanged.text
+
+
+def test_consent_page_lists_an_unrecognised_scope_instead_of_dropping_it():
+    """Agnes issues only ``read`` today. If that ever widens, an undescribed
+    scope must still reach the page: silently omitting it is the exact bug this
+    screen was fixed for."""
+    from app.auth.mcp_oauth import _access_summary
+
+    lines = _access_summary(["read", "admin:everything"])
+
+    assert any("admin:everything" in line for line in lines), "an unrecognised scope must be shown, not swallowed"
+    assert any("not read-only" in line for line in lines)
+
+
+def test_consent_page_title_escapes_the_client_name_exactly_once(seeded_app):
+    """``client_name`` is attacker-controlled and must be escaped — but escaping
+    it twice showed users a literal "&amp;" in the browser tab."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+
+    reg = client.post(
+        f"{MCP_MOUNT}/register",
+        json={
+            "client_name": "Ben & Jerry's",
+            "redirect_uris": ["http://localhost:9999/callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "client_secret_post",
+        },
+    ).json()
+    _, challenge = _pkce()
+    r = client.get(
+        f"{MCP_MOUNT}/authorize",
+        params={
+            "response_type": "code",
+            "client_id": reg["client_id"],
+            "redirect_uri": "http://localhost:9999/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "xyz",
+            "scope": "read",
+        },
+        follow_redirects=False,
+    )
+    pending = parse_qs(urlparse(r.headers["location"]).query)["pending"][0]
+
+    page = client.get(
+        "/api/mcp/oauth/consent",
+        params={"pending": pending},
+        headers={"Authorization": f"Bearer {admin_token}"},
+        follow_redirects=False,
+    )
+
+    assert page.status_code == 200, page.text
+    assert "<title>Authorize Ben &amp; Jerry&#x27;s — Agnes</title>" in page.text
+    assert "&amp;amp;" not in page.text, "the client name was escaped twice"
+
+
+def test_consent_redirect_percent_encodes_the_client_state(seeded_app):
+    """``state`` is opaque to us and echoed verbatim. Unencoded, an "&" in it
+    splits into extra query parameters on the client's callback."""
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    tricky_state = "a&code=injected b=c"
+
+    reg = _register_client(client)
+    _, challenge = _pkce()
+    r = client.get(
+        f"{MCP_MOUNT}/authorize",
+        params={
+            "response_type": "code",
+            "client_id": reg["client_id"],
+            "redirect_uri": "http://localhost:9999/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": tricky_state,
+            "scope": "read",
+        },
+        follow_redirects=False,
+    )
+    pending = parse_qs(urlparse(r.headers["location"]).query)["pending"][0]
+
+    allowed = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    assert allowed.status_code in (302, 307), allowed.text
+    qs = parse_qs(urlparse(allowed.headers["location"]).query)
+    assert qs["state"] == [tricky_state], "state must survive the round trip intact"
+    assert len(qs["code"]) == 1, "the state must not be able to forge a second code parameter"
+
+
 def test_provider_rejects_unknown_token(seeded_app):
     """A token that was never issued must not verify."""
     import asyncio

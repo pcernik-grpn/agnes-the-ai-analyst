@@ -391,7 +391,9 @@ def test_me_connections_lapsed_connection_still_offers_disconnect(seeded_app):
     assert r.status_code == 200
     section = r.text.split('id="source-src_oauth_lapsed"')[1]
     section = section.split('class="conn-card"')[0]  # just this card
-    assert "Expired — reconnect" in section
+    # The pill states the state only (TCRD-208) — it sits beside "Connected"
+    # and "Not connected", and the remedy lives in the detail page.
+    assert "Expired" in section
     assert 'data-action="oauth-disconnect"' in section
     assert ">Reconnect<" in section
 

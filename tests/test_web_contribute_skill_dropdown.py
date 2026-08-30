@@ -9,6 +9,15 @@ not a template one — see `app/web/static/css/paper-skin.css`.
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def contribute_skill_on(monkeypatch):
+    """The page is hidden by default since the admin cleanup; these tests are
+    about what it renders when exposed."""
+    monkeypatch.setenv("AGNES_CONTRIBUTE_SKILL_ENABLED", "1")
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}

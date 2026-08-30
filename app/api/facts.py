@@ -56,15 +56,17 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth.access import require_admin, require_facts_enabled
 from app.auth.dependencies import get_current_user
+from src.audit_helpers import identity_for_audit, log_safe
 from src.repositories import audit_repo, facts_ingest_runs_repo, facts_repo
 from src.repositories.facts_pg import (
     FactNotFound,
     IngestBatchTooLarge,
     IngestDocumentExceedsClaimCap,
+    IngestReservedStableId,
     IngestUnresolvedDocIds,
 )
 
@@ -78,17 +80,83 @@ router = APIRouter(
 
 
 class FactsSearchRequest(BaseModel):
+    # extra='forbid' (TCRD follow-up from a live finding): this endpoint had
+    # no free-text parameter at all, so an unknown field like the `q` a
+    # caller might guess at was silently swallowed by pydantic's default
+    # extra='ignore' — the call degenerated to an unfiltered, id-ordered
+    # dump instead of erroring. An unknown field on ANY facts request model
+    # must 422, never be swallowed into a convincing wrong answer.
+    model_config = ConfigDict(extra="forbid")
+
     type: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
+    q: Optional[str] = Field(default=None, max_length=200)
     limit: int = Field(default=20, ge=1, le=100)
 
 
 class FactsNeighborsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     subject_id: str
     edge_types: Optional[List[str]] = None
     depth: int = Field(default=1, ge=1, le=2)
     fanout: int = Field(default=100, ge=1, le=100)
     limit: int = Field(default=500, ge=1, le=500)
+
+
+DEFAULT_FACET_TYPES = ("client", "industry", "service_offering", "doc_type")
+
+
+@router.get("/facets")
+def facts_facets(
+    types: Optional[str] = Query(
+        default=None,
+        description="Comma-separated fact types to facet on. Defaults to the Library's four.",
+        max_length=200,
+    ),
+    limit_per_type: int = Query(default=50, ge=1, le=200),
+    user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Filterable entity values per type, with a document count each — what
+    the Library's filter menu offers instead of hand-entered tags.
+
+    The vocabulary comes from the extraction pass (client, industry, service
+    offering, document type), so it is maintained by ingestion rather than by
+    somebody remembering to tag a file.
+
+    Gated exactly as :func:`facts_search` is: a facet lists only subjects
+    this caller could reach, and each `document_count` counts only documents
+    in collections they can read — a `revealed` subject's unreadable evidence
+    is not tallied, since that would report how many files sit in a
+    collection they cannot open. Response: ``{"facets": {type: [{"subject_id",
+    "label", "document_count"}]}}``.
+    """
+    wanted = [t.strip() for t in types.split(",") if t.strip()] if types else list(DEFAULT_FACET_TYPES)
+    if not wanted:
+        raise HTTPException(status_code=422, detail="no facet types requested")
+    if len(wanted) > 12:
+        raise HTTPException(status_code=422, detail="too many facet types (max 12)")
+    return {"facets": facts_repo().facet_values(user, types=wanted, limit_per_type=limit_per_type)}
+
+
+@router.get("/type-map")
+def facts_type_map(user=Depends(get_current_user)) -> Dict[str, Any]:
+    """Live counts per node type over everything the caller can see — the
+    head of the Library's Knowledge tab, where each type is a way in.
+
+    Same visibility gate as :func:`facts_search` with no ``type``, just
+    aggregated: a type's ``count`` is exactly how many subjects a
+    ``search(type=...)`` would let this caller reach. A type nobody can see
+    is absent rather than reported as ``0``, so the response never
+    distinguishes "no such type here" from "none you may read" — the same
+    non-disclosure ``search()`` makes. Response: ``{"types": [{"type",
+    "count"}], "total"}``, ordered by type.
+    """
+    counts = facts_repo().count_visible_facts_by_type(user)
+    return {
+        "types": [{"type": t, "count": n} for t, n in counts.items()],
+        "total": sum(counts.values()),
+    }
 
 
 @router.post("/search")
@@ -102,16 +170,26 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     from readable claims only, per-key latest-document_date-wins with a
     `conflicted` marker on a genuine tie — the projection runs in SQL so
     `filters` evaluate against it BEFORE the `limit` is applied (never a
-    Python post-filter, which would leak a shortfall signal). Response:
-    ``{"subjects": [{"id", "type", "aliases", "attrs", "claim_count",
-    "quote_count", "revealed"}], "limit_applied"}`` — `limit_applied` is
-    True only when the CALLER'S OWN readable result set exceeds `limit`,
-    never a signal that grants hid additional matches.
+    Python post-filter, which would leak a shortfall signal). ``q`` is an
+    OPTIONAL free-text name lookup matched against alias natural keys ONLY
+    (never claim text) — see :meth:`FactsPgRepository.search` for the
+    normalization and ranking rules. Response: ``{"subjects": [{"id",
+    "type", "aliases", "attrs", "claim_count", "quote_count", "revealed"}],
+    "limit_applied"}`` — `limit_applied` is True only when the CALLER'S OWN
+    readable result set exceeds `limit`, never a signal that grants hid
+    additional matches.
     """
     try:
-        return facts_repo().search(user, type=body.type, filters=body.filters or {}, limit=body.limit)
+        result = facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.search",
+        params={"type": body.type, "result_count": len(result.get("subjects", [])), "limit": body.limit},
+    )
+    return result
 
 
 @router.post("/neighbors")
@@ -131,7 +209,7 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
     point of view (spec §5 rule 2).
     """
     try:
-        return facts_repo().neighbors(
+        result = facts_repo().neighbors(
             user,
             body.subject_id,
             edge_types=body.edge_types,
@@ -141,6 +219,14 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
         )
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.neighbors",
+        resource=f"fact:{body.subject_id}",
+        params={"node_count": len(result.get("nodes", [])), "edge_count": len(result.get("edges", []))},
+    )
+    return result
 
 
 @router.get("/{subject_id}/claims")
@@ -162,14 +248,132 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
     # collection, so no route-template gate can express the check; every
     # repo read method filters by the caller (spec §5), tested S1-S6.
     try:
-        return facts_repo().claims(user, subject_id)
+        result = facts_repo().claims(user, subject_id)
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.claims",
+        resource=f"fact:{subject_id}",
+        params={"claim_count": len(result.get("claims", []))},
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
 # write path (build order step 4) — ingest + corrections management.
 # ---------------------------------------------------------------------------
+
+
+class FactsIngestAnonymizationScope(BaseModel):
+    """One corpus's anonymization tally within this batch (spec §9.2). A
+    self-reported COUNT, never independently verified by Agnes — see
+    ``docs/anonymization.md``'s "current limits"."""
+
+    docs_anonymized: int = Field(default=0, ge=0)
+    docs_skipped: int = Field(default=0, ge=0)
+
+
+class FactsIngestAnonymizationReport(BaseModel):
+    """OPTIONAL producer declaration that (some of) this batch went through
+    the anonymize-in-front pipeline (spec §9: source -> crawl -> convert ->
+    anonymize -> Agnes) before ingestion. Additive to the wire contract — a
+    producer that never anonymizes omits this field entirely.
+
+    ``scopes`` is keyed by ``corpus_id`` (the collection id, matching the
+    connect wizard's own scope-row shape); a key that does not resolve to a
+    real collection is KEPT, not rejected — this is a self-reported tally,
+    not a join against ``file_corpora`` (spec §9.2's "current limits": Agnes
+    records the declaration, it cannot verify the content was anonymized).
+    """
+
+    declared: bool = False
+    scopes: Dict[str, FactsIngestAnonymizationScope] = Field(default_factory=dict)
+
+
+def _anonymize_marked_corpus_ids() -> set:
+    """Collection ids at least one SharePoint connection's confirmed scope
+    marks ``anonymize=true`` (the connect wizard's step-2 checkbox,
+    ``app/api/admin_sharepoint.py``, stored on the connection's own
+    ``config.scopes[].anonymize`` — see that module's docstring) — the
+    admin's INTENT half of "requested vs declared" (``docs/anonymization.md``).
+
+    Read straight off ``source_connections`` (a DuckDB<->PG frozen pair, so
+    this answers on either backend) rather than a cache: cheap — an instance
+    has few SharePoint connections, each a small JSON config — and always
+    current, with nothing to invalidate on a wizard edit.
+    """
+    from src.repositories import source_connections_repo
+
+    out: set = set()
+    for connection in source_connections_repo().list(source_type="sharepoint"):
+        scopes = (connection.get("config") or {}).get("scopes")
+        if not isinstance(scopes, list):
+            continue
+        for scope in scopes:
+            if isinstance(scope, dict) and scope.get("anonymize") and scope.get("collection_id"):
+                out.add(str(scope["collection_id"]))
+    return out
+
+
+def _refuse_undeclared_anonymize_marked_corpora(body: "FactsIngestRequest") -> None:
+    """Fail-closed gate (anonymize-fail-closed hardening): refuse a batch
+    that carries a document for a corpus whose SharePoint scope is
+    anonymize-marked unless THIS batch's own ``anonymization`` block
+    declares that corpus.
+
+    This is the enforcement point, independent of whether the connect
+    wizard's ``config.scopes`` survived an unrelated edit, whether the
+    per-instance HMAC key is configured, or whether the producer remembered
+    to run the anonymizer — none of that machinery has to fail loudly for
+    THIS gate to hold, because it does not trust any of it: it re-derives
+    "was this corpus supposed to be anonymized" from the connection's own
+    scope rows on every call and refuses outright when the batch does not
+    say it happened. Called before ``facts_repo().ingest_batch()`` — a
+    refusal here means nothing from this batch is ever written.
+
+    A lookup failure (the ``source_connections`` table unreadable) is NOT
+    treated as "nothing is marked" — that would silently accept plaintext
+    into a corpus this instance cannot currently prove is safe. It is
+    refused the same way, with its own reason, so a transient failure never
+    degrades into the exact silent-accept this gate exists to close.
+    """
+    requested_corpus_ids = {d.get("corpus_id") for d in body.documents if d.get("corpus_id")}
+    if not requested_corpus_ids:
+        return
+    try:
+        anonymize_marked = _anonymize_marked_corpus_ids()
+    except Exception as exc:  # noqa: BLE001 — fail closed, not open
+        logger.exception(
+            "facts.ingest: anonymize-mark lookup failed; refusing rather than risking a silent un-anonymized accept"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "anonymization_check_unavailable",
+                "message": (
+                    "could not determine whether the target corpus is anonymize-marked; refusing this "
+                    "batch rather than risking an un-anonymized write"
+                ),
+            },
+        ) from exc
+    declared_corpus_ids = set(body.anonymization.scopes.keys()) if body.anonymization is not None else set()
+    undeclared = sorted(requested_corpus_ids & anonymize_marked - declared_corpus_ids)
+    if undeclared:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "anonymization_not_declared",
+                "corpus_ids": undeclared,
+                "message": (
+                    "these collections are anonymize-marked in the SharePoint connect wizard, but this "
+                    "batch's `anonymization` block does not declare them — include the corpus id(s) under "
+                    "anonymization.scopes, or unmark the scope in the connect wizard if this batch is "
+                    "intentionally unanonymized"
+                ),
+            },
+        )
 
 
 class FactsIngestRequest(BaseModel):
@@ -180,12 +384,17 @@ class FactsIngestRequest(BaseModel):
     schema — the producer contract explicitly tolerates unknown fields
     (underscore-prefixed crawler internals are stripped server-side, not
     rejected), so a rigid Pydantic model would reject valid producer input
-    on every crawler-side field addition."""
+    on every crawler-side field addition.
+
+    ``anonymization`` is the one exception: a small, OPTIONAL, strictly
+    typed block (spec §9.2) — malformed input there is a real protocol
+    error (422), not tolerated crawler noise."""
 
     documents: List[Dict[str, Any]] = Field(default_factory=list)
     full_documents: List[str] = Field(default_factory=list)
     nodes: List[Dict[str, Any]] = Field(default_factory=list)
     edges: List[Dict[str, Any]] = Field(default_factory=list)
+    anonymization: Optional[FactsIngestAnonymizationReport] = None
 
 
 @router.post("/ingest")
@@ -197,14 +406,41 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     protocol error (never split across requests, per §7.2). ``documents``
     may be omitted only when every evidence ``doc_id`` already resolves
     through a prior upload's ``corpus_file_sources`` mapping — otherwise
-    400 with the unresolved ids itemized. Everything else — the verbatim
-    gate, deferred-vs-rejected, union vs `full_documents` replace, alias/
-    edge resolution, correction re-attachment, the post-ingest orphan
-    sweep — happens in :meth:`FactsPgRepository.ingest_batch`; this
+    400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)
+    can anchor more than one ``corpus_file_sources`` row for the same
+    ``doc_id``; resolution is corpus-scoped and deterministic (indexed
+    copies preferred, ``corpus_file_id`` as tiebreak) — never an arbitrary
+    cross-collection pick, since that would mis-scope a claim's visibility.
+    When this batch's ``documents[]`` declared at least one collection but a
+    cited ``doc_id`` is anchored only in some OTHER, undeclared collection,
+    that claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized
+    in ``claims_rejected`` like any other reason) rather than written under
+    a collection wider than the producer's batch ever declared (RBAC
+    review, PR #1736) — nothing is ever silently attached cross-collection.
+    An entirely `documents[]`-omitted batch (the "already resolves" replay
+    above) has no batch-declared scope to escape and is unaffected.
+    Everything else — the verbatim gate, deferred-vs-rejected, union vs
+    `full_documents` replace, alias/edge resolution, correction
+    re-attachment, the post-ingest orphan sweep — happens in
+    :meth:`FactsPgRepository.ingest_batch`; this
     handler only translates its typed exceptions to HTTP status codes.
-    Response IS the run report: ``{claims_written, claims_rejected:
-    [{row, reason}], deferred: [...], subjects_created, subjects_deleted,
-    corrections_active: [...], review_items: [...]}``.
+    Response IS the run report: ``{claims_written,
+    claims_accepted_via_identity, claims_rejected: [{row, reason}],
+    source_urls_rejected: [{doc_id, reason}], deferred: [...],
+    subjects_created, subjects_deleted, corrections_active: [...],
+    review_items: [...]}``.
+
+    ``claims_accepted_via_identity`` (spec §8) is the subset of
+    ``claims_written`` whose quote passed the verbatim gate ONLY via the
+    document's own SERVER-STORED ``filename``/``path`` — never a chunk of
+    its extracted text — so an operator can see how much evidence is
+    filename-grounded rather than content-grounded.
+
+    ``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``
+    the validator dropped as invalid (``too_long`` / ``unparseable`` /
+    ``not_https`` / ``no_host``) — the claim itself still wrote, only its
+    citation link is missing; a producer that never sends ``source_url`` is
+    not itemized here at all, only one that sends a value Agnes refuses.
 
     A copy of that same report is ALSO persisted to ``facts_ingest_runs``
     (``GET /api/facts/ingest-runs``, the source card's pipeline strip and
@@ -213,7 +449,32 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     its transaction: a run-report write is a side record, never a condition
     of the ingest succeeding, so a failure there is logged and swallowed,
     never surfaced as a 5xx for a batch that in fact wrote its claims fine.
+
+    ``anonymization`` (spec §9.2, optional) rides along INTO that persisted
+    run report only — never into the returned report above, and never
+    joined against real corpus ids (a corpus id the batch's own
+    ``documents`` never mention is kept, not rejected: this is the
+    producer's self-reported tally of what it anonymized, not something
+    Agnes independently verifies — see ``docs/anonymization.md``).
+
+    Anonymize-fail-closed hardening: BEFORE any of the above runs, a batch
+    that documents a corpus whose SharePoint connect-wizard scope is
+    anonymize-marked (``config.scopes[].anonymize``) is REFUSED — whole
+    batch, nothing written — unless THIS batch's own ``anonymization``
+    block declares that corpus (``403`` ``anonymization_not_declared``,
+    itemizing the offending corpus ids). This is the enforcement point for
+    the guarantee the connect wizard's checkbox only ever *requested*:
+    Agnes still cannot verify a document's CONTENT was anonymized (see
+    ``docs/anonymization.md``), but it now refuses to accept a claim for an
+    anonymize-marked corpus with no declaration at all, regardless of
+    whether the connection's ``config.scopes`` survived an unrelated edit,
+    the per-instance HMAC key is configured, or the producer remembered the
+    block. A lookup failure while answering "is this corpus marked" is
+    itself refused (``503`` ``anonymization_check_unavailable``) rather
+    than treated as "nothing is marked" — see
+    :func:`_refuse_undeclared_anonymize_marked_corpora`.
     """
+    _refuse_undeclared_anonymize_marked_corpora(body)
     try:
         report = facts_repo().ingest_batch(
             documents=body.documents,
@@ -230,6 +491,22 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
         )
     except IngestUnresolvedDocIds as exc:
         raise HTTPException(status_code=400, detail={"reason": "unresolved_doc_ids", "doc_ids": exc.unresolved})
+    except IngestReservedStableId as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "reserved_source_stable_id", "stable_ids": exc.stable_ids},
+        )
+
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.ingest",
+        params={
+            "documents": len(body.documents),
+            "claims_written": report.get("claims_written", 0),
+            "claims_rejected": len(report.get("claims_rejected", [])),
+        },
+    )
 
     try:
         corpus_ids = sorted({d.get("corpus_id") for d in body.documents if d.get("corpus_id")})
@@ -239,10 +516,12 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             documents_seen=len(body.documents),
             claims_written=report.get("claims_written", 0),
             claims_rejected=report.get("claims_rejected", []),
+            source_urls_rejected=report.get("source_urls_rejected", []),
             deferred=report.get("deferred", []),
             subjects_created=report.get("subjects_created", 0),
             subjects_deleted=report.get("subjects_deleted", 0),
             review_items=report.get("review_items", []),
+            anonymization=body.anonymization.model_dump() if body.anonymization else None,
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)
@@ -251,6 +530,8 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
 
 
 class FactsCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     verdict: str = Field(pattern="^(wrong|restricted|revealed)$")
     reason: str = Field(min_length=1, max_length=2000)
 
