@@ -48,6 +48,7 @@ from app.instance_config import (
     get_news_enabled,
     get_knowledge_digests_ui_enabled,
     get_contribute_skill_enabled,
+    get_store_moderation_enabled,
     get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
     feature_enabled,
@@ -1309,11 +1310,11 @@ async def how_it_works_page(
     from app.services.journey import mark_journey
     from src.repositories import mcp_sources_repo
 
-    # "Use Agnes outside this tab" is earned by ARRIVING here — this page is where
+    # "Take Agnes to your tools" is earned by ARRIVING here — this page is where
     # every connector lives, and it is the checklist row's own destination. The
     # row used to tick itself the instant it was clicked, before the reader had
-    # seen anything; the tour's "Connect my AI tools" button already marks it the
-    # same way (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
+    # seen anything; the tour's closing button already marks it the same way
+    # (tour.js::markUseAnywhereDone). Best-effort and swallowed (see
     # app/services/journey.py) — a bookkeeping write must never fail a render.
     mark_journey(user.get("id"), use_anywhere=True)
 
@@ -2095,8 +2096,34 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: rather than literals at each site because they are the same sentence
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
-_LOCKED_STACK_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-_GRANTED_STACK_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
+_LOCKED_STACK_TOOLTIP = (
+    "Required by your admin — your agents get this automatically, and you cannot remove it."
+)
+_GRANTED_STACK_TOOLTIP = (
+    "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
+)
+
+#: The Access column asks ONE question — *can my agent use this* — and the
+#: three kinds answer it differently, which is the honest shape of the
+#: product rather than an inconsistency to paper over: a capability is the
+#: caller's to add, granted data is the admin's to give. The old copy named
+#: the MECHANISM instead ("Install", "Add to stack", "In stack"), which said
+#: what the server does and left the reader to infer what they get. Named
+#: once, because this column has already collected four spellings of one
+#: state and every extra literal is how a fifth arrives.
+_AGENT_ADD = "Add to my agents"
+_AGENT_REMOVE = "Remove"
+# The resting states drop the possessive the ACTION keeps ("Add to my
+# agents"): the action is a sentence about you, the state is a fact about the
+# row, and repeating "your agents" on every line both clipped the 142px cell
+# and said nothing the lede above the list has not already said.
+_AGENT_HAS = "Agents can use this"
+_AGENT_CAN_QUERY = "Agents can query this"
+_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
+_AGENT_HAS_TOOLTIP = (
+    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
+    "sees what that scope allows."
+)
 
 
 def _library_row_base(
@@ -2149,6 +2176,15 @@ def _library_row_base(
         # the wording can differ from the filtered value. Empty → the template
         # falls back to "In stack".
         "stack_pill": "",
+        # The VERB, per kind. One label ("Add to stack") used to sit on every
+        # row while the click posted to four different endpoints meaning four
+        # different things — install a skill, install a plugin, ask for a local
+        # copy of granted data, pin a collection. A control has to name what it
+        # does, so each kind supplies its own three words: the action, the
+        # resting state once done, and the undo. Blank falls back to the old
+        # stack vocabulary, which is still right for a collection.
+        "stack_action": "",
+        "stack_undo": "",
         # Membership the caller cannot drop — any group grant, whichever tier.
         # It reads the SAME "In stack" as any other member (it is one) and is
         # marked by a LOCK plus a tooltip naming who *can* remove it. The tier
@@ -2225,6 +2261,30 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
         return False
 
 
+def _library_type_map(user: dict) -> list[dict]:
+    """Node types with caller-scoped counts for the Knowledge tab's head.
+
+    Fails soft on every axis, because this is a decoration on a page that
+    must render without it: the `facts` feature can be off, the app-state
+    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
+    and the graph can simply be empty. Any of those renders the Library
+    exactly as it does today, with no type map — never a 500 on the
+    caller's main inventory page.
+    """
+    try:
+        from app.instance_config import feature_enabled
+
+        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+            return []
+        from src.repositories import facts_repo
+
+        counts = facts_repo().count_visible_facts_by_type(user)
+    except Exception:  # noqa: BLE001 - decoration must never break the page
+        logger.debug("library: type map unavailable", exc_info=True)
+        return []
+    return [{"type": t, "count": n} for t, n in counts.items()]
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -2283,6 +2343,29 @@ async def library_page(
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
 
+    # ── What could not be read ────────────────────────────────────────────
+    # Every content block below is wrapped so one broken source cannot take the
+    # page down — the right instinct, wrongly finished: a band that raised is
+    # simply ABSENT, and every count on the page is derived from what survived,
+    # so a library whose data packages failed to load looks exactly like a
+    # library that has none. Bad enough and it renders "Your library is empty"
+    # to someone whose library is not. Recorded here so the page can say so.
+    #
+    # Only CONTENT losses are recorded. A failed fact count, grant lookup or
+    # item count degrades a detail on rows that are still there; a notice for
+    # those would cry wolf and teach people to ignore the one that matters.
+    _load_errors: list[str] = []
+
+    #: What a lost content group is CALLED to the person reading the page —
+    #: the internal type name means nothing to them.
+    _ETYPE_LABELS = {"skill": "skills", "plugin": "plugins", "agent": "agent templates"}
+    _RT_LABELS = {"data_package": "data packages", "memory_domain": "memory"}
+
+    def _lost(label: str, exc: Exception) -> None:
+        logger.warning("/library: could not resolve %s: %s", label, exc)
+        if label not in _load_errors:
+            _load_errors.append(label)
+
     # The onboarding step is literally "Explore your Library" — so looking at it
     # completes it. It used to need a click on the checklist row instead, which
     # made the row a box to tick rather than a thing to do: someone who had spent
@@ -2332,14 +2415,25 @@ async def library_page(
     items: list = []
 
     # ── Artefacts (file_corpora) ──────────────────────────────────────────
-    fc_repo = file_corpora_repo()
-    cf_repo = corpus_files_repo()
+    # Resolving the repos and listing the collections sits INSIDE the guard
+    # below, not above it: outside, a backend that cannot answer took the whole
+    # page down with a 500, which is the one outcome this block's try/except
+    # exists to prevent. The guard only ever protected the loop, so it covered
+    # every failure except the one most likely to happen.
+    fc_repo = None
+    cf_repo = None
     # Resolved ONCE, not per collection: the flag/backend check is the same
     # for every row, and a fresh count query per row is only worth paying
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
-    _all_cols = fc_repo.list()
+    _all_cols: list = []
+    try:
+        fc_repo = file_corpora_repo()
+        cf_repo = corpus_files_repo()
+        _all_cols = fc_repo.list()
+    except Exception as e:
+        _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
     # count re-resolved the caller's readable-collection set (a grants query
     # plus a full owned-collections scan), so the page cost grew with the
@@ -2396,8 +2490,16 @@ async def library_page(
             file_type_key, file_type_label = _artefact_type(file_count, first_file)
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
-            fname = first_file.get("filename") if first_file else ""
             is_folder = file_count != 1
+            # What this row can be FOUND by. Nobody searches for the folder —
+            # they search for the file inside it ("kpis"), and until now the
+            # engine saw only the folder's own name, so a file sitting visibly
+            # on screen answered "Nothing matches these filters". A folder is
+            # therefore searchable by every filename it holds; the client then
+            # opens it and hides the siblings, so the hit reads as the file.
+            fname = " ".join(f.get("filename") or "" for f in files) if is_folder else (
+                first_file.get("filename") if first_file else ""
+            )
             row = _library_row_base(
                 item_id=col["id"],
                 kind="artefact",
@@ -2429,17 +2531,15 @@ async def library_page(
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
-            row["stack_title"] = (
-                "The default agent can use this artefact"
-                if row["in_stack"]
-                else "You can reach this, but the default agent can't until you add it"
-            )
+            row["stack_title"] = _AGENT_HAS_TOOLTIP if row["in_stack"] else _AGENT_ADD_TOOLTIP
             # An artefact is the one kind whose membership IS the caller's to
             # set (no admin grant tier exists for a personal upload), so its
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
             # a folder shows its folder's state as a plain badge.
-            row["stack_pill"] = "In stack"
+            row["stack_pill"] = _AGENT_HAS
+            row["stack_action"] = _AGENT_ADD
+            row["stack_undo"] = _AGENT_REMOVE
             # Membership here is a `user_stack_subscriptions` row, and it is the
             # caller's to add or drop either way. Children deliberately inherit
             # neither flag: Stack membership is per collection, so a file inside a
@@ -2457,6 +2557,18 @@ async def library_page(
             # description every file shared word for word. A collection prints its
             # file count there instead, so it needs none.
             row["file_format"] = "" if is_folder else _artefact_format(first_file)
+            row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
+            # `file_format` is what the row PRINTS (a folder prints its file
+            # count instead, so it has none). `format_keys` is what the row can
+            # be FILTERED by, which for a folder is every format inside it —
+            # the same reason its search text holds every filename. Keeping the
+            # two apart is what lets a folder answer "show me PDFs" without
+            # claiming to be a PDF.
+            row["format_keys"] = (
+                sorted({fmt for f in files if (fmt := _artefact_format(f))})
+                if is_folder
+                else ([row["file_format"]] if row["file_format"] else [])
+            )
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2507,6 +2619,13 @@ async def library_page(
                     # nested rows are files too, and the retired Type column is
                     # where their format used to show.
                     child["file_format"] = _artefact_format(f)
+                    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
+                    # Whether the extraction pass actually got text out of this
+                    # file. Only surfaced when it is NOT `indexed`: a healthy
+                    # file saying "indexed" on every row is noise, but a file
+                    # nobody can search is worth knowing about without opening
+                    # the collection page to find it.
+                    child["ingest_label"] = _ingest_label(f)
                     child["file_id"] = f["id"]
                     child["file_name"] = f.get("filename") or ""
                     child["slug"] = slug or ""
@@ -2524,7 +2643,7 @@ async def library_page(
                     row["children"].append(child)
             items.append(row)
     except Exception as e:
-        logger.warning("/library: could not enumerate artefacts: %s", e)
+        _lost("files and collections", e)
 
     # ── Store entities the caller may see: SKILLS and PLUGINS ─────────────
     # The Library is the single source of truth for what a user can reach, so it
@@ -2551,7 +2670,7 @@ async def library_page(
         for inst in user_store_installs_repo().list_for_user(uid):
             installed_store[inst["id"]] = inst
     except Exception as e:
-        logger.warning("/library: could not resolve store installs: %s", e)
+        _lost("skills, plugins and agent templates", e)
 
     for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
         try:
@@ -2562,7 +2681,7 @@ async def library_page(
                 limit=1000,
             )
         except Exception as e:
-            logger.warning("/library: could not enumerate %ss: %s", _etype, e)
+            _lost(_ETYPE_LABELS.get(_etype, _etype + "s"), e)
             continue
         for s in _entities:
             status = s.get("visibility_status") or "pending"
@@ -2654,18 +2773,24 @@ async def library_page(
             # caller either way — including on their own entity.
             _inst = installed_store.get(s["id"])
             items[-1]["stack_endpoint"] = f"/api/store/entities/{s['id']}/install"
+            # The endpoint is ``/install`` and a store entity was never a stack
+            # member (``/api/stack`` takes only data_package and memory_domain),
+            # so the row says what the click actually does.
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             if _inst:
                 items[-1]["stack_state"] = "in_stack"
-                items[-1]["stack_pill"] = "In stack"
+                items[-1]["stack_pill"] = _AGENT_HAS
                 items[-1]["stack_removable"] = True
-                items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+                items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
             else:
                 items[-1]["stack_state"] = "available"
                 items[-1]["stack_addable"] = True
+                # An author looking at their own unadded skill needs the extra
+                # fact that authoring it did not add it; everyone else needs
+                # only the general one.
                 items[-1]["stack_title"] = (
-                    "Yours, but not part of your Stack"
-                    if owned
-                    else "Available to you, but the default agent can't use it until you add it"
+                    "You wrote this, but your agents cannot use it until you add it." if owned else _AGENT_ADD_TOOLTIP
                 )
 
     # ── Everything else the caller has ACCESS to ──────────────────────────
@@ -2714,11 +2839,11 @@ async def library_page(
     ) -> None:
         """Append one access-granted row (never owner-shareable).
 
-        ``droppable``: the membership is the caller's own subscription
-        (classic mode, optional tier) — render the REMOVE control, exactly
-        as /catalog offers for the same membership. Callers whose
-        membership is the grant itself (auto-membership, recipes, plugins)
-        leave it False and get the locked pill."""
+        ``droppable``: the membership is the caller's own subscription, which
+        only exists under CLASSIC membership — there, subscribing is what makes
+        a granted resource queryable, so the control is real and the caller may
+        undo it. Under auto-membership (the default) the grant IS the
+        membership and callers leave this False."""
         items.append(
             _library_row_base(
                 item_id=item_id,
@@ -2743,45 +2868,50 @@ async def library_page(
                 owner_key=owner_key or "workspace",
             )
         )
-        # Membership is the caller's mode-resolved reality, not the grant
-        # (Devin Review on #1199): under auto-membership every granted row IS
-        # in the Stack (``in_stack`` arrives True, rendering exactly as
-        # before); under the classic default a granted-but-unsubscribed
-        # ``available`` resource is NOT a member — claiming "In stack" there
-        # would label rows the agent cannot actually query (membership also
-        # drives ``get_accessible_tables``). Callers whose membership
-        # genuinely is the grant (recipes, plugins) omit the argument.
+        # What this column can offer depends on which membership mode the
+        # instance runs, because the two modes disagree about what a
+        # subscription DOES.
+        #
+        # Auto-membership (the default since Wave 0): the grant already put the
+        # resource in reach — StackResolver.stack returns required ∪ available
+        # regardless of any subscription — so there is nothing here for the
+        # caller to add. The only thing a subscription still decides is whether
+        # `agnes pull` writes a local copy, which changes how fast THEIR
+        # queries run and nothing about what their agents can do; that is a
+        # workspace question and it lives on the package's own page
+        # (/catalog/p/<slug>, sourced from `entry.materialized`) and in
+        # `agnes stack add`. An "Add to my agents" control here would claim to
+        # grant access the admin's grant already gave.
+        #
+        # Classic membership: subscribing is exactly what makes the resource
+        # queryable (membership drives get_accessible_tables), so the control
+        # is real, the verb is true, and a self-subscription is the caller's to
+        # drop — rendering it as a locked admin mandate is what Devin Review
+        # #1199 was about.
         if in_stack and droppable:
-            # Classic self-subscription: the caller added it, the caller can
-            # remove it — HERE, not just on /catalog. This row used to render
-            # the locked pill ("only an admin can remove it"), which was
-            # false for a self-subscription and read as a required mandate;
-            # /catalog offered Remove for the very same membership. The lock
-            # is driven by droppability, and this membership IS droppable.
             import json as _json
 
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In stack"
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
-            # Remove is a path-param DELETE; re-add (after a remove, without
-            # a reload) POSTs the generic subscribe endpoint with a body —
-            # the row carries both so the click handler can cycle.
+            # Remove is a path-param DELETE; re-add (after a remove, without a
+            # reload) POSTs the generic subscribe endpoint with a body — the
+            # row carries both so the click handler can cycle.
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Added by you — click to remove it from your stack"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
         elif in_stack:
             items[-1]["stack_state"] = "in_stack"
-            # Every non-droppable member row says the same thing about
-            # membership — "In stack" — and is LOCKED: there is no per-user
-            # membership to drop, only a grant an admin can revoke (required
-            # tier, or auto-membership where the grant IS the membership).
-            # The lock is driven by *droppability*, not by the grant tier:
-            # keying it on ``requirement == 'required'`` (as this once did)
-            # left an optional grant rendering the success-tinted check that
-            # a REMOVABLE row wears at rest. The tier stays legible in the
-            # tooltip and the Optional/Required facet.
-            items[-1]["stack_pill"] = "In stack"
+            # ONE pill for both grant tiers, because the caller can do exactly
+            # the same thing with either: query it, and not remove it. The
+            # tiers differ only in WHY, which is what the tooltip is for — two
+            # pills promising two different things about removal is what made
+            # a single state read as two. The tier stays legible in the tooltip
+            # and in the Access facet.
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
             if requirement == "required":
                 items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
@@ -2800,10 +2930,12 @@ async def library_page(
 
             items[-1]["stack_state"] = "available"
             items[-1]["stack_addable"] = True
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Granted to you, but not in your stack — add it to make it queryable"
+            items[-1]["stack_title"] = _AGENT_ADD_TOOLTIP
 
     # Governed data packages + memory domains — StackResolver.browse() is
     # exactly "required ∪ available for my groups" for these two types.
@@ -2833,9 +2965,7 @@ async def library_page(
     except Exception as e:
         logger.warning("/library: could not count memory-domain items: %s", e)
         dom_counts = None
-    # Membership mode decides droppability below: classic optional members
-    # are the caller's own subscriptions (removable here, as on /catalog);
-    # under auto-membership the grant IS the membership, nothing to drop.
+    # Only classic membership has a subscription to drop; see _add_shared_row.
     from app.instance_config import get_stack_auto_membership
 
     _auto_membership = get_stack_auto_membership()
@@ -2896,7 +3026,7 @@ async def library_page(
                     droppable=(not _auto_membership and e.in_stack and e.requirement != "required"),
                 )
         except Exception as e:
-            logger.warning("/library: could not resolve %s: %s", rt.value, e)
+            _lost(_RT_LABELS.get(rt.value, rt.value), e)
 
     # Recipes — granted, resolved straight off the repo (no _fetch_entries
     # support for this type in StackResolver).
@@ -2921,7 +3051,7 @@ async def library_page(
                     owner_label="Your workspace",
                 )
     except Exception as e:
-        logger.warning("/library: could not resolve recipes: %s", e)
+        _lost("recipes", e)
 
     # Curated marketplace plugins — grant resource_id is the canonical
     # "<marketplace_slug>/<plugin_name>" path, so match on that.
@@ -3010,27 +3140,30 @@ async def library_page(
                 # (`curated_install` / `curated_uninstall`). The Library's toggle
                 # is kind-agnostic — it POSTs/DELETEs whatever the row names.
                 row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
+                # Same verb as a store entity, and for the same reason.
+                row["stack_action"] = "Install"
+                row["stack_undo"] = "Uninstall"
                 # Droppable unless an admin pinned it globally (`is_system`) or
                 # required-tier-granted it to one of the caller's groups. Those
                 # are precisely the two cases `curated_uninstall` answers 409
                 # to, so the lock promises exactly what the API enforces.
                 locked = bool(pl.get("is_system")) or key in plugin_required
+                row["stack_action"] = _AGENT_ADD
+                row["stack_undo"] = _AGENT_REMOVE
                 if key in plugin_in_stack:
                     row["stack_state"] = "in_stack"
-                    row["stack_pill"] = "In stack"
+                    row["stack_pill"] = _AGENT_HAS
                     row["stack_locked"] = locked
                     row["stack_removable"] = not locked
-                    row["stack_title"] = (
-                        _LOCKED_STACK_TOOLTIP if locked else "The default agent can use this — click to remove it"
-                    )
+                    row["stack_title"] = _LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP
                 else:
                     row["stack_state"] = "available"
                     row["stack_pill"] = ""
                     row["stack_locked"] = False
                     row["stack_addable"] = True
-                    row["stack_title"] = "Granted to you, but the default agent can't use it until you add it"
+                    row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve marketplace plugins: %s", e)
+        _lost("plugins from your organization", e)
 
     # Installed AGENTS. Skills and plugins are already covered by the store sweep
     # above — whether installed or not — so listing them here again would double
@@ -3059,12 +3192,14 @@ async def library_page(
             # Installing a store item IS its Stack membership, and the caller may
             # undo it — the same install endpoint, removed.
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In stack"
+            items[-1]["stack_pill"] = _AGENT_HAS
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
-            items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve installed agents: %s", e)
+        _lost("agent templates", e)
 
     # ── Hosted data apps ───────────────────────────────────────────────
     # Same visibility set as the /apps page (data_apps_list_page): the
@@ -3187,7 +3322,7 @@ async def library_page(
                     )
                 )
         except Exception as e:
-            logger.warning("/library: could not list data apps: %s", e)
+            _lost("apps", e)
 
     # ── Definitions — the semantic layer, as a page FOOTER ────────────────
     # Deliberately NOT rows in the list above. Metrics and glossary terms are
@@ -3294,6 +3429,16 @@ async def library_page(
             labels[k] = c.get(label_key) or k
         return sorted(((k, labels[k], n) for k, n in counts.items()), key=lambda x: x[1])
 
+    def _present_multi(attr_key: str) -> list:
+        """Tally a list-valued key. The count is top-level ROWS, not files:
+        it must equal what clicking the option leaves on screen, and the
+        engine returns rows."""
+        counts: dict = {}
+        for c in items:
+            for k in c.get(attr_key) or []:
+                counts[k] = counts.get(k, 0) + 1
+        return sorted(((k, k, n) for k, n in counts.items()), key=lambda x: x[1])
+
     library_origins = _present("origin", "origin_label")
     library_requirements = _present("requirement", "requirement_label")
     library_owners = _present("owner_key", "owner_label")
@@ -3311,6 +3456,52 @@ async def library_page(
     # rows with no stack membership at all (files, apps) are neither in nor
     # addable. Zero means the toggle doesn't render: no dead filters.
     library_available_count = sum(1 for c in items if c.get("stack_state") == "available")
+
+    #: Recency, as a facet rather than only a sort. "What arrived this week" is
+    #: the question a growing library gets asked most, and `data-added` could
+    #: only ever answer it by sorting — which shows you the newest row but not
+    #: how many are new. The buckets are CUMULATIVE and stored as a set on the
+    #: row (`7d|30d|90d`), so picking "Last 30 days" matches everything inside
+    #: 30 days rather than a 23-day slice; the engine's `multi` mode does the
+    #: containment test. A row with no date carries nothing and is simply never
+    #: matched, which is honest — we do not know when it arrived.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _now = _dt.now(_tz.utc)
+    _age_labels = [("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30), ("90d", "Last 90 days", 90)]
+    _age_counts: dict = {}
+    for c in items:
+        iso = c.get("added_iso")
+        buckets = []
+        if iso:
+            try:
+                when = _dt.fromisoformat(iso)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_tz.utc)
+                age = _now - when
+                buckets = [key for key, _lbl, days in _age_labels if age <= _td(days=days)]
+            except ValueError:
+                buckets = []
+        c["age_buckets"] = buckets
+        for b in buckets:
+            _age_counts[b] = _age_counts.get(b, 0) + 1
+    library_ages = [(k, lbl, _age_counts[k]) for k, lbl, _d in _age_labels if _age_counts.get(k)]
+
+    #: How the caller relates to the row, which is a different question from
+    #: Owner (a *who*). Retired with the three-way Scope segment; it was the one
+    #: part of that control worth keeping, because "things I made" and "things
+    #: shared with me" are separate piles in everyone's head.
+    _OWNERSHIP_LABELS = {
+        "mine": "Created by you",
+        "shared_by_me": "Shared by you",
+        "shared_with_me": "Shared with you",
+    }
+    _own_counts: dict = {}
+    for c in items:
+        k = c.get("ownership")
+        if k in _OWNERSHIP_LABELS:
+            _own_counts[k] = _own_counts.get(k, 0) + 1
+    library_ownerships = [(k, lbl, _own_counts[k]) for k, lbl in _OWNERSHIP_LABELS.items() if _own_counts.get(k)]
 
     # Tags are multi-valued per row, so they need their own tally.
     tag_counts: dict = {}
@@ -3339,24 +3530,49 @@ async def library_page(
     # Unlisted types fall to the end, alphabetically.
     _SECTION_ORDER = [
         "data_package",
-        "data_app",
         "plugin",
         "skill",
         "agent",
         "recipe",
-        # Loose files + collections-as-folders (and hosted data apps).
+        # Loose files + collections-as-folders.
         "files",
+        # Apps read AFTER the caller's own files — the same reading order they
+        # had as a trailing block inside the Artefacts band, now carried by the
+        # section order instead of by row order within one band.
+        "data_app",
         "memory_domain",
     ]
-    #: Kinds that land INSIDE another kind's section instead of getting their
-    #: own. Data apps live among the caller's artifacts in Files — the
-    #: original "Data apps coming soon" badge on that band promised exactly
-    #: this — while their rows keep ``type_key="data_app"`` so the Type facet
-    #: and the row's own label stay honest.
-    _SECTION_OF = {"data_app": "files"}
+    #: Which TAB a section belongs to. The Library answers two questions that
+    #: a single flat list served badly: "what does this organization know"
+    #: (documents, governed data, memory, recipes, and the apps built on that
+    #: data — everything you read, query or open) and "what can my agent do"
+    #: (the three kinds that actually change an agent's behaviour). Anything
+    #: unlisted falls to Knowledge, which is the browse half.
+    _TAB_KNOWLEDGE = "knowledge"
+    _TAB_CAPABILITIES = "capabilities"
+    _SECTION_TAB = {
+        "data_package": _TAB_KNOWLEDGE,
+        "data_app": _TAB_KNOWLEDGE,
+        "recipe": _TAB_KNOWLEDGE,
+        "files": _TAB_KNOWLEDGE,
+        "memory_domain": _TAB_KNOWLEDGE,
+        "plugin": _TAB_CAPABILITIES,
+        "skill": _TAB_CAPABILITIES,
+        "agent": _TAB_CAPABILITIES,
+    }
+    #: Data apps used to land INSIDE the Files band (``_SECTION_OF``). They
+    #: have their own band now: an app is not an artefact the caller uploaded,
+    #: and the Files hint had to claim it was one. Their rows keep
+    #: ``type_key="data_app"`` either way, so the Type facet and the row label
+    #: are unaffected.
     grouped: dict = {}
     for c in items:
-        grouped.setdefault(_SECTION_OF.get(c["type_key"], c["type_key"]), []).append(c)
+        # The tab rides the ROW, not just the section: the filter engine's
+        # segmented control reads it off `data-tab` (see library.html), which
+        # is what makes tab switching share one code path with search, the
+        # facets and the empty-section hiding instead of growing a second one.
+        c["tab"] = _SECTION_TAB.get(c["type_key"], _TAB_KNOWLEDGE)
+        grouped.setdefault(c["type_key"], []).append(c)
 
     def _section_rank(type_key: str) -> tuple:
         try:
@@ -3388,7 +3604,7 @@ async def library_page(
     #: it to explain itself. Kept to a short clause; a group with no hint simply
     #: renders none.
     _SECTION_HINTS = {
-        "files": "Files you upload, outputs your agent generates, and your hosted data apps.",
+        "files": "Files you upload and the outputs your agent generates.",
         "skill": "Skills built here.",
         "plugin": "Bundles of skills and commands.",
         "agent": "Assistants you installed.",
@@ -3432,16 +3648,16 @@ async def library_page(
         share it, so the folders come FIRST as their own block — the reader sees
         the containers before the loose contents, and the drop targets are all
         in one place. Everything else keeps the global recency order.
+
+        Data apps had a third block here while they lived inside this band;
+        they have their own section now, so folders-then-loose is the whole
+        rule.
         """
         if key != "files":
             return rows
-        # Three stable blocks: folders (containers first, drop targets in one
-        # place), then loose files, then data apps — the sub-kinds of the
-        # Artefacts umbrella stay grouped instead of interleaving by recency.
         folders = [r for r in rows if r.get("is_folder")]
-        apps = [r for r in rows if r.get("type_key") == "data_app"]
-        loose = [r for r in rows if not r.get("is_folder") and r.get("type_key") != "data_app"]
-        return folders + loose + apps
+        loose = [r for r in rows if not r.get("is_folder")]
+        return folders + loose
 
     library_sections = []
     for key, rows in sorted(grouped.items(), key=lambda kv: _section_rank(kv[0])):
@@ -3449,6 +3665,7 @@ async def library_page(
         library_sections.append(
             {
                 "key": key,
+                "tab": _SECTION_TAB.get(key, _TAB_KNOWLEDGE),
                 "label": _SECTION_LABELS.get(key) or (rows[0]["type_label"] + "s"),
                 "hint": _SECTION_HINTS.get(key, ""),
                 "soon": _SECTION_SOON.get(key, ""),
@@ -3462,6 +3679,31 @@ async def library_page(
             }
         )
 
+    #: The tab bar itself — one entry per tab, in reading order, each with the
+    #: number of top-level rows behind it (a folder counts once, matching the
+    #: section counts). A tab with nothing in it still renders: the pair is the
+    #: page's structure, and hiding one would make the remaining tab look like
+    #: a stray control. The labels are the two questions the page answers.
+    _TAB_LABELS = [(_TAB_KNOWLEDGE, "Knowledge"), (_TAB_CAPABILITIES, "Capabilities")]
+    _tab_counts: dict[str, int] = {_TAB_KNOWLEDGE: 0, _TAB_CAPABILITIES: 0}
+    for _sec in library_sections:
+        _tab_counts[_sec["tab"]] = _tab_counts.get(_sec["tab"], 0) + _sec["count"]
+    library_tabs = [{"key": k, "label": lbl, "count": _tab_counts.get(k, 0)} for k, lbl in _TAB_LABELS]
+
+    # Which tab opens. `?tab=` is the explicit form; a detail page's back link
+    # arrives as `?section=<type_key>` instead (router._detail_back) and must
+    # land on the tab that HOLDS that section, or the reader follows "back" to
+    # a page where their row is filtered out. Validated against our own keys,
+    # so what reaches the page's JS is never caller text.
+    _requested_tab = request.query_params.get("tab")
+    _requested_section = request.query_params.get("section")
+    if _requested_tab in _tab_counts:
+        library_active_tab = _requested_tab
+    elif _requested_section in _SECTION_TAB:
+        library_active_tab = _SECTION_TAB[_requested_section]
+    else:
+        library_active_tab = _TAB_KNOWLEDGE
+
     from app.instance_config import feature_enabled
 
     ctx = _build_context(
@@ -3469,6 +3711,8 @@ async def library_page(
         user=user,
         library_items=items,
         library_sections=library_sections,
+        library_tabs=library_tabs,
+        library_active_tab=library_active_tab,
         definitions_footer=definitions_footer,
         library_origins=library_origins,
         library_requirements=library_requirements,
@@ -3477,6 +3721,16 @@ async def library_page(
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
+        #: The kind. Left out for a long time because "the list is already
+        #: GROUPED by type into these very sections" — true of one flat list of
+        #: eight kinds, but a tab now holds several and grouping is not
+        #: filtering: it tells you where a kind is, not how to see only it.
+        #: File formats, from the rows that have one. Rendered on every file row
+        #: already and filterable by nothing until now.
+        library_formats=_present_multi("format_keys"),
+        library_ownerships=library_ownerships,
+        library_load_errors=_load_errors,
+        library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
         # Band to open on arrival — a detail page's back link returns here as
@@ -3519,6 +3773,9 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
+        # TCRD-250: node types with live, caller-scoped counts at the head
+        # of the Knowledge tab. Empty list = render nothing, see helper.
+        library_type_map=_library_type_map(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
@@ -4548,6 +4805,25 @@ async def catalog_recipe_detail(
     return templates.TemplateResponse(request, "catalog_recipe_detail.html", ctx)
 
 
+# What a file's extraction state is CALLED on a Library row. `indexed` is
+# deliberately absent: a healthy file is the overwhelming majority, and a row
+# that says "indexed" on every line spends the slot on the one value that
+# carries no information. Absence means fine; a label means look.
+_INGEST_LABELS = {
+    "pending": "Not indexed yet",
+    "processing": "Indexing",
+    "needs_review": "Needs review",
+    "rejected": "Not indexed",
+}
+
+
+def _ingest_label(f: dict | None) -> str:
+    """The row-level note for a file whose text your agents cannot search yet."""
+    if not f:
+        return ""
+    return _INGEST_LABELS.get(f.get("processing_status") or "", "")
+
+
 def _human_size(n: int) -> str:
     """Format bytes as a short human string. Mirrors the format used on
     the marketplace card meta line."""
@@ -4970,6 +5246,11 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         "can_news": get_news_enabled(),
         "can_knowledge_digests": get_knowledge_digests_ui_enabled(),
         "can_contribute_skill": get_contribute_skill_enabled(),
+        # The Moderation & Trust hub, retired on the same pattern: its three
+        # zones each have a better door already in the column (Submissions,
+        # Marketplaces, and verification's own switch), so the page was a
+        # landing spot for links you can reach directly.
+        "can_store_moderation": get_store_moderation_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -5297,6 +5578,44 @@ async def studio(
     )
 
 
+def _simulate_preview_ctx(request: Request) -> dict | None:
+    """Who the admin came here to fix, when they arrived from the person lens.
+
+    The Access page's person lens links out with `?from=simulate&user=<id>`,
+    and a page that understands it can show "← Back to preview: Jane" and a
+    "Re-check Jane →" return link — a closed loop, instead of dropping the
+    person the moment you leave the audit.
+
+    This lived inline in the data-package route, so the package page was the
+    only destination that closed the loop; the memory link was a one-way exit
+    with no way back at all. Resolved server-side to a name plus their groups
+    so the banner can say "Jane — Everyone, product-team" rather than echoing
+    a uuid. An unknown or garbage id resolves to None and the page renders
+    normally — the banner is chrome, never a 500.
+    """
+    if request.query_params.get("from") != "simulate":
+        return None
+    uid = request.query_params.get("user") or ""
+    if not uid:
+        return None
+    try:
+        person = users_repo().get_by_id(uid)
+    except Exception:  # noqa: BLE001
+        person = None
+    if not person:
+        return None
+    try:
+        groups = list(user_group_members_repo().list_group_names_for_user(uid))
+    except Exception:  # noqa: BLE001
+        groups = []
+    return {
+        "user_id": uid,
+        "name": person.get("name") or person.get("email") or uid,
+        "groups": [g for g in groups if g],
+        "back_href": f"/admin/access?lens=simulate&user={uid}",
+    }
+
+
 @router.get("/admin/corporate-memory", response_class=HTMLResponse)
 async def corporate_memory_admin(
     request: Request,
@@ -5388,6 +5707,7 @@ async def corporate_memory_admin(
         contradictions=contradictions,
         audit_entries=[],
         knowledge_json_exists=knowledge_json_exists,
+        preview_ctx=_simulate_preview_ctx(request),
     )
     return templates.TemplateResponse(request, "admin_corporate_memory.html", ctx)
 
@@ -6857,30 +7177,7 @@ async def admin_package_detail(
         logger.warning("package detail: could not compute delivery state: %s", e)
 
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
-    # The Simulate lens's "Share it →" lands here carrying WHO the admin came
-    # to fix. Resolved server-side to a name + their groups so the banner can
-    # say "Jane — Everyone, product-team" instead of echoing a uuid, and the
-    # back link returns to the preview with the same person still selected.
-    # Unknown/garbage ids resolve to None and the page renders normally.
-    preview_ctx = None
-    if request.query_params.get("from") == "simulate":
-        _puid = request.query_params.get("user") or ""
-        if _puid:
-            try:
-                _pu = users_repo().get_by_id(_puid)
-            except Exception:  # noqa: BLE001 — the banner is chrome, never a 500
-                _pu = None
-            if _pu:
-                try:
-                    _pgroups = list(user_group_members_repo().list_group_names_for_user(_puid))
-                except Exception:  # noqa: BLE001
-                    _pgroups = []
-                preview_ctx = {
-                    "user_id": _puid,
-                    "name": _pu.get("name") or _pu.get("email") or _puid,
-                    "groups": [g for g in _pgroups if g],
-                    "back_href": f"/admin/access?lens=simulate&user={_puid}",
-                }
+    preview_ctx = _simulate_preview_ctx(request)
 
     ctx = _build_context(
         request,
@@ -7463,9 +7760,9 @@ def _source_inventory(user: dict | None = None) -> dict:
             # unallowlisted name, in which case Import would 400 even though
             # the card looks ready. Gate the button on this too rather than
             # advertise a one-click path that dead-ends for that config.
-            from src.orchestrator_security import is_token_env_allowed
+            from src.orchestrator_security import is_config_secret_env_allowed
 
-            row["token_env_allowlisted"] = is_token_env_allowed(row["token_env"])
+            row["token_env_allowlisted"] = is_config_secret_env_allowed(row["token_env"])
         derived.append(row)
 
     try:
@@ -7650,6 +7947,69 @@ def _source_inventory(user: dict | None = None) -> dict:
 # the producer reports real per-item cost.
 _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
+# Every `claims_rejected` reason the verbatim gate itself produces (spec §8 +
+# §8.4) — both fold into the "rejected quotes" badge, never "protocol
+# errors" (unresolved doc id, malformed edge, …), even though they are
+# distinct reasons an operator can tell apart in the drawer.
+_VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
+
+
+def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
+    """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
+    ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
+    file name + collection name it belongs to, for the card's drawer — a
+    bare hash "tells nobody anything" (live-use feedback, TCRD-240/241
+    follow-up).
+
+    ``None`` for an id this instance has never seen (`corpus_file_sources`
+    carries no row for it) — the caller renders that as the honest
+    "not in any collection" fallback next to the raw sha16, never a guess.
+    Also ``None`` on any lookup failure (PG-only `corpus_file_sources` on a
+    DuckDB-backed instance, a deleted collection, …) — resolution is a
+    read-only display nicety, never worth a 500 for the card.
+    """
+    try:
+        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+
+        source_row = corpus_file_sources_repo().get_by_source_doc_id(doc_id)
+        if source_row is None:
+            return None
+        file_row = corpus_files_repo().get(source_row["corpus_file_id"])
+        if file_row is None:
+            return None
+        collection = file_corpora_repo().get(file_row["corpus_id"])
+        return {
+            "name": file_row.get("filename"),
+            "collection": collection.get("name") if collection else None,
+        }
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: doc_id resolution failed for %s: %s", doc_id, e)
+        return None
+
+
+def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
+    """Add a resolved ``doc`` key (``{name, collection}`` or ``None``) to
+    each "Last run" rejection/deferred row, memoizing the lookup per
+    ``doc_id`` so a run with many claims against the same document does not
+    re-resolve it once per row. Every original key (``row``, ``reason``,
+    ``doc_id``, …) is preserved untouched — this only adds information, it
+    never replaces the raw fields the drawer's category counts and any
+    other reader of this cell already depend on.
+    """
+    doc_cache: dict[str, Optional[dict]] = {}
+    enriched = []
+    for row in rows:
+        row = dict(row)
+        doc_id = row.get("doc_id")
+        if doc_id:
+            if doc_id not in doc_cache:
+                doc_cache[doc_id] = _resolve_sharepoint_rejection_doc(doc_id)
+            row["doc"] = doc_cache[doc_id]
+        else:
+            row["doc"] = None
+        enriched.append(row)
+    return enriched
+
 
 def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
@@ -7672,12 +8032,17 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     **Error badge categories are a deliberate, narrower simplification** of
     spec §13.2's illustrative four (unsupported type / model error / deleted
     / rejected quote) — those live in the CRAWLER's own per-document error
-    log, which Agnes never receives. The three badges below are the ones
-    Agnes's own ingest run report actually carries: `rejected_quotes` (the
-    verbatim gate, spec §8, doing its job), `deferred` (a claim whose file
-    was not yet `indexed` — free retry once it is), and `protocol_errors`
-    (every OTHER `claims_rejected` reason — unresolved doc id, malformed
-    edge, alias type conflict, …).
+    log, which Agnes never receives. The badges below are the ones Agnes's
+    own ingest run report actually carries: `rejected_quotes` (the verbatim
+    gate, spec §8, doing its job — both `verbatim_gate_failed` and the
+    meaningfulness floor's `quote_not_meaningful`, §8.4: two different
+    reasons the SAME gate refuses a quote), `deferred` (a claim whose file
+    was not yet `indexed` — free retry once it is), `protocol_errors` (every
+    OTHER `claims_rejected` reason — unresolved doc id, malformed edge,
+    alias type conflict, …), and `source_urls_rejected` (O7 follow-up: a
+    document's `source_url` the ingest validator dropped — the claim itself
+    still wrote, only its citation link is missing; a producer that never
+    sends `source_url` is not in this list at all).
 
     Every sub-block degrades independently on its own `try/except` — a
     repo call that raises (PG-only `RequiresPostgresBackend` on a
@@ -7745,8 +8110,13 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     if last_run is not None:
         claims_rejected = last_run.get("claims_rejected") or []
         deferred = last_run.get("deferred") or []
-        rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
-        protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
+        # O7 follow-up: NOT folded into `protocol_errors` — a dropped
+        # `source_url` never rejects the claim (it still writes), so it is
+        # a different signal than every `claims_rejected` reason and gets
+        # its own badge rather than muddying "why was nothing written".
+        source_urls_rejected = last_run.get("source_urls_rejected") or []
+        rejected_quotes = [r for r in claims_rejected if r.get("reason") in _VERBATIM_GATE_REASONS]
+        protocol_errors = [r for r in claims_rejected if r.get("reason") not in _VERBATIM_GATE_REASONS]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
         cell["cost_estimate"] = {
             "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
@@ -7755,9 +8125,10 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
-            "rejected_quotes": rejected_quotes,
-            "deferred": deferred,
-            "protocol_errors": protocol_errors,
+            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
+            "deferred": _enrich_sharepoint_rejection_rows(deferred),
+            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
+            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
         }
     else:
         cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
@@ -7766,7 +8137,43 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── schedule: static text — the crawl runs externally, so this is
     # honestly a label, never live state (spec §13.2's "hourly delta · 03:00
     # full check · extraction in its own lane" collapsed to one line here).
-    cell["schedule"] = {"text": "external producer · hourly delta"}
+    #
+    # `in_agnes` (TCRD-226) is a SEPARATE, additive sub-object: the
+    # in-Agnes `corpus-extraction` job kind's own schedule state for THIS
+    # connection — whether extraction.enabled is on, the configured cadence
+    # (if any), and this connection's own last/next run (last_run_at is
+    # this connection's own `config.extraction.last_run_at`, the SAME
+    # bookkeeping `app/api/admin_sharepoint.py::_record_extraction_dispatch`
+    # writes; next_run_at is a best-effort display estimate,
+    # `src.scheduler.next_due_at` — see its own docstring for why it is
+    # never the source of truth for an actual dispatch). Never confused
+    # with the static `text` above, which describes the EXTERNAL
+    # producer's own crawl cadence, not Agnes's job queue.
+    in_agnes_schedule: dict[str, Any] = {
+        "enabled": False,
+        "schedule": None,
+        "last_run_at": None,
+        "next_run_at": None,
+    }
+    try:
+        from app.instance_config import feature_enabled, get_value
+        from src.scheduler import next_due_at
+
+        in_agnes_schedule["enabled"] = feature_enabled(
+            "extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False
+        )
+        schedule_cfg = str(get_value("extraction", "schedule", default="") or "").strip() or None
+        in_agnes_schedule["schedule"] = schedule_cfg
+        extraction_state = (conn.get("config") or {}).get("extraction") or {}
+        last_run_at = extraction_state.get("last_run_at")
+        in_agnes_schedule["last_run_at"] = last_run_at
+        if schedule_cfg:
+            next_run = next_due_at(schedule_cfg, last_run_at)
+            in_agnes_schedule["next_run_at"] = next_run.isoformat() if next_run else None
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
+
+    cell["schedule"] = {"text": "external producer · hourly delta", "in_agnes": in_agnes_schedule}
 
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity
@@ -7813,8 +8220,13 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # collections with no group", fail-closed (an ungranted collection is
     # invisible to everyone, spec §13.1's "under-sharing looks like a bug"
     # made visible as a count rather than discovered by an analyst).
+    # `collections_total` (added alongside the card's rephrase to a plain
+    # sharing-state sentence — "all scope collections have a group" needs to
+    # know what "all" is) is `len(scope_ids)` regardless of whether the
+    # grants lookup below succeeds — it costs no extra query.
     groups_matched = 0
     collections_no_group = 0
+    collections_total = len(scope_ids)
     if scope_ids:
         try:
             from src.repositories import resource_grants_repo
@@ -7827,7 +8239,43 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
-    cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
+    cell["identity"] = {
+        "groups_matched": groups_matched,
+        "collections_no_group": collections_no_group,
+        "collections_total": collections_total,
+    }
+
+    # ── scopes: the connection's OWN confirmed scope rows (`config.scopes`),
+    # reused through `admin_sharepoint._scope_out` so the card renders
+    # exactly the connect wizard's own step-3 "Share" shape — one source of
+    # truth for what a scope row looks like, not a second projection that
+    # can drift from it. Each row degrades independently (a deleted
+    # collection, an unavailable grants repo) to its raw shape rather than
+    # dropping the row or failing the whole cell; a repo-wide failure
+    # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
+    # all rather than a 500 for the whole card — same posture as every
+    # other sub-block here. Unlike `scope_ids` above (a distinct-corpus
+    # heuristic over ingest history), this list is direct — every scope this
+    # CONNECTION has confirmed, whether or not it has ingested anything yet.
+    scopes: list[dict[str, Any]] = []
+    try:
+        from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
+
+        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
+        for raw_scope in (conn.get("config") or {}).get("scopes") or []:
+            if not isinstance(raw_scope, dict):
+                continue
+            try:
+                scopes.append(_scope_out(raw_scope, declared_corpus_ids))
+            except Exception as e:
+                logger.debug(
+                    "sharepoint pipeline cell: scope row resolution failed for %s: %s",
+                    raw_scope.get("source_scope_id"),
+                    e,
+                )
+    except Exception as e:
+        logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
+    cell["scopes"] = scopes
 
     # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
     # own confirmed scopes marked anonymize=true, read straight off `conn` —
@@ -8467,6 +8915,14 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     which is how /admin/tables' "Manage access" arrives.
     """
     ctx = _build_context(request, user=user)
+    # Inviting from a group's People search completes an address rather than
+    # asking for one. The instance's configured sign-in domains are the only
+    # ones an invited account could ever authenticate with, so they are the
+    # candidates worth offering; with none configured the field takes a full
+    # address, as before.
+    from app.instance_config import get_allowed_domains
+
+    ctx["invite_domains"] = get_allowed_domains() or []
     return templates.TemplateResponse(request, "admin_access.html", ctx)
 
 
@@ -8772,7 +9228,22 @@ async def admin_moderation_hub_page(
     submission queue and marketplace curation are surfaced as links (count +
     jump-off), not rebuilt here. ``/admin/store`` is the natural parent of the
     ``/admin/store/submissions`` review queue.
+
+    Hidden by default (``features.store_moderation_enabled``): the two links
+    it surfaces are their own nav rows, and verification has its own switch,
+    so the page was a landing spot for doors already in the column. Redirect
+    rather than 404 — its entry points were a sidebar row and a palette shortcut,
+    and a bookmark from before the flip should land somewhere useful.
+
+    NOTE: this page is the only UI that renders the queued agent-share
+    approvals (Track C6). While it is hidden they are decided through
+    ``GET/PATCH /api/admin/share-requests`` only, which is deliberate — owner-
+    initiated agent sharing is itself V2-deferred in the agent-profiles spec,
+    so on a default instance the queue this page would show is empty.
     """
+    if not get_store_moderation_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from app.instance_config import get_store_verification_enabled
 
     verification_enabled = get_store_verification_enabled()

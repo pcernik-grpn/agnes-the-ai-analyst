@@ -762,6 +762,45 @@ def test_orphan_rate_empty_is_none():
     assert metrics.orphan_rate([], {}) is None
 
 
+# ---------------------------------------------------------------------------
+# Alias-search ranking -- ordering-aware companion to precision/recall
+# (additive: precision_recall_by_type's set semantics above are untouched).
+# ---------------------------------------------------------------------------
+
+
+def test_alias_search_hit_rank_finds_the_matching_subject():
+    subjects = [
+        {"id": "s0", "aliases": ["zephyr-corp"]},
+        {"id": "s1", "aliases": ["parts-authority"]},
+        {"id": "s2", "aliases": ["alpha-logistics"]},
+    ]
+    assert metrics.alias_search_hit_rank(subjects, "parts-authority") == 1
+
+
+def test_alias_search_hit_rank_none_when_alias_absent():
+    subjects = [{"id": "s0", "aliases": ["zephyr-corp"]}]
+    assert metrics.alias_search_hit_rank(subjects, "nonexistent") is None
+
+
+def test_top_k_alias_hit_rate_counts_rank_zero_hits_and_misses():
+    # rank 0 (hit @k=1), rank 1 (miss @k=1), None (miss)
+    rate = metrics.top_k_alias_hit_rate([0, 1, None], k=1)
+    assert rate == pytest.approx(1 / 3)
+
+
+def test_top_k_alias_hit_rate_wider_k_counts_more_hits():
+    rate = metrics.top_k_alias_hit_rate([0, 1, None], k=2)
+    assert rate == pytest.approx(2 / 3)
+
+
+def test_top_k_alias_hit_rate_empty_is_none():
+    assert metrics.top_k_alias_hit_rate([], k=1) is None
+
+
+def test_alias_query_text_derives_a_human_query_from_the_slug():
+    assert metrics._alias_query_text("organization:parts-authority") == "parts authority"
+
+
 def test_probe_facts_endpoint_returns_false_on_unreachable_server():
     assert metrics.probe_facts_endpoint("http://127.0.0.1:1", "", timeout=0.5) is False
 

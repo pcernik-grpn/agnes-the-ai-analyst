@@ -359,6 +359,26 @@ auth:
 #   # How many days to keep `audit_log` rows before the daily audit-prune
 #   # scheduler job deletes them. Set to 0 to keep rows forever. Default 365.
 #   retention_days: 365
+#
+#   # Per-action sampling (optional, Wave 2 — Task 4). Off by default: an
+#   # action not listed here is NEVER sampled, full stop. Each entry is
+#   # `<action>: <ratio 0.0-1.0>`; a row for that action is written on
+#   # exactly 1 of every round(1 / ratio) calls, using a deterministic
+#   # per-action counter (NOT a random draw), so "1 in 10" is exactly true
+#   # even on a low-traffic instance. `1.0` (or simply omitting the action)
+#   # means always write; `0` means never write — the supported way to
+#   # silence a noisy, low-stakes action without touching its call site.
+#   # Measure actual volume first with `scripts/audit_volume_estimate.py`
+#   # before reaching for this knob.
+#   #
+#   # SECURITY: never list an action here that matters for security or
+#   # compliance — auth (login/token/password), RBAC/grant changes, secret
+#   # rotation, admin configuration, or anything an incident review might
+#   # need every row of. Sampling exists only for high-volume, low-stakes
+#   # reads (a routine chat tool call, a catalog list) — never for the
+#   # actions that record who changed what.
+#   sampling:
+#     chat.tool_call: 0.1   # keep 1 in 10 chat tool-call rows
 
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY
@@ -400,10 +420,11 @@ auth:
 #                                    # redesign` above. Env override:
 #                                    # AGNES_STACK_AUTO_MEMBERSHIP.
 #
-#   # Three surfaces the admin cleanup retired. All default false — the pages
+#   # Four surfaces the admin cleanup retired. All default false — the pages
 #   # and their APIs are intact, so setting one to true brings the surface
 #   # back exactly as it was. Env overrides: AGNES_NEWS_ENABLED,
-#   # AGNES_KNOWLEDGE_DIGESTS_ENABLED, AGNES_CONTRIBUTE_SKILL_ENABLED.
+#   # AGNES_KNOWLEDGE_DIGESTS_ENABLED, AGNES_CONTRIBUTE_SKILL_ENABLED,
+#   # AGNES_STORE_MODERATION_ENABLED.
 #   news_enabled: true               # In-product news: the /admin/news editor, the
 #                                    # /news reader, the /home "What's new" strip and
 #                                    # their nav + palette entries. UI only —
@@ -421,6 +442,14 @@ auth:
 #                                    # The Library's skill builder is the supported
 #                                    # path; both POST handlers are gated with the
 #                                    # page, so a stale button cannot publish past it.
+#   store_moderation_enabled: true   # The Moderation & Trust hub (/admin/store) and
+#                                    # its nav + palette entries. Its zones each have
+#                                    # a better door already: Submissions is its own
+#                                    # nav row, curation is /admin/marketplaces, and
+#                                    # verification has store.verification_enabled.
+#                                    # UI only — the store APIs and
+#                                    # /api/admin/share-requests* keep serving, so a
+#                                    # queued agent share is still decidable by API.
 
 # --- Library & Store trust vocabulary (optional, opt-in) ---
 # Both default to false so a routine upgrade never changes what existing
@@ -750,14 +779,17 @@ ai:
 # a hint, so use it to discover the schema if this comment block has aged.
 #
 # corporate_memory:
-#   # How knowledge reaches users:
-#   # "mandatory_only" — admin controls everything, no user voting
-#   # "admin_curated" — admin controls, users vote as feedback signal
-#   # "hybrid" — mandatory from admin + optional from user voting (default)
-#   #
-#   # NOT YET ENFORCED (#1573): GET /api/memory/bundle currently ships every
-#   # approved item to every user regardless of this value — changing it has
-#   # no effect on distribution yet.
+#   # Which OPTIONAL (approved, non-required) items are distributed to a
+#   # user's bundle (GET /api/memory/bundle, the per-domain markdown
+#   # `agnes pull` writes, and the matching sync-manifest md5). Required
+#   # (mandatory) items always reach their target audience regardless of
+#   # this setting — it only ever narrows the optional channel, never it.
+#   # "mandatory_only" — no optional channel at all; approved items stay
+#   #   catalog-browsable but are never bundled/synced
+#   # "admin_curated"  — same distribution as mandatory_only; voting is a
+#   #   feedback signal for admins only, it never triggers distribution
+#   # "hybrid"          — approved items are personally opt-in: only items
+#   #   the caller has upvoted (vote > 0) join their bundle (default)
 #   distribution_mode: "hybrid"
 #
 #   # How new AI-extracted items enter the system:
@@ -1096,6 +1128,21 @@ chat:
   #     project_id: my-gcp-project
   #     region: europe-west1      # or "global"
 
+# --- Session archive / analyst-sessions bridge (optional) ---
+# Web-chat sessions (`chat_messages`, the `chat:` block above) materialize
+# into the same jsonl shape the CLI/analyst session pipeline already reads
+# (SESSION_DATA_DIR -> services/session_pipeline), so the usage rollups and
+# the /admin/sessions transcript viewer pick up chat conversations exactly
+# like any other session (audit-full-coverage plan, F4).
+sessions:
+  # ON by default: a chat session is exported (best-effort, atomic write)
+  # when it ends (archive/delete/idle-reaper kill) and by a bounded
+  # pipeline sweep for any still-active session. Set false to keep chat
+  # transcripts out of the filesystem session store entirely — the prior
+  # behavior, where chat_messages was the only copy and had no admin
+  # transcript viewer. Env override: AGNES_SESSIONS_INCLUDE_CHAT.
+  include_chat: true
+
 # --- Hosted Data Apps (optional) ---
 # Hosted data apps (user web applications run next to the data)
 data_apps:
@@ -1183,8 +1230,18 @@ facts:
 # here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
 # NOT editable from /admin/server-config (locked: requires the
 # extraction-worker deployment) — this is operator/deploy-time config, not
-# a runtime toggle. The rest of this block (`producer`, `timeout_s`) is
-# plain instance data, read directly via get_value.
+# a runtime toggle. The rest of this block (`producer`, `schedule`,
+# `timeout_s`) is plain instance data, read directly via get_value.
+#
+# Flipping `enabled` here is NOT, by itself, enough to run the
+# extraction-worker compose service. That service sets AGNES_ROLE=worker
+# (a role split), which makes the deployment multi-process — see
+# `deployment.role` and `coordination.backend` above, and
+# docs/DEPLOYMENT.md#multi-process. Before starting it you ALSO need:
+# Postgres app-state (`database.backend`), explicit
+# `JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis`.
+# Without those, `app/startup_guards.py::validate_deployment` refuses to
+# boot the worker container.
 extraction:
   enabled: false
   producer:
@@ -1203,6 +1260,21 @@ extraction:
     # by default. Only the NAMES listed here are copied — this is not a way
     # back to forwarding the whole environment.
     env_passthrough: []
+  # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
+  # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
+  # driving a scheduler row (`extraction-run-due`, see
+  # services/scheduler/__main__.py) that fires `POST /api/admin/sharepoint/
+  # extraction/run-due`. That sweep applies this SAME cadence independently
+  # to each SharePoint connection's own last-run stamp, enqueueing the
+  # existing `corpus-extraction` job kind for whichever connections are due
+  # — not a per-connection schedule, one clock applied to every connection.
+  # Empty (the default) disables the sweep entirely — no scheduler row is
+  # registered — same "off unless explicitly turned on" posture as
+  # `enabled` above. An admin can still trigger a one-off run at any time
+  # via `POST /api/admin/sharepoint/connections/{id}/extract` regardless of
+  # this setting (subject to the same `enabled`/producer-configured gate).
+  # SCHEDULER_EXTRACTION_SCHEDULE overrides this at the environment level.
+  schedule: ""
   # Hard ceiling on one producer run, in seconds — the subprocess is killed
   # at this timeout and the job fails (no automatic retry: a failed
   # producer run usually needs an operator to look at it).
@@ -1230,6 +1302,34 @@ extraction:
   # instance's per-instance pseudonym key — different instances must use
   # different keys, or the same person pseudonymizes identically across
   # tenants). Neither var is set when no scope is anonymize-marked.
+  #
+  # Producer callback credential (TCRD-226): the producer calls BACK into
+  # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
+  # its actual work, so the child env ALSO carries AGNES_API_URL (this
+  # instance's own base URL — resolved from SERVER_URL, falling back to
+  # AGNES_INTERNAL_URL, then to this process's own loopback) and, when
+  # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
+  # shared-secret bearer token). On a role-split `extraction-worker`
+  # container (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
+  # `extraction-worker` service in docker-compose.yml) that loopback
+  # fallback would be the WORKER's own address, not the instance's real
+  # callback surface — so on that topology the job refuses cleanly instead
+  # ("neither SERVER_URL nor AGNES_INTERNAL_URL configured") unless one of
+  # the two is set explicitly. A single-container ("all-in-one") deployment
+  # is unaffected: there, the producer's parent process IS the app, so the
+  # loopback fallback is correct and no explicit configuration is required.
+  # The token itself is a DELIBERATE OVER-GRANT, not an
+  # oversight: presenting that token resolves to a synthetic user in the
+  # Admin system group (see app/auth/scheduler_token.py) — god-mode on
+  # every RBAC check — while the producer only ever needs to read its own
+  # connection's scope map, upload into its own scope collections, and
+  # POST to the facts-ingest endpoint. It is reused because it is the only
+  # existing credential class a headless subprocess can already present; a
+  # narrower, producer-scoped credential is the right long-term fix and is
+  # out of scope here. A compromised or merely misbehaving producer under
+  # this token can do anything an admin can, not merely ingest facts —
+  # weigh that before pointing `producer` at anything you have not
+  # reviewed.
   anonymization:
     # Name of the env var holding the per-instance HMAC key — checked
     # against ITS OWN allowlist before the value is read (the name here is

@@ -116,7 +116,13 @@ class TestTheOldInlineSwitchIsGone:
         assert "cset-devsw" not in css, "dead styles for a switch that no longer exists"
 
 
-class TestUseAgnesElsewhere:
+# The rail's route to /how-it-works#connect. Same label as the chat landing's
+# door, the onboarding checklist's step and the tour's closing button — one
+# door, one name, so a reader who meets it twice knows it is the same place.
+_ROW = "Take {{ instance_brand_short }} to your tools"
+
+
+class TestTakeAgnesToYourTools:
     """The rail's route out of the product.
 
     Everything else in the rail is a destination INSIDE Agnes. This one is how
@@ -142,24 +148,24 @@ class TestUseAgnesElsewhere:
         assert "Set up your tools" in page
 
     def test_it_sits_above_the_profile_row(self, rail):
-        assert rail.index("Use {{ instance_brand_short }} elsewhere") < rail.index('id="userMenu"')
+        assert rail.index(_ROW) < rail.index('id="userMenu"')
 
     def test_it_is_outside_the_collapsible_nav(self, rail):
         """Same reason the profile is: it stays reachable in the ≤1024px bar
         with the nav collapsed."""
-        assert rail.index('<div class="rail-foot">') < rail.index("Use {{ instance_brand_short }} elsewhere")
+        assert rail.index('<div class="rail-foot">') < rail.index(_ROW)
 
     def test_it_is_not_styled_as_a_muted_state(self, rail):
         """`rail-i--muted` italicises the label and exists for "Admin paused"
         — a condition being reported, not a place to go."""
-        i = rail.index("Use {{ instance_brand_short }} elsewhere")
+        i = rail.index(_ROW)
         anchor = rail.rfind("<a class=", 0, i)
         assert "rail-i--muted" not in rail[anchor:i]
 
     def test_it_uses_the_instance_brand(self, rail):
-        """ "Use Agnes elsewhere" on an instance that calls itself something
-        else would be the one place the rename did not reach."""
-        assert "Use {{ instance_brand_short }} elsewhere" in rail
+        """ "Take Agnes to your tools" on an instance that calls itself
+        something else would be the one place the rename did not reach."""
+        assert _ROW in rail
 
 
 class TestTheCollapsedRailKeepsItsSearch:

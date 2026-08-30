@@ -116,7 +116,7 @@
   .outcome-muted { color: var(--ds-text-muted); }
 
   .group-chip {
-    display: inline-block;
+    display: inline-flex; align-items: center; gap: 4px;
     padding: 3px 8px; border-radius: 999px;
     font-size: 11px; font-weight: 500;
     white-space: nowrap;
@@ -894,7 +894,10 @@ function renderUsers(users) {
             // name (deriveDisplayName would over-capitalize "data-team").
             const display = (g.origin === "google_sync" && g.name !== "Admin" && g.name !== "Everyone")
               ? deriveDisplayName(g.name) : g.name;
-            return `<span class="group-chip ${cls}" title="${esc(g.name)}">${esc(display)}</span>`;
+            // The mark, inside the chip: the pill's colour says WHICH group
+            // this is, and said nothing about it being a group at all.
+            return `<span class="group-chip ${cls}" title="${esc(g.name)}">${
+              AgnesKindGlyph.groupGlyph()}${esc(display)}</span>`;
           }).join("")
         }</div>`;
     tr.innerHTML = `

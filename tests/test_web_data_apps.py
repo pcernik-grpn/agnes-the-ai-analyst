@@ -361,7 +361,9 @@ def test_admin_linked_apps_wizard_renders_for_admin(web_env):
     c = web_env["client"]
     resp = c.get("/admin/linked-apps", headers=_auth(web_env["admin_pat"]))
     assert resp.status_code == 200
-    assert "Link Keboola apps" in resp.text
+    # Heading matches the sidebar row ("Linked apps"); the page used to open
+    # with the verb ("Link Keboola apps") while the nav named the noun.
+    assert "Linked apps" in resp.text
     # the three wizard steps are present
     assert 'id="wiz-step-1"' in resp.text
     assert 'id="wiz-step-3"' in resp.text

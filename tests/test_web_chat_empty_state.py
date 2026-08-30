@@ -137,10 +137,14 @@ class TestChatEmptyStatePill:
         # the door names them in its description); the floating chip markup that
         # carried them is what went with the banner.
         assert "Claude Code" in body
-        assert 'class="klb-chips"' not in body
         assert "Secure. Private. Always in sync." in body
-        for retired in ('class="klb"', "Agnes is your knowledge layer.", "Connect your tools"):
-            assert retired not in body, f"the retired hero is back: {retired}"
+        # The hero's whole `.klb-*` class family is deleted, not merely uncalled
+        # (macros/_knowledge_layer.html and its ~230 lines of CSS are gone), so
+        # the guard is the prefix rather than a list of the classes anyone
+        # happened to think of.
+        assert "klb" not in body, "the retired hero's markup is back"
+        for retired in ("Agnes is your knowledge layer.", "Connect your tools"):
+            assert retired not in body, f"the retired hero's copy is back: {retired}"
         assert 'id="rdb-actions"' in body
         # The suggestions carry a label again, and it names the one thing the
         # chips cannot say about themselves — that they are derived from what
@@ -154,26 +158,36 @@ class TestChatEmptyStatePill:
         assert "Operated by" not in body
         assert "Suggested questions" not in body
 
-    def test_below_the_input_is_the_suggestions_and_nothing_else(self, seeded_app, monkeypatch):
-        """Below the composer carries the suggested questions and nothing else —
-        no onboarding, no marketing, no documentation link.
+    def test_the_span_from_suggestions_to_the_input_is_nothing_else(self, seeded_app, monkeypatch):
+        """The suggested questions run straight into the composer — no
+        onboarding, no marketing, no documentation link between them.
 
-        The rule protects the INTENT ZONE: the span a reader crosses between
-        having a question and the suggestions that help them phrase it, where a
-        navigate-away control is a detour. It used to also allow two readouts
-        here (the Stack count line and the agent picker); the picker moved into
-        the composer pill and the count line is retired, so the zone is now
-        strictly empty of everything but the chips.
+        The rule protects the INTENT ZONE: the span a reader crosses between the
+        suggestions that help them phrase a question and the field they type it
+        into, where a navigate-away control is a detour. The zone used to sit
+        BELOW the composer, when the chips trailed it; the chips lead it now, so
+        the span runs from the chips down to `</form>` instead. Same invariant,
+        mirrored.
+
+        It used to also allow two readouts here (the Stack count line and the
+        agent picker); the picker moved into the composer pill and the count
+        line is retired, so the zone is strictly the chips and then the input.
         """
         _enable_rail_chat(seeded_app, monkeypatch)
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
-        below = body[body.index("</form>") :]
-        below = below[: below.index('id="rdb-actions-list"')]
+        # The chips precede the input they feed.
+        assert body.index('id="rdb-actions-list"') < body.index('id="chat-form"'), (
+            "the suggestions belong above the composer"
+        )
+        zone = body[body.index('id="rdb-actions"') : body.index("</form>")]
         for retired in ("rdb-orient", "New here?", 'href="/how-it-works"', 'class="rdb-context"'):
-            assert retired not in below, f"below-input area is not suggestions-only: {retired}"
-        # The picker is in the composer, not under it.
+            assert retired not in zone, f"suggestions-to-input span is not clean: {retired}"
+        # Nothing trails the composer but the ways out.
+        below = body[body.index("</form>") :]
+        assert 'id="rdb-actions"' not in below
+        # The picker is in the composer, not beside it.
         composer = body[body.index('class="cloud-chat-composer"') : body.index("</form>")]
         assert 'id="chat-agent-btn"' in composer
 
@@ -258,8 +272,9 @@ class TestChatEmptyStatePill:
         assert 'class="cld-trust-link" href="/how-it-works"' in body
         assert "See how Agnes works" in body
         # Links, not buttons — the composer above is the page's only action.
-        for retired in ("btn btn-primary", 'class="klb-cta"', 'class="klb-ctas"', "klb-cta-secondary"):
-            assert retired not in doors, f"a door rendered as a button: {retired}"
+        # (`klb-cta` was the hero CTA's class; it is deleted, and the body-wide
+        # prefix guard above covers it now.)
+        assert "btn btn-primary" not in doors, "a door rendered as a button"
 
     def test_requires_login(self, seeded_app):
         """Same auth gate as every other authenticated page — unauthenticated

@@ -101,6 +101,18 @@ class ConnectionNotInScope(GrantDenied):
     """
 
 
+class SourceNotGranted(GrantDenied):
+    """Raised when the caller's groups hold no ``ResourceType.MCP_SOURCE``
+    grant for the tool's source (TCRD-236), and the source is not exempt
+    under the backward-compat default (see
+    :func:`visible_mcp_source_ids`).
+
+    Subclasses ``GrantDenied`` for the same reason ``ConnectionNotInScope``
+    does — every existing handler already maps that exception to the right
+    transport error with no new except-arm.
+    """
+
+
 @dataclass(frozen=True)
 class CallerAuthority:
     """Who a passthrough call runs as, normalized across caller shapes.
@@ -167,6 +179,58 @@ def connection_scope_ids(authority: CallerAuthority) -> Optional[frozenset]:
     return agent_scope_filter(authority.agent_id, "connections_mode", "connection")
 
 
+def _mcp_source_ids_without_any_grant(source_ids: Iterable[str]) -> set:
+    """Among ``source_ids``, those holding NO ``mcp_source`` grant row for
+    ANY group — i.e. a source nobody has ever narrowed. Treated as
+    visible-to-everyone (see :func:`visible_mcp_source_ids`), which is what
+    keeps every already-registered source working the moment ``ResourceType.
+    MCP_SOURCE`` ships even where the boot/registration-time grandfather
+    seed (``src/mcp_source_grants.py``) has not yet run for it.
+    """
+    ids = set(source_ids)
+    if not ids:
+        return set()
+    from src.repositories import resource_grants_repo
+
+    from app.resource_types import ResourceType
+
+    granted_anywhere = {
+        g["resource_id"] for g in resource_grants_repo().list_all(resource_type=ResourceType.MCP_SOURCE.value)
+    }
+    return ids - granted_anywhere
+
+
+def visible_mcp_source_ids(user_id: Optional[str], source_ids: Iterable[str]) -> frozenset:
+    """Subset of ``source_ids`` visible to ``user_id`` under the
+    ``ResourceType.MCP_SOURCE`` gate (TCRD-236): explicitly granted to one
+    of the caller's groups, OR ungated (the source holds no ``mcp_source``
+    grant row at all — the backward-compat default; see
+    :func:`_mcp_source_ids_without_any_grant`).
+
+    Never short-circuits for admin — that bypass is the CALLER's job (every
+    caller here already branches on ``authority.is_admin`` before reaching
+    this), matching every other non-short-circuiting grant primitive in
+    ``app.auth.access``.
+    """
+    ids = set(source_ids)
+    if not ids or not user_id:
+        return frozenset()
+    from app.auth.access import _allowed_ids_for_user
+    from app.resource_types import ResourceType
+
+    granted = _allowed_ids_for_user(user_id, ResourceType.MCP_SOURCE.value)
+    ungated = _mcp_source_ids_without_any_grant(ids)
+    return frozenset((granted | ungated) & ids)
+
+
+def mcp_source_is_visible_to(user_id: Optional[str], source_id: Optional[str]) -> bool:
+    """Single-source convenience wrapper around :func:`visible_mcp_source_ids`
+    for the call seam (``enforce_passthrough_access``)."""
+    if not user_id or not source_id:
+        return False
+    return source_id in visible_mcp_source_ids(user_id, [source_id])
+
+
 def enforce_passthrough_access(tool: Dict[str, Any], caller: Any) -> None:
     """Full authorization gate for a single passthrough invocation.
 
@@ -177,16 +241,23 @@ def enforce_passthrough_access(tool: Dict[str, Any], caller: Any) -> None:
 
     1. **grant** — admin short-circuits; otherwise the caller must be in a group
        listed in ``tool_grants`` for this tool (``GrantDenied`` on miss);
-    2. **mutating** — a ``mutating`` tool needs an admin caller or a caller
+    2. **source** — the tool's MCP source must be visible to the caller under
+       ``ResourceType.MCP_SOURCE`` (TCRD-236): granted to one of the caller's
+       groups, or ungated (no ``mcp_source`` grant exists for it at all — the
+       backward-compat default; see :func:`visible_mcp_source_ids`)
+       (``SourceNotGranted``, a ``GrantDenied`` subclass — same "discovery
+       must not outrun authorization" reasoning as the connection-scope gate
+       below: hiding a source from the listing is not enough on its own);
+    3. **mutating** — a ``mutating`` tool needs an admin caller or a caller
        group whose grant carries ``allow_mutating=TRUE``
        (``MutatingNotAllowed``);
-    3. **connection scope** — an agent whose ``connections_mode='selected'``
+    4. **connection scope** — an agent whose ``connections_mode='selected'``
        may only reach tools on an MCP source it declared
        (``ConnectionNotInScope``). This is the *call* seam of the same filter
        the listing applies: hiding a tool from ``tools/list`` is discovery,
        not authorization, so an agent that names an unlisted tool directly is
        refused here;
-    4. **rate limit** — per-(tool, user) token bucket (``RateLimited``).
+    5. **rate limit** — per-(tool, user) token bucket (``RateLimited``).
 
     ``caller`` is a bare user id (transports), a user dict (REST), a restricted
     ``Principal``, or ``None`` when the transport could not resolve an identity
@@ -212,6 +283,10 @@ def enforce_passthrough_access(tool: Dict[str, Any], caller: Any) -> None:
         group_ids = list(_user_group_ids(authority.user_id)) if authority.user_id else []
         if not tool_registry_repo().is_granted_to_groups(tool_id, group_ids):
             raise GrantDenied(f"no grant on tool {tool_id!r} for your groups")
+        if not mcp_source_is_visible_to(authority.user_id, tool.get("source_id")):
+            raise SourceNotGranted(
+                f"no grant on source {tool.get('source_id')!r} for your groups",
+            )
     check_mutating(tool, is_admin=authority.is_admin, group_ids=group_ids)
     allowed_sources = connection_scope_ids(authority)
     if allowed_sources is not None and tool.get("source_id") not in allowed_sources:

@@ -566,6 +566,34 @@ body.chat-page-body main { margin: 0; padding: 0; }
 }
 @keyframes cloudchat-blink { 50% { opacity: 0; } }
 
+/* The tail of a turn, made legible (TCRD-213). Once the answer's prose ends,
+   the model is still emitting its `sources` / `next_actions` trailer — the
+   painter withholds a half-open fence, so tokens keep arriving while the text
+   on screen cannot change. A caret blinking under finished-looking prose is
+   indistinguishable from a stall, so for that window the caret is replaced by
+   a label that says the turn is still going. Same element, so nothing reflows
+   underneath the reader; the compound selector means it disappears the moment
+   `is-streaming` does. */
+.msg.is-streaming.is-trailing .msg-body::after {
+  content: "Finishing\2026";
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  vertical-align: middle;
+  animation: cloudchat-tail-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cloudchat-tail-pulse { 50% { opacity: 0.55; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.is-streaming.is-trailing .msg-body::after { animation: none; }
+}
+
 /* Actions row (timestamp + copy) — revealed on hover or copy-button
    focus. Stays muted so it doesn't compete with the body. */
 .msg-actions {
@@ -2043,16 +2071,18 @@ html[data-ui-layout="rail"] .cloud-chat-capabilities {
      fraction around. */
   overflow: visible;
 }
-/* Empty-state layout order: greeting → composer → suggestions → banner →
-   footer credit (very bottom). The primary entry point (greeting + composer)
-   leads the page; the Knowledge Layer banner sits below the suggested actions,
-   and the credit pins to the very bottom (its own auto top-margin). Fixed
-   orders work in both states: in an active conversation the greeting + extras +
-   banner + credit are hidden and messages (order 0) precede the composer
-   (order 2), pinning it to the bottom. */
+/* Empty-state layout order: greeting → suggestions → composer → ways out →
+   footer credit (very bottom). The suggestions lead the composer rather than
+   trailing it: they are the answer to "what can I even ask", which is a
+   question the reader has BEFORE the input, not after it. The ways out
+   (#chat-empty-extras) still close the page. Fixed orders work in both states:
+   in an active conversation the greeting + suggestions + extras + banner +
+   credit are hidden and messages (order 0) precede the composer (order 3),
+   pinning it to the bottom. */
 html[data-ui-layout="rail"] .cloud-chat-main > #chat-capabilities { order: 1; }
-html[data-ui-layout="rail"] .cloud-chat-main > #chat-form { order: 2; }
-html[data-ui-layout="rail"] .cloud-chat-main > #chat-empty-extras { order: 3; }
+html[data-ui-layout="rail"] .cloud-chat-main > #chat-suggested { order: 2; }
+html[data-ui-layout="rail"] .cloud-chat-main > #chat-form { order: 3; }
+html[data-ui-layout="rail"] .cloud-chat-main > #chat-empty-extras { order: 4; }
 html[data-ui-layout="rail"] .cloud-chat-main > #chat-empty-banner { order: 0; }
 html[data-ui-layout="rail"] .cloud-chat-main > .cloud-chat-empty-foot { order: 5; }
 /* The dashboard is ONE centered content column (~1280px): greeting, composer,
@@ -2137,15 +2167,31 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   --cld-gap-block: 26px;   /* end of a block, same region */
   --cld-gap-section: 40px; /* between the page's three sections */
 }
-html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-form {
-  /* The page's one SECTION break, and it lands here now. Everything above is
-     orientation — what this is, what it answers from, the two doors, the promise
-     — and everything below is the act of asking. The composer is what the reader
-     crosses that boundary to reach, so the boundary belongs immediately before
-     it. (It was `block` while the cards sat at the foot and this gap only
-     separated the lede from the input.) */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-suggested {
+  /* The page's one SECTION break. Everything above is orientation — what this
+     is, what it answers from, the two doors, the promise — and everything below
+     is the act of asking. The break used to sit on #chat-form because the
+     composer opened that region; the suggestions open it now, so the boundary
+     moved up with them and the chips + input read as one block. */
   margin-top: var(--cld-gap-section, 40px);
 }
+/* The section break above already opens the ask region, so the .rdb block gap
+   would double it — the chips carry the region's own top edge, not a second
+   one. (The .rdb in #chat-empty-extras keeps its gap: the ways out DO need
+   separating from the composer above them.) */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) #chat-suggested .rdb {
+  margin-top: 0;
+}
+/* …and the gap it gives up reappears here, INSIDE the ask region, between the
+   chips and the input they feed. Block gap, not section: these two are one
+   thing now — "here is what you could ask" immediately above "ask it". */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-form {
+  margin-top: var(--cld-gap-block, 26px);
+}
+/* Both drop the 24px inset in the empty state so their .rdb lands on the SAME
+   --rdb-col-narrow grid as the composer — an inset here would sit the chips a
+   hair inside the input they belong to. */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-suggested,
 html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-empty-extras {
   padding: 0;
 }
@@ -2159,8 +2205,10 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 /* Banner + extras + credit hide with the greeting panel once a conversation
    starts (all placed after #chat-capabilities in the DOM). */
 html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ #chat-empty-banner,
+html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ #chat-suggested,
 html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ #chat-empty-extras,
 html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ .cloud-chat-empty-foot { display: none; }
+html[data-ui-layout="rail"] .cloud-chat-suggested,
 html[data-ui-layout="rail"] .cloud-chat-empty-extras {
   flex: 0 0 auto;
   display: flex;
@@ -2179,15 +2227,6 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   flex: 0 0 auto;
   margin: 12px 0 0;
 }
-/* The trust caption ("Secure. Private. Always in sync.") sits centered just
-   below the hero banner, leading the "Ask Agnes anything" heading. */
-html[data-ui-layout="rail"] #chat-capabilities .klb-hub-label--lead {
-  margin: 0;
-}
-html[data-ui-layout="rail"] #chat-capabilities .klb-hub-label--lead .klb-hub-caption {
-  justify-content: center;
-}
-
 /* Footer credit — pinned to the very bottom (margin-top:auto). No divider. */
 html[data-ui-layout="rail"] .cloud-chat-empty-foot {
   flex: 0 0 auto;
@@ -4289,4 +4328,71 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   padding: 8px var(--space-3);
   font-size: var(--text-xs);
   color: var(--ds-text-secondary);
+}
+
+/* ── Instant tooltips for icon-only controls (TCRD-212) ──────────────────────
+   Driven by `data-tip` and the `Tip` helper in chat.js. Lives on document.body
+   at `position: fixed` because `.cloud-chat-files-list` scrolls, and anything
+   drawn inside a row would be clipped by that scroll container.
+
+   Colour is an INVERSION of the page's own text/surface pair rather than a
+   picked value: `--ds-text-primary` is by definition legible against
+   `--ds-surface`, so using one as the other's background is contrast-correct
+   in the paper, blue, navy and dark themes alike, and cannot repeat the
+   white-on-white failure of DES-134. Compact and arrow-less so it reads as a
+   tooltip rather than a popover — the second half of that finding. */
+.ds-tip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 260px;
+  padding: 0.3rem 0.5rem;
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-text-primary);
+  color: var(--ds-surface);
+  font-family: var(--ds-font);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  text-align: center;
+  box-shadow: var(--ds-shadow-md);
+  pointer-events: none;
+  animation: ds-tip-in 90ms var(--ds-ease-enter);
+}
+
+.ds-tip[hidden] {
+  display: none;
+}
+
+@keyframes ds-tip-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.ds-tip.is-below {
+  animation-name: ds-tip-in-below;
+}
+
+@keyframes ds-tip-in-below {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-tip { animation: none; }
+}
+
+/* A saved file says so in the row itself, permanently — a toast expires and a
+   swapped icon only explains itself on hover (TCRD-212). */
+.cloud-chat-files-saved {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  margin-top: 0.2rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--ds-accent-success-line);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-accent-success-bg);
+  color: var(--ds-accent-success-ink);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  line-height: 1.5;
 }

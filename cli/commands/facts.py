@@ -77,24 +77,32 @@ def _format_attrs(attrs: Optional[dict]) -> str:
 @facts_app.command("search")
 def search_facts(
     fact_type: str = typer.Argument(..., metavar="TYPE", help="Subject type to search (e.g. 'person', 'engagement')"),
+    q: Optional[str] = typer.Argument(
+        None, metavar="[QUERY]", help="Optional free-text name lookup (e.g. a person or organization name)"
+    ),
     filter: List[str] = typer.Option([], "--filter", help="Attribute filter key=value (repeatable)"),
     limit: int = typer.Option(20, "--limit", min=1, max=100, help="Max results (server caps at 100)"),
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ) -> None:
-    """Search typed subjects (facts) by type and attribute filters.
+    """Search typed subjects (facts) by type, an optional name, and attribute filters.
 
-    Attributes are projected from YOUR readable evidence only, per key,
-    latest-`document_date`-wins — a genuine tie between two documents shows
-    as `⚠ conflicted (n values)` rather than silently picking one. Use
-    `agnes facts claims <id>` on a result to see the underlying quotes, or
-    `agnes facts neighbors <id>` to traverse its edges.
+    QUERY matches subject ALIASES only (never claim text) — an exact or
+    prefix match on the name ranks first. Attributes are projected from YOUR
+    readable evidence only, per key, latest-`document_date`-wins — a genuine
+    tie between two documents shows as `⚠ conflicted (n values)` rather than
+    silently picking one. Use `agnes facts claims <id>` on a result to see
+    the underlying quotes, or `agnes facts neighbors <id>` to traverse its
+    edges.
     """
     filters: dict = {}
     for raw in filter:
         k, v = _parse_filter(raw)
         filters[k] = v
 
-    resp = api_post("/api/facts/search", json={"type": fact_type, "filters": filters, "limit": limit})
+    body: dict = {"type": fact_type, "filters": filters, "limit": limit}
+    if q:
+        body["q"] = q
+    resp = api_post("/api/facts/search", json=body)
     if resp.status_code != 200:
         typer.echo(render_error(resp.status_code, resp.json()), err=True)
         raise typer.Exit(1)
@@ -107,8 +115,10 @@ def search_facts(
 
     subjects = data.get("subjects", [])
     if not subjects:
-        typer.echo(f"No facts found for type '{fact_type}'.")
-        typer.echo("Try a different --filter, or drop filters entirely to see everything of this type you can read.")
+        typer.echo(f"No facts found for type '{fact_type}'{f' matching {q!r}' if q else ''}.")
+        typer.echo(
+            "Try a different QUERY or --filter, or drop them entirely to see everything of this type you can read."
+        )
         return
 
     typer.echo(f"{'ID':20s}  {'TYPE':14s}  {'CLAIMS':6s}  {'QUOTES':6s}  ATTRS")
@@ -124,6 +134,91 @@ def search_facts(
             "never a signal that grants hid additional matches)",
             err=True,
         )
+
+
+@facts_app.command("type-map")
+def facts_type_map(
+    json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+) -> None:
+    """Show every node type in the graph with a live count of what YOU can see.
+
+    Each row is a way in: pass its TYPE to `agnes facts search` to list the
+    subjects behind the number. Counts are gated exactly as `search` is, so
+    a type's number is what you could reach and never a total that includes
+    evidence you cannot read. A type you have no visible subjects for is
+    omitted entirely rather than shown as 0.
+    """
+    resp = api_get("/api/facts/type-map")
+    if resp.status_code != 200:
+        typer.echo(render_error(resp.status_code, resp.json()), err=True)
+        raise typer.Exit(1)
+
+    _echo_server_label()
+    data = resp.json()
+    if json:
+        typer.echo(json_lib.dumps(data, indent=2, default=str))
+        return
+
+    types = data.get("types", [])
+    if not types:
+        typer.echo("No node types are visible to you.")
+        typer.echo(
+            "Either nothing has been extracted into the graph yet, or none of its evidence "
+            "is in a collection you can read — ask an admin about collection grants."
+        )
+        return
+
+    width = max(len(t["type"]) for t in types)
+    typer.echo(f"{'TYPE':{width}s}  COUNT")
+    for t in types:
+        typer.echo(f"{t['type']:{width}s}  {t['count']}")
+    typer.echo(f"\n{data.get('total', 0)} subjects across {len(types)} types.")
+    typer.echo("Run `agnes facts search <TYPE>` to list the subjects behind a row.", err=True)
+
+
+@facts_app.command("facets")
+def facts_facets(
+    types: Optional[str] = typer.Option(
+        None, "--types", help="Comma-separated fact types (default: client, industry, service_offering, doc_type)"
+    ),
+    limit: int = typer.Option(50, "--limit", min=1, max=200, help="Max values per type"),
+    json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+) -> None:
+    """List the entity values you can filter documents by, with a document count each.
+
+    The vocabulary comes from the extraction pass rather than hand-entered
+    tags. Counts cover only documents in collections you can read, so a facet
+    never reports files you could not open.
+    """
+    path = "/api/facts/facets?limit_per_type=" + str(limit)
+    if types:
+        path += "&types=" + types
+    resp = api_get(path)
+    if resp.status_code != 200:
+        typer.echo(render_error(resp.status_code, resp.json()), err=True)
+        raise typer.Exit(1)
+
+    _echo_server_label()
+    data = resp.json()
+    if json:
+        typer.echo(json_lib.dumps(data, indent=2, default=str))
+        return
+
+    facets = data.get("facets", {})
+    if not any(facets.values()):
+        typer.echo("No entity values are visible to you.")
+        typer.echo(
+            "Either nothing has been extracted into the graph yet, or none of its evidence "
+            "is in a collection you can read."
+        )
+        return
+
+    for ftype, values in facets.items():
+        if not values:
+            continue
+        typer.echo(f"\n{ftype}")
+        for v in values:
+            typer.echo(f"  {v['document_count']:>5}  {v['label']}")
 
 
 @facts_app.command("neighbors")

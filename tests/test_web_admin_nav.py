@@ -313,7 +313,11 @@ class TestAdminNavHalfLabels:
 class TestAdminNavActiveState:
     def test_active_href_resolves_own_section_item(self) -> None:
         assert resolve_active_href("/admin/users") == "/admin/users"
-        assert resolve_active_href("/admin/access") == "/admin/access"
+        # Access has no child entries at all now — no tabs, no items — so
+        # there is no entry href to return. The sidebar row lights off
+        # `resolve_active_section_key`, which is what a destination without
+        # children has always relied on.
+        assert resolve_active_href("/admin/access") is None
         assert resolve_active_href("/admin/tokens") == "/admin/tokens"
 
     def test_active_href_follows_detail_pages_to_the_parent_entry(self) -> None:
@@ -347,28 +351,28 @@ class TestAdminNavActiveState:
         # via the section's own `match` rather than a child's.
         assert resolve_active_section_key("/admin/grants") == "access"
         assert resolve_active_href("/admin/grants") is None
-        # Access has tabs now, so its own page IS a child entry.
-        assert resolve_active_href("/admin/access") == "/admin/access"
+        # Access has no children now, so nothing resolves as an entry href —
+        # the section itself owns `/admin/access` as a match prefix.
+        assert resolve_active_href("/admin/access") is None
+        assert resolve_active_section_key("/admin/access") == "access"
 
-    def test_the_simulate_lens_is_a_tab_resolved_off_the_query(self) -> None:
-        """Simulate shares `/admin/access` with the Groups workspace — one
-        path, two lenses — so no path prefix can separate them and
-        `resolve_section_tabs` reads the query. The two must never be lit at
-        once, and the bare path must light the workspace, or a deep link and
-        a plain visit would look identical."""
-        bare = {t["label"]: t["active"] for t in resolve_section_tabs("/admin/access")}
-        assert bare == {"Groups": True, "Simulate a person": False}
+    def test_the_section_renders_no_tab_strip(self) -> None:
+        """Replaces `test_the_simulate_lens_is_a_tab_resolved_off_the_query`.
 
-        sim = {t["label"]: t["active"] for t in resolve_section_tabs("/admin/access", "lens=simulate")}
-        assert sim == {"Groups": False, "Simulate a person": True}
+        Access had two tabs and both stopped being true. "Groups" named one
+        of the ways the page groups its list — the other is by bundle — so
+        the label promised a destination where there was a grouping. And
+        Simulate is the third way of reading the same grants, by person,
+        which makes it a position in the page's own switch rather than a
+        second page.
 
-        # An unrelated query is not the lens, and must not disturb the default.
-        other = {t["label"]: t["active"] for t in resolve_section_tabs("/admin/access", "group=abc")}
-        assert other == bare
-
-        # `?resource=` is the /admin/tables deep link, and is not a lens either.
-        pick = {t["label"]: t["active"] for t in resolve_section_tabs("/admin/access", "resource=table:t1")}
-        assert pick == bare
+        `?lens=simulate` still resolves into the section (every existing link
+        and each group row's "See it as a person" keeps working); it just no
+        longer lights a tab, because there is no strip to light.
+        """
+        assert resolve_section_tabs("/admin/access") == []
+        assert resolve_section_tabs("/admin/access", "lens=simulate") == []
+        assert resolve_active_section_key("/admin/access") == "access"
 
     def test_only_one_item_renders_is_active_for_each_page(self, seeded_app) -> None:
         c = seeded_app["client"]
@@ -401,9 +405,17 @@ class TestAdminNavActiveState:
             assert actives == [expected], (path, actives)
 
         # A legacy disclosure GROUP still lights its own item row.
+        #
+        # Matched on the class TOKEN, not the whole attribute: a row carrying a
+        # one-line gloss renders `admin-nav__link admin-nav__link--glossed
+        # is-active`, so an exact-string compare would read "not active" for
+        # every glossed row and fail on the styling rather than the behavior.
         resp = c.get("/admin/mcp-sources", headers=_auth(token))
         nav = resp.text.split('<aside class="admin-nav"', 1)[1].split("</aside>", 1)[0]
-        assert 'class="admin-nav__link is-active"' in nav
+        active_rows = [
+            cls for cls in re.findall(r'<a class="(admin-nav__link[^"]*)"', nav) if "is-active" in cls.split()
+        ]
+        assert len(active_rows) == 1, active_rows
         assert ">MCP sources<" in nav
 
 
@@ -415,7 +427,10 @@ class TestAdminNavActiveSection:
         assert resolve_active_section_key("/admin/users") == "people"
         assert resolve_active_section_key("/admin/access") == "access"
         assert resolve_active_section_key("/admin/tables") == "data"
-        assert resolve_active_section_key("/admin/mcp-sources") == "instance"
+        # Content (key "library"), not Instance: an MCP source is a source of
+        # things analysts reach, like a marketplace — not instance plumbing.
+        assert resolve_active_section_key("/admin/mcp-sources") == "library"
+        assert resolve_active_section_key("/admin/linked-apps") == "library"
         assert resolve_active_section_key("/admin/store/lint") == "library"
         assert resolve_active_section_key("/admin/news") == "library"
         assert resolve_active_section_key("/admin/server-config") == "instance"
@@ -455,7 +470,15 @@ class TestAdminNavActiveSection:
             assert by_key[key] == "false", key
 
         # A page inside a group does expand that one, and only it.
-        resp2 = c.get("/admin/mcp-sources", headers={"Authorization": f"Bearer {token}"})
+        #
+        # The expected key is RESOLVED from the inventory rather than written
+        # here: this test is about the expand-one-group rule, not about which
+        # section owns /admin/mcp-sources, and hard-coding the pair meant a
+        # row moving between sections failed this test for the wrong reason.
+        probe_path = "/admin/mcp-sources"
+        probe_key = resolve_active_section_key(probe_path)
+        assert probe_key is not None, probe_path
+        resp2 = c.get(probe_path, headers={"Authorization": f"Bearer {token}"})
         groups2 = dict(
             re.findall(
                 r'data-admin-nav-group="([\w-]+)">\s*'
@@ -464,9 +487,9 @@ class TestAdminNavActiveSection:
                 resp2.text,
             )
         )
-        assert groups2["instance"] == "true"
+        assert groups2[probe_key] == "true"
         for key in [s["key"] for s in group_sections] + ["docs"]:
-            if key != "instance":
+            if key != probe_key:
                 assert groups2[key] == "false", key
 
         # The active section's body has no `hidden`; the rest do.

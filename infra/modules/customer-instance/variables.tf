@@ -177,6 +177,29 @@ variable "prod_instance" {
     # without the URL simply never registers the tool server. Inert unless
     # kai_agent_enabled is also true on this VM.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Opt-in extraction lane on this VM: a Redis coordination backend + the
+    # `extraction-worker` compose service (AGNES_ROLE=worker), which makes the
+    # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
+    # default so a module bump alone never moves the existing fleet. Turning
+    # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL into the
+    # VM's app .env (env overrides instance.yaml — app/coordination/factory.py
+    # — so the applier-owned /data/state/instance.yaml is never touched) and
+    # engages a module-owned docker-compose.extraction.yml overlay carrying
+    # the `redis` service and the worker re-pin. The multi-process startup
+    # guard (app/startup_guards.py) then requires the instance to already run
+    # the Postgres app-state backend and boots refuse loudly on a DuckDB
+    # instance — deliberate: migrate the backend first, then flip this.
+    # Requires the module-level extraction_worker_image (validated below).
+    extraction_worker_enabled = optional(bool, false)
+    # Worker container resource ceilings, written to /opt/agnes/.env like
+    # kai_agent_mem_limit above (TF fields, not .env hand-edits — the startup
+    # script rewrites .env from scratch on every boot). Defaults mirror the
+    # base compose's own AGNES_EXTRACTION_WORKER_MEM_LIMIT/_CPUS fallbacks
+    # (docker-compose.yml) — the worker runs the extraction producer as a
+    # subprocess (document conversion + LLM calls), hence beefier than the
+    # kai engine's.
+    extraction_worker_mem_limit = optional(string, "4g")
+    extraction_worker_cpus      = optional(string, "2.0")
     # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
     # (app >= 0.85: env > instance.yaml > default; "kai-agent" since 0.88).
     # Codifies which engine runs
@@ -387,6 +410,12 @@ variable "dev_instances" {
     # Engine → instance MCP tool surface — see prod_instance for the
     # rationale; same default, inert without kai_agent_enabled.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Opt-in extraction lane (Redis coordination + extraction-worker) — see
+    # prod_instance for the full contract; same defaults, OFF by default so
+    # a module bump alone never moves existing VMs.
+    extraction_worker_enabled   = optional(bool, false)
+    extraction_worker_mem_limit = optional(string, "4g")
+    extraction_worker_cpus      = optional(string, "2.0")
     # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
     # rationale; same default (empty = no env line), same validations below.
     chat_provider = optional(string, "")
@@ -845,6 +874,33 @@ variable "kai_agent_env" {
     ])
     error_message = "kai_agent_env keys and values must be single-line (and keys must not contain '='): the map becomes KEY=VALUE lines in the engine's env_file, where an embedded newline corrupts the file and the engine silently never starts."
   }
+}
+
+variable "extraction_worker_image" {
+  description = <<-EOT
+    Full image ref (with tag) of the extraction-worker image — the app image's
+    `worker` Dockerfile target built WITH the operator's extraction producer
+    baked in via the EXTRACTION_PRODUCER_INSTALL build-arg (this public repo
+    does not vendor a producer; the operator's own infra builds and publishes
+    the variant, mirroring the `-rich` tag pattern). Pin an immutable tag —
+    the agnes-auto-upgrade tick re-pulls it every cycle.
+
+    Why a separate variable instead of the app image: docker-compose.prod.yml
+    deliberately pins the `extraction-worker` compose service to the plain app
+    image (source-less prod VMs cannot `build:`), which bypasses the build-arg
+    entirely — a worker started from it has the lane wired up but no producer
+    on PATH, so every `corpus-extraction` job fails clean. The module overlay
+    re-pins the service to THIS image, which is the only place the producer
+    can come from on a VM.
+
+    Registry access: same rule as kai_agent_image — `gcloud auth
+    configure-docker` is run for a *-docker.pkg.dev host, any other private
+    registry needs pre-authenticated pull access on the VM.
+
+    Required when any instance sets `extraction_worker_enabled = true`.
+  EOT
+  type        = string
+  default     = ""
 }
 
 variable "alert_webhook_url" {

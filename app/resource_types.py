@@ -54,6 +54,62 @@ class ResourceType(StrEnum):
     AGENT = "agent"
     CORPUS_FILE = "corpus_file"
     STORE_ENTITY = "store_entity"
+    MCP_SOURCE = "mcp_source"
+
+
+class ResourceFamily(StrEnum):
+    """The three groups `/admin/access` renders, in render order.
+
+    Two are the Library's own tabs, so the admin taxonomy and the taxonomy
+    the person on the other end reads are the same one. The third exists
+    because two types are neither: a chat and a Slack channel are where a
+    group *meets* Agnes, not something it holds.
+
+    Unlike :class:`ResourceType`, these values are not persisted — they are
+    a projection, so renaming one is a UI change, not a data migration.
+    """
+
+    KNOWLEDGE = "knowledge"
+    CAPABILITY = "capability"
+    SURFACE = "surface"
+
+
+@dataclass(frozen=True)
+class ResourceFamilySpec:
+    """Section header copy for one family.
+
+    Attributes:
+        key: The enum member.
+        display_name: Section heading on /admin/access.
+        blurb: The one line under it, saying what belongs in the family —
+            load-bearing for ``CAPABILITY``, whose whole definition is the
+            test "does it change what the agent can do".
+    """
+
+    key: ResourceFamily
+    display_name: str
+    blurb: str
+
+
+#: Declaration order is render order. Knowledge first: it is what an admin
+#: grants most of, and what a person opens the page to check.
+RESOURCE_FAMILIES: dict[ResourceFamily, ResourceFamilySpec] = {
+    ResourceFamily.KNOWLEDGE: ResourceFamilySpec(
+        key=ResourceFamily.KNOWLEDGE,
+        display_name="Knowledge",
+        blurb="Read, query or open — and what their agents may cite.",
+    ),
+    ResourceFamily.CAPABILITY: ResourceFamilySpec(
+        key=ResourceFamily.CAPABILITY,
+        display_name="Capabilities",
+        blurb="The only things that change what their agents can do.",
+    ),
+    ResourceFamily.SURFACE: ResourceFamilySpec(
+        key=ResourceFamily.SURFACE,
+        display_name="Surfaces",
+        blurb="Where the group meets Agnes — not things it holds.",
+    ),
+}
 
 
 # Shape returned by ``list_blocks`` delegates. Kept as plain ``dict`` to keep
@@ -83,6 +139,9 @@ class ResourceTypeSpec:
 
     Attributes:
         key: The enum member; ``key.value`` is what gets persisted.
+        family: Which of the three /admin/access sections this type renders
+            under. Required, so a new type cannot be added without someone
+            deciding whether it is knowledge, a capability, or a surface.
         display_name: Plural label rendered as a section header on the
             admin /access page.
         description: One-liner shown in the create-grant form's helper text.
@@ -98,6 +157,7 @@ class ResourceTypeSpec:
     """
 
     key: ResourceType
+    family: ResourceFamily
     display_name: str
     description: str
     id_format: str
@@ -228,9 +288,17 @@ def _data_package_blocks() -> List[Block]:
     """
     from src.repositories import data_packages_repo
 
-    rows = data_packages_repo().list(limit=_GRANT_PROJECTION_LIMIT)  # all live rows; see _GRANT_PROJECTION_LIMIT
+    repo = data_packages_repo()
+    rows = repo.list(limit=_GRANT_PROJECTION_LIMIT)  # all live rows; see _GRANT_PROJECTION_LIMIT
     if not rows:
         return []
+    # Which tables each package carries. `/admin/access` needs it to answer
+    # the question `/admin/tables` sends it — "who can see THIS table" — now
+    # that a table reaches a person by being in a package rather than by a
+    # grant of its own. One query per package, bounded by the same
+    # projection limit as the packages themselves; both backends implement
+    # `list_tables` and the pair is contract-tested.
+    contains = {r["id"]: [t["id"] for t in repo.list_tables(r["id"])] for r in rows}
     return [
         {
             "id": "data_packages",
@@ -244,6 +312,7 @@ def _data_package_blocks() -> List[Block]:
                     "icon": r.get("icon"),
                     "color": r.get("color"),
                     "slug": r.get("slug"),
+                    "contains": contains.get(r["id"], []),
                 }
                 for r in rows
             ],
@@ -732,6 +801,61 @@ def _knowledge_digest_blocks() -> List[Block]:
 
 
 # ---------------------------------------------------------------------------
+# MCP source projection (TCRD-236)
+# ---------------------------------------------------------------------------
+
+
+def _mcp_source_blocks() -> List[Block]:
+    """Project ``mcp_sources`` into the (block -> items) shape rendered by
+    the admin /access page.
+
+    MCP sources (admin-registered external MCP servers, ``app/api/
+    admin_mcp.py``) predate a grantable resource type of their own —
+    visibility was governed only by the per-TOOL ``tool_grants`` table
+    (Universal MCP, RFC #461 M5): every user who could see one tool of a
+    source could discover the source existed, and there was no way to hide
+    a whole server from a group in one action. This resource type adds
+    that coarser, source-wide knob.
+
+    The gate this powers (``app/api/mcp_policy.py::visible_mcp_source_ids``)
+    is ANDed with the existing per-tool grant, never replaces it — granting
+    a source here does not widen which TOOLS a group can see, it only
+    controls whether the group can see the source at all. A source with no
+    MCP_SOURCE grant of its own is treated as visible-to-everyone (the
+    backward-compat default every already-registered source is grandfathered
+    onto at boot — see ``src/mcp_source_grants.py``), so this ships as a
+    no-op until an admin deliberately narrows a specific source here.
+
+    One synthetic block ``"MCP servers"`` holds every registered source
+    (enabled and disabled — an admin narrowing access to a currently-off
+    source is still a legitimate action); ``resource_id`` is
+    ``mcp_sources.id``.
+    """
+    from src.repositories import mcp_sources_repo
+
+    rows = mcp_sources_repo().list_all()
+    if not rows:
+        return []
+    return [
+        {
+            "id": "mcp_sources",
+            "name": "MCP servers",
+            "items": [
+                {
+                    "resource_id": r["id"],
+                    "name": r["name"],
+                    "category": "mcp_source",
+                    "description": r.get("connect_hint"),
+                    "transport": r.get("transport"),
+                    "enabled": bool(r.get("enabled", True)),
+                }
+                for r in rows
+            ],
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Registry — the one place that gets edited when adding a new resource type
 # ---------------------------------------------------------------------------
 
@@ -739,6 +863,7 @@ def _knowledge_digest_blocks() -> List[Block]:
 RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ResourceType.MARKETPLACE_PLUGIN: ResourceTypeSpec(
         key=ResourceType.MARKETPLACE_PLUGIN,
+        family=ResourceFamily.CAPABILITY,
         display_name="Marketplace plugins",
         description="A plugin from a registered marketplace.",
         id_format="<marketplace_slug>/<plugin_name>",
@@ -746,6 +871,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.TABLE: ResourceTypeSpec(
         key=ResourceType.TABLE,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Tables",
         description=(
             "Does NOT grant analyst visibility — the unified-stack design routes "
@@ -761,6 +887,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.DATA_PACKAGE: ResourceTypeSpec(
         key=ResourceType.DATA_PACKAGE,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Data packages",
         description="An admin-curated bundle of data tables.",
         id_format="<package_id>",
@@ -768,6 +895,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.SEMANTIC_MODEL: ResourceTypeSpec(
         key=ResourceType.SEMANTIC_MODEL,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Semantic models",
         description="A semantic model — datasets, fields, relationships and metrics.",
         id_format="<model_id>",
@@ -775,6 +903,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.MEMORY_DOMAIN: ResourceTypeSpec(
         key=ResourceType.MEMORY_DOMAIN,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Memory domains",
         description=(
             "A corporate-memory domain. A grant is ADDITIVE — it makes the "
@@ -790,6 +919,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.MEMORY_ITEM: ResourceTypeSpec(
         key=ResourceType.MEMORY_ITEM,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Memory items",
         description=(
             "Per-group override of an individual knowledge item's Required "
@@ -800,6 +930,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.RECIPE: ResourceTypeSpec(
         key=ResourceType.RECIPE,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Recipes",
         description=(
             "An admin-curated SQL recipe analysts copy + adapt. With no "
@@ -810,6 +941,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.CHAT: ResourceTypeSpec(
         key=ResourceType.CHAT,
+        family=ResourceFamily.SURFACE,
         display_name="Cloud chat",
         description=(
             "The cloud-hosted Claude chat feature. With no grant it is "
@@ -821,6 +953,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.SLACK_CHANNEL: ResourceTypeSpec(
         key=ResourceType.SLACK_CHANNEL,
+        family=ResourceFamily.SURFACE,
         display_name="Slack channels",
         description=(
             "A Slack channel where @agnes mentions are answered. Grant "
@@ -832,6 +965,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.COLLECTION: ResourceTypeSpec(
         key=ResourceType.COLLECTION,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Collections",
         description=(
             "A user-uploaded file collection. Grant a group access to a "
@@ -842,6 +976,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.KNOWLEDGE_DIGEST: ResourceTypeSpec(
         key=ResourceType.KNOWLEDGE_DIGEST,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Maintained digests",
         description=(
             "An admin-defined digest document regenerated from its source "
@@ -853,6 +988,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.DATA_APP: ResourceTypeSpec(
         key=ResourceType.DATA_APP,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Data apps",
         description="A hosted user web application served behind instance auth.",
         id_format="<slug>",
@@ -860,6 +996,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.CORPUS_FILE: ResourceTypeSpec(
         key=ResourceType.CORPUS_FILE,
+        family=ResourceFamily.KNOWLEDGE,
         display_name="Files in collections",
         description=(
             "A single file inside a multi-file collection. Grant a group access "
@@ -871,6 +1008,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.AGENT: ResourceTypeSpec(
         key=ResourceType.AGENT,
+        family=ResourceFamily.CAPABILITY,
         display_name="Agents",
         description=(
             "An assistant composed in the Agent builder. Grant a group access "
@@ -882,6 +1020,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ),
     ResourceType.STORE_ENTITY: ResourceTypeSpec(
         key=ResourceType.STORE_ENTITY,
+        family=ResourceFamily.CAPABILITY,
         display_name="Skills, agents & plugins",
         description=(
             "An item authored in this instance and published to the Library. "
@@ -891,6 +1030,21 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         ),
         id_format="<store_entity_id>",
         list_blocks=_store_entity_blocks,
+    ),
+    ResourceType.MCP_SOURCE: ResourceTypeSpec(
+        key=ResourceType.MCP_SOURCE,
+        family=ResourceFamily.CAPABILITY,
+        display_name="MCP servers",
+        description=(
+            "An admin-registered MCP server. Controls whether a group can see "
+            "the server AT ALL — ANDed with the existing per-tool tool_grants "
+            "(Universal MCP), never widening it. Every already-registered "
+            "server is grandfathered onto Everyone at boot, and a newly "
+            "registered one at creation time, so this ships as a no-op until "
+            "an admin narrows a specific server here."
+        ),
+        id_format="<mcp_source_id>",
+        list_blocks=_mcp_source_blocks,
     ),
 }
 

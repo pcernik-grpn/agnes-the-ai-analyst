@@ -141,7 +141,15 @@ materialized into its sandbox pre-spawn; owners inspect/approve/archive/
 delete via `/api/v1/agents/{id}/memories`, `agnes agent memory …`, or the
 `/agents` builder panel. `agnes chat <slug>` is a streaming terminal client
 over the multi-turn session API (AG-UI SSE) — a pure `/api/v1` caller, no
-privileged backchannel. Design:
+privileged backchannel. A live, user-driven agent turn can also mid-turn
+**@delegate** one sub-request to another agent the caller may run (depth-1,
+one delegation per turn) — a `delegate_to_agent` in-sandbox tool reaches
+`POST /api/v1/agents/{slug}/delegate`, which spawns the delegate as a fresh
+child session under the ORIGINAL CALLER's identity
+(`ChatManager.handle_delegation`), never A's or B's owner, so the delegate's
+row-level access policies bind to the caller, never a wider identity —
+the exact `AgentPrincipal` mechanism above, reused rather than reinvented.
+Design:
 [`docs/superpowers/specs/2026-07-21-agent-profiles-and-agent-api-design.md`](docs/superpowers/specs/2026-07-21-agent-profiles-and-agent-api-design.md).
 
 ## Configuration
@@ -521,7 +529,14 @@ allowlist (`is_attach_host_allowed`); derive client IP from trusted proxy hops
 (`app.auth.client_ip.trusted_client_ip`), never leftmost XFF; require a CSRF
 token on state-changing web POSTs and never mutate on GET; scope infra exposure
 per-instance, never fleet-wide. `agnes-reviewer-rules` runs the reviewer
-quick-scan from that playbook on every PR.
+quick-scan from that playbook on every PR. Every audit action string must be
+registered in `src/audit_events.py`'s `CATALOG` (or covered by
+`DYNAMIC_ACTION_PREFIXES`), and new audit writes go through `log_safe`. Every
+mutating, read (`GET`), and WebSocket route must declare its audit posture in
+`src/audit_posture.py` — a cataloged action or an exempt reason from the
+closed vocabulary, never left undeclared — enforced by
+`tests/test_audit_catalog.py`, `tests/test_audit_route_posture.py`, and
+`tests/test_audit_read_posture.py`.
 
 ### Vendor-agnostic public repo — no customer-specific content
 This repo is the public source-available distribution. **Nothing customer-specific belongs in code, config defaults, comments, docs, commit messages, or PR titles/bodies** — no specific deployments or brands, cloud project IDs, internal hostnames, runbook paths, internal SA emails, or cross-references to private repos. Frame motivations abstractly ("behind a TLS-terminating reverse proxy"); use placeholders in examples (`example.com`, `<your-host>`, `<install-dir>`). Customer-specific automation lives in the private infra repos that *consume* this repo. Before opening a PR, scan the diff and PR body for customer-specific tokens.

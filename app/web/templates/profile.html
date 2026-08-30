@@ -113,7 +113,7 @@
      /admin/users/{id}, so a group wears one colour across the product. The
      name stays on one line (a wrapped pill reads as two chips) and ellipsises
      instead; the full value is on the chip's `title` either way. */
-  .group-chip { font-size: 12.5px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 3px 11px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .group-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 3px 11px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .group-chip.is-admin       { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .group-chip.is-everyone    { background: var(--ds-surface-sunken); color: var(--ds-text-secondary); }
   .group-chip.is-google_sync { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
@@ -284,7 +284,7 @@
             {% set chip_class = "is-" ~ (m.origin or "custom") %}
           {% endif %}
           <li class="pf-row" role="listitem">
-            <span class="group-chip {{ chip_class }}" title="{{ m.name }}">{{ m.display_name or m.name }}</span>
+            <span class="group-chip {{ chip_class }}" title="{{ m.name }}">{{ ds.group_mark('inline') }}{{ m.display_name or m.name }}</span>
             <span class="pf-row-body">
               {# Plain English, not the raw `source` slug the row used to
                  print in monospace. #}
@@ -472,16 +472,16 @@
         pages refuse, and entity access checks fall back to your explicit group
         grants, until you re-enable it. Surfaces that read Admin membership
         directly (the table catalog among them) still show everything: this is a
-        consent gate against accidental god-mode use, not a containment
-        boundary.</p>
+        confirmation against accidental use of full admin access, not a
+        containment boundary.</p>
         <button type="button" class="cc-btn" id="elevation-toggle" data-paused="false">
           Re-enable admin mode
         </button>
         {% else %}
         <p>Admin elevation is <strong>active</strong>: every access check
         short-circuits to allow. Pause it to make entity checks fall back to your
-        explicit grants and admin pages refuse (a consent gate against accidental
-        god-mode use — you can re-enable it here at any time).</p>
+        explicit grants and admin pages refuse (a confirmation against accidental
+        use of full admin access — you can re-enable it here at any time).</p>
         <button type="button" class="cc-btn" id="elevation-toggle" data-paused="true">
           Pause admin mode for this browser
         </button>

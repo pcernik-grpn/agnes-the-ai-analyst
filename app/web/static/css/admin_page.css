@@ -515,3 +515,19 @@
     background: var(--ds-surface-sunken);
     color: var(--ds-text-secondary);
 }
+
+/* ── The admin surface is a white sheet, like every index page ────────────
+   `base_index.html` pages (Library, Agents, Chats) paint their whole shell
+   `--ds-surface` — see `.idx` in style-custom.css, whose own comment gives
+   the reason: the header zone should read as part of the page surface, not
+   as a grey band above it. Admin pages extend a different base and so sat
+   on the app background, which is why an admin page and the Library read as
+   two products even when their components matched.
+
+   Scoped by the sheet, not by a selector: `admin_page.css` is loaded by the
+   two admin bases and nothing else, so `.container--full` here can only ever
+   mean an admin page's shell. One rule moves all forty of them. */
+.container--full {
+    background: var(--ds-surface);
+    min-height: 100vh;
+}

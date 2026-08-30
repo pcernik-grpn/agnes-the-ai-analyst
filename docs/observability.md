@@ -3,11 +3,23 @@
 ## Audit & activity trails (retention status)
 
 Agnes keeps seven distinct records of "who did what": `audit_log` (admin/API
-actions), chat transcripts (`chat_messages`, no admin viewer — privacy
-decision), CLI session JSONLs (viewer: `/admin/sessions`), usage rollups
+actions), chat transcripts (`chat_messages` — flag-controlled, see below),
+CLI session JSONLs (viewer: `/admin/sessions`), usage rollups
 (`usage_events`, viewer: `/admin/telemetry`), `sync_history`, `llm_usage`
 (per-call agent token accounting), and agent-runtime forensics
 (`agent_scope_snapshots`).
+
+Chat transcripts used to have no admin viewer at all (a deliberate privacy
+decision). Since the audit-full-coverage plan's F4 bridge, a chat session is
+materialized into the SAME jsonl shape and `SESSION_DATA_DIR` layout a
+CLI/analyst session already uses (`app/chat/session_export.py`), on session
+end (archive/delete/idle-reaper kill) and via a bounded pipeline sweep for
+still-active sessions — so it becomes visible at `/admin/sessions` and feeds
+the usage rollups exactly like a CLI session. Controlled by
+`sessions.include_chat` (`config/instance.yaml.example`, env override
+`AGNES_SESSIONS_INCLUDE_CHAT`) — **on by default**; set it `false` to
+restore the old no-materialized-copy behavior (`chat_messages` stays the
+only copy, no admin transcript viewer).
 
 `/admin/activity` (`GET /api/admin/activity`, `agnes admin activity`, and the
 `activity` MCP tool) is a **unified, read-side projection** over the first
@@ -25,8 +37,10 @@ on both backends (`AuditRepository.query_unified` /
 `AuditRepository.kpis`/`facets`) read the SAME union and accept the SAME
 `trail=` filter as the timeline — the cards, dropdowns and table can never
 tell different stories for one filter state. **`chat_messages` is never
-part of this union** — customer data in transcripts, no admin viewer by
-design; it is not one of the four SELECTs the projection UNIONs.
+part of this union** — it is not one of the four SELECTs the projection
+UNIONs, and that is unaffected by the F4 export above: an exported chat
+transcript is browsable transcript-by-transcript at `/admin/sessions` (the
+same surface CLI sessions use), never folded into this KPI/facet timeline.
 
 Retention, per trail:
 
@@ -39,6 +53,7 @@ Retention, per trail:
 | `usage_events` | `retention.usage_events_days` (or `USAGE_EVENTS_RETENTION_DAYS` env, which wins when set) | 0 = forever | own job, `POST /api/admin/usage/prune` (`agnes admin usage prune`) |
 | `chat_messages` | — | no policy | — (privacy decision, deliberately out of scope) |
 | CLI session JSONLs | — | no policy | — (filesystem, out of scope for DB retention) |
+| Exported chat-session JSONLs | `sessions.include_chat` (default: on) | no policy, same as CLI session JSONLs above | — (filesystem, out of scope for DB retention; viewer: `/admin/sessions`) |
 
 `sync_state` (current per-table sync status) and the live `agents` table are
 never touched by any prune above — only the trail tables themselves
@@ -47,6 +62,80 @@ window defaults to `0` = keep forever, so a freshly-installed instance prunes
 nothing until an admin opts in. See `src/audit_retention.py` for the
 dispatcher and `config/instance.yaml.example` for the full `retention:`
 block.
+
+## Audit log volume — how much does audit logging cost you
+
+The audit-coverage work (wave 1 + wave 2 of the audit-full-coverage plan)
+moved `audit_log` from "whatever handlers happened to write" to "every
+mutating route writes its declared action, and every sensitive read does
+too" — a route with no explicit `log_safe()` call gets a row from
+`AuditFallbackMiddleware` instead of writing nothing. That is a real
+increase in write volume on a busy instance, so two things exist to make it
+measurable and controllable rather than assumed:
+
+- **`scripts/audit_volume_estimate.py`** — reads the last N days of
+  `audit_log` (default 7) and reports rows/day overall, the top actions by
+  volume, a projection of row count (and an approximate size, from sampled
+  row byte sizes) at the configured `audit.retention_days`, and flags any
+  single action responsible for more than 25% of rows. Run it against any
+  instance's own `DATA_DIR` (or `DATABASE_URL` for a Postgres-backed one):
+
+  ```bash
+  DATA_DIR=/path/to/data .venv/bin/python -m scripts.audit_volume_estimate
+  DATA_DIR=/path/to/data .venv/bin/python -m scripts.audit_volume_estimate --days 30 --limit 10 --json
+  ```
+
+- **`audit.sampling`** (`config/instance.yaml.example`) + `src/audit_helpers
+  .should_sample(action)` — an opt-in, per-action sampling ratio. Nothing is
+  sampled by default; an operator who sees one action dominating the report
+  above can configure e.g. `audit.sampling: {chat.tool_call: 0.1}` to keep 1
+  in 10 rows for that action only. Sampling is **deterministic** (a
+  per-action call counter, not `random`) so "1 in 10" is exactly true even
+  on a low-traffic instance, and a security-relevant action (auth,
+  RBAC/grant changes, secret rotation, admin configuration) must never be
+  listed there — see the caveat next to the worked example in
+  `config/instance.yaml.example`.
+
+**Measured example.** The numbers below are a real run of
+`scripts.audit_volume_estimate`, not an estimate written by hand — but the
+source is a **local, synthetic seed**, not production traffic. Instance
+shape: a fresh local DuckDB `system.duckdb`, seeded with a 14-day, ~150
+rows/day mix modeling a small (~10-person) analyst team already covered by
+wave 1's declared-action middleware — chat/MCP tool calls weighted
+heaviest, catalog/query reads next, scheduler ticks and admin mutations
+rarest (`retention_days` left at the default 365):
+
+```
+Audit volume report — backend=duckdb window=7d since=2026-08-22T20:34:08Z
+  events_total=1054  rows_per_day=150.6
+  retention_days=365  projected_rows_at_retention=54969
+  projected size at retention: 17.0 MB (avg 323.4 bytes/row, sampled)
+  ! dominant action: chat.tool_call = 27.9% of rows (>25%)
+
+  action                                        count      pct
+  chat.tool_call                                  294    27.9%
+  mcp.tool_call                                   189    17.9%
+  chat.question_answer                            147    14.0%
+  query.local                                     112    10.6%
+  catalog.list                                     77     7.3%
+  activity.read                                    63     6.0%
+  catalog.sample                                   42     4.0%
+  catalog.schema                                   35     3.3%
+  login_success                                    28     2.7%
+  data.download                                    21     2.0%
+  (10 more, each < 1%)
+```
+
+At this rate a year of retention projects to ~55k rows / ~17 MB — trivial
+for either backend. What actually drives the total is chat/MCP tool-call
+volume, not the wave-1/2 declared-action or read-ratchet middleware itself:
+those add at most one row per otherwise-unaudited request, and most
+instances' request volume is dominated by chat/agent tool calls that were
+already audited before this work. A real production instance's actual
+numbers will differ with its real traffic mix — run the script against your
+own `DATA_DIR` rather than relying on the figures above; they exist to show
+the methodology and a plausible order of magnitude, not to stand in for a
+measurement of your instance.
 
 Optional integration that wires four signals into a single PostHog project:
 

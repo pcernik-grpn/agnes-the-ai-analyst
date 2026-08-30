@@ -16,11 +16,18 @@ CLAUDE.local.md
 
 # Local dev data (copied from server for testing)
 dev_data/
+# ...and `data` itself, symlink or file: the trailing-slash form above
+# matches a directory only, which is how a `data -> /Users/<someone>/…`
+# symlink reached `integration` on 2026-08-29.
+/data
 session-analysis/
 
 # CLI sync artifacts (local parquets + DuckDB)
 server/
 user/
+# ...and `user` itself: same trailing-slash gap as `/data` below — a
+# symlink named `user` is not a directory, so `user/` never matched it.
+/user
 
 # Environment variables
 .env

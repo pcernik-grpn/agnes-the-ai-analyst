@@ -27,6 +27,14 @@ from pathlib import Path
 # (the policy is a ratchet, not a sweep). Tuple of (cli_cmd, mcp_tool).
 _COHORT: dict[str, tuple[str, str]] = {
     "/documentation/api": ("docs api", "documentation_api"),
+    # Fact-graph node types with caller-scoped counts (TCRD-250): the head
+    # of the Library's Knowledge tab, and an agent's way to learn which
+    # types exist before spending a `fact_search` call. Joins its
+    # search/neighbors/claims siblings on all three surfaces.
+    "/api/facts/type-map": ("facts type-map", "fact_type_map"),
+    # Entity facets for the Library's filter menu (TCRD-250 piece 4). Same
+    # three surfaces as its type-map sibling above.
+    "/api/facts/facets": ("facts facets", "fact_facets"),
     # Reading one collection file's text (#1240). The endpoint's path is
     # browser-shaped — the Library's preview modal fetches it directly — but
     # its contract is now agent-facing: an agent shown a file it could not
@@ -679,6 +687,42 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/knowledge/digests": (
+        "enumerating maintained digests for a WEB surface (TCRD-250). Both "
+        "other surfaces already RECEIVE digests by a better route than a "
+        "list call: `agnes pull` writes every granted digest to "
+        "`.claude/rules/ka_<slug>.md` from the manifest "
+        "(app/api/sync.py::_digest_entries), and a chat agent therefore "
+        "reads them as files already in its sandbox rather than by calling "
+        "a tool. This route exists only because a browser cannot read that "
+        "directory — it is the enumeration a page needs, not an analyst "
+        "query. Same reasoning as the grandfathered GET "
+        "/api/facts/ingest-runs. The digest CONTENT endpoint it pairs with "
+        "is itself grandfathered, and is what `agnes pull` calls"
+    ),
+    "/api/v1/agents/{slug}/delegate": (
+        "Track C7 (@delegation MVP) — sandbox-internal RPC, reachable only "
+        "by a live agent turn's own in-process delegation tool "
+        "(app/chat/runner.py's `_delegation_mcp_server`) under that turn's "
+        "own session-scoped ticket (never a durable user credential an "
+        "analyst would hold at a terminal — see app/api/agent_delegation.py's "
+        "module docstring). A CLI/MCP 'delegate now' command is a plausible "
+        "FUTURE feature, but exposing THIS exact route as a generic "
+        "analyst-facing tool would let a caller puppet another agent's turn "
+        "outside the depth-1/one-per-turn/caller-binding guarantees this "
+        "route enforces for a LIVE delegating turn"
+    ),
+    "/api/admin/upgrade-freeze": (
+        "per-instance auto-upgrade freeze (TCRD-238) — deliberately never "
+        "MCP-exposed per the 'operator security-posture' standing exemption "
+        "in CONTRIBUTING.md: an agent-invokable tool that can suspend a "
+        "fleet's upgrade path (and therefore its security patching) is a "
+        "denial-of-patching seam, not a convenience. No CLI surface either: "
+        "the consumer is the host's own cron tick reading a marker on the "
+        "state disk, and the human who sets it is the operator already in "
+        "/admin before a demo — an `agnes admin` verb would be a third way "
+        "to write one file, with no analyst workflow behind it"
+    ),
     "/api/admin/sso/config": (
         "external SSO login config (design 2026-08-28) — CLI-reachable via "
         "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
@@ -1015,6 +1059,20 @@ _EXEMPT: dict[str, str] = {
         "wizard's source card, derived at request time from the connection's own "
         "stored PEM — admin-only display primitive, no analyst CLI/MCP analogue"
     ),
+    # Extraction enqueue wiring (TCRD-226) — admin/scheduler job-trigger
+    # endpoints, same exemption class as run-corporate-memory/
+    # run-knowledge-digests/reap-idle below: an admin action and a
+    # scheduler sweep, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extract": (
+        "admin-triggered one-off run of the existing corpus-extraction job kind — "
+        "admin/scheduler maintenance op, mirrors the run-corporate-memory exemption; "
+        "no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/extraction/run-due": (
+        "scheduler-driven sweep firing corpus-extraction for every due SharePoint "
+        "connection — admin/scheduler maintenance op, mirrors the "
+        "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.
@@ -1296,6 +1354,32 @@ _EXEMPT: dict[str, str] = {
     "/api/facts/ingest-runs": (
         "persisted ingest run reports (spec §7.2/§13.2) — admin-only, feeds the "
         "/admin/data-sources source card, not an analyst query surface; no CLI/MCP analogue"
+    ),
+    # F3 (audit-full-coverage plan, Task 9). Batch ingestion endpoint the
+    # `agnes push` command calls internally to upload the offline-query
+    # audit spool — mirrors the grandfathered /api/upload/sessions and
+    # /api/upload/local-md endpoints (no standalone `agnes upload …`
+    # subcommand, no MCP analogue: there is nothing for an agent or an
+    # analyst to invoke here directly, it's a delivery mechanism for
+    # events the CLI already produced as a side effect of `agnes
+    # query`/`agnes explore` running locally).
+    "/api/upload/audit-events": (
+        "client-reported CLI audit event batch upload (F3, audit-full-coverage "
+        "plan) — internal to `agnes push`, mirrors the grandfathered "
+        "/api/upload/sessions and /api/upload/local-md endpoints; no standalone "
+        "CLI subcommand or MCP analogue"
+    ),
+    # Wave 2, Task 3. System-to-system only: apps-runner holds the Docker
+    # socket but no database access, so this is its ONLY path to an audit_log
+    # row. Authenticated by the shared X-Runner-Token, never a user session —
+    # a human or an agent calling it AS THEMSELVES has nothing to report and
+    # no credential that would work, so a CLI subcommand or MCP tool would be
+    # a surface with no caller. Same class as the webhook/OAuth-callback
+    # carve-outs above.
+    "/api/data-apps/runner-events": (
+        "apps-runner container-lifecycle event report (wave 2, audit-coverage "
+        "plan) — system-to-system, X-Runner-Token authenticated; no user-facing "
+        "CLI subcommand or MCP analogue"
     ),
 }
 

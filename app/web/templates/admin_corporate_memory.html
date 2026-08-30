@@ -1,8 +1,18 @@
 {% extends "base_admin.html" %}
 
-{% block title %}Memory Review - Data Analyst Portal{% endblock %}
+{% block title %}Corporate memory — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
+<style>
+  .cm-preview-ctx {
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    background: var(--ds-accent-info-bg);
+    border: 1px solid var(--ds-accent-info-line);
+    border-radius: var(--ds-radius-btn);
+  }
+  .cm-preview-ctx__line { margin: 6px 0 0; font-size: 13.5px; color: var(--ds-text-secondary); }
+</style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1014,6 +1024,22 @@
 {% endblock %}
 
 {% block admin_content %}
+{# Arrival from the Access page's person lens (?from=simulate&user=). The
+   errand is "fix THIS person's access", so the page says whose, and offers
+   the way back — without it this was a one-way exit out of an audit: you
+   clicked a memory domain in someone's Library preview and there was no
+   link back to the person you were looking at. Same contract and same
+   wording as the package page's banner. #}
+{% if preview_ctx %}
+<div class="cm-preview-ctx">
+  <a class="apg-back" href="{{ preview_ctx.back_href }}"><span aria-hidden="true">&larr;</span> Back to preview: {{ preview_ctx.name }}</a>
+  <p class="cm-preview-ctx__line">
+    Fixing access for <b>{{ preview_ctx.name }}</b>{% if preview_ctx.groups %} — their groups:
+    {{ preview_ctx.groups | join(', ') }}{% endif %}. Share a domain with one of them, then re-check.
+    <a href="{{ preview_ctx.back_href }}">Re-check {{ preview_ctx.name }} &rarr;</a>
+  </p>
+</div>
+{% endif %}
 {# Moderation buttons now route through the canonical .btn-* family in
    style-custom.css. The page-local .btn-mandate/.btn-approve/.btn-reject/
    .btn-revoke variants are retired:
@@ -1031,7 +1057,7 @@
    can't reach — the swap approach keeps the rendering uniform across
    the static and JS-string contexts. #}
     {% set page_hero_eyebrow = "Agent Experience" %}
-    {% set page_hero_title = "Memory Review" %}
+    {% set page_hero_title = "Corporate memory" %}
     {% set page_hero_plain = True %}
     {% set page_hero_subtitle = "Review pending knowledge items from analyst sessions — approve, mandate, or reject — and resolve contradictions and duplicate candidates. Approved items flow to the user-facing <a href=\"/corporate-memory\" style=\"color:inherit;text-decoration:underline;\">Curated Memory</a> page." %}
     {% include "_page_hero.html" %}
@@ -2115,7 +2141,8 @@
               '<div data-group-id="' + gid + '" '
               + 'style="display:flex; gap:8px; align-items:center; '
               +        'padding:6px; border:1px solid var(--border); border-radius:6px;">'
-              + '<span style="flex:1;">' + gname + '</span>'
+              + '<span style="flex:1; display:flex; align-items:center; gap:6px;">'
+              + AgnesKindGlyph.groupGlyph() + escapeHtml(gname) + '</span>'
               + '<select class="cmd-rbac-req" style="padding:4px; border:1px solid var(--border); border-radius:4px;">'
               + '<option value="">(no grant)</option>'
               + '<option value="available">available</option>'
@@ -2420,7 +2447,8 @@
                     '<div data-group-id="' + gid + '" '
                     + 'style="display:flex; gap:8px; align-items:center; '
                     +        'padding:6px; border:1px solid var(--border); border-radius:6px;">'
-                    + '<span style="flex:1;">' + gname + '</span>'
+                    + '<span style="flex:1; display:flex; align-items:center; gap:6px;">'
+                    + AgnesKindGlyph.groupGlyph() + escapeHtml(gname) + '</span>'
                     + '<select class="emd-rbac-req" style="padding:4px; border:1px solid var(--border); border-radius:4px;">'
                     +   opt('', '(no grant)')
                     +   opt('available', 'available')

@@ -118,6 +118,8 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # `src.repositories.facts_repo()` directly rather than self-calling over
     # HTTP (see `_facts_caller`'s docstring below).
     "fact_search",
+    "fact_type_map",
+    "fact_facets",
     "fact_neighbors",
     "fact_claims",
     "schema",
@@ -821,6 +823,7 @@ def register_foundation_tools(
     async def fact_search(
         type: str | None = None,
         filters: dict[str, Any] | None = None,
+        q: str | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict:
         """Search typed facts extracted from documents — entities (people,
@@ -849,6 +852,9 @@ def register_foundation_tools(
             filters: Attribute equality filters, e.g. {"status": "active"} —
                 evaluated against the PROJECTED value, so a filter on a
                 conflicted key never matches.
+            q: Optional free-text name lookup (e.g. a person or org name),
+                matched against alias names only, never claim text. An
+                exact or prefix match ranks first.
             limit: Max results (server caps at 100).
 
         Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
@@ -861,7 +867,74 @@ def register_foundation_tools(
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, limit=limit)
+        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
+
+    @tool(read_only=True)
+    async def fact_type_map() -> dict:
+        """List every fact type in the graph with a live count of the
+        subjects YOU can see. Use this to orient BEFORE `fact_search` when
+        you do not yet know what types exist — each row's `type` is a valid
+        `fact_search(type=...)` argument, and its `count` tells you whether
+        searching it is worth a call.
+
+        Counted through the same visibility gate `fact_search` applies, so a
+        number is what you could actually reach and never a total inflated
+        by evidence you cannot read. A type with no subjects visible to you
+        is omitted entirely rather than returned with a count of 0 — absence
+        here means "nothing you can see", which is deliberately
+        indistinguishable from "no such type". Behind the `facts` feature
+        flag (off by default); requires the Postgres app-state backend.
+        Mirrors `GET /api/facts/type-map` and `agnes facts type-map`.
+
+        Returns ``{"types": [{"type", "count"}], "total"}``, ordered by type.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        counts = await asyncio.to_thread(facts_repo().count_visible_facts_by_type, caller)
+        return {
+            "types": [{"type": t, "count": n} for t, n in counts.items()],
+            "total": sum(counts.values()),
+        }
+
+    @tool(read_only=True)
+    async def fact_facets(
+        types: list[str] | None = None,
+        limit_per_type: Annotated[int, Field(ge=1, le=200)] = 50,
+    ) -> dict:
+        """List the entity values documents can be filtered by — clients,
+        industries, service offerings, document types — with a document count
+        each. Use this to answer "which clients do we have work for?" or
+        "how much do we have on X?" without reading any document, and to pick
+        a concrete value before calling `fact_search`.
+
+        Counts cover only documents in collections YOU can read, so a facet
+        never reports files you could not open — including for a subject
+        carrying a `revealed` correction, whose unreadable evidence is
+        deliberately not tallied. Behind the `facts` feature flag; requires
+        the Postgres app-state backend. Mirrors `GET /api/facts/facets` and
+        `agnes facts facets`.
+
+        Args:
+            types: Fact types to facet on. Omit for the default four.
+            limit_per_type: Max values returned per type.
+
+        Returns ``{"facets": {type: [{"subject_id", "label", "document_count"}]}}``.
+        """
+        from app.api.facts import DEFAULT_FACET_TYPES
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        wanted = list(types) if types else list(DEFAULT_FACET_TYPES)
+        return {
+            "facets": await asyncio.to_thread(
+                facts_repo().facet_values, caller, types=wanted, limit_per_type=limit_per_type
+            )
+        }
 
     @tool(read_only=True)
     async def fact_neighbors(

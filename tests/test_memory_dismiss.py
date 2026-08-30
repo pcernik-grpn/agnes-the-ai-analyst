@@ -74,8 +74,7 @@ class TestDismissPost:
 
         conn = get_system_db()
         cnt = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_item_user_dismissed "
-            "WHERE user_id = 'analyst1' AND item_id = 'dm_a1'"
+            "SELECT COUNT(*) FROM knowledge_item_user_dismissed WHERE user_id = 'analyst1' AND item_id = 'dm_a1'"
         ).fetchone()[0]
         assert cnt == 1
         conn.close()
@@ -98,8 +97,7 @@ class TestDismissPost:
 
         conn = get_system_db()
         cnt = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_item_user_dismissed "
-            "WHERE user_id = 'analyst1' AND item_id = 'dm_idem'"
+            "SELECT COUNT(*) FROM knowledge_item_user_dismissed WHERE user_id = 'analyst1' AND item_id = 'dm_idem'"
         ).fetchone()[0]
         assert cnt == 1
         conn.close()
@@ -122,10 +120,7 @@ class TestDismissPost:
 
         # And nothing landed in the table.
         conn = get_system_db()
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_item_user_dismissed "
-            "WHERE item_id = 'dm_m1'"
-        ).fetchone()[0]
+        cnt = conn.execute("SELECT COUNT(*) FROM knowledge_item_user_dismissed WHERE item_id = 'dm_m1'").fetchone()[0]
         assert cnt == 0
         conn.close()
 
@@ -165,8 +160,7 @@ class TestUndismissDelete:
 
         conn = get_system_db()
         cnt = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_item_user_dismissed "
-            "WHERE user_id = 'analyst1' AND item_id = 'dm_u1'"
+            "SELECT COUNT(*) FROM knowledge_item_user_dismissed WHERE user_id = 'analyst1' AND item_id = 'dm_u1'"
         ).fetchone()[0]
         assert cnt == 0
         conn.close()
@@ -218,13 +212,9 @@ class TestListingHidesDismissed:
         )
         assert r2.status_code == 200
         ids2 = {it["id"] for it in r2.json()["items"]}
-        assert "dm_l_app" not in ids2, (
-            "dismissed approved item must be excluded with hide_dismissed=true"
-        )
+        assert "dm_l_app" not in ids2, "dismissed approved item must be excluded with hide_dismissed=true"
         assert "dm_l_keep" in ids2
-        assert "dm_l_mand" in ids2, (
-            "mandatory item must remain visible even when a dismissal row exists"
-        )
+        assert "dm_l_mand" in ids2, "mandatory item must remain visible even when a dismissal row exists"
 
     def test_listing_carries_dismissed_by_me_flag(self, seeded_app):
         """Each item in the listing carries ``dismissed_by_me``."""
@@ -263,6 +253,12 @@ class TestBundleAlwaysHidesDismissed:
             "INSERT INTO knowledge_item_user_dismissed (user_id, item_id) VALUES (?, ?)",
             ["analyst1", "dm_b_mand"],
         )
+        # #1573: default distribution_mode (hybrid) gates approved items
+        # behind a personal upvote — vote both so dismissal, not the
+        # distribution gate, is what this test exercises.
+        repo = KnowledgeRepository(conn)
+        repo.vote("dm_b_app", "analyst1", 1)
+        repo.vote("dm_b_keep", "analyst1", 1)
         conn.close()
 
         c = seeded_app["client"]
@@ -276,10 +272,6 @@ class TestBundleAlwaysHidesDismissed:
         mandatory_ids = {i["id"] for i in body["mandatory"]}
         approved_ids = {i["id"] for i in body["approved"]}
 
-        assert "dm_b_app" not in approved_ids, (
-            "dismissed approved item must be excluded from the bundle"
-        )
+        assert "dm_b_app" not in approved_ids, "dismissed approved item must be excluded from the bundle"
         assert "dm_b_keep" in approved_ids
-        assert "dm_b_mand" in mandatory_ids, (
-            "mandatory item must remain in the bundle even with a stale dismissal row"
-        )
+        assert "dm_b_mand" in mandatory_ids, "mandatory item must remain in the bundle even with a stale dismissal row"

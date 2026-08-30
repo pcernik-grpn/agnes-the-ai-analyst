@@ -405,9 +405,13 @@ class TestRailOptIn:
         # only when flipping it would change the list.
         assert "control: '#lib-stack-toggle'" in text
         assert 'data-facet="availability"' in text, "the demoted acquisition filter must exist"
-        # The segment is gone, not merely hidden — a filter is not a tab.
+        # The SCOPE segment is gone, not merely hidden — a filter is not a tab.
+        # A segmented control as such is fine again, and there is one: the
+        # Knowledge / Capabilities tabs. That is the distinction this test was
+        # always drawing — those ARE tabs, and they change which half of the
+        # Library you are in rather than narrowing the list you are looking at.
         assert 'id="lib-scope"' not in text
-        assert "segments: {" not in text
+        assert "container: '#lib-scope'" not in text
 
     def test_rail_has_no_studio_or_marketplace_entry(self, web_client, admin_cookie, monkeypatch):
         """Studio is retired from the rail and Marketplace is no longer a rail
@@ -492,8 +496,11 @@ class TestRailOptIn:
         # Every "add something" path sits behind ONE chevron button.
         assert 'id="lib-new-btn"' in text
         assert 'id="lib-new-menu"' in text
+        # Matched on the closing bracket, not the closing tag: every item now
+        # carries a `<small>` description, so the label is no longer the whole
+        # span. Same trick the agent-template check below uses.
         for label in ("Build a skill", "Build a plugin", "Upload a file"):
-            assert f"<span>{label}</span>" in text
+            assert f">{label}<" in text
         # The page-head `.pnote` caveats are retired, and so are the two tinted
         # panels that replaced them. What is left above the inventory is ONE thin
         # row (the caveat about the list), and Data apps states its schedule as a
@@ -759,14 +766,14 @@ class TestRailChatHistory:
         assert "Get started" not in text
         assert "rail-getstarted-check" not in text
         # The row lives in the FOOT — the zone that survives collapse — under
-        # "Use Agnes elsewhere" and above the profile. It is not part of the
+        # "Take Agnes to your tools" and above the profile. It is not part of the
         # nav proper: setup is a thing you finish and stop seeing, so it sits
         # with the other always-reachable rows rather than among destinations.
         foot = text.split('class="rail-foot"', 1)[1]
         row_pos = foot.find('class="rail-getstarted"')
         assert row_pos != -1, "the onboarding row belongs in the rail foot"
         assert foot.find('href="/how-it-works#connect"') < row_pos < foot.find('id="userMenu"'), (
-            "the onboarding row belongs under 'Use Agnes elsewhere', above the profile"
+            "the onboarding row belongs under 'Take Agnes to your tools', above the profile"
         )
         # …and nothing left it behind in the collapsible nav above.
         assert "rail-getstarted" not in text.split('class="rail-foot"', 1)[0]
@@ -1363,11 +1370,11 @@ class TestRailChatsDestination:
         assert 'id="rail-pinned"' not in rail
 
     def test_the_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
-        """It measures the ANALYST's journey — connect your tools, ask your first
-        question — and it is the only element in the rail with a coloured progress
-        arc, so it pulls hardest of anything on screen while you are registering a
-        table. Nothing is lost: the checklist is still reachable from the account
-        menu and from the chat dashboard's own hero."""
+        """It measures the ANALYST's journey — take Agnes to your tools, ask your
+        first question — and it is the only element in the rail with a coloured
+        progress arc, so it pulls hardest of anything on screen while you are
+        registering a table. Nothing is lost: the checklist is still reachable from
+        the account menu and from the chat dashboard's "Set up Agnes" door."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
         admin_rail = self._rail(web_client, admin_cookie, "/admin/users")

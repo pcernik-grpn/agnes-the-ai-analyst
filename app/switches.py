@@ -182,6 +182,26 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="store_moderation",
+        config_keys=("features", "store_moderation_enabled"),
+        env_var="AGNES_STORE_MODERATION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The Moderation & Trust hub (/admin/store) and its nav + command-palette "
+            "entries. Off by default: its three zones each have a better door — "
+            "submission review is its own nav row (/admin/store/submissions), "
+            "marketplace curation is /admin/marketplaces, and entity verification "
+            "already has its own switch (store.verification_enabled), so the hub was "
+            "a landing page for links the column already carries. Hides UI only: "
+            "/api/admin/share-requests* and the store APIs keep serving, so an admin "
+            "can still decide a queued agent share by API while the page is hidden."
+        ),
+    ),
+    Switch(
         name="guardrails",
         config_keys=("guardrails", "enabled"),
         env_var="AGNES_GUARDRAILS_ENABLED",
@@ -696,8 +716,12 @@ SWITCHES: tuple[Switch, ...] = (
             "it gates needs a configured `extraction.producer` command AND a worker "
             "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
             "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
-            "feature whose backend is absent. Enable the profile/producer and this flag "
-            "together."
+            "feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
+            "(a role split), which makes the deployment multi-process — it ALSO needs "
+            "Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET, and "
+            "coordination.backend=redis (docs/DEPLOYMENT.md#multi-process), or the "
+            "process refuses to boot. Enable the profile/producer, satisfy those "
+            "multi-process prerequisites, and this flag together."
         ),
         description=(
             "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "

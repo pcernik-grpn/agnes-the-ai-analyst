@@ -17,7 +17,7 @@
             <div class="features-content">
                 <h1 class="features-title">{{ config.INSTANCE_NAME }}</h1>
                 <p class="features-subtitle">
-                    One place for your team's curated data, plugins, skills, and shared memory — so your AI agent stops guessing and starts answering.
+                    One place for your team’s curated data, plugins, skills, and shared memory — so your AI agent stops guessing and starts answering.
                 </p>
 
                 {# Feature cards mirror the product pillars surfaced on /home,
@@ -98,7 +98,7 @@
                         </div>
                         <div class="feature-text">
                             <h3>Memory <span class="feature-beta">Beta</span></h3>
-                            <p>Shared analyst knowledge and prior solutions, fed back into Claude's context on demand.</p>
+                            <p>Shared analyst knowledge and prior solutions, fed back into Claude’s context on demand.</p>
                         </div>
                     </div>
                     {% endif %}
@@ -156,28 +156,28 @@
 
                 {% set _err = request.query_params.get('error') %}
                 {% set _err_messages = {
-                    'not_in_allowed_group': "Your Google account isn't a member of any group permitted to use this " ~ (instance_brand or "Agnes") ~ " instance. Ask your " ~ (instance_brand or "Agnes") ~ " administrator to grant you access.",
-                    'group_check_unavailable': "We couldn't verify your group membership with Google right now. Please try signing in again in a moment.",
+                    'not_in_allowed_group': "Your Google account isn’t a member of any group permitted to use this " ~ (instance_brand or "Agnes") ~ " instance. Ask your " ~ (instance_brand or "Agnes") ~ " administrator to grant you access.",
+                    'group_check_unavailable': "We couldn’t verify your group membership with Google right now. Please try signing in again in a moment.",
                     'deactivated': "This account has been deactivated. Contact your " ~ (instance_brand or "Agnes") ~ " administrator if you believe this is in error.",
                     'oauth_failed': "Google sign-in failed. Please try again.",
-                    'no_email': "Google didn't return an email for this account.",
-                    'domain_not_allowed': "This email's domain is not permitted to sign in to this " ~ (instance_brand or "Agnes") ~ " instance.",
+                    'no_email': "Google didn’t return an email for this account.",
+                    'domain_not_allowed': "This email’s domain is not permitted to sign in to this " ~ (instance_brand or "Agnes") ~ " instance.",
                     'google_not_configured': "Google sign-in is not configured on this server.",
                     'keboola_oauth_failed': "Keboola sign-in failed. Please try again.",
                     'keboola_not_configured': "Keboola sign-in is not configured on this server.",
                     'microsoft_oauth_failed': "Microsoft sign-in failed. Please try again.",
-                    'microsoft_no_email': "Microsoft didn't return an email for this account.",
+                    'microsoft_no_email': "Microsoft didn’t return an email for this account.",
                     'microsoft_not_configured': "Microsoft sign-in is not configured on this server.",
-                    'microsoft_not_in_allowed_group': "Your Microsoft account isn't a member of any Entra ID group permitted to use this " ~ (instance_brand or "Agnes") ~ " instance. Ask your " ~ (instance_brand or "Agnes") ~ " administrator to grant you access.",
+                    'microsoft_not_in_allowed_group': "Your Microsoft account isn’t a member of any Entra ID group permitted to use this " ~ (instance_brand or "Agnes") ~ " instance. Ask your " ~ (instance_brand or "Agnes") ~ " administrator to grant you access.",
                     'keboola_not_permitted': "Your Keboola token or project role is not permitted to sign in here. Contact your " ~ (instance_brand or "Agnes") ~ " administrator.",
                     'keboola_oauth_not_master': "Keboola sign-in was refused: the session Keboola issued did not verify as a master token, which is unexpected for an interactive login. Please report this to your " ~ (instance_brand or "Agnes") ~ " administrator.",
                     'keboola_project_mismatch': "Your Keboola session belongs to a different project than this instance. Retry and pick project " ~ (keboola_expected_project or "configured for this instance") ~ " on the Keboola sign-in screen.",
                     'email_not_configured': "Email link sign-in is not available on this server (no mail delivery configured).",
-                    'email_send_failed': "We couldn't send the sign-in email. Please try again later or contact your " ~ (instance_brand or "Agnes") ~ " administrator.",
+                    'email_send_failed': "We couldn’t send the sign-in email. Please try again later or contact your " ~ (instance_brand or "Agnes") ~ " administrator.",
                     'sso_not_configured': "External SSO sign-in is not configured on this server.",
                     'sso_oauth_failed': "External SSO sign-in failed. Please try again.",
-                    'sso_no_email': "Your identity provider didn't return a usable email for this account. Ask your administrator to check the account's email attribute.",
-                    'sso_no_subject': "Your identity provider didn't return the expected account identifier. Contact your administrator.",
+                    'sso_no_email': "Your identity provider didn’t return a usable email for this account. Ask your administrator to check the account’s email attribute.",
+                    'sso_no_subject': "Your identity provider didn’t return the expected account identifier. Contact your administrator.",
                     'sso_wrong_tenant': "This account belongs to a different organization than the one configured for SSO sign-in here.",
                     'sso_identity_conflict': "This email address is already associated with a different external identity. Contact your " ~ (instance_brand or "Agnes") ~ " administrator to resolve the conflict.",
                 } %}

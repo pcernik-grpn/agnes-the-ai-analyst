@@ -497,6 +497,7 @@ from app.api.tokens import router as tokens_router, admin_router as tokens_admin
 from app.api.agents_admin import router as agents_admin_router
 from app.api.agent_runtime import router as agent_runtime_router  # noqa: E402
 from app.api.agent_sessions import router as agent_sessions_router  # noqa: E402
+from app.api.agent_delegation import router as agent_delegation_router  # noqa: E402
 from app.api.agent_webhooks import router as agent_webhooks_router  # noqa: E402
 from app.api.agent_memory import router as agent_memory_router  # noqa: E402
 from app.api.agent_schedules import router as agent_schedules_router  # noqa: E402
@@ -588,6 +589,7 @@ from app.api.admin_usage_summary import router as admin_usage_summary_router
 from app.api.admin_reports import router as admin_reports_router
 from app.api.admin_dashboard import router as admin_dashboard_router
 from app.api.admin_adoption import router as admin_adoption_router
+from app.api.admin_upgrade_freeze import router as admin_upgrade_freeze_router
 from app.api.db_state import router as db_state_router
 from app.api.admin_analytics import router as admin_analytics_router
 from app.marketplace_server.router import router as marketplace_server_router
@@ -1383,6 +1385,19 @@ async def lifespan(app):
         except Exception as e:
             logger.warning("Could not seed built-in marketplace: %s", e)
 
+        # Grandfather every already-registered MCP source onto the Everyone
+        # group under the new ResourceType.MCP_SOURCE gate (TCRD-236) —
+        # without this, shipping a default-deny source-level gate would drop
+        # every existing MCP connection the moment this boots. Idempotent;
+        # a source an admin later narrows keeps a grant row of its own and is
+        # left alone on every subsequent boot. See src/mcp_source_grants.py.
+        try:
+            from src.mcp_source_grants import seed_default_mcp_source_grants
+
+            seed_default_mcp_source_grants()
+        except Exception as e:
+            logger.warning("Could not seed default mcp_source grants: %s", e)
+
         # Seed admin user (SEED_ADMIN_EMAIL) and add them to the Admin user_group.
         # Optional SEED_ADMIN_PASSWORD lets the seeded user sign in immediately
         # without going through bootstrap; never overwritten if already set.
@@ -2167,17 +2182,23 @@ def _is_truthy_env(name: str) -> bool:
 
 
 def _debug_enabled() -> bool:
-    """Whether the FastAPI debug toolbar is mounted.
+    """Whether the FastAPI debug toolbar is mounted. Opt-in via ``DEBUG`` only.
 
-    LOCAL_DEV_MODE (auth-bypassed dev) implies DEBUG so operators needn't set
-    both. But an *explicit* DEBUG env wins either way — set ``DEBUG=0`` to run
-    local-dev WITHOUT the toolbar, whose per-request instrumentation
-    (incl. the compose healthcheck) can peg CPU on heavy HTML pages.
+    ``LOCAL_DEV_MODE`` (auth-bypassed dev) used to imply DEBUG, so an operator
+    needn't set both. That convenience cost far more than it saved: the
+    toolbar's per-request instrumentation (incl. the compose healthcheck) pegs
+    CPU on heavy HTML pages, and the local-dev command everyone runs sets
+    LOCAL_DEV_MODE. ``/library`` — the heaviest template in the product — took
+    MINUTES to answer while ``/api/version`` stayed instant, which reads as a
+    database or template fault rather than a middleware one (TCRD-247 was
+    filed, and first diagnosed, against schema healing on that evidence).
+
+    A profiler that attaches itself because a *different* flag is set is a trap
+    whatever its default, so the toolbar is now armed only by ``DEBUG`` being
+    explicitly truthy. Local dev with the toolbar is ``DEBUG=1 LOCAL_DEV_MODE=1``
+    — which is what ``docs/development.md`` has always documented.
     """
-    raw = os.environ.get("DEBUG")
-    if raw is not None and raw.strip() != "":
-        return _is_truthy_env("DEBUG")
-    return _is_truthy_env("LOCAL_DEV_MODE")
+    return _is_truthy_env("DEBUG")
 
 
 DEBUG = _debug_enabled()
@@ -2605,19 +2626,36 @@ def create_app() -> FastAPI:
 
     app.add_middleware(SecurityHeadersMiddleware)
 
-    # RequestIdMiddleware mounted LAST — Starlette inserts middleware at
-    # index 0, so the last add_middleware call ends up OUTERMOST and runs
-    # FIRST per request. The request_id ContextVar is set before any
-    # downstream middleware or handler runs, and every response gets the
-    # x-request-id header.
-    app.add_middleware(RequestIdMiddleware)
+    # Fallback audit safety net (F1 — audit-full-coverage plan, Task 2) —
+    # writes a generic `http.request` row for any authenticated mutating
+    # request whose handler wrote no audit row of its own. Added BEFORE
+    # AuditTimingMiddleware below so it ends up the more INNER of the two:
+    # by the time its post-response check runs (after `await self.app(...)`
+    # returns), AuditTimingMiddleware's "before" phase has already stamped
+    # the correlation_id contextvar this middleware reads as a tie-break.
+    # See app/middleware/audit_fallback.py for the full mechanism (and why
+    # it does NOT lean on the audit-identity contextvar alone).
+    from app.middleware.audit_fallback import AuditFallbackMiddleware
 
-    # Audit-timing contextvar (pure ASGI, zero hot-path overhead) — lets
-    # audit_repo().log() auto-fill duration_ms for every HTTP-triggered
-    # audit write; see src/audit_context.py.
+    app.add_middleware(AuditFallbackMiddleware)
+
+    # Audit-timing + request-meta contextvars (pure ASGI, zero hot-path
+    # overhead) — lets AuditRepository.log() auto-fill duration_ms,
+    # client_ip and correlation_id for every HTTP-triggered audit write;
+    # see src/audit_context.py. Added BEFORE RequestIdMiddleware below so
+    # RequestIdMiddleware ends up the more OUTER of the two (see the next
+    # comment) and this middleware can read request_id_var already set.
     from app.middleware.audit_timing import AuditTimingMiddleware
 
     app.add_middleware(AuditTimingMiddleware)
+
+    # RequestIdMiddleware mounted LAST (of this pair) — Starlette inserts
+    # middleware at index 0, so the last add_middleware call ends up
+    # OUTERMOST and runs FIRST per request. The request_id ContextVar is
+    # set before any downstream middleware or handler runs (including
+    # AuditTimingMiddleware just above, which reads it for correlation_id),
+    # and every response gets the x-request-id header.
+    app.add_middleware(RequestIdMiddleware)
 
     # HTTP request metrics (three-plane wave 2D, task 1) — registered as an
     # `@app.middleware("http")` function (not add_middleware) so it becomes
@@ -2893,6 +2931,7 @@ def create_app() -> FastAPI:
     app.include_router(agents_admin_router)
     app.include_router(agent_runtime_router)
     app.include_router(agent_sessions_router)
+    app.include_router(agent_delegation_router)
     app.include_router(agent_webhooks_router)
     app.include_router(agent_memory_router)
     app.include_router(agent_schedules_router)
@@ -3023,6 +3062,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_reports_router)
     app.include_router(admin_dashboard_router)
     app.include_router(admin_adoption_router)
+    app.include_router(admin_upgrade_freeze_router)
     app.include_router(admin_contributed_skills_router)
     app.include_router(db_state_router)
     app.include_router(admin_analytics_router)

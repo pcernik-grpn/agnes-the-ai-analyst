@@ -503,31 +503,19 @@ html[data-ui-layout="rail"] body.detail-page footer {
     color: color-mix(in srgb, var(--ds-warn-ink) 85%, var(--ds-text-primary));
 }
 
-/* ── Knowledge Layer hero (macros/_knowledge_layer.html) ─────────────────
-   A single premium horizontal banner: a text lead + green CTA on the left,
-   the Agnes orb as the visual anchor in the centre, and lightweight floating
-   integration chips (dotted connectors fanning back to the orb) on the right.
-   No inner cards, no hard borders — depth is carried by soft layered
-   gradients and generous spacing. Shared component; the rail chat dashboard
-   is the first consumer. All colours ride --ds-* tokens so it follows every
-   palette theme. */
-.klb {
-    position: relative;
-    overflow: hidden;
-    border-radius: 24px;
-    padding: 38px 46px;
-}
+/* ── Knowledge-surface fill (.cbn--bar) ──────────────────────────────────
+   The near-white layered gradient + soft lift that says "this is Agnes
+   itself". It was shared by two banners — the Knowledge Layer hero (`.klb`)
+   and the compact connect bar — until the hero was retired; the connect bar
+   is the only consumer now, but the fill is kept as its own rule because
+   `.cld-door--lead` below imitates it deliberately and the two should stay
+   readable side by side.
 
-/* Shared knowledge-surface fill — the near-white layered gradient + soft lift.
-   Both banners that speak for the Knowledge Layer paint the SAME surface: the
-   full hero (`.klb`, chat landing) and the compact connect bar (`.cbn--bar`,
-   Library / Workspace). One rule, so the two can only differ in geometry.
    Almost-white base with a whisper of mint on the left, a very light purple on
    the right, and subtle radial blues — an expensive-SaaS gradient, no hard
    edges. Kept faint so it reads as near-white. Every layer rides --ds-surface
    or a color-mix into it, so the fill follows every palette theme (which is
    why `.cbn--bar` needs no dark-theme override of its own). */
-.klb,
 .cbn--bar {
     background:
         radial-gradient(60% 120% at 84% 12%, color-mix(in srgb, var(--ds-kind-agent) 7%, transparent), transparent 60%),
@@ -542,209 +530,6 @@ html[data-ui-layout="rail"] body.detail-page footer {
     box-shadow:
         0 1px 2px color-mix(in srgb, var(--ds-text-primary) 4%, transparent),
         0 22px 52px -42px color-mix(in srgb, var(--ds-primary) 34%, transparent);
-}
-
-/* Decorative layers — dotted field fading in from the far left, thin curved
-   lines in the top-right corner. */
-.klb-decor { position: absolute; inset: 0; pointer-events: none; }
-.klb-decor-dots {
-    position: absolute; left: 0; top: 0; bottom: 0; width: 260px;
-    background-image: radial-gradient(color-mix(in srgb, var(--ds-primary) 30%, transparent) 1.3px, transparent 1.4px);
-    background-size: 17px 17px;
-    -webkit-mask-image: linear-gradient(90deg, rgba(0, 0, 0, .55), transparent 76%);
-    mask-image: linear-gradient(90deg, rgba(0, 0, 0, .55), transparent 76%);
-    opacity: .55;
-}
-.klb-decor-curves {
-    position: absolute; top: -10px; right: -10px; width: 320px; height: 220px;
-    color: color-mix(in srgb, var(--ds-kind-agent) 22%, transparent);
-    opacity: .6;
-}
-
-/* Composition — text lead | centred orb | floating chips. */
-.klb-inner {
-    position: relative; z-index: 1;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto minmax(0, 185px);
-    align-items: center;
-    gap: 26px;
-}
-
-/* LEFT — text lead. */
-.klb-lead { max-width: 460px; min-width: 0; }
-.klb-pill {
-    display: inline-flex; align-items: center; gap: 7px;
-    padding: 5px 12px;
-    border-radius: var(--ds-radius-pill, 999px);
-    background: color-mix(in srgb, var(--ds-assistant) 12%, var(--ds-surface));
-    color: var(--ds-assistant-dark);
-    font-size: 12.5px; font-weight: 650; letter-spacing: -0.005em;
-}
-.klb-pill svg { width: 15px; height: 15px; }
-.klb-headline {
-    margin: 14px 0 0;
-    font-size: clamp(22.5px, 2vw, 30px);
-    line-height: 1.05;
-    font-weight: 760;
-    letter-spacing: -0.032em;
-    color: var(--ds-text-primary);
-}
-/* Second line — blue → purple accent gradient. */
-.klb-headline-grad {
-    background: linear-gradient(96deg, var(--ds-assistant) 6%, var(--ds-kind-agent) 94%);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-}
-.klb-sub {
-    /* 12px → 10px, and .klb-cta's lead 20px → 14px: the two together buy back
-       exactly the 30px the onboarding link under the CTA costs, so the lead
-       column stays shorter than the chips column and the hero's height is
-       unchanged (312px at 1280px wide, measured with and without the link). */
-    margin: 10px 0 0;
-    max-width: 460px;
-    font-size: 14.5px;
-    line-height: 1.5;
-    color: var(--ds-text-secondary);
-}
-.klb-cta {
-    display: inline-flex; align-items: center; gap: 8px;
-    margin-top: 14px;  /* see .klb-sub — the height budget for .klb-orient */
-    padding: 10px 14px;
-    border-radius: var(--ds-radius-pill, 999px);
-    background: var(--ds-primary); color: var(--ds-text-inverse);
-    font-size: 14.5px; font-weight: 650; text-decoration: none;
-    box-shadow: 0 8px 20px -10px color-mix(in srgb, var(--ds-primary) 50%, transparent);
-    transition: background var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease),
-                transform var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
-}
-.klb-cta svg { width: 15px; height: 15px; }
-.klb-cta:hover { background: var(--ds-primary-dark); }
-.klb-cta:active { transform: translateY(1px); }
-
-/* Optional onboarding link under the CTA — muted, unfilled, smaller than the
-   sub-copy, so it reads as an aside the reader may take rather than a second
-   action competing with "Connect your tools". Its 8px lead plus the 6px taken
-   off .klb-cta and the 2px off .klb-sub is the whole 30px it costs — the lead
-   column stays under the chips column's height, so the hero does not grow. */
-.klb-orient {
-    /* Block-level (fit-content) so it starts its own line under the inline-flex
-       CTA without a wrapper element. */
-    display: flex; align-items: center; gap: 6px;
-    width: fit-content;
-    margin-top: 8px;
-    font-size: 13px; font-weight: 500;
-    color: var(--ds-text-muted);
-    text-decoration: none;
-    transition: color var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
-}
-.klb-orient svg { width: 14px; height: 14px; flex-shrink: 0; opacity: .85; }
-.klb-orient:hover { color: var(--ds-text-secondary); text-decoration: underline; }
-
-/* CENTER — the orb, visual anchor: glow + dotted halo ring, gentle float.
-   Nudged down a touch so its centre sits at the optical midpoint of the
-   headline → description → CTA block (rather than the whole column, whose
-   pill sits higher), keeping the composition from feeling top-heavy. */
-.klb-orb { position: relative; display: grid; place-items: center; transform: translateY(22px); }
-.klb-orb-glow {
-    position: absolute; width: 204px; height: 204px; border-radius: 50%;
-    background: radial-gradient(circle,
-        color-mix(in srgb, var(--ds-primary) 16%, transparent),
-        color-mix(in srgb, var(--ds-kind-agent) 10%, transparent) 42%,
-        transparent 68%);
-    filter: blur(6px);
-}
-.klb-orb-ring {
-    position: relative;
-    width: 176px; height: 176px; border-radius: 50%;
-    border: 1.5px dashed color-mix(in srgb, var(--ds-primary) 22%, transparent);
-    display: grid; place-items: center;
-    background: radial-gradient(circle, color-mix(in srgb, var(--ds-surface) 55%, transparent), transparent 70%);
-}
-.klb-orb-img {
-    display: block;
-    filter: drop-shadow(0 14px 30px color-mix(in srgb, var(--ds-primary) 28%, transparent));
-    animation: klb-orb-float 4s ease-in-out infinite;
-    will-change: transform;
-}
-@keyframes klb-orb-float {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-8px); }
-}
-@media (prefers-reduced-motion: reduce) {
-    .klb-orb-img { animation: none; }
-}
-
-/* RIGHT — floating chips + dotted connectors. */
-.klb-integrations {
-    position: relative;
-    display: flex; flex-direction: column; gap: 14px;
-    align-items: stretch;
-}
-.klb-connectors {
-    position: absolute; top: 0; bottom: 0; right: calc(100% + 2px);
-    width: clamp(30px, 3.4vw, 52px); height: 100%;
-    overflow: visible; pointer-events: none;
-}
-.klb-connectors path {
-    fill: none;
-    stroke: color-mix(in srgb, var(--ds-primary) 18%, transparent);
-    stroke-width: 1;
-    stroke-linecap: round;
-    stroke-dasharray: 1.4 5;
-    vector-effect: non-scaling-stroke;
-}
-.klb-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; align-items: flex-end; }
-.klb-chip {
-    display: inline-flex; align-items: center; gap: 11px;
-    padding: 10px 18px 10px 11px;
-    border-radius: var(--ds-radius-pill, 999px);
-    background: var(--ds-surface);
-    box-shadow:
-        0 0 0 1px color-mix(in srgb, var(--ds-border) 70%, transparent),
-        0 6px 18px -8px color-mix(in srgb, var(--ds-text-primary) 22%, transparent);
-    font-size: 14.5px; font-weight: 600; color: var(--ds-text-primary);
-    white-space: nowrap;
-}
-.klb-chip-logo {
-    flex-shrink: 0; width: 30px; height: 30px; border-radius: 9px;
-    display: grid; place-items: center;
-    background: color-mix(in srgb, var(--ds-bg-dim, var(--ds-border)) 40%, var(--ds-surface));
-    color: var(--ds-text-secondary);
-}
-.klb-chip-logo img { width: 19px; height: 19px; object-fit: contain; display: block; }
-.klb-chip-logo svg { width: 18px; height: 18px; }
-
-/* The trust caption ("Secure. Private. Always in sync.") — rendered on its
-   own beneath the hero by the rail chat dashboard. */
-.klb-hub-title { margin-top: 14px; font-size: 14.5px; font-weight: 650; letter-spacing: -0.01em; color: var(--ds-text-primary); }
-.klb-hub-caption {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12.5px; color: var(--ds-text-muted);
-}
-.klb-lock { width: 13px; height: 13px; flex-shrink: 0; }
-
-/* Stack below tablet width: lead → orb → chips, connectors off. */
-@media (max-width: 980px) {
-    .klb { padding: 34px 26px; border-radius: 22px; }
-    .klb-inner {
-        grid-template-columns: minmax(0, 1fr);
-        justify-items: center;
-        text-align: center;
-        gap: 28px;
-    }
-    .klb-lead { max-width: 540px; }
-    .klb-sub { max-width: none; margin-left: auto; margin-right: auto; }
-    /* Centred with the rest of the stacked lead. */
-    .klb-orient { margin-left: auto; margin-right: auto; }
-    .klb-decor-dots { display: none; }
-    .klb-connectors { display: none; }
-    .klb-chips { flex-direction: row; flex-wrap: wrap; justify-content: center; align-items: center; }
-}
-@media (max-width: 560px) {
-    .klb { padding: 26px 18px; border-radius: 18px; }
-    .klb-orb-ring { width: 176px; height: 176px; }
-    .klb-orb-glow { width: 200px; height: 200px; }
 }
 
 /* Dashboard */
@@ -6050,7 +5835,9 @@ details.section-card > summary {
    --ds-readonly (sharing-state semantic) — either would misattribute meaning.
    See the allowlist note in tests/test_design_system_contract.py. */
 .group-chip {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     padding: 3px 10px;
     border-radius: var(--radius-full);
     font-size: var(--text-sm);
@@ -6205,8 +5992,7 @@ details.section-card > summary {
 
 /* ── Chat landing: admin notice + doors (.cld-*) ─────────────────────────────
    The chat landing page introduces itself in text now, not in a banner. The
-   Knowledge Layer hero that used to lead this page (`.klb`, still defined
-   above because `.cbn--bar` shares its surface fill) asserted a category and
+   Knowledge Layer hero that used to lead this page asserted a category and
    spent the page's best space on a CTA pointing away from the composer; the
    six-step admin setup panel that briefly replaced it read as onboarding and
    graduated at the wrong moment. Both are gone. What is left is small on
@@ -6414,10 +6200,10 @@ details.section-card > summary {
    tinted panels with nothing to distinguish the card that is about your own
    instance from the one that points at your editor.
 
-   The surface is the Knowledge Layer banner's, reused rather than imitated —
-   `.klb`'s own layered fill scaled to card size. That banner is where the
-   product's visual language for "this is Agnes itself" was set, so the card
-   that speaks for Agnes should paint the same thing. Every layer rides
+   The surface is the knowledge-surface fill scaled to card size — the same
+   gradient `.cbn--bar` paints (see its rule near the top of this file). That
+   fill is where the product's visual language for "this is Agnes itself" was
+   set, so the card that speaks for Agnes should paint it too. Every layer rides
    `--ds-surface` or a color-mix into it, which is what lets one rule follow
    every palette theme with no dark-mode override. */
 .cld-door--lead {
@@ -6449,9 +6235,9 @@ details.section-card > summary {
 /* …and everything real sits above it. */
 .cld-door--lead > * { position: relative; z-index: 1; }
 
-/* The title is solid accent ink, NOT the banner's blue→purple gradient — that
-   was tried here and does not survive the themes at this size.
-   `.klb-headline-grad` runs `--ds-assistant` → `--ds-kind-agent`: fine on a
+/* The title is solid accent ink, NOT the retired hero's blue→purple gradient —
+   that was tried here and does not survive the themes at this size. The
+   gradient ran `--ds-assistant` → `--ds-kind-agent`: fine on a
    30px/760 headline, which only owes 3:1, and wrong on a 14.5px card title,
    which owes 4.5:1. `--ds-assistant` is 4.1:1 on the paper surface, and under
    `data-theme="dark"` `--ds-kind-agent` collapses to 2.4:1 — so the right end
@@ -6575,7 +6361,14 @@ details.section-card > summary {
        empty-instance position; overridden below for the ordinary one. */
     margin: calc(var(--cld-gap-inner, 10px) - var(--cld-gap-tight, 5px)) 0 0;
 }
-.cld-trust .klb-hub-caption { justify-content: center; }
+/* The trust claim ("Secure. Private. Always in sync."), inlined in chat.html.
+   It was `.klb-hub-*` in the retired hero's stylesheet, shared with a hero
+   variant that also rendered a title; only the caption survived the hero. */
+.cld-trust-claim {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    font-size: 12.5px; color: var(--ds-text-muted);
+}
+.cld-trust-lock { width: 13px; height: 13px; flex-shrink: 0; }
 .cld-trust-sep {
     width: 1px; height: 13px;
     background: var(--ds-border);

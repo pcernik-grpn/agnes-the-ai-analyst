@@ -28,7 +28,7 @@ from connectors.snowflake.settings import (
     SF_PRIVATE_KEY_PASSPHRASE_ENV,
     SF_TOKEN_ENV,
 )
-from src.audit_helpers import client_kind_from_user
+from src.audit_helpers import client_kind_from_user, log_safe
 from src.identifier_validation import (
     is_safe_identifier as _is_safe_identifier,
 )
@@ -864,6 +864,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "builder is the supported path. Both POST handlers carry the gate "
                 "too, so a stale external button gets a redirect home rather than "
                 "a silent publish."
+            ),
+        },
+        "store_moderation_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "store_moderation_enabled", False),
+            "hint": (
+                "The Moderation & Trust hub (/admin/store), its nav row, its "
+                "command-palette row and the `g v` shortcut. OFF by default: each "
+                "of its three zones has a nearer door — Submissions is its own nav "
+                "row, curation is /admin/marketplaces, and verification has its own "
+                "store.verification_enabled — so the hub was a landing page for "
+                "links the column already carries. Hides UI only: the store APIs "
+                "and /api/admin/share-requests* keep serving, so a queued agent "
+                "share stays decidable by API."
             ),
         },
     },
@@ -2759,6 +2773,12 @@ async def get_server_config(
     # Always surface the optional BQ knobs so the operator sees them in the
     # UI's JSON editor instead of having to know they exist (Phase J).
     _ensure_bq_optional_fields(sections)
+    log_safe(
+        user_id=user.get("id"),
+        action="server_config.read",
+        resource="instance.yaml",
+        params={"view": "redacted"},
+    )
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
@@ -2838,6 +2858,12 @@ async def get_server_config_overlay(
         for section in _EDITABLE_SECTIONS
         if isinstance(raw.get(section), dict)
     }
+    log_safe(
+        user_id=user.get("id"),
+        action="server_config.read",
+        resource="instance.yaml",
+        params={"view": "overlay"},
+    )
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
@@ -7014,6 +7040,10 @@ async def configure_instance(
 
     config_path = _state_dir() / "instance.yaml"
 
+    # Changed top-level overlay KEY NAMES only (never values) — the audit
+    # row `instance.configure` reports at the end of this handler.
+    changed_keys: set = set()
+
     # Same serialization + corrupt-overlay handling as POST /server-config.
     with _overlay_write_lock:
         overlay: dict = {}
@@ -7060,9 +7090,11 @@ async def configure_instance(
         # env-resolved merged config.
         if request.instance_name:
             overlay.setdefault("instance", {})["name"] = request.instance_name
+            changed_keys.add("instance")
 
         if request.allowed_domain:
             overlay.setdefault("auth", {})["allowed_domain"] = request.allowed_domain
+            changed_keys.add("auth")
 
         # data_source.type is fully owned by this endpoint, but the REST of
         # the data_source block is not — an instance can already carry
@@ -7075,6 +7107,7 @@ async def configure_instance(
             existing_data_source = {}
         existing_data_source["type"] = request.data_source
         overlay["data_source"] = existing_data_source
+        changed_keys.add("data_source")
         if request.data_source == "keboola":
             overlay["data_source"]["keboola"] = {
                 "stack_url": request.keboola_url,
@@ -7101,6 +7134,7 @@ async def configure_instance(
                     "model": "claude-haiku-4-5-20251001",
                     "structured_output": "auto",
                 }
+                changed_keys.add("ai")
             elif llm_key:
                 overlay["ai"] = {
                     "provider": "anthropic",
@@ -7108,6 +7142,7 @@ async def configure_instance(
                     "model": "claude-haiku-4-5-20251001",
                     "structured_output": "auto",
                 }
+                changed_keys.add("ai")
 
         # Atomic write to writable data volume — same tmp + os.replace pattern
         # as the server-config editor so a concurrent save can't tear the file.
@@ -7127,6 +7162,7 @@ async def configure_instance(
         secrets_to_persist["KEBOOLA_STACK_URL"] = request.keboola_url
 
     if secrets_to_persist:
+        changed_keys.add("secrets")
         # SECURITY (#12): this path writes KEBOOLA_STORAGE_TOKEN to the plaintext
         # .env_overlay even when the Fernet vault is configured, bypassing
         # encryption-at-rest. Warn so it's visible; full fix (route datasource
@@ -7178,6 +7214,15 @@ async def configure_instance(
     from app.instance_config import reset_cache
 
     reset_cache()
+
+    # Changed key NAMES only — never values (secret-bearing keys/config
+    # content never enters an audit record).
+    log_safe(
+        user_id=user.get("id"),
+        action="instance.configure",
+        resource="instance.yaml",
+        params={"keys": sorted(changed_keys)},
+    )
 
     return {
         "status": "ok",
@@ -7746,6 +7791,7 @@ def run_corporate_memory(
     audit_params: dict = {
         "items_new": stats.get("items_new", 0),
         "items_filtered": stats.get("items_filtered", 0),
+        "items_duplicate_skipped": stats.get("items_duplicate_skipped", 0),
         "items_db_inserted": stats.get("items_db_inserted", 0),
         "items_db_updated": stats.get("items_db_updated", 0),
         "items_db_errors": stats.get("items_db_errors", 0),

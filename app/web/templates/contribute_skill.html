@@ -121,7 +121,7 @@
   {% if result %}
   <div class="contrib-result" role="status">
     <strong>Published.</strong> &ldquo;{{ result.skill_name }}&rdquo; is now in your
-    marketplace{% if result.granted_group %}, visible to <strong>{{ result.granted_group }}</strong>{% endif %}.
+    marketplace{% if result.granted_group %}, visible to <strong>{{ ds.group_mark('inline') }}{{ result.granted_group }}</strong>{% endif %}.
     <div class="contrib-result-actions">
       {{ ds.button('Open in ' ~ (instance_brand or 'Agnes') ~ ' →', variant='primary', href=result.detail_url) }}
       <form method="post" action="/admin/contribute-skill/{{ result.plugin_name }}/delete" style="margin:0">

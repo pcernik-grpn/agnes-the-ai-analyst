@@ -335,5 +335,10 @@ class TestTheLibraryShapedPreview:
         assert "/library-preview" in src
         assert "ax-preview" in src
         assert "What their Library shows" in src
-        assert "In stack · Automatic" in src
-        assert "Not in stack yet · Optional" in src
+        # The chips speak the person's words now, not the admin's — this
+        # lens exists to show what somebody else sees, so "In stack ·
+        # Automatic" (the retired admin vocabulary) was the one place it
+        # could least afford to say it. See tests/test_access_vocabulary.py.
+        assert "Required by your admin" in src
+        assert "In their Library" in src
+        assert "Available, no local copy yet" in src
