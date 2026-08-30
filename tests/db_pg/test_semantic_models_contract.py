@@ -235,3 +235,46 @@ def test_count_valid_agrees_with_list_all_on_both_engines(repo):
     usable = [r for r in repo.list_all() if r.get("status") == "valid" and r.get("document_json")]
     assert repo.count_valid() >= len(usable)
     assert repo.count_valid() == len(usable)
+
+
+def test_counts_by_provenance_groups_every_origin(repo):
+    """The read-time answer to "how many models does this source own".
+
+    Keyed on the same ``(source, source_ref)`` pair ``delete_missing`` prunes
+    on, but deliberately NOT equal to what a prune would delete — the prune is
+    narrower (detached rows on PG, the ``safe_prune`` skip). "Owns" is "is
+    stamped with this provenance", nothing more. One grouped query, not one
+    COUNT per source.
+    """
+    assert repo.counts_by_provenance() == {}
+
+    _upsert(repo, id="m1", slug="retail", source="ossie_git", source_ref="ss_a")
+    _upsert(repo, id="m2", slug="finance", source="ossie_git", source_ref="ss_a")
+    _upsert(repo, id="m3", slug="other", source="ossie_git", source_ref="ss_b")
+
+    counts = repo.counts_by_provenance()
+    assert counts[("ossie_git", "ss_a")] == 2
+    assert counts[("ossie_git", "ss_b")] == 1
+    assert ("ossie_git", "ss_c") not in counts, "a scope with no rows is absent, never a zero row"
+
+
+def test_counts_by_provenance_treats_a_null_source_ref_as_its_own_origin(repo):
+    """Same asymmetry ``delete_missing`` has: NULL is one origin among others,
+    not a wildcard. Both engines must agree on the key it lands under."""
+    _upsert(repo, id="m1", slug="kept", source="keboola_metastore", source_ref=None)
+    _upsert(repo, id="m2", slug="other", source="keboola_metastore", source_ref="conn-a")
+
+    counts = repo.counts_by_provenance()
+    assert counts[("keboola_metastore", None)] == 1
+    assert counts[("keboola_metastore", "conn-a")] == 1
+
+
+def test_counts_by_provenance_counts_invalid_documents_too(repo):
+    """An invalid document is still a row this source wrote and this source's
+    next prune would reach. Excluding it would report "owns 0" for a source
+    that is importing fine and failing validation — two different problems the
+    health report already tells apart (``invalid_models``)."""
+    _upsert(repo, id="m1", slug="retail", source="ossie_git", source_ref="ss_a")
+    _upsert(repo, id="m2", slug="broken", source="ossie_git", source_ref="ss_a", status="invalid")
+
+    assert repo.counts_by_provenance()[("ossie_git", "ss_a")] == 2

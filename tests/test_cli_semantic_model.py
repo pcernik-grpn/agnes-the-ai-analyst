@@ -253,6 +253,110 @@ class TestSemanticSourceList:
         assert result.exit_code == 0
         assert json.loads(result.stdout) == rows
 
+    def test_json_carries_the_owned_model_count_verbatim(self):
+        """`--json` is the server payload, so the count rides along untouched."""
+        rows = [{"id": "ss_1", "kind": "git", "name": "x", "enabled": True, "owned_model_count": 3}]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)[0]["owned_model_count"] == 3
+
+    def test_table_distinguishes_a_synced_source_that_owns_nothing(self):
+        """#1707: both rows read `ok`; only the model count tells them apart."""
+        rows = [
+            {
+                "id": "ss_full",
+                "kind": "connection",
+                "name": "Warehouse",
+                "enabled": True,
+                "last_sync_status": "ok",
+                "owned_model_count": 4,
+            },
+            {
+                "id": "ss_empty",
+                "kind": "connection",
+                "name": "Empty",
+                "enabled": True,
+                "last_sync_status": "ok",
+                "owned_model_count": 0,
+            },
+        ]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list"])
+        assert result.exit_code == 0
+        lines = {line.split()[0]: line for line in result.output.splitlines() if line.startswith("ss_")}
+        assert "4 models" in lines["ss_full"]
+        assert "0 models" in lines["ss_empty"]
+
+    def test_a_synced_source_owning_nothing_gets_a_forward_hint(self):
+        rows = [
+            {
+                "id": "ss_empty",
+                "kind": "connection",
+                "name": "Empty",
+                "enabled": True,
+                "last_sync_status": "ok",
+                "owned_model_count": 0,
+            }
+        ]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list"])
+        assert result.exit_code == 0
+        assert "synced but own no models" in result.output
+        assert "agnes admin semantic source sync" in result.output
+
+    def test_no_hint_when_every_synced_source_owns_something(self):
+        rows = [
+            {
+                "id": "ss_full",
+                "kind": "git",
+                "name": "Full",
+                "enabled": True,
+                "last_sync_status": "ok",
+                "owned_model_count": 1,
+            }
+        ]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list"])
+        assert "own no models" not in result.output
+
+    def test_a_never_synced_source_owning_nothing_is_not_flagged(self):
+        """Nothing has run yet — "0 models" there is expected, not a finding."""
+        rows = [{"id": "ss_new", "kind": "git", "name": "New", "enabled": True, "owned_model_count": 0}]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list"])
+        assert "own no models" not in result.output
+
+    def test_an_explicit_null_renders_the_placeholder_not_zero(self):
+        """`null` is "cannot say" (the source's provenance could not be
+        resolved), not "owns nothing" — and it must not be flagged as a
+        silently-empty source either."""
+        rows = [
+            {
+                "id": "ss_murky",
+                "kind": "connection",
+                "name": "Murky",
+                "enabled": True,
+                "last_sync_status": "ok",
+                "owned_model_count": None,
+            }
+        ]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list"])
+        assert result.exit_code == 0
+        assert "0 models" not in result.output
+        assert "own no models" not in result.output
+
+    def test_a_server_without_the_field_renders_a_placeholder(self):
+        """Version skew: an older server omits the field. Print "-", never a
+        confident "0 models" the server never claimed."""
+        rows = [{"id": "ss_1", "kind": "git", "name": "x", "enabled": True, "last_sync_status": "ok"}]
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list"])
+        assert result.exit_code == 0
+        assert "0 models" not in result.output
+        assert "own no models" not in result.output
+
 
 class TestSemanticSourceSync:
     def test_sync_reports_counts(self):

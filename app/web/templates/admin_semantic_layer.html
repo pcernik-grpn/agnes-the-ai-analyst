@@ -1113,6 +1113,13 @@ function hlRender(body) {
 
   const mutedScopes = hlMutedScopes(body.mutes || []);
   const failedSources = (body.sources || []).filter((s) => s.last_sync_status === "error");
+  // #1707: a fetch that worked is not a fetch that brought anything back.
+  // Only a source that actually SYNCED counts — a never-synced one has not
+  // imported nothing, it has not run — and `owned_model_count: null` means
+  // "cannot say" (src/semantic/ownership.py), never "owns none".
+  const emptySources = (body.sources || []).filter(
+    (s) => s.last_sync_status === "ok" && typeof s.owned_model_count === "number" && s.owned_model_count === 0
+  );
   const orphaned = body.orphaned_models || [];
   const tableBindings = body.orphaned_table_bindings || [];
   const invalid = body.invalid_models || [];
@@ -1123,6 +1130,7 @@ function hlRender(body) {
 
   const nothingWrong =
     !failedSources.length &&
+    !emptySources.length &&
     !orphaned.length &&
     !tableBindings.length &&
     !invalid.length &&
@@ -1150,6 +1158,17 @@ function hlRender(body) {
     const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
     li.appendChild(hlEl("strong", null, s.name || s.source_id));
     li.appendChild(document.createTextNode(": " + (s.last_sync_error || "unknown error")));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  // Its own section, never a row inside "Sync failures": nothing failed
+  // here, so it must not borrow the failure vocabulary. Neutral text, the
+  // same styling every other non-failure section uses.
+  hlSection(container, "Sources that synced but imported nothing", emptySources, (li, s) => {
+    const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
+    li.appendChild(hlEl("strong", null, s.name || s.source_id));
+    li.appendChild(document.createTextNode(" — check this source's scope/config"));
     const badge = hlMutedBadge(muted);
     if (badge) li.appendChild(badge);
   });

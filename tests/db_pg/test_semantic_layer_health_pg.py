@@ -133,6 +133,53 @@ class TestSyncStatus:
         assert by_id["src-b"]["last_sync_status"] is None
 
 
+class TestOwnedModelCount:
+    """#1707: "synced ok" and "synced ok and imported nothing" must not read
+    the same in the report the admin banner and the CLI both consume."""
+
+    def test_each_source_reports_how_many_models_it_owns(self, pg_state):
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _source("src-a", name="Warehouse", status="ok")
+        _source("src-b", name="Empty", status="ok")
+        _model("m1", slug="revenue", source="ossie_upload", source_ref="src-a")
+        _model("m2", slug="churn", source="ossie_upload", source_ref="src-a")
+
+        health = compute_semantic_layer_health()
+        by_id = {s["source_id"]: s for s in health["sources"]}
+        assert by_id["src-a"]["last_sync_status"] == by_id["src-b"]["last_sync_status"] == "ok"
+        assert by_id["src-a"]["owned_model_count"] == 2
+        assert by_id["src-b"]["owned_model_count"] == 0
+
+    def test_an_unresolvable_provenance_reports_null_not_zero(self, pg_state):
+        """"Cannot say" must not be rendered as "imported nothing" — the
+        health page and CLI both key their finding on an integer 0."""
+        from src.repositories import semantic_source_repo
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        semantic_source_repo().create(
+            id="src-murky",
+            kind="connection",
+            name="Murky",
+            adapter="native",
+            config={"provenance": {"source": "someone_elses_scope"}},
+        )
+
+        by_id = {s["source_id"]: s for s in compute_semantic_layer_health()["sources"]}
+        assert by_id["src-murky"]["owned_model_count"] is None
+
+    def test_another_sources_models_are_not_counted(self, pg_state):
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _source("src-a", name="A", status="ok")
+        _source("src-b", name="B", status="ok")
+        _model("m1", slug="revenue", source="ossie_upload", source_ref="src-b")
+
+        by_id = {s["source_id"]: s for s in compute_semantic_layer_health()["sources"]}
+        assert by_id["src-a"]["owned_model_count"] == 0
+        assert by_id["src-b"]["owned_model_count"] == 1
+
+
 class TestOrphanedModels:
     def test_a_model_whose_source_was_deleted_is_flagged(self, pg_state):
         from src.semantic.coverage import compute_semantic_layer_health
@@ -495,6 +542,7 @@ class TestTheEndpointOnPostgres:
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
+        assert all("owned_model_count" in s for s in body["sources"])
         for key in (
             "sources",
             "orphaned_models",

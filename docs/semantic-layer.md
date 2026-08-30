@@ -99,6 +99,41 @@ source never stops the sweep over the rest; each source's own
 /api/admin/semantic-sources` and in Health, below) still reflects only its own
 outcome.
 
+### Did the sync actually bring anything back?
+
+`last_sync_status='ok'` answers "did the fetch work", never "did it import
+anything" — a `connection` source scoped at a database with no semantic
+content syncs green forever while owning zero models, which reads exactly
+like a healthy source. Every surface that shows a source's sync state
+therefore also shows **`owned_model_count`**: `GET
+/api/admin/semantic-sources` (list, single-source `GET`, and the `POST`/`PUT`
+responses, so every shape matches), the `sources` block of the health report,
+the **Models** column on `/admin/semantic-sources`, and `agnes admin semantic
+source list`.
+
+A source that synced OK and still owns nothing is the finding, and it is
+reported as one: amber on the page, a named line in the CLI listing, and its
+own **"Sources that synced but imported nothing"** section in the health
+report (page + CLI). Never with error styling — the fetch worked, so nothing
+failed — and never for a source that has not synced at all: owning nothing
+before the first run is "has not run", not "imported nothing".
+
+The count is derived at read time, never stored: it counts `semantic_models`
+rows stamped with the exact `(source, source_ref)` provenance this source's
+imports write under (`src/semantic/ownership.py`). "Owns" means that and
+nothing more — in particular it is **not** "its next sync could delete this
+many": the prune is keyed on the same pair but is narrower (it skips
+`sync_mode='detached'` rows on Postgres, and a `safe_prune` source skips the
+prune entirely on a run that produced no valid document).
+
+Invalid documents count as owned: the count answers "did this source bring
+anything in", and whether what it brought in parses is a separate question
+the health report's `invalid_models` already answers. A source whose
+`config.provenance` override cannot be resolved reports `null` rather than a
+confident `0` — the resolver validates against live state, so an
+unresolvable override means "cannot say", not "owns nothing" (it is logged as
+a warning server-side, renders as `—` on the page and `-` in the CLI).
+
 `enabled: false` (`--disabled` on `add`, or `PUT .../sources/{id}` with
 `enabled: false`) excludes a source from **both** this scheduled sweep and the
 manual `agnes admin semantic-source sync <id>` / `POST .../sources/{id}/sync`
@@ -443,7 +478,12 @@ Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
 (admin, `/admin/semantic-layer` → **Health**) answers "is what exists broken,
 stale, or internally inconsistent" — a different question, in one response:
 
-- **`sources`** — every `semantic_sources` row's last sync outcome, verbatim.
+- **`sources`** — every `semantic_sources` row's last sync outcome, verbatim,
+  plus `owned_model_count` (see above): a source can sync `ok` and import
+  nothing, and the status alone cannot say so. A dedicated **"Sources that
+  synced but imported nothing"** section lists exactly those, so a
+  silently-empty source is a finding rather than a number the reader has to
+  notice — reported without error styling, because nothing failed.
 - **`orphaned_models`** — non-`manual` models whose `source_ref` names no live
   source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
   not cascade to the models it fed, so a project can vanish and leave its

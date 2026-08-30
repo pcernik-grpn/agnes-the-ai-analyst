@@ -50,6 +50,7 @@ from src.repositories import (
 )
 from src.semantic.cache_render import DEFAULT_TTL_SECONDS
 from src.semantic.document_validation import validate_document
+from src.semantic.ownership import with_owned_model_count
 from src.semantic.projection import project_document, prune_model
 from src.semantic_context import get_semantic_context as _get_semantic_context
 from src.semantic_context import get_semantic_schema as _get_semantic_schema
@@ -1042,12 +1043,25 @@ async def delete_semantic_model(model_id: str, user: dict = Depends(require_admi
 
 # ---------------------------------------------------------------------------
 # Admin: semantic-sources CRUD + sync
+#
+# Every read AND write response goes through `with_owned_model_count`, so a
+# caller that renders any of them into the same table never has to special-
+# case a missing field (#1707).
 # ---------------------------------------------------------------------------
 
 
 @router.get("/api/admin/semantic-sources")
 async def list_semantic_sources(enabled_only: bool = False, user: dict = Depends(require_admin)):
-    return semantic_source_repo().list_all(enabled_only=enabled_only)
+    """Every registered source, each with the number of semantic models it
+    OWNS (``owned_model_count``).
+
+    The count is derived, never stored (see ``src/semantic/ownership.py``):
+    ``last_sync_status='ok'`` answers "did the fetch work", not "did it bring
+    anything back", so a source scoped at an upstream with nothing in it is
+    otherwise indistinguishable from a healthy one (#1707). ``null`` means the
+    source's provenance could not be resolved — "cannot say", not "owns none".
+    """
+    return with_owned_model_count(semantic_source_repo().list_all(enabled_only=enabled_only))
 
 
 @router.post("/api/admin/semantic-sources", status_code=201)
@@ -1064,7 +1078,7 @@ async def create_semantic_source(body: SemanticSourceCreate, user: dict = Depend
     from uuid import uuid4
 
     source_id = f"ss_{uuid4().hex[:12]}"
-    return semantic_source_repo().create(
+    created = semantic_source_repo().create(
         id=source_id,
         kind=body.kind,
         name=body.name.strip(),
@@ -1072,14 +1086,19 @@ async def create_semantic_source(body: SemanticSourceCreate, user: dict = Depend
         config=body.config,
         enabled=body.enabled,
     )
+    # Same shape as the list row — a caller that renders the POST response
+    # straight into the table must not have to special-case a missing field
+    # (it is 0 here by definition: nothing has synced yet).
+    return with_owned_model_count([created])[0]
 
 
 @router.get("/api/admin/semantic-sources/{source_id}")
 async def get_semantic_source(source_id: str, user: dict = Depends(require_admin)):
+    """One source, same shape as the list row — ``owned_model_count`` and all."""
     row = semantic_source_repo().get(source_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
-    return row
+    return with_owned_model_count([row])[0]
 
 
 @router.put("/api/admin/semantic-sources/{source_id}")
@@ -1089,11 +1108,11 @@ async def update_semantic_source(source_id: str, body: SemanticSourceUpdate, use
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
     fields = body.model_dump(exclude_unset=True)
     if not fields:
-        return repo.get(source_id)
+        return with_owned_model_count([repo.get(source_id)])[0]
     if fields.get("adapter") is not None:
         _assert_known_adapter(fields["adapter"])
     _assert_no_provenance_override(fields.get("config"))
-    return repo.update(source_id, **fields)
+    return with_owned_model_count([repo.update(source_id, **fields)])[0]
 
 
 @router.delete("/api/admin/semantic-sources/{source_id}", status_code=204)

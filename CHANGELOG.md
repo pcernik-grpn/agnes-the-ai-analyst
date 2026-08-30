@@ -10,6 +10,29 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **A semantic source that syncs successfully and imports nothing is no longer
+  indistinguishable from a healthy one (#1707).** `last_sync_status='ok'` says
+  the fetch worked, not that it brought anything back — a `connection` source
+  scoped at a database with no semantic views read green while owning zero
+  models, so "upstream has nothing" and "scoped wrong, silently" looked the
+  same. Every surface that shows a source's sync state now also shows
+  `owned_model_count`: `GET /api/admin/semantic-sources` (list, single-source
+  `GET`, and the `POST`/`PUT` responses, so every shape matches), the
+  `sources` block of `GET /api/admin/semantic-layer/health`, a **Models**
+  column on `/admin/semantic-sources`, and `agnes admin semantic source
+  list`. The health report additionally grew a **"Sources that synced but
+  imported nothing"** section — on the `/admin/semantic-layer` Health tab and
+  in `agnes admin semantic health` — so the case is a listed finding rather
+  than a number the reader has to notice, and it no longer reads "No sync
+  failures, disconnected models, or invalid documents". Reported without
+  error styling everywhere (attention, not failure — nothing failed), and
+  only for a source that actually synced: a never-synced source owning
+  nothing has not run yet. The count is derived at read time — it counts
+  `semantic_models` rows stamped with the source's `(source, source_ref)`
+  provenance (`src/semantic/ownership.py`), invalid documents included —
+  and nothing is stored, so it cannot drift out of agreement with the models
+  table. A source whose provenance cannot be resolved reports `null`
+  ("cannot say", logged server-side) rather than a confident `0`.
 - **`agnes semantic-model search <term>` — the non-admin way to find a semantic
   model.** `GET /api/semantic-models/search` is public and RBAC-filtered, and
   had an MCP tool and a web page but no CLI: the only listing was `agnes admin

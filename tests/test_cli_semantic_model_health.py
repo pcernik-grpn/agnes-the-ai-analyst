@@ -92,3 +92,59 @@ def test_json_flag_passes_the_key_through_verbatim():
     assert result.exit_code == 0
     assert "orphaned_table_bindings" in result.output
     assert "orders_gone" in result.output
+
+
+class TestSourcesThatSyncedButImportedNothing:
+    """#1707: the report already carried `owned_model_count`, but this
+    renderer filtered `sources` on `last_sync_status == "error"` alone — so a
+    source that synced fine and imported nothing produced no section at all
+    AND still got the reassuring "No sync failures…" line."""
+
+    @staticmethod
+    def _source(source_id: str, *, status: str | None, owned: int | None) -> dict:
+        return {
+            "source_id": source_id,
+            "name": source_id.title(),
+            "last_sync_status": status,
+            "last_sync_at": None,
+            "last_sync_error": None,
+            "owned_model_count": owned,
+        }
+
+    def _run(self, sources: list[dict]):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, _health_body(sources=sources))):
+            return runner.invoke(app, ["semantic-model", "health"])
+
+    def test_a_synced_source_owning_nothing_is_reported(self):
+        result = self._run([self._source("warehouse", status="ok", owned=0)])
+        assert result.exit_code == 0
+        assert "Sources that synced but imported nothing (1):" in result.output
+        assert "Warehouse" in result.output
+
+    def test_it_suppresses_the_nothing_is_wrong_line(self):
+        result = self._run([self._source("warehouse", status="ok", owned=0)])
+        assert "No sync failures, disconnected models, or invalid documents." not in result.output
+
+    def test_it_is_not_styled_as_an_error(self):
+        """Nothing failed — the fetch worked. It must not read as a failure."""
+        result = self._run([self._source("warehouse", status="ok", owned=0)])
+        assert "Sync failures" not in result.output
+
+    def test_a_source_owning_models_is_not_reported(self):
+        result = self._run([self._source("warehouse", status="ok", owned=3)])
+        assert "synced but imported nothing" not in result.output
+        assert "No sync failures, disconnected models, or invalid documents." in result.output
+
+    def test_a_never_synced_source_is_not_reported(self):
+        result = self._run([self._source("fresh", status=None, owned=0)])
+        assert "synced but imported nothing" not in result.output
+
+    def test_a_failed_source_stays_in_the_sync_failures_section_only(self):
+        result = self._run([self._source("broken", status="error", owned=0)])
+        assert "Sync failures (1):" in result.output
+        assert "synced but imported nothing" not in result.output
+
+    def test_an_unknown_count_is_never_reported_as_empty(self):
+        """`null` means "cannot say", not "owns nothing"."""
+        result = self._run([self._source("murky", status="ok", owned=None)])
+        assert "synced but imported nothing" not in result.output

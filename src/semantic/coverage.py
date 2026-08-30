@@ -493,6 +493,20 @@ def compute_cross_domain_coverage(source_id: str | None = None) -> dict[str, Any
 
 
 def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-source sync state, plus how many models each source OWNS.
+
+    ``last_sync_status='ok'`` says the fetch worked, never that it brought
+    anything back — a source scoped at an upstream with no semantic content
+    syncs green forever while owning nothing (#1707). ``owned_model_count``
+    is derived at read time from the ``(source, source_ref)`` provenance the
+    importer stamps (``src/semantic/ownership.py``), so the report can tell
+    "healthy" from "silently empty" without a stored counter. It is ``None``
+    for a source whose provenance could not be resolved — "cannot say", which
+    is a different statement from "owns nothing".
+    """
+    from src.semantic.ownership import owned_model_counts
+
+    counts = owned_model_counts(sources)
     return [
         {
             "source_id": s["id"],
@@ -500,6 +514,9 @@ def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "last_sync_status": s.get("last_sync_status"),
             "last_sync_at": s.get("last_sync_at"),
             "last_sync_error": s.get("last_sync_error"),
+            # `None` when the provenance could not be resolved — "cannot
+            # say", never a confident 0 (see src/semantic/ownership.py).
+            "owned_model_count": counts.get(s["id"]),
         }
         for s in sources
     ]
