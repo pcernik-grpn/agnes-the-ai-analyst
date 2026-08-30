@@ -1094,6 +1094,16 @@ _EXEMPT: dict[str, str] = {
         "keboola-only browse-and-register primitive with no analyst CLI/MCP analogue; "
         "`agnes admin register-table` already covers the actual registration step"
     ),
+    "/api/admin/source-pipelines": (
+        "the /admin/data-sources source cards' own pipeline strip, as data — "
+        "read-only, and by construction NOT new data: it re-serves the exact "
+        "dict that page already inlines into its HTML, so the page can repaint "
+        "a card after the wizard/token/package mutations that happen on it over "
+        "fetch. No analyst CLI/MCP analogue: every fact in it is a projection of "
+        "surfaces that already have one (`agnes admin list-tables`, `agnes admin "
+        "sync`, `agnes admin data-package list`), assembled in the shape one "
+        "browser card draws"
+    ),
     # SharePoint connect wizard (spec 2026-08-27 §13.2) — admin-only browse
     # and scope-confirmation primitives feeding the wizard's step 2/3, with
     # no analyst CLI/MCP analogue (the wizard itself is the only client; the
