@@ -16,6 +16,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **A data package's lifecycle status now means what its label says.** The status picker offers "Draft — admin-only, hidden from analysts" and "Coming soon — visible but not usable yet", and until now `status` drove nothing but a card pill and a hero filter checkbox: a package marked **draft** and granted to a group landed in every member's Library fully materialized, and a **coming-soon** one shipped parquets like any other row. Both promises are now kept in `StackResolver` — `draft` is filtered out of `browse()`, `stack()` and the Principal (agent / co-session) path, and `coming-soon` browses but is never materialized and never enters the stack. Because `app/api/sync.py` builds the pull manifest out of `resolver.stack`, one gate covers the Library, the stack and `agnes pull` at once rather than three surfaces drifting apart again. `browse_admin()` opts out explicitly so admins still see the drafts they author, and the new `include_hidden` parameter defaults to False so a future caller fails closed. The package detail page stops contradicting itself with it: a draft reads "Reaches: Nobody — draft" instead of the grant count, and the delivery panel explains that the grants are in place and will take effect when the status changes.
+
 ### Removed
 
 ### Internal
