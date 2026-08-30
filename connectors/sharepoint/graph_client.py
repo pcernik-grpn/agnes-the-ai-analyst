@@ -639,3 +639,52 @@ async def probe_unique_permissions(access_token: str, drive_id: str, item_ids: L
                     value = raw
             result[item_id] = value
     return result
+
+
+# ---------------------------------------------------------------------------
+# ACL mirroring readers (design spec 2026-08-28 §6 link 1): unlike the probe
+# above, these two ARE read for enforcement — the ACL sync job (2026-08-30
+# plan, Task 4) classifies their output into Agnes groups/grants. Both page
+# via ``@odata.nextLink``, the standard Graph collection convention.
+# ---------------------------------------------------------------------------
+
+
+async def _graph_get_all_pages(
+    access_token: str, path: str, *, params: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """Collect ``value`` across ``@odata.nextLink`` pages (permissions and
+    transitiveMembers both page; a single-page read costs nothing extra)."""
+    items: List[Dict[str, Any]] = []
+    body = await _graph_get(access_token, path, params=params)
+    while True:
+        items.extend(body.get("value") or [])
+        next_link = body.get("@odata.nextLink")
+        if not next_link:
+            return items
+        # nextLink is absolute and already carries the query string; _graph_get
+        # prepends GRAPH_BASE itself, so strip that same prefix back off.
+        body = await _graph_get(access_token, next_link.split("/v1.0", 1)[-1])
+
+
+async def list_item_permissions(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+    """Raw Graph ``permission`` objects on one drive item (the scope root) —
+    the sync's per-run read of who currently has access. App-only requires
+    ``Sites.FullControl.All`` or a per-site ``Sites.Selected`` full-control
+    role; a Graph failure surfaces as :class:`SharePointGraphError`, never
+    swallowed (the caller marks the run/scope failed and audits it)."""
+    return await _graph_get_all_pages(access_token, f"/drives/{drive_id}/items/{item_id}/permissions")
+
+
+async def list_group_transitive_members(access_token: str, group_id: str) -> List[Dict[str, Any]]:
+    """Transitive USER members of an Entra group — nested groups are
+    flattened by Graph itself; non-user directory objects (nested groups,
+    service principals, ...) are dropped here so callers never have to
+    re-check ``@odata.type``. Requires ``GroupMember.Read.All`` (NOT
+    included in ``Sites.FullControl.All`` — a separate app-registration
+    permission grant)."""
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/groups/{group_id}/transitiveMembers",
+        params={"$select": "id,mail,userPrincipalName", "$top": "999"},
+    )
+    return [r for r in rows if r.get("@odata.type") == "#microsoft.graph.user"]
