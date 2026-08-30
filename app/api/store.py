@@ -47,6 +47,7 @@ from fastapi import (
     UploadFile,
 )
 
+from src.images.variants import ALLOWED_WIDTHS, coerce_width, variant_path
 from src.repositories import (
     audit_repo,
     store_entities_repo,
@@ -1732,6 +1733,9 @@ async def get_entity_status(
 @router.get("/entities/{entity_id}/photo")
 async def get_entity_photo(
     entity_id: str,
+    w: str | None = Query(
+        None, description="Serve a resized WebP variant (480 or 960); any other value serves the original"
+    ),
     _user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -1755,10 +1759,13 @@ async def get_entity_photo(
     abs_path = _entity_dir(entity_id) / entity["photo_path"]
     if not abs_path.is_file():
         raise HTTPException(status_code=404, detail="photo_not_found")
-    return FileResponse(
-        abs_path,
-        headers={"Cache-Control": "public, max-age=2592000, immutable"},
-    )
+    photo_headers = {"Cache-Control": "public, max-age=2592000, immutable"}
+    width = coerce_width(w)
+    if width in ALLOWED_WIDTHS:
+        variant = await run_in_threadpool(variant_path, abs_path, width)
+        if variant is not None:
+            return FileResponse(variant, media_type="image/webp", headers=photo_headers)
+    return FileResponse(abs_path, headers=photo_headers)
 
 
 @router.get("/entities/{entity_id}/docs/{filename}")

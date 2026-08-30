@@ -18,6 +18,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   parent-side profile writer.
 
 ### Added
+- Cover images can be requested as resized WebP variants with ?w=480 or ?w=960 on the upload, marketplace and store photo routes; other widths serve the original. Variants are generated once on first request and cached on disk.
 
 ### Changed
 - Cover images on package, memory-domain, marketplace and store pages now declare their size, decode off the main thread and lazy-load below the fold; page heroes are fetched at high priority.

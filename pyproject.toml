@@ -96,8 +96,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Image variants for cover photos are generated on the server at serve time
     # (resize + WebP encode). The serving code lives in `app/web/cover_files.py`
-    # and `src/images/` (follow-up PRs). Pillow was marked test-only when the
-    # vision ingest path never imported PIL; it now generates production assets.
+    # and `src/images/`. Pillow was marked test-only when the vision ingest
+    # path never imported PIL; it now generates production assets.
     "pillow>=10.0.0",
 ]
 
