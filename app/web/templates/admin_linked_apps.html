@@ -1,8 +1,8 @@
 {% extends "base_admin_page.html" %}
-{% block title %}Link Keboola apps — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}Linked apps — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% set page_hero_eyebrow = "Data Apps" %}
-{% set page_hero_title = "Link Keboola apps" %}
+{% set page_hero_title = "Linked apps" %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = "Ingest externally-hosted apps from a Keboola MCP source and grant them to a group — in three steps. Linked apps open on Keboola; " ~ (instance_brand or 'Agnes') ~ " only catalogs, links, and grants them." %}
 
@@ -69,10 +69,10 @@
        upstream rather than an unrecognised shape. #}
     <div class="wiz-map" id="wiz-map" hidden>
       <p class="wiz-note">Which column carries what? Leave a field on <em>auto</em> to keep
-        the built-in guesses. An app needs an <strong>id</strong> and a <strong>URL</strong>
-        to be linkable; the name is optional and falls back to the id.</p>
+        the built-in guesses. An app needs an <strong>ID</strong> and a <strong>URL</strong>
+        to be linkable; the name is optional and falls back to the ID.</p>
       <div class="wiz-row">
-        <label for="wiz-map-id">Id</label>
+        <label for="wiz-map-id">ID</label>
         <select id="wiz-map-id" aria-label="Column carrying the app id" class="ds-dropdown-native"></select>
         {{ ds.dropdown(id='wiz-map-id-dd', target='wiz-map-id', aria_label='Column carrying the app id', options=[]) }}
         <label for="wiz-map-url">URL</label>

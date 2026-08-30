@@ -692,3 +692,44 @@ html[data-ui-layout="rail"] .admin-nav .admin-nav__group-hd {
 .admin-main {
     min-width: 0;
 }
+
+/* ── A row that carries a gloss ───────────────────────────────────────────
+   Two lines: the label, and one line answering "what is this?". Only the
+   disclosure rows (Content · Instance · Activity) have one — the tab strips
+   deliberately do not, see the note in `_admin_nav.html`.
+
+   The row stops being height-driven here: `.admin-nav__link` pins every plain
+   row to `--admin-nav-row-h` so the column aligns, but a two-line row must be
+   sized by its content or the gloss is clipped. `min-height` (not `height`)
+   keeps the alignment floor for a row whose gloss happens to be short. */
+.admin-nav__link--glossed {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding-top: 7px;
+    padding-bottom: 8px;
+}
+
+.admin-nav__label {
+    /* Inherits the row's 14px/500 — declared so the gloss below cannot drag
+       the label's weight with it. */
+    font-weight: 500;
+    line-height: 1.2;
+}
+
+/* Muted, one step down, and never wider than the column. The gloss is
+   reference text: it must be readable when looked for and quiet when not,
+   so it takes `--ds-text-muted` rather than the row's own colour and does
+   NOT brighten on hover or when the row is active — only the label does. */
+.admin-nav__gloss {
+    font-size: 11.5px;
+    font-weight: 400;
+    line-height: 1.35;
+    color: var(--ds-text-muted);
+    /* Two lines maximum, then ellipsis: a gloss that wraps to three lines is
+       a description, and the page it opens is where those belong. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}

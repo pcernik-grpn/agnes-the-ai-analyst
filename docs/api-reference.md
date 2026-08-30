@@ -741,7 +741,19 @@ checks against.
 
 ### `/api/admin/data-packages` — Data packages
 
+`POST /api/admin/data-packages/builder/turn` (admin) runs one turn of the
+package drawer's conversation and returns `{reply, patch, suggestions}`. It
+**writes nothing, and has no `apply` flag at all** — creating a package writes
+grants, so a turn only ever proposes into the open drawer and the admin
+presses Create having seen the access matrix they are about to write. Unlike
+the two builder-turn endpoints under `/api/store` and `/api/agents`, the
+candidate lists are fetched server-side rather than accepted from the caller:
+the worst case here is a group, so the set of grantable groups is the
+server's answer. Proposed table and group ids are validated against it, and a
+fabricated one is dropped rather than corrected.
+
 - /api/admin/data-packages
+- /api/admin/data-packages/builder/turn
 - /api/admin/data-packages/{pkg_id}
 - /api/admin/data-packages/{pkg_id}/restore
 - /api/admin/data-packages/{pkg_id}/tables
@@ -840,6 +852,8 @@ section for the full operator flow. CLI: `agnes admin analytics migrate
 ### `/api/admin/mcp-sources` — MCP source management
 
 - /api/admin/mcp-sources
+- /api/admin/mcp-sources/builder/turn
+- /api/admin/mcp-sources/preview-introspect
 - /api/admin/mcp-sources/{source_id}
 - /api/admin/mcp-sources/{source_id}/classify
 - /api/admin/mcp-sources/{source_id}/introspect
@@ -900,6 +914,10 @@ marketplace / corporate-memory). Non-admins submit a proposed create payload fro
 the `/admin/studio/{domain}` builder; admins approve/reject (guarded state
 transitions — turning an approved suggestion into the real resource is a deferred
 follow-up that must re-validate through the domain endpoint, never replay).
+
+The Studio is **hidden by default** since the admin cleanup (`studio.enabled` /
+`AGNES_STUDIO_ENABLED`), and these endpoints answer `403` while it is off. See
+[feature-flags.md](feature-flags.md).
 
 - /api/studio/suggestions
 - /api/studio/suggestions/mine
@@ -1151,15 +1169,58 @@ client id, certificate via vault secret or `config.cert_private_key_env`);
 these three routes are the wizard's own steps 2/3.
 
 - /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
+- /api/admin/sharepoint/connections/{connection_id}/certificate
+- /api/admin/sharepoint/connections/{connection_id}/extract
+- /api/admin/sharepoint/extraction/run-due
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
-libraries; both → the drive's root children) using the connection's resolved
-certificate. A missing/unresolvable certificate is a typed `409
-sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
-rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+libraries; `drive_id` → the drive's root children; `drive_id` + `item_id` →
+that folder's own children, at any depth — TCRD-240) using the connection's
+resolved certificate. `item_id` is structurally validated before it ever
+reaches a Graph URL path segment, and is rejected (`422
+item_id_requires_drive_id`) without a `drive_id`. A missing/unresolvable
+certificate is a typed `409 sharepoint_cert_unresolved` (surface absence
+rather than fail the crawl); a rejected/failed Graph call is a typed `502
+sharepoint_graph_error`.
+
+`?with_permissions=1` (default off) additionally probes each listed FOLDER
+for `hasUniqueRoleAssignments` (batched via Graph's `POST /$batch`, capped
+at 20 sub-requests per batch and at 200 folders per browse click) and adds
+`unique_permissions: true|false|null` to each folder item — `null` covers
+both "never probed" (beyond the 200-folder cap) and "the probe itself
+failed", collapsed into one honest "unknown". This is an **advisory-only**
+signal for the wizard's own unique-permissions badge (see below) — Agnes
+does not derive or enforce anything from a SharePoint ACL today (design
+spec §13.1, "Decision #2"); a Phase-2 design for actually deriving and
+mirroring source permissions exists as a separate, not-yet-merged spec
+("SharePoint ACL mirroring design") and is out of scope for this endpoint.
+Off by default so plain browsing never pays the extra Graph round trip; a
+probe failure never fails the browse itself, only degrades the affected
+folders to `null`.
+
+`GET …/tree/search` (TCRD-240) is a bounded breadth-first folder search over
+the same live tree — Graph's own `/search` is known to silently under-return
+under app-only auth, so this module never calls it. Params: `q` (required,
+`min_length=2`), `mode` (`prefix` default, `contains`, or `glob` —
+`fnmatch` syntax, case/composition-insensitive; a malformed glob, defined as
+unbalanced `[`/`]`, is a typed `422 invalid_search_pattern`), an optional
+`drive_id` + `item_id` subtree root (neither given searches every drive of
+every reachable site; `item_id` without `drive_id` is `422`), and
+`max_depth`/`max_visited` (defaults `5`/`2000`, CLAMPED to caps `12`/`20000`
+rather than rejected — raised from the original `10`/`2000` once a real
+library measured at 443k files / 97,899 folders made the old visited cap
+truncate almost every whole-library search at the very top; each visited
+folder is one *sequential* Graph call, never fanned out concurrently, which
+is what keeps the raised cap from turning into a throttling risk). Response:
+`{matches: [{item_id, drive_id, display_path}], visited, truncated, hint}`
+— `truncated` is `true` whenever a cap is what stopped the walk, never a
+silently partial result; `hint` is a short next-step string ("scope the
+search to a site or folder, or narrow the pattern") when `truncated` is
+`true`, else `null`.
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
@@ -1177,6 +1238,43 @@ exclusion — without touching its already-created collection.
 `GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
 collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
 crawling moves inside Agnes.
+
+`GET …/certificate` returns read-only certificate metadata — the thumbprint
+the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`
+header value) plus the conventional uppercase-hex SHA-1 fingerprint
+(`thumbprint_sha1_hex`), `subject`/`issuer`, `not_before`/`not_after`, and a
+derived `expires_in_days` (may be negative) / `status`
+(`ok`/`expiring_soon` at ≤30 days/`expired`) — derived at request time from
+the connection's already-stored PEM, no new schema. Catches two real
+failure modes: a registered certificate that doesn't match what the
+connection presents (opaque provider auth error), and a certificate
+expiring silently. Never returns the private key. No certificate configured
+or an unparseable one is a typed absence — `{"certificate": null, "reason":
+"..."}` — not an error status.
+
+**Extraction enqueue wiring (TCRD-226).** `POST …/extract` is a one-off
+admin trigger for the existing `corpus-extraction` job kind
+(`app/worker/kinds.py::_run_corpus_extraction`) — enqueues
+`{"connection_id": connection_id}` and returns `202
+{"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
+any other work; refuses cleanly (never a job that fails 30 minutes later in
+a worker) with `409 extraction_disabled` (`extraction.enabled` is false) or
+`409 extraction_producer_not_configured` (no `extraction.producer.command`/
+`.module` set); a run already queued/running for the same connection is
+`409 extraction_already_running` — deduped on a stable per-connection
+idempotency key shared with the sweep below.
+
+`POST /api/admin/sharepoint/extraction/run-due` is the scheduler-driven
+sweep: fires `corpus-extraction` for every SharePoint connection whose
+cadence (`extraction.schedule`, a single instance-wide setting in the
+`extraction:` config block, applied independently to each connection's own
+last-run stamp) says it is due — same shape as `POST /api/v1/agents/run-due`
+(walk + per-row due-check + enqueue into an existing job kind, no second
+scheduling mechanism). Scheduler row `extraction-run-due` in
+`services/scheduler/__main__.py`, registered only when `extraction.schedule`
+is configured (absent/empty = off). A clean, typed no-op (`{"dispatched":
+[], "count": 0, "skipped": true, "reason": ...}`), never an error, when the
+feature isn't usable or no schedule is configured.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
@@ -1211,6 +1309,8 @@ has its own surface).
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.
 
+These endpoints are NOT gated by `features.contribute_skill_enabled` — that flag hides the `/admin/contribute-skill` WEB PAGE only (off by default since the admin cleanup; the Library's skill builder is the supported path). The API, CLI and MCP surfaces keep working, so automation that publishes contributed skills is unaffected.
+
 - /api/admin/contributed-skills
 - /api/admin/contributed-skills/{name}
 
@@ -1229,6 +1329,22 @@ Admin-only, write-only vault for datasource secrets (`KEBOOLA_STORAGE_TOKEN`, `B
 
 - /api/admin/slack-secrets
 - /api/admin/slack-secrets/{name}
+
+### `/api/admin/sso` — External SSO login (runtime-configured Entra ID OIDC)
+
+Singleton runtime config for the optional external-identity login (`sso`
+provider slot): tenant/client IDs, a write-only Fernet-encrypted client
+secret, the mandatory email-domain allowlist, button label and enable flag,
+plus the captured external-identity bindings. `PUT`/`DELETE` on the config
+and secret are guarded by the last-login-door rule (422 `last_login_door`
+when the operation would leave no usable sign-in method). Postgres app-state
+backend required (typed 501 on DuckDB). See `docs/auth-sso-entra.md`.
+
+- /api/admin/sso/config
+- /api/admin/sso/client-secret
+- /api/admin/sso/test-config
+- /api/admin/sso/identities
+- /api/admin/sso/identities/{user_id}
 
 ### `/api/admin/db` — Database state and migration
 
@@ -1382,6 +1498,7 @@ and `agnes semantic-model schema <type> [<type> ...] [--json]`. MCP:
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
 
@@ -1432,6 +1549,34 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/{session_id}/leave
 - /api/chat/{session_id}/messages
 
+### `/api/agents/{agent_id}/builder/turn` — Agent-builder assistant
+
+The `/api/agents` CRUD this section used to document is gone: `/api/v1/agents*`
+absorbed every operation it served and the router was deleted (remediation
+Track C, Task C1.2). One route survives under this prefix — the builder's
+conversational turn.
+
+`POST /api/agents/{agent_id}/builder/turn` (owner only) runs one turn of the
+builder's assistant: it takes the owner's message plus the transcript so far
+and the caller's own plugin candidates, and asks the configured LLM for a
+configuration patch. When the patch is applied it goes through the same
+`PUT /api/v1/agents/{agent_id}` path a hand edit uses — so the
+builder-declaration → enforced-scope derivation is identical either way.
+
+The model's proposal is filtered before anything is written: unknown fields,
+knowledge/plugin ids outside the caller's own candidate lists, and tones
+outside the four the UI offers are dropped, and neither `status` nor the
+`*_mode` scope columns are writable from a conversation.
+
+Returns `{reply, patch, agent, suggestions}`. Two optional request fields
+serve the builder page's unsaved working copy: `apply` (default `true`) writes
+the patch as described above — pass `false` to get the sanitized patch back
+**without** writing, in which case `agent` is `null`; and `config`, the
+caller's unsaved copy, narrowed to the patchable keys and used only to build
+the prompt. With no AI credential configured the endpoint answers
+`503 builder_llm_unavailable` and the form stays fully usable by hand.
+
+- /api/agents/{agent_id}/builder/turn
 ### `/api/sharing` — Owner-initiated sharing of Library items
 
 The owner-scoped counterpart to `/api/access` (which is admin-only): the creator
@@ -1441,8 +1586,57 @@ Shareable resource types are `collection` and `agent` — skills are excluded
 because an approved store entity is already readable by every authenticated
 user.
 
+**Track C6 — agent-sharing needs admin approval (Postgres-backed instances).**
+A user may build agents freely, but when a NON-ADMIN actor shares an `agent`
+with a group it has not already reached, the grant is not written
+immediately: it is queued in `share_requests` and `PUT /api/sharing/agent/{id}`
+answers `202` (not `200`), with `pending_group_ids` naming what's awaiting a
+decision. An admin actor (regardless of who owns the agent) and any un-share
+(revoking a group) both stay instant and answer `200`, matching every other
+resource type. `GET /api/sharing/agent/{id}` always echoes the current
+`pending_group_ids` so a page reload still shows "pending approval". The
+queue (`share_requests`) is Postgres-only (A3 ratchet) — see
+`/api/admin/share-requests` below — but sharing itself never regresses: on a
+DuckDB-backed instance the approval step simply isn't active, so a
+non-admin's agent share falls back to the pre-C6 instant grant instead of a
+`501`. Only the admin queue endpoints answer `501` there.
+
 - /api/sharing/groups
 - /api/sharing/{resource_type}/{resource_id}
+
+### `/api/admin/share-requests` — Agent-sharing approval queue (Track C6, PG-only)
+
+These endpoints are NOT gated by `features.store_moderation_enabled` — that flag
+hides the `/admin/store` WEB PAGE (off by default), which is the only UI that
+renders this queue. While it is hidden, a queued request is still listed and
+decided here. See [feature-flags.md](feature-flags.md).
+
+Every route requires admin. `GET` lists queued requests, optionally filtered by
+comma-separated `status` (`pending`/`approved`/`rejected`; omitted returns every
+decision, newest first — the queue doubles as its own audit trail). Each row
+carries resolved display fields (`resource_name`, `requested_group_name`,
+`requested_by_email`) alongside the raw ids. `PATCH /api/admin/share-requests/{id}`
+takes `{"decision": "approve" | "reject"}` — the decision rides in the body
+rather than a verb path segment, the same shape as
+`PATCH /api/v1/agents/{agent_id}/memories/{memory_id}`'s `{"action": ...}`
+(`tests/test_api_design_rules.py::test_no_new_verbs_in_path` forbids a new
+verb segment in a path). `decision: "approve"` writes the grant via the same
+`resource_grants_repo().ensure_grant` the admin-curated `/admin/access` layer
+uses — an approved share reaches the grantee through the identical mechanism
+the shared-agent runtime already honors — and marks the request `approved`
+with `decided_by`/`decided_at`. `decision: "reject"` leaves no grant and marks
+it `rejected`. An unrecognized `decision` is `400`. The PATCH is a clean `404`
+on an unknown id OR a request that was already decided (an atomic
+`WHERE status = 'pending'` guard — a double-click can never double-write the
+grant or flip an already-decided verdict). Every decision writes an
+`audit_log` row (`share_request.approved` / `share_request.rejected`).
+PG-only (A3 ratchet): on a DuckDB-backed instance every route here answers
+`501 requires_postgres_backend`. Web-only by design — see the triple-surface
+ratchet's `_SHARE_REQUESTS_ADMIN_REASON` for why no CLI/MCP vocabulary was
+added.
+
+- /api/admin/share-requests
+- /api/admin/share-requests/{request_id}
 
 ### `/api/collections` — File collections (bring-your-files)
 
@@ -1457,6 +1651,21 @@ server-side plus `nosniff`; anything else — notably an uploaded `.html` — is
 inline on this origin. Both read-gate on the parent collection's access OR a
 grant on the `corpus_file` itself, so a file shared out of a folder stays
 viewable by the person it was shared with.
+
+Uploading (`POST .../files`) returns one `{file_id, filename, path,
+processing_status, …, claims_purged}` per file. `claims_purged` (spec §8) is
+the count of fact-graph claims dropped for that file because its content
+changed in place (§6) — 0 for a brand-new file, an unchanged-content resync
+or rename, or when the `facts` flag is off — so a producer's ingest
+idempotence can tell "content changed, re-ingest is genuinely needed" apart
+from "already shipped". The optional `source_stable_ids` field refuses any
+value matching the RESERVED zip-bundle member-anchor shape
+(`cf_<hex>!<member path>`, only `ingest_bundle` may mint one) with a `400`
+(`reason: "reserved_source_stable_id"`) before any file in the batch is
+stored — otherwise a caller with mere collection READ access (enough to see
+a real member's id and filename in this same listing) could re-upload an
+unrelated file under a member's own anchor and have it silently resolve to
+(and overwrite) that member's row.
 
 - /api/collections
 - /api/collections/search
@@ -1482,12 +1691,21 @@ admin gate; visibility is enforced entirely server-side, per caller, from
 readable collection grants (§4/§5). `search` and `neighbors` project
 attributes and traverse edges from readable claims only; `claims` returns
 the caller's readable evidence for one subject, `404` (never `403`) when it
-does not exist or has no readable claim. Triple-surface: `agnes facts
-search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/
-`fact_claims` (MCP foundation tools) call the same repository directly —
-facts have no local scope, so every result is labeled `[server]` on the
-CLI's stderr, a deliberate deviation from the `--scope auto|local|server`
-convention (spec §12).
+does not exist or has no readable claim. `search` also accepts an OPTIONAL
+`q` — a free-text name lookup matched against `fact_aliases.natural_key`
+ONLY (never a claim's quote or attrs, so it cannot reopen the §5 attribute
+oracle): the query is normalized (casefolded, spaces -> hyphens) and matched
+as a substring, filtering candidates before `limit` applies, then ranked —
+an exact match on the alias's slug first, a prefix match second, any other
+substring match last (no `pg_trgm`/extension similarity ranking; this
+schema does not enable one). All three request models are `extra="forbid"`
+— an unrecognized field `422`s rather than being silently ignored. Triple-
+surface: `agnes facts search|neighbors|claims` (CLI; `search` takes an
+optional second positional `[query]` for `q`) and `fact_search`/
+`fact_neighbors`/`fact_claims` (MCP foundation tools) call the same
+repository directly — facts have no local scope, so every result is labeled
+`[server]` on the CLI's stderr, a deliberate deviation from the `--scope
+auto|local|server` convention (spec §12).
 
 **Write surface** (build order step 4) — scheduler token or admin PAT, no
 CLI/MCP by design (a producer contract, not an analyst command). `ingest`
@@ -1495,7 +1713,15 @@ is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `413`; a single document's evidence alone over the claim cap is a `422`
 `document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
 must be a substring of one chunk of the evidencing document's extracted
-text), union vs `full_documents` replace mode, alias/edge resolution,
+text OR of the document's own SERVER-STORED `filename`/`path` — never a
+producer-supplied identity string off the wire, which would let a producer
+self-certify an invented quote), union vs `full_documents` replace mode,
+alias/edge resolution, a `documents[]` entry's OPTIONAL `source_url` (§8/O7,
+e.g. the crawler's Graph `webUrl`) persisted onto `corpus_file_sources` for
+the citation's "Open in source" link — validated https-only/length-capped,
+dropped (never rejects the surrounding claim) when absent or invalid; a
+SENT-but-invalid value is itemized on the response's `source_urls_rejected:
+[{doc_id, reason}]` (never an absent one), same shape as `claims_rejected`,
 `wrong`-correction re-attachment across a subject's delete-then-recreate,
 and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
 `review_items` mixes two self-describing shapes (a `kind` discriminator on
@@ -1509,16 +1735,57 @@ dst's claims are gone. Same detection re-runs at read time in
 caller-scoped: a dst the caller cannot independently read (its own claim
 AND the edge's own claim both readable, the same discipline
 `possible_duplicate_of` review items get) never appears. Response is the
-run report: `{claims_written, claims_rejected: [{row,
-reason}], deferred: [...], subjects_created, subjects_deleted,
-corrections_active: [...], review_items: [...]}`. `documents` may be
+run report: `{claims_written, claims_accepted_via_identity,
+claims_rejected: [{row, reason}], deferred: [...], subjects_created,
+subjects_deleted, corrections_active: [...], review_items: [...]}`.
+`claims_accepted_via_identity` is the subset of `claims_written` whose
+quote passed the gate ONLY via the document's filename/path — surfaced so
+an operator can see how much evidence is filename- rather than
+content-grounded (weaker evidence still, per §8's own honesty note that the
+gate validates the quote, not the fact). `documents` may be
 omitted only when every evidence `doc_id` already resolves through a prior
 upload's `corpus_file_sources` mapping — otherwise `400` with the
-unresolved ids itemized. Corrections management
+unresolved ids itemized. A **zip-bundle member is citable exactly like a
+top-level file**: `src.ingest.bundle.ingest_bundle` writes each member's own
+`corpus_file_sources` anchor at unpack time (`source_doc_id` = the member's
+own content `sha256[:16]`, `source_stable_id` = `"<archive
+corpus_files.id>!<member path>"`), so a claim referencing that `doc_id`
+resolves to the member's `corpus_file_id`, never the archive's — no
+`documents[]` entry is required once the archive has been ingested once.
+That shape is RESERVED: a `documents[].stable_id` matching it is refused
+with a `400` (`reason: "reserved_source_stable_id"`) before any document in
+the batch is resolved — the identical guard the collections upload endpoint
+enforces on `source_stable_ids` (see the Collections section below); only
+`ingest_bundle` may mint an anchor on that shape.
+Corrections management
 (`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
 `wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
+
+`GET /api/facts/facets` answers "what can I filter documents by" —
+`{"facets": {type: [{"subject_id", "label", "document_count"}]}}`, defaulting
+to `client`, `industry`, `service_offering` and `doc_type`. The vocabulary
+comes from the extraction pass rather than hand-entered tags, so it is
+maintained by ingestion. Same gate as `search()`; `document_count` tallies
+only documents in collections the caller can READ, and deliberately does not
+tally a `revealed` subject's unreadable evidence — a revealed correction
+reveals the subject, not the geography of its evidence (§4), and counting
+those files would report how many sit in a collection the caller cannot
+open. Triple-surface with `agnes facts facets` and the `fact_facets` MCP
+tool.
+
+`GET /api/facts/type-map` answers "what is in the graph at all" —
+`{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
+through the SAME visibility gate as `search()` with no `type` (shared via
+`_visible_facts_for_corpus_cte(all_collections=True)`, never a second copy
+of the rule), so a type's number is exactly what that caller could reach
+through `search(type=...)`. A type with no subjects visible to the caller
+is OMITTED rather than reported as `0`: absence is deliberately
+indistinguishable from "no such type in this ontology", because a `0` would
+confirm the type exists and that something occupies it — the aggregate form
+of the §5 existence oracle. Triple-surface with `agnes facts type-map` and
+the `fact_type_map` MCP tool.
 
 Every successful ingest batch also persists a copy of its run report to
 `facts_ingest_runs` — written AFTER the ingest transaction commits, so a
@@ -1530,6 +1797,8 @@ counts and per-category error badges — an admin-only, UI-internal surface,
 not an analyst query (no CLI/MCP analogue).
 
 - /api/facts/search
+- /api/facts/type-map
+- /api/facts/facets
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
@@ -1590,6 +1859,7 @@ by-slug surface but keep their grants for a lossless re-link.
 
 - /api/data-apps
 - /api/data-apps/reap-idle
+- /api/data-apps/runner-events
 - /api/data-apps/{slug}
 - /api/data-apps/{slug}/deploy
 - /api/data-apps/{slug}/drafts
@@ -1745,8 +2015,13 @@ the engine exposes nothing.
   answer as SSE). The brokered identity is a short-lived `mcp-oauth` access
   token minted for the ticket's user, so the engine reaches exactly the tools
   and RBAC a Claude Desktop connector would — the broker adds no authority.
-  Point the engine's `HOST_BROKER_MCP_URL` here and set
-  `KAI_BROKER_MCP_ENABLED`.
+  A session bound to a scope-limited agent (or an agent whose session user is
+  not its owner) instead gets a registered `agent_session` token: the
+  resolver rebuilds owner-grants ∩ agent-scope live per request
+  (`AgentPrincipal`), the same narrowed identity the native broker replay
+  mints. A co-session is refused (`403 mcp_not_available_to_co_session`)
+  rather than resolved to its stored owner. Point the engine's
+  `HOST_BROKER_MCP_URL` here and set `KAI_BROKER_MCP_ENABLED`.
 - /api/kai/workspace — `GET`, authenticated by the session credential (the
   engine's *server* calls it once per SDK process spawn; the sandbox never
   sees it). Returns `200` with a gzipped tar of the caller's workspace tree,
@@ -1766,9 +2041,14 @@ the engine exposes nothing.
   verbatim (the git override and the admin Workspace Prompt are mutually
   exclusive by design — see
   [initial-workspace-override.md](initial-workspace-override.md)), and a
-  co-session or a session bound to a scope-limited agent gets the un-filtered
-  bundled text, because the rendered document describes the *owner's*
-  reachable tables and skills. The payload is therefore per-session, but stays
+  co-session gets the un-filtered bundled text, because the rendered document
+  describes one identity's reachable tables and skills and a co-session has
+  no single one. A session bound to an agent additionally carries the agent
+  overlay — the persona `CLAUDE.md` (which replaces the rendered prompt,
+  native parity with `WorkdirManager._materialize_profile`), the identity
+  skill, and the active memories at `.claude/agent-memory.md`; its flattened
+  marketplace components are intersection-filtered for a scope-limited
+  agent. The payload is therefore per-session, but stays
   byte-stable for a given session and configuration, which is what the
   engine's re-fetch on every SDK respawn relies on. Per *session* rather than
   per caller because the rendered document carries a date (`{{ today }}` in
@@ -1799,6 +2079,21 @@ metered server-side.
   `require_resource_access`: ungranted analyst on a known collection → 403;
   unknown corpus or a not-yet-built artifact → 404. REST-only (no CLI/MCP
   analogue — mirrors `/api/data/{table_id}/download`).
+- /api/knowledge/digests — the maintained digests THIS caller can read:
+  `{digests: [{id, slug, title, status, status_reason, generated_at}]}`,
+  sorted by slug, never the markdown itself. The enumeration a WEB surface
+  needs (TCRD-250): the content endpoint below has been readable since K4 and
+  `agnes pull` writes every granted digest to `.claude/rules/ka_<slug>.md`,
+  but nothing could list them, so a page had no way to show a reader which
+  digests exist without already knowing an id. Filtered by the SAME
+  fail-closed `_caller_can_read_digest` predicate the manifest builder uses
+  (`app/api/sync.py::_digest_entries`), so the web list and the pulled files
+  can never disagree about entitlement. A digest that has never generated is
+  omitted, matching the manifest — listing it would promise a page that
+  404s. Staleness travels per row, so a stale digest is visibly stale rather
+  than silently so. REST-only by design (see the triple-surface exemption):
+  the CLI and a chat agent already RECEIVE digests as pulled files, so an
+  enumeration call is a browser's need, not theirs.
 - /api/knowledge/digests/{digest_id}/content — serves one maintained
   digest's markdown (K4, #799): `{id, slug, title, output_md, status,
   status_reason, generated_at}`. Listed in the sync manifest's
@@ -1863,6 +2158,7 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 - /api/me/display-name
 - /api/me/effective-access
 - /api/me/elevation
+- /api/me/external-identity
 - /api/me/home-stats
 - /api/me/onboarded
 - /api/me/stats/queries
@@ -1955,10 +2251,102 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 
 ### `/api/store` — Marketplace flea-market store
 
+`POST /api/store/entities/builder/turn` runs one turn of the `/skills`
+builder's conversation. It takes `{type, message, history, draft}` and returns
+`{reply, patch, suggestions}` — and it writes **nothing**: a Library entity has
+no row until the author saves it, so the draft lives in their browser and the
+patch is merged there for them to review. The model's output is untrusted:
+only the fields that type allows survive (a `plugin` patch can never carry a
+`body` — its contents are an uploaded archive), a category must be one the
+server actually offers, and everything is length-capped. With no AI credential
+configured it answers `503 builder_llm_unavailable` and the form stays fully
+usable by hand.
+
+`POST /api/chat/sessions` accepts an optional `preview_skill` (`{name, body}`)
+that backs the `/skills` builder's Preview for SKILLS. The skills catalog
+reports what is on disk in a session's project scope, so previewing a skill
+that exists nowhere but the author's browser means writing it there: the draft
+is materialized into that one session's own `.claude/skills/`, which is forced
+to be a copy so it can never reach the author's shared workspace. Both fields
+are untrusted — the name becomes a directory name and is *replaced* rather
+than sanitized, and the body is length-capped. Nothing is persisted beyond the
+session. Both delivery paths carry it: native providers mount the session
+directory, and the kai-agent provider packs the same bytes into its workspace
+tarball, so the preview cannot work on one provider and silently do nothing on
+the other.
+
+`POST /api/store/entities/builder/preview-agent` backs that builder's Preview
+tab for agent TEMPLATES. A template is a system prompt, so trying one means
+running an agent with it — which needs a row, because a chat session runs as
+an agent id. This points the caller's single scratch agent (fixed slug
+`template-preview`, `status='scratch'`) at the draft and returns its slug.
+Those rows are filtered out of every agent listing, so the author never sees
+machinery they did not create; fetch-by-slug still resolves, which is how the
+session binds. Idempotent per user — one row however many templates they try
+— so a browser that dies mid-preview leaves at most one invisible row behind.
+The scratch agent inherits none of the author's own knowledge or plugins: a
+template carries no data access, and a preview that quietly ran with theirs
+would flatter it.
+
+`POST /api/store/entities/from-components` composes a **plugin** out of store
+entities the caller can already see, instead of out of an uploaded `.zip`.
+Every entity is baked into a one-plugin tree on save, so a published skill is
+already served to Claude Code as a single-skill plugin — this endpoint exists
+for the case that shape cannot express: one install handing someone several
+skills and agent templates at once.
+
+Body: `{name, description?, category?, components: [entity_id, …], access?,
+publisher_kind?, dry_run?}`. Each component's baked subtree is merged (minus
+its own `.claude-plugin/`, since the composite gets one synthesized manifest),
+zipped in memory, and handed to the same `POST /entities` path — so a composed
+plugin is indistinguishable downstream from an uploaded one and pays the same
+guardrail review. Component directory names keep their `-by-<username>`
+suffix: it is what the component's own frontmatter says, and it is what lets
+two owners' same-named skills coexist in one composite.
+
+`dry_run: true` returns the `PreviewResponse` shape (200) that the `.zip`
+route's `POST /entities/preview` returns, and writes nothing.
+
+Refusals, all typed under `detail.code`: `no_components`,
+`too_many_components` (cap: `MAX_COMPONENTS`), `duplicate_component`,
+`component_not_found` (**404 for an entity the caller cannot see, never 403** —
+a composite must not be a probe for someone's private item),
+`component_type_unsupported` (a plugin cannot contain a plugin — that would
+mean merging two manifests), `component_bundle_missing`,
+`component_path_conflict`, `components_too_large`.
+
+`POST /api/admin/mcp-sources/builder/turn` is the fourth builder-turn
+endpoint (after the agent, entity and package builders) and backs
+`/admin/mcp-sources/new`. It proposes into the panel and writes nothing.
+
+Two refusals in its sanitizer are specific to what it configures. A `url` the
+admin has not already typed is dropped — the model may not choose which host
+the instance dials, and "correcting" a URL is the same act as choosing one. An
+`auth_secret_env` that is not shaped like an environment-variable name is
+dropped, which is what stops a pasted token being written into a field that is
+stored and displayed.
+
+`POST /api/admin/mcp-sources/preview-introspect` dials a connection the admin
+has typed and returns its tool list, writing nothing — the same relationship to
+`POST /mcp-sources` that `/entities/preview` has to `POST /entities`. The
+builder needs it because you cannot sensibly choose which tools to grant, or
+name the source, without seeing what it exposes; the alternative was registering
+a disabled row first and introspecting that, which puts a source in the list the
+admin never agreed to create. It builds a row-shaped dict and runs the SAME url
+guard (`_check_source_url_or_400`) and the SAME introspection the registered
+path does, because a probe dials with a credential attached whether or not a row
+exists. The secret is never in the payload: `auth_secret_env` names a variable
+and the credential resolves out of the vault exactly as it does for a registered
+source, so a connection whose secret is not stored yet fails here with that
+reason.
+
 - /api/store/bundle.zip
 - /api/store/categories
 - /api/store/entities
+- /api/store/entities/builder/turn
+- /api/store/entities/builder/preview-agent
 - /api/store/entities/dryrun
+- /api/store/entities/from-components
 - /api/store/entities/from-markdown
 - /api/store/entities/preview
 - /api/store/entities/{entity_id}
@@ -2026,6 +2414,7 @@ fanned out into group members' installs and cannot be uninstalled
 ### `/api/upload` — Session and artifact upload
 
 - /api/upload/artifacts
+- /api/upload/audit-events
 - /api/upload/local-md
 - /api/upload/sessions
 
@@ -2143,6 +2532,18 @@ Guards, enforced in every mode: empty/whitespace-only `content` → `422` — th
 **Auth binds to the CALLING session, never the path `{id}`.** The in-sandbox agent reaches this route through the secret broker (`app/api/broker.py`), which authenticates as the sandbox's real owner and mints a JWT carrying `chat_session_id` for the session the ticket was minted for. Because the broker replays whatever path the sandboxed agent describes, a prompt-injected agent could otherwise target a DIFFERENT session belonging to the SAME owner but a DIFFERENT agent (with a different, possibly `off`, `memory_write_mode`) — `require_session_principal`'s ownership check alone would allow it, since both sessions share an owner. So whenever a broker-minted `chat_session_id` claim is present, it must equal the path `{id}` or the request is `403 {"code": "session_mismatch"}`, regardless of ownership. An interactive owner session token or an agent PAT (neither goes through the broker) carries no such claim, so the path `{id}` — already ownership/PAT-verified by `require_session_principal` — is trusted as-is.
 
 - /api/v1/sessions/{session_id}/memories
+
+### `POST /api/v1/agents/{slug}/delegate` — @delegation between shared agents (Track C7 MVP)
+
+Server-side handoff: a live, user-driven agent turn (agent A) hands ONE sub-request off to another agent the CALLER may run (agent B, named by `{slug}`), mid-turn, and gets B's answer back into A's turn. `{input: message: str (required)}` → `200 {status: "ok"|"denied"|"degraded", reason: str | null, agent_slug, answer: str | null, message: str | null}` — a denial or degrade is a normal `200` body, never an HTTP error: the caller (agent A's own in-process delegation tool) is expected to read `status`/`reason` and continue the turn on its own judgment.
+
+Same auth binding as `/api/v1/sessions/{id}/memories` above: reached exclusively through the secret broker under A's OWN session-scoped ticket (never a client-supplied session id) — `require_delegating_session` resolves the caller's identity from whatever the broker's JWT minting produced (an `AgentPrincipal` for a restricted/shared agent, or a plain user dict with a stashed `chat_session_id` claim for the "passthrough" optimization on an unrestricted agent run by its own owner), never from a client-shaped field.
+
+`{slug}` is resolved exactly like `require_agent_runtime_principal` resolves a runtime target (`agents_repo().get_runnable_by_slug`) — the CALLER's own runnable set (owned, or reachable via a `ResourceType.AGENT` grant), never A's owner's. THE SECURITY INVARIANT: B is spawned as a fresh CHILD session via `ChatManager.create_session(user_email=<the ORIGINAL caller>, agent_id=B)` — never A's owner, never B's owner — so B's row-level access policies (`src/access_policy.py`) bind to the caller, never a wider identity. Depth-1 only (a session spawned as a delegate target cannot itself delegate, `reason: "depth_exceeded"`) and one delegation per turn (`reason: "already_delegated_this_turn"`). An RBAC denial (`reason: "agent_not_runnable"`), an exhausted monthly budget on B (`status: "degraded"`, `reason: "budget_exhausted"`), the per-user concurrency cap (`reason: "concurrency_cap"`), or B simply not answering in time (`reason: "timeout"`) all degrade the result — none of them raise an HTTP error or crash A's turn.
+
+Sandbox-internal RPC (standing exemption from the triple-surface CLI/MCP ratchet — see `app/api/agent_delegation.py`'s module docstring): its only real caller is agent A's own in-process delegation tool (`app/chat/runner.py`'s `_delegation_mcp_server`), not something an analyst calls directly from a terminal.
+
+- /api/v1/agents/{slug}/delegate
 
 ### `/api/v1/agents/{slug}/webhooks` — outbound agent webhooks (V1b Task 6)
 

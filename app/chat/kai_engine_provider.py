@@ -65,12 +65,16 @@ deliberately not implemented).
 Known limitations, stated rather than implied (also in docs/cloud-chat.md):
 the engine does not surface token usage on its stream, so
 ``chat.daily_anthropic_spend_usd`` / ``chat.max_session_tokens`` do not meter
-engine sessions (message-rate and concurrency caps still apply); the engine
-serves its workspace from ``GET /api/kai/workspace`` (the instance template),
-so per-session personas — agent profiles, agent memories, the co-drive grant
-intersection — do not reach an engine turn; ``chat.per_tool_call_seconds`` and
-``chat.tool_calls_per_turn_budget`` are enforced by the engine's own policies,
-not these knobs.
+engine sessions (message-rate and concurrency caps still apply); agent
+personas and memories DO reach an engine turn — ``GET /api/kai/workspace``
+packs them into the per-session tarball (``_agent_workspace_members``) and a
+scoped agent's tools resolve to a live ``AgentPrincipal`` at
+``/api/kai/mcp`` — but the co-drive grant-intersection workspace still does
+not (a co-session runs as a conversation without host data access), and the
+agent memory WRITE side has no engine channel (the remember endpoint is
+unreachable from the engine sandbox, so ``memory_write_mode`` is read-only
+there); ``chat.per_tool_call_seconds`` and ``chat.tool_calls_per_turn_budget``
+are enforced by the engine's own policies, not these knobs.
 """
 
 from __future__ import annotations
@@ -649,6 +653,10 @@ class KaiEngineHandle:
         elif etype == "tool-approval-request":
             tool_call_id = str(event.get("toolCallId", ""))
             state.pending_approvals.add(tool_call_id)
+            # No-args tools send "" (not "{}"): the client only renders the
+            # command block when there is something to show. indent=2 keeps
+            # the block readable even after the 2000-char truncation.
+            args = state.tool_args.get(tool_call_id, {})
             self.stdout.feed_frame(
                 {
                     "type": "approval_request",
@@ -657,7 +665,7 @@ class KaiEngineHandle:
                     # hands it back verbatim.
                     "request_id": tool_call_id,
                     "tool": state.tool_names.get(tool_call_id, "tool"),
-                    "command": json.dumps(state.tool_args.get(tool_call_id, {}), ensure_ascii=False)[:2000],
+                    "command": json.dumps(args, ensure_ascii=False, indent=2)[:2000] if args else "",
                     "reason": "The engine requires approval before running this tool.",
                     "timeout_seconds": self._approval_timeout_seconds,
                 }

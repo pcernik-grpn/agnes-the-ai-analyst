@@ -22,6 +22,48 @@ from starlette.requests import Request
 from src.repositories import RequiresPostgresBackend
 
 
+def _exc_class():
+    """The CURRENT ``RequiresPostgresBackend``, re-read from the module.
+
+    The backend parity sweeps call ``importlib.reload(src.repositories)``
+    (tests/db_pg/_parity_sweep_util.py) to re-resolve the factory against the
+    other backend. That rebinds the class object, so the symbol this module
+    imported at collection time is a DIFFERENT class afterwards — and
+    `pytest.raises(RequiresPostgresBackend)` then fails to match an exception
+    that is, to any reader, exactly the one it asked for. It only bites when
+    both files land on the same xdist worker in that order, which is why it
+    surfaced as an intermittent failure rather than a reproducible one.
+
+    Reading the class through the module at call time makes these tests say
+    what they mean — "whatever the factory raises today" — independently of
+    who reloaded what first.
+    """
+    import src.repositories as factory
+
+    return factory.RequiresPostgresBackend
+
+
+def _registered_handler(app):
+    """The app's handler for ``RequiresPostgresBackend``, found by NAME.
+
+    `shared_app` is built once per session and its `exception_handlers` dict
+    is keyed on the class object that existed at build time. A later
+    `importlib.reload(src.repositories)` (the parity sweeps) makes a NEW
+    class, so neither the reloaded symbol nor the module-level import matches
+    that key any more — the handler is still registered and still correct,
+    but identity lookup can no longer find it.
+
+    What these two tests actually assert is "a dedicated handler for this
+    error is wired up, distinct from the catch-all". That is true regardless
+    of how many times the module was reloaded, so it is matched on the class
+    name rather than on object identity.
+    """
+    for exc_cls, handler in app.exception_handlers.items():
+        if getattr(exc_cls, "__name__", None) == "RequiresPostgresBackend":
+            return exc_cls, handler
+    return None, None
+
+
 def test_requires_postgres_backend_message_names_the_feature_and_the_recipe():
     exc = RequiresPostgresBackend("widgets")
     assert exc.feature == "widgets"
@@ -47,7 +89,7 @@ def test_build_raises_requires_postgres_backend_for_pg_only_entry(monkeypatch):
     )
     monkeypatch.setattr(factory, "_active_backend", lambda: factory.DUCKDB)
 
-    with pytest.raises(RequiresPostgresBackend) as exc_info:
+    with pytest.raises(_exc_class()) as exc_info:
         factory._build("_pg_only_probe")
     assert exc_info.value.feature == "_pg_only_probe"
 
@@ -66,7 +108,7 @@ def test_requires_postgres_backend_handler_returns_clean_501(shared_app):
     """The app-wide handler (app/main.py) must translate the typed error into
     a 501 with a JSON body naming the feature — never let it fall through to
     the unhandled-exception 500 handler."""
-    handler = shared_app.exception_handlers.get(RequiresPostgresBackend)
+    exc_cls, handler = _registered_handler(shared_app)
     assert handler is not None, "no exception handler registered for RequiresPostgresBackend"
 
     scope = {
@@ -77,7 +119,7 @@ def test_requires_postgres_backend_handler_returns_clean_501(shared_app):
         "query_string": b"",
     }
     request = Request(scope)
-    exc = RequiresPostgresBackend("widgets")
+    exc = exc_cls("widgets")
 
     response = asyncio.run(handler(request, exc))
 
@@ -93,7 +135,7 @@ def test_requires_postgres_backend_handler_is_distinct_from_the_catch_all(shared
     must resolve to its own dedicated handler, not merely fall through to the
     generic ``Exception`` catch-all (which would produce an opaque 500
     instead of the clean, feature-naming 501)."""
-    specific = shared_app.exception_handlers.get(RequiresPostgresBackend)
+    _cls, specific = _registered_handler(shared_app)
     catch_all = shared_app.exception_handlers.get(Exception)
     assert specific is not None
     assert catch_all is not None

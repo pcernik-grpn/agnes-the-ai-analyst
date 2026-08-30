@@ -14,72 +14,57 @@
  * owned by chat.css's empty-state rules — this sheet styles the dashboard
  * widgets. */
 
-/* Suggested-actions column below the hero — the shared --rdb-col definition
+/* Suggested-actions column between the hero and the composer — the shared
+ * --rdb-col definition
  * (declared on the empty-state .cloud-chat-main in chat.css) keeps it on
  * the exact same grid as the hero, composer, and context line. */
 html[data-ui-layout="rail"] .rdb {
     width: var(--rdb-col-narrow, 60%);
     min-width: 0;
-    /* Clear breathing room under the input (+ its Stack-status caption) before
-       the suggested-action group begins. */
-    margin-top: 18px;
+    /* Block gap above the group. In #chat-empty-extras (the ways out) this is
+       the whole separation from the composer above them. In #chat-suggested it
+       is zeroed — the page's one `section` break lands on that container
+       instead, so the gap above the "Suggested for you" label comes from there
+       and still far exceeds the 10px between label and chips, which is what
+       keeps the label reading as the chips' heading. See chat.css. */
+    margin-top: var(--cld-gap-block, 26px);
     font-family: var(--ds-font);
 }
 
-/* ── Stack context line — flat on the surface, under the composer ── */
+/* No rules for the retired "Using N … from your Stack" line (see chat.html). It
+   reported a number the reader could not act on, in the one row between the
+   composer and its suggestions. */
 
-html[data-ui-layout="rail"] .rdb-context {
-    align-self: center;
-    width: var(--rdb-col-narrow, 60%);
-    max-width: none;
-    min-width: 0;
-    margin: 0;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 2px 0;
-    font-size: 13px;
-    color: var(--ds-text-muted);
-    font-family: var(--ds-font);
-}
-
-.rdb-context-ico {
-    flex-shrink: 0;
-    width: 14px;
-    height: 14px;
-    /* Damped toward the text colour — the glyph marks the line as context, it
-       is not an accent of its own. */
-    color: color-mix(in srgb, var(--ds-assistant) 65%, var(--ds-text-muted));
-}
-
-/* One link in the line ("Stack"), kept in the same muted register as the
-   sentence around it — a bright accent link on a status line reads as a
-   control and pulls attention off the suggested actions below. The dotted
-   underline is what marks it clickable; hover firms it up. */
-.rdb-context a {
-    color: var(--ds-text-secondary);
-    font-weight: 600;
-    text-decoration: underline;
-    text-decoration-style: dotted;
-    text-underline-offset: 3px;
-    text-decoration-color: color-mix(in srgb, var(--ds-text-muted) 55%, transparent);
-}
-
-.rdb-context a:hover {
-    color: var(--ds-assistant-dark);
-    text-decoration-style: solid;
-    text-decoration-color: currentColor;
-}
-
-/* ── Suggested next actions — a vertical list of guided-task items, one under
- *    each other. Each item is a horizontal row: icon · title + description ·
- *    "Start →". ──────────────────────────────────────────────────────────── */
+/* ── Suggested next actions — a labelled row of CHIPS above the composer.
+ *    Each chip is one guided task: icon · title.
+ *
+ *    It used to be a vertical list, which at four items built a column and
+ *    pushed everything after it a screen down — and a stack of full-width rows
+ *    beside a text field reads as results, not as things you could ask. A
+ *    wrapping row of chips is the shape that says "pick one of these", takes one
+ *    line instead of four, and keeps the composer above the fold now that the
+ *    chips precede it. ──────────────────────────────────────────────────────── */
 
 .rdb-actions {
     min-width: 0;
     text-align: center;
 }
 
+/* Names the group — "Suggested for you", which is the claim worth a line: these
+   are derived from what this caller can reach, not four static examples. Label
+   scale, not heading scale, so it disambiguates the row without competing with
+   the page heading above the composer.
+
+   (An earlier "Suggested to ask" was retired for saying only what the chips
+   already looked like. The word that earns the line is "for you".) */
+.rdb-actions-hd {
+    margin: 0 0 var(--cld-gap-inner, 10px);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ds-text-muted);
+}
 .rdb-panel-title {
     margin: 0 0 12px;
     font-size: 15px;
@@ -98,23 +83,28 @@ html[data-ui-layout="rail"] .rdb-context {
     color: var(--ds-primary-dark);
 }
 
-/* Vertical stack — minimal, borderless single-line items, centred as a BLOCK
-   under the composer.
-
-   `width: fit-content` + auto margins, rather than centring each row on its
-   own: the rows differ in width by a few pixels, so per-row centring left the
-   icon column visibly ragged. Sizing the list to its widest row and centring
-   that box keeps every icon on one vertical line while the group still reads
-   as centred under the input. */
+/* A centred, wrapping ROW. No `width: fit-content` any more — that existed to
+   keep a column of icons on one vertical line, and there is no column now; the
+   row centres its own chips and wraps to a second line on a narrow viewport. */
 .rdb-actions-list {
     list-style: none;
+    /* Held to a reading measure and centred, NOT stretched to the composer's
+       full width. Four questions of this length come to ~900px, so they will
+       wrap on any realistic column; the choice is only whether they wrap into
+       balanced rows or leave one chip stranded under three. A measure narrower
+       than the input wraps them evenly and keeps the group reading as a block
+       belonging to the composer rather than a band spanning the page. */
     margin: 0 auto;
     padding: 0;
-    width: fit-content;
-    max-width: 100%;
+    /* The shared secondary measure, so the chip row and the cards below it sit
+       on the SAME left and right edges. At 40rem it was 20px narrower than the
+       cards — a stagger too small to read as intent. */
+    max-width: min(100%, var(--cld-measure, 660px));
     display: flex;
-    flex-direction: column;
-    gap: 11px;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
 }
 
 .rdb-action-card {
@@ -122,33 +112,38 @@ html[data-ui-layout="rail"] .rdb-context {
     min-width: 0;
 }
 
-/* One real button on a SINGLE line — icon · title, centred under the
-   composer. Borderless and flat; a subtle background on hover.
+/* One chip: icon · title on a single line, in a soft bordered pill.
 
-   `flex: 0 1 auto` (not the old `flex: 1`) is what lets the row centre: a
-   grown button filled the column and its content sat at the left edge however
-   the parent aligned it. Shrink is kept so a long title still ellipsizes
-   rather than overflowing. */
+   It has a resting box now, where the old row was borderless and flat. In a
+   column that was right — a stack of outlined rows under an input reads as a
+   result set. In a row it is the opposite: four floating icon+label pairs with
+   no boxes read as one run-on sentence, and there is nothing to say where one
+   suggestion ends and the next begins. The box is what makes them countable.
+
+   Quiet enough not to compete with the composer above: a hairline border and a
+   barely-tinted fill, both from `--ds-*` so every theme follows. */
 .rdb-action {
     flex: 0 1 auto;
     min-width: 0;
     display: flex;
     flex-direction: row;
     align-items: center;
-    gap: 11px;
-    padding: 0 8px;
-    border: none;
-    border-radius: 8px;
-    background: none;
+    gap: 8px;
+    padding: 7px 12px 7px 10px;
+    border: 1px solid color-mix(in srgb, var(--ds-border) 70%, transparent);
+    border-radius: 11px;
+    background: color-mix(in srgb, var(--ds-surface) 60%, transparent);
     font: inherit;
     text-align: left;
     color: inherit;
     cursor: pointer;
-    transition: background var(--ds-motion-fast) var(--ds-ease-standard);
+    transition: background var(--ds-motion-fast) var(--ds-ease-standard),
+                border-color var(--ds-motion-fast) var(--ds-ease-standard);
 }
 
 .rdb-action:hover:not(:disabled) {
-    background: var(--ds-surface-dim);
+    border-color: var(--ds-primary);
+    background: color-mix(in srgb, var(--ds-primary) 6%, var(--ds-surface));
 }
 
 .rdb-action:focus-visible {
@@ -161,21 +156,21 @@ html[data-ui-layout="rail"] .rdb-context {
     color: var(--ds-text-disabled);
 }
 
+/* No filled tile at chip scale — a 28px chip inside a 36px chip is a box in a
+   box. The glyph carries the accent on its own. */
 .rdb-action-icon {
     flex-shrink: 0;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 8px;
-    background: var(--ds-primary-light);
-    color: var(--ds-primary-dark);
+    width: 18px;
+    height: 18px;
+    color: var(--ds-primary-dark, var(--ds-primary));
 }
 
 .rdb-action-icon svg {
-    width: 15px;
-    height: 15px;
+    width: 16px;
+    height: 16px;
 }
 
 /* Title + description on ONE line: bold title, then a muted description that
@@ -192,7 +187,7 @@ html[data-ui-layout="rail"] .rdb-context {
 
 .rdb-action-title {
     flex-shrink: 0;
-    font-size: 13.5px;
+    font-size: 13px;
     font-weight: 550;
     letter-spacing: -0.01em;
     line-height: 1.3;

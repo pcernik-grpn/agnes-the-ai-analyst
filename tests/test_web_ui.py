@@ -425,7 +425,10 @@ class TestAdminRoleGuards:
         groups, and to answer "why can't this person see X?"."""
         resp = web_client.get("/admin/access", cookies=admin_cookie)
         assert resp.status_code == 200
-        assert "Simulate a person" in resp.text
+        # "Simulate a person" was a section tab; the person view is the third
+        # position of the page's own switch now (`?by=person`, and
+        # `?lens=simulate` still lands there).
+        assert 'data-by="person"' in resp.text
 
     def test_legacy_grants_url_redirects_to_access(self, web_client, admin_cookie):
         """The page's oldest URL 308s onto it rather than 404ing, carrying

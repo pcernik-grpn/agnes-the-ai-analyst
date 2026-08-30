@@ -648,18 +648,29 @@ docstring):
   spend view reads zero for them. Message-rate (`rate_messages_per_hour`)
   and per-user concurrency caps still apply. Cost control belongs on the
   engine's own limits and the LLM broker.
-- **Per-session personas do not reach the engine.** The engine's workspace
-  comes from `GET /api/kai/workspace` (the instance-wide template), so agent
-  profiles, agent memories and the co-drive grant-intersection workspace are
-  not materialized into engine turns. The two narrowed session kinds fail
-  **closed**, not open: `POST /api/kai/mcp` answers a co-session or a
-  scope-limited agent `403` (`mcp_not_available_to_co_session` /
-  `mcp_not_available_to_scoped_agent`) rather than resolving it to the owner,
-  and `GET /api/kai/workspace` ships the unfiltered bundled `CLAUDE.md`
-  instead of the owner's RBAC-filtered Workspace Prompt. So a collaborator's
-  engine turn reaches **no** Agnes tool surface — it cannot inherit the
-  owner's wider authority. Co-drive on this provider is therefore a
-  conversation without host data access, not an unscoped one.
+- **Agent profiles and memories DO reach the engine; co-drive workspaces do
+  not.** A session bound to an agent gets the agent overlay in its workspace
+  tarball — the persona `CLAUDE.md` (data-access rails appended), the
+  identity skill, and the active memories at `.claude/agent-memory.md` —
+  exactly what the native workdir seam materializes
+  (`app/api/kai.py::_agent_workspace_members`). A scope-limited agent's tool
+  calls resolve to the same live `AgentPrincipal` the native broker mints
+  (`_mint_mcp_access_token` registers an `agent_session` token; owner-grants
+  ∩ agent-scope is rebuilt per request), and its flattened marketplace
+  overlay is intersection-filtered the same way. Two agent gaps remain: the
+  memory **write** side has no engine channel (the remember endpoint is
+  unreachable from the engine sandbox, so `memory_write_mode` is effectively
+  read-only there), and per-user-credential passthrough MCP tools fail
+  closed for agent sessions, as they do for every restricted principal.
+  Co-drive is unchanged and fails **closed**: `POST /api/kai/mcp` answers a
+  co-session `403 mcp_not_available_to_co_session` rather than resolving it
+  to the owner, and `GET /api/kai/workspace` ships the unfiltered bundled
+  `CLAUDE.md` instead of the owner's RBAC-filtered Workspace Prompt (the
+  marketplace overlay it does ship is narrowed to the live participant
+  grant-intersection) — a collaborator's engine turn reaches **no** Agnes
+  tool surface. Co-drive on
+  this provider is therefore a conversation without host data access, not an
+  unscoped one.
 - **`chat.per_tool_call_seconds` and `chat.tool_calls_per_turn_budget` are
   inert** — the engine enforces its own tool policies.
 - **Single-gateway deployments only** (like the docker provider): the
@@ -709,8 +720,9 @@ agent loop and the sandbox live.
 |---|---|---|
 | Agent loop | the embedded engine's own | native `claude-agent-sdk` runner in the sandbox |
 | Spawned per session | nothing — Agnes holds a connection | one container on the host daemon |
-| Workspace delivery | engine fetches the instance-wide template tarball (`GET /api/kai/workspace`) | user's own workspace bind-mounted, writes persist |
-| Agent profiles / memories / co-drive workspaces | not materialized into engine turns (fail closed — see limitations) | fully supported |
+| Workspace delivery | engine fetches a per-session tarball (`GET /api/kai/workspace`: rendered prompt + marketplace overlay + agent overlay) | user's own workspace bind-mounted, writes persist |
+| Agent profiles / memories | persona, identity skill and memories ride the tarball; scoped tools enforced live; memory writes have no channel | fully supported (incl. memory writes) |
+| Co-drive workspaces | not materialized (fail closed — see limitations) | fully supported |
 | Token spend metering (`daily_anthropic_spend_usd`, `max_session_tokens`) | not metered | metered |
 | Per-tool knobs (`per_tool_call_seconds`, `tool_calls_per_turn_budget`) | inert (engine's own policies) | enforced |
 | Pause | bookkeeping (engine keeps transcript + sandbox) | `docker pause`; lost on daemon restart/reboot |
@@ -724,9 +736,9 @@ Rules of thumb: run the default `kai-agent` when the deployment already
 provisions the engine (the `customer-instance` module does) and you want
 nothing spawned on the Agnes host per session. Run `docker` when you need
 the native runner's full feature surface — per-user durable workspaces,
-agent profiles/memories, Agnes-side token metering, operator-controlled
-egress — and are prepared to operate the daemon, sidecar and sandbox
-image yourself.
+co-drive with host data access, agent memory writes, Agnes-side token
+metering, operator-controlled egress — and are prepared to operate the
+daemon, sidecar and sandbox image yourself.
 
 ## LLM provider: Google Vertex AI
 
@@ -763,6 +775,19 @@ How it works:
 - **kai-agent provider:** needs no change — the engine keeps speaking the
   first-party Messages format and the broker rewrites those calls into the
   Vertex shape (model moves from body to URL, `anthropic_version` injected).
+- **Agent-as-API runtime:** `POST /api/v1/agents/{slug}/responses` needs no
+  separate Vertex support either — it spawns a headless chat session through
+  `app/chat/headless.py` → the same `ChatManager`/broker path above, so the
+  per-agent model allowlist and monthly token budget
+  (`app/api/broker_agent_policy.py`) already enforce against a Vertex-shaped
+  model path (`vertex_target.model`, not the request body).
+- **`anthropic-beta` filtering:** Vertex validates that header and refuses
+  the whole request on any value it does not recognize, while first-party
+  clients (the engine's SDK included) freely send first-party-only betas.
+  The broker filters the header in vertex mode to the values Vertex accepts
+  (renaming where its spelling differs), logs what it drops, and omits the
+  header when nothing survives — an unknown future beta degrades one
+  optional feature instead of 400-ing every turn.
 
 Operator prerequisites:
 
@@ -833,9 +858,12 @@ upgrading Agnes, rebuild the image —
 Workspaces live on the Agnes host at
 `${DATA_DIR}/users/<email>/workspace`. Under the docker provider the
 workspace is bind-mounted — no size cap and no per-spawn upload. Under
-kai-agent, per-user workspace files do not reach the engine at all: it
-materializes the instance-wide workspace template served by
-`GET /api/kai/workspace`.
+kai-agent, per-user workspace FILES do not reach the engine: it materializes
+the tarball served by `GET /api/kai/workspace`, which is built from the
+instance workspace template plus the per-session overlays (rendered
+Workspace Prompt, RBAC-filtered marketplace components, and the agent
+persona/memories when the session is bound to an agent) — never from the
+user's on-host workspace tree.
 
 ## Known limitations (v1)
 

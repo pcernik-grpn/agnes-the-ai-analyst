@@ -13,9 +13,12 @@ The connector content is not *summarized* here, it LIVES here. That is the
 point: two pages both explaining "how do I connect" had already drifted
 ("Four places" vs. six tool tabs), and a summary drifts by construction.
 
-The eight section anchors are a PUBLIC CONTRACT — the Knowledge Layer banner
-CTA, the onboarding checklist's "Use Agnes from other AI tools" step, and every
-redirected /me/ai-connector bookmark all point into them.
+The eight section anchors are a PUBLIC CONTRACT. Four surfaces point into
+#connect under ONE label — "Take {brand} to your tools": the chat landing's
+door, the rail's foot row, the onboarding checklist's step and the tour's
+closing button (first person there, "to my tools"). The Library connect banner
+and /home use the same phrase on their CTAs, and every redirected
+/me/ai-connector bookmark lands here too.
 """
 
 from __future__ import annotations
@@ -323,9 +326,9 @@ def test_the_id_stays_on_the_section_not_the_details(page):
 
 def test_hash_opens_the_owning_fold(page):
     """A closed `<details>` cannot be scrolled into, so arriving at
-    `/how-it-works#connect` — the Knowledge Layer banner, the onboarding
-    checklist, the tour, every redirected `/me/ai-connector` bookmark — has to
-    open that section before the jump."""
+    `/how-it-works#connect` — the chat landing's tools door, the rail row, the
+    onboarding checklist, the tour, every redirected `/me/ai-connector`
+    bookmark — has to open that section before the jump."""
     assert "function foldForHash" in page
     assert "function syncFoldToHash" in page
     assert "window.addEventListener('hashchange', syncFoldToHash)" in page
@@ -469,7 +472,7 @@ def test_rail_orientation_entry_is_grouped_with_restart_onboarding(seeded_app, m
 
 
 # The chat dashboard's own first-run orientation link ("See how Agnes works",
-# under the Knowledge Layer hero's CTA) is guarded in
+# in the trust line at the foot of the empty state) is guarded in
 # tests/test_web_chat_empty_state.py, which has the rail + chat-backend +
 # chat-grant fixture that rendering /chat needs.
 

@@ -784,17 +784,94 @@ def get_home_status_frame_visibility() -> bool:
 def get_studio_enabled() -> bool:
     """Whether the authoring Studio surface (/admin/studio*) is exposed.
 
-    On by default. Disable per-instance with ``AGNES_STUDIO_ENABLED=0`` (the
-    infra/Terraform ``.env`` override) or ``studio.enabled: false`` in
-    instance.yaml — hides the Studio nav entry and redirects ``/admin/studio*``
-    to home.
+    **OFF by default** since the admin cleanup. It used to be on and
+    grandfathered; what changed is that the Library builders (``/library``'s
+    "+ New") now do the same authoring jobs, so the Studio was a second way to
+    do one thing — and a second place to keep in sync. Off hides the Studio nav
+    entries (its landing page, the per-domain builders AND the suggestions
+    moderation queue, which reads the same gate), drops the command-palette
+    entries, redirects ``/admin/studio*`` home, and 403s the public suggestion
+    API.
 
-    Resolution: env var > ``studio.enabled`` YAML > True — delegates to
+    Nothing is deleted: re-expose the whole surface with
+    ``AGNES_STUDIO_ENABLED=1`` (the infra/Terraform ``.env`` override) or
+    ``studio.enabled: true`` in instance.yaml.
+
+    Resolution: env var > ``studio.enabled`` YAML > False — delegates to
     :func:`feature_enabled` (the canonical resolver, #1022); see
     :data:`FEATURE_FLAGS` for the registry entry backing the
     ``/admin/server-config`` inventory panel.
     """
-    return feature_enabled("studio", "enabled", env_var="AGNES_STUDIO_ENABLED", default=True)
+    return feature_enabled("studio", "enabled", env_var="AGNES_STUDIO_ENABLED", default=False)
+
+
+def get_news_enabled() -> bool:
+    """Whether the in-product news surface is exposed: the ``/admin/news``
+    editor, the ``/news`` reader, the ``/home`` "What's new" strip, and the
+    nav / command-palette entries pointing at them.
+
+    **Off by default** since the admin cleanup. Gates UI ONLY — the
+    ``/api/admin/news/*`` endpoints keep serving and a published version stays
+    in the table, so flipping this back on restores the surface with its
+    content intact.
+
+    Resolution: env var > ``features.news_enabled`` YAML > False.
+    """
+    return feature_enabled("features", "news_enabled", env_var="AGNES_NEWS_ENABLED", default=False)
+
+
+def get_knowledge_digests_ui_enabled() -> bool:
+    """Whether the maintained-digests ADMIN PAGE
+    (``/admin/knowledge-digests``) and its nav entry are exposed.
+
+    **Off by default** since the admin cleanup. Deliberately narrow: this
+    gates the page, not the feature. ``/api/admin/knowledge-digests/*``,
+    ``agnes admin digest``, the digest scheduler job and ``agnes pull``'s
+    digest delivery are all untouched, so an instance already running digests
+    keeps running them headlessly while the page is hidden.
+
+    Resolution: env var > ``features.knowledge_digests_enabled`` YAML > False.
+    """
+    return feature_enabled(
+        "features", "knowledge_digests_enabled", env_var="AGNES_KNOWLEDGE_DIGESTS_ENABLED", default=False
+    )
+
+
+def get_contribute_skill_enabled() -> bool:
+    """Whether the paste-a-SKILL.md publish page (``/admin/contribute-skill``,
+    the landing target for an external "Load skill to Agnes" button) and its
+    nav entry are exposed.
+
+    **Off by default** since the admin cleanup — the Library's skill builder is
+    the supported path. Both POST handlers read this gate too, not just the GET:
+    a stale external button must get a redirect home rather than silently
+    publish into the contributed marketplace.
+
+    Resolution: env var > ``features.contribute_skill_enabled`` YAML > False.
+    """
+    return feature_enabled(
+        "features", "contribute_skill_enabled", env_var="AGNES_CONTRIBUTE_SKILL_ENABLED", default=False
+    )
+
+
+def get_store_moderation_enabled() -> bool:
+    """Whether the Moderation & Trust hub (``/admin/store``) and its nav +
+    command-palette entries are exposed.
+
+    **Off by default.** The hub was a landing page for links the admin column
+    already carries: submission review has its own nav row, marketplace
+    curation is ``/admin/marketplaces``, and entity verification is gated by
+    its own ``store.verification_enabled``.
+
+    Hides UI only. ``/api/admin/share-requests*`` and the store APIs keep
+    serving, so a queued agent share can still be decided by API while the
+    page is hidden — the hub is the only PAGE that renders that queue.
+
+    Resolution: env var > ``features.store_moderation_enabled`` YAML > False.
+    """
+    return feature_enabled(
+        "features", "store_moderation_enabled", env_var="AGNES_STORE_MODERATION_ENABLED", default=False
+    )
 
 
 def get_agent_profiles_enabled() -> bool:

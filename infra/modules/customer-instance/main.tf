@@ -153,10 +153,15 @@ locals {
   # D1: studio toggle — same first-boot-seed handoff as theme/experience/
   # home_route above, module-wide (studio_enabled applies uniformly to every
   # VM, mirroring its historical `var.studio_enabled` env behavior). Emitted
-  # only when explicitly false: true is both the Terraform default and the
-  # app's own default, so a non-customized instance's seed stays
-  # byte-for-byte identical to before this change.
-  instance_studio_map = var.studio_enabled ? {} : { enabled = false }
+  # only when explicitly TRUE, and the variable defaults to false: the app's
+  # own default flipped to false when the admin cleanup retired the Studio
+  # surface, so a non-customized instance's seed stays empty — the rule is
+  # "seed nothing when the request matches the app default", and this
+  # condition inverted with that default. Leaving it as
+  # `var.studio_enabled ? {} : {enabled = false}` would have seeded nothing
+  # for an operator asking for `true` and quietly given them a disabled
+  # Studio.
+  instance_studio_map = var.studio_enabled ? { enabled = true } : {}
   # D1 residual (2026-08): `data_source.type` — the last knob still rewritten
   # by an always-wins `.env` line (`DATA_SOURCE=...`) on every boot, which
   # permanently shadowed the admin UI's `/admin/server-config` control of the
@@ -618,6 +623,10 @@ resource "google_compute_instance" "vm" {
     kai_agent_image              = var.kai_agent_image
     kai_agent_jwt_secret         = var.kai_agent_jwt_secret
     kai_agent_e2b_key_secret     = var.kai_agent_e2b_key_secret
+    extraction_worker_enabled    = each.value.extraction_worker_enabled
+    extraction_worker_image      = var.extraction_worker_image
+    extraction_worker_mem_limit  = each.value.extraction_worker_mem_limit
+    extraction_worker_cpus       = each.value.extraction_worker_cpus
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [
@@ -676,6 +685,18 @@ resource "google_compute_instance" "vm" {
         ))
       )
       error_message = "kai_agent_enabled=true on instance ${each.value.name} requires kai_agent_image, kai_agent_jwt_secret and kai_agent_e2b_key_secret on the module, plus kai_agent_env carrying HOST_AGENT_IDENTITY and CLOUD_LLM_PROVIDER (and the ANTHROPIC_UPSTREAM_URL/ANTHROPIC_UPSTREAM_API_KEY pair when the provider is anthropic) — the engine's env validation refuses to boot without them."
+    }
+
+    # Same plan-time catch for the extraction lane: without a worker image
+    # the overlay would pin the `extraction-worker` service to an empty
+    # `image:` and `docker compose up` fails the whole boot. The image is
+    # the one thing the module cannot default — the producer-bundled
+    # variant only exists in the operator's own registry (the public app
+    # image deliberately carries no producer; see docker-compose.prod.yml's
+    # extraction-worker comment).
+    precondition {
+      condition     = !each.value.extraction_worker_enabled || var.extraction_worker_image != ""
+      error_message = "extraction_worker_enabled=true on instance ${each.value.name} requires extraction_worker_image on the module — the producer-bundled worker image (Dockerfile `worker` target built with EXTRACTION_PRODUCER_INSTALL); the plain app image has no producer and every corpus-extraction job would fail."
     }
   }
 

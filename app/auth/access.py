@@ -451,6 +451,29 @@ def can_access_session(
 # ---------------------------------------------------------------------------
 
 
+def is_admin_session(user) -> bool:
+    """Boolean form of :func:`require_admin`'s checks, for routes that
+    resolve the user OPTIONALLY (``Depends(get_optional_user)``) and so
+    cannot mount ``require_admin`` itself — e.g. the SSO provider's
+    ``?mode=test`` leg, where the same route must also serve anonymous
+    normal-mode traffic.
+
+    Composes the exact primitives ``require_admin`` uses, in the same order:
+    restricted-principal hard-deny first (an agent is a *restriction* of its
+    owner, never an elevation), then the live Admin-membership read, then the
+    elevation consent gate. Keep the two in lockstep — a check added to
+    ``require_admin`` belongs here too (``tests/test_auth_providers.py``
+    pins the shared primitive set).
+    """
+    if not user or isinstance(user, PRINCIPAL_TYPES):
+        return False
+    if not is_user_admin(user["id"]):
+        return False
+    from app.auth.elevation import elevation_paused
+
+    return not elevation_paused()
+
+
 def require_admin(
     user=Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),

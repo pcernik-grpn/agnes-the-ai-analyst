@@ -1,0 +1,99 @@
+/* =====================================================================
+ * dev_preview.css — the local-dev audience switch.
+ *
+ * A developer tool that happens to live on top of the product, so it is
+ * styled to read as one: small, corner-parked, and clearly not something a
+ * user was given. It used to sit inline in the chat page's empty banner,
+ * where it looked like a feature.
+ *
+ * Only ever loaded under LOCAL_DEV_MODE for an admin (the partial that uses
+ * it renders nothing otherwise), but it is a real stylesheet all the same —
+ * `--ds-*` tokens throughout, and it must work in both themes.
+ * ===================================================================== */
+
+.devsw {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  /* Above the page, below anything modal — a tool must never sit on top of a
+     dialog the developer is trying to read. `.modal-backdrop` is 1000. */
+  z-index: 900;
+  font-size: 12px;
+}
+
+.devsw-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-radius: var(--ds-radius-pill);
+  border: 1px solid var(--ds-border);
+  background: var(--ds-surface);
+  color: var(--ds-text-secondary);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--ds-shadow-md);
+  opacity: 0.75;
+  transition: opacity var(--ds-motion-fast) var(--ds-ease-standard);
+}
+/* Quiet until reached for. It is on every page, so at full strength it would
+   be the most persistent thing on the screen. */
+.devsw-pill:hover,
+.devsw-pill:focus-visible,
+.devsw[data-open] .devsw-pill { opacity: 1; }
+
+.devsw-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ds-accent-warn-line);
+  flex-shrink: 0;
+}
+.devsw-chev svg { width: 12px; height: 12px; display: block; }
+
+.devsw-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: 244px;
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid var(--ds-border);
+  background: var(--ds-surface);
+  box-shadow: var(--ds-shadow-lg, var(--ds-shadow-md));
+}
+.devsw-menu[hidden] { display: none; }
+
+.devsw-cap {
+  margin: 2px 6px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ds-text-muted);
+}
+
+.devsw-item {
+  display: block;
+  padding: 7px 8px;
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--ds-text-primary);
+}
+.devsw-item span { display: block; font-weight: 600; }
+.devsw-item small { display: block; color: var(--ds-text-muted); font-size: 11.5px; }
+.devsw-item:hover { background: var(--ds-surface-sunken); }
+.devsw-item.is-on { background: var(--ds-primary-light); }
+.devsw-item.is-on span { color: var(--ds-primary); }
+
+.devsw-note {
+  margin: 8px 6px 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ds-text-muted);
+}
+
+@media print {
+  .devsw { display: none; }
+}

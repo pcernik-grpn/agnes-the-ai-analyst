@@ -103,6 +103,49 @@ def test_source_facet_offers_uploaded_option(seeded_app):
     assert 'value="uploaded"' in text
 
 
+def test_filter_menu_offers_recency_ownership_and_format(seeded_app):
+    """Beyond owner/source/access, the menu slices on data the rows already
+    carry: when it was added, whose it is, and what kind of file it is. Tags
+    cannot do this job — no artefact kind has a tags column — so these are what
+    "filter by tag" has to mean until entities land (TCRD-250)."""
+    col = _create(seeded_app, "Facet Demo", seeded_app["admin_token"])
+    _upload(seeded_app, col["id"], "deck.pdf", b"%PDF-1.4 x", "application/pdf", seeded_app["admin_token"])
+    text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+
+    # Recency: cumulative buckets, so a row carries every window it falls in
+    # and picking two never means "in neither".
+    assert 'data-facet="age"' in text
+    assert 'data-age="7d|30d|90d"' in text
+    assert "Last 7 days" in text
+    # Whose it is, stated as a question about you rather than a user id.
+    assert 'data-facet="ownership"' in text
+    assert "Created by you" in text
+    # File format — the row already prints it where the description used to be.
+    assert "data-format=" in text
+
+
+def test_a_file_that_is_not_indexed_says_so_on_its_row(seeded_app):
+    """A file whose text the extraction pass could not read is only findable by
+    opening its collection. It says so on the row instead — and a healthy file
+    says nothing, because a marker on every row carries no information."""
+    col = _create(seeded_app, "Ingest Demo", seeded_app["admin_token"])
+    r = _upload(seeded_app, col["id"], "brief.pdf", b"%PDF-1.4 x", "application/pdf", seeded_app["admin_token"])
+    assert r.status_code in (200, 201), r.text
+
+    from src.repositories import corpus_files_repo
+
+    repo = corpus_files_repo()
+    files = repo.list_for_corpus(col["id"])
+    assert files, "upload produced no corpus file"
+
+    from app.web.router import _ingest_label
+
+    assert _ingest_label({"processing_status": "indexed"}) == ""
+    assert _ingest_label({"processing_status": "needs_review"}) == "Needs review"
+    assert _ingest_label({"processing_status": "pending"}) == "Not indexed yet"
+    assert _ingest_label(None) == ""
+
+
 def test_shared_collection_is_shared_with_me_for_grantee(seeded_app):
     """A collection admin owns and shares into the analyst's group shows on the
     analyst's Library as shared_with_me, attributed to the owner."""
@@ -351,9 +394,15 @@ def test_sortable_columns_are_name_owner_and_sharing(seeded_app):
     keys = re.findall(r'data-sort-key="([^"]+)"', head)
     assert keys == ["name", "owner", "sharing"], f"sortable columns drifted: {keys}"
     assert ">Type<" not in head, "the Type column should be gone, not merely unsortable"
-    before, marker, _ = head.partition(">Actions<")
-    assert marker, "Actions header missing"
-    assert "lib-sort" not in before.rsplit("<th", 1)[-1], "Actions must not be sortable"
+    # The trailing column has no visible label. It holds a control on some rows
+    # and a STATUS on others ("Required by your admin" is the reason there is no
+    # control), and the word "Actions" promised the first for both. The header
+    # stays for the grid and for screen readers, unsortable as it always was.
+    before, marker, _ = head.partition('class="lib-cell-actions"')
+    assert marker, "trailing column header missing"
+    assert ">Actions<" not in head, "the trailing column must not claim to be actions"
+    assert '<span class="lib-sr">Access</span>' in head, "it still needs an accessible name"
+    assert "lib-sort" not in head.split(marker, 1)[1], "the trailing column must not be sortable"
 
 
 def test_every_sortable_column_opens_a_to_z(seeded_app):

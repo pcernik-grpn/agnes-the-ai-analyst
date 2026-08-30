@@ -2,6 +2,22 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "access-redesign",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "LOCAL_DEV_MODE=1",
+        "TESTING=1",
+        "AGNES_CHAT_ENABLED=true",
+        ".venv/bin/uvicorn",
+        "app.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9020"
+      ],
+      "port": 9020
+    },
+    {
       "name": "agnes-dev",
       "runtimeExecutable": "env",
       "runtimeArgs": [

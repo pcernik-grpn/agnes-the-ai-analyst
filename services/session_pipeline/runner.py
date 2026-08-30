@@ -106,6 +106,76 @@ DEFAULT_SESSION_DATA_DIR = Path(os.environ.get("SESSION_DATA_DIR", "/data/user_s
 _DEFAULT_TIME_BUDGET_SECONDS = 150.0
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Normalize a possibly-naive datetime to UTC-aware for comparison.
+
+    DuckDB returns naive datetimes for TIMESTAMP columns even though the
+    values are always written as UTC (see the comment on this in
+    app/api/admin_sessions.py); Postgres columns and ``Path.stat()``'s
+    ``st_mtime`` are unambiguous. Treating a naive value as already-UTC
+    (rather than local time) matches every other write in this codebase.
+    """
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def _sweep_chat_session_exports(effective_dir: Path, *, limit: int = 200) -> int:
+    """Bounded pre-scan: export any recently-active chat session whose
+    messages are newer than its already-exported jsonl's mtime (or that has
+    no exported file yet) — F4, audit-full-coverage plan Task 8. Runs once
+    at the top of every ``run_processor()`` call (i.e. once per processor
+    per scheduler tick); cheap even called that often since the candidate
+    query is capped at *limit* most-recently-active sessions and each one's
+    own mtime check skips anything already current. No-ops (no repo call at
+    all) when ``sessions.include_chat`` is off.
+
+    Returns the number of sessions actually (re-)exported, for the caller's
+    log line.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sessions", "include_chat", env_var="AGNES_SESSIONS_INCLUDE_CHAT", default=True):
+        return 0
+
+    from app.chat.session_export import export_chat_session_jsonl
+    from src.repositories import chat_session_repo, users_repo
+
+    try:
+        sessions = chat_session_repo().list_recently_active(limit=limit)
+    except Exception:
+        logger.warning("chat session export sweep: could not list recently-active sessions", exc_info=True)
+        return 0
+
+    exported = 0
+    for s in sessions:
+        last_active = _as_utc(s.last_message_at)
+        if last_active is None:
+            continue
+        # Same owner lookup export_chat_session_jsonl itself uses (exact
+        # email match, NOT the local-part/prefix resolution
+        # resolve_user_identity does for CLI-collector directory names) —
+        # so the path checked here for a stale mtime is exactly the path
+        # the export call below will write.
+        owner = users_repo().get_by_email(s.user_email)
+        if not owner:
+            continue
+        target = effective_dir / owner["id"] / f"chat-{s.id}.jsonl"
+        if target.exists():
+            try:
+                file_mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC)
+            except OSError:
+                file_mtime = None
+            if file_mtime is not None and last_active <= file_mtime:
+                continue
+        try:
+            if export_chat_session_jsonl(s.id) is not None:
+                exported += 1
+        except Exception:
+            logger.warning("chat session export sweep: export failed for %s", s.id, exc_info=True)
+    return exported
+
+
 def run_processor(
     conn: duckdb.DuckDBPyConnection,
     processor: SessionProcessor,
@@ -166,6 +236,15 @@ def run_processor(
     next tick).
     """
     effective_dir = session_data_dir if session_data_dir is not None else DEFAULT_SESSION_DATA_DIR
+
+    try:
+        n_exported = _sweep_chat_session_exports(effective_dir)
+        if n_exported:
+            logger.info("chat session export sweep: exported %d session(s)", n_exported)
+    except Exception:
+        # Best-effort, like every other step of this sweep — a chat-export
+        # failure must never block the processor tick it happens to share.
+        logger.warning("chat session export sweep failed (non-fatal)", exc_info=True)
 
     stats: dict[str, Any] = {
         "processor": processor.name,

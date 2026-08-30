@@ -39,11 +39,22 @@
 {% set _active_href = admin_nav_active_href(_admin_path) %}
 {% set _active_section_key = admin_nav_active_section_key(_admin_path) %}
 {% import "macros/_icon.html" as ico %}
-{# Flags addressable by an item's `when` key. `can_studio` is
-   `get_studio_enabled()`, put on every context by `_build_context`;
-   `default(false)` so a context that somehow lacks it hides the row rather
-   than raising. #}
-{% set _nav_flags = {'can_studio': can_studio | default(false)} %}
+{# Flags addressable by an item's `when` key — each one a `get_*_enabled()`
+   put on every context by `_build_context` (and by `_chrome_ctx`, so the
+   palette agrees with this column). `default(false)` so a context that
+   somehow lacks one hides the row rather than raising.
+
+   All five surfaces here are hidden by DEFAULT since the admin cleanup and
+   their routes redirect home when the flag is off, so failing closed is also
+   the truthful direction: a row rendered past a missing flag would be a link
+   to a redirect. #}
+{% set _nav_flags = {
+     'can_studio': can_studio | default(false),
+     'can_news': can_news | default(false),
+     'can_knowledge_digests': can_knowledge_digests | default(false),
+     'can_contribute_skill': can_contribute_skill | default(false),
+     'can_store_moderation': can_store_moderation | default(false),
+   } %}
 {# The head is a page-level heading that also answers "which instance am I
    changing": under the rail this column is the primary navigation of the page
    and the rail beside it is a glyph strip.
@@ -142,16 +153,29 @@
             </button>
             <div class="admin-nav__group-body" id="admin-nav-body-{{ section['key'] }}"{% if not _sec_open %} hidden{% endif %}>
                 {# `when` (optional) names a flag in `_nav_flags` that must be
-                   truthy for the row to render — see admin_nav.py. Only Studio
-                   uses it. A row naming a flag that isn't in the map is
+                   truthy for the row to render — see admin_nav.py. Studio, its
+                   suggestions queue, Knowledge digests, News, Contribute a
+                   skill and Store moderation use it. A row naming a flag that
+                   isn't in the map is
                    DROPPED, not shown: `when` gates surfaces that can be
                    disabled instance-wide, so failing closed is the safe
                    direction. Add a supported flag by extending `_nav_flags`
                    above — Jinja has no ambient `context` lookup, and an
                    explicit map is what makes the supported set readable. #}
+                {# `gloss` (optional) is the one-line answer to "what is this?",
+                   rendered UNDER the label. Only these disclosure rows carry
+                   one: the tab strips tried captions and dropped them (see
+                   admin_nav.py's note on the Data tabs), and that call still
+                   holds there — "Sources" and "Tables" carry their own meaning
+                   and four captions doubled a horizontal strip's height. A
+                   vertical column of specialist labels is the opposite case:
+                   "Store lint" cannot be renamed into self-explanation, and
+                   the copy already existed one click away on the page itself.
+                   Height stays bounded because the column expands one section
+                   at a time. #}
                 {% for item in section['items'] if not item.get('when') or _nav_flags.get(item['when']) %}
-                <a class="admin-nav__link{% if item['href'] == _active_href %} is-active{% endif %}"
-                   href="{{ item['href'] }}">{{ item['label'] }}</a>
+                <a class="admin-nav__link{% if item.get('gloss') %} admin-nav__link--glossed{% endif %}{% if item['href'] == _active_href %} is-active{% endif %}"
+                   href="{{ item['href'] }}">{% if item.get('gloss') %}<span class="admin-nav__label">{{ item['label'] }}</span><span class="admin-nav__gloss">{{ item['gloss'] }}</span>{% else %}{{ item['label'] }}{% endif %}</a>
                 {% endfor %}
             </div>
         </div>

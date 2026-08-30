@@ -111,8 +111,12 @@ def _audit(user: dict, action: str, params: dict) -> None:
     if _should_audit(actor_id, {"endpoint": action, **params}):
         try:
             audit_repo().log(
-                user_id=actor_id, action=action, params=params,
-                result="success", client_kind="web",
+                # client_kind intentionally omitted (F0 audit-context
+                # autofill, Task 1) — this read isn't necessarily browser-only.
+                user_id=actor_id,
+                action=action,
+                params=params,
+                result="success",
             )
         except Exception:
             logger.exception("audit_log write failed for %s; continuing", action)
@@ -121,11 +125,10 @@ def _audit(user: dict, action: str, params: dict) -> None:
 def _trend_start() -> date:
     """First day of the 30-day trend window (inclusive), so the response
     carries exactly _TREND_DAYS entries ending today (UTC)."""
-    return (datetime.now(timezone.utc).date() - timedelta(days=_TREND_DAYS - 1))
+    return datetime.now(timezone.utc).date() - timedelta(days=_TREND_DAYS - 1)
 
 
-def _build_series(sessions_map: dict, events_map: dict, start: date,
-                  *, per_user: bool = False) -> list[dict]:
+def _build_series(sessions_map: dict, events_map: dict, start: date, *, per_user: bool = False) -> list[dict]:
     """Zero-filled daily rows over the 30-day window. Missing days surface
     as zeros rather than gaps so the chart x-axis is continuous."""
     out = []
@@ -283,8 +286,7 @@ def adoption_user_top_skills(
     window = _norm_window(window)
     target = _resolve(user_id)
     username = _username_for_user(target)
-    rows = usage_repo().adoption_user_top_skills(
-        _cutoff(window), user_id, username, limit=limit)
+    rows = usage_repo().adoption_user_top_skills(_cutoff(window), user_id, username, limit=limit)
     return {"window": window, "rows": rows}
 
 
@@ -298,6 +300,5 @@ def adoption_user_top_tools(
     window = _norm_window(window)
     target = _resolve(user_id)
     username = _username_for_user(target)
-    rows = usage_repo().adoption_user_top_tools(
-        _cutoff(window), user_id, username, limit=limit)
+    rows = usage_repo().adoption_user_top_tools(_cutoff(window), user_id, username, limit=limit)
     return {"window": window, "rows": rows}

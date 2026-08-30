@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
+from src.audit_helpers import log_safe
 from src.repositories import audit_repo
 from app.chat.readiness import (
     ENV_ANTHROPIC,
@@ -257,7 +258,7 @@ async def admin_debug(
     }
 
 
-@router.get("/{chat_id}/tail-ticket")
+@router.post("/{chat_id}/tail-ticket")
 async def tail_ticket(
     chat_id: str,
     request: Request,
@@ -269,6 +270,17 @@ async def tail_ticket(
     reliably across browsers (Safari in particular strips cookies on WS
     upgrades from `fetch`), so we mint a ticket here under the normal admin
     auth flow and the JS hands it to the WS as a query parameter.
+
+    POST, not GET, for two reasons that are the same reason: minting a
+    credential is a state change, and the brokered admin-READ surface
+    (``app/api/broker.py``) replays every ``GET``/``HEAD`` admin route under
+    the caller's resolved identity precisely BECAUSE "never mutate on GET" is
+    supposed to hold. As a GET this route was the counterexample — a chat
+    sandbox could ask the broker for it and get back a live ticket for
+    ``/admin/chat/{any_chat_id}/tail``, i.e. read another user's live session.
+    The sandbox runs an agent that any document it reads can prompt-inject, so
+    that is a real path, not a theoretical one. Guarded by
+    ``tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential``.
     """
     # Verify the session exists so 404 surfaces here rather than mid-WS.
     repo = getattr(request.app.state, "chat_repo", None)
@@ -295,6 +307,14 @@ async def admin_tail(ws: WebSocket, chat_id: str, ticket: str = ""):
         await ws.close(code=4503, reason="coordination_unavailable")
         return
     if user_id is None:
+        log_safe(
+            user_id=None,
+            action="chat.session.tail_rejected",
+            resource=f"chat_session:{chat_id}",
+            params={"reason": "invalid_or_expired_ticket"},
+            result="denied",
+            client_kind="web",
+        )
         await ws.close(code=4401, reason="invalid_or_expired_ticket")
         return
     repo = getattr(ws.app.state, "chat_repo", None)
@@ -306,6 +326,18 @@ async def admin_tail(ws: WebSocket, chat_id: str, ticket: str = ""):
         await ws.close(code=4404)
         return
     await ws.accept()
+    # The admin is now streaming ANOTHER user's live chat log. The ticket
+    # issuance (a separate POST) records that permission was granted; only
+    # this row records that the content was actually watched, which is the
+    # event a "who read whose conversation" question is really asking about.
+    log_safe(
+        user_id=user_id,
+        action="chat.session.tail_view",
+        resource=f"chat_session:{chat_id}",
+        params={"subject_email": s.user_email},
+        result="success",
+        client_kind="web",
+    )
     chat_data_dir = getattr(ws.app.state, "chat_data_dir", None)
     if chat_data_dir is None:
         await ws.send_json({"type": "no_log", "reason": "chat_data_dir_not_configured"})

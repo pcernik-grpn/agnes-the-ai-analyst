@@ -91,6 +91,7 @@ from src.keboola_chat_tools import (
     derived_tool_id,
     exposed_tool_name,
 )
+from src.audit_helpers import log_safe
 from src.repositories import (
     connection_secrets_repo,
     mcp_sources_repo,
@@ -279,21 +280,21 @@ def _resolve_token(connection_id: str, row: Dict[str, Any]) -> Optional[str]:
     if not token:
         token_env = row.get("token_env") or ""
         if token_env:
-            # SECURITY: only read env vars on the remote-attach allowlist. Without
+            # SECURITY: only read env vars on the config-secret allowlist. Without
             # this, an admin could set token_env=JWT_SECRET_KEY (or DATABASE_URL,
             # ANTHROPIC_API_KEY, …) and exfiltrate that server-process secret via
             # the outbound X-StorageApi-Token header in /test and /tables. Enforced
             # here (validate-at-use) as well as at create/update, so a row written
             # before this guard existed still cannot leak an off-allowlist env var.
-            from src.orchestrator_security import is_token_env_allowed
+            from src.orchestrator_security import is_config_secret_env_allowed
 
-            if is_token_env_allowed(token_env):
+            if is_config_secret_env_allowed(token_env):
                 token = os.environ.get(token_env, "")
             else:
                 logger.warning(
-                    "connection %s: token_env %r is not on the remote-attach "
+                    "connection %s: token_env %r is not on the config-secret "
                     "allowlist; refusing to read it (add it to "
-                    "AGNES_REMOTE_ATTACH_TOKEN_ENVS or use a vault secret)",
+                    "AGNES_CONFIG_SECRET_ENVS or use a vault secret)",
                     connection_id,
                     token_env,
                 )
@@ -301,20 +302,28 @@ def _resolve_token(connection_id: str, row: Dict[str, Any]) -> Optional[str]:
 
 
 def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
-    """Reject a token_env that isn't on the remote-attach allowlist (409-style
-    400). None/empty is allowed — vault-secret connections don't use token_env.
-    Called on create/update so a bad name never lands in the row."""
+    """Reject a secret-ref env name that isn't on the config-secret allowlist
+    (409-style 400). None/empty is allowed — vault-secret connections don't use
+    token_env. Called on create/update so a bad name never lands in the row.
+
+    The write-time gate is the config-resolution UNION (attach names plus
+    config-only names like the SharePoint certificate env) — the hard
+    per-consumer boundary is enforced again at resolve time: the ATTACH paths
+    accept only ``is_token_env_allowed`` names, the settings resolvers only
+    ``is_config_secret_env_allowed`` ones."""
     if not token_env:
         return
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_token_env_allowed(token_env):
+    if not is_config_secret_env_allowed(token_env):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"token_env {token_env!r} is not allowlisted. Use a Keboola storage-"
-                "token env var (or add the name to AGNES_REMOTE_ATTACH_TOKEN_ENVS), "
-                "or store the token in the vault via PUT .../secret instead."
+                f"token_env {token_env!r} is not allowlisted. Use a data-source "
+                "credential env var (or add the name to AGNES_CONFIG_SECRET_ENVS, "
+                "or AGNES_REMOTE_ATTACH_TOKEN_ENVS if it must also serve as a "
+                "remote-attach token_env), or store the token in the vault via "
+                "PUT .../secret instead."
             ),
         )
 
@@ -336,7 +345,7 @@ _CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
 
 def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict[str, Any]]) -> None:
     """Reject config-EMBEDDED secret-ref env var names that aren't on the
-    remote-attach allowlist — the same guard :func:`_reject_disallowed_token_env`
+    config-secret allowlist — the same guard :func:`_reject_disallowed_token_env`
     already applies to the request's top-level ``token_env`` field.
 
     Snowflake needs up to three independent secret-ref NAMES at once
@@ -785,6 +794,12 @@ async def create_connection(
     row = _with_secret_status(repo.get(conn_id))
     if body.source_type == "keboola" and body.seed_from_instance_credentials and row is not None:
         row = await _seed_keboola_instance_credential(conn_id, row)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.create",
+        resource=f"source_connection:{conn_id}",
+        params={"name": body.name, "source_type": body.source_type},
+    )
     return row
 
 
@@ -841,6 +856,22 @@ async def update_connection(
     default at all, which falls back to the legacy
     ``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See
     :func:`_guard_default_repoint`.
+
+    SharePoint connections: ``config.scopes`` (the connect wizard's
+    server-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and
+    ``config.extraction`` (the in-Agnes extraction schedule's own
+    ``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried
+    forward when the request's ``config`` omits the key — the same
+    "explicit wins" contract as Keboola's ``project_id``/``project_name``
+    above — since this endpoint's wholesale ``config`` replace would
+    otherwise let an ordinary edit through the generic connection editor
+    (which renders neither field) silently erase every confirmed scope's
+    ``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or
+    reset the extraction schedule's clock. An explicit ``scopes: []`` (or
+    ``extraction: null``) in the request still clears it deliberately. The
+    full set of keys is ``app.api.admin_sharepoint.
+    SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by
+    ``tests/test_sharepoint_config_carry_forward_ratchet.py``.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -905,6 +936,38 @@ async def update_connection(
                     **{k: v for k, v in old_config.items() if k in ("project_id", "project_name")},
                     **config,
                 }
+            # SharePoint has a WHOLE SET of server-written config keys, same
+            # shape of problem as `project_id`/`project_name` above, one
+            # source type over: each is written by a dedicated
+            # `app/api/admin_sharepoint.py` endpoint/job, never typed by
+            # hand, never rendered by this generic editor's form. Because
+            # this endpoint REPLACES `config` wholesale, an ordinary edit
+            # through that form (a rename, a certificate change) silently
+            # wiped whichever of them wasn't carried forward — first
+            # `scopes` (which is the ONLY place the anonymize-in-front
+            # pipeline's opt-in lives, see
+            # `app/worker/kinds.py::_anonymize_marked_scope_map` — the
+            # anonymize-fail-closed report, 2026-08-29), then `extraction`
+            # (TCRD-226, merged hours later the SAME day — the identical bug,
+            # one key over, with no test to catch it).
+            #
+            # The list itself is NOT restated here: it is imported from
+            # `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`
+            # (`app/api/admin_sharepoint.py`, next to the functions that
+            # actually write these keys) and ratcheted by
+            # `tests/test_sharepoint_config_carry_forward_ratchet.py`, which
+            # statically scans that file's writers and fails if a THIRD key
+            # ever lands there without a matching entry — so this carry-
+            # forward cannot silently go stale the way a third hand-copied
+            # tuple here would. Same "explicit wins" contract as
+            # `project_id`/`project_name` above: an explicit `scopes: []`
+            # (or the wizard's own DELETE endpoint) still empties it.
+            elif existing_row.get("source_type") == "sharepoint":
+                from app.api.admin_sharepoint import SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _sp_key in SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS:
+                    if _sp_key not in config and old_config.get(_sp_key) is not None:
+                        config = {**config, _sp_key: old_config[_sp_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`
@@ -940,6 +1003,16 @@ async def update_connection(
         is_default=body.is_default,
     )
     _resync_derived_chat_tools(connection_id)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.update",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "fields": sorted(
+                k for k, v in body.model_dump(exclude_unset=True).items() if k != "confirm_connection_change"
+            )
+        },
+    )
     return _with_secret_status(repo.get(connection_id))
 
 
@@ -1069,6 +1142,12 @@ async def delete_connection(
     # advice. (Devin Review on this PR.)
     _remove_chat_tools(connection_id)
     repo.delete(connection_id)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.delete",
+        resource=f"source_connection:{connection_id}",
+        params={"source_type": row.get("source_type")},
+    )
     # Best-effort: clear any vault secret — ignore if none exists.
     try:
         connection_secrets_repo().delete(connection_id)
@@ -1338,6 +1417,13 @@ async def set_connection_secret(
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
     await _store_connection_secret(connection_id, row, body.value, body.kind)
+    # NEVER include body.value — the secret itself never enters the audit record.
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.secret.set",
+        resource=f"source_connection:{connection_id}",
+        params={"kind": body.kind},
+    )
 
 
 @router.delete("/{connection_id}/secret", status_code=204)
@@ -1356,6 +1442,12 @@ async def delete_connection_secret(
         raise HTTPException(status_code=400, detail="invalid_kind")
     key = master_secret_key(connection_id) if kind == "master" else connection_id
     connection_secrets_repo().delete(key)
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.secret.clear",
+        resource=f"source_connection:{connection_id}",
+        params={"kind": kind},
+    )
     if kind != "master":
         # The chat-tools source holds a COPY of the storage token, taken at
         # enable time. Clearing the connection's token is how an admin cuts a
@@ -1862,6 +1954,12 @@ async def test_connection(
     row = source_connections_repo().get(connection_id)
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
+
+    log_safe(
+        user_id=_user.get("id"),
+        action="source_connection.test",
+        resource=f"source_connection:{connection_id}",
+    )
 
     config = row.get("config") or {}
     try:

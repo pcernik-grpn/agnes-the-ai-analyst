@@ -261,6 +261,115 @@ function showToast(text, kind = "ok", { durationMs = 2400 } = {}) {
   setTimeout(dismiss, durationMs);
 }
 
+/** Instant, styled tooltips for icon-only controls (`data-tip="..."`).
+ *
+ *  Replaces the native `title` attribute on the session-files drawer's
+ *  actions. `title` has a ~1s browser delay, cannot be styled, and cannot be
+ *  shown on keyboard focus — so the one sentence explaining what an icon
+ *  does was, in practice, unreachable. That mattered most AFTER saving a
+ *  file, where "open in Library" lived only in a `title` nobody saw.
+ *
+ *  The tooltip node is a single element on `document.body`, positioned
+ *  `fixed`. It has to be: `.cloud-chat-files-list` is `overflow-y: auto`, so
+ *  a tooltip rendered inside a row would be clipped by its own scroll
+ *  container. Listeners are delegated from `document` because the file list
+ *  is re-rendered on every refresh — per-node binding would leak and would
+ *  miss rows added later.
+ *
+ *  Accessibility: the trigger keeps its own `aria-label` as its accessible
+ *  name; while visible the tooltip is also wired up via `aria-describedby`,
+ *  and it appears on `:focus-visible`, so a keyboard user gets what a mouse
+ *  user gets. */
+/** Where a tooltip bubble goes, as pure geometry — no DOM, so the flip and
+ *  clamp rules are testable without jsdom.
+ *
+ *  `rect` is the trigger's viewport rect, `tip` the bubble's measured size,
+ *  `view` the viewport. Returns `{top, left, below}`. Above is preferred; it
+ *  flips below only when the bubble would not clear the top margin, and the
+ *  horizontal centre is clamped so a control near either edge still shows a
+ *  fully on-screen bubble. */
+function _tipPosition(rect, tip, view, { offset = 8, margin = 8 } = {}) {
+  const below = rect.top - tip.height - offset < margin;
+  const top = below ? rect.bottom + offset : rect.top - tip.height - offset;
+  const centred = rect.left + rect.width / 2 - tip.width / 2;
+  const left = Math.max(margin, Math.min(centred, view.width - tip.width - margin));
+  return { top: Math.round(top), left: Math.round(left), below };
+}
+
+const Tip = (() => {
+  let node = null;
+  let trigger = null;
+
+  function ensure() {
+    if (node) return node;
+    node = document.createElement("div");
+    node.className = "ds-tip";
+    node.id = "ds-tip";
+    node.setAttribute("role", "tooltip");
+    node.hidden = true;
+    document.body.appendChild(node);
+    return node;
+  }
+
+  function place(el) {
+    const { top, left, below } = _tipPosition(
+      el.getBoundingClientRect(),
+      node.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight }
+    );
+    node.style.top = `${top}px`;
+    node.style.left = `${left}px`;
+    node.classList.toggle("is-below", below);
+  }
+
+  function show(el) {
+    const text = el.getAttribute("data-tip");
+    if (!text) return;
+    ensure();
+    trigger = el;
+    node.textContent = text;
+    node.hidden = false;
+    el.setAttribute("aria-describedby", "ds-tip");
+    place(el);
+  }
+
+  function hide() {
+    if (!node || node.hidden) return;
+    node.hidden = true;
+    if (trigger) trigger.removeAttribute("aria-describedby");
+    trigger = null;
+  }
+
+  function bind() {
+    document.addEventListener("mouseover", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (!el || el === trigger) return;
+      show(el);
+    });
+    document.addEventListener("mouseout", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el && el === trigger) hide();
+    });
+    document.addEventListener("focusin", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el) show(el);
+    });
+    document.addEventListener("focusout", hide);
+    // A tooltip anchored to a rect that has since moved is worse than none,
+    // so any scroll or resize retires it rather than trying to re-follow.
+    document.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    document.addEventListener("click", hide, true);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") hide();
+    });
+  }
+
+  return { bind, hide };
+})();
+
+Tip.bind();
+
 /** Set the title strip above the messages area. Pass ``null`` to
  *  hide it (empty-state / new-chat shell), pass a string to show it.
  *  Long titles ellipsis via CSS. */
@@ -518,6 +627,34 @@ function extractNextActions(markdown) {
     out = out.slice(0, open.index) + out.slice(close + _NEXT_ACTIONS_CLOSE.length);
   }
   return { text: out.trimEnd(), actions: actions.slice(0, _NEXT_ACTIONS_MAX) };
+}
+
+/** True while the stream sits inside a trailer fence whose closing ``` has
+ *  not arrived yet.
+ *
+ *  This is the window TCRD-213 is actually about. The `next_actions` chips are
+ *  NOT a second LLM call made after streaming — they are a fenced trailer at
+ *  the end of the SAME streamed answer, and `_streamingSafeText` deliberately
+ *  withholds a half-open fence so raw ``` markup never flashes on screen. The
+ *  consequence is that once the prose ends, tokens keep arriving for as long
+ *  as the model spends on `sources` + `next_actions`, while the painted text
+ *  cannot change. The turn is working; the screen cannot show it. A blinking
+ *  caret under finished-looking prose is indistinguishable from a hang, which
+ *  is exactly the "vypadá to, jako by se aplikace zasekla" report.
+ *
+ *  Scans to the LAST opener of either trailer and asks whether a close
+ *  follows it, so a closed `sources` fence ahead of an still-open
+ *  `next_actions` one is judged on the open one. */
+function _inWithheldTrailer(text) {
+  const s = text || "";
+  let last = -1;
+  for (const re of [_SOURCES_OPEN_RE, _NEXT_ACTIONS_OPEN_RE]) {
+    const g = new RegExp(re.source, "gi");
+    let m;
+    while ((m = g.exec(s)) !== null) last = Math.max(last, m.index + m[0].length);
+  }
+  if (last === -1) return false;
+  return s.indexOf("```", last) === -1;
 }
 
 function stripNextActionsFence(markdown) {
@@ -899,6 +1036,11 @@ async function loadSidebar() {
   }
   const empty = $("cloud-chat-empty-state");
   if (empty) empty.hidden = list.length > 0;
+  // A successful load clears a FAILED state left over from an earlier
+  // attempt (TCRD-207/DES-153) — reaching this line means the fetch above
+  // resolved, so whatever was wrong before no longer is.
+  const failed = $("cloud-chat-failed-state");
+  if (failed) failed.hidden = true;
   // The rail's section chrome (reveal Pinned once it has rows, stand Chats down
   // when everything is pinned, re-apply each section's persisted open state) has
   // ONE owner — rail_history.js, loaded on every rail page including this one.
@@ -1249,14 +1391,76 @@ let _currentAgentId = null;
  * exist", because a session row exists the moment you click "+ New chat". */
 let _sessionHasTurns = false;
 
+/** The conversation has started: settle the agent AND raise the thread
+ * header.
+ *
+ * These were two independent decisions and they disagreed. `openSession`
+ * titled every session it opened — "Untitled chat" when there was nothing
+ * better — which put `.has-thread` on the shell and swapped the centred
+ * empty-state layout for the conversation one. But switching agent on an
+ * empty dashboard goes through `newChat()` to get a session for the new
+ * agent, so picking an agent redrew the page as a conversation that did not
+ * exist: thread header, Copy transcript, composer pushed to the foot, and
+ * the dashboard still sitting there underneath.
+ *
+ * The distinction the picker already drew is the right one everywhere — "has
+ * this conversation started", not "does a session row exist" — so the header
+ * is driven from here too, and a session with no turns keeps the empty-state
+ * layout it had before the switch. */
+function _markConversationStarted() {
+  _sessionHasTurns = true;
+  _syncAgentPicker();
+  const meta = _sessionsCache.find(s => s.id === currentChatId);
+  setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+}
+
+/** The inverse: no turns, so the empty-state dashboard and the live picker,
+ * and no thread chrome for a transcript that does not exist yet. */
+function _markConversationNotStarted() {
+  _sessionHasTurns = false;
+  _syncAgentPicker();
+  setThreadTitle(null);
+}
+
 /** What to call an agent in the picker. The seeded default agent is named the
  * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
  * answer to "who am I talking to?" — show the instance brand there instead.
  * A default the owner has since RENAMED keeps its own name. */
+/** How long a name may be before the pill abbreviates it. Sized to the widest
+ *  name that fits the 9rem cap at the button's weight without ellipsis. */
+const AGENT_LABEL_MAX = 14;
+
+/** The FULL name, for the menu, the in-conversation label and the title
+ *  attribute — everywhere there is room to say it.
+ *
+ *  The default agent is "Default", not the brand. It used to render as "Agnes",
+ *  which read more naturally on its own but was the odd one out once the caller
+ *  had named agents of their own ("Agnes" beside "Delivery Health" looks like a
+ *  different kind of thing), and it disagreed with the /agents page, where the
+ *  same row is called Default. One name per agent, everywhere. */
 function _agentLabel(a, brand) {
   if (!a) return brand;
-  if (a.is_default && (!a.name || a.name === "Default")) return brand;
+  if (a.is_default && (!a.name || a.name === "Default")) return "Default";
   return a.name || "Untitled agent";
+}
+
+/** The label as the PILL shows it: initials once a name is long enough to crowd
+ *  the composer ("Finance Proposals" → "FP").
+ *
+ *  Initials, not an ellipsis, so the pill's width is stable across agents rather
+ *  than growing to the cap — the trade is that two names sharing initials look
+ *  alike in the pill. The full name is always one hover (title) or one click
+ *  (the menu, which ticks the current row) away, and the in-conversation label
+ *  spells it out, so nothing depends on reading the pill alone.
+ *
+ *  Single long word has no initials to take, so it falls back to the CSS
+ *  ellipsis rather than rendering one lonely letter. */
+function _agentPillLabel(name) {
+  const full = String(name || "").trim();
+  if (full.length <= AGENT_LABEL_MAX) return full;
+  const words = full.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return full;
+  return words.slice(0, 3).map(w => w[0].toUpperCase()).join("");
 }
 
 function _agentById(id) {
@@ -1288,8 +1492,13 @@ function _syncAgentPicker() {
   }
   const agent = _agentById(_currentAgentId) || _defaultAgent();
   const name = _agentLabel(agent, btn.dataset.fallbackLabel);
-  if (btnLabel) btnLabel.textContent = name;
-  btn.title = "Choose which agent to chat with";
+  const pill = _agentPillLabel(name);
+  if (btnLabel) btnLabel.textContent = pill;
+  // When the pill abbreviates, the title is the only place the full name shows
+  // on hover — so say it there rather than repeating the generic instruction.
+  btn.title = pill === name
+    ? "Choose which agent to chat with"
+    : `${name} — choose which agent to chat with`;
   btn.hidden = _sessionHasTurns;
   if (staticLabel) {
     staticLabel.textContent = name;
@@ -1315,12 +1524,13 @@ function _renderAgentMenu() {
   if (!_agentsCache.length) {
     const note = document.createElement("li");
     note.className = "cloud-chat-agent-menu-note";
-    note.textContent = "No agents yet — build one on the Agents page.";
+    // No "build one on the Agents page" instruction any more: the create row
+    // below IS that path, so the note only has to state the fact.
+    note.textContent = "No agents yet.";
     menu.appendChild(note);
-    return;
   }
   const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
-  for (const a of _agentsCache) {
+  for (const a of (_agentsCache.length ? _agentsCache : [])) {
     const li = document.createElement("li");
     li.className = "cloud-chat-agent-menu-item";
     if (a.id === currentId) li.classList.add("is-current");
@@ -1377,6 +1587,47 @@ function _renderAgentMenu() {
     });
     menu.appendChild(li);
   }
+
+  /* …and one row that is not an agent: the way to make another.
+   *
+   * It belongs here because this menu is where the caller finds out their
+   * agents are not enough — you go looking for the one that answers this
+   * question, do not find it, and the next move should be in reach rather than
+   * back through the rail to /agents. Standard account-switcher shape: the set,
+   * then "add one".
+   *
+   * `?new=1` is the SAME path the Agents page's own "New agent" card takes
+   * (agents.html strips the param and calls createAgent, so the server mints
+   * the row) — not a second way to create an agent, just a second door to the
+   * one that exists. An <a>, so it is a real link: middle-click and
+   * open-in-new-tab work, and it needs no JS to function.
+   *
+   * Separated from the list by a rule, because it is a different KIND of row:
+   * every item above it switches this conversation, this one leaves the page. */
+  const create = document.createElement("li");
+  create.className = "cloud-chat-agent-menu-create";
+  create.setAttribute("role", "none");
+  const link = document.createElement("a");
+  link.href = "/agents?new=1";
+  link.setAttribute("role", "menuitem");
+  link.className = "cloud-chat-agent-menu-create-link";
+  const plus = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  plus.setAttribute("class", "cloud-chat-agent-menu-create-ico");
+  plus.setAttribute("viewBox", "0 0 24 24");
+  plus.setAttribute("fill", "none");
+  plus.setAttribute("aria-hidden", "true");
+  const pp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  pp.setAttribute("d", "M12 5v14M5 12h14");
+  pp.setAttribute("stroke", "currentColor");
+  pp.setAttribute("stroke-width", "2");
+  pp.setAttribute("stroke-linecap", "round");
+  plus.appendChild(pp);
+  link.appendChild(plus);
+  const ctext = document.createElement("span");
+  ctext.textContent = "Create new agent";
+  link.appendChild(ctext);
+  create.appendChild(link);
+  menu.appendChild(create);
 }
 
 /** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
@@ -1387,7 +1638,23 @@ async function _refreshAgents() {
     // Re-pointed from this page's own now-deleted /api/agents (Task C1.2) —
     // /api/v1/agents absorbed its wire shape, `mine` included, in Task C1.1.
     const res = await api("/api/v1/agents");
-    _agentsCache = (res.data || []).filter(a => a.mine && a.slug);
+    // Ready agents only — a draft is unfinished by its author's own say-so,
+    // and offering one here invites a conversation with something half-built.
+    // The picker is the "who am I talking to" control, not the agent index;
+    // /agents is where drafts belong, beside the thing that finishes them.
+    //
+    // `status`/`is_default` survive the move: v1's `_serialize` starts from
+    // `dict(row)`, so both columns pass through unchanged.
+    //
+    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent
+    // is seeded `status: "ready"` and an older draft one is promoted on first
+    // touch (`AgentsRepository.get_or_create_default`), so it passes the
+    // status test on its own. This keeps it from being dropped in the window
+    // before that heal lands — a picker without the default is a one-way
+    // switch, the same dead end the on-open refresh exists to avoid.
+    _agentsCache = (res.data || []).filter(
+      a => a.mine && a.slug && (a.status === "ready" || a.is_default)
+    );
   } catch (err) {
     console.warn("chat: could not load agents for the picker", err);
   }
@@ -1492,8 +1759,7 @@ async function loadAndRenderHistory(chatId) {
     }
   } else {
     hideCapabilities();
-    _sessionHasTurns = true;
-    _syncAgentPicker();
+    _markConversationStarted();
     lastAssistantArticle = null;
     lastUserText = "";
     for (const m of history) {
@@ -1596,7 +1862,12 @@ async function openSession(chatId, wsUrlOverride) {
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
-  setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+  // A titled session is necessarily one with turns (titles are derived from
+  // the conversation), so it can raise its header right away, before history
+  // hydrates. An UNTITLED one cannot be judged yet — it is equally a thread
+  // whose title never landed and a session created a moment ago by the agent
+  // picker — so the chrome waits for `loadAndRenderHistory` to say which.
+  setThreadTitle(meta && meta.title ? meta.title : null);
   // Who this conversation runs as. Read from the sidebar row (agent_id is
   // projected by GET /api/chat/sessions) rather than a per-open round-trip;
   // newChat() refreshes that cache before calling us, so a just-created
@@ -2571,6 +2842,9 @@ function _renderStreamingMarkdown() {
   _streamLastRender = performance.now();
   if (!currentAssistantBody) return; // finalized (or never started) — nothing to paint
   const visible = _streamingSafeText(currentAssistantText);
+  if (currentAssistantArticle) {
+    currentAssistantArticle.classList.toggle("is-trailing", _inWithheldTrailer(currentAssistantText));
+  }
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
   } catch (_e) {
@@ -2630,7 +2904,7 @@ function _resetStreamingState() {
   _turnSealedText = "";
   _turnSealedArticles = [];
   if (!article || !body) return;
-  article.classList.remove("is-streaming");
+  article.classList.remove("is-streaming", "is-trailing");
   if (!text.trim()) return; // an empty bubble has nothing to finish
   enhanceCodeBlocks(body);
   enhanceTables(body);
@@ -2658,7 +2932,7 @@ function _sealStreamingSegment() {
     currentAssistantArticle.remove();
   } else {
     _flushStreamingTail();
-    currentAssistantArticle.classList.remove("is-streaming");
+    currentAssistantArticle.classList.remove("is-streaming", "is-trailing");
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
     renderMermaidBlocks(currentAssistantBody);
@@ -2741,7 +3015,7 @@ function finalizeAssistantMessage(frame) {
   _turnSealedText = "";
   _turnSealedArticles = [];
   if (currentAssistantArticle && currentAssistantBody) {
-    currentAssistantArticle.classList.remove("is-streaming");
+    currentAssistantArticle.classList.remove("is-streaming", "is-trailing");
     currentAssistantBody.innerHTML = renderAnswerMarkdown(tail);
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
@@ -2925,6 +3199,14 @@ const _TOOL_LABELS = {
   fact_search: "Searched the knowledge graph",
   fact_neighbors: "Walked related facts",
   fact_claims: "Read the evidence",
+  // Track C7 (@delegation MVP) — the in-sandbox SDK tool
+  // `app/chat/runner.py::_delegation_mcp_server` exposes as
+  // `mcp__agnes-delegation__delegate_to_agent`; `_plainToolName` strips
+  // the `mcp__<server>__` prefix down to `delegate_to_agent`. No new
+  // frame types were introduced (delegation rides the existing generic
+  // tool_call/tool_result pair, already AG-UI-mapped) — this label is
+  // the whole of the "agent badge" for this MVP.
+  delegate_to_agent: "Delegating to another agent",
 };
 
 const _BASH_COMMAND_LABELS = [
@@ -2983,7 +3265,13 @@ function renderApprovalRequest(frame) {
   head.appendChild(icon);
   const name = document.createElement("span");
   name.className = "cloud-chat-tool-name";
-  name.textContent = "Approval required";
+  // Name the tool being approved — the frame carries it ("tool" is the
+  // engine provider's nothing-known fallback, not a name worth showing).
+  const approvalTool = typeof frame.tool === "string" && frame.tool !== "tool" ? frame.tool : "";
+  name.textContent = approvalTool
+    ? `Approval required · ${_toolLabel(approvalTool, { command: frame.command })}`
+    : "Approval required";
+  name.title = approvalTool;
   head.appendChild(name);
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
@@ -2991,13 +3279,36 @@ function renderApprovalRequest(frame) {
   head.appendChild(summary);
   wrap.appendChild(head);
 
-  if (frame.command) {
+  // The engine provider sends tool args as a JSON string; a no-args call
+  // used to arrive as "{}" and render as a code block saying nothing.
+  let cmdText = typeof frame.command === "string" ? frame.command.trim() : "";
+  if (cmdText === "{}") cmdText = "";
+  if (cmdText) {
+    try {
+      // One-line JSON args (older frames replayed from a reconnect) →
+      // pretty-printed. Anything unparsable — a shell command from the
+      // native runner, a truncated payload — renders verbatim.
+      const parsed = JSON.parse(cmdText);
+      if (parsed && typeof parsed === "object") cmdText = JSON.stringify(parsed, null, 2);
+    } catch {
+      /* not JSON — keep as-is */
+    }
     const pre = document.createElement("pre");
     pre.className = "cloud-chat-approval-cmd";
     const code = document.createElement("code");
-    code.textContent = frame.command;
+    code.textContent = cmdText;
     pre.appendChild(code);
     wrap.appendChild(pre);
+  }
+
+  // The engine's approval request_id IS the toolCallId, so when the tool
+  // card for this call is already on screen it claims "running…" while the
+  // tool is actually parked on this decision — say so. (Native-runner ids
+  // are unrelated to tool ids; the lookup just misses there.)
+  const inflightCard = inFlightToolCalls.get(frame.request_id);
+  if (inflightCard) {
+    const meta = inflightCard.querySelector(".cloud-chat-tool-meta");
+    if (meta) meta.textContent = "waiting for approval";
   }
 
   const actions = document.createElement("div");
@@ -3039,6 +3350,14 @@ function resolveApprovalCard(frame) {
   if (frame.request_id) {
     pendingApprovalFrames.delete(frame.request_id);
     answeredApprovalIds.add(frame.request_id);
+  }
+  // Undo renderApprovalRequest's "waiting for approval" on the matching
+  // tool card: the call either resumes (allow) or is about to land its
+  // error result, which overwrites the meta anyway.
+  const inflightCard = frame.request_id ? inFlightToolCalls.get(frame.request_id) : null;
+  if (inflightCard) {
+    const meta = inflightCard.querySelector(".cloud-chat-tool-meta");
+    if (meta) meta.textContent = "running…";
   }
   const el = frame.request_id
     ? document.querySelector(`[data-approval-id="${CSS.escape(frame.request_id)}"]`)
@@ -4239,8 +4558,7 @@ async function submitUserMessage(text) {
   // session's scope/memory/model/budget are fixed at creation and cannot be
   // re-pointed mid-thread. Disabling here rather than at session creation is
   // what keeps an empty "+ New chat" from dead-ending the picker.
-  _sessionHasTurns = true;
-  _syncAgentPicker();
+  _markConversationStarted();
   const ta = $("chat-input");
   if (ta) {
     ta.value = "";
@@ -4268,17 +4586,24 @@ async function submitUserMessage(text) {
     // openSession saw a session id it had never opened and reset the turns
     // flag — flipping the settled agent label back into a live picker
     // mid-send. The session is new; the conversation is not.
-    _sessionHasTurns = true;
-    _syncAgentPicker();
+    _markConversationStarted();
   } catch (err) {
     setStatus(`Could not start chat: ${err.message}`, "error");
     showCapabilities();
+    // Step 1 cleared the composer optimistically, but no turn ever started:
+    // give the text back rather than destroying what they typed. A chat
+    // backend that is down must cost a retry, not the message — otherwise
+    // the only record of a long prompt is the user's memory of it.
+    const taFailed = $("chat-input");
+    if (taFailed && !taFailed.value) {
+      taFailed.value = text;
+      autosizeComposer();
+    }
     // The turn never started, so nothing is settled — hand the picker back
     // with the dashboard. Otherwise a chat backend that is down strands the
     // reader on a label they cannot change and a conversation that never
     // began.
-    _sessionHasTurns = false;
-    _syncAgentPicker();
+    _markConversationNotStarted();
     return;
   }
   // 3. Now ``#chat-messages`` is stable — render the user bubble and
@@ -5630,7 +5955,7 @@ function renderCoPresence(host, participants) {
     const name = document.createElement("span");
     name.className = "cloud-chat-files-name";
     name.textContent = f.name;
-    name.title = f.path;
+    name.setAttribute("data-tip", f.name);
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
     // Engine listings carry no mtime (modified_at is null) — skip the segment
@@ -5660,7 +5985,7 @@ function renderCoPresence(host, participants) {
     const dl = document.createElement("a");
     dl.className = "cloud-chat-files-btn";
     dl.innerHTML = ICON_DOWNLOAD;
-    dl.title = "Download";
+    dl.setAttribute("data-tip", "Download a copy");
     dl.setAttribute("aria-label", "Download " + f.name);
     dl.href =
       "/api/chat/sessions/" + encodeURIComponent(chatId) +
@@ -5671,7 +5996,7 @@ function renderCoPresence(host, participants) {
     save.type = "button";
     save.className = "cloud-chat-files-btn";
     save.innerHTML = ICON_SAVE;
-    save.title = "Save to Library — it outlives this session";
+    save.setAttribute("data-tip", "Save to Library — it outlives this session");
     save.setAttribute("aria-label", "Save " + f.name + " to Library");
     save.addEventListener("click", async () => {
       save.disabled = true;
@@ -5691,12 +6016,21 @@ function renderCoPresence(host, participants) {
           const link = document.createElement("a");
           link.className = "cloud-chat-files-btn";
           link.innerHTML = ICON_IN_LIBRARY;
-          link.title = "Saved — open in Library";
+          link.setAttribute("data-tip", "Open in your Library");
           link.setAttribute("aria-label", "Saved to Library — open");
           link.href = data.library_url || "/library";
           link.target = "_blank";
           link.rel = "noopener";
           save.replaceWith(link);
+          // Record the outcome IN THE ROW, not only in a toast that expires
+          // and an icon that explains itself only on hover. This is the
+          // "co se stalo a kam" half of TCRD-212: a reader returning to the
+          // drawer a minute later can still see which files they kept.
+          const saved = document.createElement("span");
+          saved.className = "cloud-chat-files-saved";
+          saved.textContent = "Saved to Library";
+          meta.appendChild(saved);
+          li.classList.add("is-saved");
           showToast("Saved to your Library", "ok");
         } else {
           let msg = "Could not save to Library.";
@@ -6079,7 +6413,16 @@ function renderCoPresence(host, participants) {
   // suggested-next-actions wiring, handed submitUserMessage/openSession so
   // every suggestion starts (or resumes) a conversation through the exact
   // same flow as a typed message.
-  initChatDashboard({ submitPrompt: submitUserMessage, openSession });
+  // `capabilities` is the same server-rendered snapshot renderCapabilities()
+  // reads, passed in rather than re-parsed in the dashboard module so the page
+  // has exactly one parser for that blob. The dashboard uses it to decide
+  // which suggestions are honest: with no reachable tables, the four data
+  // starters ("Compare revenue trends", …) would every one of them fail.
+  initChatDashboard({
+    submitPrompt: submitUserMessage,
+    openSession,
+    capabilities: readCapabilitySnapshot(),
+  });
   // Pre-seeded question (/chat?q=… — the detail pages' "Ask Agnes" links):
   // prefill the composer and focus, but never auto-send — a GET must stay
   // side-effect free (a reload would otherwise re-create sessions).
@@ -6094,16 +6437,25 @@ function renderCoPresence(host, participants) {
     _composer.focus();
   }
   // Sidebar list — a failed fetch must not break the page: the history list
-  // shows its empty state, the dashboard renders its suggestions without
-  // the personalized resume row (partial data), and boot continues (deep
-  // links + onboarding still work).
+  // shows its FAILED state (never the empty one — TCRD-207/DES-153), the
+  // dashboard renders its suggestions without the personalized resume row
+  // (partial data), and boot continues (deep links + onboarding still work).
   let _sidebarOk = true;
   try {
     await loadSidebar();
   } catch (_) {
     _sidebarOk = false;
     const empty = $("cloud-chat-empty-state");
-    if (empty) empty.hidden = false;
+    if (empty) empty.hidden = true;
+    const failed = $("cloud-chat-failed-state");
+    if (failed) {
+      failed.hidden = false;
+      const retryBtn = failed.querySelector("[data-state-retry]");
+      if (retryBtn && !retryBtn._wired) {
+        retryBtn._wired = true;
+        retryBtn.addEventListener("click", () => loadSidebar().catch(() => {}));
+      }
+    }
   }
   updateDashboardSuggestions(_sidebarOk ? _sessionsCache : null);
   // Sidebar cache (_sessionsCache) is now populated so openSession can

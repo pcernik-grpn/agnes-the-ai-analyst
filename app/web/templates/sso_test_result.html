@@ -1,0 +1,90 @@
+{% extends "base_page.html" %}
+{% block title %}SSO Test Sign-in — {{ config.INSTANCE_NAME }}{% endblock %}
+{% set page_hero_eyebrow = "Admin" %}
+{% set page_hero_title = "SSO test sign-in result" %}
+{% set page_hero_subtitle = "Side-effect-free: no account was created or linked, no session was issued." %}
+{% block page %}
+
+{% if result_error %}
+<div class="flash flash-error" role="alert">
+    {% if result_error == 'sso_no_email' %}
+    The token carried no usable email — the account has neither an <code>email</code> claim nor a mail-shaped UPN.
+    {% elif result_error == 'sso_no_subject' %}
+    The token carried no <code>oid</code> claim — the directory object ID this integration exists to capture.
+    {% elif result_error == 'sso_wrong_tenant' %}
+    The token's <code>tid</code> does not match the configured tenant.
+    {% elif result_error == 'domain_not_allowed' %}
+    The resolved email's domain is <strong>not permitted</strong> by the configured allowlist — this sign-in would be refused.
+    {% else %}
+    The sign-in would be refused: <code>{{ result_error }}</code>.
+    {% endif %}
+</div>
+{% elif binding_refusal %}
+<div class="flash flash-error" role="alert">
+    {% if binding_refusal == 'deactivated' %}
+    The claims are valid, but the Agnes account this login resolves to is <strong>deactivated</strong> — a real sign-in would be refused.
+    {% elif binding_refusal == 'sso_identity_conflict' %}
+    The claims are valid, but this mailbox's Agnes account is already bound to a <strong>different</strong> external identity in the same tenant — a real sign-in would be refused (<code>sso_identity_conflict</code>); unlink the stale identity or deactivate the account.
+    {% else %}
+    A real sign-in would be refused: <code>{{ binding_refusal }}</code>.
+    {% endif %}
+</div>
+{% else %}
+<div class="flash flash-success" role="status">
+    The end-to-end exchange with tenant <code>{{ resolved_tid }}</code> succeeded and every check passed —
+    a real "{{ display_name }}" sign-in by this account would be accepted.
+</div>
+{% endif %}
+
+<table class="data-table">
+    <tbody>
+        <tr>
+            <th scope="row">Resolved email</th>
+            <td>{{ resolved_email or "—" }}</td>
+        </tr>
+        <tr>
+            <th scope="row">Directory object ID (<code>oid</code>)</th>
+            <td><code>{{ resolved_oid or "—" }}</code></td>
+        </tr>
+        <tr>
+            <th scope="row">Tenant ID (<code>tid</code>)</th>
+            <td><code>{{ resolved_tid or "—" }}</code></td>
+        </tr>
+        <tr>
+            <th scope="row">Domain allowlist verdict</th>
+            <td>
+                {% if domain_allowed %}
+                <span class="badge badge--success">{{ domain }} is permitted</span>
+                {% elif domain %}
+                <span class="badge badge--danger">{{ domain }} is not permitted</span> (allowed: {{ allowed_domains | join(", ") }})
+                {% else %}
+                —
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th scope="row">A real sign-in would</th>
+            <td>
+                {% if binding_outcome == 'sign_in' %}
+                sign in as {{ binding_account_email }} (already linked to this external identity)
+                {% elif binding_outcome == 'attach' %}
+                link existing account {{ binding_account_email }} (first SSO sign-in attaches by email)
+                {% elif binding_outcome == 'replace' %}
+                sign in as {{ binding_account_email }}, replacing its stale binding from a previously configured tenant
+                {% elif binding_outcome == 'create' %}
+                create a NEW account for {{ resolved_email }}
+                {% elif binding_outcome == 'refused' %}
+                be <strong>refused</strong>{% if binding_account_email %} for {{ binding_account_email }}{% endif %} (<code>{{ binding_refusal }}</code>)
+                {% else %}
+                —
+                {% endif %}
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <a href="/admin/server-config" class="btn btn-secondary">Back to server config</a>
+</p>
+
+{% endblock %}

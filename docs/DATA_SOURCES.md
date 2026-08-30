@@ -437,11 +437,21 @@ Off by default for three reasons worth knowing before turning it on:
 2. The ATTACH sends a live workspace PAT to the endpoint. Pin it with
    `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST` — the same control that governs every
    other credentialed ATTACH, and it applies here.
-3. **It has not been verified against a live Databricks workspace.** The
-   `_remote_attach` contract, the view DDL, the opt-in gate, the identifier
-   refusals, and the credential-egress allowlist are covered by tests; whether
-   `uc_catalog` installs, authenticates, and returns rows against a real
-   workspace is not. Treat the first enablement as a trial.
+3. **The ATTACH mechanism itself has not been verified against a live
+   Databricks workspace.** The `_remote_attach` contract, the view DDL, the
+   opt-in gate, the identifier refusals, and the credential-egress allowlist
+   are covered by tests; whether `uc_catalog` installs, authenticates, and
+   returns rows against a real workspace is not. Treat the first enablement
+   as a trial. The SQL-warehouse paths this connector otherwise relies on —
+   `materialized` rows (`materialize_query`), `remote` rows
+   (`execute_select`/`execute_scan_to_arrow`), and semantic-layer metric-view
+   discovery (`_list_metric_views` + the `SHOW CREATE TABLE ... $$<yaml>$$`
+   parse) — ARE covered against a real workspace, by
+   `tests/test_live_databricks.py`: `pytest tests/test_live_databricks.py -m
+   live -v` with `DATABRICKS_HOST`, `DATABRICKS_TOKEN`,
+   `DATABRICKS_WAREHOUSE_ID` (and optionally `DATABRICKS_CATALOG`, to also
+   exercise the metric-view discovery test) exported. Dev-local only — not
+   wired into CI, same as the BigQuery/Keboola/Jira `-m live` siblings.
 
 With it off — the default — remote rows still work; every statement simply
 runs on the SQL warehouse.
@@ -515,6 +525,15 @@ CREATE TABLE _remote_attach (
     token_env VARCHAR   -- Env-var name holding the auth token (NOT the token itself)
 );
 ```
+
+`token_env` must name a variable on the connector-ATTACH token allowlist
+(`src/orchestrator_security.py`) — data-source attach tokens only, extendable
+via `AGNES_REMOTE_ATTACH_TOKEN_ENVS` (the override REPLACES the defaults).
+Config-resolution secrets (names a settings resolver reads from a connection's
+config, extendable via `AGNES_CONFIG_SECRET_ENVS`) are deliberately *not*
+valid here: the orchestrator refuses them before any ATTACH, so a connector
+can never direct one to its own `url`. Pin the destination hosts credentials
+may be sent to with `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`.
 
 ### Identifier validation
 

@@ -4,10 +4,11 @@
    layout switch left to read.
 
    IA: the rail is TWO fixed zones with the conversation list between them.
-   Top — New chat and Chats, then the caller's conversations in two collapsible
-   sections (Pinned · Recent) under them; Chats is a destination row of its own,
-   which is what retired the "View all chats" link that used to close the recent
-   feed. Bottom — the browse destinations Library · Agents, then
+   Top — New chat, then the caller's conversations in two sections
+   (Pinned · Recent), then a "View all chats" link closing the region. The
+   Chats destination row is the COLLAPSED form of that whole zone: it shows in
+   the 56px strip, where text cannot, and folds away when the rail is expanded
+   or peeked. Bottom — the browse destinations Library · Agents, then
    Admin behind a divider, then the onboarding card, then the profile pinned to
    the very bottom.
 
@@ -56,6 +57,7 @@
    Styles live in app/web/static/css/rail.css (.rail-* prefix),
    activated by html[data-ui-layout="rail"]. #}
 {% import "macros/_agnes_orb.html" as agnes_orb %}
+{% import "macros/_state.html" as state %}
 {% if session.user %}
 {% set _path = request.url.path %}
 {# Collapsed vs. expanded rail width is a PERSISTED USER PREFERENCE
@@ -262,24 +264,32 @@
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
             <span class="rail-i-label">New chat</span>
         </a>
-        {# Chats — the destination the conversation lists below belong to, and
-           the reason this rail survives being collapsed.
+        {# Chats — the way to /chats while the rail is COLLAPSED, and only then.
 
-           Verb then noun: start one, or go to all of them. It is an ORDINARY
-           `.rail-i`, peer of Library and Agents, and it replaces the
-           "View all chats" link that used to close the recent feed — a quiet
-           text row INSIDE the region that collapse hides, which made /chats
-           the one page in the product with no reachable entry point from an
-           admin page (and, since that link was itself `hidden` until you had a
-           conversation, no entry point at all on a first run).
+           The conversation region below is text end to end (two labels plus
+           titles), so it has no icon form and the 56px strip cannot show it.
+           This row is that region's glyph: one speech bubble standing in for
+           the whole zone while the rail is narrow, and folded away the moment
+           the rail is expanded or peeked, where the real lists and their own
+           "View all chats" link answer the same question better. So the zone
+           reads as ONE thing at both widths — never an icon row stacked above
+           the lists that duplicate it.
+
+           `.rail-i--collapsed-only` is what folds it (height + opacity, see
+           rail.css); it is otherwise an ORDINARY `.rail-i`, peer of Library and
+           Agents at the same 1.7 stroke, so the collapsed strip reads as one
+           set. Not a second plus (New chat owns that) and not two bubbles,
+           which reads as "several people" rather than "your own history".
+
+           On an ADMIN page the modifier is withheld, so the row simply stays:
+           the conversation region is not rendered there at all, so folding this
+           away on peek would leave an admin with no path to /chats — the bug
+           that put a destination row here in the first place.
 
            `.on` on /chats and nowhere else: /chat's pre-conversation state
            belongs to New chat above, and an open conversation is marked in the
-           list below. Its glyph is a single speech bubble — not a second plus
-           (New chat owns that), and not two bubbles, which reads as "several
-           people" rather than "your own history" — at the same 1.7 stroke as
-           Library and Agents so the collapsed strip reads as one set. #}
-        <a class="rail-i {% if _path.startswith('/chats') %}on{% endif %}"
+           list below. #}
+        <a class="rail-i{% if not _admin_page %} rail-i--collapsed-only{% endif %} {% if _path.startswith('/chats') %}on{% endif %}"
            id="nav-chats" href="/chats">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12a8 8 0 0 1-11.6 7.1L4 20l.9-4.4A8 8 0 1 1 20 12Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
             <span class="rail-i-label">Chats</span>
@@ -307,16 +317,22 @@
        the lists, admin pages get the Chats row that leads to them, and neither
        page has content that vanishes when the rail narrows. #}
     {% if not _admin_page %}
-    {# Conversations — the caller's chats in TWO collapsible sections, Pinned
-       above Recent, both under the Chats row that owns them. The rail is a
-       WORKING SET now, not the whole history: what you have pinned, the handful
-       you touched most recently, and — one row up, not one row down — the door to
-       the surface that manages the rest (/chats, templates/chats.html).
+    {# Conversations — the caller's chats in TWO sections, Pinned above Recent,
+       with the door to the rest at their foot. The rail is a WORKING SET, not
+       the whole history: what you have pinned, the handful you touched most
+       recently, and one quiet link to the surface that manages everything else
+       (/chats, templates/chats.html).
 
-       Nesting is expressed by PROXIMITY, not by an indent. The lists sit directly
-       under their destination with nothing between them, and both keep the full
-       column width: at 240px a nested indent would buy a visual cue with the
-       ~28px that conversation titles need, and those titles already truncate.
+       Neither section is collapsible. A disclosure on each was tried and
+       retired: it spent a caret, a persisted per-section flag and a
+       `is-collapsed` state on a region that is already only a handful of rows
+       tall and already scrolls in its own box — three moving parts to put away
+       something small enough to scroll past. Emptiness still hides a section
+       (see #rail-pinned below), which is the only conditional this region keeps.
+
+       Both lists keep the full column width: at 240px a nested indent would buy
+       a visual cue with the ~28px that conversation titles need, and those
+       titles already truncate.
 
        Why the feed is capped again, having had its cap deliberately removed:
        the cap that went away was a cap with nowhere to go — five rows and a
@@ -336,22 +352,14 @@
        header it replaces: the two lists answer different questions. Pinned is a
        small, hand-curated shelf you return to; Recent is a purely chronological
        feed. As sibling groups inside one list they were told apart only by a
-       header that scrolled away, and neither could be put away when
-       you didn't need it — a caller with nine pins had to scroll past all nine
-       to reach yesterday's work, and a caller who lives in their pins had to
-       keep the whole feed on screen underneath them. A section each, with a
-       disclosure, lets either one own the space.
+       header that scrolled away.
 
        Anatomy of a section header: the same quiet uppercase label the group
-       headers already used (10.5px/700, `--ds-text-muted`) promoted to a
-       <button>, with the rail's existing disclosure caret directly AFTER the
-       label — rotated the way Admin's is (down = open). Beside the word rather
-       than pushed to the rail's right edge: at the edge it read as a second
-       column of controls, and the caret's job is to say "this label opens", so
-       it belongs against the label. The button still spans the full width, so
-       the hit area is the whole line. No fill, no border, no divider, and no
-       count: it stays a LABEL that happens to be operable, not a fourth row
-       treatment competing with the nav rows above and below.
+       headers already used (10.5px/700, `--ds-text-muted`), and nothing else —
+       an <h2> with a <span> inside it. No fill, no border, no divider, no count
+       and no control: it is a LABEL, not a fourth row treatment competing with
+       the nav rows above and below. It is not focusable and takes no clicks, so
+       the region's whole tab order is New chat → the titles → View all chats.
 
          • The <ul id="chat-list"> + #cloud-chat-empty-state ids are the same
            the chat page used, so on /chat chat.js owns this list unchanged —
@@ -362,8 +370,8 @@
          • On every OTHER rail page chat.js isn't loaded, so js/rail_history.js
            fetches /api/chat/sessions and renders the same rows, wiring each to
            /chat?session=<id>. It bails on /chat for the ROWS (chat.js is
-           authoritative there) but owns the sections' open/closed state on every
-           rail page, /chat included.
+           authoritative there) but owns which of the two sections renders at
+           all on every rail page, /chat included.
          • #rail-pinned starts `hidden` and is unhidden by whichever renderer
            runs, only once it has pinned rows to show — a "Pinned" header over
            nothing is the dead chrome the single-list version was trying to
@@ -379,32 +387,23 @@
            navigates, never a "Show more" that expands in place. #}
     <section class="rail-history" id="rail-history">
         <div class="rail-history-body" id="rail-history-body">
-            {# Pinned — hidden until there is something in it (see above). #}
+            {# Pinned — hidden until there is something in it (see above). No
+               label: the pin glyph on the row is what says a row is pinned, and
+               these rows lead the same one list rather than opening a second. #}
             <section class="rail-chatsec" id="rail-pinned" hidden>
-                <h2 class="rail-chatsec-hd-wrap">
-                    <button type="button" class="rail-chatsec-hd" id="rail-pinned-toggle"
-                            aria-expanded="true" aria-controls="rail-pinned-body">
-                        <span class="rail-chatsec-txt">Pinned</span>
-                        <svg class="rail-chatsec-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                    </button>
-                </h2>
                 <div class="rail-chatsec-body" id="rail-pinned-body">
                     <ul id="pinned-chat-list" class="cloud-chat-list" role="list"></ul>
                 </div>
             </section>
 
-            {# "Recent", not "Chats": the label has to say that this list is a
-               SLICE, and it has to not repeat the destination row above it —
-               two things called Chats in the same zone, one of them a full list
-               and one of them five rows, is the ambiguity this label resolves. #}
+            {# The feed. No label here either — "Recent" was there to say this
+               list is a SLICE, and the "View all chats" row that closes the list
+               now says the same thing in the place a caller looks for it: at the
+               bottom, when they have run out of rows. Two <section>s remain
+               because the two RENDER TARGETS remain (chat.js and rail_history.js
+               both route pinned rows to their own <ul>), but with no labels and
+               no gap between them they read as the single list they are. #}
             <section class="rail-chatsec" id="rail-chats">
-                <h2 class="rail-chatsec-hd-wrap">
-                    <button type="button" class="rail-chatsec-hd" id="rail-chats-toggle"
-                            aria-expanded="true" aria-controls="rail-chats-body">
-                        <span class="rail-chatsec-txt">Recent</span>
-                        <svg class="rail-chatsec-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                    </button>
-                </h2>
                 <div class="rail-chatsec-body" id="rail-chats-body">
                     <ul id="chat-list" class="cloud-chat-list" role="list"></ul>
                     {# Starts hidden; chat.js (/chat) and rail_history.js
@@ -412,23 +411,47 @@
                        zero sessions, so "No conversations yet" never flashes
                        before the list loads. #}
                     <p id="cloud-chat-empty-state" class="rail-history-empty" hidden>No conversations yet.</p>
+                    {# TCRD-207 (DES-153): a FETCH that never completed is a
+                       DIFFERENT fact than a fetch that resolved with zero rows —
+                       the conversations are still there, the list just couldn't
+                       be read. Both renderers reveal exactly one of these two
+                       elements, never the empty one on a failure (see
+                       js/rail_history.js and js/chat.js's loadSidebar()). Kept
+                       AFTER the empty state so `.cloud-chat-list:not(:empty) +
+                       .rail-history-empty` (rail.css) still matches the ul's
+                       immediate sibling. #}
+                    {{ state.panel('failed', "Couldn't load your conversations",
+                                   cta_label='Retry', cta_attrs='data-state-retry',
+                                   id='cloud-chat-failed-state', hidden=True,
+                                   compact=True) }}
                 </div>
 
             </section>
 
-            {# No door to /chats down here any more. It was a quiet
-               `.rail-history-all` link — the last thing in the scroll box,
-               deliberately lighter than a `.rail-i` so it would not compete with
-               the conversations, revealed by `railSectionsSync` only once you had
-               one to view, and carrying no active state on /chats.
+            {# The LAST ROW of that list, not a footer under it: same height,
+               same left edge and same hover as a conversation row, in muted ink
+               so it reads as the end of the list rather than another entry in
+               it. Where a caller runs out of rows is exactly where "there are
+               more" belongs.
 
-               Every one of those properties is why it failed at the job. A text
-               row inside the region that collapse hides, itself conditional on
-               having history, is not a way to a page: on an admin page it was
-               gone with the region, and on a first run it was gone for want of a
-               conversation. The Chats row at the top of this zone is the door
-               now — a destination is reachable whether or not you have used it
-               yet, and it needs no reveal logic at all. #}
+               OUTSIDE both <ul>s on purpose. Every renderer clears its list with
+               `innerHTML = ""` before appending rows, so a static <li> in there
+               would survive exactly until the first fetch resolved. A sibling
+               element is the only version of "last row" that a re-render cannot
+               delete.
+
+               ALWAYS rendered — no reveal logic. It used to be unhidden by
+               `railSectionsSync` only once the caller had a conversation, which
+               meant /chats had no entry point at all on a first run: the page
+               that explains an empty history was reachable only after you had
+               one. An empty list plus this row is the honest first run.
+
+               The other half of that old bug — a text row inside the region the
+               collapsed rail hides — is answered by the Chats row up in the nav
+               zone, which is exactly the state this row is not in
+               (`.rail-i--collapsed-only`). Between the two, /chats is reachable
+               at both rail widths and on every page, and never twice at once. #}
+            <a class="rail-history-all" href="/chats">View all chats</a>
         </div>
     </section>
     {% endif %}{# /not _admin_page — the conversation lists #}
@@ -474,7 +497,12 @@
            orphans; the merge (spec 2026-08-12) is the durable answer. #}
     </div>
 
-    {% if session.user.is_admin %}
+    {# `dev_preview != 'member'` is the local-dev audience switch: previewing
+       as a member has to take the Admin destination away, or the preview shows
+       an admin rail beside a member page and answers the wrong question. It
+       changes the RENDER only — the caller keeps every permission they had,
+       and /admin still answers if they type it. See _dev_preview.html. #}
+    {% if session.user.is_admin and dev_preview != 'member' %}
     {# Admin — the last thing in the bottom zone, behind the nav's only divider
        (rail.css): a different KIND of destination from Library/Agents
        (operating the instance vs. using it).
@@ -526,8 +554,59 @@
        the foot, below the rule that marks off the account zone. See the note on
        it there for why it is not a `.rail-i` destination. #}
 
-    {# NOT on an admin page. This is the ANALYST's journey — connect your tools,
-       ask your first question, five steps of learning to use the chat product —
+
+    </div>{# /.rail-collapsible #}
+
+    {# The foot is the profile row alone — onboarding is a card at the end of
+       the bottom zone (see .rail-getstarted), and "How {brand} works" is an item
+       in the account menu below. It stays outside .rail-collapsible so the
+       profile (and everything in its menu) is reachable in the ≤1024px bar even
+       with the nav collapsed. #}
+    <div class="rail-foot">
+
+        {# "Take {brand} to your tools" — straight to the section of How-it-works
+           that hands you the MCP endpoint and the CLI install, rather than to
+           the top of a long page you then have to scan.
+
+           It sits in the foot rather than the nav above because it is not a
+           destination inside the product: it is how you take the product
+           somewhere else. Above the profile row, which is the other thing in
+           this zone that is about you rather than about your data.
+
+           Outside .rail-collapsible for the same reason the profile is —
+           it stays reachable in the ≤1024px bar with the nav collapsed. #}
+        {# Plain `rail-i`, not `--muted`: that modifier italicises the label
+           and exists for the "Admin paused" state, which is a condition being
+           reported rather than a place to go. This is a place to go. #}
+        {# One label, one destination. Every clickable route to
+           /how-it-works#connect says "take {brand} to your tools" — the chat
+           landing's door, the onboarding checklist's step, the tour's closing
+           button and this row — because they are one door, and a reader who
+           met three names for it had no way to know that. The phrasing is the
+           one that survived the hero: it names the DIRECTION ({brand} travels
+           out to your editor), where "connect your tools" read as sending data
+           the other way.
+
+           It is the longest label in the rail and it was measured, not
+           guessed: the label box is 169px (240 rail − 2×12 rail padding −
+           2×11 row padding − 16 icon − 9 gap) and "Take Agnes to your tools"
+           renders 152px at 13px/500, so the default brand clears it by 17px.
+           A brand short-name past ~7 characters does not — hence `title`, so
+           the ellipsis the label already had is recoverable on hover. #}
+        <a class="rail-i{% if _path == '/how-it-works' %} is-active{% endif %}"
+           href="/how-it-works#connect"
+           title="Take {{ instance_brand_short }} to your tools">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 13.5a4 4 0 0 0 5.7.4l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.5 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M14 10.5a4 4 0 0 0-5.7-.4l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.5-1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <span class="rail-i-label">Take {{ instance_brand_short }} to your tools</span>
+        </a>
+
+        {# Onboarding sits BELOW "Take {brand} to your tools" and above the profile.
+           It moved out of .rail-collapsible to get here, which also makes it
+           reachable in the ≤1024px bar for the same reason the profile is —
+           a setup card you cannot reach while the nav is collapsed is a
+           reminder you cannot act on. #}
+    {# NOT on an admin page. This is the ANALYST's journey — take {brand} to your
+       tools, ask your first question, five steps of learning the chat product —
        and it is the only element in the rail carrying a coloured progress arc,
        so it pulls the eye hardest of anything on screen while you are registering
        a table or editing a grant. Whose progress it measures is the point: an
@@ -538,7 +617,7 @@
 
        Unlike the conversation region above, nothing is lost by its absence: the
        checklist is also reachable from the account menu's "Start over
-       onboarding" and from the chat dashboard's own hero. #}
+       onboarding" and from the chat dashboard's "Set up {brand}" door. #}
     {% if can_chat and not _admin_page %}
     {# Onboarding row — the last thing in the bottom zone, under Admin and
        directly above the profile; that zone's position/order is unchanged
@@ -622,15 +701,6 @@
     </div>
     {% endif %}
 
-    </div>{# /.rail-collapsible #}
-
-    {# The foot is the profile row alone — onboarding is a card at the end of
-       the bottom zone (see .rail-getstarted), and "How {brand} works" is an item
-       in the account menu below. It stays outside .rail-collapsible so the
-       profile (and everything in its menu) is reachable in the ≤1024px bar even
-       with the nav collapsed. #}
-    <div class="rail-foot">
-
         {# User row + pop-up menu — same ids/classes as the header's user
            menu so app.js wiring (trigger toggle, theme radio group)
            works unchanged; only the container styling differs. #}
@@ -645,7 +715,7 @@
                 {% endif %}
                 <span class="rail-user-txt">
                     <b>{{ session.user.name or session.user.email }}</b>
-                    {% if session.user.is_admin %}<span class="rail-user-role">Admin</span>{% endif %}
+                    {% if session.user.is_admin and dev_preview != 'member' %}<span class="rail-user-role">Admin</span>{% endif %}
                 </span>
             </button>
             <div class="app-user-menu-panel" id="userMenuPanel" role="menu" hidden>
@@ -678,8 +748,15 @@
                    has no other one (the /home "What's new" strip and the
                    command palette are both conditional). Mirrors the topnav
                    `_app_header.html` row; label "News", not the page's
-                   "What's new" heading (tests/test_web_news_page.py). #}
+                   "What's new" heading (tests/test_web_news_page.py).
+
+                   Now behind `can_news` (features.news_enabled, off by default
+                   since the admin cleanup): with the surface hidden the route
+                   redirects home, and this row is the one entry point that
+                   would otherwise still advertise it. #}
+                {% if can_news %}
                 <a class="app-user-menu-item {% if _path.startswith('/news') %}is-active{% endif %}" role="menuitem" href="/news">News</a>
+                {% endif %}
 
                 {# ── Get your bearings ──────────────────────────────────────
                    Two items, one job, hence their own group behind a separator.

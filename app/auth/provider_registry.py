@@ -38,7 +38,7 @@ value is unset rather than a narrowed list that resolves to nothing). See
 import importlib
 import logging
 import os
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from fastapi import HTTPException
 
@@ -46,12 +46,12 @@ from app.instance_config import get_value
 
 logger = logging.getLogger(__name__)
 
-KNOWN_PROVIDERS: tuple[str, ...] = ("google", "email", "password", "keboola", "microsoft")
+KNOWN_PROVIDERS: tuple[str, ...] = ("google", "email", "password", "keboola", "microsoft", "sso")
 
 # Single-slot cache for the parsed allowlist, keyed by the raw configured value.
 # See configured_allowlist() for why parsing + misconfig logging must not re-run
 # per request.
-_ALLOWLIST_CACHE: Optional[tuple[tuple, Optional[list[str]]]] = None
+_ALLOWLIST_CACHE: tuple[tuple, list[str] | None] | None = None
 
 # Providers whose usability depends on instance configuration; ``password``
 # needs none and is always usable. Mirrors the login page's per-provider
@@ -61,6 +61,7 @@ _AVAILABILITY_PROBES: dict[str, str] = {
     "email": "app.auth.providers.email",
     "keboola": "app.auth.providers.keboola",
     "microsoft": "app.auth.providers.microsoft",
+    "sso": "app.auth.providers.sso",
 }
 
 # What an unusable allowlist falls back to. Both require an existing user row
@@ -72,7 +73,7 @@ _RESCUE_PROVIDERS: tuple[str, ...] = ("password", "email")
 
 # One-shot marker so the lockout rescue logs once per distinct configuration,
 # not on every request (same rationale as the parse cache above).
-_LOCKOUT_RESCUE_LOGGED: Optional[tuple] = None
+_LOCKOUT_RESCUE_LOGGED: tuple | None = None
 
 
 def _probe_availability(name: str) -> tuple[bool, bool]:
@@ -114,11 +115,11 @@ def _provider_available(name: str) -> bool:
     return _probe_availability(name)[0]
 
 
-def configured_allowlist() -> Optional[list[str]]:
+def configured_allowlist() -> list[str] | None:
     raw_env = os.environ.get("AGNES_AUTH_PROVIDERS")
     if raw_env is not None:
         cache_key: tuple = ("env", raw_env)
-        source: Optional[object] = raw_env
+        source: object | None = raw_env
     else:
         source = get_value("auth", "providers")
         cache_key = ("cfg", repr(source))
@@ -140,7 +141,7 @@ def configured_allowlist() -> Optional[list[str]]:
     return _rescue_if_unusable(cache_key, result)
 
 
-def _rescue_if_unusable(cache_key: tuple, allowlist: Optional[list[str]]) -> Optional[list[str]]:
+def _rescue_if_unusable(cache_key: tuple, allowlist: list[str] | None) -> list[str] | None:
     """Fall back to local sign-in when an allowlist names only unconfigured providers.
 
     ``auth.providers: [keboola]`` with no stack configured would render zero
@@ -211,7 +212,7 @@ def _rescue_if_unusable(cache_key: tuple, allowlist: Optional[list[str]]) -> Opt
     return list(_RESCUE_PROVIDERS)
 
 
-def _parse_allowlist(source: Optional[object]) -> Optional[list[str]]:
+def _parse_allowlist(source: object | None) -> list[str] | None:
     """Parse the raw ``auth.providers`` value into a known-provider allowlist,
     logging misconfiguration exactly once per distinct value (the caller caches
     on the raw value). ``None`` (unset, or set-but-all-unknown) ⇒ all providers."""
@@ -293,12 +294,44 @@ def _other_login_door_usable() -> bool:
     the email rescue this function backs) or :func:`probe_providers` (would
     recompute email's own answer as a side effect); it probes only the
     non-email providers directly. Short-circuits on the first configured
-    OAuth provider, so the DB read only ever runs when none is configured.
+    OAuth provider — ``sso`` goes LAST because its probe is a DB read, so
+    every env-configured provider short-circuits before it runs.
     """
-    for oauth in ("google", "microsoft", "keboola"):
+    for oauth in ("google", "microsoft", "keboola", "sso"):
         if _provider_available(oauth):
             return True
     return _has_usable_password_holder()
+
+
+def any_login_door_usable_besides(excluded: str) -> bool:
+    """True when some login door OTHER than ``excluded`` is genuinely usable
+    under the current allowlist.
+
+    Backs the SSO admin API's last-login-door guard (design 2026-08-28):
+    disabling/deleting the ``sso`` config is refused when nothing else could
+    still sign anyone in. "Usable" is stricter than "offered": ``password``
+    counts only with at least one real holder (mirroring the doctor's door
+    computation), and on the UNSET allowlist ``email`` counts on availability
+    alone — it is default-excluded there, but the zero-door rescue
+    (:func:`_email_default_offering`) re-offers it the moment the last other
+    door goes away, so an available mail transport IS a fallback door.
+    Deliberately ignores the lockout rescue's password/email fallback —
+    that is a break-glass path, not a reason to allow the lockout.
+    """
+    allowlist = configured_allowlist()
+    candidates = list(allowlist) if allowlist is not None else list(KNOWN_PROVIDERS)
+    for name in candidates:
+        if name == excluded:
+            continue
+        if name == "password":
+            if _has_usable_password_holder():
+                return True
+        elif name == "email":
+            if _provider_available("email"):
+                return True
+        elif _provider_available(name):
+            return True
+    return False
 
 
 # Tracks whether the zero-door email rescue is CURRENTLY active, so the
