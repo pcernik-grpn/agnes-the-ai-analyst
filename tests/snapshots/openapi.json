@@ -29279,7 +29279,7 @@
     },
     "/api/admin/semantic-sources": {
       "get": {
-        "description": "Every registered source, each with the number of semantic models it\nOWNS (``owned_model_count``).\n\nThe count is derived, never stored (see ``src/semantic/ownership.py``):\n``last_sync_status='ok'`` answers \"did the fetch work\", not \"did it bring\nanything back\", so a source scoped at an upstream with nothing in it is\notherwise indistinguishable from a healthy one (#1707). ``null`` means the\nsource's provenance could not be resolved \u2014 \"cannot say\", not \"owns none\".",
+        "description": "Every registered source, each with the number of semantic models it\nOWNS (``owned_model_count``) and what it SCANS (``scan_scope``).\n\nBoth are derived, never stored (``src/semantic/ownership.py``,\n``src/semantic/scan_scope.py``). ``last_sync_status='ok'`` answers \"did\nthe fetch work\", not \"did it bring anything back\", so a source scoped at\nan upstream with nothing in it is otherwise indistinguishable from a\nhealthy one (#1707); and a count of 0 alone still cannot separate \"there\nis nothing upstream\" from \"the role I connect as cannot see it\", which is\nwhy the scope names the database/schema/role (or project, catalog,\nrepository) the sync actually looked at. ``owned_model_count: null`` means\nthe source's provenance could not be resolved \u2014 \"cannot say\", not \"owns\nnone\"; ``scan_scope: null`` means no scope could be derived from this\nsource's config.",
         "operationId": "list_semantic_sources_api_admin_semantic_sources_get",
         "parameters": [
           {
@@ -29459,7 +29459,7 @@
         ]
       },
       "get": {
-        "description": "One source, same shape as the list row \u2014 ``owned_model_count`` and all.",
+        "description": "One source, same shape as the list row \u2014 ``owned_model_count``,\n``scan_scope`` and all.",
         "operationId": "get_semantic_source_api_admin_semantic_sources__source_id__get",
         "parameters": [
           {

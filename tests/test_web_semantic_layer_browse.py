@@ -364,6 +364,72 @@ class TestModelDetail:
         assert "customers" in r.text
         assert ">orders<" not in r.text
 
+    @staticmethod
+    def _chip_html(body: str) -> str:
+        """Slice out just the filter-chip element, so assertions on its
+        href/classes can't be satisfied by an unrelated `?tab=` link
+        elsewhere on the page (the tab nav, cross-links, ...)."""
+        start = body.index('data-testid="slb-filter-chip"')
+        # back up to the start of the enclosing <div ...>
+        start = body.rindex("<div", 0, start)
+        end = body.index("</div>", start) + len("</div>")
+        return body[start:end]
+
+    def test_active_filter_renders_a_removable_chip(self, seeded_app):
+        """A8 (issue #1707): tabs drop `q` on click with no indication it was
+        ever applied. A removable chip above the table makes the active
+        filter visible; its "x" links to the same tab without `q`. It is now
+        the page's only removable-filter control — the old `Clear`
+        link/search-box combo was redundant with it and was removed."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics&q=Orders", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-testid="slb-filter-chip"' in r.text
+        chip_html = self._chip_html(r.text)
+        assert "Orders" in chip_html
+        # The remove link must drop `q`, not merely restate it — scoped to
+        # the chip element, not the page (the tab nav also links `?tab=metrics`).
+        assert f'href="/semantic-layer/{_SLUG}?tab=metrics"' in chip_html
+        assert "q=Orders" not in chip_html
+        # The redundant `Clear` control next to the search box is gone.
+        assert ">Clear<" not in r.text
+
+    def test_no_filter_chip_when_q_is_absent(self, seeded_app):
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-testid="slb-filter-chip"' not in r.text
+
+    def test_filter_chip_escapes_special_characters_in_q(self, seeded_app):
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(
+            f"/semantic-layer/{_SLUG}?tab=metrics&q=%3Cscript%3Ealert(1)%3C/script%3E",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+
+    def test_filter_chip_caps_width_and_ellipsizes_a_long_value(self, seeded_app):
+        """A long `q` must not overflow the chip's fixed-height pill — the
+        value span carries the same max-width + ellipsis guard as the
+        library page's `.fbar-chip__vals` (filter_toolbar.css)."""
+        _seed_model()
+        c = seeded_app["client"]
+        long_q = "x" * 400
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics&q={long_q}", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        chip_html = self._chip_html(r.text)
+        assert long_q in chip_html
+        assert "slb-filter-chip__value" in chip_html
+        style_block = r.text[: r.text.index("</style>")]
+        assert "max-width: 22rem" in style_block
+        assert "text-overflow: ellipsis" in style_block
+        assert "white-space: nowrap" in style_block
+
     def test_constraints_filter_matches_the_constraints_own_name(self, seeded_app):
         """Devin #1398: the constraint's own name (the linked first column) must
         be searchable, not only the metric names it applies to."""

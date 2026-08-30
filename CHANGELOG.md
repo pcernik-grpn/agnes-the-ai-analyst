@@ -23,6 +23,34 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   whose model the caller cannot read. The registry link lands filtered
   (`/catalog/semantics?q=<metric>`), on the row it means rather than on the
   full list.
+- **A semantic source now reports WHAT it scanned, not only that the scan
+  worked (#1707).** Observed live: a Snowflake semantic view existed, the role
+  Agnes connects as held no privilege on it, `SHOW SEMANTIC VIEWS` came back
+  empty — and the source reported `ok` with zero owned models, identical to a
+  correctly-scoped source pointed at an upstream that genuinely holds nothing.
+  "There is nothing upstream" and "I cannot see it, and I am not saying so"
+  are different statements, and the second is a misconfiguration an admin has
+  to fix. The four surfaces that already show `owned_model_count` now also
+  carry `scan_scope`: `GET /api/admin/semantic-sources` (list, single-source
+  `GET`, and the `POST`/`PUT` responses), the `sources` block of `GET
+  /api/admin/semantic-layer/health`, the **Last sync** cell on
+  `/admin/semantic-sources` (`✓ ok · <when> · scanned ESHOP_DEMO.RAW as
+  ESHOP_DEMO_ROLE`), and `agnes admin semantic source list`. The health
+  report's **"Sources that synced but imported nothing"** finding names the
+  scope too — on the `/admin/semantic-layer` Health tab and in `agnes admin
+  semantic health` — so the finding points at the grant to check instead of
+  ending at "check this source's config". Per adapter: Snowflake reports
+  database, schema (or `(whole database)`) and the ROLE it connects as;
+  Keboola the project its connection is bound to; Databricks the Unity
+  Catalog catalogs and workspace; a git source its repository, ref and file
+  glob (stated even when it is the default — a repo of `*.yml` documents
+  against the default `**/*.yaml` clones fine and matches nothing, which is
+  the same failure in git shape); an upload source its document count. Derived from the source's own config at
+  read time (`src/semantic/scan_scope.py`) and never stored — the scope is a
+  property of the row, not of a run — so nothing can drift, and an adapter
+  with no resolver reports `null` and every surface omits it. Coordinates
+  only: no token, no credential env-var name, and any URL echoed has its
+  `user:pass@` userinfo stripped first.
 - **A semantic source that syncs successfully and imports nothing is no longer
   indistinguishable from a healthy one (#1707).** `last_sync_status='ok'` says
   the fetch worked, not that it brought anything back — a `connection` source
@@ -1081,6 +1109,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **Semantic layer browse: the active `q` filter is now visible and has one
+  removable control, not three partial ones (#1707, A8).** `/semantic-layer
+  /{slug}` tabs are plain links (`?tab={t}`, no `q`), so arriving at
+  `?tab=metrics&q=Orders` and clicking any tab silently dropped the filter
+  with no indication it had ever applied — and the page still had no single
+  place that stated "a filter is active" (a search box showing the value, a
+  `Clear` link, and the tabs disagreeing about whether it survives a click).
+  Carrying `q` across tabs was rejected as the fix — a filter scoped to one
+  tab's fields rarely still means the same thing on another — so tabs still
+  drop it exactly as before. Instead, a removable filter chip (`filter:
+  Orders ×`) now renders above the table whenever `q` is active, making the
+  active filter visible; its `×` links to the same tab without `q` and
+  replaces the redundant `Clear` link that used to sit next to the search
+  box (now the page's only removable-filter control). The chip does not
+  survive a tab switch — that loss is still silent by design.
 - **`/admin/semantic-layer` claimed "Never synced yet." on instances whose
   sources had synced that morning (#1707).** The status strip read the
   whole-sweep summary, which is deliberately in-memory ("since this process
