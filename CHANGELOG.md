@@ -1054,6 +1054,48 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
+  admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+  knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+  their table in `<div class="data-table-wrap">`, but no CSS rule ever
+  backed the class — so a wide table dragged the whole page into horizontal
+  scroll in a narrow window instead of just itself. Fixing the overflow
+  naively would have broken sticky table headers on all ten pages —
+  `overflow-x: auto` makes the wrap a nearer scrolling ancestor than the
+  viewport, and with no height cap the header would silently stop sticking
+  at all instead of visibly failing — so sticky is now consciously disabled
+  for any thead inside `.data-table-wrap` rather than left in that
+  ambiguous, silently-broken state. Also replaced seven admin pages' inline
+  `style="text-align:right"` on a header (semantic sources, marketplaces,
+  mcp_sources, mcp_source_detail, knowledge_digests, initial_workspace,
+  access) with the existing `.num` class.
+- **Security: the cloud-chat approval gate now covers mutating MCP tools, not
+  just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
+  mutating MCP tool the in-chat agent can call — deleting a data-app draft,
+  deploying one, `pull` — executed without the approve/deny round-trip its own
+  contract asks for. Approval now follows each tool's own behaviour annotation
+  (`readOnlyHint`) rather than its name, so it covers future tools by
+  construction: a read-only tool still runs unasked, and everything else —
+  including a tool the runner has no annotation for, such as a per-caller
+  passthrough tool or one from a workspace-configured MCP server — raises the
+  same approval card, showing the call's arguments. The one user-visible
+  change in the shipped tool set: `agnes_data_app_preview` now asks before it
+  runs (it mints a scoped preview grant); the two pure render directives
+  beside it, `agnes_data_app_refresh` and `agnes_data_app_close`, are now
+  correctly annotated read-only on both MCP surfaces and do not ask. The
+  workspace policy hook also runs for MCP calls now, so an operator `deny` on
+  an MCP tool is enforced instead of being downgraded to a card the user can
+  click past, and the same mutations reached through the CLI
+  (`agnes app create|deploy|stop|delete|draft …`) are `ask`-flagged in the
+  bundled sandbox hook so the Bash route raises the same card. "Allow for
+  session" remembers the exact tool + arguments approved, never the tool as a
+  family. Read-only built-in tools (`Read`/`Grep`/…) are unaffected.
+  Fail-closed, scoped honestly: on the `docker` provider, on an SDK whose hook
+  matcher cannot block safely, mutating MCP tools are DENIED with an actionable
+  message rather than silently allowed, and an internal error in the gate
+  denies too — but on an SDK with no `PreToolUse` hook support at all nothing
+  can be registered and tool calls run ungated (logged loudly). The `kai-agent`
+  provider is unaffected; its engine raises its own approvals.
 - **Semantic-layer detail page: the detach toolbar's "Export detached
   version" link 404'd, and its two buttons rendered as unstyled text
   (#1707).** The link pointed at the HTML detail route
