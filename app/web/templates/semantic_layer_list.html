@@ -1,9 +1,14 @@
 {% extends "base_page.html" %}
 
-{% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# NAME: "Semantic models", never "Semantic layer" — that name was worn by
+   three of the four semantic surfaces at once (this page, /catalog/semantics
+   and /admin/semantic-layer), so a browser tab could not tell them apart.
+   The eyebrow keeps the concept; the title names the page's contents.
+   Guarded by tests/test_semantic_page_names_contract.py. #}
+{% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% set page_hero_eyebrow = "Semantic layer" %}
-{% set page_hero_title = "Semantic layer" %}
+{% set page_hero_title = "Semantic models" %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = "Browse your organization's datasets, metrics, relationships and glossary — the stored document itself, not just the flat metric list." %}
 
@@ -114,7 +119,7 @@
     <h3 class="empty-state__title">No semantic model available</h3>
     <p class="empty-state__description">
         Ask an admin to import or author one, or to grant you access to an existing one
-        (<a href="/catalog/semantics">the metric &amp; glossary catalog</a> is a related, separate view).
+        (<a href="/catalog/semantics">Metrics &amp; glossary</a> is a related, separate view).
     </p>
 </div>
 {% endif %}

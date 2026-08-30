@@ -226,7 +226,7 @@ def test_materialize_query_parquet_sliced_merges_via_duckdb(tmp_path):
             "file_type": "parquet",
         }
 
-    def fake_download_slices(file_info, dest_dir):
+    def fake_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         s1, s2 = dest_dir / "slice-00000", dest_dir / "slice-00001"
@@ -403,7 +403,7 @@ def test_materialize_query_sliced_parquet_tempdir_cleaned_on_exception(tmp_path)
             "file_type": "parquet",
         }
 
-    def boom_download_slices(file_info, dest_dir):
+    def boom_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         # Capture the tempdir the extractor created (parent of dest_dir).
         captured_tmpdir["path"] = Path(dest_dir).parent
         # Simulate a real download writing partial state, then disk full.
@@ -463,7 +463,7 @@ def test_materialize_query_warns_on_survived_scratch_when_exception_raised(tmp_p
             "file_type": "parquet",
         }
 
-    def boom_download_slices(file_info, dest_dir):
+    def boom_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         raise OSError(28, "No space left on device")
 
     client = MagicMock()
@@ -896,7 +896,7 @@ def test_sliced_consolidation_bounds_writer_row_groups(tmp_path, small_row_group
             "file_type": "parquet",
         }
 
-    def fake_download_slices(file_info, dest_dir):
+    def fake_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         paths = []
@@ -1607,3 +1607,125 @@ def test_materialize_query_meta_registration_replaces_own_row_only(tmp_path, fak
     finally:
         conn.close()
     assert rows == [("orders", "materialized"), ("sibling", "remote")]
+
+
+# ---- empty upstream table (entries-less sliced manifest) -------------------
+
+
+def test_materialize_query_empty_upstream_table_is_a_zero_row_success(tmp_path):
+    """End to end for the empty-table branch, driving the REAL Storage API
+    client (only its `requests` session is mocked) so the synthetic slice it
+    writes is the one the extractor merges.
+
+    An entries-less sliced manifest on a table Storage API reports as
+    ``rowsCount: 0`` used to raise, which left a table that is simply empty
+    upstream permanently red. It must now be an ordinary 0-row sync: the
+    published parquet carries the declared columns so the inner view
+    resolves, and ``_meta`` records 0 rows rather than the run failing.
+    """
+    from connectors.keboola.storage_api import KeboolaStorageClient
+
+    manifest_resp = MagicMock()
+    manifest_resp.json.return_value = {"entries": []}
+    manifest_resp.raise_for_status = MagicMock()
+    detail_resp = MagicMock()
+    detail_resp.status_code = 200
+    detail_resp.json.return_value = {"rowsCount": 0, "columns": ["id", "answer_text"]}
+    sess = MagicMock()
+    sess.get.side_effect = [manifest_resp, detail_resp]
+    real_client = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+    def fake_prepare(table_id, *, export_filter=None, export_timeout=None):
+        return {
+            "job_id": 1,
+            "file_id": 2,
+            "rows": 0,
+            "file_info": {"id": 2, "url": "https://fake/manifest", "isSliced": True},
+            "file_type": "parquet",
+        }
+
+    client = MagicMock()
+    client.prepare_export.side_effect = fake_prepare
+    client.download_file_slices.side_effect = real_client.download_file_slices
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    result = kbe.materialize_query(
+        table_id="form_answers",
+        bucket="in.c-forms",
+        source_table="answers",
+        source_query=None,
+        storage_client=client,
+        output_dir=output_dir,
+    )
+
+    assert result["rows"] == 0
+    final = output_dir / "form_answers.parquet"
+    assert final.exists()
+
+    conn = duckdb.connect()
+    try:
+        res = conn.execute(f"SELECT * FROM read_parquet('{final}')")
+        assert [d[0] for d in res.description] == ["id", "answer_text"]
+        assert res.fetchall() == []
+    finally:
+        conn.close()
+
+    extract_db = output_dir.parent / "extract.duckdb"
+    conn = duckdb.connect(str(extract_db), read_only=True)
+    try:
+        assert conn.execute("SELECT table_name, rows, query_mode FROM _meta").fetchall() == [
+            ("form_answers", 0, "materialized")
+        ]
+        # The inner view must still resolve its columns — that is what makes
+        # the orchestrator's master view usable for an empty table.
+        assert [d[0] for d in conn.execute("SELECT * FROM form_answers").description] == [
+            "id",
+            "answer_text",
+        ]
+    finally:
+        conn.close()
+
+
+def test_materialize_query_lost_slices_still_fails(tmp_path):
+    """The other half of the same branch: an entries-less manifest on a table
+    upstream says has rows is data loss and must keep failing loudly."""
+    from connectors.keboola.storage_api import KeboolaStorageClient, StorageApiError
+
+    manifest_resp = MagicMock()
+    manifest_resp.json.return_value = {"entries": []}
+    manifest_resp.raise_for_status = MagicMock()
+    detail_resp = MagicMock()
+    detail_resp.status_code = 200
+    detail_resp.json.return_value = {"rowsCount": 12, "columns": ["id"]}
+    sess = MagicMock()
+    sess.get.side_effect = [manifest_resp, detail_resp]
+    real_client = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+    def fake_prepare(table_id, *, export_filter=None, export_timeout=None):
+        return {
+            "job_id": 1,
+            "file_id": 2,
+            "rows": 12,
+            "file_info": {"id": 2, "url": "https://fake/manifest", "isSliced": True},
+            "file_type": "parquet",
+        }
+
+    client = MagicMock()
+    client.prepare_export.side_effect = fake_prepare
+    client.download_file_slices.side_effect = real_client.download_file_slices
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    with pytest.raises(StorageApiError, match=r"claims 12 rows"):
+        kbe.materialize_query(
+            table_id="form_answers",
+            bucket="in.c-forms",
+            source_table="answers",
+            source_query=None,
+            storage_client=client,
+            output_dir=output_dir,
+        )
+    assert not (output_dir / "form_answers.parquet").exists()

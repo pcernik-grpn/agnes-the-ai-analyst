@@ -1031,6 +1031,76 @@ class TestAdminRegistrySmoke:
 
 
 # ---------------------------------------------------------------------------
+# Admin source pipelines  (the /admin/data-sources card strip, as data)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminSourcePipelinesSmoke:
+    COVERED_ROUTES = {
+        "GET /api/admin/source-pipelines",
+    }
+
+    def test_strip_counts_a_table_against_its_connection(self, seeded_app_both):
+        """The strip is a fold over four different repos — table_registry,
+        sync_state, data_packages and the grant tables — so it is exactly the
+        kind of read that can silently answer "0 tables" on one backend and
+        "1" on the other. Registered through the API, read back through the
+        endpoint, on both.
+        """
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+
+        created = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "Pipelines Smoke",
+                "source_type": "keboola",
+                "config": {"stack_url": "https://connection.example.com"},
+            },
+            headers=h,
+        )
+        assert created.status_code in (200, 201), created.text
+        conn_id = created.json()["id"]
+
+        empty = c.get("/api/admin/source-pipelines", headers=h)
+        assert empty.status_code == 200, empty.text
+        cells = empty.json()[conn_id]
+        # Per-connector shape: Keboola carries the semantic cell, and a fresh
+        # connection reports each stage as the state it is actually in.
+        assert set(cells) == {"tables", "sync", "semantic", "feeds"}
+        assert cells["tables"]["count"] == 0
+        assert cells["feeds"]["packages"] == 0
+
+        registered = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "pipelines_smoke_orders",
+                "source_type": "keboola",
+                "bucket": "in.c-smoke",
+                "source_table": "orders",
+                "query_mode": "local",
+                "connection_id": conn_id,
+            },
+            headers=h,
+        )
+        assert registered.status_code in (200, 201), registered.text
+        table_id = registered.json().get("id") or registered.json().get("table_id")
+
+        after = c.get("/api/admin/source-pipelines", headers=h)
+        assert after.status_code == 200
+        cells = after.json()[conn_id]
+        assert cells["tables"]["count"] == 1
+        assert cells["tables"]["basis"] == "connection"
+
+        c.delete(f"/api/admin/registry/{table_id}", headers=h)
+        c.delete(f"/api/admin/source-connections/{conn_id}", headers=h)
+
+    def test_non_admin_is_refused(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/api/admin/source-pipelines", headers=_analyst_headers(seeded_app_both))
+        assert r.status_code == 403, r.text
+
+
+# ---------------------------------------------------------------------------
 # Admin Doctor  (new-instance deployment gate)
 # ---------------------------------------------------------------------------
 
