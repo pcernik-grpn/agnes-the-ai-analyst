@@ -4219,6 +4219,13 @@ async def semantic_layer_object(
         model_name=row.get("name") or model.get("name") or slug,
         is_imported=is_imported(row.get("source")),
         source_label=source_label(row.get("source")),
+        # A5 (#1707): this page renders through the shared detail scaffold, so
+        # the model's provenance sits in the right rail the way every other
+        # detail page carries its facts. `sync_mode` is a Postgres-only column
+        # (A3 ratchet) — a DuckDB-backed instance reads back as "synced", the
+        # same fail-quiet state the model detail page settles on.
+        source_ref=row.get("source_ref"),
+        sync_mode=row.get("sync_mode") or "synced",
         object_type=object_type,
         object_type_label=OBJECT_TYPE_LABELS[object_type],
         back_tab=OBJECT_TYPE_TAB[object_type],
