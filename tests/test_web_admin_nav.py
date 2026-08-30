@@ -1324,7 +1324,11 @@ class TestDataLensFlowStrip:
         headers = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
 
         data_html = c.get("/admin/tables", headers=headers).text
-        assert 'class="tab-flow"' in data_html
+        # `tab-strip tab-flow`: the flow variant IS a tab strip that adds
+        # connectors. The item look is the shared component's now — four
+        # copies of it had drifted, which is why People and Access rendered a
+        # different blue from this page while using the same markup.
+        assert 'class="tab-strip tab-flow"' in data_html
         assert "tab-flow__arrow" in data_html
         # The break sits between Packages and Semantic — exactly one.
         assert data_html.count("tab-flow__break") == 1
@@ -1334,7 +1338,9 @@ class TestDataLensFlowStrip:
 
         people_html = c.get("/admin/users", headers=headers).text
         assert 'class="tab-strip"' in people_html
+        # Same items, no connectors: People is a row of peers, not a pipeline.
         assert "tab-flow__item" not in people_html
+        assert "tab-flow__arrow" not in people_html
 
 
 # `TestTopnavAdminMenuCoversTheInventory` was here. It held the topnav's Admin

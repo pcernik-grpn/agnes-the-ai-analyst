@@ -627,24 +627,11 @@
   .lib-browse__state #lib-chips { margin: 0; }
   /* A chip sits on the same baseline as the count beside it. */
   .library-page .lib-browse__state .fbar-chip { height: 22px; }
-  /* The tab strip closes the header, full width, so it reads as the divider
-     between the page and its list rather than as another control. */
-  /* The content switcher. Underlined rather than pilled, so it reads as a
-     division of the page below it and not as another control in the row above;
-     quieter than the title, louder than the utilities. */
-  .lib-head .lib-tabs {
-    margin: 14px 0 0; border: 0; background: none; padding: 0; gap: 18px;
-    box-shadow: inset 0 -1px 0 var(--ds-border-light);
-  }
-  .lib-head .lib-tabs .fbar-seg__btn {
-    border-radius: 0; border-bottom: 2px solid transparent; height: 32px;
-    padding: 0 0 2px; font-size: 13.5px; gap: 7px;
-  }
-  .lib-head .lib-tabs .fbar-seg__btn.is-active {
-    background: none; box-shadow: none;
-    color: var(--ds-text-primary); border-bottom-color: var(--ds-primary);
-  }
-  .lib-head .lib-tabs .fbar-seg__n { font-size: 11.5px; font-weight: 600; }
+  /* The strip closes the header, full width, so it reads as the divider
+     between the page and its list rather than as another control. Everything
+     about how a tab LOOKS is `.tab-strip`'s, in components.css — this sets
+     only where the strip sits on this page. */
+  .lib-head .lib-tabs { margin: 14px 0 0; }
   /* Chips describe the LIST, so they sit beside it, not up in the header —
      left-aligned on the same edge as the rows, and tight to them. */
   #lib-chips { margin: 0 0 10px; justify-content: flex-start; }
@@ -2061,7 +2048,13 @@
      it against each row's `data-tab`, hides a section whose rows all fall out
      and rewrites the count. No tab-specific JS. #}
   {% if library_tabs %}
-  <div class="fbar-seg lib-tabs" id="lib-tabs" role="radiogroup" aria-label="Library section">
+  {# `.fbar-seg__btn` stays on the buttons: filter_toolbar.js's segment engine
+     binds to that class, and it is a wire hook, not a look. The LOOK comes
+     from `.tab-strip` around them — the same strip People, Access and Data
+     use, defined once in components.css. This block used to re-underline the
+     pill segmented control page-locally, which is how a fourth copy of one
+     component's styling came to exist. #}
+  <div class="fbar-seg tab-strip lib-tabs" id="lib-tabs" role="radiogroup" aria-label="Library section">
     {% for t in library_tabs %}
     <button type="button" class="fbar-seg__btn{% if t.key == library_active_tab %} is-active{% endif %}"
             data-own="{{ t.key }}" role="radio"

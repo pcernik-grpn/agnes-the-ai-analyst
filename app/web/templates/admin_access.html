@@ -1845,12 +1845,11 @@
      filter is a segment beside the search (it narrows what you are looking
      at). Two different jobs, two different controls — they had been the same
      control, which is why switching view and filtering felt alike. */
-  .ax-by { margin: 0; border-bottom: 0; gap: 2px; }
-  .ax-by__n {
-    margin-left: 5px; font-size: 11px; font-weight: 600;
-    color: var(--ds-text-muted); font-variant-numeric: tabular-nums;
-  }
-  .ax-by .is-active .ax-by__n { color: var(--ds-text-link); }
+  /* Placement only. How a tab and its count LOOK is `.tab-strip`'s, in
+     components.css — this page carried its own copy of both, which is why
+     its tabs did not match Data's while using the same component. */
+  .ax-by { margin: 0 0 14px; }
+  .ax-by__n { font-variant-numeric: tabular-nums; }
   .ax-kindfilter { flex: 0 0 auto; flex-wrap: wrap; }
   .ax-kindfilter[hidden] { display: none; }
 
@@ -2340,15 +2339,15 @@
   <nav class="tab-strip ax-by" id="ax-by" role="tablist" aria-label="How to read these grants">
     <button type="button" role="tab" id="ax-tab-group" class="tab-strip__item is-active"
             data-by="group" aria-selected="true" aria-controls="ax-pane-edit">
-      By group <span class="ax-by__n" data-by-n="group"></span>
+      By group <span class="tab-strip__n ax-by__n" data-by-n="group"></span>
     </button>
     <button type="button" role="tab" id="ax-tab-bundle" class="tab-strip__item"
             data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
-      By resource <span class="ax-by__n" data-by-n="resource"></span>
+      By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span>
     </button>
     <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item"
             data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1">
-      By person <span class="ax-by__n" data-by-n="person"></span>
+      By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span>
     </button>
   </nav>
   {# The shared toolbar component, the same one the Library's browsing block
