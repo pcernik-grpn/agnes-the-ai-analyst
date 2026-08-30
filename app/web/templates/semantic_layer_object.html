@@ -1,43 +1,31 @@
-{% extends "base_page.html" %}
+{% extends "base_ds.html" %}
+{# One object inside a semantic model — its own detail page.
+
+   A5 (issue #1707): this page used to hand-build every panel as
+   `<div class="slb-panel"><h2>…`, which left it the only detail page in the
+   product without the shared scaffold: no right rail, so the model's
+   provenance (where the document came from, which ref, whether sync still
+   owns it) was nowhere on the page a reader had drilled two levels to reach,
+   and section headings carried a different weight from the dozen pages that
+   go through `macros/_detail.html`. It now composes from the same macros as
+   catalog_table_detail / memory_domain_detail / library_file_detail: the hero,
+   `section_open`/`section_close` for the main column, `side_rows` for the
+   facts, and (admin only) `manage` for the doors out to management. #}
 
 {% block title %}{{ object_name }} — {{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
-{% block head_extra %}
-<style>
-.slb-back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: var(--space-6) 0 0;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--ds-text-secondary);
-    text-decoration: none;
-}
-.slb-back:hover { color: var(--ds-text-primary); }
+{% block body_attrs %}class="detail-page"{% endblock %}
 
+{% block head_extra %}
+{% import "macros/_detail.html" as detail with context %}
+{{ detail.styles() }}
+<style>
 .slb-meta {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: var(--space-3);
-    margin: 0 0 var(--space-5);
-}
-
-.slb-panel {
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
-    background: var(--ds-surface);
-    padding: var(--space-4) var(--space-5);
-    margin-bottom: var(--space-5);
-}
-.slb-panel h2 {
-    font-size: 13px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--ds-text-muted);
-    margin: 0 0 var(--space-3);
+    margin: var(--space-3) 0 0;
 }
 
 .slb-expr {
@@ -111,15 +99,14 @@
 </style>
 {% endblock %}
 
-{% block page_prehead %}
-<a class="slb-back" href="/semantic-layer/{{ slug }}?tab={{ back_tab }}">&larr; {{ model_name }}</a>
-{% endblock %}
+{% block content %}
+{% import "macros/_detail.html" as detail with context %}
 
-{% set page_hero_eyebrow = model_name ~ " · " ~ object_type_label %}
-{% set page_hero_title = object_name %}
-{% set page_hero_plain = True %}
-
-{% block toolbar %}
+{# The provenance badge stays in the header, next to the name it qualifies:
+   "read-only, because a source owns it" is a fact about THIS object, not a
+   metadata row. `body_slot` is the scaffold's hook for exactly this — page
+   -owned markup inside the hero body. #}
+{% set _badges %}
 <div class="slb-meta">
     {% if is_imported %}
     <span class="badge">Imported from {{ source_label }} — read-only</span>
@@ -127,13 +114,25 @@
     <span class="badge">Native</span>
     {% endif %}
 </div>
-{% endblock %}
+{% endset %}
 
-{% block page %}
+{# A semantic object is Data — the same teal and cylinder glyph as the tables
+   it describes; only the type badge (Dataset / Metric / …) tells them apart.
+   Back goes to the model's own tab for this object type, which is where the
+   reader clicked through from. #}
+{% call detail.hero(
+     kind='data', name=object_name,
+     type_label=object_type_label,
+     description=obj.description or None,
+     back_href='/semantic-layer/' ~ slug ~ '?tab=' ~ back_tab,
+     back_label=model_name,
+     body_slot=_badges|trim) %}
+{% endcall %}
+
+{{ detail.cols_open() }}
 
 {% if object_type == 'dataset' %}
-<div class="slb-panel">
-    <h2>Fields</h2>
+{{ detail.section_open('Fields', icon='table') }}
     {% if fields %}
     <table class="data-table">
         <thead>
@@ -157,15 +156,21 @@
     {% else %}
     <p class="empty-state__description">No fields declared.</p>
     {% endif %}
-</div>
+{{ detail.section_close() }}
 {% if obj.source %}
-<div class="slb-panel"><h2>Source</h2><p>{{ obj.source }}</p></div>
+{# "Source table", not "Source": the rail's provenance block already answers
+   "where did this DOCUMENT come from", and one page cannot spell two different
+   questions the same way. This one is the physical object the dataset binds
+   to. It stays a main-column section rather than moving to the rail, because
+   the rail is redesign-only and a legacy instance would lose the fact. #}
+{{ detail.section_open('Source table', icon='db') }}
+    <p>{{ obj.source }}</p>
+{{ detail.section_close() }}
 {% endif %}
 {% endif %}
 
 {% if object_type == 'metric' %}
-<div class="slb-panel">
-    <h2>SQL expression</h2>
+{{ detail.section_open('SQL expression', icon='code') }}
     {% if expressions %}
     {% for e in expressions %}
     <span class="badge slb-expr-dialect">{{ e.dialect }}</span>
@@ -180,12 +185,11 @@
     {% if registry_href %}
     <p class="slb-registry-link"><a href="{{ registry_href }}">Open in the metric registry &rarr;</a></p>
     {% endif %}
-</div>
+{{ detail.section_close() }}
 {% endif %}
 
 {% if object_type == 'relationship' %}
-<div class="slb-panel">
-    <h2>Linkage</h2>
+{{ detail.section_open('Linkage', icon='link') }}
     <div class="slb-rel-sides">
         {% if from_dataset %}
         <a href="/semantic-layer/{{ slug }}/dataset:{{ obj.from | urlencode }}">{{ obj.from }}</a>
@@ -200,32 +204,29 @@
         {% endif %}
     </div>
     <p>{{ (obj.from_columns or []) | join(', ') }} = {{ (obj.to_columns or []) | join(', ') }}</p>
-</div>
+{{ detail.section_close() }}
 {% endif %}
 
 {% if object_type == 'constraint' %}
-<div class="slb-panel">
-    <h2>Rule</h2>
+{{ detail.section_open('Rule', icon='check') }}
     <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}" data-tip="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft." aria-label="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft.">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
     <pre class="slb-expr">{{ obj.rule or "" }}</pre>
     <p>Applies to metrics: {{ (obj.metrics or []) | join(', ') }}</p>
     <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
-</div>
+{{ detail.section_close() }}
 {% endif %}
 
 {% if object_type == 'glossary' %}
-<div class="slb-panel">
-    <h2>Definition</h2>
+{{ detail.section_open('Definition', icon='book') }}
     <p>{{ obj.definition or "" }}</p>
     {% if obj.see_also %}
     <p>See also: {{ obj.see_also | join(', ') }}</p>
     {% endif %}
-</div>
+{{ detail.section_close() }}
 {% endif %}
 
 {% if ai is not none %}
-<div class="slb-panel">
-    <h2>AI context</h2>
+{{ detail.section_open('AI context', icon='spark') }}
     {% if ai_instructions %}<p>{{ ai_instructions }}</p>{% endif %}
     {% if ai_examples %}
     <p><strong>Examples:</strong> {{ ai_examples | join(' · ') }}</p>
@@ -246,6 +247,60 @@
         </div>
         {% endfor %}
     </div>
-</div>
+{{ detail.section_close() }}
 {% endif %}
+
+{{ detail.aside_open() }}
+{# The rail is redesign-only: on the legacy path there is no rail, and
+   appending these as extra sections would change a page default instances are
+   entitled to see unchanged (THE GATING RULE in macros/_detail.html). #}
+{% if detail.redesign %}
+
+{# Unlabelled, like every other facts block in the system — each row names its
+   own value. No "Type" row: the header badge already says Dataset / Metric.
+   This is the provenance the page was missing entirely — which document this
+   object came out of, who owns that document, and whether sync still does. #}
+{# Built as a `{% set %}` block, not string concatenation: the block is
+   autoescaped, so a model name carrying markup is escaped before `side_rows`
+   emits the row with `| safe`. #}
+{% set _model_link %}<a href="/semantic-layer/{{ slug | urlencode }}">{{ model_name }}</a>{% endset %}
+{{ detail.side_open('') }}
+  {% set _rows = [{'key': 'Source', 'val': source_label},
+                  {'key': 'Source ref', 'val': source_ref}] %}
+  {% set _ = _rows.append({'key': 'Model', 'html': True, 'val': _model_link | trim}) %}
+  {% if sync_mode == 'detached' %}
+    {# Detached means an admin took this model off sync so it could be edited —
+       the source no longer overwrites it, which is exactly the fact that
+       explains a document drifting from its origin. #}
+    {% set _ = _rows.append({'key': 'Sync', 'html': True,
+                             'val': detail.status('Detached', 'warn') | trim}) %}
+  {% else %}
+    {% set _ = _rows.append({'key': 'Sync', 'html': True,
+                             'val': detail.status('Synced', 'ok') | trim}) %}
+  {% endif %}
+  {{ detail.side_rows(_rows) }}
+{{ detail.side_close() }}
+
+{# ── Managing it ───────────────────────────────────────────────────────
+   N6 (#1707). LAST in the rail, admin-only — the same visibility condition
+   the model page puts on Detach. An admin who reaches a stale object here had
+   no way on to the pages that own it and was retyping URLs; these are the
+   three, under their current names (#1844): where the document comes from,
+   whether the layer is healthy, and the model list itself. Nothing here edits
+   the object — this page stays read-only. #}
+{% if user.is_admin %}
+{{ detail.manage(
+     [{'label': 'Semantic sources', 'href': '/admin/semantic-sources'},
+      {'label': 'Semantic models', 'href': '/semantic-layer'}],
+     admin_href='/admin/semantic-layer',
+     admin_label='Semantic layer health',
+     title='Manage this model') }}
+{% endif %}
+
+{% endif %}
+{{ detail.cols_close() }}
+
+{# Closes the `.detail` wrapper `detail.hero()` opens — the macro only closes
+   `.detail-hero` itself, so every migrated detail template emits this. #}
+</div>
 {% endblock %}

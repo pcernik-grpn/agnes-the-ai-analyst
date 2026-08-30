@@ -492,6 +492,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
 ### Changed
+- **A semantic object's page looks like — and carries what — every other detail
+  page does (#1707).** `/semantic-layer/{model}/{object}` was the one detail
+  page in the product that hand-built its panels instead of composing from the
+  shared detail scaffold, so its section headings carried a different weight
+  and it had no right rail at all. It now renders through the same macros as
+  the table, package, file, plugin, memory-domain and data-app pages, which
+  gives it the provenance a reader had drilled two levels to find and could
+  not see: **Source**, **Source ref**, the **Model** it belongs to, and
+  whether **sync** still owns the document or an admin has detached it. An
+  admin also gets a **Manage this model** cluster in the rail — **Semantic
+  sources**, **Semantic models** and **Semantic layer health** — instead of
+  retyping those URLs after spotting a stale object. The page stays read-only
+  for everyone; nothing here edits the object. The severity tooltip and the
+  "Open in the metric registry →" link are unchanged.
 - **Each semantic-layer page has a name of its own (#1707).** Three of the four
   rendered the identical title "Semantic layer", so a browser tab, a bookmark
   or a history entry could not tell them apart, and a link's label routinely
