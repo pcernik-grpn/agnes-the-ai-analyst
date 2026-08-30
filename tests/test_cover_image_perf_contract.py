@@ -302,38 +302,3 @@ def test_stack_card_cover_protocol_relative_url_has_no_srcset():
     assert "?w=" not in html
     assert "srcset=" not in html
     assert 'src="//cdn.example.com/cover.png"' in html
-
-
-def test_catalog_package_hero_has_no_srcset_and_eager_high_priority(seeded_app):
-    """d2: GET /catalog/p/<slug> — the page hero cover is an admin-uploaded
-    (internal, relative) cover, so it gets ``fetchpriority="high"`` and no
-    ``loading`` attribute (a hero is above the fold), but fetches the fixed
-    480 variant directly: the hero tile is a fixed 108x62 CSS-px box (never
-    a fluid grid column like the stack card), so a srcset only offers a
-    960 the tile can never show a visible benefit from.
-    """
-    app_data = seeded_app
-    client = app_data["client"]
-    headers = _auth(app_data["admin_token"])
-    create = client.post(
-        "/api/admin/data-packages",
-        json={
-            "name": "Cover perf package",
-            "slug": "cover-perf-package",
-            "cover_image_url": "/uploads/covers/deadbeef.png",
-        },
-        headers=headers,
-    )
-    assert create.status_code == 201, create.text
-
-    r = client.get("/catalog/p/cover-perf-package", headers=headers)
-    assert r.status_code == 200
-    html = r.text
-    img_start = html.index('<img src="/uploads/covers/deadbeef.png')
-    hero_img = html[img_start : html.index(">", img_start) + 1]
-    assert 'fetchpriority="high"' in hero_img
-    assert "loading=" not in hero_img
-    assert 'width="480"' in hero_img
-    assert 'height="240"' in hero_img
-    assert "?w=480" in hero_img
-    assert "srcset=" not in hero_img

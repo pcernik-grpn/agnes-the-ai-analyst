@@ -3178,7 +3178,16 @@ class TestServerSideCoverHero:
         r = web_client.get(f"/marketplace/flea/{eid}", cookies=cookies)
         assert r.status_code == 200
         assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
-        assert 'fetchpriority="high"' in r.text
+        # The hero <img> comes from the shared detail.hero() macro: eager
+        # (no ``loading``), fixed 480 variant with intrinsic size, and no
+        # srcset — the tile is a fixed CSS-px box, a 960 can't show a gain.
+        img_start = r.text.index(f'<img src="/api/store/entities/{eid}/photo')
+        hero_img = r.text[img_start : r.text.index(">", img_start) + 1]
+        assert 'fetchpriority="high"' in hero_img
+        assert "loading=" not in hero_img
+        assert "srcset=" not in hero_img
+        assert 'width="480"' in hero_img
+        assert 'height="240"' in hero_img
 
     def test_inner_skill_hero_carries_cover_img_server_side(self, web_client):
         """The nested flea skill page (marketplace_flea_skill_detail) resolves
