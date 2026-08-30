@@ -91,6 +91,43 @@ def test_build_profile_rails_are_not_added_without_a_persona():
     assert agent_profile.build_profile(_agent_row(system_prompt="")) is None
 
 
+def test_build_profile_appends_facts_rails_when_the_switch_is_on(monkeypatch):
+    """A persona REPLACES the workspace CLAUDE.md wholesale, so the
+    `facts.enabled`-gated "Facts — entity and relationship questions" section
+    the default Workspace Prompt carries (`config/claude_md_template.txt`)
+    never reached a persona'd agent — it was told its data lives behind
+    `agnes catalog` alone and had no pointer to the fact tools, so a
+    who/what/relationship question it could have answered via `fact_search`
+    failed instead. See docs/superpowers/runs/2026-08-28-run-p-planted.md for
+    the same failure mode on the default (non-persona) path."""
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    row = _agent_row(system_prompt="You write poems.")
+    profile = agent_profile.build_profile(row)
+    md = profile.claude_md
+    assert "fact_search" in md
+    assert "fact_neighbors" in md
+    assert "fact_claims" in md
+    assert "agnes facts search" in md
+    # Additive, not a replacement — the agent still needs the table rails.
+    assert agent_profile.DATA_ACCESS_RAILS in md
+    # The facts guidance follows the catalog guidance, so a who/what/
+    # relationship question is steered to the more specific tool.
+    assert md.index(agent_profile.DATA_ACCESS_RAILS) < md.index("fact_search")
+
+
+def test_build_profile_omits_facts_rails_when_the_switch_is_off(monkeypatch):
+    """An instance with `facts` off must not steer a persona toward tools
+    that would all 404 (`app.auth.access.require_facts_enabled`)."""
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    row = _agent_row(system_prompt="You write poems.")
+    profile = agent_profile.build_profile(row)
+    md = profile.claude_md
+    assert "fact_search" not in md
+    assert "Facts —" not in md
+    # The catalog guidance is unaffected by the switch.
+    assert agent_profile.DATA_ACCESS_RAILS in md
+
+
 def test_build_profile_skill_body_is_valid_skill_md():
     row = _agent_row(system_prompt="Be helpful.")
     profile = agent_profile.build_profile(row)

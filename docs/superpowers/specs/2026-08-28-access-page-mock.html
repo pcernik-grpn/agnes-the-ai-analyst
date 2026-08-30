@@ -1,0 +1,864 @@
+<meta charset="utf-8">
+<title>Access Rebuilt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400..700&family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400..600&display=swap">
+
+<style>
+:root{
+  --ground:#EDEFF1; --surface:#FFFFFF; --surface-2:#F5F7F8;
+  --ink:#131A20; --ink-2:#3D474E; --muted:#5F696F;
+  --line:#D6DBDE; --line-2:#E7EBED;
+  --teal:#0E5C63; --teal-soft:#DCEAEA;
+  --marker:rgba(255,206,61,.55); --marker-edge:#96690A;
+  --shadow:0 1px 2px rgba(19,26,32,.05), 0 10px 30px -14px rgba(19,26,32,.28);
+  --sans:"Familjen Grotesk","Helvetica Neue",Arial,sans-serif;
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F141A; --surface:#181F26; --surface-2:#131A20;
+    --ink:#E3E9EC; --ink-2:#B5C0C7; --muted:#8B959C;
+    --line:#2A343C; --line-2:#222B32;
+    --teal:#4FBDB5; --teal-soft:#17302F;
+    --marker:rgba(255,206,61,.26); --marker-edge:#DCAE3E;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px -16px rgba(0,0,0,.75);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F141A; --surface:#181F26; --surface-2:#131A20;
+  --ink:#E3E9EC; --ink-2:#B5C0C7; --muted:#8B959C;
+  --line:#2A343C; --line-2:#222B32;
+  --teal:#4FBDB5; --teal-soft:#17302F;
+  --marker:rgba(255,206,61,.26); --marker-edge:#DCAE3E;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px -16px rgba(0,0,0,.75);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font-family:var(--serif);font-size:1.03rem;line-height:1.6;-webkit-font-smoothing:antialiased}
+.page{max-width:76rem;margin:0 auto;padding:4rem 1.5rem 4rem}
+.prose{max-width:38rem}
+
+.eyebrow{font-family:var(--sans);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);margin:0 0 1.1rem;display:flex;flex-wrap:wrap;gap:.45rem .9rem}
+.eyebrow b{color:var(--teal);font-weight:600}
+h1{font-family:var(--sans);font-weight:700;font-size:clamp(2.3rem,6vw,3.4rem);
+  line-height:1.03;letter-spacing:-.025em;margin:0;text-wrap:balance}
+.stand{font-size:1.15rem;color:var(--ink-2);margin:1.2rem 0 0;max-width:38rem;text-wrap:pretty}
+h2{font-family:var(--sans);font-weight:600;font-size:1.35rem;letter-spacing:-.012em;
+  margin:3.5rem 0 0;text-wrap:balance}
+p{margin:.9rem 0 0}
+code{font-family:var(--mono);font-size:.85em;background:var(--surface-2);
+  border:1px solid var(--line-2);border-radius:3px;padding:.05em .3em}
+a{color:var(--teal)}
+:focus-visible{outline:2px solid var(--teal);outline-offset:3px}
+
+.asks{display:grid;gap:1rem;grid-template-columns:1fr;margin-top:2.5rem}
+@media(min-width:52rem){.asks{grid-template-columns:repeat(3,1fr)}}
+.ask-card{background:var(--surface);border:1px solid var(--line);border-radius:5px;
+  padding:1.05rem 1.15rem;box-shadow:var(--shadow)}
+.ask-who{font-family:var(--sans);font-size:.68rem;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--teal);font-weight:600;margin:0 0 .5rem}
+.ask-q{font-family:var(--sans);font-size:.92rem;font-weight:500;line-height:1.4;margin:0 0 .55rem}
+.ask-do{font-size:.92rem;color:var(--muted);margin:0;line-height:1.5}
+.ask-do b{color:var(--ink-2);font-weight:600}
+
+figure{margin:2.75rem 0 0}
+figcaption{font-family:var(--sans);font-size:.79rem;color:var(--muted);margin-top:.8rem;line-height:1.45}
+.scroll{overflow-x:auto;padding-bottom:.3rem}
+
+.app{font-family:var(--sans);font-size:.85rem;line-height:1.45;
+  background:var(--surface);border:1px solid var(--line);border-radius:7px;
+  box-shadow:var(--shadow);overflow:hidden;min-width:62rem}
+.app-bar{display:flex;align-items:center;gap:.55rem;padding:.55rem .9rem;background:var(--surface-2);
+  border-bottom:1px solid var(--line-2);font-family:var(--mono);font-size:.73rem;color:var(--muted)}
+.dot{width:.48rem;height:.48rem;border-radius:50%;background:var(--line);flex:none}
+.app-grid{display:grid;grid-template-columns:9.5rem 1fr}
+.rail{border-right:1px solid var(--line-2);background:var(--surface-2);padding:.9rem .7rem;
+  display:flex;flex-direction:column;gap:.15rem}
+.rail i{font-style:normal;font-size:.8rem;color:var(--muted);padding:.32rem .5rem;border-radius:4px}
+.rail i.on{background:var(--teal-soft);color:var(--teal);font-weight:600}
+.rail .sp{flex:1;min-height:1.5rem}
+.main{padding:1.25rem 1.4rem 1.5rem;min-width:0}
+
+.top{display:flex;align-items:flex-start;gap:1rem;flex-wrap:wrap}
+.ptitle{font-size:1.35rem;font-weight:700;letter-spacing:-.015em;margin:0}
+.psub{color:var(--muted);font-size:.8rem;margin:.2rem 0 0}
+.psub b{color:var(--teal);font-weight:600}
+.ctrls{margin-left:auto;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.inp{border:1px solid var(--line);border-radius:4px;background:var(--surface-2);
+  color:var(--muted);padding:.3rem .65rem;font-size:.78rem;min-width:12rem}
+.bt{border:1px solid var(--line);border-radius:4px;background:var(--surface);
+  color:var(--ink-2);padding:.3rem .6rem;font-size:.78rem;white-space:nowrap}
+.bt.pri{background:var(--teal);border-color:var(--teal);color:#fff}
+:root[data-theme="dark"] .bt.pri,:root:not([data-theme="light"]) .bt.pri{color:var(--ground)}
+
+/* grouping switch — same device as the Library's By subject / By type */
+.segs{display:flex;gap:.3rem;margin:1.15rem 0 .2rem;align-items:center;flex-wrap:wrap}
+.seg{font-size:.78rem;padding:.28rem .7rem;border:1px solid var(--line);border-radius:20px;color:var(--muted)}
+.seg.on{background:var(--ink);border-color:var(--ink);color:var(--surface);font-weight:500}
+:root[data-theme="dark"] .seg.on,:root:not([data-theme="light"]) .seg.on{color:var(--ground)}
+.segs .hint{font-size:.75rem;color:var(--muted);margin-left:.4rem}
+
+/* a group, as a section of one full-width list */
+.gs{border-top:1px solid var(--line);margin-top:.1rem}
+.gs.open{border-top-width:2px;border-top-color:var(--ink)}
+.gs-hd{display:grid;grid-template-columns:auto 1fr auto;gap:.9rem;align-items:center;padding:.75rem .1rem .7rem}
+.gs-hd .car{font-family:var(--mono);font-size:.8rem;color:var(--muted);width:.8rem}
+.gs-nm{display:flex;align-items:baseline;gap:.55rem;flex-wrap:wrap;min-width:0}
+.gs-nm b{font-size:1rem;font-weight:700;letter-spacing:-.01em}
+.gs-nm .og{font-family:var(--mono);font-size:.68rem;color:var(--muted);
+  border:1px solid var(--line);border-radius:3px;padding:0 .3rem}
+.gs-nm .rc{font-size:.79rem;color:var(--muted)}
+.gs-hd .rt{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;justify-content:flex-end}
+.cnt{font-family:var(--mono);font-size:.71rem;color:var(--muted);white-space:nowrap}
+.cnt b{color:var(--teal);font-weight:500}
+
+.gs-aud{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;
+  padding:.15rem .1rem .8rem;margin-top:-.15rem}
+.avs{display:flex;align-items:center;gap:.25rem}
+.av{width:1.35rem;height:1.35rem;border-radius:50%;background:var(--teal-soft);color:var(--teal);
+  border:1px solid var(--teal);display:grid;place-items:center;
+  font-family:var(--mono);font-size:.58rem;font-weight:500}
+.av.more{background:var(--surface);border-color:var(--line);color:var(--muted)}
+.gs-aud .src{font-size:.77rem;color:var(--muted)}
+.gs-aud .inp{min-width:15rem}
+
+/* family sections */
+.fam{margin-top:.95rem}
+.fam:first-of-type{margin-top:.2rem}
+.fam-hd{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap;padding-bottom:.3rem}
+.fam-hd .fn{font-size:.68rem;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-2)}
+.fam-hd .fd{font-size:.77rem;color:var(--muted)}
+.fam-hd .fc{margin-left:auto;font-family:var(--mono);font-size:.71rem;color:var(--muted)}
+
+.gr{display:grid;grid-template-columns:6.2rem minmax(0,1fr) 12rem 13rem;gap:1.1rem;
+  padding:.55rem .1rem;border-bottom:1px solid var(--line-2);align-items:center}
+.gr:hover{background:var(--surface-2)}
+.gr .kd{font-family:var(--mono);font-size:.66rem;color:var(--teal);border:1px solid var(--teal);
+  border-radius:3px;padding:.03rem .3rem;text-align:center;white-space:nowrap}
+.gr .kd.own{color:var(--marker-edge);border-color:var(--marker-edge)}
+.gr .nm{font-weight:600;font-size:.86rem;min-width:0}
+.gr .nm span{display:block;font-weight:400;font-size:.77rem;color:var(--muted);margin-top:.05rem}
+.gr .nm em{font-style:normal;color:var(--marker-edge);font-family:var(--mono);font-size:.72rem}
+.ctl{display:flex;gap:.25rem;align-items:center}
+.sw{display:inline-flex;border:1px solid var(--line);border-radius:4px;overflow:hidden}
+.sw b{font-weight:500;font-size:.73rem;padding:.16rem .48rem;color:var(--muted);background:var(--surface)}
+.sw b.on{background:var(--teal);color:#fff;font-weight:600}
+:root[data-theme="dark"] .sw b.on,:root:not([data-theme="light"]) .sw b.on{color:var(--ground)}
+.rev{font-size:.73rem;border:1px solid var(--line);border-radius:4px;padding:.16rem .5rem;
+  color:var(--muted);background:var(--surface);white-space:nowrap}
+.usr{font-size:.75rem;color:var(--ink-2);font-family:var(--sans);white-space:nowrap}
+.usr.q{color:var(--muted);font-style:italic}
+.usr b{display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;font-style:normal;margin-bottom:.05rem}
+.colhd{display:grid;grid-template-columns:6.2rem minmax(0,1fr) 12rem 13rem;gap:1.1rem;
+  padding:0 .1rem .35rem;font-size:.65rem;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);font-weight:600}
+.colhd .u{color:var(--marker-edge)}
+
+/* cropped states */
+.crops{display:grid;gap:1.1rem;grid-template-columns:1fr}
+@media(min-width:56rem){.crops{grid-template-columns:1fr 1fr}}
+.crop{background:var(--surface);border:1px solid var(--line);border-radius:6px;
+  box-shadow:var(--shadow);overflow:hidden;font-family:var(--sans);font-size:.85rem}
+.crop-hd{padding:.6rem .85rem;border-bottom:1px solid var(--line-2);background:var(--surface-2);
+  display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.crop-hd .inp{margin:0;min-width:11rem;background:var(--surface);color:var(--ink)}
+.crop-hd .hit{font-family:var(--mono);font-size:.71rem;color:var(--muted);margin-left:auto}
+.crop-b{padding:.5rem .85rem 1rem}
+.crop .gs{margin-top:0}
+.crop .gs:first-child{border-top:none}
+.mini{display:grid;grid-template-columns:5.4rem minmax(0,1fr) auto;gap:.7rem;align-items:center;
+  padding:.4rem 0;border-bottom:1px solid var(--line-2);font-size:.82rem}
+.mini .nm3{font-weight:600}
+.mini .nm3 mark{background:var(--marker);color:inherit;border-radius:2px;padding:0 .12em}
+.mini .rd{font-size:.75rem;color:var(--ink-2);white-space:nowrap}
+.zero{padding:1.6rem .3rem 1.3rem;text-align:left}
+.zero .z1{font-size:.95rem;font-weight:600}
+.zero .z2{font-size:.85rem;color:var(--muted);margin-top:.3rem;max-width:26rem}
+.zero .z3{margin-top:.7rem;display:flex;gap:.4rem;flex-wrap:wrap}
+
+/* the same rows, inverted */
+.bb{border-top:1px solid var(--line);margin-top:.1rem}
+.bb-hd{display:grid;grid-template-columns:6.2rem minmax(0,1fr) auto;gap:1.1rem;align-items:center;
+  padding:.7rem .1rem .55rem}
+.bb-hd .nm2{font-size:.95rem;font-weight:700;letter-spacing:-.008em}
+.bb-hd .nm2 span{display:block;font-weight:400;font-size:.78rem;color:var(--muted);margin-top:.05rem}
+.bbr{display:grid;grid-template-columns:6.2rem minmax(0,1fr) 12rem 13rem;gap:1.1rem;align-items:center;
+  padding:.42rem .1rem;border-bottom:1px solid var(--line-2)}
+.bbr .gnm{font-weight:600;font-size:.85rem}
+.bbr .gnm span{color:var(--muted);font-weight:400;font-family:var(--mono);font-size:.72rem;margin-left:.4rem}
+.bbr .sp2{grid-column:1}
+
+.adv{margin-top:1.15rem;padding-top:.8rem;border-top:1px solid var(--line);
+  display:flex;gap:.7rem;align-items:baseline;flex-wrap:wrap;font-size:.79rem;color:var(--muted)}
+.adv .lk{color:var(--teal);font-weight:600;margin-left:auto}
+
+/* the old matrix */
+.old{border:1px solid var(--line);border-radius:6px;background:var(--surface);
+  box-shadow:var(--shadow);overflow:hidden;max-width:34rem}
+.old-hd{padding:.5rem .8rem;background:var(--surface-2);border-bottom:1px solid var(--line-2);
+  font-family:var(--mono);font-size:.71rem;color:var(--muted)}
+.old-b{padding:.5rem .8rem .8rem;max-height:13.5rem;overflow:hidden;position:relative}
+.old-s{font-family:var(--sans);font-size:.72rem;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink-2);margin:.55rem 0 .25rem}
+.old-r{display:grid;grid-template-columns:1fr auto;gap:.6rem;font-family:var(--sans);
+  font-size:.78rem;color:var(--ink-2);padding:.16rem 0;border-bottom:1px solid var(--line-2)}
+.old-r .tg{font-family:var(--mono);font-size:.66rem;color:var(--muted);
+  border:1px solid var(--line);border-radius:3px;padding:0 .3rem}
+.old-f{position:absolute;left:0;right:0;bottom:0;height:5rem;
+  background:linear-gradient(to bottom,transparent,var(--surface))}
+
+.expl{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--teal);
+  border-radius:2px;padding:1.2rem 1.4rem;margin-top:2.5rem;box-shadow:var(--shadow);max-width:44rem}
+.expl h3{font-family:var(--sans);font-size:.98rem;font-weight:600;margin:0 0 .2rem}
+.expl p{font-size:.97rem;line-height:1.55}
+.expl .kicker{font-family:var(--sans);font-size:.92rem;color:var(--ink-2);
+  margin-top:.9rem;padding-top:.8rem;border-top:1px solid var(--line-2)}
+
+.vtab{width:100%;border-collapse:collapse;font-family:var(--sans);font-size:.85rem;margin-top:1.4rem}
+.vtab th{text-align:left;font-size:.68rem;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);
+  font-weight:600;padding:0 1rem .5rem 0;border-bottom:1px solid var(--line)}
+.vtab td{padding:.6rem 1rem .6rem 0;border-bottom:1px solid var(--line-2);vertical-align:top;color:var(--ink-2)}
+.vtab td.now{color:var(--muted);text-decoration:line-through}
+.vtab td.new{color:var(--ink);font-weight:600}
+.vtab td code{font-size:.8em}
+
+.map{width:100%;height:auto;display:block;max-width:40rem}
+.map text{font-family:var(--sans);fill:var(--ink)}
+.map .nm{font-size:11.5px;font-weight:600}
+.map .ct{font-size:10px;fill:var(--muted);font-family:var(--mono)}
+.map .box{fill:var(--surface);stroke:var(--line)}
+.map .box-k{fill:var(--teal-soft);stroke:var(--teal)}
+.map .box-x{fill:var(--surface-2);stroke:var(--line);stroke-dasharray:4 3}
+.map .ln{stroke:var(--line);fill:none}
+.map .ln-d{stroke:var(--marker-edge);fill:none;stroke-dasharray:3 3;opacity:.85}
+.map .evl{font-size:9.5px;fill:var(--marker-edge);font-family:var(--mono)}
+.map .xl{font-size:9.5px;fill:var(--muted);font-family:var(--mono)}
+
+.notes{margin-top:1.6rem;display:grid;gap:.55rem}
+.nt{display:grid;grid-template-columns:auto 1fr;gap:.75rem;align-items:baseline;
+  font-family:var(--sans);font-size:.9rem;line-height:1.5}
+.nt .k{font-family:var(--mono);font-size:.7rem;color:var(--teal);border:1px solid var(--teal);
+  border-radius:3px;padding:.02rem .35rem;white-space:nowrap}
+.nt .k.z{color:var(--marker-edge);border-color:var(--marker-edge)}
+.nt .k.u{color:var(--muted);border-color:var(--line)}
+.nt b{font-weight:600}
+
+.build{margin-top:2.2rem;display:grid;gap:.85rem;grid-template-columns:1fr}
+@media(min-width:52rem){.build{grid-template-columns:repeat(3,1fr)}}
+.bcard{background:var(--surface);border:1px solid var(--line);border-radius:5px;
+  padding:.95rem 1.05rem;box-shadow:var(--shadow)}
+.bcard .sl{font-family:var(--mono);font-size:.72rem;color:var(--teal);font-weight:500}
+.bcard h4{font-family:var(--sans);font-size:.92rem;font-weight:600;margin:.3rem 0 .35rem;line-height:1.35}
+.bcard p{font-size:.87rem;color:var(--muted);margin:0;line-height:1.5}
+.bcard code{font-size:.78em}
+.bcard .dep{display:block;margin-top:.5rem;font-family:var(--sans);font-size:.74rem;color:var(--marker-edge)}
+
+.open{margin-top:2.5rem;background:var(--surface-2);border:1px solid var(--line);
+  border-radius:5px;padding:1.1rem 1.3rem;max-width:44rem}
+.open h3{font-family:var(--sans);font-size:.95rem;font-weight:600;margin:0}
+.open ol{margin:.6rem 0 0;padding-left:1.3rem}
+.open li{margin-top:.4rem;font-size:.95rem;line-height:1.5}
+
+.foot{margin-top:4rem;padding-top:1.3rem;border-top:1px solid var(--line);
+  font-family:var(--sans);font-size:.8rem;color:var(--muted);display:flex;gap:.4rem 1.2rem;flex-wrap:wrap}
+</style>
+
+<div class="page">
+
+<p class="eyebrow"><b>Agnes</b><span>Access page</span><span>28 Aug 2026</span><span>companion to Library Rebuilt</span></p>
+<h1>Access Rebuilt</h1>
+<p class="stand">A group is an audience. What an admin hands it is a handful of named bundles, sectioned the way the Library sections them — and every row says, next to the control, the words the person on the other end will read.</p>
+
+<div class="asks">
+  <div class="ask-card">
+    <p class="ask-who">Zdeněk</p>
+    <p class="ask-q">“Určitě potřebuji nejdřív pomoc s definicí, implementaci může dělat někdo jiný.”</p>
+    <p class="ask-do">So this is the definition. <b>Fifteen flat resource types become three families</b> — the Library's two, plus the surfaces that were never library items at all.</p>
+  </div>
+  <div class="ask-card">
+    <p class="ask-who">TCRD-203</p>
+    <p class="ask-q">“Maintaining an access matrix doesn't scale for an admin.”</p>
+    <p class="ask-do">The matrix is O(groups × resources) and asks one level below the decision. <b>The bundle becomes the unit; the matrix survives as Advanced</b>, opened from a resource.</p>
+  </div>
+  <div class="ask-card">
+    <p class="ask-who">Tomáš · 27 Aug</p>
+    <p class="ask-q">What does a user see when the corporate brain knows something they aren't allowed to read?</p>
+    <p class="ask-do">Open. <b>TCRD-207 decides it once</b> for all nine surfaces. The sharpened version — a fact with two sources, one readable — is at the foot of this page.</p>
+  </div>
+</div>
+
+<h2>What it is today</h2>
+<div class="prose">
+<p>One flat tree, fifteen resource types deep, a row per resource. It grows with the instance rather than with the decision — and it presents a table row with the same weight as the package row that actually puts that table in someone's stack.</p>
+</div>
+
+<figure>
+  <div class="old">
+    <div class="old-hd">/admin/access → Delivery → What it can use</div>
+    <div class="old-b">
+      <p class="old-s">Tables</p>
+      <div class="old-r"><span>in.c-crm.opportunities</span><span class="tg">optional</span></div>
+      <div class="old-r"><span>in.c-crm.accounts</span><span class="tg">optional</span></div>
+      <div class="old-r"><span>in.c-finance.invoices</span><span class="tg">optional</span></div>
+      <div class="old-r"><span>in.c-finance.revenue_recognized</span><span class="tg">optional</span></div>
+      <p class="old-s">Data packages</p>
+      <div class="old-r"><span>Revenue Core</span><span class="tg">automatic</span></div>
+      <div class="old-r"><span>Customer 360</span><span class="tg">optional</span></div>
+      <p class="old-s">Semantic models</p>
+      <div class="old-r"><span>revenue-core / master token (semantic layer)</span><span class="tg">—</span></div>
+      <div class="old-f"></div>
+    </div>
+  </div>
+  <figcaption>Measured on <code>main</code>: 15 grantable types, tier rendered <b>Optional / Automatic</b> — words that appear nowhere the user can see. Per <code>CLAUDE.md</code>, a per-table grant no longer surfaces a table in an analyst's manifest, so those first four rows are a lever that isn't connected.</figcaption>
+</figure>
+
+<h2>The page</h2>
+
+<figure>
+<div class="scroll">
+<div class="app">
+  <div class="app-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>agnes</span><span>/admin/access</span></div>
+  <div class="app-grid">
+    <div class="rail">
+      <i>Library</i><i>Agents</i><i>Chats</i>
+      <span class="sp"></span>
+      <i>People</i><i class="on">Access</i><i>Tables</i><i>Sources</i>
+    </div>
+    <div class="main">
+      <div class="top">
+        <div>
+          <p class="ptitle">Access</p>
+          <p class="psub">6 groups · 41 people · <b>every grant here is a row someone reads in the Library</b></p>
+        </div>
+        <div class="ctrls">
+          <span class="inp">⌕ &nbsp;Search groups, bundles or people…</span>
+          <span class="bt">+ New group</span>
+          <span class="bt pri">+ Grant a bundle</span>
+        </div>
+      </div>
+
+      <div class="segs">
+        <span class="seg on">By group</span>
+        <span class="seg">By bundle</span>
+        <span class="seg">Everything</span>
+        <span class="hint">same rows — whichever question you arrived with</span>
+      </div>
+
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Delivery</b><span class="og">custom</span><span class="rc">reaches 14 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>8</b></span><span class="cnt">capabilities <b>3</b></span><span class="cnt">surfaces <b>2</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Finance</b><span class="og">synced · google</span><span class="rc">reaches 9 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>5</b></span><span class="cnt">capabilities <b>2</b></span><span class="cnt">surfaces <b>1</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Partners</b><span class="og">custom</span><span class="rc">reaches 6 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>2</b></span><span class="cnt">capabilities <b>1</b></span><span class="cnt">surfaces <b>1</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Leadership</b><span class="og">synced · google</span><span class="rc">reaches 5 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>4</b></span><span class="cnt">capabilities <b>1</b></span><span class="cnt">surfaces <b>0</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Everyone</b><span class="og">system · auto</span><span class="rc">reaches 41 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>3</b></span><span class="cnt">capabilities <b>2</b></span><span class="cnt">surfaces <b>0</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Admin</b><span class="og">system · god mode</span><span class="rc">reaches 3 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>—</b></span><span class="cnt">capabilities <b>—</b></span><span class="cnt">surfaces <b>—</b></span>
+            <span class="cnt">everything, always</span><span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<figcaption><b>How it opens: six lines.</b> Every one answers whether it needs you — origin, reach, and a count per family — so nothing here is a shutter over hidden content. Typing in the filter is the other way in; a deep link (<code>?group=delivery</code>) opens that one directly. Group names, member counts and the 142 legacy grants are illustrative. Package, memory, recipe, app, plugin, skill and agent-template rows are the same ones the Library redesign draws; the resource kinds are the fifteen registered in <code>app/resource_types.py</code>.</figcaption>
+</figure>
+
+<div class="notes">
+  <div class="nt"><span class="k">1</span><span><b>Collapsed, but never a shutter.</b> The Library redesign counts “nothing is collapsed on arrival” among its fixes, because five grey bars over hidden content is not a summary. The rule that keeps both pages honest: <b>a collapsed row must answer something.</b> These answer origin, reach, and a count per family — enough to skip a group without opening it.</span></div>
+  <div class="nt"><span class="k">2</span><span><b>The search is the filter.</b> One control, and typing is what expands a group — so there is no second “filter groups” box beside it, and no state where the two disagree about what you are looking at.</span></div>
+  <div class="nt"><span class="k">3</span><span><b>No second column.</b> Groups are sections of one full-width list, not a permanent pane you use for two seconds and then work around. The group you came for is open; the rest are one line each, carrying the three counts that say whether they need you at all.</span></div>
+  <div class="nt"><span class="k">4</span><span><b>Two families and a third block.</b> Knowledge and Capabilities come from the Library. Mapping the fifteen types onto them exposed two that fit neither: a chat and a Slack channel are places the group meets Agnes, not things it holds. They stop pretending to be library items.</span></div>
+  <div class="nt"><span class="k">5</span><span><b>Every row shows what the person reads.</b> The right-hand column is not decoration — it is where the vocabulary stops drifting, because the admin sets the tier while looking at the sentence it produces in someone else's Library.</span></div>
+  <div class="nt"><span class="k">6</span><span><b>Origin, not just presence.</b> An amber kind-tag means an owner shared it. Those rows are revoke-only and link to the item's detail page, which is where the Library redesign put sharing when it cut the column from the list.</span></div>
+  <div class="nt"><span class="k z">7</span><span><b>“Simulate a person” became a button.</b> It sits on the audience, worded as the question an admin actually has. It was the second lens behind a URL parameter; it is now the answer to “can Maria see this”, on every group header, expanded or not.</span></div>
+  <div class="nt"><span class="k u">8</span><span><b>Tables left the default view.</b> A table reaches a person by being in a package. <code>/admin/tables</code> → Manage access stops deep-linking a table row and answers which packages contain it, and who gets those.</span></div>
+</div>
+
+
+<h2>One group, opened</h2>
+<div class="prose">
+<p>Click a line, or arrive on a link from <code>/admin/tables</code> or a package's Share panel, and the group opens in place. The rest stay one line each — so the group above and below are still there to compare against, which is the thing the pane could never do.</p>
+</div>
+
+<figure>
+<div class="scroll">
+<div class="app">
+  <div class="app-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>agnes</span><span>/admin/access?group=delivery</span></div>
+  <div class="app-grid">
+    <div class="rail">
+      <i>Library</i><i>Agents</i><i>Chats</i>
+      <span class="sp"></span>
+      <i>People</i><i class="on">Access</i><i>Tables</i><i>Sources</i>
+    </div>
+    <div class="main">
+      <div class="gs open">
+        <div class="gs-hd">
+          <span class="car">⌄</span>
+          <span class="gs-nm"><b>Delivery</b><span class="og">custom</span><span class="rc">reaches 14 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>8</b></span><span class="cnt">capabilities <b>3</b></span><span class="cnt">surfaces <b>2</b></span>
+            <span class="bt">Rename</span><span class="bt pri">See it as a person</span>
+          </span>
+        </div>
+        <div class="gs-aud">
+          <span class="avs"><span class="av">MO</span><span class="av">JB</span><span class="av">ZS</span><span class="av">EK</span><span class="av">TF</span><span class="av more">+9</span></span>
+          <span class="src">11 added by an admin · 3 synced from Google · stored as delivery@example.com</span>
+          <span class="inp">Add someone, or check who's in…</span>
+        </div>
+        <div class="colhd">
+          <span>Kind</span><span>What the group gets</span><span>Admin control</span><span class="u">What the person reads</span>
+        </div>
+        <div class="fam">
+          <div class="fam-hd">
+            <span class="fn">Knowledge</span>
+            <span class="fd">read, query or open — and what their agents may cite</span>
+            <span class="fc">9 granted</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">package</span>
+            <span class="nm">Revenue Core<span>Invoices, subscriptions and recognized revenue, reconciled to finance.</span></span>
+            <span class="ctl"><span class="sw"><b class="on">Required</b><b>Available</b></span></span>
+            <span class="usr"><b>In the Library</b>Required by your admin</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">package</span>
+            <span class="nm">Customer 360<span>One row per account joining CRM, product usage, support history and billing.</span></span>
+            <span class="ctl"><span class="sw"><b>Required</b><b class="on">Available</b></span></span>
+            <span class="usr"><b>In the Library</b>Keep a local copy</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">memory</span>
+            <span class="nm">Pricing &amp; packaging decisions<span>Curated decisions and their rationale, maintained by the pricing group.</span></span>
+            <span class="ctl"><span class="sw"><b>Required</b><b class="on">Available</b></span></span>
+            <span class="usr"><b>In the Library</b>Keep a local copy</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">semantic</span>
+            <span class="nm">Revenue &amp; engagements<span>Datasets, fields, relationships and metrics behind every revenue answer.</span></span>
+            <span class="ctl"><span class="rev">Granted · revoke</span></span>
+            <span class="usr q">nothing — it shapes the answer</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">recipe</span>
+            <span class="nm">Top accounts by growth<span>Ranks accounts by QoQ revenue growth, excluding under two quarters of history.</span></span>
+            <span class="ctl"><span class="rev">Granted · revoke</span></span>
+            <span class="usr"><b>In the Library</b>Ask Agnes</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">corpus</span>
+            <span class="nm">SharePoint · /Engagements<span>318 documents. Grant-scoped search: if they can see it, their agent can cite it.</span></span>
+            <span class="ctl"><span class="rev">Granted · revoke</span></span>
+            <span class="usr q">no control — it's simply citable</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd own">app</span>
+            <span class="nm">Churn explorer <em>shared by Maxmilián O.</em><span>Shares its rendered output — the app runs under its own credentials.</span></span>
+            <span class="ctl"><span class="rev">Revoke only</span></span>
+            <span class="usr"><b>In the Library</b>Open</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd own">collection</span>
+            <span class="nm">Myers close-out <em>shared by Jordan B.</em><span>Change it where it lives — /library/d/cs-myers-closeout.</span></span>
+            <span class="ctl"><span class="rev">Revoke only</span></span>
+            <span class="usr q">no control — it's simply citable</span>
+          </div>
+        </div>
+
+        <div class="fam">
+          <div class="fam-hd">
+            <span class="fn">Capabilities</span>
+            <span class="fd">the only things that change what their agents can do</span>
+            <span class="fc">4 granted</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">plugin</span>
+            <span class="nm">agnes-analyst<span>Analyst rails: catalog, schema, query path, snapshots, metric lookups.</span></span>
+            <span class="ctl"><span class="sw"><b class="on">Required</b><b>Available</b></span></span>
+            <span class="usr"><b>In the Library</b>Installed · required</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">skill</span>
+            <span class="nm">cohort-analysis<span>Retention and revenue cohort grids from any table with a signup and an event date.</span></span>
+            <span class="ctl"><span class="sw"><b>Required</b><b class="on">Available</b></span></span>
+            <span class="usr"><b>In the Library</b>Install</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd own">agent</span>
+            <span class="nm">revenue-analyst <em>shared by Zdeněk S.</em><span>A template others start their own agent from — scoped to the revenue packages.</span></span>
+            <span class="ctl"><span class="rev">Revoke only</span></span>
+            <span class="usr"><b>In the Library</b>Use as template</span>
+          </div>
+        </div>
+
+        <div class="fam">
+          <div class="fam-hd">
+            <span class="fn">Surfaces</span>
+            <span class="fd">where the group meets Agnes — not things it holds</span>
+            <span class="fc">2 granted</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">slack</span>
+            <span class="nm">#cuesta-delivery<span>Agnes answers in this channel for members of this group.</span></span>
+            <span class="ctl"><span class="rev">Granted · revoke</span></span>
+            <span class="usr q">not a Library row</span>
+          </div>
+
+          <div class="gr">
+            <span class="kd">chat</span>
+            <span class="nm">Myers close-out review<span>One shared conversation, readable by the group.</span></span>
+            <span class="ctl"><span class="rev">Granted · revoke</span></span>
+            <span class="usr q">not a Library row</span>
+          </div>
+        </div>
+
+        <div class="adv">
+          <span><b>142 table grants</b>, 3 corpus files and 1 recipe were granted one by one, before packages.</span>
+          <span>They still work. Nothing was migrated.</span>
+          <span class="lk">Open Advanced →</span>
+        </div>
+      </div>
+
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Finance</b><span class="og">synced · google</span><span class="rc">reaches 9 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>5</b></span><span class="cnt">capabilities <b>2</b></span><span class="cnt">surfaces <b>1</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">›</span>
+          <span class="gs-nm"><b>Partners</b><span class="og">custom</span><span class="rc">reaches 6 people</span></span>
+          <span class="rt">
+            <span class="cnt">knowledge <b>2</b></span><span class="cnt">capabilities <b>1</b></span><span class="cnt">surfaces <b>1</b></span>
+            <span class="bt">See it as a person</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<figcaption>The neighbours stay. Amber kind-tags are the rows an owner shared, not an admin — revoke-only here, edited on the item's own page. The right-hand column is the sentence this control produces in that person's Library.</figcaption>
+</figure>
+
+<h2>Typing is how you open things</h2>
+<div class="prose">
+<p>One control, not two. The search in the header <i>is</i> the filter — and it is what expands groups, so the collapsed default and the search are one mechanism rather than two competing ones. A group opens because it matched, showing only the rows that matched.</p>
+<p>That is also the answer at sixty synced groups, where scrolling stops being a way in: you type, and the three or four that matter open themselves.</p>
+</div>
+
+<figure>
+<div class="crops">
+  <div class="crop">
+    <div class="crop-hd">
+      <span class="inp">⌕ &nbsp;revenue</span>
+      <span class="hit">3 groups · 5 rows</span>
+    </div>
+    <div class="crop-b">
+      <div class="gs open">
+        <div class="gs-hd">
+          <span class="car">⌄</span>
+          <span class="gs-nm"><b>Delivery</b><span class="rc">2 of 13 rows</span></span>
+          <span class="rt"><span class="cnt">knowledge <b>2</b></span></span>
+        </div>
+        <div class="mini"><span class="kd">package</span><span class="nm3"><mark>Revenue</mark> Core</span><span class="rd">Required by your admin</span></div>
+        <div class="mini"><span class="kd">semantic</span><span class="nm3"><mark>Revenue</mark> &amp; engagements</span><span class="rd">shapes the answer</span></div>
+      </div>
+      <div class="gs open">
+        <div class="gs-hd">
+          <span class="car">⌄</span>
+          <span class="gs-nm"><b>Finance</b><span class="rc">2 of 8 rows</span></span>
+          <span class="rt"><span class="cnt">knowledge <b>2</b></span></span>
+        </div>
+        <div class="mini"><span class="kd">package</span><span class="nm3"><mark>Revenue</mark> Core</span><span class="rd">Required by your admin</span></div>
+        <div class="mini"><span class="kd own">agent</span><span class="nm3"><mark>revenue</mark>-analyst</span><span class="rd">Use as template</span></div>
+      </div>
+      <div class="gs">
+        <div class="gs-hd">
+          <span class="car">⌄</span>
+          <span class="gs-nm"><b>Leadership</b><span class="rc">1 of 5 rows</span></span>
+          <span class="rt"><span class="cnt">knowledge <b>1</b></span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="crop">
+    <div class="crop-hd">
+      <span class="inp">⌕ &nbsp;forecasting</span>
+      <span class="hit">0 rows</span>
+    </div>
+    <div class="crop-b">
+      <div class="zero">
+        <p class="z1">Nothing here is called “forecasting”.</p>
+        <p class="z2">Six groups searched, and every bundle in them. This is a miss, not a permission problem — an admin sees every grant in the instance.</p>
+        <p class="z3"><span class="bt">Clear</span><span class="bt">Search the Library instead</span><span class="bt pri">+ Grant a bundle</span></p>
+      </div>
+    </div>
+  </div>
+</div>
+<figcaption>Left: matching groups open themselves, showing only matching rows and saying how many they hid. Right: the miss says it is a miss. <b>DES-113</b> found an empty result presented as an access problem — routed through <code>error.html</code> — and this is the surface where an admin, of all people, must never be told they lack access to their own instance.</figcaption>
+</figure>
+
+<h2>Why not two panes</h2>
+<div class="prose">
+<p>The old layout had one failure underneath the cramping: <b>it answered one question out of three.</b> Master-detail on groups means “who gets Revenue Core?” and “why can Maria see this?” both start with a hunt for the right group to click — and comparing two groups costs you your place. It also spent a fifth of the width permanently on navigation used for two seconds, then squeezed the dense part into what was left.</p>
+<p>So the switch does the navigating. It is the same device the Library uses for <i>By subject / By type / Everything</i>, and it means the page can be entered from any of the three directions an admin actually arrives from. Here is the second one.</p>
+</div>
+
+<figure>
+<div class="scroll">
+<div class="app">
+  <div class="app-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>agnes</span><span>/admin/access?by=bundle</span></div>
+  <div class="app-grid">
+    <div class="rail">
+      <i>Library</i><i>Agents</i><i>Chats</i>
+      <span class="sp"></span>
+      <i>People</i><i class="on">Access</i><i>Tables</i><i>Sources</i>
+    </div>
+    <div class="main">
+      <div class="top">
+        <div>
+          <p class="ptitle">Access</p>
+          <p class="psub">19 bundles · <b>who gets each one, and what they read</b></p>
+        </div>
+        <div class="ctrls">
+          <span class="inp">⌕ &nbsp;Search groups, bundles or people…</span>
+          <span class="bt">+ New group</span>
+          <span class="bt pri">+ Grant a bundle</span>
+        </div>
+      </div>
+
+      <div class="segs">
+        <span class="seg">By group</span>
+        <span class="seg on">By bundle</span>
+        <span class="seg">Everything</span>
+        <span class="hint">the question the package Share panel exists to answer — now answered here too</span>
+      </div>
+
+      <div class="colhd">
+        <span>Kind</span><span>Bundle, and who gets it</span><span>Admin control</span><span class="u">What the person reads</span>
+      </div>
+
+      <div class="bb">
+        <div class="bb-hd">
+          <span class="kd">package</span>
+          <span class="nm2">Revenue Core<span>Invoices, subscriptions and recognized revenue, reconciled to finance.</span></span>
+          <span class="cnt">3 groups · <b>28 people</b></span>
+        </div>
+        <div class="bbr">
+          <span class="sp2"></span>
+          <span class="gnm">Delivery<span>14 people</span></span>
+          <span class="ctl"><span class="sw"><b class="on">Required</b><b>Available</b></span></span>
+          <span class="usr">Required by your admin</span>
+        </div>
+        <div class="bbr">
+          <span class="sp2"></span>
+          <span class="gnm">Finance<span>9 people · synced</span></span>
+          <span class="ctl"><span class="sw"><b class="on">Required</b><b>Available</b></span></span>
+          <span class="usr">Required by your admin</span>
+        </div>
+        <div class="bbr">
+          <span class="sp2"></span>
+          <span class="gnm">Leadership<span>5 people · synced</span></span>
+          <span class="ctl"><span class="sw"><b>Required</b><b class="on">Available</b></span></span>
+          <span class="usr">Keep a local copy</span>
+        </div>
+      </div>
+
+      <div class="bb">
+        <div class="bb-hd">
+          <span class="kd">package</span>
+          <span class="nm2">Customer 360<span>One row per account joining CRM, product usage, support history and billing.</span></span>
+          <span class="cnt">1 group · <b>14 people</b></span>
+        </div>
+        <div class="bbr">
+          <span class="sp2"></span>
+          <span class="gnm">Delivery<span>14 people</span></span>
+          <span class="ctl"><span class="sw"><b>Required</b><b class="on">Available</b></span></span>
+          <span class="usr">Keep a local copy</span>
+        </div>
+      </div>
+
+      <div class="bb">
+        <div class="bb-hd">
+          <span class="kd own">app</span>
+          <span class="nm2">Churn explorer<span>Shared by Maxmilián O. — shares its rendered output, whoever views it.</span></span>
+          <span class="cnt">2 groups · <b>20 people</b></span>
+        </div>
+        <div class="bbr">
+          <span class="sp2"></span>
+          <span class="gnm">Delivery<span>14 people</span></span>
+          <span class="ctl"><span class="rev">Revoke only</span></span>
+          <span class="usr">Open</span>
+        </div>
+        <div class="bbr">
+          <span class="sp2"></span>
+          <span class="gnm">Partners<span>6 people</span></span>
+          <span class="ctl"><span class="rev">Revoke only</span></span>
+          <span class="usr">Open</span>
+        </div>
+      </div>
+
+      <div class="adv">
+        <span><b>Granted to nobody:</b> 2 packages, 1 recipe, 4 skills.</span>
+        <span>Authored, then never handed to anyone.</span>
+        <span class="lk">Show them →</span>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<figcaption>The same rows, read the other way. Two things only this direction shows: an app shared to <b>Partners as well as Delivery</b> — the comparison the old layout made impossible — and the bundles <b>granted to nobody</b>, which in the group view simply never appear. That second line is TCRD-221, now visible as a side effect of the grouping rather than a feature.</figcaption>
+</figure>
+
+<div class="expl">
+  <h3>Why the tier is not an access control</h3>
+  <p><code>features.stack_auto_membership</code> has been default-on since Wave 0 — the <code>redesign</code> preset is the only preset, and it implies the flag (<code>app/instance_config.py:632</code>). So the grant <em>is</em> the membership: everyone in the group can query the package the moment it is granted, and there is nothing for the analyst to add.</p>
+  <p>What the tier decides is narrower. <b>Required</b> — permanent, always downloaded. <b>Available</b> — the person gets exactly one choice, keep a local copy or don't. Server-side query works either way; a local copy is speed, not access.</p>
+  <p class="kicker">Which is why the words on both ends have to be the same words. <code>docs/RBAC.md</code> still calls auto-membership opt-in — stale, and worth one line, because it is the document this definition rests on.</p>
+</div>
+
+<h2>One control, three names</h2>
+<div class="prose">
+<p>Nothing in the repo catches this. The design-system contract tests police colour and tokens; no test reads language. Sixteen of the twenty-six open <code>DR(agnes)</code> reviews carry a naming collision, and this is the one that decides whether a person can stop worrying about a resource.</p>
+</div>
+
+<table class="vtab">
+  <thead><tr><th>Where</th><th>Says today</th><th>Should say</th><th>Because</th></tr></thead>
+  <tbody>
+    <tr><td>Admin UI</td><td class="now">Automatic</td><td class="new">Required</td><td>“Automatic” names neither the permanence nor the download, and matches nothing the person sees</td></tr>
+    <tr><td>Admin UI</td><td class="now">Optional</td><td class="new">Available</td><td>the API's own word, and the state is not optional — the copy is</td></tr>
+    <tr><td>Library, required row</td><td class="new">Required by your admin</td><td class="new">unchanged</td><td>already right: it is a state, not a disabled button</td></tr>
+    <tr><td>Library, available row</td><td class="new">Keep a local copy</td><td class="new">unchanged</td><td>already right: the one choice the person actually has</td></tr>
+    <tr><td>API, docs, CLI</td><td><code>available</code> / <code>required</code></td><td class="new">unchanged</td><td>the wire words stay; only the labels move</td></tr>
+    <tr><td>Tier on other kinds</td><td class="now">shown everywhere</td><td class="new">not rendered</td><td>it applies to packages, memory and plugins only</td></tr>
+  </tbody>
+</table>
+
+<h2>Facts, not just documents</h2>
+<div class="prose">
+<p>The Library redesign leaves one question open — whether nodes and edges land in Agnes or stay behind the MCP server — and it reaches this page either way, because the same redesign promises every fact traces to a verbatim quote in a source document.</p>
+<p>The rule that follows from grant-scoped search: <b>a fact is visible if you can read at least one document that evidences it.</b> Nothing new to grant; the graph inherits document grants. Which produces the case worth deciding with the picture in front of you.</p>
+</div>
+
+<figure>
+<svg class="map" viewBox="0 0 620 200" role="img" aria-label="A fact evidenced by two documents, one readable and one not">
+  <rect class="box" x="8" y="18" width="188" height="52" rx="5"/>
+  <text class="nm" x="20" y="40">Myers close-out</text>
+  <text class="ct" x="20" y="56">granted · you may read it</text>
+
+  <rect class="box-x" x="8" y="120" width="188" height="52" rx="5"/>
+  <text class="nm" x="20" y="142" opacity=".55">Kohlberg fee memo</text>
+  <text class="xl" x="20" y="158">not granted to you</text>
+
+  <path class="ln-d" d="M196 44 C 250 44, 250 84, 300 90"/>
+  <text class="evl" x="212" y="72">evidenced_by</text>
+  <path class="ln" d="M196 146 C 250 146, 250 106, 300 100" opacity=".4" stroke-dasharray="2 4"/>
+
+  <rect class="box-k" x="300" y="70" width="196" height="52" rx="5"/>
+  <text class="nm" x="314" y="92">Myers · fee $45,000</text>
+  <text class="ct" x="314" y="108">1 of 2 citations visible</text>
+
+  <text class="ct" x="512" y="88">you see the fact,</text>
+  <text class="ct" x="512" y="102">and one quote for it</text>
+</svg>
+<figcaption>A fact with two sources, one you may read. Showing it is right — the evidence you can see is real evidence — but the visible citation list is then not the whole story, and two colleagues comparing notes will find that out. <b>TCRD-207's call, not this page's</b>; TCRD-196 owns the graph's access model, and “See it as a person” is where an admin would check it.</figcaption>
+</figure>
+
+<h2>Build order, from Monday</h2>
+<div class="prose">
+<p>Integration merges Monday 31 Aug; the demo is Wednesday 9 Sep. A → B → E is the only chain: the panes go, then families have somewhere to sit, then rows can move out of the default view. C, D, F and G are independent of everything.</p>
+</div>
+
+<div class="build">
+  <div class="bcard"><span class="sl">A</span><h4>One list, three groupings</h4><p>The two panes become full-width group sections, collapsed on arrival, plus <code>?by=</code> and <code>?group=</code>. Biggest slice, and the one the rest hangs off — a family header has nowhere to sit until the panes are gone.</p></div>
+  <div class="bcard"><span class="sl">B</span><h4>A family per resource type</h4><p>One field on <code>ResourceTypeSpec</code>, fifteen values, grouped section headers. Its docstring already says adding a type should be the single place you edit.<span class="dep">after A</span></p></div>
+  <div class="bcard"><span class="sl">C</span><h4>The tier says what it does</h4><p>Required / Available in the admin UI, the person's sentence beside it, and the control removed from the kinds it never applied to.</p></div>
+  <div class="bcard"><span class="sl">D</span><h4>Origin on every row</h4><p>Owner-shared rows become revoke-only and link to <code>/library/d/&lt;id&gt;</code>. Reads <code>library_sharing.py</code>, which already owns that writer.</p></div>
+  <div class="bcard"><span class="sl">E</span><h4>The matrix becomes Advanced</h4><p>Default view shows bundles; per-resource rows move behind one entry point. Nothing migrated, nothing revoked.<span class="dep">after B</span></p></div>
+  <div class="bcard"><span class="sl">F</span><h4>Two entry points corrected</h4><p>“See it as a person” onto the audience; <code>/admin/tables</code> → Manage access answers the package question instead of pre-filtering a table row.</p></div>
+  <div class="bcard"><span class="sl">G</span><h4>A guard, so it can’t regrow</h4><p>One test pinning the tier vocabulary across admin, Library and API — plus the stale opt-in line in <code>docs/RBAC.md</code>.</p></div>
+</div>
+
+<div class="open">
+  <h3>Still open, and named on purpose</h3>
+  <ol>
+    <li><b>Acknowledge or stay silent</b> — whether “exists but you can't see it” is ever said. TCRD-207, across all nine surfaces, with the two-source case above as its sharpest form.</li>
+    <li><b>Where the graph lives</b> — in Agnes, or behind the MCP server. The Library redesign's own step 2. Read-only through MCP gets the type map and the detail page; local is what subject grouping and filtering want.</li>
+    <li><b>IdP propagation</b> — Google and Entra groups flowing into Agnes groups, so access management is something the customer's admin already did elsewhere. A real dependency, not this page.</li>
+  </ol>
+</div>
+
+<p class="foot"><span>Agnes · Access page</span><span>TCRD-203</span><span>Companion to Library Rebuilt</span><span>28 Aug 2026</span></p>
+
+</div>

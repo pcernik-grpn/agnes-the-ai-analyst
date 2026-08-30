@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from app.auth.access import require_admin
 from app.datasource_secrets import DATA_SOURCE_SECRET_NAMES
 from app.secrets_vault import VaultKeyNotConfiguredError
+from src.audit_helpers import log_safe
 from src.repositories import audit_repo, system_secrets_repo
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,8 @@ async def list_datasource_secrets(user: dict = Depends(require_admin)):
         else:
             source, has_value = "unset", False
         out.append({"name": name, "source": source, "has_value": has_value})
+    # NEVER a value — this endpoint only ever reports presence/source.
+    log_safe(user_id=user.get("id"), action="datasource.secret.read", resource="datasource_secrets")
     return {"secrets": out}
 
 

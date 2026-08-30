@@ -226,7 +226,10 @@ writes that field, there is no drift to reconcile and no need to cross-check
 - **A cut PR went stale (merge conflict against a newer `main`)?** The queue
   wasn't fully flushed before something else merged past it — close the
   stale cut PR and re-dispatch `daily-cut.yml` rather than resolving the
-  conflict by hand (see § The train-driver role above).
+  conflict by hand (see § The train-driver role above). Closing the PR
+  leaves its `release-cut/vX.Y.Z` branch behind on the remote; there is
+  nothing to clean up first — the branch is workflow-owned, and the
+  re-dispatch force-pushes over it when it computes the same version.
 - **Wrong version number tagged?** `git tag -d vX.Y.Z && git push --delete
   origin vX.Y.Z` then re-tag against the right SHA. Update the GitHub Release if
   you already created it.

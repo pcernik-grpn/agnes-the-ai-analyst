@@ -8,6 +8,17 @@ behavior (that's covered by tests/test_api_knowledge_digests.py).
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def digests_page_on(monkeypatch):
+    """The PAGE is hidden by default since the admin cleanup (the API, the CLI
+    and the scheduler job are untouched — see get_knowledge_digests_ui_enabled).
+    These tests are the page's own auth gating and shell markers, so they
+    expose it."""
+    monkeypatch.setenv("AGNES_KNOWLEDGE_DIGESTS_ENABLED", "1")
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}

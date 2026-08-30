@@ -282,7 +282,7 @@ class TestBranding:
     def test_brand_set_but_default_title_is_error(self, seeded_app, monkeypatch):
         import app.web.router as web_router
 
-        monkeypatch.setenv("AGNES_INSTANCE_BRAND", "Cuesta IQ")
+        monkeypatch.setenv("AGNES_INSTANCE_BRAND", "Acme IQ")
         monkeypatch.setattr(web_router, "get_instance_name", lambda: "AI Harness")
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         check = _check(report, "branding")
@@ -292,8 +292,8 @@ class TestBranding:
     def test_brand_set_with_named_instance_is_ok(self, seeded_app, monkeypatch):
         import app.web.router as web_router
 
-        monkeypatch.setenv("AGNES_INSTANCE_BRAND", "Cuesta IQ")
-        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Cuesta")
+        monkeypatch.setenv("AGNES_INSTANCE_BRAND", "Acme IQ")
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Acme")
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         check = _check(report, "branding")
         assert check["status"] == "ok"
@@ -307,7 +307,7 @@ class TestProbeProviders:
 
         rows = {r["name"]: r for r in probe_providers()}
         assert rows["password"]["available"] is True
-        assert set(rows) == {"google", "email", "password", "keboola", "microsoft"}
+        assert set(rows) == {"google", "email", "password", "keboola", "microsoft", "sso"}
 
     def test_rows_carry_allowed_and_available(self):
         from app.auth.provider_registry import probe_providers

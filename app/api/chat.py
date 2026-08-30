@@ -9,7 +9,7 @@ import secrets
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import exc as sa_exc
 
 from app.auth.access import require_resource_access
@@ -30,6 +30,7 @@ from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.resource_types import ResourceType
+from src.audit_helpers import log_safe
 from src.repositories import agents_repo, user_journey_repo
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,14 @@ def _consume_ticket(ticket: str) -> tuple[str, str] | None:
         return None
 
 
+class PreviewSkill(BaseModel):
+    """A draft skill to make invokable for one session. Both fields are
+    untrusted; see the note on CreateSessionBody.preview_skill."""
+
+    name: str = Field(default="", max_length=120)
+    body: str = Field(default="", max_length=40_000)
+
+
 class CreateSessionBody(BaseModel):
     surface: str = "web"
     title: str | None = None
@@ -106,6 +115,22 @@ class CreateSessionBody(BaseModel):
     #: ``POST /api/v1/agents/{slug}/sessions`` uses); web chat was simply never
     #: wired to it, which is why agents could be configured but not used.
     agent_slug: str | None = None
+    #: A draft SKILL to make invokable in this session only — what backs the
+    #: /skills builder's Preview. The skills catalog reports what is on disk
+    #: in the session's project scope, so previewing a skill that exists
+    #: nowhere but the author's browser means writing it into that scope.
+    #:
+    #: Untrusted on both fields. The name becomes a DIRECTORY name and is
+    #: replaced rather than sanitized (WorkdirManager.safe_skill_dirname); the
+    #: body is capped here and again at the write. The write is contained to
+    #: the session's own `.claude`, which is forced to a copy so a draft can
+    #: never reach the author's shared workspace — see
+    #: tests/test_preview_skill_containment.py.
+    #:
+    #: Nothing is persisted: it lives in memory for the life of the session,
+    #: because a preview that outlived the tab would be a copy of unfinished
+    #: work nobody asked us to keep.
+    preview_skill: "PreviewSkill | None" = None
 
 
 def _get_manager(request: Request) -> ChatManager:
@@ -193,10 +218,17 @@ async def create_session(
             title=body.title,
             profile=body.profile,
             agent_id=agent_id,
+            preview_skill=body.preview_skill.model_dump() if body.preview_skill else None,
         )
     except ConcurrencyCapHit as exc:
         raise HTTPException(status_code=429, detail={"kind": "concurrency_cap", "hint": str(exc)})
     ticket = _issue_ticket(s.id, user["email"])
+    log_safe(
+        user_id=user["id"],
+        action="chat.session.create",
+        resource=f"session:{s.id}",
+        params={"surface": body.surface},
+    )
     return {
         "id": s.id,
         "surface": s.surface.value,
@@ -384,8 +416,23 @@ async def set_session_archived(
     if body.archived:
         await _kill_quietly(request, chat_id, reason="user_archive")
         repo.archive_session(chat_id)
+        # F4 (audit-full-coverage plan, Task 8): direct safety net alongside
+        # the kill()-path finalize hook above — best-effort, never blocks
+        # the archive response.
+        try:
+            from app.chat.session_export import export_chat_session_jsonl
+
+            export_chat_session_jsonl(chat_id)
+        except Exception:
+            logger.exception("chat session export failed on archive for %s", chat_id)
     else:
         repo.restore_session(chat_id)
+    log_safe(
+        user_id=user["id"],
+        action="chat.session.archive",
+        resource=f"session:{chat_id}",
+        params={"archived": body.archived},
+    )
     return {"id": chat_id, "archived": body.archived}
 
 
@@ -413,6 +460,7 @@ async def delete_session_permanently(
         raise HTTPException(404)
     await _kill_quietly(request, chat_id, reason="user_delete")
     repo.hard_delete_session(chat_id)
+    log_safe(user_id=user["id"], action="chat.session.delete", resource=f"session:{chat_id}")
 
 
 def _chat_config_for_delivery(request: Request):
@@ -536,6 +584,7 @@ async def reissue_ticket(
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
     ticket = _issue_ticket(chat_id, user["email"])
+    log_safe(user_id=user["id"], action="chat.session.ticket", resource=f"session:{chat_id}")
     return {
         "id": chat_id,
         "ws_ticket": ticket,
@@ -607,6 +656,20 @@ async def archive_session(
     except Exception:
         logger.exception("kill on archive failed for %s", chat_id)
     repo.archive_session(chat_id)
+    # F4 (audit-full-coverage plan, Task 8): direct safety net alongside the
+    # kill()-path finalize hook above — best-effort, never blocks archive.
+    try:
+        from app.chat.session_export import export_chat_session_jsonl
+
+        export_chat_session_jsonl(chat_id)
+    except Exception:
+        logger.exception("chat session export failed on archive for %s", chat_id)
+    log_safe(
+        user_id=user["id"],
+        action="chat.session.archive",
+        resource=f"session:{chat_id}",
+        params={"archived": True},
+    )
 
 
 async def _flush_gap_replay(ws: WebSocket, gate: GapReplayGate, mgr: ChatManager, chat_id: str, last_seq: int) -> None:

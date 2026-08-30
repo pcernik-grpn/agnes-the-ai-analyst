@@ -378,6 +378,67 @@ def test_list_sessions_for_user_self_filters_on_username_only(usage_repo):
     }
 
 
+def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_repo):
+    """TCRD-222 widened `get_session_summary`'s projection on both repos, but
+    each backend spells its own column tuple AND its own SQL string. A test
+    that only greps `_SESSION_COLS` for the names passes while a query that
+    forgot to SELECT them returns short — and the behavioural test that came
+    with that change runs on DuckDB only. This drives both engines through
+    the same assertion, which is the point of this file.
+    """
+    repo, _, _ = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_summary(
+        repo,
+        session_file="tk/s1.jsonl",
+        username="tok",
+        started_at=now,
+        input_tokens=100,
+        output_tokens=200,
+        cache_read_tokens=300,
+        cache_creation_tokens=400,
+    )
+
+    row = repo.get_session_summary("tk/s1.jsonl")
+    assert row is not None
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 200
+    assert row["cache_read_tokens"] == 300
+    assert row["cache_creation_tokens"] == 400
+
+
+def test_sessions_listing_carries_the_token_counters_on_both_backends(usage_repo):
+    """Same seam, the other widened projection: the admin session LIST reads
+    `_SESSION_COLS`, so a backend that lists the column but never selects it
+    would render an empty token cell rather than fail."""
+    repo, _, _ = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_summary(
+        repo,
+        session_file="tk/s2.jsonl",
+        username="tok2",
+        started_at=now,
+        input_tokens=7,
+        output_tokens=11,
+        cache_read_tokens=13,
+        cache_creation_tokens=17,
+    )
+
+    rows = repo.sessions_list(
+        {"since": now - timedelta(days=1), "username": "tok2"},
+        sort_col="started_at",
+        direction="desc",
+        limit=10,
+        offset=0,
+    )
+    assert rows, "seeded session must be listed"
+    row = next(r for r in rows if r["session_file"] == "tk/s2.jsonl")
+    assert row["input_tokens"] == 7
+    assert row["output_tokens"] == 11
+    assert row["cache_read_tokens"] == 13
+    assert row["cache_creation_tokens"] == 17
+
+
 def test_tokens_totals_and_by_model(usage_repo):
     repo, _, _ = usage_repo
     now = datetime.now(timezone.utc)

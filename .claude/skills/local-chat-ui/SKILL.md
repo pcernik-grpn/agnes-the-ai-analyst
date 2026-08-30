@@ -18,6 +18,10 @@ LOCAL_DEV_MODE=1 TESTING=1 AGNES_CHAT_ENABLED=true .venv/bin/uvicorn app.main:ap
 - `TESTING=1` bypasses the `JWT_SECRET_KEY` and `ANTHROPIC_API_KEY` startup checks (and the chat provider-backing boot gates).
 - `AGNES_CHAT_ENABLED=true` enables chat; without it the rail panel is never rendered.
 - No `instance.yaml` is required; the app falls back to built-in defaults.
+- The debug toolbar is **opt-in via `DEBUG=1`** and deliberately not implied by
+  `LOCAL_DEV_MODE`. Leave it off for UI work: it instruments every request, and
+  on a heavy page like `/library` that turns a sub-second render into minutes
+  while `/api/version` stays instant (TCRD-247).
 
 This server has **no working turn engine**: with no LLM credentials and no
 provider backing a real message cannot be answered, so it is only good for

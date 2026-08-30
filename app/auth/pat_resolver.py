@@ -44,6 +44,7 @@ ResolutionReason = Literal[
     "agent_pat_agent_deleted",
     "pat_scope_forbidden",
     "pat_parent_revoked",
+    "session_revoked",
 ]
 
 # Path prefixes an agent PAT (typ="agent_pat") is allowed to authenticate
@@ -119,6 +120,93 @@ DATA_APP_GIT_SCOPE_PREFIX = "data-app-git:"
 # never authorize viewing a different one).
 DATA_APP_PREVIEW_SCOPE_PREFIX = "data-app-preview:"
 
+# Scope prefix minted by `app.api.data_apps._mint_service_token` for the
+# RUNTIME credential a hosted app calls the Agnes API with (`AGNES_TOKEN`).
+#
+# Unlike its two siblings above, this credential legitimately needs MANY
+# endpoints — it is a data client, "exactly like the CLI and MCP surfaces"
+# (spec `2026-07-21-data-apps-design.md`) — so a per-surface boolean does not
+# fit. It is gated the way agent PATs are instead: a fail-closed path
+# allowlist — `_DATA_APP_ALLOWED_EXACT` + `_DATA_APP_ALLOWED_SUBTREES` below,
+# applied by `_data_app_path_allowed`.
+#
+# Note the prefixes do not overlap: `"data-app-git:x".startswith("data-app:")`
+# is False (`-` vs `:` at index 8), so a clone credential still falls to its
+# own gate above rather than being reclassified as a service token. That is
+# load-bearing and pinned by a test.
+DATA_APP_SERVICE_SCOPE_PREFIX = "data-app:"
+
+# The API surface a hosted data app may reach.
+#
+# Split into exact paths and subtrees ON PURPOSE. One entry per router would
+# be shorter, but it admits every route that router will ever grow: an
+# earlier draft of this gate listed a bare `/api/query` + `/api/semantic-
+# models` and thereby handed apps `POST /api/query/hybrid` (the admin-only
+# BigQuery+local join) and `POST /api/semantic-models/apply` (create-or-
+# replace of a semantic model by slug, when the owner is an Admin) for free.
+# The allowlist matches paths, not handlers, so it cannot tell a read from a
+# write on its own — the narrowness has to be written down here, and
+# `tests/test_data_app_service_scope.py::test_the_admitted_route_set_is_pinned`
+# walks the real route table so a newly-added route under one of these can
+# never be admitted silently.
+#
+# Deliberately absent: `/api/admin/*`; `POST /cli/auth/rescope-surface`
+# (admin-gated but PAT-requiring, and it mints a fresh 90-day `surface='all'`
+# PAT — the one real credential-laundering path this scope was open to,
+# since the service token itself is minted WITHOUT expiry); and the
+# `require_session_token` minting routes (`/auth/tokens`,
+# `/api/user/cowork-bundle`, `/api/mcp-connect/token`), which already refuse
+# any PAT-typed credential regardless of scope. Those last three are covered
+# here as defence in depth, not because this gate is what closes them.
+
+# Exact paths — no children admitted.
+_DATA_APP_ALLOWED_EXACT = frozenset(
+    {
+        "/api/query",  # SQL; NOT /api/query/hybrid
+        "/api/catalog/tables",
+        # Semantic layer, read-only members only. Never `/apply`, and the
+        # `{slug}.yaml` document download is left out until an app needs it —
+        # a subtree entry here would re-admit `/apply`.
+        "/api/semantic-models/context",
+        "/api/semantic-models/schema",
+        "/api/semantic-models/search",
+        "/api/semantic-models/validate-query",
+        # v2 — what the `agnes` CLI actually calls. The spec sanctions
+        # installing the CLI inside an app, and CLAUDE.md's discovery
+        # protocol (`agnes catalog` / `schema` / `describe` / `snapshot
+        # create`) is backed entirely by `/api/v2/*`. NOT
+        # `/api/v2/metadata-cache/refresh` (admin) or `/api/v2/marketplace/*`.
+        "/api/v2/catalog",
+        "/api/v2/scan",
+        "/api/v2/scan/estimate",
+        "/api/v2/metadata-cache/status",
+    }
+)
+
+# Subtrees — the entry itself and anything below it. Used only where the
+# route carries a path parameter, so an exact list is impossible.
+_DATA_APP_ALLOWED_SUBTREES = (
+    "/api/data",  # /{table_id}/download, /{table_id}/check-access
+    "/api/catalog/profile",  # /{table_name}, /{table_name}/refresh
+    "/api/catalog/metrics",  # /{metric_path:path}
+    "/api/metrics",  # bare + /{metric_id:path}
+    "/api/glossary",  # bare + /search + /{glossary_id:path}
+    "/api/v2/schema",  # /{table_id}
+    "/api/v2/sample",  # /{table_id}
+)
+
+
+def _data_app_path_allowed(path: str) -> bool:
+    """Is `path` on the hosted-app data surface?
+
+    Subtrees match exact-or-child: plain `startswith` would let
+    `/api/queryevil` ride in on `/api/query` and `/api/data-apps` on
+    `/api/data`.
+    """
+    if path in _DATA_APP_ALLOWED_EXACT:
+        return True
+    return any(path == p or path.startswith(p + "/") for p in _DATA_APP_ALLOWED_SUBTREES)
+
 
 def _client_ip(request: Optional[Request]) -> Optional[str]:
     """See app/auth/dependencies._client_ip — same trusted-hop model (F9)."""
@@ -158,6 +246,13 @@ def resolve_token_to_user(
     ``app/api/data_apps_proxy.py``'s view-only serving path passes
     ``True``. Both scope checks reject their own prefix independently, so a
     caller that (mistakenly) allows one never accepts the other.
+
+    The third data-app scope, ``data-app:<slug>`` (the runtime service token
+    minted by ``app.api.data_apps._mint_service_token``), has no boolean
+    because it is not confined to one surface — it is a data client. It is
+    gated instead by the ``_DATA_APP_ALLOWED_EXACT`` /
+    ``_DATA_APP_ALLOWED_SUBTREES`` path allowlist, so there is no parameter
+    to pass: every caller gets the same enforcement.
     """
     if not token:
         return None, "no_token"
@@ -171,6 +266,25 @@ def resolve_token_to_user(
         return None, "pat_scope_forbidden"
     if scope.startswith(DATA_APP_PREVIEW_SCOPE_PREFIX) and not allow_data_app_preview_scope:
         return None, "pat_scope_forbidden"
+
+    if scope.startswith(DATA_APP_SERVICE_SCOPE_PREFIX):
+        # Callers that omit `request` fall through to path="" — which matches
+        # no prefix, so the service token is fail-closed rejected there, the
+        # same way an agent PAT is (see `_AGENT_PAT_ALLOWED_PREFIXES` below).
+        # Today that means MCP-over-HTTP and the git smart-HTTP surfaces; a
+        # hosted app is a REST client by design.
+        path = request.url.path if request is not None else ""
+        if not _data_app_path_allowed(path):
+            # Log the refused path: this failure is otherwise invisible from
+            # the outside — the container stays healthy and the app renders,
+            # only its API calls 401 — so an operator needs to see WHICH
+            # endpoint the app was refused, not just that something broke.
+            logger.warning(
+                "data-app service token refused off-surface: scope=%s path=%s",
+                scope,
+                path or "<no-request>",
+            )
+            return None, "pat_scope_forbidden"
 
     if payload.get("typ") == "agent_pat":
         # Callers that omit `request` (git smart-HTTP in
@@ -293,6 +407,50 @@ def resolve_token_to_user(
         # short-circuit in src/rbac.py).
         if payload.get("scope") in ("chat", "mcp-oauth"):
             user["credential_surface"] = "stack"
+        if payload.get("scope") == "mcp-oauth":
+            # F0 audit-context (Task 1): stamp so
+            # src.audit_helpers.client_kind_from_user classifies every
+            # request authenticated by an MCP-OAuth connector token (Claude
+            # Desktop / claude.ai, minted by
+            # app.auth.mcp_oauth.AgnesMCPOAuthProvider's exchange_* methods)
+            # as client_kind='mcp', not 'web'.
+            user["token_type"] = "mcp_oauth"
+
+        # Issue #1676: server-side session revocation. `session_revoked_before`
+        # (PG-only column — A3 ratchet, see
+        # migrations/versions/0082_session_revoked_before.py) is a
+        # per-user timestamp floor: a `typ="session"` token whose `iat`
+        # predates it is refused here even though its signature and `exp`
+        # are both still fine. `POST /auth/logout` bumps it to "now" via
+        # `users_repo().revoke_sessions(...)`, so a captured cookie stops
+        # working the moment the owner logs out instead of staying valid for
+        # the rest of its 30-day `exp`.
+        #
+        # Rides the `user` row already loaded above for the `active` check on
+        # EVERY authenticated request — no additional query. On a DuckDB-
+        # backed instance the column doesn't exist (frozen post-A3 schema),
+        # so `session_revoked_before` is simply absent from the dict and this
+        # never fires there (documented trade-off, not a silent gap — see
+        # CHANGELOG.md).
+        if payload.get("typ") == "session":
+            revoked_before = user.get("session_revoked_before")
+            iat = payload.get("iat")
+            if revoked_before is not None and iat is not None:
+                if isinstance(revoked_before, str):
+                    revoked_before = datetime.fromisoformat(revoked_before)
+                if revoked_before.tzinfo is None:
+                    revoked_before = revoked_before.replace(tzinfo=timezone.utc)
+                # `iat` is whole-SECOND precision (PyJWT floors a datetime to
+                # int() on encode); `revoked_before` is a DB timestamp with
+                # sub-second precision. Floor both to the same granularity
+                # before comparing (strict `<`), or a session re-minted in the
+                # SAME second as the revoke call — a plain logout-then-
+                # log-back-in — would spuriously compare "before" the floored
+                # revoke timestamp and get rejected.
+                token_iat = datetime.fromtimestamp(iat, tz=timezone.utc)
+                if token_iat < revoked_before.replace(microsecond=0):
+                    return None, "session_revoked"
+
         _stash_payload(request, payload)
         return user, None
 

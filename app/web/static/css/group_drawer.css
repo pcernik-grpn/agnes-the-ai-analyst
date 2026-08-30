@@ -2,11 +2,13 @@
  * group_drawer.css — what js/components/group_drawer.js adds INSIDE the
  * shared drawer chrome (css/drawer.css).
  *
- * Two rules, because the drawer now asks for a name and nothing else.
- * The audience read-out, the person-search rows and the review slab that
- * used to live here went with the drawer's steps 2–4: those were a second
- * copy of the member and grant editors, and /admin/access is the one that
- * survived. Everything else the drawer draws is shared chrome —
+ * A name, a description, and — on a NEW group only — the people it
+ * starts with. The audience read-out, the full person editor and the
+ * review slab that used to live here went with the drawer's steps 2-4:
+ * those were a second copy of the member and grant editors, and
+ * /admin/access is the one that survived. What is left is seeding, which
+ * has no other natural moment. Everything else the drawer draws is
+ * shared chrome —
  * css/drawer.css for the sheet, `.btn` for the buttons.
  * ===================================================================== */
 
@@ -21,3 +23,73 @@
   line-height: 1.5;
 }
 .gdw-locked[hidden] { display: none; }
+
+/* ── Seeding a new group's people ────────────────────────────────────────
+   The chips sit ABOVE the search rather than below it: they are what you
+   have already decided, and a list that grows downward from the field would
+   push the field — the thing you are still typing into — down the panel on
+   every pick. The results open below, over nothing, because the field is
+   the last control in the pane. */
+.gdw-people[hidden] { display: none; }
+.gdw-people__lede {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ds-text-muted);
+}
+.gdw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.gdw-chips[hidden] { display: none; }
+.gdw-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px 3px 10px;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-primary-light);
+  color: var(--ds-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.gdw-chip__x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.gdw-chip__x:hover { background: color-mix(in srgb, var(--ds-primary) 18%, transparent); }
+.gdw-found {
+  margin-top: 6px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  overflow: hidden;
+}
+.gdw-found[hidden] { display: none; }
+.gdw-found__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--ds-border-light);
+  background: none;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.gdw-found__row:last-child { border-bottom: 0; }
+.gdw-found__row:hover { background: var(--ds-surface-dim); }
+.gdw-found__row:focus-visible { outline: var(--ds-focus-outline); outline-offset: -2px; }
+.gdw-found__who { font-size: 13px; font-weight: 600; color: var(--ds-text-primary); }
+.gdw-found__mail { font-size: 12px; color: var(--ds-text-muted); }
+.gdw-found__none { margin: 0; padding: 10px 12px; font-size: 12.5px; color: var(--ds-text-muted); }

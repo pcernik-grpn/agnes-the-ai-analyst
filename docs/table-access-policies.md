@@ -229,6 +229,7 @@ Every policy-related rejection is a structured `reason`-keyed detail (never a ra
 | `bq_path_policied` | 403, query surfaces | a direct `bq."dataset"."table"` path (or the full-backtick form) names the physical source of a policied table — query the registered name instead |
 | `sf_path_policied` | 403, query surfaces | the same for `sf."SCHEMA"."TABLE"` |
 | `dbx_path_policied` | 403, query surfaces | the same for `dbx."<catalog.schema>"."<table>"` and for a bare three-part Databricks path |
+| `kbc_path_policied` | 403, query surfaces | the same for `kbc."<bucket>"."<table>"` (#1492; the prefix also gained the registry gate `kbc_path_not_registered` and the grant gate `kbc_path_access_denied` the other three already had) |
 | `policy_note_required` | 422, admin write | `access_policy_sql` is set without `access_policy_note` |
 | `policy_preview_unsafe_group_name` | 422, admin preview | an `as_groups` name carries a pattern metacharacter (`%`, `_`) |
 | `policy_preview_unsafe_live_group_name` | 422, admin preview | the `as_user` persona's own live group name carries one — the resolver would refuse to bind it, so this policy could never be served to that user |

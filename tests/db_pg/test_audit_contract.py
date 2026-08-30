@@ -496,6 +496,46 @@ def test_log_autofills_duration_from_request_context(audit_repo):
     assert by_action["in.scope"] is not None and by_action["in.scope"] >= 0
 
 
+def test_log_autofills_client_ip_correlation_id_and_client_kind(audit_repo):
+    """F0 (audit-full-coverage plan, Task 1): client_ip / correlation_id /
+    client_kind auto-fill from the request-context contextvars in BOTH
+    backends when the caller passes None; an explicit kwarg still wins."""
+    import contextvars
+
+    from src import audit_context
+
+    repo, _, _ = audit_repo
+
+    def _in_fresh_context(fn):
+        return contextvars.copy_context().run(fn)
+
+    def _autofilled():
+        audit_context.set_request_meta(client_ip="203.0.113.7", correlation_id="rid-abc123")
+        audit_context.set_client_kind("mcp")
+        repo.log(user_id="u1", action="autofilled.row")
+
+    def _explicit_wins():
+        audit_context.set_request_meta(client_ip="203.0.113.7", correlation_id="rid-abc123")
+        repo.log(user_id="u1", action="explicit.row", client_ip="198.51.100.9")
+
+    def _no_context():
+        repo.log(user_id="u1", action="no.context.row")
+
+    _in_fresh_context(_autofilled)
+    _in_fresh_context(_explicit_wins)
+    _in_fresh_context(_no_context)
+
+    rows, _ = repo.query(limit=10)
+    by_action = {r["action"]: r for r in rows}
+    assert by_action["autofilled.row"]["client_ip"] == "203.0.113.7"
+    assert by_action["autofilled.row"]["correlation_id"] == "rid-abc123"
+    assert by_action["autofilled.row"]["client_kind"] == "mcp"
+    assert by_action["explicit.row"]["client_ip"] == "198.51.100.9"
+    assert by_action["no.context.row"]["client_ip"] is None
+    assert by_action["no.context.row"]["correlation_id"] is None
+    assert by_action["no.context.row"]["client_kind"] is None
+
+
 # ---------------------------------------------------------------------------
 # B8: prune_older_than — retention-based audit_log pruning
 # ---------------------------------------------------------------------------
@@ -610,3 +650,383 @@ def test_upload_filenames_since_parses_params_on_both_engines(audit_repo):
     repo.log(user_id="u2", action="session.upload", params={"bytes": 4})  # no filename
     repo.log(user_id="u2", action="other.action", params={"filename": "zzz.jsonl"})
     assert repo.upload_filenames_since(since) == ["aaa.jsonl", "bbb.jsonl"]
+
+
+# ---------------------------------------------------------------------------
+# E3 slice 2 — query_unified: the Activity Center timeline widened across
+# audit_log + sync_history + llm_usage + agent_scope_snapshots (never
+# chat_messages). Raw INSERTs into the three non-audit trail tables, since
+# there is no repo-level writer for this test's purposes — same pattern as
+# ``_backdate`` above (implementation-specific path per backend).
+# ---------------------------------------------------------------------------
+
+
+def _insert_sync_history(
+    audit_repo_tuple, *, id_, table_id, synced_at, rows=0, duration_ms=None, status="ok", error=None
+):
+    repo, conn, backend = audit_repo_tuple
+    if backend == "duckdb":
+        conn.execute(
+            "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [id_, table_id, synced_at, rows, duration_ms, status, error],
+        )
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text(
+                    "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
+                    "VALUES (:id, :table_id, :synced_at, :rows, :duration_ms, :status, :error)"
+                ),
+                {
+                    "id": id_,
+                    "table_id": table_id,
+                    "synced_at": synced_at,
+                    "rows": rows,
+                    "duration_ms": duration_ms,
+                    "status": status,
+                    "error": error,
+                },
+            )
+
+
+def _insert_llm_usage(
+    audit_repo_tuple,
+    *,
+    id_,
+    agent_id,
+    user_id,
+    session_id,
+    model,
+    input_tokens=10,
+    output_tokens=20,
+    cache_read_tokens=0,
+    cache_creation_tokens=0,
+    created_at=None,
+):
+    repo, conn, backend = audit_repo_tuple
+    created_at = created_at or datetime.now(timezone.utc)
+    if backend == "duckdb":
+        conn.execute(
+            "INSERT INTO llm_usage (id, agent_id, user_id, session_id, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_creation_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                id_,
+                agent_id,
+                user_id,
+                session_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                created_at,
+            ],
+        )
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text(
+                    "INSERT INTO llm_usage (id, agent_id, user_id, session_id, model, input_tokens, output_tokens, "
+                    "cache_read_tokens, cache_creation_tokens, created_at) VALUES "
+                    "(:id, :agent_id, :user_id, :session_id, :model, :input_tokens, :output_tokens, "
+                    ":cache_read_tokens, :cache_creation_tokens, :created_at)"
+                ),
+                {
+                    "id": id_,
+                    "agent_id": agent_id,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
+                    "created_at": created_at,
+                },
+            )
+
+
+def _insert_agent_scope_snapshot(audit_repo_tuple, *, id_, session_id, agent_id, effective_scope, created_at=None):
+    repo, conn, backend = audit_repo_tuple
+    created_at = created_at or datetime.now(timezone.utc)
+    if backend == "duckdb":
+        conn.execute(
+            "INSERT INTO agent_scope_snapshots (id, session_id, agent_id, effective_scope, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [id_, session_id, agent_id, effective_scope, created_at],
+        )
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text(
+                    "INSERT INTO agent_scope_snapshots (id, session_id, agent_id, effective_scope, created_at) "
+                    "VALUES (:id, :session_id, :agent_id, :effective_scope, :created_at)"
+                ),
+                {
+                    "id": id_,
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "effective_scope": effective_scope,
+                    "created_at": created_at,
+                },
+            )
+
+
+def _insert_chat_message(audit_repo_tuple, *, session_id, message_id, content):
+    """Plants one chat_sessions + chat_messages row (FK-required) so the
+    privacy regression test has something a leaky projection COULD surface."""
+    repo, conn, backend = audit_repo_tuple
+    now = datetime.now(timezone.utc)
+    if backend == "duckdb":
+        conn.execute(
+            "INSERT INTO chat_sessions (id, user_email, surface, started_at) VALUES (?, ?, ?, ?)",
+            [session_id, "leak-probe@example.com", "web", now],
+        )
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            [message_id, session_id, "user", content, now],
+        )
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text(
+                    "INSERT INTO chat_sessions (id, user_email, surface, started_at) "
+                    "VALUES (:id, :email, :surface, :started_at)"
+                ),
+                {"id": session_id, "email": "leak-probe@example.com", "surface": "web", "started_at": now},
+            )
+            c.execute(
+                sa.text(
+                    "INSERT INTO chat_messages (id, session_id, role, content, created_at) "
+                    "VALUES (:id, :session_id, :role, :content, :created_at)"
+                ),
+                {"id": message_id, "session_id": session_id, "role": "user", "content": content, "created_at": now},
+            )
+
+
+def test_query_unified_folds_in_all_trails(audit_repo):
+    repo, _, _ = audit_repo
+    now = datetime.now(timezone.utc)
+    repo.log(user_id="u1", action="table.read", resource="table:orders", result="success", client_kind="web")
+    _insert_sync_history(audit_repo, id_="sh1", table_id="t_web_sessions", synced_at=now, rows=100, status="ok")
+    _insert_llm_usage(audit_repo, id_="lu1", agent_id="agent-1", user_id="u2", session_id="sess-1", model="claude-x")
+    _insert_agent_scope_snapshot(
+        audit_repo, id_="ss1", session_id="sess-1", agent_id="agent-1", effective_scope='{"tables":["orders"]}'
+    )
+
+    rows, _ = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=50)
+    by_trail = {r["trail"]: r for r in rows}
+    assert set(by_trail) == {"audit", "sync", "llm", "agent_scope"}
+
+    assert by_trail["audit"]["action"] == "table.read"
+
+    sync_row = by_trail["sync"]
+    assert sync_row["action"] == "sync.table"
+    assert sync_row["resource"] == "table:t_web_sessions"
+    assert sync_row["result"] == "ok"
+    assert sync_row["source"] == "scheduler"
+    assert sync_row["user_id"] is None
+
+    llm_row = by_trail["llm"]
+    assert llm_row["action"] == "llm.call"
+    assert llm_row["resource"] == "agent:agent-1"
+    assert llm_row["user_id"] == "u2"
+    assert llm_row["source"] == "agent"
+
+    scope_row = by_trail["agent_scope"]
+    assert scope_row["action"] == "agent.spawn.scope"
+    assert scope_row["resource"] == "agent:agent-1"
+    assert scope_row["source"] == "agent"
+
+
+def test_query_unified_orders_across_trails_newest_first(audit_repo):
+    repo, _, _ = audit_repo
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _insert_sync_history(audit_repo, id_="sh-old", table_id="t1", synced_at=base, status="ok")
+    repo_id = repo.log(action="mid.event")
+    _insert_agent_scope_snapshot(
+        audit_repo,
+        id_="ss-new",
+        session_id="s1",
+        agent_id="a1",
+        effective_scope="{}",
+        created_at=base + timedelta(hours=2),
+    )
+    # Backdate the audit row deterministically between the other two.
+    if audit_repo[2] == "duckdb":
+        audit_repo[1].execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [base + timedelta(hours=1), repo_id])
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text("UPDATE audit_log SET timestamp = :ts WHERE id = :id"),
+                {"ts": base + timedelta(hours=1), "id": repo_id},
+            )
+
+    rows, _ = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=50)
+    order = [r["trail"] for r in rows]
+    assert order == ["agent_scope", "audit", "sync"]
+
+
+def test_query_unified_trail_filter_narrows_to_one_trail(audit_repo):
+    repo, _, _ = audit_repo
+    now = datetime.now(timezone.utc)
+    repo.log(action="audit.only")
+    _insert_sync_history(audit_repo, id_="sh1", table_id="t1", synced_at=now, status="ok")
+    _insert_llm_usage(audit_repo, id_="lu1", agent_id="a1", user_id="u1", session_id="s1", model="m")
+
+    rows, _ = repo.query_unified(trail="audit", since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=50)
+    assert {r["trail"] for r in rows} == {"audit"}
+    assert {r["action"] for r in rows} == {"audit.only"}
+
+    rows2, _ = repo.query_unified(trail="sync", since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=50)
+    assert {r["trail"] for r in rows2} == {"sync"}
+
+
+def test_query_unified_invalid_trail_raises(audit_repo):
+    repo, _, _ = audit_repo
+    with pytest.raises(ValueError):
+        repo.query_unified(trail="not-a-real-trail")
+
+
+def test_query_unified_cursor_pagination_across_trails(audit_repo):
+    repo, _, _ = audit_repo
+    import time
+
+    repo.log(action="a.1")
+    time.sleep(0.005)
+    repo.log(action="a.2")
+    time.sleep(0.005)
+    _insert_sync_history(audit_repo, id_="sh1", table_id="t1", synced_at=datetime.now(timezone.utc), status="ok")
+    time.sleep(0.005)
+    _insert_llm_usage(audit_repo, id_="lu1", agent_id="a1", user_id="u1", session_id="s1", model="m")
+    time.sleep(0.005)
+    _insert_agent_scope_snapshot(audit_repo, id_="ss1", session_id="s1", agent_id="a1", effective_scope="{}")
+
+    page1, c1 = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=2)
+    assert len(page1) == 2
+    assert c1 is not None
+    page2, c2 = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=2, cursor=c1)
+    assert len(page2) == 2
+    assert c2 is not None
+    page3, c3 = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=2, cursor=c2)
+    assert len(page3) == 1
+    assert c3 is None
+    seen_trails = {r["trail"] for r in page1 + page2 + page3}
+    assert seen_trails == {"audit", "sync", "llm", "agent_scope"}
+    seen_ids = {r["id"] for r in page1 + page2 + page3}
+    assert len(seen_ids) == 5
+
+
+def test_query_unified_result_class_and_resource_prefix_filters_apply_across_trails(audit_repo):
+    """The unified projection reuses ``_filters_where`` unchanged — prove a
+    filter that only ever matched audit_log rows before now also reaches
+    into the folded-in trails."""
+    repo, _, _ = audit_repo
+    now = datetime.now(timezone.utc)
+    _insert_sync_history(audit_repo, id_="sh-ok", table_id="t_ok", synced_at=now, status="ok")
+    _insert_sync_history(audit_repo, id_="sh-err", table_id="t_err", synced_at=now, status="error")
+
+    rows, _ = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), result_class="success", limit=50)
+    assert {r["resource"] for r in rows} == {"table:t_ok"}
+
+    rows2, _ = repo.query_unified(
+        since=datetime(2000, 1, 1, tzinfo=timezone.utc), resource_prefix="table:t_err", limit=50
+    )
+    assert {r["resource"] for r in rows2} == {"table:t_err"}
+
+
+def test_query_unified_never_surfaces_chat_messages(audit_repo):
+    """Privacy regression (E3 slice 2): chat transcript content must never
+    leak into the Activity Center timeline, unfiltered."""
+    repo, _, _ = audit_repo
+    secret = "the customer's Q3 churn number is 4.2% — do not repeat this"
+    _insert_chat_message(audit_repo, session_id="leak-sess", message_id="leak-msg", content=secret)
+    repo.log(action="unrelated.audit.row")
+
+    rows, _ = repo.query_unified(since=datetime(2000, 1, 1, tzinfo=timezone.utc), limit=200)
+    assert "chat" not in {r["trail"] for r in rows}
+    blob = json.dumps(rows, default=str)
+    assert secret not in blob
+    assert "leak-sess" not in blob
+    assert "leak-msg" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Blocking fix follow-up: kpis()/facets() widened to the SAME unified union
+# as query_unified() — the sibling endpoints backing the KPI cards + facet
+# dropdowns on /admin/activity must count/list the folded-in trails too, or
+# the page tells two different stories.
+# ---------------------------------------------------------------------------
+
+
+def _seed_kpi_facet_trails(audit_repo):
+    """One row per trail, same shape as TestKpiTableParity._seed() in
+    tests/test_activity_api.py — kept in sync deliberately (not imported,
+    since that lives in the top-level app-test module, this in the PG
+    contract module)."""
+    repo, _, _ = audit_repo
+    now = datetime.now(timezone.utc)
+    repo.log(user_id="alice", action="table.read", result="success", client_kind="web")
+    repo.log(user_id="bob", action="query.run", result="denied", client_kind="cli")
+    _insert_sync_history(audit_repo, id_="kf-sh1", table_id="t_kf", synced_at=now, status="ok")
+    _insert_llm_usage(audit_repo, id_="kf-lu1", agent_id="agent-kf", user_id="alice", session_id="sess-kf", model="m")
+    _insert_agent_scope_snapshot(
+        audit_repo, id_="kf-ss1", session_id="sess-kf", agent_id="agent-kf", effective_scope="{}"
+    )
+
+
+def test_kpis_events_total_matches_query_unified_row_count(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    rows, _ = repo.query_unified(since=since, limit=200)
+    k = repo.kpis(since=since)
+    assert k["events_total"] == len(rows) == 5
+
+
+def test_kpis_trail_filter_matches_query_unified_trail_filter(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    for trail in ("audit", "sync", "llm", "agent_scope"):
+        rows, _ = repo.query_unified(since=since, trail=trail, limit=200)
+        k = repo.kpis(since=since, trail=trail)
+        assert k["events_total"] == len(rows), f"trail={trail}"
+
+
+def test_kpis_rejects_unknown_trail(audit_repo):
+    repo, _, _ = audit_repo
+    with pytest.raises(ValueError):
+        repo.kpis(since=datetime(2000, 1, 1, tzinfo=timezone.utc), trail="not-a-real-trail")
+
+
+def test_facets_actions_include_folded_in_trails(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    out = repo.facets(since=since, limit=50)
+    actions = {a["value"] for a in out["actions"]}
+    assert {"sync.table", "llm.call", "agent.spawn.scope", "table.read", "query.run"} <= actions
+    sources = {s["value"] for s in out["sources"]}
+    assert "scheduler" in sources
+    assert "agent" in sources
+
+
+def test_facets_trail_filter_narrows_to_one_trail(audit_repo):
+    repo, _, _ = audit_repo
+    _seed_kpi_facet_trails(audit_repo)
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    out = repo.facets(since=since, trail="audit", limit=50)
+    actions = {a["value"] for a in out["actions"]}
+    assert actions == {"table.read", "query.run"}
+
+
+def test_facets_rejects_unknown_trail(audit_repo):
+    repo, _, _ = audit_repo
+    with pytest.raises(ValueError):
+        repo.facets(since=datetime(2000, 1, 1, tzinfo=timezone.utc), trail="not-a-real-trail")

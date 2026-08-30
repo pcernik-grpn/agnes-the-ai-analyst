@@ -28,6 +28,10 @@
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+{# The builder workspace — shared with the other builder pages rather than
+   inlined here. What stays in the <style> below is this page's own: the
+   agent LIST (cards, bands, template picker) and its page head. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <style>
   /* Non-interactive group heading inside the skill picker's branded menu —
      mirrors the native <optgroup label> the select itself still carries
@@ -48,9 +52,20 @@
   .ag-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 0; max-width: 64ch; }
 
   /* ── List view ── */
+  /* The list is two bands — ready first, drafts under — because a card's
+     click does a different thing in each, and the heading is what says so. */
+  /* No `.ag-listbar`: the "+ New agent" button it held is a card in the grid
+     now (`.ag-new`), so there is no toolbar row above the collection. */
+  .ag-group + .ag-group { margin-top: 30px; }
+  .ag-group-h { margin-bottom: 12px; }
+  .ag-group-h h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .ag-group-n { font-size: 12px; font-weight: 600; color: var(--ds-text-muted); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: var(--ds-radius-pill); padding: 0 8px; }
+  .ag-group-h p { margin: 3px 0 0; font-size: 12.5px; color: var(--ds-text-secondary); }
   .ag-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+  /* Every card opens the builder, ready or draft, so there is one hover
+     treatment (on `.ag-card` below) rather than a state-dependent one. */
   .ag-card { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; cursor: pointer; transition: border-color var(--ds-motion-fast) var(--ds-ease-standard), box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
-  .ag-card:hover { border-color: var(--ds-border); box-shadow: var(--ds-shadow-md); }
+  .ag-card:hover { border-color: var(--ds-primary); box-shadow: var(--ds-shadow-md); }
   .ag-card-top { display: flex; align-items: center; gap: 11px; }
   .ag-ava { width: 38px; height: 38px; border-radius: 10px; background: var(--ds-agnes-soft); color: var(--ds-agnes); display: grid; place-items: center; flex-shrink: 0; }
   .ag-ava svg { width: 21px; height: 21px; }
@@ -72,6 +87,10 @@
   .ag-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
   .ag-new { border: 1.5px dashed var(--ds-border); background: var(--ds-surface-sunken); color: var(--ds-text-secondary); border-radius: 14px; padding: 16px 18px; display: flex; align-items: center; justify-content: center; gap: 9px; font-size: 14px; font-weight: 600; cursor: pointer; min-height: 158px; font-family: inherit; transition: color var(--ds-motion-fast) var(--ds-ease-standard), border-color var(--ds-motion-fast) var(--ds-ease-standard); }
   .ag-new:hover { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+  .ag-new:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  /* The plus at the weight of the cards' avatar tile, so the first cell has a
+     mark where its neighbours have one and the row's rhythm survives. */
+  .ag-new-plus { font-size: 19px; font-weight: 500; line-height: 1; }
   /* Template picker — the first step of "New agent" once the caller has any
      Agent Template installed. */
   /* No --ds-* scrim token exists (every modal in the codebase hard-codes its
@@ -98,138 +117,6 @@
      (rendered in JS, the head is hidden there) sits after the columns. */
   .ag-head + .pnote { margin-top: 16px; }
   #ag-builder-view .pnote { margin: 18px 0 0; }
-
-  /* Status pill — draft vs ready. */
-  .ag-status { font-size: 12px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 2px 10px; flex-shrink: 0; white-space: nowrap; }
-  .ag-status--draft { color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); }
-  .ag-status--ready { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); border: 1px solid var(--ds-accent-success-line); }
-
-  /* ── Builder ── */
-  .ag-back { border: none; background: none; color: var(--ds-text-secondary); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; padding: 4px 8px 4px 0; margin-bottom: 6px; }
-  .ag-back:hover { color: var(--ds-primary); }
-  .ag-build-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 2px 0 18px; }
-  .ag-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
-  .ag-build-head h2 { font-size: 24px; margin: 2px 0 0; }
-  .ag-build-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; margin-top: 4px; }
-  /* Delete sits left of the status button — a real button so it reads as an
-     action next to "Mark ready", but danger-tinted only on hover/focus so it
-     never competes with the primary affordance. */
-  .ag-build-actions .ag-del-btn:hover,
-  .ag-build-actions .ag-del-btn:focus-visible { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
-  .ag-bgrid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 22px; align-items: start; }
-  @media (max-width: 980px) { .ag-bgrid { grid-template-columns: 1fr; } }
-
-  /* Numbered collapsible sections. */
-  .ag-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
-  .ag-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; cursor: pointer; user-select: none; }
-  .ag-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
-  .ag-sec-head h3 { font-size: 15px; margin: 0; }
-  .ag-sec-head h3 .ag-sec-note { font-weight: 400; color: var(--ds-text-muted); font-size: 13px; margin-left: 4px; }
-  .ag-sec-sub { margin: 2px 0 0; font-size: 12.5px; color: var(--ds-text-secondary); }
-  .ag-sec-grow { flex: 1; min-width: 0; }
-  .ag-sec-sum { font-size: 12.5px; color: var(--ds-text-muted); white-space: nowrap; }
-  .ag-sec-chev { color: var(--ds-text-muted); transition: transform var(--ds-motion-fast) var(--ds-ease-standard); }
-  .ag-sec-chev svg { width: 16px; height: 16px; display: block; }
-  .ag-sec.collapsed .ag-sec-chev { transform: rotate(-90deg); }
-  .ag-sec-body { padding: 4px 18px 18px; border-top: 1px solid var(--ds-border); }
-  .ag-sec.collapsed .ag-sec-body { display: none; }
-  .ag-sec.collapsed .ag-sec-head { padding-bottom: 14px; }
-
-  /* Fields. */
-  .ag-field { display: block; margin: 14px 0 0; }
-  .ag-field > span { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--ds-text-primary); }
-  .ag-field > span em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
-  .ag-field input[type=text], .ag-field textarea { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); resize: vertical; }
-  .ag-field input:focus, .ag-field textarea:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
-  .ag-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-  .ag-chip { font-size: 13px; font-weight: 500; padding: 5px 13px; border-radius: var(--ds-radius-pill); border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); cursor: pointer; font-family: inherit; }
-  .ag-chip.on { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); font-weight: 600; }
-
-  /* Ingredient rows (knowledge / capabilities / surfaces). */
-  .ag-row { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--ds-border); }
-  .ag-row:last-child { border-bottom: none; padding-bottom: 2px; }
-  .ag-row-body { flex: 1; min-width: 0; }
-  .ag-row-name { font-size: 14px; font-weight: 600; color: var(--ds-text-primary); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .ag-row-desc { font-size: 12.5px; color: var(--ds-text-secondary); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .ag-row-meta { font-size: 12px; color: var(--ds-text-muted); margin-left: 4px; }
-  .ag-kind { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; border-radius: var(--ds-radius-pill); padding: 1px 8px; }
-  .ag-kind--data { background: var(--ds-kind-data-soft); color: var(--ds-kind-data); }
-  .ag-kind--memory { background: var(--ds-kind-memory-soft); color: var(--ds-kind-memory); }
-  .ag-kind--plugin { background: var(--ds-kind-plugin-soft); color: var(--ds-kind-plugin); }
-  .ag-kind--skill { background: var(--ds-kind-skill-soft); color: var(--ds-kind-skill); }
-  .ag-kind--agent { background: var(--ds-kind-agent-soft); color: var(--ds-kind-agent); }
-  .ag-kind--file { background: var(--ds-kind-library-soft); color: var(--ds-kind-library); }
-
-  /* Ingredient toolbar — a search box over the (now workspace-wide) pool, so
-     data · memory · files and every available plugin/skill stay scannable. */
-  .ag-toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0 4px; }
-  .ag-search { flex: 1; min-width: 0; padding: 8px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 13.5px; background: var(--ds-surface); color: var(--ds-text-primary); }
-  .ag-search:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
-  .ag-toolcount { font-size: 12.5px; color: var(--ds-text-muted); white-space: nowrap; flex-shrink: 0; }
-  .ag-emptyrows { padding: 16px 2px; font-size: 13px; color: var(--ds-text-muted); }
-  /* "Already in your stack" marker — the axis the caller cares about now that
-     the pool is everything available, not just the stack. */
-  .ag-instack { font-size: 11px; font-weight: 600; border-radius: var(--ds-radius-pill); padding: 1px 8px; color: var(--ds-agnes); background: var(--ds-agnes-soft); border: 1px solid var(--ds-agnes-line); white-space: nowrap; }
-  .ag-tglbtn { flex-shrink: 0; font: inherit; font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); cursor: pointer; }
-  .ag-tglbtn.on { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
-  .ag-note { font-size: 12.5px; color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 9px; padding: 8px 12px; margin: 12px 0 0; }
-  .ag-note a { color: var(--ds-primary); }
-
-  /* Boundaries (read-only, admin-managed). */
-  .ag-bnd { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
-  .ag-bnd-row { display: flex; justify-content: space-between; gap: 12px; padding: 9px 13px; font-size: 13px; border-bottom: 1px solid var(--ds-border); }
-  .ag-bnd-row:last-child { border-bottom: none; }
-  .ag-bnd-k { color: var(--ds-text-secondary); }
-  .ag-bnd-v { color: var(--ds-text-primary); font-weight: 550; text-align: right; }
-
-  /* Schedules (unattended runs). Status chips ride the shared status accent
-     vocabulary; `backlogged` wears the WARN treatment deliberately — it means
-     the previous run is still sitting queued because no worker is claiming
-     agent_response jobs, which an owner must notice, not skim past. */
-  .ag-sch-cadence { font-family: var(--ds-font-mono); font-size: 12px; color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 6px; padding: 1px 7px; white-space: nowrap; }
-  .ag-sch-status { font-size: 11px; font-weight: 700; letter-spacing: 0.02em; border-radius: var(--ds-radius-pill); padding: 1px 8px; white-space: nowrap; }
-  .ag-sch-status--enqueued { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); border: 1px solid var(--ds-accent-success-line); }
-  .ag-sch-status--failed { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); }
-  .ag-sch-status--backlogged { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border: 1px solid var(--ds-accent-warn-line); }
-  .ag-row--sch-off .ag-row-name, .ag-row--sch-off .ag-row-desc, .ag-row--sch-off .ag-sch-last { opacity: 0.55; }
-  .ag-sch-last { font-size: 12px; color: var(--ds-text-muted); margin-top: 3px; }
-  .ag-sch-acts { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-  .ag-sch-form { margin-top: 14px; border-top: 1px dashed var(--ds-border); }
-  .ag-sch-form h4 { font-size: 13.5px; margin: 14px 0 0; color: var(--ds-text-primary); }
-  .ag-field select { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); }
-  .ag-field select:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
-  .ag-hint { display: block; font-weight: 400; font-size: 12px; color: var(--ds-text-muted); margin-top: 5px; line-height: 1.5; }
-  .ag-hint code { font-family: var(--ds-font-mono); font-size: 11.5px; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 5px; padding: 0 4px; }
-  .ag-sch-en { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ds-text-primary); margin-top: 14px; cursor: pointer; }
-  .ag-sch-err { margin-top: 12px; font-size: 13px; color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); border-radius: 9px; padding: 8px 12px; }
-  .ag-sch-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
-  .ag-sch-fine { font-size: 12px; color: var(--ds-text-muted); margin: 0; }
-
-  /* Preview aside. */
-  .ag-preview { position: sticky; top: 18px; }
-  .ag-preview h3 { font-size: 14px; margin: 0 0 10px; }
-  .ag-pv-card { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; box-shadow: var(--ds-shadow-md); overflow: hidden; }
-  .ag-pv-hd { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--ds-border); }
-  .ag-pv-hd .ag-ava { width: 32px; height: 32px; border-radius: 9px; }
-  .ag-pv-name { font-size: 14px; font-weight: 650; color: var(--ds-text-primary); }
-  .ag-pv-role { font-size: 12px; color: var(--ds-text-muted); display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
-  .ag-pv-body { padding: 14px; }
-  /* Theme-aware tint (not the light-only --ds-agnes-soft) so the greeting
-     stays readable against the assistant bubble in dark mode too. */
-  .ag-pv-bubble { background: color-mix(in srgb, var(--ds-agnes) 9%, var(--ds-surface)); border: 1px solid var(--ds-agnes-line); color: var(--ds-text-primary); border-radius: 12px 12px 12px 4px; padding: 10px 13px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
-  /* A mock composer, not a control: it copies the real chat pill so the
-     preview reads as the app, which also made people click it and type into
-     nothing. `cursor: default` + `user-select: none` withdraw the two cues
-     that invite that; `aria-hidden` on the element keeps it out of the
-     accessibility tree, where a fake textbox is worse than useless. */
-  .ag-pv-input { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-pill); padding: 8px 8px 8px 14px; color: var(--ds-text-muted); font-size: 13px; cursor: default; user-select: none; }
-  .ag-pv-note { padding: 0 14px 12px; font-size: 11.5px; color: var(--ds-text-muted); }
-  .ag-pv-send { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-primary); color: var(--ds-text-inverse); display: grid; place-items: center; font-size: 14px; flex-shrink: 0; }
-  .ag-pv-meta { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
-  .ag-pv-row { display: flex; justify-content: space-between; gap: 10px; padding: 8px 12px; font-size: 12.5px; border-bottom: 1px solid var(--ds-border); }
-  .ag-pv-row:last-child { border-bottom: none; }
-  .ag-pv-k { color: var(--ds-text-secondary); }
-  .ag-pv-v { color: var(--ds-text-primary); font-weight: 550; }
 </style>
 {% endblock %}
 
@@ -237,11 +124,11 @@
 <div class="ag-head" id="ag-page-head">
   <div>
     <h1>Agents</h1>
-    <p class="lede">Build a focused assistant from anything you can access — governed data, memory, and your files for what it knows, plus any plugin or skill for what it can do. Everything here respects your existing permissions.</p>
+    <p class="lede">Describe what you need and the builder configures it — grounded in anything you can access: governed data, memory, and your files for what it knows, plus any plugin or skill for what it can do. Try it before you ship it. Everything here respects your existing permissions.</p>
   </div>
 </div>
 {# The "not wired to the surfaces yet" caveat is gone: agents run from here now
-   (the Chat button on each card opens a session as that agent). The other
+   (each card's Chat action opens a session as that agent). The other
    surfaces are still a per-surface rollout, but "you cannot use what you
    built" — the thing this notice was apologising for — is no longer true. #}
 {% endblock %}
@@ -255,6 +142,10 @@
 {% endblock %}
 
 {% block scripts %}
+{# NOT deferred: the builder renders on boot, so BuilderShell has to exist
+   before the page script below runs. Same reason modal.js loads eagerly. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script src="{{ static_url('js/components/builder_preview.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -284,7 +175,8 @@
   var collapsed = {};           // sectionKey -> bool, per open agent
   var plugins = null;           // all marketplace items available to the caller
   var pluginsErr = false;
-  var query = { knowledge: '', capabilities: '' };  // per-section search text
+  var query = { knowledge: '', capabilities: '' };  // picker search text
+  var picker = null;            // null | 'knowledge' | 'capabilities' — open picker modal
 
   /* ── Schedules — per-open-agent working copy of the agent-schedules rows
      (/api/v1/agents/{slug}/schedules, owner CRUD). Reset on every
@@ -303,48 +195,93 @@
     return { name: '', schedule: '', prompt: '', enabled: true, skill: '', busy: false };
   }
 
-  /* Persist one agent with a short debounce: field edits fire on every
-     keystroke, so a naive PUT-per-input would hammer the API. Keyed by id so
-     two agents edited in one session never share a timer.
+  /* ── Editing is explicit ──
+     The builder used to debounce-PATCH every keystroke. That made "leave
+     without saving" impossible to offer honestly — there was nothing unsaved
+     to leave — and gave the owner no moment at which they had decided the
+     agent was as they wanted it. Edits now accumulate in the working copy and
+     go to the server only on Save (or on Preview, which cannot run an agent
+     the server has not been told about — see openPreview).
 
-     `PUT /api/v1/agents/{id}` (re-pointed from this page's own now-deleted
-     `PATCH /api/agents/{id}` in Task C1.2) accepts the exact same builder
-     wire fields — `surfaces` is sent explicitly on every save (as it always
-     was here), because v1 does not invent the `{web: true}` default a bare
-     create without one would have gotten from the old router. */
-  var saveTimers = {};
-  function persist(a) {
-    if (!a || !a.id) return;
-    clearTimeout(saveTimers[a.id]);
-    saveTimers[a.id] = setTimeout(function () {
-      fetch('/api/v1/agents/' + encodeURIComponent(a.id), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({
-          name: a.name, role: a.role, instructions: a.instructions,
-          tone: a.tone, greeting: a.greeting, knowledge: a.knowledge,
-          plugins: a.plugins, surfaces: a.surfaces, status: a.status
-        })
-      }).then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (updated) {
-          // A rename re-derives a draft's slug server-side (`_draft_slug_rename`);
-          // the local copy must pick it up, or the card's Chat link (built from
-          // `a.slug`) keeps pointing at the pre-rename address until a reload.
-          if (updated && updated.slug) a.slug = updated.slug;
-        })
-        .catch(function (e) { console.error('agents: save failed', e); });
-    }, 400);
+     `baseline` is a snapshot of the open agent taken at the last agreement
+     with the server: on open, and after every successful save. Anything that
+     differs from it is unsaved. */
+  var EDITABLE = ['name', 'role', 'instructions', 'tone', 'greeting', 'knowledge', 'plugins', 'surfaces', 'status'];
+  var baseline = null;      // JSON string, or null when no agent is open
+  var isNewAgent = false;   // the open agent is a placeholder never yet saved
+  var saving = false;
+
+  function snapshot(a) {
+    if (!a) return null;
+    var o = {};
+    EDITABLE.forEach(function (k) { o[k] = a[k]; });
+    return JSON.stringify(o);
   }
-  /* Every existing call site means "persist what the user just changed", which
-     is always the open agent — so save() keeps its old no-arg signature. */
-  function save() { persist(current()); }
+  function setBaseline() { baseline = snapshot(current()); }
+  function isDirty() {
+    var a = current();
+    return !!a && baseline !== null && snapshot(a) !== baseline;
+  }
+  /* There are unsaved edits worth warning about — including a brand-new agent
+     the owner has not committed, which is "unsaved" even before it is
+     touched, because leaving throws the whole row away. */
+  function hasPendingWork() { return !!current() && (isNewAgent || isDirty()); }
+
+  /* A field changed. No network — just keep the header's Save button and the
+     unsaved marker honest about the new state. */
+  function touch() {
+    var a = current();
+    if (a) a.updated = new Date().toISOString();
+    syncHeaderState();
+  }
+
+  function agentPayload(a) {
+    return {
+      name: a.name, role: a.role, instructions: a.instructions,
+      tone: a.tone, greeting: a.greeting, knowledge: a.knowledge,
+      plugins: a.plugins, surfaces: a.surfaces, status: a.status
+    };
+  }
+
+  /* Commit the working copy. Resolves with the server's row (or null on
+     failure) — callers that need the agent to be live server-side before
+     doing something else (Preview) wait on it. */
+  function saveAgent() {
+    var a = current();
+    if (!a || !a.id) return Promise.resolve(null);
+    saving = true; syncHeaderState();
+    // `PUT /api/v1/agents/{id}` — re-pointed from this page's own now-deleted
+    // `PATCH /api/agents/{id}` (Task C1.2). v1 takes the same builder wire
+    // fields; `agentPayload` already sends `surfaces` explicitly, which v1
+    // needs because it does not invent the old router's `{web: true}` default.
+    return fetch('/api/v1/agents/' + encodeURIComponent(a.id), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(agentPayload(a))
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (updated) {
+      // A rename re-derives a draft's slug server-side (`_draft_slug_rename`);
+      // the local copy must pick it up, or the card's Chat link (built from
+      // `a.slug`) keeps pointing at the pre-rename address until a reload.
+      if (updated && updated.slug) a.slug = updated.slug;
+      // Saving is what turns a placeholder into an agent the owner owns:
+      // from here on, leaving no longer throws it away.
+      isNewAgent = false;
+      setBaseline();
+      return updated;
+    }).catch(function (e) {
+      console.error('agents: save failed', e);
+      if (window.appToast) window.appToast({ kind: 'error', msg: 'Could not save: ' + e.message });
+      return null;
+    }).finally(function () { saving = false; syncHeaderState(); });
+  }
   function current() { return agents.find(function (a) { return a.id === currentId; }) || null; }
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
+  /* Delegated, not duplicated: two escapers across two builder pages is two
+     chances for one of them to be the weaker one. */
+  var esc = BuilderShell.esc;
 
   function makeAgent() {
     return {
@@ -416,9 +353,13 @@
   // Collapse the whole .idx-head band (not just its content) so the builder
   // view doesn't leave an empty grey strip above the white surface band.
   var pageHeadBand = pageHead ? pageHead.closest('.idx-head') : null;
+  /* `show` is really "are we on the list view": the page head belongs to the
+     list, and the builder is a full-bleed workspace. One flag drives both
+     because they are the same question asked twice. */
   function setPageHead(show) {
     if (pageHead) pageHead.hidden = !show;
     if (pageHeadBand) pageHeadBand.hidden = !show;
+    document.body.classList.toggle('ag-building', !show);
   }
 
   function renderList() {
@@ -435,51 +376,113 @@
         '</div>';
       return;
     }
-    var cards = agents.map(function (a) {
-      return '<div class="ag-card" data-ag-open="' + esc(a.id) + '" role="button" tabindex="0">' +
-        '<div class="ag-card-top">' +
-          '<span class="ag-ava">' + AVA_SVG + '</span>' +
-          '<div style="min-width:0;flex:1"><h3>' + (esc(a.name) || 'Untitled') + '</h3></div>' +
-          statusPill(a) +
-        '</div>' +
-        '<div class="ag-card-role">' + (esc(a.role) || '<span style="color:var(--ds-text-muted)">No role yet — open to configure.</span>') + '</div>' +
-        '<div class="ag-card-foot">' +
-          '<span class="ag-card-count">' + agentCounts(a) + '</span>' +
-          '<span class="ag-card-acts">' +
-            // The point of the page: an agent you can actually talk to. Opens a
-            // session running AS this agent instead of the caller's default.
-            // Every agent gets one, `draft` included and regardless of
-            // `surfaces.web` — that field is descriptive today (nothing else
-            // in the platform enforces it either: the agent-as-API surface
-            // and Slack/Telegram routing read the same JSON blob and act on
-            // it just as little), so gating only this button would be an
-            // inconsistent, partial enforcement rather than a real one.
-            (a.slug
-              ? '<a class="ag-chat" href="/chat?agent=' + encodeURIComponent(a.slug) + '">Chat</a>'
-              : '') +
-            // The seeded default agent is not deletable (the API refuses it with
-            // 400 default_agent_undeletable) — every chat session is attributed
-            // to it. Render the reason in place of a control that cannot work.
-            (a.is_default
-              ? '<span class="ag-card-locked" title="Every chat is attributed to this agent">Default</span>'
-              : '<button type="button" class="ag-del" data-ag-del="' + esc(a.id) + '">Delete</button>') +
-          '</span>' +
-        '</div>' +
-      '</div>';
-    }).join('');
-    /* "New agent" leads the grid — the create affordance stays in the same
-       first-cell position no matter how many agents the caller already has,
-       instead of drifting to the end of a growing list (and below the fold). */
-    listView.innerHTML = '<div class="ag-grid">' +
-      '<button type="button" class="ag-new" data-ag-new><span style="font-size:18px">+</span> New agent</button>' +
-      cards + '</div>';
+    /* Ready and draft agents are different objects to their owner — one is a
+       thing you use, the other a thing you are still making — so the list says
+       so in two titled bands, ready first.
+
+       What a CARD does is the same in both: it opens the builder. This page is
+       where an agent is configured, and the card is the thing that stands for
+       the configuration; a click that started a conversation instead meant the
+       one obvious gesture on a ready agent could not reach the thing the page
+       is for, and an owner who wanted to change a prompt had to find the small
+       footer button. Chatting keeps a footer action on every card, so nothing
+       became unreachable — /chat's own agent picker is the other route to it. */
+    var ready = agents.filter(function (a) { return a.status === 'ready'; });
+    var drafts = agents.filter(function (a) { return a.status !== 'ready'; });
+
+    /* "New agent" is the FIRST CARD, not a button above the grid. Making a new
+       agent is the same kind of act as opening an existing one — you land in the
+       same builder — so it belongs in the same row, in the position the eye
+       reaches first, rather than floating over the collection as a toolbar.
+
+       It leads whichever group actually renders: Ready when there is one, else
+       Drafts. `group()` drops an empty group entirely, so handing the card to
+       Ready unconditionally would lose it on an instance whose every agent is
+       still a draft. */
+    var readyHtml = group('Ready', 'Click one to open its builder — Chat starts a conversation.', ready, newCard());
+    listView.innerHTML = readyHtml +
+      group('Drafts', 'Still being built — click one to keep going.', drafts,
+            readyHtml ? '' : newCard());
+  }
+
+  /* The dashed "add one here" affordance — a peer of the cards beside it in
+     size and radius, and deliberately NOT one in fill: a solid card would read
+     as an agent that exists. */
+  function newCard() {
+    return '<button type="button" class="ag-new" data-ag-new>' +
+      '<span class="ag-new-plus" aria-hidden="true">+</span>' +
+      '<span>New agent</span>' +
+    '</button>';
+  }
+
+  /* One titled band of cards. An empty group renders nothing rather than an
+     empty heading — a "Drafts" header over no drafts reads like a bug.
+
+     `lead` is optional markup for a first cell that is not an agent (the
+     "New agent" card). It rides INSIDE the grid so it shares the row's track
+     sizing and gap; placed outside it would need its own width rules and would
+     drift from the cards the moment the grid's columns changed. It does not
+     count toward the group's badge, which counts agents. */
+  function group(title, sub, list, lead) {
+    if (!list.length) return '';
+    return '<section class="ag-group">' +
+      '<div class="ag-group-h"><h2>' + title + '<span class="ag-group-n">' + list.length + '</span></h2>' +
+        '<p>' + sub + '</p></div>' +
+      '<div class="ag-grid">' + (lead || '') + list.map(agentCard).join('') + '</div>' +
+    '</section>';
+  }
+
+  function agentCard(a) {
+    // The card IS the builder affordance, in both states: this page configures
+    // agents, and the card stands for the configuration. (`statusPill` below is
+    // what says WHICH state it is in — the card's behaviour no longer differs,
+    // so nothing here reads the status itself.)
+    var open = 'data-ag-open="' + esc(a.id) + '"';
+    /* The counterpart action, on every card: Chat — every agent stays
+       talk-to-able, `draft` included and regardless of `surfaces.web`, because
+       that field is descriptive today (the agent-as-API surface and
+       Slack/Telegram routing read the same JSON blob and act on it just as
+       little), so gating only this button would be partial enforcement, not
+       real. Without a slug there is no session to open, so the card carries no
+       Chat action rather than a dead one. */
+    var alt = a.slug
+      ? '<a class="ag-chat" href="/chat?agent=' + encodeURIComponent(a.slug) + '">Chat</a>'
+      : '';
+    return '<div class="ag-card" ' + open + ' role="button" tabindex="0">' +
+      '<div class="ag-card-top">' +
+        '<span class="ag-ava">' + AVA_SVG + '</span>' +
+        '<div style="min-width:0;flex:1"><h3>' + (esc(a.name) || 'Untitled') + '</h3></div>' +
+        statusPill(a) +
+      '</div>' +
+      '<div class="ag-card-role">' + (esc(a.role) || '<span style="color:var(--ds-text-muted)">No role yet — open to configure.</span>') + '</div>' +
+      '<div class="ag-card-foot">' +
+        '<span class="ag-card-count">' + agentCounts(a) + '</span>' +
+        '<span class="ag-card-acts">' + alt +
+          // The seeded default agent is not deletable (the API refuses it with
+          // 400 default_agent_undeletable) — every chat session is attributed
+          // to it. Render the reason in place of a control that cannot work.
+          (a.is_default
+            ? '<span class="ag-card-locked" title="Every chat is attributed to this agent">Default</span>'
+            : '<button type="button" class="ag-del" data-ag-del="' + esc(a.id) + '">Delete</button>') +
+        '</span>' +
+      '</div>' +
+    '</div>';
   }
 
   /* ── Builder view ── */
   var SECTION_KEYS = ['identity', 'knowledge', 'capabilities', 'surfaces', 'schedules', 'boundaries'];
 
-  function openBuilder(id) {
+  /* `opts.isNew` marks a placeholder minted by "New agent" — see
+     headActionsHtml and leaveBuilder for what that changes. */
+  function openBuilder(id, opts) {
+    // The conversation and the live preview socket belong to ONE agent —
+    // carrying either into the next builder would show someone else's
+    // transcript and stream a previous agent's answers into this one's pane.
+    if (currentId !== id) resetBuilderPanes();
     currentId = id;
+    isNewAgent = !!(opts && opts.isNew);
+    // Everything the owner does from here is measured against this snapshot.
+    setBaseline();
     collapsed = { identity: false, knowledge: true, capabilities: true, surfaces: true, schedules: true, boundaries: true };
     schedForm = blankSchedForm();
     loadPlugins().then(renderBuilder);
@@ -490,26 +493,94 @@
     renderBuilder();
     window.scrollTo(0, 0);
   }
-  function closeBuilder() { currentId = null; renderList(); window.scrollTo(0, 0); }
+  function closeBuilder() {
+    resetBuilderPanes();
+    currentId = null; baseline = null; isNewAgent = false;
+    renderList(); window.scrollTo(0, 0);
+  }
 
-  function section(key, no, title, note, sub, summary, body) {
-    var isC = !!collapsed[key];
-    return '<div class="ag-sec' + (isC ? ' collapsed' : '') + '" data-sec="' + key + '">' +
-      '<div class="ag-sec-head" data-ag-toggle-sec="' + key + '" role="button" tabindex="0" aria-expanded="' + (!isC) + '">' +
-        '<span class="ag-sec-no">' + no + '</span>' +
-        '<div class="ag-sec-grow"><h3>' + title + (note ? ' <span class="ag-sec-note">' + note + '</span>' : '') + '</h3>' +
-          (sub ? '<p class="ag-sec-sub">' + sub + '</p>' : '') + '</div>' +
-        '<span class="ag-sec-sum">' + (summary || '') + '</span>' +
-        '<span class="ag-sec-chev"><svg viewBox="0 0 24 24" fill="none"><path d="M5 8.5l7 7 7-7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>' +
-      '</div>' +
-      '<div class="ag-sec-body">' + body + '</div>' +
-    '</div>';
+  /* ── Leaving the builder ──
+     "← All agents" is the only way out, and what it costs depends on what is
+     open. On a NEW agent it is destructive — the placeholder row exists
+     server-side (the conversation and the preview both need an id to talk
+     to), so walking away has to delete it, or every abandoned attempt would
+     litter the list with untitled drafts. On an EXISTING agent it only throws
+     away the edits made since the last save, and the working copy is rolled
+     back to the baseline so a later re-open does not show them again.
+
+     Either way the owner is asked first, and only when there is something to
+     lose: a clean existing agent leaves without a dialog. */
+  function leaveBuilder() {
+    var a = current();
+    if (!a) { closeBuilder(); return; }
+    if (isNewAgent) {
+      confirmModal({
+        title: 'Discard this agent?',
+        message: 'It has not been saved. The configuration and this conversation will be lost.',
+        confirmText: 'Discard', cancelText: 'Keep building', danger: true
+      }).then(function (ok) { if (ok) discardNewAgent(a); });
+      return;
+    }
+    if (!isDirty()) { closeBuilder(); return; }
+    confirmModal({
+      title: 'Leave without saving?',
+      message: 'Your changes to “' + (a.name || 'this agent') + '” will be discarded.',
+      confirmText: 'Discard changes', cancelText: 'Keep editing', danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      revertToBaseline(a);
+      closeBuilder();
+    });
+  }
+
+  /* Put the working copy back to the last agreement with the server. Nothing
+     was written, so this is a pure client-side rollback. */
+  function revertToBaseline(a) {
+    if (baseline === null) return;
+    var saved = JSON.parse(baseline);
+    EDITABLE.forEach(function (k) { a[k] = saved[k]; });
+  }
+
+  function discardNewAgent(a) {
+    var id = a.id;
+    agents = agents.filter(function (x) { return x.id !== id; });
+    closeBuilder();
+    fetch('/api/v1/agents/' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); })
+      .catch(function (err) {
+        // The row outlived the attempt to discard it. Put it back rather than
+        // leaving an agent on the server that the list denies exists.
+        console.error('agents: discard failed', err);
+        agents.push(a); renderList();
+        if (window.appToast) window.appToast({ kind: 'error', msg: 'Could not discard the draft: ' + err.message });
+      });
+  }
+
+  /* `addKey`, when given, puts a "+" in the section header that opens that
+     section's picker. It sits INSIDE the header — which is itself a toggle —
+     so the click handler must match the button before the header; it does,
+     because `closest()` from the button finds the button first. Header rather
+     than body so the affordance is reachable while the section is collapsed,
+     which is the state most sections are in most of the time. */
+  /* Positional wrapper over BuilderShell.section — all this page adds is
+     where "is it collapsed" lives. NOTE the shell escapes title / note /
+     sub / summary, so they must be passed RAW; a pre-escaped summary would
+     come back out as `&amp;`. */
+  function section(key, no, title, note, sub, summary, body, addKey) {
+    return BuilderShell.section({
+      key: key, no: no, title: title, note: note, sub: sub,
+      summary: summary, body: body, addKey: addKey,
+      collapsed: !!collapsed[key],
+    });
   }
 
   function identityBody(a) {
-    return '<label class="ag-field"><span>Name</span>' +
-        '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
-      '<label class="ag-field"><span>Role <em>— one line</em></span>' +
+    /* Role first, name LAST (TCRD-205). The name is the least interesting
+       decision here and the hardest to make before you have said what the
+       agent is for — so the form opens on the thing itself and closes on
+       what to call it. Safe to reorder: the section summary already renders
+       `Unnamed`, so an un-named draft was never gated. */
+    return '<label class="ag-field"><span>Role <em>— one line</em></span>' +
         '<input type="text" data-ag-field="role" value="' + esc(a.role) + '" placeholder="e.g. Answers revenue questions from our governed metrics." maxlength="90" autocomplete="off"></label>' +
       '<label class="ag-field"><span>Instructions <em>— what it should do, and what it should avoid</em></span>' +
         '<textarea rows="4" data-ag-field="instructions" placeholder="e.g. Always use canonical metric definitions. Cite the table you queried. Never invent numbers.">' + esc(a.instructions) + '</textarea></label>' +
@@ -519,6 +590,8 @@
         }).join('') + '</div></div>' +
       '<label class="ag-field"><span>Greeting</span>' +
         '<textarea rows="2" data-ag-field="greeting" placeholder="Hi, I&#39;m …">' + esc(a.greeting) + '</textarea></label>' +
+      '<label class="ag-field"><span>Name <em>— last, once you know what it is</em></span>' +
+        '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
       '<div class="ag-note">Instructions replace the default analyst prompt. Agnes still appends its data-access rails (<code>agnes catalog</code> → <code>schema</code> → <code>query</code>), so you don’t need to restate them — write the persona and its task.</div>';
   }
 
@@ -527,10 +600,33 @@
      or rebuilds the whole section. `key` names both the query slot and the
      data-rows target. */
   function toolbar(key, placeholder, shown, total) {
-    return '<div class="ag-toolbar">' +
-        '<input type="text" class="ag-search" data-ag-search="' + key + '" value="' + esc(query[key]) + '" placeholder="' + esc(placeholder) + '" autocomplete="off">' +
-        '<span class="ag-toolcount" data-count="' + key + '">' + shown + ' of ' + total + '</span>' +
-      '</div>';
+    return BuilderShell.toolbar({
+      key: key, placeholder: placeholder, shown: shown, total: total, value: query[key],
+    });
+  }
+
+  /* The empty state for a section that holds nothing yet. It names the
+     conversation as the primary way to fill the section, and offers the
+     by-hand path as the secondary one — the whole point of showing only what
+     is attached is that this page stops reading as a form to be filled in. */
+  function emptySlot(key, head, body, cta) {
+    return '<div class="ag-slot">' +
+      '<p class="ag-slot-head">' + esc(head) + '</p>' +
+      '<p class="ag-slot-body">' + esc(body) + '</p>' +
+      '<button type="button" class="ag-addrow" data-ag-add="' + key + '">+ ' + esc(cta) + '</button>' +
+    '</div>';
+  }
+
+  /* An attached id with nothing in the pool to describe it — see the callers. */
+  function unknownRow(id, attr) {
+    return '<div class="ag-row">' +
+      '<div class="ag-row-body">' +
+        '<div class="ag-row-name"><code>' + esc(id) + '</code>' +
+          '<span class="ag-kind ag-kind--unknown">Unavailable</span></div>' +
+        '<div class="ag-row-desc">Attached, but not in what you can currently see.</div>' +
+      '</div>' +
+      '<button type="button" class="ag-tglbtn ag-tglbtn--rm" ' + attr + '="' + esc(id) + '">Remove</button>' +
+    '</div>';
   }
 
   var KIND_LABEL = { data: 'Data', memory: 'Memory', file: 'File' };
@@ -541,6 +637,26 @@
      is a template someone published to the Library. */
   var TYPE_LABEL = { plugin: 'Plugin', skill: 'Skill', agent: 'Agent Template' };
 
+  /* One knowledge row. `mode` is 'attached' (in the configuration panel, where
+     the only action is to take it back out) or 'pick' (in the picker modal,
+     where the toggle adds and removes). Both ride the same `data-ag-kn`
+     handler — the underlying operation is identical, only the label differs. */
+  function knowledgeRow(a, k, mode) {
+    var on = a.knowledge.indexOf(k.id) >= 0;
+    var label = mode === 'pick' ? (on ? '✓ Grounded' : '+ Ground') : 'Remove';
+    return '<div class="ag-row">' +
+      '<div class="ag-row-body">' +
+        '<div class="ag-row-name">' + esc(k.name) +
+          '<span class="ag-kind ag-kind--' + esc(k.kind) + '">' + (KIND_LABEL[k.kind] || 'Data') + '</span>' +
+          (k.meta ? '<span class="ag-row-meta">' + esc(k.meta) + '</span>' : '') + '</div>' +
+        '<div class="ag-row-desc">' + esc(k.description) + '</div>' +
+      '</div>' +
+      '<button type="button" class="ag-tglbtn' + (mode === 'pick' && on ? ' on' : '') +
+        (mode === 'attached' ? ' ag-tglbtn--rm' : '') + '" data-ag-kn="' + esc(k.id) + '">' + label + '</button>' +
+    '</div>';
+  }
+
+  /* Picker rows — the full RBAC-scoped pool, filtered by the modal's search. */
   function knowledgeRows(a) {
     var q = query.knowledge;
     var list = KNOWLEDGE.filter(function (k) { return matchesQuery(q, [k.name, k.description, KIND_LABEL[k.kind]]); });
@@ -549,25 +665,50 @@
         ? 'No data, memory, or files match “' + esc(q) + '”.'
         : 'Nothing you can access yet — add data or memory from the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.') + '</p>';
     }
-    return list.map(function (k) {
-      var on = a.knowledge.indexOf(k.id) >= 0;
-      return '<div class="ag-row">' +
-        '<div class="ag-row-body">' +
-          '<div class="ag-row-name">' + esc(k.name) +
-            '<span class="ag-kind ag-kind--' + esc(k.kind) + '">' + (KIND_LABEL[k.kind] || 'Data') + '</span>' +
-            (k.meta ? '<span class="ag-row-meta">' + esc(k.meta) + '</span>' : '') + '</div>' +
-          '<div class="ag-row-desc">' + esc(k.description) + '</div>' +
-        '</div>' +
-        '<button type="button" class="ag-tglbtn' + (on ? ' on' : '') + '" data-ag-kn="' + esc(k.id) + '">' + (on ? '✓ Grounded' : '+ Ground') + '</button>' +
-      '</div>';
-    }).join('');
+    return list.map(function (k) { return knowledgeRow(a, k, 'pick'); }).join('');
   }
 
+  /* The panel is a statement of what this agent IS, not a catalogue of what it
+     could be: it lists only what is actually attached. The full pool lives one
+     click away behind the header "+", because the intended way to fill this in
+     is to say so in the conversation. */
   function knowledgeBody(a) {
-    var shown = KNOWLEDGE.filter(function (k) { return matchesQuery(query.knowledge, [k.name, k.description, KIND_LABEL[k.kind]]); }).length;
-    return toolbar('knowledge', 'Search data, memory & files…', shown, KNOWLEDGE.length) +
-      '<div class="ag-rows" data-rows="knowledge">' + knowledgeRows(a) + '</div>' +
-      '<div class="ag-note">Everything you can access — your workspace’s governed data and memory, plus files from your <a href="/artefacts">Artefacts</a>. Discover more in the <a href="/catalog">Catalog</a>.</div>';
+    var attached = KNOWLEDGE.filter(function (k) { return a.knowledge.indexOf(k.id) >= 0; });
+    /* An id the panel cannot resolve is still real configuration — a source
+       that was granted when the agent was built and has since left the
+       caller's scope. Showing it as a bare id beats dropping it silently,
+       which would make the panel disagree with the agent. */
+    var unknown = a.knowledge.filter(function (id) {
+      return !KNOWLEDGE.some(function (k) { return k.id === id; });
+    });
+    if (!attached.length && !unknown.length) {
+      return emptySlot('knowledge',
+        'Nothing grounded yet.',
+        'Say what it should know — “ground it in our sales data” — and the builder attaches it. Or add one by hand.',
+        'Add data, memory or files');
+    }
+    return '<div class="ag-rows">' +
+        attached.map(function (k) { return knowledgeRow(a, k, 'attached'); }).join('') +
+        unknown.map(function (id) { return unknownRow(id, 'data-ag-kn'); }).join('') +
+      '</div>' +
+      '<button type="button" class="ag-addrow" data-ag-add="knowledge">+ Add data, memory or files</button>';
+  }
+
+  function capabilityRow(a, p, mode) {
+    var on = a.plugins.indexOf(p.id) >= 0;
+    var type = p.type || 'plugin';
+    var label = mode === 'pick' ? (on ? '✓ Enabled' : '+ Enable') : 'Remove';
+    return '<div class="ag-row">' +
+      '<div class="ag-row-body">' +
+        '<div class="ag-row-name">' + esc(p.name) +
+          '<span class="ag-kind ag-kind--' + esc(type) + '">' + esc(TYPE_LABEL[type] || type) + '</span>' +
+          (mode === 'pick' && p.installed ? '<span class="ag-instack">In your stack</span>' : '') +
+          (p.category ? '<span class="ag-row-meta">' + esc(p.category) + '</span>' : '') + '</div>' +
+        '<div class="ag-row-desc">' + esc(p.description || '') + '</div>' +
+      '</div>' +
+      '<button type="button" class="ag-tglbtn' + (mode === 'pick' && on ? ' on' : '') +
+        (mode === 'attached' ? ' ag-tglbtn--rm' : '') + '" data-ag-cap="' + esc(p.id) + '">' + label + '</button>' +
+    '</div>';
   }
 
   function capabilityRows(a) {
@@ -578,29 +719,117 @@
         ? 'No plugins or skills match “' + esc(q) + '”.'
         : 'No plugins or skills are available to you yet — browse the <a href="/catalog?kind=plugins">Catalog</a>.') + '</p>';
     }
-    return list.map(function (p) {
-      var on = a.plugins.indexOf(p.id) >= 0;
-      var type = p.type || 'plugin';
-      return '<div class="ag-row">' +
-        '<div class="ag-row-body">' +
-          '<div class="ag-row-name">' + esc(p.name) +
-            '<span class="ag-kind ag-kind--' + esc(type) + '">' + esc(TYPE_LABEL[type] || type) + '</span>' +
-            (p.installed ? '<span class="ag-instack">In your stack</span>' : '') +
-            (p.category ? '<span class="ag-row-meta">' + esc(p.category) + '</span>' : '') + '</div>' +
-          '<div class="ag-row-desc">' + esc(p.description || '') + '</div>' +
-        '</div>' +
-        '<button type="button" class="ag-tglbtn' + (on ? ' on' : '') + '" data-ag-cap="' + esc(p.id) + '">' + (on ? '✓ Enabled' : '+ Enable') + '</button>' +
-      '</div>';
-    }).join('');
+    return list.map(function (p) { return capabilityRow(a, p, 'pick'); }).join('');
   }
 
   function capabilitiesBody(a) {
-    if (plugins === null) return '<p class="ag-row-desc" style="padding:12px 0">Loading everything available to you…</p>';
     if (pluginsErr) return '<div class="ag-note">Could not load the marketplace right now — try reloading the page.</div>';
-    var shown = plugins.filter(function (p) { return matchesQuery(query.capabilities, [p.name, p.description, p.category, p.type]); }).length;
-    return toolbar('capabilities', 'Search plugins & skills…', shown, plugins.length) +
-      '<div class="ag-rows" data-rows="capabilities">' + capabilityRows(a) + '</div>' +
-      '<div class="ag-note">Any plugin or skill available to you — not just what’s in your stack; items already added are marked. Browse the full set in the <a href="/catalog?kind=plugins">Catalog</a>.</div>';
+    /* Enabled ids are the agent's own state and render immediately; only the
+       NAMES come from the marketplace. While that is still in flight an
+       enabled capability shows as its id rather than vanishing, so the panel
+       never briefly claims the agent has no tools when it has three. */
+    var pool = plugins || [];
+    var attached = pool.filter(function (p) { return a.plugins.indexOf(p.id) >= 0; });
+    var unknown = a.plugins.filter(function (id) {
+      return !pool.some(function (p) { return p.id === id; });
+    });
+    if (!attached.length && !unknown.length) {
+      if (plugins === null) return '<p class="ag-emptyrows">Loading…</p>';
+      return emptySlot('capabilities',
+        'No tools yet.',
+        'Tell the builder what it should be able to do and it picks the plugin or skill. Or add one by hand.',
+        'Add a plugin or skill');
+    }
+    return '<div class="ag-rows">' +
+        attached.map(function (p) { return capabilityRow(a, p, 'attached'); }).join('') +
+        unknown.map(function (id) { return unknownRow(id, 'data-ag-cap'); }).join('') +
+      '</div>' +
+      '<button type="button" class="ag-addrow" data-ag-add="capabilities">+ Add a plugin or skill</button>';
+  }
+
+  /* ── The picker ──
+     The full pool of everything the caller can reach, one click behind the
+     "+". It is deliberately a modal and not a third pane: browsing a
+     catalogue is a detour from building an agent, and it should end by
+     returning you to where you were. Rows reuse the section's own row
+     renderers and the same `data-ag-kn` / `data-ag-cap` handlers, so add and
+     remove behave identically wherever you do them.
+
+     Structure is the app-wide `.modal-backdrop > .modal-card` (style-custom
+     .css) so this inherits the shared overlay, not a private one. */
+  var PICKERS = {
+    knowledge: {
+      title: 'Add data, memory or files',
+      sub: 'Everything you can reach. Grounding an agent never widens what the person talking to it may see.',
+      search: 'Search data, memory & files…',
+      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.'
+    },
+    capabilities: {
+      title: 'Add a plugin or skill',
+      sub: 'Any plugin or skill available to you — not only what is in your stack.',
+      search: 'Search plugins & skills…',
+      foot: 'Browse the full set in the <a href="/catalog?kind=plugins">Catalog</a>.'
+    }
+  };
+
+  function pickerHtml(a) {
+    if (!picker) return '';
+    var def = PICKERS[picker];
+    var pool = picker === 'knowledge' ? KNOWLEDGE : (plugins || []);
+    var shown = picker === 'knowledge'
+      ? KNOWLEDGE.filter(function (k) { return matchesQuery(query.knowledge, [k.name, k.description, KIND_LABEL[k.kind]]); }).length
+      : pool.filter(function (p) { return matchesQuery(query.capabilities, [p.name, p.description, p.category, p.type]); }).length;
+    return BuilderShell.picker({
+      key: picker,
+      title: def.title,
+      sub: def.sub,
+      searchPlaceholder: def.search,
+      query: query[picker],
+      shown: shown,
+      total: pool.length,
+      rows: picker === 'knowledge' ? knowledgeRows(a) : capabilityRows(a),
+      // Pre-built: the footer carries links to the Catalog.
+      foot: def.foot,
+    });
+  }
+
+  function openPicker(key) {
+    picker = key;
+    query[key] = '';
+    renderPicker();
+    var s = document.querySelector('[data-ag-search="' + key + '"]');
+    if (s) s.focus();
+  }
+
+  function closePicker() {
+    if (!picker) return;
+    picker = null;
+    renderPicker();
+  }
+
+  function renderPicker() {
+    var host = document.getElementById('ag-picker');
+    if (!host) return;
+    var a = current();
+    host.innerHTML = a ? pickerHtml(a) : '';
+  }
+
+  /* Only the rows + count, so the search input keeps focus and caret — same
+     reason the ingredient search has always partial-rendered. */
+  function renderPickerRows() {
+    var a = current();
+    if (!a || !picker) return;
+    var rowsEl = document.querySelector('[data-rows="' + picker + '"]');
+    if (rowsEl) rowsEl.innerHTML = picker === 'knowledge' ? knowledgeRows(a) : capabilityRows(a);
+  }
+
+  /* An ingredient was added or removed. With the picker open, re-render the
+     panel and the picker's rows in place: a full renderBuilder would tear the
+     modal down under the pointer mid-selection. */
+  function afterIngredientChange() {
+    touch();
+    if (picker) { renderPickerRows(); renderCfgPane(); }
+    else renderBuilder();
   }
 
   function surfacesBody(a) {
@@ -794,7 +1023,7 @@
   function schedulesBody(a) {
     if (!a.slug) return '<div class="ag-note">This agent has no address yet — reload the page and try again.</div>';
     if (schedulesErr === 'disabled') {
-      return '<div class="ag-note">Scheduled runs are turned off on this instance (agent profiles are disabled) — ask an admin to enable them.</div>';
+      return '<div class="ag-note">Scheduled runs are turned off on this instance (agents are disabled) — ask an admin to enable them.</div>';
     }
     if (schedulesErr) return '<div class="ag-note">Could not load this agent’s schedules right now — try reloading the page.</div>';
     if (schedules === null) return '<p class="ag-row-desc" style="padding:12px 0">Loading schedules…</p>';
@@ -870,28 +1099,192 @@
     el.textContent = msg || '';
   }
 
-  function previewHtml(a) {
-    var kn = a.knowledge.length, cp = a.plugins.length;
+  /* ── Builder conversation ───────────────────────────────────────────────
+     The left pane is a conversation that WRITES the right pane. Each turn
+     POSTs to /api/agents/{id}/builder/turn, which applies the patch through
+     the ordinary PATCH path and returns the updated agent row — so the panel
+     always re-renders from the server's copy, never from a patch the page
+     hoped landed.
+
+     Transcript state is page-local (the endpoint is stateless and replays
+     `history` each turn). A reload therefore loses the conversation but never
+     the agent: the configuration is what was persisted. */
+  var conv = [];            // [{ role: 'user' | 'assistant', text }]
+  var convBusy = false;
+  var convErr = null;
+  var convDraft = '';       // survives re-renders triggered from the config panel
+  var builderTab = 'create';
+  var DEFAULT_CHIPS = [
+    'An agent for pipeline questions',
+    'Something that answers HR policy questions',
+    'A finance agent for margin and revenue'
+  ];
+  var convChips = DEFAULT_CHIPS.slice();
+  var touched = {};         // field -> true, cleared after one render
+
+  /* ── Live preview ──
+     A REAL session with the agent (POST /api/chat/sessions with the agent's
+     slug, then its WebSocket), not a mock of one. The socket lives in a
+     variable rather than the DOM so a re-render of either pane cannot drop
+     the connection mid-turn. */
+  /* Preview is a session, a socket and a stream of tokens — genuinely
+     stateful, which is why it is a service rather than part of the (pure)
+     shell. `resolveSlug` is the only thing that differs between the two
+     builders: here it is the agent being edited, saved first because the
+     agent runs SERVER-SIDE and can only answer as a configuration the server
+     has. That commit is the same write Save does, baseline included, so the
+     header stops claiming unsaved changes for edits that were just saved. */
+  var preview = BuilderPreview({
+    label: 'agents',
+    resolveSlug: function () {
+      var a = current(); if (!a) return null;
+      return saveAgent().then(function () { return a.slug; });
+    },
+    onUpdate: function () { renderConvPane(); },
+  });
+  var pv = preview.state;
+
+  function resetBuilderPanes() {
+    conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = DEFAULT_CHIPS.slice();
+    builderTab = 'create'; touched = {};
+    preview.reset();
+    pv = preview.state;
+  }
+
+
+  var msgHtml = BuilderShell.message;
+
+  var CUBE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>';
+
+  /* The opening turn is written by the page, not the model: it costs nothing,
+     it never fails, and it is what tells a first-time owner what kind of
+     sentence this box wants. */
+  function openingMessage() {
+    return 'Hi! I will help you build an agent. You can say something like, ' +
+      '“an agent that answers pipeline questions for the sales team” or ' +
+      '“something that looks up policies from the handbook.”\n\nWhat would you like it to do?';
+  }
+
+  function convHtml() {
+    return BuilderShell.conversation({
+      id: 'ag-conv',
+      rows: [{ role: 'assistant', text: openingMessage() }].concat(conv),
+      busy: convBusy,
+      err: convErr,
+    });
+  }
+
+  /* Chips are a create-tab affordance only, and never while a turn is in
+     flight — a suggestion you cannot click is noise. */
+  function composerHtml(kind, value, placeholder, busy) {
+    return BuilderShell.composer({
+      kind: kind, value: value, placeholder: placeholder, busy: busy,
+      chips: (kind === 'create' && !convBusy) ? convChips : [],
+    });
+  }
+
+  /* Which engine answered the last turn, so the pane can say when it is the
+     scripted stand-in. The turn has always reported it (`engine`, see
+     app/api/builder_core.py) and this builder used to discard it — which
+     defeats the point of naming the engine at all: someone spends an afternoon
+     judging a string-slicer. `BuilderShell.engineNotice` renders it, so all
+     four builders word it identically. */
+  var convEngine = null;
+
+  function createPaneHtml() {
+    return BuilderShell.engineNotice(convEngine) + convHtml() +
+      composerHtml('create', convDraft, 'Tell me what this agent should do…', convBusy);
+  }
+
+  function previewPaneHtml(a) {
+    var ready = (a.name || '').trim();
+    if (!ready) {
+      return BuilderShell.conversationEmpty({
+        id: 'ag-pv-conv', icon: CUBE_SVG, text: 'Start by defining your agent.',
+      }) + composerHtml('preview', '', 'Start by defining your agent.', true);
+    }
+    var rows = pv.msgs.slice();
+    if (pv.stream) rows.push({ role: 'assistant', text: pv.stream });
+    var body = rows.length || pv.err || pv.busy
+      ? BuilderShell.conversation({ id: 'ag-pv-conv', rows: rows, busy: pv.busy, err: pv.err })
+      : BuilderShell.conversationEmpty({
+          id: 'ag-pv-conv', icon: CUBE_SVG,
+          text: 'Talk to ' + a.name + ' the way your team will.',
+        });
+    /* Answers render as plain text (this page has no HTML sanitizer, and an
+       unsanitized model answer is exactly the innerHTML the security
+       playbook forbids). The full chat page has the real renderer — tables,
+       code blocks, tool cards — so link to the same session rather than
+       reimplementing it in the drawer. */
+    var full = pv.session
+      ? ' <a href="/chat?session=' + encodeURIComponent(pv.session.id) + '">Open in full chat →</a>'
+      : '';
+    return body +
+      '<p class="ag-live-note">A real session with this agent, using the configuration on the right.' + full + '</p>' +
+      composerHtml('preview', pv.draft, 'Ask ' + (a.name || 'your agent') + '…', pv.busy);
+  }
+
+  function cfgBodyHtml(a) {
     var sn = Object.keys(a.surfaces).filter(function (k) { return a.surfaces[k]; }).length;
-    return '<h3>Preview</h3>' +
-      '<div class="ag-pv-card">' +
-        '<div class="ag-pv-hd">' +
-          '<span class="ag-ava">' + AVA_SVG + '</span>' +
-          '<div style="min-width:0"><div class="ag-pv-name" id="ag-pv-name">' + (esc(a.name) || 'Your agent') + '</div>' +
-          '<div class="ag-pv-role" id="ag-pv-role">' + (esc(a.role) || '—') + '</div></div>' +
-        '</div>' +
-        '<div class="ag-pv-body">' +
-          '<div class="ag-pv-bubble" id="ag-pv-greeting">' + (esc(a.greeting) || '…') + '</div>' +
-          '<div class="ag-pv-input" aria-hidden="true"><span id="ag-pv-ph">Ask ' + (esc(a.name) || 'your agent') + '…</span><span class="ag-pv-send">↑</span></div>' +
-        '</div>' +
-        '<div class="ag-pv-note">Preview only — not a live chat.</div>' +
-      '</div>' +
-      '<div class="ag-pv-meta">' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Grounded in</span><span class="ag-pv-v">' + kn + ' source' + (kn === 1 ? '' : 's') + '</span></div>' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Can use</span><span class="ag-pv-v">' + cp + ' tool' + (cp === 1 ? '' : 's') + '</span></div>' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Tone</span><span class="ag-pv-v" style="text-transform:capitalize">' + esc(a.tone) + '</span></div>' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Surfaces</span><span class="ag-pv-v">' + sn + '</span></div>' +
-      '</div>';
+    return '<div class="ag-cfg-ava"><span>' + AVA_SVG + '</span></div>' +
+      section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
+        (a.name || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
+      section('knowledge', 2, 'Data & resources', 'what it knows',
+        'What this agent is allowed to reach. Outside of this it says it cannot help, rather than guessing.',
+        a.knowledge.length + ' source' + (a.knowledge.length === 1 ? '' : 's'), knowledgeBody(a), 'knowledge') +
+      section('capabilities', 3, 'Capabilities', 'what it can do',
+        'The tools it can use — plugins and skills.',
+        a.plugins.length + ' enabled', capabilitiesBody(a), 'capabilities') +
+      section('surfaces', 4, 'Surfaces', 'where it runs',
+        'The same agent, reachable where your team already works.',
+        'On ' + sn, surfacesBody(a)) +
+      section('schedules', 5, 'Schedules', 'when it runs on its own',
+        'Run this agent unattended on a cadence — each schedule sends its own prompt.',
+        scheduleSummary(), schedulesBody(a)) +
+      section('boundaries', 6, 'Boundaries', 'set by admin',
+        'Guardrails managed by your workspace admin — you build within them.',
+        'Admin-managed', boundariesBody());
+  }
+
+  /* ── Header actions ──
+     A NEW agent and an EXISTING one are at different points in their life, so
+     they get different verbs.
+
+     New: Save as draft (commit it) and Mark ready (commit it AND publish it).
+     There is deliberately no Delete — there is nothing yet to delete, and the
+     way out is "← All agents", which discards the placeholder. Offering both
+     would be two buttons for one outcome, one of them sounding permanent and
+     the other harmless.
+
+     Existing: Save, the status toggle, and Delete. "← All agents" leaves
+     without saving. Delete is the destructive one and stays furthest from
+     Save, which is the button being aimed at. */
+  function headActionsHtml(a) {
+    var dirty = isDirty();
+    var busy = saving ? ' disabled' : '';
+    var mark = '<button type="button" class="cc-btn cc-btn--primary" data-ag-status' + busy + '>' +
+      (a.status === 'ready' ? 'Back to draft' : 'Mark ready') + '</button>';
+    if (isNewAgent) {
+      return statusPill(a) +
+        '<button type="button" class="cc-btn" data-ag-save' + busy + '>' +
+          (saving ? 'Saving…' : 'Save as draft') + '</button>' + mark;
+    }
+    return statusPill(a) +
+      (dirty ? '<span class="ag-unsaved" title="Not saved yet">Unsaved changes</span>' : '') +
+      // Same reason as the list card: the default agent has no delete.
+      (a.is_default ? '' : '<button type="button" class="cc-btn ag-del-btn" data-ag-del="' + esc(a.id) + '">Delete</button>') +
+      '<button type="button" class="cc-btn" data-ag-status' + busy + '>' +
+        (a.status === 'ready' ? 'Revert to draft' : 'Mark ready') + '</button>' +
+      '<button type="button" class="cc-btn cc-btn--primary" data-ag-save' +
+        (saving || !dirty ? ' disabled' : '') + '>' + (saving ? 'Saving…' : 'Save') + '</button>';
+  }
+
+  /* Repaint ONLY the header actions. Called on every keystroke (via touch()),
+     so it must not rebuild the panel the caret is sitting in. */
+  function syncHeaderState() {
+    var a = current();
+    var host = document.getElementById('ag-build-actions');
+    if (a && host) host.innerHTML = headActionsHtml(a);
   }
 
   function renderBuilder() {
@@ -900,55 +1293,162 @@
     setPageHead(false);
     listView.hidden = true;
     builderView.hidden = false;
-    var sn = Object.keys(a.surfaces).filter(function (k) { return a.surfaces[k]; }).length;
     builderView.innerHTML =
-      '<button type="button" class="ag-back" data-ag-back>← All agents</button>' +
-      '<div class="ag-build-head">' +
-        '<div style="min-width:0">' +
-          '<div class="ag-build-kicker">Configuring agent</div>' +
-          '<h2 id="ag-build-title">' + (esc(a.name) || 'Untitled') + '</h2>' +
-        '</div>' +
-        '<div class="ag-build-actions">' + statusPill(a) +
-          // Same reason as the list card: the default agent has no delete.
-          (a.is_default ? '' : '<button type="button" class="cc-btn ag-del-btn" data-ag-del="' + esc(a.id) + '">Delete</button>') +
-          '<button type="button" class="cc-btn' + (a.status === 'ready' ? '' : ' cc-btn--primary') + '" data-ag-status>' +
-            (a.status === 'ready' ? 'Back to draft' : 'Mark ready') + '</button>' +
-        '</div>' +
-      '</div>' +
-      '<div class="ag-bgrid">' +
-        '<div>' +
-          section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
-            (esc(a.name) || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
-          section('knowledge', 2, 'Knowledge', 'what it knows',
-            'Ground it in anything you can access — governed data, memory, and your files.',
-            a.knowledge.length + ' source' + (a.knowledge.length === 1 ? '' : 's'), knowledgeBody(a)) +
-          section('capabilities', 3, 'Capabilities', 'what it can do',
-            'Give it tools — any plugin or skill available to you, not only what’s in your stack.',
-            a.plugins.length + ' enabled', capabilitiesBody(a)) +
-          section('surfaces', 4, 'Surfaces', 'where it runs',
-            'The same agent, reachable where your team already works.',
-            'On ' + sn, surfacesBody(a)) +
-          section('schedules', 5, 'Schedules', 'when it runs on its own',
-            'Run this agent unattended on a cadence — each schedule sends its own prompt.',
-            scheduleSummary(), schedulesBody(a)) +
-          section('boundaries', 6, 'Boundaries', 'set by admin',
-            'Guardrails managed by your workspace admin — you build within them.',
-            'Admin-managed', boundariesBody()) +
-        '</div>' +
-        '<aside class="ag-preview" id="ag-preview">' + previewHtml(a) + '</aside>' +
-      '</div>';
+      BuilderShell.head({
+        backLabel: 'All agents',
+        title: a.name || 'New agent',
+        titleId: 'ag-build-title',
+        actionsId: 'ag-build-actions',
+        // Which verbs belong here depends on where this agent is in its life.
+        actions: headActionsHtml(a),
+      }) +
+      BuilderShell.workspace({
+        left: BuilderShell.tabs({
+          active: builderTab,
+          tabs: [{ id: 'create', label: 'Create' }, { id: 'preview', label: 'Preview' }],
+        }) + (builderTab === 'create' ? createPaneHtml() : previewPaneHtml(a)),
+        cfgTitle: 'Configuration',
+        cfgSub: 'what this agent is, editable by hand',
+        cfgBodyId: 'ag-cfg-body',
+        cfg: cfgBodyHtml(a),
+      }) +
+      '<div id="ag-picker"></div>';
     syncSkillDropdown();
+    flagTouchedFields();
+    scrollConvToEnd();
+    renderPicker();
   }
 
-  /* Light-touch preview sync while typing (no re-render → keeps focus). */
+  /* Re-render ONLY the pane that changed. A full renderBuilder on every
+     keystroke or streamed token would pull the caret out of whichever
+     composer the owner is typing in, and rebuild the other pane for nothing. */
+  function renderConvPane() {
+    var a = current(); if (!a) return;
+    var pane = builderView.querySelector('.ag-pane');
+    if (!pane) { renderBuilder(); return; }
+    var tabs = pane.querySelector('.ag-tabs');
+    if (!tabs) { renderBuilder(); return; }
+    // Keep the tab strip; replace everything after it.
+    while (tabs.nextSibling) pane.removeChild(tabs.nextSibling);
+    pane.insertAdjacentHTML('beforeend', builderTab === 'create' ? createPaneHtml() : previewPaneHtml(a));
+    scrollConvToEnd();
+  }
+
+  function renderCfgPane() {
+    var a = current(); if (!a) return;
+    var body = document.getElementById('ag-cfg-body');
+    if (!body) { renderBuilder(); return; }
+    body.innerHTML = cfgBodyHtml(a);
+    syncSkillDropdown();
+    flagTouchedFields();
+  }
+
+  function scrollConvToEnd() {
+    var el = document.getElementById('ag-conv') || document.getElementById('ag-pv-conv');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  /* Highlight the fields the last turn wrote, once. Without this a patch that
+     changes three fields deep in a collapsed section is invisible: the reply
+     says what changed, but the panel gives no clue where to look. */
+  function flagTouchedFields() {
+    var keys = Object.keys(touched);
+    if (!keys.length) return;
+    keys.forEach(function (k) {
+      var el = document.querySelector('[data-ag-field="' + k + '"]');
+      if (el) { el.classList.remove('ag-touched'); void el.offsetWidth; el.classList.add('ag-touched'); }
+    });
+    touched = {};
+  }
+
+  /* One builder turn. The reply is inserted as TEXT (see .ag-msg-text) — the
+     model's output is untrusted and this page has no HTML sanitizer. */
+  function sendBuilderTurn(text) {
+    var a = current(); if (!a || convBusy) return;
+    conv.push({ role: 'user', text: text });
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    renderConvPane();
+    fetch('/api/agents/' + encodeURIComponent(a.id) + '/builder/turn', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        message: text,
+        history: conv.slice(0, -1),
+        /* Editing is explicit now, so a turn must NOT write: it returns the
+           sanitized patch and the page merges it into the same unsaved
+           working copy the panel is showing. Without this, "leave without
+           saving" would silently keep everything the conversation had said,
+           and Save would have nothing left to do. */
+        apply: false,
+        // ...and for the same reason the server's row is no longer what the
+        // owner is looking at, so the turn is given the working copy to
+        // reason about instead of the last-saved one.
+        config: agentPayload(a),
+        // The picker's own ids, so the assistant can only choose capabilities
+        // this page is actually offering (the server validates against this
+        // same list before returning a patch).
+        plugin_candidates: (plugins || []).slice(0, 60).map(function (p) {
+          return { id: String(p.id), name: String(p.name || ''), description: String(p.description || '').slice(0, 400) };
+        })
+      })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) {
+          var d = (body && body.detail) || {};
+          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
+        }
+        return body;
+      });
+    }).then(function (body) {
+      conv.push({ role: 'assistant', text: body.reply || '' });
+      convEngine = body.engine || null;
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      var patch = body.patch || {};
+      if (Object.keys(patch).length) {
+        /* Merge into the working copy. This is the one place the old
+           "re-render from the server's row, never the patch" rule had to
+           give: with `apply:false` there IS no updated row, because nothing
+           was written. The safety it bought — never showing a scope the
+           agent does not have — is not lost, only moved: an unsaved patch
+           grants nothing at all, and Save re-derives the enforced scope
+           server-side and returns the row the panel then reflects. */
+        EDITABLE.forEach(function (k) {
+          if (Object.prototype.hasOwnProperty.call(patch, k)) a[k] = patch[k];
+        });
+        touched = {};
+        Object.keys(patch).forEach(function (k) { touched[k] = true; });
+        touch();
+        renderCfgPane();
+        syncPreview();
+      }
+    }).catch(function (err) {
+      console.error('agents: builder turn failed', err);
+      convErr = err.message;
+    }).finally(function () {
+      convBusy = false;
+      renderConvPane();
+    });
+  }
+
+  /* ── Live preview session ──
+     Opened lazily on the first message so switching to the tab costs nothing.
+     Bound by slug to the agent being edited, which is why the draft is saved
+     server-side before the socket opens — see the note in the body. */
+
+  /* Engine errors arrive as internal kinds (`kai_integration_not_configured`,
+     `concurrency_cap`). Pasted verbatim they read as a broken page, and send
+     the owner looking for a mistake in a configuration that is in fact fine —
+     what is missing is instance-level plumbing only an admin can supply. Say
+     which of the two it is; keep the kind in the console. */
+
+
+
+  /* Light-touch header sync while typing (no re-render → keeps focus). */
   function syncPreview() {
     var a = current(); if (!a) return;
     var el;
-    if ((el = document.getElementById('ag-pv-name'))) el.textContent = a.name || 'Your agent';
-    if ((el = document.getElementById('ag-pv-role'))) el.textContent = a.role || '—';
-    if ((el = document.getElementById('ag-pv-greeting'))) el.textContent = a.greeting || '…';
-    if ((el = document.getElementById('ag-pv-ph'))) el.textContent = 'Ask ' + (a.name || 'your agent') + '…';
-    if ((el = document.getElementById('ag-build-title'))) el.textContent = a.name || 'Untitled';
+    if ((el = document.getElementById('ag-build-title'))) el.textContent = a.name || 'New agent';
     if ((el = document.querySelector('[data-sec="identity"] .ag-sec-sum'))) el.textContent = (a.name || 'Unnamed') + ' · ' + a.tone;
   }
 
@@ -986,6 +1486,13 @@
     // no-modal draft flow: the row is still renamed (and its slug re-derived,
     // `_draft_slug_rename`) on the very next keystroke in the Identity field.
     payload.name = payload.name || 'Untitled';
+    // …and explicitly a DRAFT. v1's create defaults `status` to 'ready'
+    // where the deleted router made drafts, so without this a brand-new
+    // agent would be Ready before it has a role — it would appear in the
+    // chat composer's agent picker (which filters to ready) as something
+    // nobody has configured, and the header's own "Save as draft" /
+    // "Mark ready" pair would contradict the row's real state.
+    if (!payload.status) payload.status = 'draft';
     return fetch('/api/v1/agents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -995,8 +1502,11 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function (created) {
+      /* The row is created up front because the conversation and the preview
+         both address the agent by id — but it is a PLACEHOLDER until the
+         owner saves it, and leaving the builder deletes it again. */
       agents.push(created);
-      openBuilder(created.id);
+      openBuilder(created.id, { isNew: true });
     }).catch(function (err) {
       console.error('agents: create failed', err);
       if (window.appToast) window.appToast({ kind: 'error', msg: 'Could not create the agent: ' + err.message });
@@ -1043,9 +1553,37 @@
     // without this the click both navigated and swapped the view underneath it.
     // Let the anchor do what an anchor does.
     if (e.target.closest('.ag-chat')) return;
-    var t = e.target.closest('[data-ag-new],[data-ag-open],[data-ag-del],[data-ag-back],[data-ag-status],[data-ag-toggle-sec],[data-ag-tone],[data-ag-kn],[data-ag-cap],[data-ag-surf],[data-ag-tpl],[data-ag-tpl-close],[data-ag-sch-toggle],[data-ag-sch-del],[data-ag-sch-create]');
+    // Backdrop click closes the picker — but only when the click is ON the
+    // backdrop, not on the card inside it (which is a descendant, so a plain
+    // closest() would swallow every click in the modal as a dismissal).
+    if (picker && e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) { closePicker(); return; }
+    var t = e.target.closest('[data-ag-new],[data-ag-open],[data-ag-del],[data-ag-back],[data-ag-save],[data-ag-status],[data-ag-toggle-sec],[data-ag-tone],[data-ag-kn],[data-ag-cap],[data-ag-surf],[data-ag-add],[data-ag-pick-close],[data-ag-tpl],[data-ag-tpl-close],[data-ag-sch-toggle],[data-ag-sch-del],[data-ag-sch-create],[data-ag-tab],[data-ag-chip],[data-ag-send]');
     if (!t) return;
     var a = current();
+    if (t.hasAttribute('data-ag-tab')) {
+      var tab = t.getAttribute('data-ag-tab');
+      if (tab !== builderTab) {
+        // Carry the half-typed line across the switch — losing it is the
+        // cheapest possible way to make a tab feel destructive.
+        var live = builderView.querySelector('[data-ag-comp]');
+        if (live) { if (builderTab === 'create') convDraft = live.value; else pv.draft = live.value; }
+        builderTab = tab;
+        renderBuilder();
+      }
+      return;
+    }
+    if (t.hasAttribute('data-ag-chip')) {
+      sendBuilderTurn(t.getAttribute('data-ag-chip'));
+      return;
+    }
+    if (t.hasAttribute('data-ag-send')) {
+      var kind = t.getAttribute('data-ag-send');
+      var box = builderView.querySelector('[data-ag-comp="' + kind + '"]');
+      var text = box ? box.value.trim() : '';
+      if (!text) return;
+      if (kind === 'create') sendBuilderTurn(text); else preview.send(text);
+      return;
+    }
     if (t.hasAttribute('data-ag-new')) {
       // With templates installed, picking one is the leading path — that is the
       // relationship between the two entities made visible, instead of leaving
@@ -1078,10 +1616,7 @@
       // Optimistic removal: the row disappears at once, and a failed DELETE
       // restores it rather than leaving the list lying about what exists.
       agents = agents.filter(function (x) { return x.id !== id; });
-      // A pending debounced PUT would land on a row we just removed — drop it
-      // (deleting straight after an edit is now one click away in the builder).
-      clearTimeout(saveTimers[id]);
-      if (currentId === id) currentId = null;
+      if (currentId === id) { currentId = null; baseline = null; isNewAgent = false; }
       renderList();
       fetch('/api/v1/agents/' + encodeURIComponent(id), {
         method: 'DELETE', credentials: 'same-origin'
@@ -1095,29 +1630,51 @@
     } else if (t.hasAttribute('data-ag-open')) {
       openBuilder(t.getAttribute('data-ag-open'));
     } else if (t.hasAttribute('data-ag-back')) {
-      closeBuilder();
+      leaveBuilder();
+    } else if (t.hasAttribute('data-ag-save') && a) {
+      saveAgent().then(function (ok) { if (ok) renderBuilder(); });
     } else if (t.hasAttribute('data-ag-status') && a) {
+      /* The status toggle is itself a decision worth committing, so it saves
+         rather than leaving "Ready" on screen over a draft row on the server.
+         On a new agent this is also what commits the placeholder. */
       a.status = a.status === 'ready' ? 'draft' : 'ready';
-      a.updated = new Date().toISOString(); save(); renderBuilder();
+      touch();
+      saveAgent().then(function () { renderBuilder(); });
     } else if (t.hasAttribute('data-ag-toggle-sec')) {
+      /* Toggle the class in place — do NOT re-render. Every section's body is
+         always in the DOM (`.ag-sec.collapsed .ag-sec-body` merely hides it),
+         so a re-render was never needed to open one; and rebuilding the panel
+         threw away the scroll position, snapping you to the top of the
+         configuration every time you opened section 5. */
       var key = t.getAttribute('data-ag-toggle-sec');
-      collapsed[key] = !collapsed[key]; renderBuilder();
+      collapsed[key] = !collapsed[key];
+      var sec = builderView.querySelector('[data-sec="' + key + '"]');
+      if (sec) {
+        sec.classList.toggle('collapsed', collapsed[key]);
+        t.setAttribute('aria-expanded', String(!collapsed[key]));
+      } else {
+        renderBuilder();
+      }
     } else if (t.hasAttribute('data-ag-tone') && a) {
-      a.tone = t.getAttribute('data-ag-tone'); save(); renderBuilder();
+      a.tone = t.getAttribute('data-ag-tone'); touch(); renderBuilder();
+    } else if (t.hasAttribute('data-ag-add')) {
+      openPicker(t.getAttribute('data-ag-add'));
+    } else if (t.hasAttribute('data-ag-pick-close')) {
+      closePicker();
     } else if (t.hasAttribute('data-ag-kn') && a) {
       var kid = t.getAttribute('data-ag-kn');
       var ki = a.knowledge.indexOf(kid);
       ki >= 0 ? a.knowledge.splice(ki, 1) : a.knowledge.push(kid);
-      save(); renderBuilder();
+      afterIngredientChange();
     } else if (t.hasAttribute('data-ag-cap') && a) {
       var pid = t.getAttribute('data-ag-cap');
       var pi = a.plugins.indexOf(pid);
       pi >= 0 ? a.plugins.splice(pi, 1) : a.plugins.push(pid);
-      save(); renderBuilder();
+      afterIngredientChange();
     } else if (t.hasAttribute('data-ag-surf') && a) {
       var sid = t.getAttribute('data-ag-surf');
       var def = SURFACE_DEFS.find(function (d) { return d.id === sid; });
-      if (def && !def.base) { a.surfaces[sid] = !a.surfaces[sid]; save(); renderBuilder(); }
+      if (def && !def.base) { a.surfaces[sid] = !a.surfaces[sid]; touch(); renderBuilder(); }
     } else if (t.hasAttribute('data-ag-sch-toggle') && a) {
       toggleSchedule(a, t.getAttribute('data-ag-sch-toggle'), t);
     } else if (t.hasAttribute('data-ag-sch-del') && a) {
@@ -1260,8 +1817,7 @@
     if (sk) {
       query[sk] = e.target.value;
       var a2 = current(); if (!a2) return;
-      var rowsEl = document.querySelector('[data-rows="' + sk + '"]');
-      if (rowsEl) rowsEl.innerHTML = sk === 'knowledge' ? knowledgeRows(a2) : capabilityRows(a2);
+      renderPickerRows();
       var cntEl = document.querySelector('[data-count="' + sk + '"]');
       if (cntEl) {
         var pool = sk === 'knowledge' ? KNOWLEDGE : (plugins || []);
@@ -1278,12 +1834,46 @@
     // loses the caret; values survive re-renders triggered elsewhere.
     var sf = e.target.getAttribute && e.target.getAttribute('data-ag-sch-field');
     if (sf) { if (schedForm) schedForm[sf] = e.target.value; return; }
+    // Composer text is state, not just DOM: the config panel re-renders the
+    // whole conversation pane whenever a turn lands, and a draft that only
+    // lived in the textarea would vanish under the owner mid-sentence.
+    var comp = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
+    if (comp) {
+      if (comp === 'create') convDraft = e.target.value; else pv.draft = e.target.value;
+      e.target.style.height = 'auto';
+      e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
+      return;
+    }
     var f = e.target.getAttribute && e.target.getAttribute('data-ag-field');
     if (!f) return;
     var a = current(); if (!a) return;
     a[f] = e.target.value;
     a.updated = new Date().toISOString();
-    save(); syncPreview();
+    touch(); syncPreview();
+  });
+
+  /* The in-page "← All agents" is not the only way out — a nav click, a
+     reload or a closed tab leaves too, and those cannot be intercepted with
+     our own dialog. The browser's generic prompt is the only thing available
+     there, and it is worth having: the alternative is silently discarding an
+     unsaved agent. Registered unconditionally; it does nothing unless there
+     is actually something pending. */
+  window.addEventListener('beforeunload', function (e) {
+    if (!hasPendingWork()) return;
+    e.preventDefault();
+    e.returnValue = '';   // required by older browsers to show the prompt
+  });
+
+  /* Enter sends, Shift+Enter opens a line — the convention every chat box on
+     this site already follows, so a composer that behaved otherwise would be
+     the surprising one. */
+  document.addEventListener('keydown', function (e) {
+    var kind = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
+    if (!kind || e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    var text = (e.target.value || '').trim();
+    if (!text) return;
+    if (kind === 'create') sendBuilderTurn(text); else preview.send(text);
   });
 
   /* Keyboard access for the div-based cards/section headers. The Chat link is
@@ -1292,8 +1882,14 @@
      (same guard the click handler above already applies to .ag-chat) would
      override the anchor's own navigation with openBuilder(). */
   document.addEventListener('keydown', function (e) {
+    // The picker owns Escape while it is up. It is not one of modal.js's
+    // dialogs and carries no [id$="Modal"]/.modal-overlay class, so the global
+    // Escape handler in _app_scripts.html does not see it.
+    if (e.key === 'Escape' && picker) { e.preventDefault(); closePicker(); return; }
     if (e.key !== 'Enter' && e.key !== ' ') return;
     if (e.target.closest && e.target.closest('.ag-chat')) return;
+    // Space in the picker's search box is a space, not a section toggle.
+    if (e.target.matches && e.target.matches('input,textarea')) return;
     var t = e.target.closest && e.target.closest('[data-ag-open],[data-ag-toggle-sec]');
     if (t) { e.preventDefault(); t.click(); }
   });

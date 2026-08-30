@@ -12,7 +12,6 @@ All require admin auth (the server returns 403 otherwise).
 from __future__ import annotations
 
 import json as json_lib
-import sys
 from typing import Optional
 
 import typer
@@ -106,18 +105,27 @@ def timeline(
         None, "--result-class", help="Filter by result class (success|error|denied|none|other)"
     ),
     source: Optional[str] = typer.Option(
-        None, "--source", help="Filter by source (web|cli|scheduler|system|api|broker|other)"
+        None, "--source", help="Filter by source (web|cli|scheduler|system|agent|other)"
+    ),
+    trail: Optional[str] = typer.Option(
+        None,
+        "--trail",
+        help="Narrow to one physical trail (audit|sync|llm|agent_scope). "
+        "Unset returns the unified timeline across all four.",
     ),
     include_self_reads: bool = typer.Option(
-        False, "--include-self-reads",
+        False,
+        "--include-self-reads",
         help="Include the Activity Center's own activity.read audit rows (hidden by default)",
     ),
     search: Optional[str] = typer.Option(None, "--search", help="Full-text search on params JSON"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON to stdout"),
 ):
-    """Tail the audit_log timeline (default last 24h, up to 50 rows).
+    """Tail the unified activity timeline (default last 24h, up to 50 rows).
 
-    Equivalent to GET /api/admin/activity with filters.
+    Folds in audit_log, sync_history, llm_usage and agent_scope_snapshots
+    (never chat_messages — privacy decision). Equivalent to GET
+    /api/admin/activity with filters.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -139,6 +147,8 @@ def timeline(
         params["result_pattern"] = result
     if result_class:
         params["result_class"] = result_class
+    if trail:
+        params["trail"] = trail
     if source:
         params["source"] = source
     if include_self_reads:
@@ -169,7 +179,9 @@ def timeline(
     col_action = 28
     col_user = 22
     col_result = 10
-    header = f"  {'TIME':<{col_time}}  {'ACTION':<{col_action}}  {'USER':<{col_user}}  {'RESULT':<{col_result}}  RESOURCE"
+    header = (
+        f"  {'TIME':<{col_time}}  {'ACTION':<{col_action}}  {'USER':<{col_user}}  {'RESULT':<{col_result}}  RESOURCE"
+    )
     typer.echo(header)
     typer.echo("  " + "-" * (len(header) - 2))
     for row in rows:
@@ -178,13 +190,11 @@ def timeline(
         uid = str(row.get("user_id") or row.get("user_email") or "")[:col_user]
         res = str(row.get("result") or "")[:col_result]
         resource_val = str(row.get("resource") or "")
-        typer.echo(
-            f"  {ts:<{col_time}}  {act:<{col_action}}  {uid:<{col_user}}  {res:<{col_result}}  {resource_val}"
-        )
+        typer.echo(f"  {ts:<{col_time}}  {act:<{col_action}}  {uid:<{col_user}}  {res:<{col_result}}  {resource_val}")
 
     next_cur = data.get("next_cursor")
     if next_cur:
-        typer.echo(f"\n  (more rows available — pass --limit higher or use --json to page with cursor)")
+        typer.echo("\n  (more rows available — pass --limit higher or use --json to page with cursor)")
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +290,9 @@ def sync(
     col_rows = 10
     col_dur = 10
     col_status = 8
-    header = f"  {'TABLE':<{col_table}}  {'SYNCED AT':<{col_time}}  {'ROWS':>{col_rows}}  {'DURATION':>{col_dur}}  STATUS"
+    header = (
+        f"  {'TABLE':<{col_table}}  {'SYNCED AT':<{col_time}}  {'ROWS':>{col_rows}}  {'DURATION':>{col_dur}}  STATUS"
+    )
     typer.echo(header)
     typer.echo("  " + "-" * (len(header) - 2))
     for row in rows:

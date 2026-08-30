@@ -76,6 +76,9 @@
                         `.ds-dropdown-native` shipped without its twin would
                         be an invisible control on the theme this page is
                         being drawn for #}
+{# The builder workspace's rules — package_drawer grows into it when
+   opened from "+ New". Without the sheet the two panes stack. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
 {# package_drawer.css dresses the fields of the shared create/edit drawer.
    Linked here because this page now opens that component for "Edit details"
@@ -184,12 +187,15 @@
   }
   .apd-share-row:last-of-type { border-bottom: none; }
   .apd-share-row__txt { min-width: 0; }
+  /* The group mark, not initials: "BM" beside "Board Materials" said the
+     name twice and said nothing about what kind of name it was. Shape from
+     the one shared set (js/kind_glyph.js). */
   .apd-ava {
     width: 30px; height: 30px; border-radius: 9px; flex: 0 0 auto;
     display: flex; align-items: center; justify-content: center;
-    font-size: 12px; font-weight: 700;
     background: var(--ds-surface-sunken); color: var(--ds-text-secondary);
   }
+  .apd-ava svg { width: 16px; height: 16px; }
   /* A grant to Everyone is company-wide — it must not look like one more
      group in the list, because it is the one row whose blast radius is the
      whole instance. */
@@ -718,6 +724,9 @@
 <script src="{{ static_url('js/filter_toolbar.js') }}"></script>
 {# NOT deferred: the click handler below is wired at parse time and would
    otherwise reference window.AgnesPackageDrawer before it exists. #}
+{# package_drawer builds the shared builder workspace when opened
+   from "+ New", so the shell has to be defined before it runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
@@ -786,9 +795,6 @@
     return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
                           .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
-  function initials(name) {
-    return String(name || "?").trim().charAt(0).toUpperCase() || "?";
-  }
   function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
   function grantOf(groupId) { return SHARING.find((s) => s.group_id === groupId); }
   function groupOf(groupId) { return GROUPS.find((g) => g.id === groupId); }
@@ -831,7 +837,8 @@
           : plural(s.member_count || 0, "member", "members");
         return `
         <div class="apd-share-row" data-share-group="${esc(s.group_id)}">
-          <div class="apd-ava ${s.is_everyone ? "is-everyone" : ""}">${esc(initials(s.group_name))}</div>
+          <div class="apd-ava ${s.is_everyone ? "is-everyone" : ""}"
+               role="img" aria-label="Group">${AgnesKindGlyph.get("group")}</div>
           <div class="apd-share-row__txt">
             <div class="apd-g-name">${esc(s.group_name)}</div>
             <div class="apd-g-sub">${esc(sub)}</div>

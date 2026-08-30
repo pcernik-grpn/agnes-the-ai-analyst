@@ -754,16 +754,16 @@ def test_mcp_route_refuses_when_the_switch_is_off(seeded_app, kai_env, monkeypat
     assert resp.json()["detail"] == "kai_mcp_not_enabled"
 
 
-def test_mcp_token_refuses_the_two_narrowed_session_kinds(seeded_app, kai_env, monkeypatch):
+def test_mcp_token_narrows_the_restricted_session_kinds(seeded_app, kai_env, monkeypatch):
     """A co-session guest and a scope-limited agent must NOT get owner authority.
 
-    `/api/kai/mcp` accepts any `mcp`-scoped broker ticket, and the native chat
-    runner mints one for every chat sandbox — so without this the two session
-    kinds `_mint_identity_jwt` deliberately narrows (live participant
-    intersection; owner-grants ∩ agent-scope) could borrow the stored owner's
-    whole tool surface through this route. This token is a registered bearer
-    with a baked subject and cannot carry either intersection, so it refuses,
-    the same call `_ticket_owner_for_git` makes. Found by Devin Review.
+    `_mint_identity_jwt` (the native replay path) answers a scope-limited
+    agent with an `agent_session` JWT whose authority is rebuilt live per
+    request (`AgentPrincipal`); this route now mints and REGISTERS the same
+    token instead of refusing, so a scoped agent's engine turn reaches the
+    tool surface with exactly the narrowed authority — never the owner's. A
+    co-session still refuses (its copresence surfaces have no engine
+    equivalent yet), and a deleted agent still fails closed.
     """
     from app.api import kai as kai_mod
     from fastapi import HTTPException
@@ -795,21 +795,93 @@ def test_mcp_token_refuses_the_two_narrowed_session_kinds(seeded_app, kai_env, m
             monkeypatch.setattr(
                 repos, "agents_repo", lambda: type("A", (), {"get_by_id": staticmethod(lambda _i: agent)})()
             )
+        return kai_mod._mint_mcp_access_token(chat_id)
+
+    def _refused(session, agent=None):
         with pytest.raises(HTTPException) as e:
-            kai_mod._mint_mcp_access_token(chat_id)
+            _with(session, agent)
         return e.value
 
-    # 1. shared conversation -> refused, not resolved to its stored owner
-    exc = _with(_Sess(is_co_session=True))
+    # 1. shared conversation -> still refused, not resolved to its stored owner
+    exc = _refused(_Sess(is_co_session=True))
     assert (exc.status_code, exc.detail) == (403, "mcp_not_available_to_co_session")
 
-    # 2. scope-limited agent -> refused
-    exc = _with(_Sess(agent_id="ag_1"), agent={"id": "ag_1", "deleted_at": None, "scope_mode": "selected"})
-    assert (exc.status_code, exc.detail) == (403, "mcp_not_available_to_scoped_agent")
+    # 2. scope-limited agent -> the SAME narrowed identity the native broker
+    # mints: typ=agent_session, no baked-in subject, registered so the MCP
+    # verifier accepts it. The resolver turns it into a live AgentPrincipal.
+    from src.repositories import oauth_clients_repo
+
+    scoped_agent = {"id": "ag_1", "deleted_at": None, "tables_mode": "selected", "owner_user_id": "analyst1"}
+    token = _with(_Sess(agent_id="ag_1"), agent=scoped_agent)
+    claims = _claims(token)
+    assert claims["typ"] == "agent_session"
+    assert claims["chat_session_id"] == chat_id
+    assert claims["sub"] == f"agent-session:{chat_id}", "no real identity may be baked into the token"
+    row = oauth_clients_repo().get_access_token(token)
+    assert row is not None, "the MCP verifier resolves against oauth_access_tokens"
+    assert row["client_id"] == "kai-agent-broker"
 
     # 3. deleted agent -> fails CLOSED rather than falling through to the owner
-    exc = _with(_Sess(agent_id="ag_2"), agent={"id": "ag_2", "deleted_at": "2026-01-01T00:00:00Z"})
+    exc = _refused(_Sess(agent_id="ag_2"), agent={"id": "ag_2", "deleted_at": "2026-01-01T00:00:00Z"})
     assert (exc.status_code, exc.detail) == (401, "ticket_agent_not_found")
+
+    # 4. an all-'all' agent whose session user is NOT its owner (Slack channel
+    # binding: the mentioner) also takes the narrowed path — running the turn
+    # with the mentioning user's own authority is `_mint_identity_jwt`'s
+    # documented owner-mismatch bug.
+    passthrough_foreign = {
+        "id": "ag_3",
+        "deleted_at": None,
+        "owner_user_id": "someone-else",
+        "tables_mode": "all",
+        "plugins_mode": "all",
+        "connections_mode": "all",
+        "memory_mode": "all",
+    }
+    token = _with(_Sess(agent_id="ag_3"), agent=passthrough_foreign)
+    assert _claims(token)["typ"] == "agent_session"
+
+
+def test_mcp_token_cache_misses_when_the_agent_scope_shape_changes(seeded_app, kai_env, monkeypatch):
+    """Narrowing an agent mid-conversation must not keep serving the owner
+    token for the rest of the cache entry's 15-minute life — the required
+    identity SHAPE is recomputed before the cache is read, and a kind
+    mismatch is a miss (the same cache-skips-the-guards class the deleted/
+    co-session cases already fixed)."""
+    from app.api import kai as kai_mod
+
+    body = _mint_session(seeded_app)
+    chat_id = body["chat_id"]
+    real = kai_mod.chat_session_repo().get_session(chat_id)
+
+    owner_token = kai_mod._mint_mcp_access_token(chat_id)
+    assert _claims(owner_token)["typ"] == "session"
+
+    class _Sess:
+        user_email = real.user_email
+        is_co_session = False
+        agent_id = "ag_flip"
+        id = chat_id
+
+    monkeypatch.setattr(
+        kai_mod, "chat_session_repo", lambda: type("R", (), {"get_session": staticmethod(lambda _sid: _Sess())})()
+    )
+    import src.repositories as repos
+
+    monkeypatch.setattr(
+        repos,
+        "agents_repo",
+        lambda: type(
+            "A",
+            (),
+            {"get_by_id": staticmethod(lambda _i: {"id": "ag_flip", "deleted_at": None, "tables_mode": "selected"})},
+        )(),
+    )
+    # Deliberately NOT clearing the cache: the fresh owner-kind entry is live
+    # and unexpired, and must still not be served for the now-narrowed session.
+    narrowed = kai_mod._mint_mcp_access_token(chat_id)
+    assert narrowed != owner_token
+    assert _claims(narrowed)["typ"] == "agent_session"
 
 
 def test_mcp_token_is_bound_to_the_mcp_resource_server(seeded_app, kai_env):
@@ -937,6 +1009,230 @@ def test_workspace_archive_is_byte_stable_across_a_second_boundary(seeded_app, k
     assert first == second
     # Belt and braces: the gzip header's 4-byte MTIME field must be zeroed.
     assert first[4:8] == b"\x00\x00\x00\x00"
+
+
+def _mint_agent_session(seeded_app, agent_kwargs, memories=()):
+    """An engine credential for a session BOUND to an agent — the shape
+    `ChatManager.create_session(agent_id=...)` produces on an engine instance
+    (`POST /api/kai/sessions` itself never binds one)."""
+    import uuid as _uuid
+
+    from app.api.kai import mint_engine_session_token
+    from app.chat.types import Surface
+    from src.repositories import agent_memories_repo, agents_repo, chat_session_repo
+
+    agent_id = str(_uuid.uuid4())
+    agents_repo().create(id=agent_id, owner_user_id="analyst1", **agent_kwargs)
+    for content in memories:
+        agent_memories_repo().create(
+            id=str(_uuid.uuid4()),
+            agent_id=agent_id,
+            owner_user_id="analyst1",
+            content=content,
+            source_session_id=None,
+            status="active",
+        )
+    session = chat_session_repo().create_session(
+        user_email="analyst@test.com",
+        surface=Surface.WEB,
+        session_id=str(_uuid.uuid4()),
+        agent_id=agent_id,
+    )
+    token, _ = mint_engine_session_token("analyst@test.com", session.id)
+    return _claims(token)["downstream_credential"]
+
+
+def test_workspace_carries_the_agent_persona_skill_and_memories(seeded_app, kai_env):
+    """The three artifacts the native workdir seam materializes for an agent
+    session must ride the tarball — this provider spawns nothing, so the
+    tarball IS the only channel a persona/memory can take to the turn.
+
+    The persona REPLACES CLAUDE.md (with the data-access rails appended, so a
+    persona can never silently drop the platform's data floor), the identity
+    skill lands at its native path, and the memories render through the same
+    helper the native seam writes through. The skill must NOT advertise the
+    remember endpoint: the engine sandbox has no channel to it.
+    """
+    import tarfile as _tarfile
+
+    credential = _mint_agent_session(
+        seeded_app,
+        {"name": "Analyst Persona", "slug": "analyst-persona", "system_prompt": "You are the revenue analyst."},
+        memories=("Analyst prefers charts over tables.",),
+    )
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200
+
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        claude_md = tar.extractfile("CLAUDE.md").read().decode("utf-8")
+        skill = tar.extractfile(".claude/skills/agnes-agent-context/SKILL.md").read().decode("utf-8")
+        memory = tar.extractfile(".claude/agent-memory.md").read().decode("utf-8")
+
+    assert claude_md.startswith("You are the revenue analyst.")
+    assert "Data access (Agnes platform)" in claude_md, "the persona must carry the data-access rails"
+    assert "Analyst Persona" in skill
+    assert "$AGNES_SERVER" not in skill, "the remember curl recipe is uncallable from the engine sandbox"
+    assert "Analyst prefers charts over tables." in memory
+
+
+def test_workspace_agent_persona_gets_fact_tool_guidance_when_the_switch_is_on(seeded_app, kai_env, monkeypatch):
+    """The default (no-persona) Workspace Prompt template carries a
+    `facts.enabled`-gated "Facts — entity and relationship questions"
+    section (`config/claude_md_template.txt`), but a persona REPLACES
+    `CLAUDE.md` wholesale — so without `agent_profile.FACTS_ACCESS_RAILS`
+    that guidance never reached a persona'd agent, and a who/what/
+    relationship question that `fact_search` would have answered directly
+    instead fell back to `agnes catalog` + SQL and reported no data, while
+    the empty default agent (unaltered rails) answered it correctly."""
+    import tarfile as _tarfile
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    credential = _mint_agent_session(
+        seeded_app,
+        {
+            "name": "Analyst Persona",
+            "slug": "analyst-persona-facts-on",
+            "system_prompt": "You are the revenue analyst.",
+        },
+    )
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200
+
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        claude_md = tar.extractfile("CLAUDE.md").read().decode("utf-8")
+
+    assert claude_md.count("fact_search") == 1
+    assert "fact_neighbors" in claude_md
+    assert "fact_claims" in claude_md
+    # Additive, not a replacement — the catalog guidance is still there too,
+    # and it comes first (steer to the more specific tool second).
+    assert "Data access (Agnes platform)" in claude_md
+    assert claude_md.index("Data access (Agnes platform)") < claude_md.index("fact_search")
+
+
+def test_workspace_agent_persona_gets_no_fact_tool_guidance_when_the_switch_is_off(seeded_app, kai_env, monkeypatch):
+    """An instance with `facts` off must not steer a persona'd agent toward
+    tools that would all 404."""
+    import tarfile as _tarfile
+
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    credential = _mint_agent_session(
+        seeded_app,
+        {
+            "name": "Analyst Persona",
+            "slug": "analyst-persona-facts-off",
+            "system_prompt": "You are the revenue analyst.",
+        },
+    )
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200
+
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        claude_md = tar.extractfile("CLAUDE.md").read().decode("utf-8")
+
+    assert "fact_search" not in claude_md
+    assert "Data access (Agnes platform)" in claude_md
+
+
+def test_workspace_agent_overlay_defaults_to_nothing(seeded_app, kai_env):
+    """The seeded default agent (empty system_prompt, no memories) must leave
+    the archive bit-for-bit identical to a no-agent session — the same
+    default-agent-unchanged guarantee the native persona seam keeps."""
+    plain = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    default_agent = _mint_agent_session(seeded_app, {"name": "Default", "slug": "default-x", "system_prompt": ""})
+
+    client = seeded_app["client"]
+    with mock.patch("time.time", return_value=1_700_000_000.0):
+        baseline = client.get("/api/kai/workspace", headers={"Authorization": f"Bearer {plain}"}).content
+        agented = client.get("/api/kai/workspace", headers={"Authorization": f"Bearer {default_agent}"}).content
+    assert baseline == agented
+
+
+def test_marketplace_identity_narrows_a_scoped_agent(seeded_app, kai_env, monkeypatch):
+    """The flattened marketplace overlay must resolve for the session's
+    EFFECTIVE identity: a scoped agent takes the intersection-filtered
+    principal path, never its caller's whole stack; a passthrough agent owned
+    by the caller keeps the plain caller; any resolution failure ships
+    nothing rather than the un-narrowed set."""
+    from types import SimpleNamespace
+
+    from app.api import kai as kai_mod
+    from app.auth.session_principal import AgentPrincipal
+
+    owner = {"id": "analyst1", "email": "analyst@test.com"}
+
+    # No agent → the caller, untouched.
+    plain = SimpleNamespace(id="s1", agent_id=None)
+    assert kai_mod._marketplace_identity(plain, owner) is owner
+
+    # Passthrough agent owned by the caller → still the caller.
+    import src.repositories as repos
+
+    passthrough = {
+        "id": "ag_p",
+        "deleted_at": None,
+        "owner_user_id": "analyst1",
+        "tables_mode": "all",
+        "plugins_mode": "all",
+        "connections_mode": "all",
+        "memory_mode": "all",
+    }
+    monkeypatch.setattr(repos, "agents_repo", lambda: SimpleNamespace(get_by_id=lambda _i: passthrough))
+    assert kai_mod._marketplace_identity(SimpleNamespace(id="s2", agent_id="ag_p"), owner) is owner
+
+    # Scoped agent → an AgentPrincipal carrying the live intersection.
+    scoped = dict(passthrough, id="ag_s", plugins_mode="selected")
+    monkeypatch.setattr(repos, "agents_repo", lambda: SimpleNamespace(get_by_id=lambda _i: scoped))
+    monkeypatch.setattr(repos, "users_repo", lambda: SimpleNamespace(get_by_id=lambda _i: owner))
+    monkeypatch.setattr(
+        "src.agent_scope_intersection.resolve_agent_authority", lambda _a, *_args, **_kw: {"table": frozenset()}
+    )
+    principal = kai_mod._marketplace_identity(SimpleNamespace(id="s3", agent_id="ag_s"), owner)
+    assert isinstance(principal, AgentPrincipal)
+    assert principal.agent_id == "ag_s"
+    assert principal.caller_user_id == "analyst1"
+
+    # Deleted agent → nothing, never the un-narrowed caller.
+    monkeypatch.setattr(repos, "agents_repo", lambda: SimpleNamespace(get_by_id=lambda _i: None))
+    assert kai_mod._marketplace_identity(SimpleNamespace(id="s4", agent_id="ag_gone"), owner) is None
+
+
+def test_marketplace_identity_narrows_a_co_session(seeded_app, kai_env, monkeypatch):
+    """A guest-driven conversation must not receive the stored owner's whole
+    marketplace text — the overlay resolves through a `SessionPrincipal`
+    carrying the live participant grant-intersection (the same construction
+    the co-session token resolver performs), and a co-session with no live
+    participants ships nothing."""
+    from types import SimpleNamespace
+
+    import src.repositories as repos
+    from app.api import kai as kai_mod
+    from app.auth.session_principal import SessionPrincipal
+
+    owner = {"id": "analyst1", "email": "analyst@test.com"}
+    guest = SimpleNamespace(id="cs1", is_co_session=True, agent_id=None)
+
+    live = [
+        SimpleNamespace(user_id="analyst1", user_email="analyst@test.com", left_at=None),
+        SimpleNamespace(user_id="u2", user_email="guest@test.com", left_at=None),
+    ]
+    monkeypatch.setattr(
+        repos,
+        "chat_session_participants_repo",
+        lambda: SimpleNamespace(get_session_participants=lambda _sid: live),
+    )
+    monkeypatch.setattr("src.grant_intersection.compute_grant_intersection", lambda _emails: {"table": frozenset()})
+    principal = kai_mod._marketplace_identity(guest, owner)
+    assert isinstance(principal, SessionPrincipal)
+    assert principal.participant_emails == ["analyst@test.com", "guest@test.com"]
+
+    # No live participants → nothing, never the un-narrowed owner.
+    monkeypatch.setattr(
+        repos,
+        "chat_session_participants_repo",
+        lambda: SimpleNamespace(get_session_participants=lambda _sid: []),
+    )
+    assert kai_mod._marketplace_identity(guest, owner) is None
 
 
 @pytest.mark.parametrize(
@@ -1089,15 +1385,18 @@ def test_a_blank_render_leaves_the_templates_own_instructions_alone(seeded_app, 
     assert _claude_md_from(archive) == (BUNDLED_TEMPLATE_DIR / "CLAUDE.md").read_text(encoding="utf-8")
 
 
-def test_the_rendered_prompt_is_withheld_from_the_two_narrowed_session_kinds(monkeypatch):
-    """The rendered document is RBAC-filtered for the session's OWNER.
+def test_the_rendered_prompt_follows_native_parity_for_restricted_sessions(monkeypatch):
+    """The rendered document is RBAC-filtered for the session's USER.
 
-    A co-session is driven by a guest and a scope-limited agent is deliberately
-    narrower than its owner, so serving either the owner's filtered view is the
-    "over-authorized guests" bug this codebase already refuses elsewhere
-    (`_mint_mcp_access_token`, and `WorkdirManager`'s ephemeral co-drive path,
-    which likewise never calls the renderer). Here it degrades to the bundled
-    text rather than raising, because the route's contract is 200-or-204.
+    A co-session is driven by a guest, so it still degrades to the bundled
+    text (the live participant intersection cannot be expressed in a static
+    render; degrade rather than raise because the route's contract is
+    200-or-204). A scope-limited agent session, though, now GETS the render —
+    native parity: `WorkdirManager` seeds every agent session's workdir from
+    the session user's own rendered prompt regardless of agent scope, and the
+    agent's narrower authority is enforced live at the tool seams
+    (`_mint_mcp_access_token` mints the `AgentPrincipal`-resolved token). A
+    deleted agent still falls back, never up.
     """
     from types import SimpleNamespace
 
@@ -1115,10 +1414,9 @@ def test_the_rendered_prompt_is_withheld_from_the_two_narrowed_session_kinds(mon
     scoped = SimpleNamespace(user_email="owner@example.com", is_co_session=False, agent_id="a1")
     monkeypatch.setattr(
         "src.repositories.agents_repo",
-        lambda: SimpleNamespace(get_by_id=lambda _id: {"id": "a1", "deleted_at": None, "scope": "selected"}),
+        lambda: SimpleNamespace(get_by_id=lambda _id: {"id": "a1", "deleted_at": None, "tables_mode": "selected"}),
     )
-    monkeypatch.setattr("src.agent_scope_intersection.agent_is_passthrough", lambda _a: False)
-    assert kai_mod._workspace_prompt_for(scoped) is None
+    assert kai_mod._workspace_prompt_for(scoped) == "# owner-only\n"
 
     # Deleted agent falls BACK, never up to the owner's view.
     monkeypatch.setattr(

@@ -419,6 +419,53 @@ class TestAuthWhoami:
         assert result.exit_code == 1
         assert "Not logged in" in result.output
 
+    def test_whoami_sandbox_reports_brokered_identity(self, monkeypatch):
+        """In a chat sandbox (AGNES_SESSION_ID set, no token by design) whoami
+        must NOT say "Not logged in" — auth there is per-request via the
+        relay/broker. It verifies the identity live via /api/me/effective-access
+        and reports the brokered state, including admin capability."""
+        monkeypatch.setenv("AGNES_SESSION_ID", "sess-123")
+        monkeypatch.setenv("AGNES_USER_EMAIL", "admin@example.com")
+        me = _make_response(200, {"is_admin": True, "items": [], "tables": []})
+        with patch("cli.commands.auth.get_token", return_value=None):
+            with patch("cli.client.api_get", return_value=me):
+                with patch("cli.commands.auth.get_server_url", return_value="http://127.0.0.1:9/agnes-api"):
+                    result = runner.invoke(app, ["auth", "whoami"])
+        assert result.exit_code == 0, result.output
+        assert "Not logged in" not in result.output
+        assert "admin@example.com" in result.output
+        assert "brokered session identity" in result.output
+        assert "Admin: yes" in result.output
+        # The address itself is NOT verified by this call — effective-access
+        # answers is_admin + grants, never an identity — so the line must not
+        # present it as confirmed. This command exists because the sandbox was
+        # misinforming the agent about who it is.
+        assert "(from sandbox environment)" in result.output
+
+    def test_whoami_sandbox_non_admin(self, monkeypatch):
+        monkeypatch.setenv("AGNES_SESSION_ID", "sess-123")
+        monkeypatch.setenv("AGNES_USER_EMAIL", "user@example.com")
+        me = _make_response(200, {"is_admin": False, "items": [], "tables": []})
+        with patch("cli.commands.auth.get_token", return_value=None):
+            with patch("cli.client.api_get", return_value=me):
+                with patch("cli.commands.auth.get_server_url", return_value="http://127.0.0.1:9/agnes-api"):
+                    result = runner.invoke(app, ["auth", "whoami"])
+        assert result.exit_code == 0, result.output
+        assert "Admin: no" in result.output
+
+    def test_whoami_sandbox_server_unreachable(self, monkeypatch):
+        """When the live verification fails, whoami still explains the
+        brokered model (never "Not logged in") but exits non-zero."""
+        monkeypatch.setenv("AGNES_SESSION_ID", "sess-123")
+        monkeypatch.setenv("AGNES_USER_EMAIL", "user@example.com")
+        with patch("cli.commands.auth.get_token", return_value=None):
+            with patch("cli.client.api_get", side_effect=RuntimeError("relay down")):
+                with patch("cli.commands.auth.get_server_url", return_value="http://127.0.0.1:9/agnes-api"):
+                    result = runner.invoke(app, ["auth", "whoami"])
+        assert result.exit_code == 1
+        assert "Not logged in" not in result.output
+        assert "brokered session identity" in result.output
+
     def test_whoami_valid_token(self):
         """Whoami decodes JWT and shows user info. v19: no role claim."""
         import jwt as pyjwt

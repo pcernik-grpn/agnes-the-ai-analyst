@@ -2,9 +2,9 @@
 
 **Date:** 2026-08-27 (rev 3)
 **Status:** buildable draft — revision 3 after a six-way audit (spec internals,
-Agnes code, cuesta-star-graph, evaluation workbook v0.2, licences/services, UI)
+Agnes code, the producer repo, evaluation workbook v0.2, licences/services, UI)
 **Verified against:** Agnes worktree `zs/facts-scope-access` (base `d97e186a8`),
-`keboola/cuesta-star-graph` main `753be22`, `eval_scoring_workbook_v0.2.xlsx`
+the producer repo's main at `753be22`, `eval_scoring_workbook_v0.2.xlsx`
 (FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
 **Scope note:** this spec deliberately contains customer-specific material
 (the evaluation workbook, Kantata, personas, TCRD ticket ids, the 1P vault
@@ -46,7 +46,7 @@ constrains the design.
 **Rev 2 → 3 (full audit against artifacts):**
 
 6. **The evaluation standard is workbook v0.2 in full** (§14) — five arms,
-   five thresholds, 0/1/2 rubric, cadence, protocol. The cuesta repo's eval
+   five thresholds, 0/1/2 rubric, cadence, protocol. The producer repo's eval
    was aligned to v0.2 on 2026-08-27 (commit `753be22`): its 12 sandbox
    questions now map onto the ten workbook prompts (two are sandbox-only
    leftovers and two workbook ids are uncovered — §14.5), and its protocol already
@@ -102,6 +102,29 @@ question, not an error: **what facts buy over the retrieval Collections
 already does.** It is a measured gate (§14, Decision #2) — and the workbook
 itself pre-registers the uncomfortable answer as a legitimate outcome.
 
+**Rev 3.2 → 3.3 (live regression fix, 2026-08-29):**
+
+14. **The verbatim gate rejected legitimate identity-grounded evidence, and
+    the producer's workaround broke something worse.** The extraction
+    ontology grounds some claims (e.g. `part_of`) in a document's own folder
+    path + filename, which the chunk-only gate (§8) rejected — 3 quotes in a
+    live run. The producer's fix, prepending a `Source: <site>/<path>`
+    header into the uploaded artifact's text, turned a filename quote into a
+    content quote, but made the artifact's bytes change on every rename,
+    which the collections upsert (§6) reads as `content_changed` and purges
+    the file's chunks AND claims for what is really a no-op rename — five
+    subjects 404'd after one rename in a live run, reappearing with NEW ids
+    on re-ingest. Fixed at the root: the gate now also accepts a quote that
+    EQUALS a whole unit of the document's own SERVER-STORED `filename`/`path`
+    (§8.2, never a producer-supplied identity string, which would let a
+    producer self-certify an invented quote) — the header workaround is no
+    longer needed. Counted honestly (`claims_accepted_via_identity` in the
+    run report, §7.2/§8.2) so the gate's broadening is never silent. The
+    other, independently real half of the same incident — a producer's
+    ingest idempotence having no signal that a purge happened — is closed by
+    `claims_purged` on the collections upload response (§8.3); consuming it
+    producer-side is a separate, later change.
+
 ---
 
 ## 1. What this is
@@ -111,14 +134,14 @@ from documents, where every assertion carries the document it came from, the
 verbatim sentence supporting it, and the date of that document. Built as a
 layer **over the existing Collections subsystem**, not beside it.
 
-It is a general Agnes capability. SharePoint (via the cuesta-star-graph
+It is a general Agnes capability. SharePoint (via the producer
 crawler) is the first contributor of documents; anything that can put files
 into a collection contributes the same way. Agnes owns the schema; producers
 write into it through the contract in §7.
 
 **Out of scope, deliberately** (each is somebody's work, not nobody's):
 
-- the crawler — **adopted** from `keboola/cuesta-star-graph`, with a named
+- the crawler — **adopted** from the producer repo, with a named
   hardening backlog (§7.1), never rewritten;
 - the extraction pass (`extract.py` + `skills/kg-builder-agent.md`) — a
   producer against §7's contract;
@@ -194,6 +217,13 @@ fact_aliases fact_id TEXT NOT NULL FK→facts ON DELETE CASCADE
              natural_key TEXT NOT NULL     -- producer slug, e.g. 'myers-emergency-power-systems'
              UNIQUE (type, natural_key)
 
+fact_alias_sources                         -- NEW PG-only table (§4/§5, S9, 2026-08-29):
+             type TEXT NOT NULL FK→fact_aliases(type, natural_key)   -- per-corpus provenance
+             natural_key TEXT NOT NULL         ON DELETE CASCADE     -- for the SAME alias string
+             corpus_id TEXT NOT NULL
+             PK (type, natural_key, corpus_id) -- insert-only; grows as more corpora
+                                                -- independently re-derive the same string
+
 edges        id TEXT PK                    -- 'e_' + token_hex(8)
              src TEXT NOT NULL FK→facts ON DELETE CASCADE
              dst TEXT NOT NULL FK→facts ON DELETE CASCADE
@@ -224,7 +254,9 @@ corpus_file_sources                        -- NEW PG-only table; the anchor (§6
              source_doc_id TEXT                -- crawler's citation key, sha256[:16] (§7.2);
                                                --   rewritten when a provisional id is replaced
              source_sha256 TEXT
-             source_url TEXT NULL              -- when it lands (open item O7)
+             source_url TEXT NULL              -- citation deep link (O7, resolved) — optional
+                                               --   `documents[]` field, https-only validated
+                                               --   at ingest, NULL when absent/rejected
              UNIQUE (corpus_id, source_stable_id) · INDEX (corpus_id, source_doc_id)
 
 corrections  subject_kind TEXT NOT NULL    -- 'fact' | 'edge'
@@ -286,6 +318,8 @@ attrs(subject)   := per-key projection over the subject's OWN readable claims on
                     – equal dates with differing values → the key is returned as
                       conflicted: {values: [...], claims: [...]} — never silently picked;
                     – a dated claim beats an undated one; two undated ones conflict.
+aliases(fact)    := { alias ∈ fact.aliases | ∃ corpus ∈ alias.provenance : corpus ∈ readable }
+                    (fact carries an active `revealed` correction ⇒ every alias, see below)
 ```
 
 Nothing a caller receives is ever computed from a claim they cannot read —
@@ -298,6 +332,26 @@ only a FACT's EXISTENCE gate, never its projections: an endpoint-only fact
 unchanged — an edge's own claims only, never inferred from its endpoints
 (§5 rule 3 / S3). `all_evidence` hides strictly more **within one grant
 snapshot**; it is not a general monotonic guarantee (grant drift, §13).
+
+**Alias visibility (review tightening, 2026-08-29 — S9).** A fact's
+EXISTENCE gate is the union above — own claims OR an incident edge's claim
+— so a fact can be visible to a caller purely on the strength of ONE
+readable claim while carrying other, unrelated claims from collections the
+caller cannot read. `fact_aliases.natural_key` is a producer-minted string
+— it can name the fact (client, person, engagement) using content the
+caller never sees. Showing it unconditionally once the fact is visible at
+all reopens exactly the oracle S2 closes for `attrs`, just for the display
+name instead of a key/value. Each alias therefore carries its OWN
+provenance — the corpus(es) whose evidence actually established that exact
+string (`fact_alias_sources`, distinct from "any corpus with a claim on
+the fact") — and is shown only when the caller can read at least one of
+them, or the fact carries an active `revealed` correction (same
+instance-wide bypass `attrs` already gets). A fact visible with zero
+readable aliases still serves its opaque subject id as a usable identity —
+never a 404, same as an endpoint-only fact's empty `attrs`. `q` free-text
+matching (§12) is bound by the SAME rule: a query string may only match an
+alias the caller can see, otherwise the match itself becomes an oracle for
+a restricted name's existence via hit count or rank position.
 
 **Admin corrections** (each with reason → `audit_log`):
 
@@ -402,8 +456,17 @@ with content). Metadata-only rows carry a *provisional* doc_id
     id** — including a manual path re-upload of a crawler-anchored file, so
     a hand upload can no longer cascade a document's claims away. Unchanged
     sha → skip re-chunking entirely; changed → purge chunks + reset
-    `processing_status` on the same row. In-place update purges zip-bundle
-    children exactly as today's purge walk does;
+    `processing_status` on the same row. **In-place update on a row that
+    STAYS a bundle (zip archive) both before AND after the update leaves
+    its zip-bundle children ALONE** — reconciling them is `ingest_bundle`'s
+    own job (below), not this purge's. A row that stops being a bundle
+    (re-uploaded at the same identity as a non-zip type) takes the full
+    purge path instead — deciding this from the OLD filename alone was
+    itself a bug (adversarial review of the citability follow-up): the row
+    stays a `bundle` by its old name while the ingest router dispatches on
+    the row's NEW type after the update, so neither side ever purged or
+    reconciled the old members, leaving a deleted document's chunks/claims
+    permanently readable under a row that is now some other file type;
   – **frozen-pair obligation**: the update-in-place methods land in
     `corpus_files.py` AND `corpus_files_pg.py` with the contract test
     extended — this PR touches a maintained pair, unlike the facts PR;
@@ -411,6 +474,26 @@ with content). Metadata-only rows carry a *provisional* doc_id
     (the mapping table is PG-only); omitting it keeps today's flow intact.
 - Ingest (§7) refuses a claim whose `doc` reference cannot be resolved
   through this mapping.
+- **RESOLVED (zip-member citability follow-up):** each member `ingest_bundle`
+  unpacks from an archive gets its OWN `corpus_file_sources` anchor —
+  `source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>` — written (best-effort, no-op on
+  DuckDB) once the member's own row is matched/created, so a claim can cite
+  the exact member instead of only the archive, and the member's id (hence
+  its claims) survives a re-sync of the archive exactly like a top-level
+  file's does. The `!`-separated shape (`cf_<hex>!<member path>`) **is
+  RESERVED and refused from callers**, not merely conventionally distinct
+  from a real producer-supplied top-level `source_stable_id` (`graph:…`/
+  `local:…` never start with `cf_`, the fixed `corpus_files.id` prefix):
+  the shape is visible to anyone with mere collection READ access (an
+  ordinary file listing returns both the archive id and every member
+  filename), so a caller-supplied `source_stable_id` on this shape is
+  refused with a `400` at BOTH entry points that accept one — the upload
+  endpoint's `source_stable_ids` field and the facts ingest
+  `documents[].stable_id` — before anything is resolved or written; only
+  `ingest_bundle` may mint one. See `src/ingest/member_identity.py`
+  (the shared predicate) and `src/ingest/bundle.py::_member_stable_id`
+  (the sole minter).
 
 Lifecycle:
 
@@ -425,7 +508,9 @@ The orphan-subject sweep runs as its own step **after any batch of
 `corpus_files` deletions** — ingest-driven or UI-driven (an admin deleting a
 file from a collection cascades claims exactly the same way) — and equally
 after a **content replace**, which deletes claims without deleting the row
-(and hard-deletes the row's zip-bundle children, whose claims cascade). Never
+(a replaced BUNDLE row's own zip-bundle children are left for
+`ingest_bundle`'s own narrower reconciliation to sweep — only the members
+that actually changed or disappeared, never the whole set). Never
 inside the deleting transaction. Its counts land in the run report or, for UI
 deletions, on the source card, attributed to the operation that triggered
 them. Edges sweep first, so by the time the fact sweep runs every surviving
@@ -442,7 +527,7 @@ same as any other edge — only the READ path (§4/§5) withholds it.
 
 ### 7.0 Wire format (verbatim from the producing pipeline)
 
-The producer is the cuesta-star-graph pipeline (crawl → convert → anonymize →
+The producer is the external producer pipeline (crawl → convert → anonymize →
 extract → reconcile → gates). Its emitted shapes, which the ingest endpoint
 accepts as-is:
 
@@ -458,7 +543,7 @@ accepts as-is:
 ```
 
 Conventions the pipeline enforces and ingest relies on
-(cuesta-star-graph, verified): node id matches
+(producer repo, verified): node id matches
 `([a-z_]+):([a-z0-9][a-z0-9-]*)` with prefix == type
 (`validate_graph.py:60`); slugs are lowercase ASCII with `&`→`and`; every
 **edge** carries ≥1 evidence entry (`possible_duplicate_of` exempt —
@@ -551,7 +636,14 @@ when a provisional metadata-only id is replaced by the content id). Evidence
 `doc_id` resolves `→ corpus_file_sources.source_doc_id → corpus_file_id`.
 The `documents` array may be omitted **only** when every referenced `doc_id`
 already resolves; otherwise the batch is rejected with the unresolved ids
-itemized.
+itemized. **RESOLVED (zip-member citability follow-up):** this resolution is
+identity-agnostic — a zip-bundle member's `corpus_file_sources` row (written
+by `ingest_bundle` at unpack time, §6) resolves exactly like a top-level
+file's; a producer citing a member's own content `doc_id`
+(`sha256[:16]`) needs no `documents[]` entry at all once the archive has
+been ingested once, and MAY additionally send one (`stable_id =
+"<archive corpus_files.id>!<member path>"`) to refresh the anchor, exactly
+like a top-level document.
 
 **Timing:** a claim referencing a file whose `processing_status` is not yet
 `indexed` is **deferred, not rejected** — the response lists it under
@@ -577,9 +669,12 @@ Semantics:
   entity-resolution review items — they are the reconcile pass's keep-split
   signal, and the sandbox's own checklist ("conflict → review queue visible
   to humans, not buried in JSONL") is still open there; Agnes closes it.
-- **Response = run report**: `{claims_written, claims_rejected: [{row,
-  reason}], subjects_created, subjects_deleted (orphans), corrections_active:
-  [...]}` — the orphan count is the honesty §6 requires.
+- **Response = run report**: `{claims_written, claims_accepted_via_identity,
+  claims_rejected: [{row, reason}], subjects_created, subjects_deleted
+  (orphans), corrections_active: [...]}` — the orphan count is the honesty §6
+  requires, and `claims_accepted_via_identity` (§8.2) is the honesty the
+  widened verbatim gate requires: how many of `claims_written` are
+  filename-grounded, not content-grounded.
 - **Idempotent**: replaying the same batch is a no-op by the uniqueness keys.
 
 **What the producer uploads as file content — decided, because §8's gate
@@ -628,32 +723,207 @@ HEAVY (concurrency 1) would block every table sync.
 
 ## 8. What "verbatim" actually means
 
-The gate: a claim's quote must be a **substring of one chunk of the
-document's extracted text** (`corpus_chunks.text`; `corpus_files` holds no
-text). Rejected at write, mechanical, the single most valuable check — and
-narrower than it sounds. Four limits, stated for customer material:
+The gate: a claim's quote must be a substring of one chunk of the document's
+extracted text (`corpus_chunks.text`; `corpus_files` holds no text), **or**
+it must EQUAL a whole unit of the document's own **server-stored identity
+strings** — `corpus_files.filename` / `corpus_files.path`, exactly as Agnes
+holds them, never a producer-supplied name/path read off the wire (that
+would let a producer self-certify an invented quote by declaring whatever
+string it likes — see §8.3). The identity half is equality, not substring
+(P0 review finding, 2026-08-29, hardened same-day as §8.2's widening below):
+a whole path component (a folder name, or the filename with or without its
+extension), the full stored path, or a contiguous run of whole components
+(e.g. `"folder/filename.ext"`) — never an arbitrary fragment, or a bare
+`.pptx`/`/`/short slice would self-certify as a cited quote via the
+document's own name. Rejected at write, mechanical, the single most valuable
+check — and narrower than it sounds. Four limits, stated for customer
+material:
 
-1. **It validates the quote, not the fact.** An invented relationship citing
-   a real adjacent sentence passes. (Test EQ2 documents this honestly; the
-   producer's own skill rule 11 — "the quote must STATE the fact, not merely
-   mention its entities" — is prompt-level mitigation, not a guarantee.)
-2. **The text is the extraction, not the document.** Markdown conversion
-   moved tables into pipe syntax, normalized ligatures, relocated headers. A
-   user searching the quote in the original will sometimes not find it.
-3. **Quotes cannot cross a chunk boundary** — the substring test is per
-   chunk.
+1. **It validates the quote, not the fact — and an identity-grounded quote
+   validates even less.** An invented relationship citing a real adjacent
+   sentence passes; one grounded only in the document's filename/path proves
+   the document exists and is named that, nothing about what it says. (Test
+   EQ2 documents the chunk half honestly; the producer's own skill rule 11 —
+   "the quote must STATE the fact, not merely mention its entities" — is
+   prompt-level mitigation, not a guarantee, for either half.)
+2. **The chunk text is the extraction, not the document.** Markdown
+   conversion moved tables into pipe syntax, normalized ligatures, relocated
+   headers. A user searching the quote in the original will sometimes not
+   find it. The identity half doesn't share this gap — `filename`/`path` are
+   the same strings a caller sees in the Library UI — but shares the next
+   two.
+3. **A quote cannot cross a boundary** — the substring test is per chunk for
+   (a); for (b) the quote must equal one of the whole-unit candidates
+   (§8.2) derived from `filename`/`path` — a quote spanning "the folder name
+   / the file name" in a way that isn't one of those candidates still fails,
+   even though a human reading the two together would recognize it.
 4. **Cross-language extraction fails the gate by construction** (Czech
-   document, English claim → no substring). Open (O6); blocks any
-   multilingual corpus.
+   document, English claim → no substring) — for both halves: a folder path
+   in one language and a claim in another still produces no match. Open
+   (O6); blocks any multilingual corpus.
 
-**Citation to the source system is new work**: `source_url` lives in
-`corpus_file_sources` when the crawler supplies it (O7); until then a
-citation names the document, not a clickable original. The original itself is
-never served by Agnes — it opens in the source under the caller's own
-identity (the TCRD-178 "resolve to the source" decision).
+**Citation to the source system (O7, resolved 2026-08-29)**: `source_url`
+lives in `corpus_file_sources`, populated when an ingest `documents[]` entry
+carries it (an additive, optional wire field — the crawler's Graph `webUrl`).
+Validated at ingest — https-only, no `javascript:`/`data:`, length-capped —
+so a hostile producer value is dropped (stored `NULL`) rather than reaching
+a rendered link; the claim itself still ingests. A citation with no
+`source_url` names the document only, same as before. The drop is never
+silent: the ingest run report (and its persisted `facts_ingest_runs` copy)
+itemizes it in `source_urls_rejected: [{doc_id, reason}]`, same shape as
+`claims_rejected`, surfaced as its own badge on the `/admin/data-sources`
+source card — a producer whose values Agnes keeps refusing shows up as a
+non-zero count, not a citation that quietly never got a link. The original
+itself is never served by Agnes — it opens in the source under the caller's
+own identity (the TCRD-178 "resolve to the source" decision).
+
+### 8.1 The canonical-source contract (ratified 2026-08-28)
+
+Stated once, as a contract, so every consumer builds to it instead of
+rediscovering it (Slack, 28 Aug — proposed in the crawler thread, ratified
+by the project owner):
+
+1. **The canonical copy stays in the source system.** Agnes never re-homes
+   source content. What Agnes stores is a *derivation*: the converted
+   markdown (uploaded through the normal collections path, §7.2) and the
+   chunks over it — and for an anonymized scope, only the anonymized
+   derivation (§9).
+2. **Citations resolve to the source system only.** A claim's user-facing
+   citation is the document name + source deep link (`source_url`, O7).
+   Chunks are the **internal substrate** the verbatim gate checks quotes
+   against — a chunk is never a citation target, never surfaced as an
+   address, and never treated as an authority. (This was the actual defect
+   in the first metadata-crawler shape — chunks as citable objects — not
+   the chunks' existence.)
+3. **Raw-file consumers read the source live.** Anything that needs an
+   *original* file (e.g. a proposal plugin pulling template documents)
+   fetches it from the source drive under its own access, at use time —
+   never from a copy vendored into a repo or served by Agnes. Copies
+   drift the moment the customer edits the original; the contract makes
+   staleness impossible rather than managed. (Consumer-side design: O8.)
+
+Rules 1–2 are enforced by construction in this design (upload path,
+endpoint-evidence read path, `/raw`-serves-derivation-only); rule 3 binds
+consumers outside this repo and is restated here so their designs cite one
+place.
 
 Conversion fidelity is therefore a **correctness dependency**, gated by test
 EQ8 (§15.3).
+
+### 8.2 The identity haystack (ratified 2026-08-29, hardened same-day)
+
+**Why identity strings count as evidence at all.** The extraction ontology
+legitimately treats a document's own identity — folder path + filename — as
+a fact in its own right: a `part_of` edge grounded in "Project Kemp/Parts
+Authority — Overview.pptx" states something true (this document lives under
+Project Kemp) using words that only ever appear in the document's name, never
+its body text. The chunk-only gate rejected these by construction (3 of the
+producer's quotes in a live proving run) even though the evidence is real.
+
+**Why only SERVER-STORED strings, never wire-supplied ones.** `documents[]`
+entries on the ingest wire (§7.0) carry a producer-declared `path`, but that
+field exists to **resolve** which `corpus_files` row an evidence `doc_id`
+means — it is never written into `corpus_files.path` by the ingest path, and
+the gate reads `frow["filename"]`/`frow["path"]` from the row `corpus_files`
+already holds, fetched independently of anything on this request. A producer
+that declared an invented `path` on the wire cannot use it to manufacture a
+match: the gate only ever sees the identity Agnes itself assigned at upload
+time (`app/api/collections.py::_upsert_corpus_file`), so self-certification
+is refused by construction, not by a runtime check that could be forgotten.
+
+**The predicate is a whole unit, never a substring** (same-day review
+finding: an initial `quote in path` shape admitted a bare `.pptx`, a stray
+`/`, or any short fragment — enough to attach a fabricated attribute to a
+real document and have it render as a confidently-cited quote, which is
+worse than a rejected claim). The candidate set for `(filename, path)`:
+the full stored `path`; `filename` with and without its extension; every
+single whole path component (a folder name, or the filename); and every
+CONTIGUOUS run of whole path components (e.g. `"Project Kemp/Parts
+Authority — Overview.pptx"`, the folder+filename shape the example above
+cites), the run ending at the filename also getting an extension-stripped
+variant. The quote must equal one member of that set exactly — no
+normalization, matching the chunk-text comparison (an NFC/NFD mismatch
+fails identically on both sides).
+
+**The count.** Every ingest response reports `claims_accepted_via_identity`
+— the subset of `claims_written` whose quote matched ONLY the identity
+haystack, never a chunk — so an operator can see how much of a batch's
+evidence is filename-grounded rather than content-grounded (weaker still,
+per limit 1 above). Zero silent widening: the gate got broader, but the
+report says by how much.
+
+**The coupled bug this closes.** Before this widening, the producer's only
+way past the chunk-only gate for a filename-grounded quote was to prepend a
+`Source: <site>/<path>` provenance header INTO the uploaded artifact's text
+— turning a filename quote into a content quote. That fixed the rejections
+but broke something worse: a rename recomputes the header, so the artifact's
+bytes change even though nothing about the document's CONTENT changed,
+Agnes takes the `content_changed` branch in the collections upsert (§6), and
+purges the file's chunks **and its claims** for what is, from the document's
+point of view, a no-op rename. §8.3 below is the other half of that same
+incident — the two together are why this section exists.
+
+### 8.3 The upload purge signal (ratified 2026-08-29)
+
+A collections upload that lands on the `content_changed` branch (§6) drops
+the replaced file's fact-graph claims (`_purge_facts_claims_for_replaced_file`
+— a claim's quote is a verbatim span of the OLD bytes, and once the sha
+moves those bytes are gone). Before this change nothing told the producer
+that happened: its own ingest idempotence (union mode merges on `(subject,
+corpus_file_id, quote_hash)`, §7.2) sees no NEW quotes to write and reports
+"already shipped", so the claims stay missing until an operator forces a
+re-ingest. `POST .../files` now returns `claims_purged` per file — the count
+dropped for THAT file on this upload, 0 for a brand-new file, an
+unchanged-content resync/rename, or when the `facts` flag is off — so a
+producer can treat a non-zero count as "re-ingest this document", closing
+the loop the two systems previously ran past each other on. (Consuming the
+signal on the producer side is a separate, later change; this section
+defines the contract it will read.)
+
+### 8.4 The meaningfulness floor (ratified 2026-08-29)
+
+A plain substring test has no notion of "meaningful": any character
+sequence that occurs literally in the text, OR (for a quote the content
+check misses) in the document's own identity strings (§8.2), satisfies it —
+including a bare file-extension fragment (`.pdf`) or a lone path separator
+(`/`). Live finding: both were accepted as claims, `claims_accepted_via_
+identity == 0` (i.e. via the content half, not identity), rendering as
+verified evidence for a claim quoting nothing at all.
+
+**The rule.** Before either half of the gate is tried, a quote must be at
+least 2 characters (trimmed) and must START with a word character (letter,
+digit, or underscore, Unicode-aware). Applied once, ahead of both checks, so
+a degenerate quote cannot fail the content half and then be self-certified
+by the identity half instead — one check closes the hole on both paths.
+
+**Why not a length floor alone.** `.pdf` and `ARR` (a real metric name) are
+the same length once `.pdf`'s leading punctuation is set aside — a raw
+character count, or a floor on word-character count, cannot tell them
+apart. What distinguishes them is shape: `.pdf`'s leading `.` can never be a
+complete word's own left edge — a real sentence never begins mid-token —
+while `ARR` is not attached to anything.
+
+**Why only the START, not the end.** A quote citing a whole sentence or
+clause routinely — and legitimately — ends in terminal punctuation ("Acme
+Corp is the client."). Sentence-final punctuation is a closing delimiter of
+the unit actually quoted; leading punctuation with nothing before it in the
+quote is not. An earlier draft of this rule checked both edges and broke
+this common, legitimate shape outright.
+
+**Why a constant, not `facts.single_valued_edges`-style config.** This
+guards evidence integrity — can a fabricated or degenerate extraction get
+past the gate — not a per-instance ontology choice; an operator should not
+be able to loosen it, the way `facts.single_valued_edges` legitimately can
+be (it encodes which edge types an instance's own ontology treats as
+functionally single-valued, a modeling decision, not a security floor). A
+future length floor guarding a *query* (cost/quality) would be a different
+problem and belongs in its own constant, never shared with this one.
+
+**The reason.** A rejected degenerate quote gets `quote_not_meaningful` in
+`claims_rejected`, distinct from `verbatim_gate_failed`: the quote WAS
+present verbatim (or trivially would be), it just isn't evidence of
+anything — a different failure than "cited text absent from the document,"
+which calls for a different fix on the producer side.
 
 ---
 
@@ -761,6 +1031,26 @@ be granted by mistake — but the decision is not ours alone.
 Anonymization is chosen **at source-connect time, per scope** (a column in
 the wizard, §13.2); on a collection detail it is a state plus a named batch
 task ("Anonymize collection…" over N documents), never a toggle.
+
+**Ingest-time enforcement (2026-08-29 hardening, closing a fail-open gap
+found post-#1715):** the producer's `anonymization` declaration on `POST
+/api/facts/ingest` (§7.2) is no longer merely recorded — Agnes now
+**refuses** (`403 anonymization_not_declared`) any batch that documents a
+corpus whose SharePoint scope is anonymize-marked (`config.scopes[]
+.anonymize`) unless that same batch's `anonymization` block declares the
+corpus. This closes the path where an unrelated edit through the generic
+connection editor silently wiped `config.scopes` (server-written, never
+echoed back by that editor's wholesale config replace), which emptied the
+anonymize map, skipped the HMAC-key resolution, raised no error, and let
+the pipeline ship un-anonymized content into a collection an admin believed
+was anonymized — reported as success. Agnes still cannot verify a
+document's CONTENT was anonymized (§9.2's limits stand), but it can no
+longer accept a claim for a marked corpus with zero declaration, and it
+fails **closed** — refuses, `503 anonymization_check_unavailable` — rather
+than accepts, whenever it cannot itself answer "is this corpus marked"
+(e.g. the connections table is unreadable). See
+`app/api/facts.py::_refuse_undeclared_anonymize_marked_corpora` and
+`docs/anonymization.md`.
 
 ---
 
@@ -1132,7 +1422,7 @@ half and you miss leaks.
 - Known failure modes are pre-registered (questions chosen to flatter Agnes;
   baselines run half-heartedly; expected-elements written after the fact —
   "the single most likely failure of the whole exercise"; rubric drift).
-- **Sandbox state** (cuesta repo main `753be22`): 12 sandbox questions
+- **Sandbox state** (producer repo main `753be22`): 12 sandbox questions
   Q01–Q12 now carry `shan_category` mappings onto the ten v0.2 prompts;
   Q07 (v0.1 S1) and Q09 (v0.1 R1) are **sandbox-only** (dropped upstream);
   **L1 and N1 have no dedicated sandbox question** — eval prep must add them
@@ -1198,6 +1488,18 @@ cover, Agnes will not tell me.* Fixtures uploaded by an account that is
 - **S8** — `revealed` correction serves the fact without quotes
   instance-wide; `restricted` hides it from a caller with full grants;
   `wrong` survives a re-ingest of the same batch.
+- **S9** — the alias oracle: one fact, two claims in two collections —
+  Alice's grant covers only the collection whose claim does not name the
+  fact (e.g. "the lead consultant on the engagement"); the OTHER,
+  unreadable collection's claim is what a producer minted the fact's
+  `fact_aliases.natural_key` from (e.g. the client's name). Alice sees the
+  fact (existence via the readable claim) but its alias/display name must
+  NOT be the one minted from the collection she cannot read — `fact_search`
+  and `fact_neighbors` fall back to the opaque subject id, and `q` matching
+  that restricted alias string returns no hit (no count-oracle). *Fails if*
+  a subject's own claims being partly readable is treated as making every
+  one of its aliases readable — the same distinction S2 draws for `attrs`,
+  extended to names.
 
 **Phase ACL (after Entra derivation — §13.1).** Source-layer S1 (sharing set
 in SharePoint, not in Agnes), source-revocation S7, and C9. Until then these
@@ -1399,7 +1701,7 @@ overclaim).
   anonymizer driver. This widens the build scope: those items are tasks in
   this plan now, not an external dependency.
 - **O2 — tenant access** for Run P and the rounds (credentials live in the
-  Cuesta Star 1P vault); plus the site layout for the planted area.
+  the producer team's password vault); plus the site layout for the planted area.
 - **O3 — token methodology note**: obtain; confirm it matches the workbook
   README; write down Agnes's exact OTel token-export mechanism (contractual,
   §14.6).
@@ -1412,5 +1714,12 @@ overclaim).
 - **O5 — reconcile the two anonymization designs** (§9.2 vs the 2026-08-24
   corpus-intake spec).
 - **O6 — cross-language extraction vs the verbatim gate** (§8).
-- **O7 — `source_url`**: who extends the crawler rows and
-  `corpus_file_sources` so citations link to the source system.
+- **O7 — `source_url`** (RESOLVED 2026-08-29): an ingest `documents[]` entry
+  may carry an optional `source_url`; validated (https-only, length-capped)
+  and persisted onto `corpus_file_sources`, surfaced in the claims read
+  shape (REST/MCP/CLI), rendered as an "Open in source" link in chat and
+  the facts UI when present (§8.1).
+- **O8 — plugin raw-file access** (§8.1 rule 3): the proposal plugin needs
+  live reads of template files from the source drive — same credential
+  story as the crawler, designed with the plugin owner; blocked on the
+  tenant-access work, not on this repo.

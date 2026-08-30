@@ -1,0 +1,76 @@
+{# Fact-graph type map — the head of the Library's Knowledge tab (TCRD-250,
+   spec §13.2 "Library"). Every node type the caller can see, with a live
+   count, each one a way in: a chip links to the same tab filtered to that
+   type.
+
+   Deliberately SELF-CONTAINED. It renders from a plain `types` list and
+   owns its own CSS (`type_map.css`), so the Knowledge tab wires it in with
+   a single `{% raw %}{% from "macros/_type_map.html" import type_map %}{% endraw %}`
+   plus one call — no edits inside the tab's own markup, which is how this
+   lands without colliding with the Library rework on PR #1751.
+
+   WIRING (two lines, both owned by the host page, deliberately NOT done
+   here so this branch never touches library.html):
+     1. `{% raw %}{% block head_extra %}<link rel="stylesheet" href="{{ static_url('css/type_map.css') }}">{% endblock %}{% endraw %}`
+     2. `{% raw %}{{ type_map(types, total, base_url=url_for('library')) }}{% endraw %}` at the top of the
+        Knowledge tab, fed from `GET /api/facts/type-map`.
+   Until step 1 lands the markup renders unstyled rather than broken.
+
+   `types`    — `[{"type": str, "count": int}]`, exactly `GET /api/facts/type-map`'s
+                shape. A type with no subjects visible to the caller is
+                ABSENT from that response by design (never a `0` row), so
+                this macro never has to render one.
+   `total`    — the response's `total`; shown as the summary line.
+   `base_url` — where a chip points; the type is appended as `?type=`.
+                Empty renders the chips as plain, unlinked counts.
+   `heading`  — section heading. Kept as a parameter because the tab that
+                hosts this owns its own heading vocabulary (TCRD-208).
+
+   The evidence rule is stated HERE rather than in a tooltip: a reader
+   comparing this number against something they know is bigger must be able
+   to see, in the same glance, that it counts only their own readable
+   evidence. Hiding that in a hover would make the map look wrong.
+
+   Empty state is intentionally plain. Once the shared empty/blocked/failed
+   vocabulary (TCRD-207, PR #1783) merges, this should switch to
+   `state.panel(kind='empty', ...)` rather than keep its own wording. #}
+{% macro type_map(types, total=0, base_url='', heading='What the graph knows') %}
+<section class="tmap" aria-labelledby="tmap-heading">
+  <div class="tmap-head">
+    <h2 class="tmap-title" id="tmap-heading">{{ heading }}</h2>
+    {% if types %}
+    <p class="tmap-sub">
+      {{ total }} thing{{ '' if total == 1 else 's' }} across
+      {{ types|length }} type{{ '' if types|length == 1 else 's' }} —
+      counted from evidence you can read, so a collection you have no access
+      to adds nothing here.
+    </p>
+    {% endif %}
+  </div>
+
+  {% if types %}
+  <ul class="tmap-grid">
+    {% for t in types %}
+    <li class="tmap-item">
+      {% if base_url %}
+      <a class="tmap-chip" href="{{ base_url }}?type={{ t.type|urlencode }}">
+        <span class="tmap-count">{{ t.count }}</span>
+        <span class="tmap-type">{{ t.type|replace('_', ' ') }}</span>
+      </a>
+      {% else %}
+      <span class="tmap-chip tmap-chip--static">
+        <span class="tmap-count">{{ t.count }}</span>
+        <span class="tmap-type">{{ t.type|replace('_', ' ') }}</span>
+      </span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="tmap-empty">
+    Nothing has been extracted into the graph yet, or none of its evidence is
+    in a collection you can read.
+  </p>
+  {% endif %}
+</section>
+{% endmacro %}

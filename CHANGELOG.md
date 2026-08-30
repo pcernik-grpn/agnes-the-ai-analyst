@@ -10,13 +10,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
-### Fixed
-- The profiler worker subprocess crashed with `TypeError: Object of type
-  Decimal is not JSON serializable` when a profiled table had DECIMAL/NUMERIC
-  columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
-  stdout `json.dumps` now uses the same `default=str` handler as the
-  parent-side profile writer.
-
 ### Added
 - Cover images can be requested as resized WebP variants with ?w=480 or ?w=960 on the upload, marketplace and store photo routes; other widths serve the original. Variants are generated once on first request and cached on disk.
 
@@ -28,11 +21,2312 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - Uploaded cover images are now served with a 30-day immutable cache
   header, so browsers stop re-validating every cover on every page load.
 
+### Fixed
+
 ### Removed
+
+### Internal
+
+- **The daily cut PR opens even when the batch is large.** `daily-cut.yml` embedded every shipped bullet in the PR body; the 0.93.0 cut carried 214 of them (216 KB) and blew past GitHub's 65,536-character limit, so `gh pr create` failed *after* the branch was already computed, committed and pushed — which reads as a broken cut rather than a broken announcement. The list is now budgeted, trimmed at bullet boundaries and stopping once the budget is spent (never interleaving whichever later bullets still fit), with a line naming how many were omitted. The CHANGELOG diff on the PR remains the complete list.
+
+## [0.93.0] - 2026-08-30
+
+### Added
+
+- **The Knowledge tab opens on what the graph knows (TCRD-250).** Node types with live, caller-scoped counts sit at the head of the tab, each one a way in — the counts come from `GET /api/facts/type-map`, so a type shows what *you* can reach and a type nobody can see is absent rather than zero. It follows the active tab through the Library's own `onApply` chain (the filter engine slices rows by `data-tab`; a non-row element has no such hook) and starts hidden, so it never flashes on Capabilities before the first apply. Renders nothing at all when the facts feature is off, the app-state backend is DuckDB, or the graph is empty — the Library must not fail because a decoration is unavailable.
+
+- **Read and WebSocket routes join the audit-posture ratchet.** Every `GET` route now declares either a cataloged action or an exempt reason drawn from a closed vocabulary (`health`, `self`, `ui_support`, `static`, `noise`), and the same applies to the WebSocket surface. This closes several previously-unaudited reads — admin cross-user lookups and connector browsing among them — without flooding `audit_log` with routine polling and self-service traffic.
+
+- **The last three silent surfaces now write audit rows.** apps-runner's container lifecycle (start/stop/resume — `resume` had no control-plane counterpart at all before this), the data-app subdomain proxy (a windowed row per user per app, not per request), and the notifications WebSocket (connect and reject) were the remaining gaps in end-to-end coverage; all three now audit through the same catalog and posture mechanism as everything else.
+
+- **`scripts/audit_volume_estimate.py`** gives operators a plain-table (or `--json`) report of `audit_log` rows/day, the top actions by volume, and a projected table size at the configured retention — plus opt-in per-action sampling (`audit.sampling` in `config/instance.yaml`, enforced by `should_sample()`) for a high-volume action an operator decides doesn't need every row kept.
+
+- **Maintained digests can be listed, not just fetched by id (TCRD-250).** `GET /api/knowledge/digests` returns the digests the caller can read — `{id, slug, title, status, status_reason, generated_at}`, sorted by slug, never the markdown. The content endpoint has been readable since K4 and `agnes pull` already writes every granted digest to `.claude/rules/ka_<slug>.md`, but nothing could enumerate them, so a web surface had no way to show a reader which digests exist without already knowing an id. Filtered by the SAME fail-closed predicate the sync manifest uses, so the browser list and the pulled files can never disagree about entitlement — there is a test asserting exactly that. A digest that has never generated is omitted, matching the manifest, since listing it would promise a page that 404s; staleness travels per row so a stale digest is visibly stale.
+
+- **The Library can be filtered by what documents are ABOUT (TCRD-250).** `GET /api/facts/facets` (plus `agnes facts facets` and the `fact_facets` MCP tool) returns each entity type's values with a document count — client, industry, service offering and document type by default. That vocabulary comes from the extraction pass, so it is maintained by ingestion rather than by somebody remembering to tag a file, which is what "filter by tags" should have meant here. Same visibility gate as `search()`, shared rather than restated, plus one extra conservatism: the document tally counts only documents in collections the caller can READ — a `revealed` subject's unreadable evidence is deliberately not tallied, since a revealed correction reveals the subject, not the geography of its evidence, and counting those files would report how many sit in a collection the caller cannot open. An alias with no recorded provenance stays admin-only-visible, so a facet shows the opaque id rather than leaking the natural key.
+
+- **The fact graph now says what is in it (TCRD-250).** `GET /api/facts/type-map` (plus `agnes facts type-map` and the `fact_type_map` MCP tool) returns every node type with a live count of the subjects the caller can actually see — the head of the Library's Knowledge tab, where each type is a way in, and an agent's way to learn which types exist before spending a `fact_search` call. Counts run through the SAME visibility gate as `search()` with no `type`, shared rather than restated: `_visible_facts_for_corpus_cte` gained an `all_collections` switch that changes only which facts are candidates, never the rule that decides visibility. A naive `GROUP BY type` would have been the fact graph's existence oracle in aggregate form — a reader counting subjects whose every claim sits in a collection they cannot read — so a type with no visible subjects is OMITTED rather than reported as `0`, leaving "nothing you can see" deliberately indistinguishable from "no such type".
+
+- **Connecting an outside AI tool is a conversation now, not a page of instructions (TCRD-206).** A new bundled `connect-this-tool` skill reaches the chat agent in every session: it asks which tool you are connecting rather than assuming Claude, hands over the two things any MCP client actually needs (the `/api/mcp/sse` endpoint and an `Authorization: Bearer` header), names where Claude Code, Cursor and VS Code each keep that config, and translates the same shape for a client it does not know rather than inventing a file path. It confirms the connection landed by reading the token's own `last_used_at` through `agnes tokens list` instead of assuming a written config means a connected client, and it refuses to let a token into the transcript — if one is pasted it says so and tells you to regenerate, which revokes it. The instructions page stays for reading ahead and copying a config. Gated on `mcp.connector_ui_enabled`, so an instance with the connector UI switched off never offers a path that dead-ends.
+
+- **Bundled-skill feature gates carry their own default.** The gate registry hardcoded `default=False`, which was correct while every gated skill was for a default-off feature. A default-ON flag would have pruned its skill from every instance that never set the flag — the common case — so each entry now names the default its own flag has.
+
+- **Document extraction now actually enqueues (TCRD-226) — the runtime PR #1692 built had nothing to create a job.** `POST /api/admin/sharepoint/connections/{id}/extract` lets an admin trigger the existing `corpus-extraction` job kind on demand — 404s on an unknown connection before any work, refuses cleanly with a typed `409` when `extraction.enabled` is off or no producer is configured (never a job that fails 30 minutes later in a worker), and `409 extraction_already_running` when a run for that connection is already queued. A new `POST /api/admin/sharepoint/extraction/run-due` scheduler sweep (registered only when the new `extraction.schedule` config is set — off by default) applies that single instance-wide cadence independently to each connection's own last-run stamp, same shape as the existing `agents:run-due` sweep. The producer subprocess also gets a credential to call back into Agnes's own API for the first time — `AGNES_API_URL` always, and `AGNES_API_TOKEN` (the scheduler's own shared-secret token) when one is configured — a deliberate, explicitly-documented over-grant (that token is Admin-group god-mode, far more than the producer needs) reused because it's the only credential class a headless subprocess can already present; never on argv, never logged. The SharePoint source card surfaces the in-Agnes schedule's last/next run and a "Run extraction now" action, separate from the external producer's own static crawl-cadence label.
+
+- **Full audit-log coverage for state-changing requests** (audit-full-coverage plan). A typed audit action catalog (`src/audit_events.py`) is now the single source of truth for every `action` string an audit writer can emit, and every `audit_log` row is auto-filled with per-request context (`client_ip`, `correlation_id`, `client_kind`, caller identity) so callers no longer thread it through by hand. Every mutating route declares its audit posture in `src/audit_posture.py` (`tests/test_audit_route_posture.py` ratchets it), and `AuditFallbackMiddleware` writes a generic `http.request` row for any authenticated mutating request whose handler wrote none — the shrinking `"fallback"` list is the map of what's left to close.
+
+- **Auth, agent, and background-job surfaces now write audit rows.** PAT enumeration (`GET /auth/tokens*`, `token.list`) and Keboola project-import (`keboola.projects_import`) close out the auth remainder. Agent invocation (`agent.invoke`), multi-turn agent-API session lifecycle (`agent.session.*`), webhook registration/removal (`agent.webhook.*`), every worker job dispatch (`job.run`), and the previously silent scheduled refresh jobs (BigQuery metadata cache, Keboola/Databricks semantic-layer sync, marketplace store lint audit) are now audited too.
+
+- **MCP, messaging, and admin/secrets/distribution surfaces now write audit rows.** Every MCP `tools/call` on both the SSE and Streamable-HTTP transports (`mcp.tool_call`), passthrough forwards and denials (`mcp.passthrough_call` / `mcp.passthrough_denied`), per-table queries (`query.table_scoped`), and the fact-graph REST endpoints (`facts.*`) are covered through a single dispatch-level wrapper rather than instrumenting each of the ~80 individual tools. Telegram and Slack messaging surfaces — including the Telegram script-run sudo path — chat session lifecycle (create/delete/archive/ticket), inbound user-message metadata, and co-presence invite/join/leave events are audited. So are source-connection CRUD and secret set/clear/test, per-user MCP source secrets, server-wide datasource/Slack secret reads, `POST /api/admin/configure` and the server-config reader, script deploy/run/delete, the marketplace zip/git-smart-HTTP distribution channels, Store/corporate-memory bundle downloads, Jira webhook ingress, artifact/`CLAUDE.local.md` uploads, and the CLI's sync telemetry.
+
+- **Offline `agnes query`/`agnes explore` runs are now audited too, client-reported after the fact.** Every local-DuckDB run (no server round-trip) is appended to a durable per-workspace spool (`cli/lib/audit_spool.py`) with metadata only — table names, a SQL hash, row/duration counts, **never SQL text** — and `agnes push` uploads the spool in one batch to the new `POST /api/upload/audit-events`. The server trusts nothing the client sends beyond a narrow action whitelist (`query.local_offline`, `explore.local_offline`) and a 2KB-per-event params cap; accepted rows are stamped `client_reported: true` so they read distinctly from server-observed audit rows. A server outage during the spool upload never fails `agnes push` — the spool stays intact and retries next run.
+
+- Web-chat sessions now materialize into the analyst-sessions jsonl store (`sessions.include_chat`, default on) — `/admin/sessions` and the usage rollups pick up chat conversations the same as any CLI session.
+
+- **SharePoint connect wizard: subfolder browsing, an instant client filter, and a bounded server-side search** (TCRD-240). `GET .../tree` now takes an `item_id` (with `drive_id`) to browse an arbitrary folder's children — the wizard's step-2 tree can drill past the drive root to any depth, not just sites → drives → root children; `item_id` is structurally validated before it ever reaches a Graph URL path segment. A new `GET .../tree/search` does a bounded breadth-first folder search over the same live tree (never Microsoft Graph's own `/search`, which is known to under-return under app-only auth) — `q` (min 2 chars), `mode` (`prefix`/`contains`/`glob`, case- and NFC-composition-insensitive), an optional `drive_id`+`item_id` subtree root (neither given searches every drive of every reachable site), and `max_depth`/`max_visited` caps (defaults 5/500, clamped rather than rejected at 10/2000) — the response's `truncated` flag is `true` whenever a cap is what stopped the walk, never a silently partial result. In the wizard: a text input above the tree instantly narrows/highlights whatever is already loaded (case- and diacritics-insensitive, no round trip), and a search box with a mode picker lists matching folders with a "Select all (N)" control — each checked result is an ordinary scope confirm, so bulk selection is just N ordinary confirms through the existing `POST .../scopes` contract, never a new bulk endpoint.
+
+- **SharePoint certificate metadata** — `GET /api/admin/sharepoint/connections/{id}/certificate` and the source card's Certificate row now show the thumbprint the connection's client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t` value — compare it against the identity provider's app registration) plus the conventional uppercase-hex SHA-1 fingerprint, subject/issuer, and a derived `ok`/`expiring_soon` (≤30 days)/`expired` status with days remaining. Derived at request time from the certificate half of the connection's already-stored PEM — no new storage, never the private key; no certificate configured or an unparseable one renders a clean "not configured"/"unreadable" line instead of an error. Catches two real failure modes: a registered certificate that doesn't match what the connection presents (opaque provider auth error), and one expiring silently.
+
+- **Microsoft Entra ID group sync**, mirroring Google Workspace sync — off by default (`auth.microsoft.group_sync_enabled` / `AGNES_MICROSOFT_GROUP_SYNC_ENABLED`). On sign-in, Agnes calls Microsoft Graph `GET /me/memberOf` with the delegated OAuth token, pages through `@odata.nextLink`, filters to `#microsoft.graph.group` entries, and replaces the user's `source='microsoft_sync'` rows in `user_group_members` (admin/system-seed/other-provider rows untouched). Turning the switch on also widens the requested OAuth scope to the delegated Graph permission `GroupMember.Read.All`, which needs its own admin-consent grant in the Entra app registration and a restart (see `docs/auth-microsoft-oauth.md`); the sync gate itself is read live, so a stale token scope fails soft rather than failing the login. `AGNES_MICROSOFT_GROUP_PREFIX` (env-only, mirrors `AGNES_GOOGLE_GROUP_PREFIX`) narrows which fetched groups are mirrored and, when set, refuses sign-in (`/login?error=microsoft_not_in_allowed_group`) for a user whose non-empty group fetch matched none of it — any other sync failure (feature off, empty fetch, Graph error) never blocks login.
+
+- **The SharePoint per-scope `anonymize` flag is now real** (spec §9/§9.2 anonymize-in-front pipeline). The `corpus-extraction` job handler hands the producer an `AGNES_EXTRACTION_ANONYMIZE_SCOPES` JSON map (`{source_scope_id: collection_id}`, only the anonymize-marked scopes) plus a per-instance `AGNES_ANONYMIZATION_HMAC_KEY` (new `instance.yaml` `extraction.anonymization.hmac_key_env`, default env name `AGNES_ANONYMIZATION_HMAC_KEY`, resolved through its own narrow allowlist — deliberately separate from the connector-ATTACH `token_env` allowlist, so this key can never be referenced by a connector-written `_remote_attach` row) — both env-only, never argv, and never resolved/forwarded at all when no scope needs them. A connection with an anonymize-marked scope and no resolvable key fails the job clean rather than running the producer without one. `POST /api/facts/ingest` additionally accepts an optional `anonymization: {declared, scopes: {corpus_id: {docs_anonymized, docs_skipped}}}` block, persisted into the run report (`facts_ingest_runs`, PG-only, new nullable-free `anonymization` JSONB column) but never echoed into the ingest's own response. New [`docs/anonymization.md`](docs/anonymization.md) documents the contract and its limits (Agnes records the producer's declaration; it cannot independently verify content was anonymized).
+
+- **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
+
+- **Agent sharing now needs admin approval, on a Postgres app-state backend (Track C6).** Building an agent stays open to any authenticated user, but when a NON-ADMIN owner shares one with a new group (`PUT /api/sharing/agent/{id}`), the grant is no longer written immediately — it's queued in a new `share_requests` table and the endpoint answers `202` (not `200`) with `pending_group_ids` naming what's awaiting a decision. An admin reviews the queue from a new "Pending agent shares" zone on `/admin/store` (also surfaced as a count on the `/admin` dashboard) or via `GET /api/admin/share-requests` + `PATCH .../{id}` (`{"decision": "approve"|"reject"}`); approving writes the exact same `resource_grants` row an admin-curated `/admin/access` grant would, so the shared-agent runtime honors it immediately. An admin actor sharing an agent, and any un-share, both stay instant exactly as before — only a non-admin's NEW agent share is gated. The queue (`share_requests`, A3 ratchet) is Postgres-only; on a DuckDB-backed instance the approval step simply isn't active — a non-admin share falls back to the pre-C6 instant grant rather than regressing to a hard failure — while the admin `/api/admin/share-requests*` surface itself answers a clean `501` there (nothing to review).
+
+- **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
+
+- **Fact search now takes a free-text name lookup.** `POST /api/facts/search` (and `agnes facts search <type> [query]`, and the `fact_search` MCP tool's new `q` argument) accept an OPTIONAL `q`, matched against alias natural keys ONLY — never a claim's quote or attrs, so it cannot reopen the fact graph's attribute oracle. The query is normalized (casefolded, spaces → hyphens) and filters candidates in SQL before `limit` is applied; matches are then ranked — an exact match on the alias's slug first, a prefix match second, any other substring match last (a deterministic tiering, no `pg_trgm`/similarity-extension dependency).
+
+- **Fact citations now resolve to the source system (spec §8/O7).** A `POST /api/facts/ingest` `documents[]` entry may carry an OPTIONAL `source_url` (the producer's citation deep link, e.g. the crawler's Graph `webUrl`) — validated https-only and length-capped before it is persisted onto `corpus_file_sources`; an absent, oversized, or non-`https` value (`javascript:`, `data:`, plain `http:`, ...) is dropped rather than stored, never rejecting the surrounding claim. The claims read shape (`GET /api/facts/{subject_id}/claims`, the `fact_claims` MCP tool, `agnes facts claims --json`) already carried an optional `document.source_url` field; it is now actually populated. The web chat's fact-evidence card renders the document name as an "Open in source" link (`target="_blank" rel="noopener noreferrer"`, scheme-allowlisted) when `source_url` is present, plain text otherwise — the canonical-source contract (§8.1): Agnes never serves the original, only points at it. A dropped value is never silent: `POST /api/facts/ingest`'s run report (and its persisted `facts_ingest_runs` copy) now carries `source_urls_rejected: [{doc_id, reason}]` alongside `claims_rejected`, and the `/admin/data-sources` SharePoint source card's "Last run" row gets a fourth "Citation links rejected" badge with the same itemized drawer the other three categories already have — so a producer sending urls Agnes keeps refusing shows up as a non-zero count instead of citations that just never go clickable.
+
+- **Collections upload responses report a per-file fact-graph purge signal.** `POST /api/collections/{id}/files` now returns `claims_purged` alongside each uploaded file — the count of fact-graph claims dropped for that file because its content changed in place (0 for a brand-new file, an unchanged-content resync/rename, or when the `facts` flag is off). Closes the coupled half of the verbatim-gate fix below: a producer's own ingest idempotence had no way to tell a purge happened, so it reported "already shipped" and the claims stayed missing until a forced re-ingest.
+
+- **SharePoint connect wizard: unique-permissions advisory badge + raised search caps for real library scale.** `GET .../tree?with_permissions=1` (default off, batched via Graph's `POST /$batch`) probes each listed folder's `hasUniqueRoleAssignments` and the wizard now shows a warn-tone "unique permissions" badge on a folder whose source-side permissions break inheritance from its parent, plus a one-line advisory on the share step when a selected scope was flagged — **advisory only**: Agnes still does not derive or enforce anything from a SharePoint ACL (Decision #2 stands), a probe failure or an un-probed folder always renders as "unknown", never a false "no unique permissions". A real library measured at 443k files / 97,899 folders made the previous search caps (depth 10 / visited 2000) truncate almost every whole-library search at the very top; caps are now depth 12 / visited 20000 (default `max_visited` also raised, 500 → 2000), and a truncated `GET .../tree/search` response carries a `hint` the UI's truncation banner now shows alongside the visited count.
+
+- **MCP servers are now a grantable resource — `ResourceType.MCP_SOURCE`.** Admin-registered MCP servers (`/admin/mcp-sources`) previously had no source-wide visibility control: any user who could see one of a server's tools (via the existing per-tool `tool_grants`) could discover the server existed, and there was no one-action way to hide a whole server from a group. A new `mcp_source` resource type shows up on `/admin/access` like every other grantable resource (data packages, agents, collections, …) and gates the two listing surfaces (`GET /api/mcp/passthrough/tools`, the SSE/Streamable-HTTP `tools/list`) and the call itself (`enforce_passthrough_access`) — ANDed with, never replacing, the existing per-tool grant. Backward compatible by construction: a source with no `mcp_source` grant at all is treated as visible-to-everyone (the "nobody has narrowed this yet" case), every already-registered source is idempotently grandfathered onto the `Everyone` group at boot, and a newly registered source gets the same default at creation time — so existing MCP connections keep working until an admin deliberately narrows a specific server.
+
+- **@delegation between shared agents — server-side handoff (Track C7 MVP).** A live, user-driven agent turn (agent A) can mid-turn hand ONE sub-request off to another agent the caller may run (agent B), get B's answer back into A's turn, and continue — a new in-sandbox tool (`delegate_to_agent`) reaches `POST /api/v1/agents/{slug}/delegate`, which resolves B exactly as the agent-runtime routes do (`agents_repo().get_runnable_by_slug` — the CALLER's own runnable set, never A's owner's) and spawns B as a fresh child chat session under the ORIGINAL CALLER's identity (`ChatManager.create_session(user_email=<caller>, agent_id=B)`) — never A's owner, never B's owner — so B's row-level access policies bind to the caller exactly like the existing C2.3 shared-agent-runtime mechanism, and A can never see a wider slice of data through B than the caller already has. Depth-1 only (a delegated session cannot itself delegate) and one delegation per turn; an RBAC denial, an exhausted monthly budget on B, the per-user concurrency cap, or B simply not answering in time all degrade the result (a normal `200` body) rather than failing A's turn. Delegation rides the existing generic `tool_call`/`tool_result` frame pipeline (already AG-UI-mapped) — no new frame types — and gets a friendly "Delegating to another agent" label in the web chat UI. Hardening: the route's `require_delegating_session` guard now fails closed (403) if a live `AgentPrincipal` is ever missing its resolved caller identity, instead of silently falling back to A's owner — defense-in-depth against a future refactor reopening the owner-fallback laundering seam (no production path exercises it today).
+
+- **A per-instance upgrade freeze an admin can set without SSH.** An
+  auto-upgrade tick once landed mid-demo; the mitigation was a human lock
+  ("ping the operator an hour ahead"). `GET/POST/DELETE /api/admin/upgrade-freeze`
+  now manages a marker file on the shared state disk
+  (`{DATA_DIR}/state/upgrade-freeze-until`, a UTC epoch, capped at 72 h so a
+  typo can't silently disable upgrades for a month), and the VM's
+  `agnes-auto-upgrade.sh` tick consults it before pulling — logging the
+  remaining freeze time on every skipped tick, failing open on a corrupt
+  marker, and cleaning up an expired one. Both actions are audit-logged
+  (`upgrade_freeze.set` / `.lift`).
+
+- **External SSO sign-in — runtime-configured Entra ID OIDC** (design doc `docs/superpowers/specs/2026-08-28-external-sso-login-design.md`). A new optional `sso` provider slot lets users of an *external* organization's Entra tenant sign in alongside every existing login method: an admin configures it at runtime (web panel on `/admin/server-config` or `agnes admin sso …` — tenant ID, client ID, a write-only Fernet-encrypted client secret, a **mandatory, explicit** email-domain allowlist that is deliberately not inherited from `auth.allowed_domain`, and the login-button label) and changes apply on the next login attempt, no restart. Every sign-in captures the validated token's `oid`/`tid` into the new PG-only `user_external_identities` table (subject binding beats email attach; same-tenant conflicts refuse with admin-findable diagnostics; stale bindings self-heal after a tenant re-point), exposed via `GET /api/me/external-identity`, the profile page's *Linked identity* line, `agnes whoami`, and the paginated admin identities list with per-user unlink. Ships with a side-effect-free admin **test sign-in** (`/auth/sso/login?mode=test`, works pre-enable), a server-side discovery probe, startup-warning announcements, and a last-login-door guard (`422 last_login_door`) so disabling or deleting the config can never lock the instance out. Postgres app-state backend required (typed `501` on DuckDB); operator doc: `docs/auth-sso-entra.md`.
+
+- **Force-SSO for allowlisted domains.** The local credential doors — password and magic link (login, `/auth/token`, forgot-password, invite/setup and magic-link legs, request and redemption sides alike) — now refuse every address whose domain is in the enabled SSO config's `allowed_email_domains`, so a link or password minted before the domain joined the allowlist stops working the moment it does. (The OAuth providers are separate doors with their own domain policies, unchanged by the forcing — see the operator doc.) This makes the allowlist's delegation real: when the external tenant offboards someone, no leftover local credential keeps their access alive. Browser forms redirect the address to `/auth/sso/login`; JSON credential endpoints keep their existing generic refusals (no domain oracle). Forcing follows the live config — disable SSO, clear the secret, delete the config, drop the domain from the allowlist, or exclude `sso` from `auth.providers`, and the other doors reopen; stored password hashes are never destroyed. See the trust-model section of `docs/auth-sso-entra.md`.
+
+- **Agent profiles run on the embedded kai-agent engine — the agent API no longer refuses `chat.provider: kai-agent`.** The three artifacts the native workdir seam materializes for an agent session now ride the engine's workspace tarball (`GET /api/kai/workspace`): the persona `CLAUDE.md` (data-access rails appended, replacing the rendered Workspace Prompt exactly as `WorkdirManager._materialize_profile` does natively — override mode included), the identity skill (minted without the remember-tool recipe, which is uncallable from the engine sandbox), and the active memories at `.claude/agent-memory.md`, rendered by the same helper the native seam writes through (`agent_profile.render_memories`) so the two sandboxes cannot drift. A scope-limited agent's tool calls are no longer refused (`403 mcp_not_available_to_scoped_agent` is gone): `/api/kai/mcp` mints and registers the same `agent_session` token the native broker replay uses, so `resolve_token_to_user` rebuilds owner-grants ∩ agent-scope live per request (`AgentPrincipal`) — narrowing an agent or revoking a grant takes effect on the next tool call, and the mint's token cache now keys on the identity *shape* so flipping an agent to `'selected'` mid-conversation can never keep serving the owner token. The same narrowed path covers an all-'all' agent whose session user is not its owner (Slack channel binding), and the flattened marketplace overlay in the tarball is intersection-filtered for restricted sessions — a scoped agent's `AgentPrincipal`, a co-session's live participant `SessionPrincipal` — rather than shipping the caller's (or stored owner's) whole stack. An agent session without a persona now gets the session user's rendered Workspace Prompt (native parity) instead of the unfiltered bundled text. With both halves in place, `POST /api/v1/agents/{slug}/sessions` drops its `503 agent_sessions_unavailable_on_provider` guard — the agent API, `agnes chat <slug>`, one-shot `/responses`, schedules, webhooks and Slack agent bindings all run on the engine provider with the right persona and the right authority. Still engine-side gaps, documented in docs/cloud-chat.md: co-drive keeps failing closed (`mcp_not_available_to_co_session`), and agent memory *writes* have no engine channel (`memory_write_mode` is effectively read-only there).
+
+- **Connecting an MCP source is a builder, and so is linking external apps.**
+  Both were the least builder-shaped surfaces in the product, and both are now
+  the two-pane shell the other four use — numbered sections with real
+  summaries, `+` pickers, one primary action.
+  - `/admin/mcp-sources/new` replaces a create modal with eleven fields plus a
+    separate page to introspect, curate tools and grant them: five steps in a
+    fixed order the admin was expected to know, across two pages, with no way
+    to find out whether the server was reachable until step three. The list
+    page is unchanged; only the create path moved.
+  - **`POST /api/admin/mcp-sources/preview-introspect`** dials a connection the
+    admin has *typed* and returns its tool list, writing nothing — the same
+    relationship to `POST /mcp-sources` that `/entities/preview` has to
+    `POST /entities`. You cannot sensibly choose which tools to grant without
+    seeing them, and the alternative was registering a disabled row first. It
+    runs the same url guard and the same introspection as the registered path.
+  - **`POST /api/admin/mcp-sources/builder/turn`** is the fourth builder turn.
+    Its sanitizer refuses two things the others need not: a `url` the admin has
+    not already typed (the model may not choose which host the instance dials),
+    and an `auth_secret_env` not shaped like a variable name (which is what
+    stops a pasted token being stored in a displayed field).
+  - `/admin/linked-apps/new` drops the two things that made the wizard
+    operator-hostile: it **detects** the source and its lister tool instead of
+    asking, and it treats the **projection map** — which response field is the
+    app's name, which is its URL — as an escape hatch shown only when a row
+    came back that the adapter's own aliases could not read, rather than as a
+    step. That map is an integration author's artifact, not an operator's.
+
+- **Suggested-prompt chips in the builders are the chips from the chat landing
+  screen.** Both are "things you could say next" under a composer; shipping two
+  different chips for one idea is how a product stops reading as one system.
+
+- **The builders lead the setup instead of waiting for it.** Every builder
+  opened with a paragraph the page hardcoded and then waited for the author to
+  describe the whole artifact in one go. Nothing modelled what was still
+  unknown, and the prompts said so outright — *"ask at most ONE question per
+  turn, and only when the answer would change the configuration."*
+  - A **declared interview** per type: an ordered list of what the thing still
+    needs, computed from the draft on every turn and handed to the model as that
+    turn's job. The panel shows it — *"2 of 5 — still to settle: the trigger,
+    the steps, a category"* — from the same predicates the prompt is built out
+    of, so the assistant and the form cannot disagree about what is missing.
+  - **The builder speaks first.** An empty message on the first turn is now the
+    opening turn, generated from the empty draft and the first open slot; a
+    later empty message is still refused.
+  - Slot thresholds match the store's own content guardrail (a description under
+    ~60 characters or a body under ~200 is rejected at Check), so the interview
+    cannot lead an author into a wall. Slots that may legitimately end empty —
+    an agent's knowledge, a package's groups — are deliberately absent: one that
+    can never be settled turns the progress line into a nag.
+  - `app/api/builder_core.py` now owns what the three turn endpoints each
+    re-implemented (transcript model, caps, stub gate, LLM call, response
+    envelope, prompt scaffolding). Each adapter keeps its own patchable fields,
+    candidates, type brief, slots and **sanitizer** — that last one
+    deliberately not generalized, since model output is untrusted input.
+
+- **Every builder turn now reports which engine answered it**, and the page
+  renders a scripted one as a standing notice. The stub also has its own flag
+  (`AGNES_BUILDER_STUB`) instead of being implied by `LOCAL_DEV_MODE` — which,
+  since `LOCAL_DEV_MODE` is also what provides local auto-auth, meant there was
+  no way to run a local instance with auth *and* a real turn, and every local
+  judgement about builder quality was made against a string-slicer returning the
+  identical wire shape. `TESTING=1` still forces the stub.
+
+- **`/admin/mcp-sources` and `/admin/linked-apps` are in the Library's + Add
+  menu.** Both are create verbs — a new capability appears in the workspace —
+  and both lived only in admin, so the menu that claims to be where you add
+  things listed four of the six things you can add. They keep the menu's
+  blast-radius grouping (an MCP source adds tool-calling reach to every agent
+  granted it) and still open their existing pages.
+
+- **A plugin can now be composed from items already in the Library** — the
+  builder's plugin type offers *Pick from the Library* beside *Upload a .zip*,
+  and `POST /api/store/entities/from-components` assembles the bundle
+  server-side from the selected skills and agent templates. Previously the
+  plugin type accepted nothing but a `.zip` packaged elsewhere, and there was
+  no way to get an authored skill back out of the Library to put in one — so
+  bundling was reachable only for authors who kept their skills on disk.
+  - Each component's baked subtree is merged (minus its own
+    `.claude-plugin/`, since the composite gets one synthesized manifest),
+    zipped in memory, and handed to the same `POST /entities` path — a composed
+    plugin is indistinguishable downstream from an uploaded one and pays the
+    same guardrail review. Component directory names keep their
+    `-by-<username>` suffix, which is what their own frontmatter says and what
+    lets two owners' same-named skills coexist in one composite.
+  - `dry_run: true` returns the same preview shape the `.zip` route's
+    *Check bundle* uses, so both routes report their contents identically.
+  - A component the caller cannot see is **404, never 403** — a composite must
+    not become a probe for someone else's private item. A plugin component is
+    refused by name (`component_type_unsupported`): merging two manifests is a
+    separate feature with its own conflict rules.
+  - Unlike a `.zip` — a `File`, which cannot be persisted — a composed draft is
+    only ids, so it survives a reload whole, and the "re-attach the .zip"
+    prompt is now scoped to the upload route.
+  - Copy throughout the type now says the thing the builder never did: a skill
+    saved to the Library **already installs on its own**, so a plugin is never
+    a prerequisite for shipping one — only for shipping several at once.
+
+- **The builder's configuration sections are cards again.** They were flattened
+  onto the panel with only a hairline between them, on the argument that six
+  white cards inside a panel that is itself a surface is two levels of
+  container for one list. True, but the cost was worse: with only a hairline a
+  section's heading, labels, hints and inputs all sit on one grey field, the
+  white input boxes become the strongest edges in the column, and nothing marks
+  where one section ends and the next begins. Both builders share the rule, so
+  `/agents` and `/skills` are fixed together, and the skills page's Type step
+  follows — flat among cards is the same mistake inverted.
+
+- **The `/chat` landing page introduces itself in text instead of a banner.**
+  The Knowledge Layer hero that led the page is retired: it asserted a category
+  ("Agnes is your knowledge layer") rather than saying what Agnes answers,
+  spent the page's best space on a CTA pointing away from the composer, and its
+  "Connect your tools" button was read as sending data *into* Agnes when the
+  direction is the opposite. In its place: a greeting, the "Ask Agnes
+  anything" heading, and one factual sentence about what it answers and that it
+  cites sources — then three labelled doors at the foot of the empty state
+  ("See what Agnes knows", "Take Agnes to your own tools", "How Agnes
+  works"), the middle one naming the direction the old CTA got backwards. Same
+  page for admins and members.
+
+- **The chat landing page stops offering what it cannot do, and gives an admin
+  one thing to do.** On an instance with no data reachable by the caller the
+  page used to say "Ask Agnes anything", suggest four data starters ("Compare
+  revenue trends", …) that would every one of them fail, and put "try:
+  summarize revenue trends" in the composer. The offer now follows the state.
+  An **admin** with nothing registered gets "Set up Agnes for your team" over
+  "It knows nothing about your company yet, so it can answer nothing", and
+  exactly one action: a *Set up Agnes* card — visually apart from its
+  neighbours, since it is a job the reader owns rather than a place to browse —
+  carrying a primary button that opens the connect wizard *on* the connector
+  this instance is configured for. Its starters become answerable ones ("How do
+  I connect our data?", "What will people be able to ask?"). A **running
+  instance** keeps the same card, reporting progress and pointing at the admin
+  overview, with governance starters in place of the data ones ("Who can see
+  what?", "What can nobody reach?"). A **member** who can reach nothing gets
+  starters aimed at the only thing they can act on ("How do I get access?")
+  rather than at data they have no grant for. Callers with data see the page
+  as before, except the three route cards move above the composer — they are
+  where you go instead of asking, so asking them to be scrolled past was
+  backwards. The "no data is registered yet" notice bar is gone: the heading
+  says it now.
+
+- **The `/agents` builder is now a conversation next to the configuration.**
+  Opening an agent gives two panes: a **Create** conversation on the left that
+  describes the agent in plain language, and the **Configuration** on the
+  right that it fills in — name, role, instructions, tone, greeting, and which
+  data packages / memory domains / artefact collections it is grounded in.
+  Every field stays hand-editable while the assistant is talking; the panel,
+  not the conversation, remains the source of truth. New endpoint
+  `POST /api/agents/{agent_id}/builder/turn` (owner-only) runs one turn
+  through the existing `connectors.llm` structured extractor and applies the
+  result through the ordinary `PATCH /api/agents/{id}` path, so the
+  builder-declaration → enforced-scope derivation is unchanged. The model's
+  output is treated as untrusted: unknown fields, ids outside the caller's
+  own candidate lists, and invented tones are dropped before anything is
+  written, and `status` / the four `*_mode` columns are not writable from a
+  conversation at all. With no AI credential configured the endpoint answers
+  `503 builder_llm_unavailable` and the panel stays fully usable by hand.
+
+- **The builder's Preview is a live chat with the agent**, replacing the
+  static mock card. It opens a real session bound to the draft agent's own
+  slug (`POST /api/chat/sessions` with `agent_slug`) and streams the answer
+  over the existing WebSocket, after flushing the pending edit so the agent
+  answers as its current configuration rather than the previous one. Answers
+  render as plain text — the page has no HTML sanitizer — with an *Open in
+  full chat* link to the same session for the full renderer. Engine failures
+  are translated into what the reader can act on instead of surfacing the
+  internal kind.
+
+- **Zip-bundle members are now individually citable in the fact graph**
+  (design §6/§7 citability follow-up). Each member `ingest_bundle` unpacks
+  from an archive gets its own `corpus_file_sources` anchor
+  (`source_stable_id = "<archive corpus_files.id>!<member path>"`,
+  `source_doc_id = <member sha256[:16]>`) — best-effort, silently a no-op on
+  a DuckDB-backed instance — so a fact-graph claim can cite the exact member
+  that contains the evidence instead of only the archive, and a producer can
+  cite a member by its own content doc_id with no `documents[]` entry. A
+  member's identity, and therefore its claims, now also survives a routine
+  re-sync of the archive: the previous behavior purged EVERY member up front
+  the moment the archive's own bytes changed (any single member changing
+  changes the zip's own sha256), re-minting every member's id and cascading
+  every member's claims on every re-sync, not just the changed one's;
+  reconciliation is now left entirely to `ingest_bundle`'s own
+  `(filename, sha256)` member matching, which purges only the members that
+  actually changed or disappeared. A member rename inside the archive is
+  still delete-old + create-new (identity stays keyed on filename+sha256,
+  unchanged by this fix) — only a byte-identical, same-named member across a
+  re-sync now keeps its row, anchor and claims. The member-anchor shape
+  (`cf_<hex>!<member path>`) is RESERVED and refused with a `400` from a
+  caller-supplied `source_stable_id` at both entry points that accept one —
+  the collections upload endpoint's `source_stable_ids` field and the facts
+  ingest `documents[].stable_id` — since the shape is visible to anyone with
+  mere collection READ access and would otherwise let a caller with WRITE
+  access silently retarget (or, via facts ingest, hijack the citation key
+  of) a real member's row. A bundle row re-uploaded at the same identity as
+  a non-bundle file type also now fully purges its old members' rows,
+  chunks, claims and anchors (deciding this from the row's OLD filename
+  alone left them permanently live, attached to a row that is now some
+  other file type); and a concurrent double-mint race on the same member no
+  longer 500s the whole ingest.
+
+- **Invite someone into a group without leaving the page.** Searching a group's
+  People for a person with no account ended the job: a link to `/admin/users`,
+  where the admin started again with both the query and the group lost. "Add
+  someone to this group" and "invite someone" are one intent. A typed address
+  now offers **Invite and add to this group** in one click; a partial name
+  offers the field that completes it. The account is created (`POST
+  /api/users`) and added to the group, and the toast says which half landed —
+  an existing address (409) is not treated as a failure, since the half that
+  matters can still go ahead. Inline rather than a modal: the query is already
+  typed and scoped to the group, and the result lands in the roster directly
+  below. **Nobody types the same text twice:** the search query is carried
+  into the invite field, completed to a full address when the instance has
+  exactly one configured sign-in domain (an invited account could not
+  authenticate with any other), and **Enter finishes the job from the search
+  box** — straight through for a complete address, otherwise moving the caret
+  to the end of what was carried over. Focus never moves while typing, only
+  on Enter, or the field would fight the search on every keystroke. The
+  404-on-add path keeps its People wording — that is a race, not a person who
+  was never invited.
+
+- Extended the audit-posture ratchet past HTTP: worker job kinds, MCP foundation tools, and
+  Slack/Telegram bot commands now declare a cataloged action or an exempt reason
+  (`JOB_POSTURE` / `MCP_TOOL_POSTURE` / `BOT_COMMAND_POSTURE` in `src/audit_posture.py`),
+  closing the gap where those surfaces could ship unaudited with nothing failing. The
+  agent kit now documents the audit contract (`.claude/skills/agnes-conventions/references/audit.md`).
+
+- **The customer-instance Terraform module can now deploy the extraction lane (TCRD-259).** A per-VM `extraction_worker_enabled` flag (default **off** — a module bump alone renders a byte-identical startup script for every VM that did not opt in) engages the two halves that only work together: a `redis` compose service for the multi-process coordination backend, and the `extraction-worker` service re-pinned to a module-level `extraction_worker_image` — the operator-built `worker` Dockerfile target with the producer baked in, which the prod overlay's plain-app-image pin was silently bypassing. The coordination declaration rides `.env` (`AGNES_COORDINATION_BACKEND=redis` + `AGNES_REDIS_URL`; env > yaml per `app/coordination/factory.py`) so the module never writes into the applier-owned `/data/state/instance.yaml`, and every service reading `env_file: .env` — including the app across `agnes-state-applier`'s managed-overlay-only force-recreates — sees the same backend. The overlay clears the base compose's profile gate (`profiles: !reset []`), making overlay presence in `COMPOSE_FILE` the entire switch: no `--profile` plumbing through the startup/upgrade/applier scripts, and the auto-upgrade reconcile keeps it as an unmanaged overlay. Boot is never gated on the lane (strict base pull/up first, redis then worker brought up tolerantly after — same posture as the kai-agent engine), and the watchdog now scans `extraction-worker` as a role container and arms its coordination-unreachable signature off the `.env` declaration too. Enabling the flag on an instance still running the DuckDB app-state backend makes the app refuse boot with the guard's named error — migrate the backend first, then flip the flag.
+
+### Changed
+
+- **The Library says what your agents get, not what the server does.** Every
+  control in the Access column named a mechanism — *Install*, *Add to stack*,
+  *In stack*, *Required by your admin*, *Granted to your group* — which told a
+  reader what happens internally and left them to infer what they get. Each now
+  names the outcome: **Add to my agents** (was Install / Add to stack), *Agents
+  can use this* (was Installed / In stack), and one state for governed data,
+  *Agents can query this*, replacing the pair of pills that promised two
+  different things about removal for what is a single, identical capability —
+  the tier survives in the tooltip, where it explains why rather than posing as
+  a different power. The two toolbar toggles follow (*Agents use it*, *Not added
+  yet*), so the page no longer says "stack" anywhere, and a permanent one-line
+  lede under the title states the rule the whole page turns on: your admin
+  decides what data you can reach, you choose what your agents can do with it.
+
+- **Every row in the Library's + Add menu says what it makes.** Four of the
+  eight — skill, plugin, agent template, upload — were a verb and nothing else,
+  so the menu told you the shape of the thing only where someone had happened to
+  write a sub-line. Each now carries the builder's own one-line description,
+  compressed, so the menu and the page it opens describe the same object the
+  same way. The menu widens 214px → 320px to fit them on one line each.
+
+- **The Library filter menu answers more than "who owns it".** It offered
+  Owner, Source, Access and a Tags category that is empty for every collection,
+  file, app and recipe (`file_corpora` has no tags column), so past a screenful
+  the only working narrowing was search. Three categories join it, each read off
+  data the rows already carry: **Added** (last 7 / 30 / 90 days, cumulative, so
+  the buckets nest instead of excluding each other), **Yours or shared**
+  (created by you · shared by you · shared with you) and **File format**. A
+  category with fewer than two distinct values still does not render, so the
+  menu grows only where the data does. A file whose text the extraction pass
+  could not read now says so on its own row — *Not indexed yet* / *Indexing* /
+  *Needs review* / *Not indexed*, and nothing at all when it is indexed, which
+  is the majority — instead of only being discoverable by opening its
+  collection.
+
+- **The Library is two tabs, and every row's button says what it does.**
+  `/library` was one flat list answering two different questions — *what does
+  this organization know* and *what can my agent do* — and a single control
+  label, "Add to stack", sat on rows whose click posted to four different
+  endpoints meaning four different things.
+  - **Knowledge / Capabilities tabs**, deep-linkable as `?tab=`. Knowledge
+    holds documents, governed data, memory, recipes and apps; Capabilities
+    holds skills, plugins and agent templates. A detail page's `?section=`
+    back link selects the tab that owns the section, so returning from an item
+    can no longer land on a page where that item is filtered out. The tabs are
+    the shared `FilterToolbar` segmented control reading `data-tab` off each
+    row, so switching tabs shares one code path with search, the facets and the
+    empty-section hiding.
+  - **Data apps are their own band** rather than a trailing block inside
+    Artefacts, whose hint had to call an app a file the caller had uploaded.
+  - **Per-kind action verbs.** `Install` / `Installed` for skills, plugins and
+    agent templates (they post to `/install` and were never stack members —
+    `/api/stack` accepts only `data_package` and `memory_domain`);
+    `Keep a local copy` / `Local copy` for governed data, because
+    `features.stack_auto_membership` has been default-on since Wave 0, so the
+    grant already *is* the membership and the only remaining choice is what
+    `agnes pull` downloads — the wording `StackResolver.browse()` already used
+    internally. A granted row now states its tier — `Required by your admin`,
+    `Granted to your group` — instead of claiming a membership the caller could
+    neither create nor drop, with the reason available only in a tooltip. The
+    grid card no longer overwrites the row's label with the stack vocabulary,
+    so table and card cannot drift.
+  - **`+ Add` follows the tab** — sources on Knowledge (data package, connect a
+    source, link an external app, upload), builders on Capabilities (skill,
+    plugin, agent template, MCP source). The blast-radius headings survive
+    inside each half. The menu is bounded to the room below its button, so its
+    last entries stay reachable.
+  - **One browsing block, sitting on the list.** Search, the filters, the view
+    switch, "+ Add", the item count and the active-filter chips are one job, so
+    they are one block directly above what they act on; the page header keeps
+    the title, the connect banner and the tabs. They used to be spread over
+    four bands — you pressed Filter in the page header and read what it did two
+    bands lower, past a promo panel, while the count sat in a third place. The
+    Library spent its first screen not listing anything. The group bands keep
+    the viewport top, which is the thing worth pinning on a long list; no header
+    pins, because one carrying all of that runs ~270px and leaves a band no room
+    to travel in. The shared floating dock (`.fbar-dock`) is untouched and still
+    `/chats`'s.
+  - **Status stopped looking like a control.** "Shared with you", "Required by
+    your admin" and "Granted to your group" all answer *why you have this* and
+    were drawn as pills in the same slot the row's buttons use, under a column
+    headed **Actions** — which is what "Required by your admin" is precisely
+    not. They read as text now; only a control keeps a box, and the trailing
+    column drops its misleading label (keeping an accessible name). Controls
+    themselves went quiet at rest: five 38px bordered boxes across the toolbar
+    gave nothing rank, so search is a field, Filter/stack/view are borderless
+    utilities that tint when on, and "+ Add" is the only filled control.
+  - **Bands open on arrival**, and an empty tab says so in its own words rather
+    than offering a "Clear filters" button for filters that are not applied.
+
+- **A mutating route without its own audit call now emits its real declared action** (`stack.subscribe`, `prompt.delete`, `collection.file_add`, …) instead of the generic `http.request` placeholder `AuditFallbackMiddleware` used to write. The `"fallback"` posture value is retired — every posture entry is now either a cataloged action or an explicit exemption.
+
+- **Authoring surfaces no longer open on a name field (TCRD-205).** The agent builder, the skill/plugin/agent-template builder and the data-package drawer each now open on what the thing is for — a role, a description, what the package carries — and ask what to call it last. The name was the least interesting decision on each form and the hardest to make first, and on the data package it was actively harmful: the slug derives from the name as you type, so a placeholder name immediately became a placeholder identifier. The derivation is unchanged and still correct; asked last, it finally has a real name to derive from. Nothing became more or less required — none of the three gated saving on a name (each already rendered `Unnamed`), so this is ordering only.
+
+- **One word per thing, across the surfaces where two had drifted (TCRD-208).** `/profile` stops calling admin elevation "god-mode" (now *full admin access*) and stops calling its confirmation a "consent gate" — "consent" already means OAuth provider consent everywhere else in Agnes, so one word was carrying two mechanisms a user meets in the same session. The connection pill on `/me/connections` states a state and nothing else (*Expired*, beside *Connected* and *Not connected*) — the remedy still lives in the detail line, where someone is actually reading. `/admin/semantic-layer` names its drift columns *in Agnes / in source* rather than *stored / upstream*, and no longer points readers at a *Master token (semantic layer)* row that was renamed to *Semantic-layer token*. `/admin/linked-apps` writes `ID` beside `URL` rather than `Id`. The login page's apostrophes are typographic, like the rest of the repo. `tests/test_product_vocabulary.py` pins each decision, because the design-system contract tests police colour and spacing but nothing policed language — which is why sixteen design reviews each re-found a naming collision independently.
+
+- **SharePoint source card: humanized rejection rows, a source-type-aware Actions menu, and one-click scope management** (TCRD-240/241 live-use follow-up). The "Last run" drawer no longer shows a bare rejection row like `6a8e0bc93c07c56a — verbatim_gate_failed` — the doc_id resolves (server-side, via `corpus_file_sources`) to the corpus file's name and collection, the raw sha16 is demoted to a tooltip, duplicate `(doc_id, reason)` rows collapse into one with a "N×" count badge, and known reason slugs (`verbatim_gate_failed`, `unresolved_doc_id`, `ambiguous_cross_collection_doc_id`) get a plain-language subline; an unknown slug still shows verbatim, never hidden. The "Identity matching" row is rephrased as a sharing-state sentence ("all scope collections have a group" / "N collections have no group — only admins see them"). The Actions menu is now source-type-aware: a SharePoint connection gets its own verb set (Manage scopes…, Test connection, Update certificate…, Delete source) instead of the meaningless-for-SharePoint Keboola items (Add tables, Rotate storage token, Semantic-layer token, chat tools, Make default project); its own "Test connection" checks the certificate + a live Graph tree call instead of Keboola's token-verify endpoint. A new "Manage scopes" button sits directly on the collapsed card next to Actions, and the expanded card lists each confirmed scope as a clickable row — both open the connect wizard bound to that connection (never a duplicate), landing on the scope step or, for a specific scope row, the share step with that row highlighted (a stored scope carries no site/drive id to drive the tree browser to). The wizard's own "Continue an existing connection" picker pre-selects the sole option when only one connection exists.
+
+- **Every admin sidebar row in the Content, Instance and Activity sections carries a one-line gloss.** "Store lint" told a first-time admin nothing; "Advisory quality findings on skills" tells them enough to open it or skip it. The copy is each page's own lede, cut to one line — it existed already, one click too late. Only the vertical disclosure rows get one: the tab strips (People · Data · Access) tried captions and dropped them, on the reasoning that a label needing a gloss should be relabelled and four captions doubled a horizontal strip's height — that call still holds there, because "Sources" and "Tables" carry their own meaning while "Store lint" cannot be renamed into self-explanation. Height stays bounded because the column expands one section at a time; glosses are clamped to two lines and the copy is written to fit.
+
+- **MCP sources and Linked apps move from Instance to Content in the admin sidebar.** They were filed as "outbound connections" and therefore instance plumbing, which confused how a thing is wired with what it is *for*: an MCP source ends as tools in an analyst's chat and a linked app ends as an app they open, so both answer Content's question — what can analysts reach — not Instance's. Content now reads in two runs: where things arrive from (Marketplaces · MCP sources · Linked apps), then what is done with what arrived (moderation · submissions · lint) and the rest. Instance is left with only what an admin touches to change the instance itself — config, database backend, initial workspace, prompts, secrets. URLs, page content and permissions are unchanged; this is which heading the row sits under.
+
+- **Every admin sidebar row and the page it opens now call the place the same thing.** Eleven rows had drifted: "Marketplaces" opened *Curated Marketplaces*, "Store lint" opened *Skill Lint*, "Corporate memory" opened *Memory Review*, "Knowledge digests" opened *Maintained digests*, "Server config" opened *Instance settings*, "Initial workspace" opened *Initial Workspace Template*, "Linked apps" opened *Link Keboola apps* (noun vs verb), "Submissions" opened *Flea Submissions* — finishing the rename decision 8 of the authoring-seam spec started, which retired the word *flea* from user-visible labels and had reached the nav row but not the page — plus Title-Case-vs-sentence-case on *Studio Suggestions* and *MCP Sources*. Browser `<title>`s were reconciled with their headings in the same pass, which removed a third name for the submissions queue (*Store submissions*), an "Activity" title over the *Audit log* page, and the stale product name in `Memory Review - Data Analyst Portal`. The rule applied throughout: the sidebar row is the name and the page matches it. **One deliberate exception** — the row "News" became **"News editor"**, because there the page was right and the column was wrong: `/admin/news` authors news and `/news` reads it, and calling both "News" put one word on two entries an admin sees at once (DES-63). A new guard, `tests/test_admin_nav_label_matches_page.py`, renders every gated row's page and fails when a row and its page disagree — this class of drift was invisible page-by-page and nothing compared the two, since the design-system contract tests police colour and layout but not language.
+
+- **The Moderation & Trust hub (`/admin/store`) is hidden behind a flag, joining the four surfaces the admin cleanup already retired.** `features.store_moderation_enabled` / `AGNES_STORE_MODERATION_ENABLED`, default `false`, on the same both-halves pattern: no entry point is drawn — the Content sidebar row, the command-palette row, its `g v` shortcut, and both `/admin` dashboard signal cards that pointed at it (store verification and the C6 agent-share queue) — and the route redirects home. The hub was a landing page for doors the column already carries: submission review is its own nav row, marketplace curation is `/admin/marketplaces`, and entity verification has its own `store.verification_enabled`. Nothing is deleted — the page, its template and every API behind it are intact, and the flag brings the surface back exactly as it was. Hides UI only: the store APIs and `/api/admin/share-requests*` keep serving, so a queued agent share stays decidable by API. Note that this page is the only UI that renders those queued agent-share approvals (Track C6); that is acceptable while owner-initiated agent sharing remains V2-deferred in the agent-profiles design spec, so the queue is empty on a default instance.
+
+- **The SharePoint wizard and source card no longer render "anonymized" from the checkbox alone.** `anonymize=true` on a scope is a *request*; the badge only reads "anonymized" (ok tone) once the latest persisted ingest run actually *declares* that collection anonymized (`anonymization_declared`, new field on `GET /connections/{id}/scopes`) — otherwise it reads "anonymization requested" (warn tone). Applies to the connect wizard's step-2 tree badge, the step-3 share preview, and a new "Anonymization" row on the `/admin/data-sources` source card.
+
+- **Vocabulary pass (D5, v1): the same concept now has one name across UI,
+  CLI and MCP help text — the old name keeps working as a deprecated
+  alias.** `agnes connectors`/`agnes connector` → **`agnes tools`**
+  (optional MCP tool connectors — Asana, Atlassian, … — were colliding with
+  "Connector" = data source used throughout the docs); `agnes stack
+  artefacts` → **`agnes stack collections`**, and its `corpus_id` argument
+  is now documented as a collection id ("Collection" is the established
+  canonical name for a file corpus — see `agnes collections` — the
+  `stack_artefact_*` MCP tool descriptions now lead with "collection" too).
+  `agnes agent`'s help text drops "agent profile" in favor of "agent"; the
+  agent builder's schedules panel says "agents are disabled" instead of
+  "agent profiles are disabled". The semantic-model CLI (`agnes admin
+  semantic-model`, `agnes semantic-model apply`) drops "Ossie document" in
+  favor of "semantic model document" (`agnes semantic-model schema`, which
+  prints the actual vendored Apache Ossie JSON Schema, keeps naming the
+  standard — that reference is accurate, not the retired synonym).
+  `/admin/data-sources`' browser tab title is now "Connections" (the hero
+  and nav tab stay "Data"/"Sources"). No REST route paths changed.
+
+- **One label for the one door out to your editor.** Seven surfaces linked to `/how-it-works#connect` under seven different names — "Use Agnes elsewhere" (rail), "Take Agnes to your tools" (chat landing), "Use Agnes outside this tab" (onboarding checklist), "Connect my AI tools" (tour), "Connect once →" (Library banner), "AI Connector" (/home, command palette) — so a reader who met two of them had no way to know they were one place. They now all say **"Take {brand} to your tools"** (the tour's closing button keeps the first person: "Take Agnes to my tools"). The phrase is the one that survived the retired Knowledge Layer hero, chosen for the same reason the hero's own CTA was dropped: it names the direction — {brand} travels out to the editor you already use — where "connect your tools" reads as sending data the other way, and "elsewhere" names no destination at all. The rail row is the tightest fit and was measured rather than guessed: 152px of label in a 169px box at 13px/500, so the default brand clears it, and a longer brand short-name truncates to the ellipsis the label already had — now recoverable through a `title` attribute the row did not have before. Explanatory prose around each link is unchanged where it already pointed the right way.
+
+- **The chat page's suggested actions moved above the composer.** "Suggested for you" used to close the empty state from under the input; it now sits between the page's lede and the composer. The chips answer "what can I even ask here", which is a question the reader has *before* they reach an empty field, not after they have already passed it — read top-down the page is now "here is what you could ask" then "ask it". The ways out (the two cards + trust line) did not move: they still close the page, because every one of them navigates away from the composer. The chips render from the same typed task model and keep the same shared column grid as the composer; they still hide the moment a conversation starts.
+
+- **The chat sandbox now tells the agent the truth about its runtime, and
+  read-only admin commands work there.** Three coupled fixes to the same
+  confusion (an in-chat agent concluding its auth was broken and recommending
+  `agnes pull`): (1) the secret broker now replays **read-only (GET/HEAD)
+  admin routes** under the session user's own identity — `agnes admin
+  list-users` / `list-tables` work for an actual admin in chat (main-scoped
+  CLI tickets only — the MCP leg keeps the full refusal), while the
+  route's live `require_admin` still refuses non-admins and agent principals,
+  and admin **mutations** stay interactive-only (403
+  `admin_mutations_require_interactive_auth`); switchable via the new live
+  flag `chat.broker_admin_reads` / `AGNES_CHAT_BROKER_ADMIN_READS` (default
+  on). (2) `agnes auth whoami` inside a sandbox (`AGNES_SESSION_ID` set, no
+  token by design) no longer answers "Not logged in" — it verifies the
+  brokered identity live via `/api/me/effective-access` and reports it,
+  including whether read-only admin commands are available. (3) the workspace
+  prompt (`config/claude_md_template.txt`) grew a sandbox-specific "This
+  sandbox — how you run and authenticate" section and stops giving the
+  sandbox laptop-only advice (`agnes pull`/`push`/`init`/`login`, Private
+  sessions, Corporate Memory, laptop Directory Structure); the bundled
+  fallback `app/initial_workspace_default/CLAUDE.md` carries the same truths.
+  The brokered read surface leans on the repo-wide "never mutate on GET"
+  invariant as its read/write boundary, so the one admin route that broke it
+  was fixed rather than special-cased: **`/admin/chat/{chat_id}/tail-ticket`
+  is a `POST`** (it mints a live one-shot credential for the admin tail
+  WebSocket, so as a `GET` it would have been brokered — handing a chat
+  sandbox a ticket to read any other user's live session). A new guard,
+  `tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential`,
+  fails on any future admin `GET`/`HEAD` route that mints one.
+
+- **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
+  The endpoint dials a connection the admin has typed but not saved — with a
+  credential attached, or on `stdio` by launching a subprocess with a
+  caller-supplied command. That is the same authority its registered sibling
+  (`POST /mcp-sources/{id}/introspect`, which is audited) already has and the
+  same principal holds it, but the registered path always leaves a row behind
+  and this one leaves nothing, so the audit entry is the only trace it
+  happened. Records the transport and the url/command, never the `env` dict.
+
+- **BREAKING: four admin surfaces are hidden by default — Studio, News, Knowledge
+  digests, and Contribute a skill.** The admin sidebar drops all four rows (plus
+  the Studio suggestions row, which reads the same flag its route always did),
+  the rail's News item and the news + Studio command-palette entries; every one
+  of the routes redirects home, including both `/admin/contribute-skill` POSTs so
+  a stale external "Load skill to Agnes" button cannot publish past a hidden
+  page. Nothing is deleted — the pages, templates and APIs are intact and each
+  surface is one flag away: `studio.enabled` / `AGNES_STUDIO_ENABLED` (was `true`,
+  now `false`), and three new flags `features.news_enabled` /
+  `AGNES_NEWS_ENABLED`, `features.knowledge_digests_enabled` /
+  `AGNES_KNOWLEDGE_DIGESTS_ENABLED`, `features.contribute_skill_enabled` /
+  `AGNES_CONTRIBUTE_SKILL_ENABLED`. **Breaking for an instance that used Studio
+  or news without setting the flag: it turns off on upgrade** (the Library
+  builders at `/library` → "+ New" do the Studio's authoring jobs). Two gates
+  stay deliberately narrow: the digests flag hides the ADMIN PAGE only —
+  `/api/admin/knowledge-digests/*`, `agnes admin digest`, the digest scheduler
+  job and `agnes pull`'s digest delivery keep working, so an instance already
+  running digests keeps running them headlessly — and the news flag hides UI
+  only, leaving `/api/admin/news/*` and any published version untouched, so
+  turning it back on restores the surface with its content intact.
+
+- **The data-package drawer shows the package, not the warehouse.** Its tables
+  field rendered the *entire* registry — ~500 rows in a project › bucket tree
+  with tri-state boxes — and ticked the members somewhere inside it, so five
+  chosen tables were five ticks scattered through a hundred collapsed groups,
+  and a table the drawer's own conversation proposed landed where nobody would
+  look. The panel now carries only what is in the package (source, query mode,
+  Remove each, count on the label) plus **+ Add tables**; the tree is kept
+  verbatim and moved inside the picker, bulk tri-state boxes and all. It opens
+  the tree when there is only one project, since otherwise a single-source
+  instance opens the picker onto one collapsed heading. The panel also says how
+  many of the chosen tables actually reach a laptop
+  (`query_mode IN ('local','materialized')` and not `server_only`) rather than
+  leaving an admin to know that rule by heart. Groups get the same treatment in
+  a follow-up — that pool carries a three-state tier per row and a grant diff on
+  save.
+
+- **A `no_tools_registered` 409 no longer reads as "already granted".** The
+  source-wide grant (`POST /api/admin/mcp-sources/{id}/grants`) answers 409
+  `no_tools_registered` when a source has no *enabled* tool row — nothing was
+  granted, and re-enabling the tools later does not go back and grant anyone.
+  Already-granted is not a 409 there at all (200 with an `already` count), so
+  the MCP builder's blanket "409 means done" reported a failed access change as
+  success, on a state the builder can produce: turn every introspected tool off,
+  pick a group, Save. The swallow is now keyed on the error code rather than the
+  status, so that case surfaces the server's own sentence (which names the fix)
+  and Save does not redirect. Sibling checked and left alone: the linked-apps
+  builder swallows 409 from `/api/admin/grants`, whose single 409 genuinely does
+  mean the grant already exists.
+
+- **The MCP builder's Save now registers the tools, so the source it hands back
+  is actually callable.** A source exposes only the `tool_registry` rows that
+  are `passthrough` and enabled (`app/api/mcp/tools_generator.py`), and Save
+  wrote the source, the secret and the grants but never a tool row — so it
+  produced a registered, granted source with **zero callable tools**, while the
+  Tools panel invited the admin to "turn off anything agents should not call"
+  and counted "N of M" on. The toggles described an outcome Save did not
+  produce, in both directions. Each tool left on is now registered as a
+  resumable step before the grants (a group pointed at a source with nothing
+  callable has been given nothing), keyed on the deterministic
+  `<source>__<tool>` id the source detail page already uses so a second Save
+  cannot duplicate a row and the 409 a re-register answers reads as done. Tools
+  toggled off are simply not registered. The introspected `input_schema` — which
+  the panel's mapper had been discarding — now reaches the registry, since it is
+  how an agent learns the tool's arguments. Materialize mode still belongs to
+  the source's own page: it needs a schedule and a table this panel does not ask
+  for.
+
+- **`dev_preview_available` had two definitions.** `_chrome_ctx` computed it as
+  `_dev_preview_enabled()`; `/chat` also passed it to `_build_context` as
+  `is_local_dev_mode() and is_user_admin(...)`. Only the first was corrected
+  when the flag's dead clause came out, and the `/chat` half was redundant on
+  its own terms — `_dev_preview.html` is the key's only consumer and gates on
+  `session.user.is_admin` itself, so a member never saw the switch through
+  either route. The duplicate is gone; chrome owns the flag, and one fewer
+  uncached `is_user_admin()` runs per chat render.
+
+- **A partial `surfaces` patch from the agent builder no longer switches the
+  other surfaces off.** `surfaces` is one opaque JSON column and both writers
+  replace it wholesale — `update_agent` `json.dumps`es the patch, and the
+  `/agents` page assigns `a[k] = patch[k]` into its working copy — while the
+  builder prompt asks the model for "only the fields you are changing this
+  turn", whose honest answer for a turn about one surface is `{"mcp": true}`.
+  Read literally, that turned an owner's Slack and Telegram off as a side
+  effect of turning MCP on, and the reply said only that MCP was enabled.
+  `_sanitize_patch` now merges the proposal over the effective configuration
+  (the saved row overlaid with the page's unsaved copy) — at the sanitizer
+  because that is the one place both writers pass through, so the patch the
+  page merges is complete too. A patch that explicitly turns a surface off
+  still does, and web chat is still forced on.
+
+- **A group the package builder proposed never reached the panel.** `applyPatch`
+  ticked group rows by querying `[data-pdw-group]`, an attribute nothing in the
+  product emits — a row is `[data-group-id]` wrapping an unlabelled checkbox — and
+  even with the right selector there was nothing to tick, because group rows are
+  hydrated only when the admin opens the access disclosure and the builder's own
+  mode is create. Compounding it, the turn reported the groups from
+  `st.grantsOriginal`, the edit-mode baseline of already-saved grants, which is
+  empty in create mode, so the conversation kept re-proposing groups the admin had
+  already accepted. The patch now fetches the rows, matches by attribute (a group
+  id is server data and may hold a quote, so it is compared rather than
+  interpolated into a selector), and opens the access disclosure when it ticks
+  anything — a box ticked inside a collapsed `<details>` is a silent change to who
+  can reach the data. `chosenGrants()`, which Save reads, was correct throughout,
+  which is why the break was invisible: ticking by hand worked, the builder's
+  proposal did not.
+
+- **`POST /api/store/entities/from-components` gained a CLI and an MCP surface**
+  — `agnes store compose <name> --add <id> --add <id>` and the
+  `store_compose_plugin` tool — matching its sibling `from-markdown` rather than
+  taking a REST-only exemption.
+
+- **A chat send that never started no longer eats the message.** The composer
+  is cleared synchronously on submit, for immediate feedback while the runner
+  boots — but when `ensureWsReady()` then failed (chat disabled, no live
+  ChatManager, session POST refused with 503) the error line appeared over an
+  empty composer and the typed prompt was gone. The failure path now puts the
+  text back, so a chat backend that is down costs a retry rather than the
+  message. Guarded by `tests/test_chat_failed_send_keeps_draft.py`.
+
+- **Clicking an agent card on `/agents` opens its builder, not a chat with it.**
+  A ready agent's card used to start a conversation, which meant the one obvious
+  gesture on the page whose whole subject is the *configuration* went somewhere
+  else, and editing was left to a small `Edit` button in the card's footer. Cards
+  now behave the same in both bands — click to configure — and **Chat** is the
+  footer action on every card (draft ones already had it). Nothing became
+  unreachable: the composer's own agent picker still opens a session as any
+  agent.
+
+- **Fixed: the empty-instance chat landing told the reader something untrue.**
+  Its lede read "It knows nothing about your company yet, so it can answer
+  nothing", and that second clause is false — with no data registered {brand}
+  answers perfectly well from general knowledge. The same page proved it two
+  elements lower: the composer's placeholder is "Ask how to get {brand} set up…"
+  and the suggested questions are "How do I connect our data?" and "What will
+  people be able to ask?", all of which get real answers, so a reader who typed
+  one caught the page contradicting itself on their first attempt. What is
+  missing is the GROUNDING, not the answering, so the copy draws that line
+  instead: *"Nothing is connected yet, so {brand} answers from general knowledge
+  rather than your company's data. Connect where your data lives and it can
+  answer from your own numbers."* The setup card made the same overclaim
+  ("Nothing is registered yet, so nobody can ask anything") and now reads "No
+  data connected yet, so answers can't use your numbers". The guards assert the
+  scoped claim and refuse either old form.
+
+- **The admin zero state greets the reader like every other chat landing.** It
+  opened with an "{instance} · Admin" eyebrow where every other state opens with
+  "Good morning, {name}" — two different openers for no benefit to the reader,
+  since an admin arriving at an unconfigured instance is still a person arriving
+  at their tool. The greeting is now defined once and emitted in both intro
+  branches, so the only thing that differs between them is the heading and lede
+  that genuinely differ. The retired eyebrow's information is not lost: the
+  deployment is identified by the rail's wordmark and the footer's build stamp.
+
+- **The chat empty state has a vertical rhythm you can read.** Its spacing was
+  inverted: the gap between the composer block and the suggestions (18px) was
+  *smaller* than the gaps inside the intro above it (25px, 28px), so eight
+  elements sat at roughly one distance apart and the page read as a list of
+  unrelated rows rather than three sections. Spacing is now a named four-step
+  scale declared once on the empty state (`--cld-gap-tight` · `-inner` ·
+  `-block` · `-section`), with `section` the largest step by construction:
+  5px inside one line, 10px from a label to what it labels, 26px between the
+  parts of a region, 40px for the page's one real boundary. The page is TWO
+  regions rather than three sections — everything down to the suggested
+  questions is "ask" (the intro says what you can ask, the composer is where you
+  ask it, the chips are ways to fill it), then one break, then the ways out. The
+  measured result for an admin is 5 · 10 · 26 · 10 · **40** · 26 · 10, reading
+  greeting → heading → lede → cards → privacy line → *break* → composer → label →
+  chips; for a member the same steps run greeting → heading → lede → *break* →
+  composer → label → chips → **40** → cards → privacy line.
+  Three alignment faults went with it, all of the same kind — near-agreement,
+  which reads as error where either agreement or a clear difference would not:
+  - **The composer's footer row was the one left-aligned block** on a page whose
+    every other element shares one centre axis, and it sat at the midpoint with
+    540px of empty row after it. Centred.
+  - **Three near-equal measures** (composer 830px, cards 660px, chips 640px) are
+    now two. The chips and the cards share `--cld-measure`, so their left and
+    right edges land on the same pixels instead of 10px apart.
+  - **The two cards' text columns started at different insets** — one after a
+    46px progress ring, the other at its own padding — so their titles never sat
+    on a shared line and the ringed card read as the heavier of the pair. The
+    icon slot is the ring's exact size now (46px, was 40px), and the tools card
+    carries a leading mark of its own.
+
+- **`/agents` opens with a "New agent" card instead of a button above the
+  grid.** Making an agent lands in the same builder as opening one, so it is the
+  same kind of act and belongs in the same row — in the position the eye reaches
+  first — rather than floating over the collection as a toolbar. The dashed cell
+  is a peer of the cards beside it in size and radius and deliberately not in
+  fill, since a solid card would read as an agent that already exists. It leads
+  whichever band actually renders: Ready when there is one, Drafts otherwise, so
+  an instance whose every agent is still a draft does not lose it (an empty band
+  renders nothing at all). The zero state keeps its own "Build an agent" panel —
+  with no grid, there is no first cell for a card to be.
+
+- **The chat empty state is reordered, and the door-cards close the page.** The
+  three cards between the heading and the input are now two, and they sit BELOW
+  the composer and its suggested questions: greeting, heading, lede — then the
+  field, the suggestions, the two cards, the privacy line. Everything above the
+  input tells you what this is and what it answers from; the cards all navigate
+  away from it, so they come after the thing the reader came for. The page's
+  single `section` break lands between the suggestions and the cards.
+
+  The one inversion is an instance with **nothing registered**: there is nothing
+  to ground an answer in yet, so the cards (and the trust line that travels with
+  them) render above the composer, where "Add your first data" is the page's real
+  action rather than the fifth thing on it. Gated on the same condition as the
+  zero-state heading and lede, so the three cannot disagree about which state the
+  page is in. This replaces a by-AUDIENCE gate that put an admin's cards above
+  the input on every instance, configured or not.
+
+  The "Using N knowledge sources and M capabilities from your Stack" line that
+  sat under the composer is **removed** — it reported a count with no action
+  attached, in the one row between the input and its suggestions. Nothing else
+  consumed those counts, and they were not free: two `StackResolver` reads plus
+  an RBAC plugin resolve on every `/chat` render, so the helpers
+  (`_stack_knowledge_source_count` / `_stack_capability_count`) and their tests
+  went with them. Git history holds the "actual Stack, not the whole catalog"
+  reasoning if the line ever returns.
+  - **The suggestions are a row of chips**, not a four-item column: a stack of
+    full-width rows under a text field reads as results, where a wrapping row of
+    pills reads as things you could ask — and takes one line instead of four. The
+    group is held to a measure so it wraps into balanced rows. Its label reads
+    **"Suggested for you"**, which is the claim worth a line: they are derived
+    from what this caller can actually reach, not four static examples. (An
+    interim "Suggested to ask" was dropped for saying only what the chips already
+    looked like — the word that earns the line is "for you".)
+  - **An admin's setup card carries a progress ring** (`3/6`) instead of
+    reporting "3 of 6 steps done" in the text of its own link — the same fact,
+    read at a glance, with the number where the eye lands first. It is rendered
+    server-side from `admin_setup`, so unlike the rail's ring it cannot flash a
+    wrong count. On an instance with nothing registered there is no ring at all:
+    a meter reading 0/6 measures the wrong thing when the point is that there is
+    no data yet, so that state keeps its "Add your first data" button.
+  - **The member's card carries the brand orb**, not a `brain` line glyph — that
+    was a generic abstraction which at 17px read as an unrecognisable pair of
+    shapes, on the one card that speaks for {brand} itself. It renders the same
+    shared macro as the rail logo and the connect banner, so the mark still lives
+    in exactly one place, and drops the tinted chip and halo behind it: those
+    give a monochrome glyph a surface to sit on, and around a full-colour mark
+    they are a badge around a badge.
+  - **A member never sees a setup card** — they cannot set the instance up, so
+    offering them the ring would be a chore they are not allowed to finish. Their
+    slot holds the one move they do have ("See what {brand} knows" → the
+    Library), with the same anatomy rather than the admin's card with its
+    controls greyed out.
+  - **"How {brand} works" is a link beside the trust caption, not a card** — it
+    is reference reading, and a card of equal size said it was a choice
+    comparable to setting the instance up. The pair closes the page under the two
+    cards, which is what everything-consulted-rather-than-acted-on is for; the
+    gap above the cards stays the page's one section break. It is also centred at
+    last — it was a `<p>` wrapping a `<div>`,
+    so the parser closed the paragraph early, its children became block siblings
+    of the row around it, and the `justify-content: center` applied to an empty
+    element. The greeting
+    grows a time-of-day glyph, corrected from the browser clock alongside the
+    salutation so the sun and the words can never disagree.
+  - **Both cards are clickable end to end.** The setup card was the one card
+    that was not a link — a `<div>` holding an `<a>` — so it had to suppress the
+    hover its neighbours offer and left the reader a 13px line of text to aim
+    at. It is a whole-card link now, its action a `<span>`, with hover and
+    `:active` driven from the card.
+  - **Only the audience card carries the tinted surface.** That fill means "this
+    is {brand} itself"; on the tools card as well, the pair read as a band of
+    two panels with nothing distinguishing the card about your own instance from
+    the one pointing at your editor. The marker-column layout and type moved to
+    their own `.cld-door--split`, so the two stay peers in shape while differing
+    in surface.
+  - **The agent picker moved INSIDE the composer, into the trailing cluster with
+    Send**, with the Stack sentence on the row below it. Choosing an agent is
+    part of composing — the agent is bound at session creation, so the control
+    sets a property of the message about to be sent, not of the page — and the
+    trailing position is what makes that work: ahead of the "+" a longer agent
+    name moved where the placeholder began (a measured 58px jump between "Agnes"
+    and "Finance Proposals", reflowing any draft already typed), while after the
+    textarea a wider pill takes its width off the end of the field and the text
+    origin does not move at all. It matches Send's 44px height so the two read as
+    one pair, keeps its fill on hover only, and the footer row collapses entirely
+    in a live conversation now that the sentence is its only occupant.
+  - **The default agent is called "Default"**, not the brand. "Agnes" read more
+    naturally alone but was the odd one out beside the caller's own named agents,
+    and it disagreed with `/agents`, where the same row is Default. One name per
+    agent, everywhere.
+  - **A long agent name shows as initials in the pill** ("Finance Proposals" →
+    "FP") so its width is stable across agents. The full name stays reachable
+    without opening anything — the title attribute carries it, the menu spells it
+    out, and the in-conversation label is never abbreviated. A single long word
+    has no initials to take and falls back to an ellipsis.
+  - **The picker's menu offers "Create new agent"**, ruled off below the agents
+    (they switch this conversation; it leaves the page). This is where a caller
+    discovers their agents are not enough, so the next move belongs in reach
+    rather than back through the rail. It points at `/agents?new=1` — the SAME
+    create path the Agents page's own card uses, a second door to one flow rather
+    than a second flow. The menu already listed ready agents only.
+  - The Stack sentence is *about* the agent, so **its counts follow the
+    selection**: an agent whose
+    knowledge or plugins are `'selected'` is counted from the ids it actually
+    lists rather than from the owner's whole Stack, and an agent scoped to
+    nothing hides the line instead of claiming a capability it cannot reach.
+    Mixed scope modes fall to the explicit list, since overstating an agent's
+    reach is the worse error. The server still renders the owner's totals for
+    first paint, so a failed `/api/v1/agents` degrades to the old behaviour.
+    The pill also takes a **resting fill** — a light tint of the accent — since
+    at `background: transparent` with muted ink it read as a label that happened
+    to carry a caret, which is the opposite of what a control that changes the
+    answer should look like. The fill is its only device — no border, since an
+    outline around a tinted 30px pill is two devices saying one thing and closed
+    the shape into a tag. The decorative glyph before the sentence is
+    gone, because a second mark 8px from the pill made a two-item row look like
+    a toolbar of unrelated readouts. The **agent menu anchors to the picker's
+    left edge** to match, and the row **sits on the composer's own text inset**
+    rather than the page's centre axis — it describes the input, so it lines up
+    with the input's content. Its sentence starts lower case, so pill and phrase
+    read as one line ("Agnes · using 1 capability from your Stack") instead of
+    two statements side by side: it grew
+    leftward from a `right: 0` anchor, which was correct while the picker
+    trailed the row and clipped the agent names behind the sidebar the moment it
+    led it.
+  - **Hover is a lift, and only the card that needs an edge keeps one.** The
+    outline is replaced by a shadow that appears on hover — one channel, so both
+    cards answer the pointer identically whatever surface each has — and the
+    tinted card drops both its resting border and the resting shadow it had. The
+    plain card keeps a subtle border, because that is the actual rule rather than
+    a per-card choice: the tinted card is held off the page by its own fill, so
+    an outline there frames something already separated, while the plain card's
+    fill is nearly the page and without an edge it stops reading as a card. The
+    1px stays in the box as `transparent` on the tinted one, so nothing shifts
+    when either lifts. Fixes with it: the quiet
+    "Continue setup" link took the PRIMARY fill on card hover, because the
+    card-level rule outranked its own `background: none` by one class and painted
+    the text link as a dark blue blob.
+
+- **The chat list has one view, and the rail's conversation zone has one door.**
+  Three changes to the same surface, all rail-layout instances:
+  - **`/chats` drops the list ⇄ grid switch.** A conversation is a title you
+    read plus two facts you glance at (which agent, how long ago); a card spent
+    a whole tile saying that much, so the list is now the only projection. The
+    `.fbar-view` control, the `#ch-grid` container, the card builder in
+    `chats_page.js` and the card CSS are gone — the Library keeps its own
+    switch, where an asset has a thumbnail worth a tile.
+  - **The rail's conversation zone is ONE unlabelled list.** "Pinned" and
+    "Recent" are gone, along with the per-section disclosure — its caret, its
+    persisted open/closed flag (`agnes.rail.chatsec.*` in localStorage) and its
+    `is-collapsed` state. Two labels and three moving parts were chrome over a
+    list a handful of rows tall that already scrolls in its own box; a pinned
+    row is marked by its pin glyph, and that the feed is a slice is said by the
+    row that closes it. Pinned rows still lead, and a section still hides when
+    it is empty, which is the only conditional left in the region. The zone's
+    tab order is now New chat → the titles → View all chats. The list also moves
+    up under **New chat** (8px of air above it became 3px, the same step the nav
+    rows use between themselves): the 8px was there to let a "PINNED" label read
+    as a heading, and with no label it only detached the list from the row it
+    belongs to. The folded Chats row now cancels the flex `gap` it was still
+    charged for, in both the persisted-open and peeked states, so the two ways
+    of reaching an open rail no longer disagree by 3px.
+  - **"View all chats" is the last ROW of that list, and the Chats row is now
+    the COLLAPSED form of the zone.** The link takes the conversation row's own
+    box — same height, left edge and hover — because it is the end of the list
+    rather than a footer under it; only its ink and weight mark it apart. It
+    sits outside both `<ul>`s, since every renderer clears its list with
+    `innerHTML = ""` and would delete an `<li>` on the first fetch. The row was introduced because the
+    conversation region is text end to end and cannot survive the rail's 56px
+    glyph strip, which left an admin page with no path to `/chats` at all; but
+    at full width it sat above the very lists it led to. Both widths are now
+    served by one zone: expanded, the lists render and a quiet link closes them;
+    collapsed, `#nav-chats` stands in for the whole region and folds away again
+    (`.rail-i--collapsed-only` — height and opacity, timed off the same
+    `--rail-peek-text-*` tokens as the peek reveal, with a `prefers-reduced-motion`
+    swap) the moment the rail opens or is peeked, so the two are never on screen
+    together. The link is static markup rather than revealed by a render, which
+    is what left `/chats` unreachable on a first run last time. On an admin page
+    the fold is not applied at all: the lists are not rendered there, so the row
+    keeps its place at every width.
+
+- **The data-package builder is told what a table IS, not just what it is
+  called.** A turn's candidate block carried `id`, `name` and 160 characters
+  of description, so "the opportunity tables for sales" could only be
+  answered by matching names — a table whose name does not say what it holds
+  was invisible to the assistant, and the proposed package came out wrong or
+  empty. Each candidate now also carries `source_type`, `query_mode`, and the
+  names of the **metrics this instance already computes over it**, which is
+  the strongest signal available for what a table is for when its description
+  is thin. Metrics are one bulk read for the whole list, and a failed read
+  costs grounding rather than the turn. Candidates also carry whether the
+  table is *distributable* (`query_mode IN ('local','materialized')` and not
+  `server_only`, i.e. whether it reaches an analyst's laptop through
+  `agnes pull`): packaging a server-only table is still allowed —
+  `data_packages.py` does not refuse it — so the prompt states it as a fact to
+  weigh, never a prohibition, because encoding it as a rule would be wrong
+  about the API. Column-level detail is deliberately excluded: it is a read
+  per table against a list capped at 120, so schemas belong to a narrowing
+  step over a shortlist. The wire contract, the propose-never-apply rule and
+  `_sanitize_patch` as the trust boundary are unchanged.
+
+- **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
+  It used to debounce-PATCH every keystroke, which meant there was never a
+  moment at which the owner had *decided* the agent was right, and no honest
+  way to offer "leave without saving". Edits — typed or made by the
+  conversation — now accumulate in an unsaved working copy and reach the
+  server only on **Save**. The header says which state you are in ("Unsaved
+  changes", Save disabled when clean).
+  - A **new** agent's header offers *Save as draft* and *Mark ready*, and no
+    Delete: the row exists server-side only because the conversation and the
+    preview address the agent by id, so it is a placeholder until saved, and
+    leaving via *← All agents* discards it (confirmation first, then a real
+    `DELETE`). A failed discard restores the row rather than leaving the list
+    denying an agent the server still has.
+  - An **existing** agent's header offers *Save*, *Revert to draft* /
+    *Mark ready*, and *Delete*. Leaving with unsaved changes asks first and
+    rolls the working copy back to the last saved state.
+  - `beforeunload` covers the ways out our own dialog cannot intercept (a nav
+    click, a reload, a closed tab).
+  - **Preview still commits.** The agent runs server-side, so it can only
+    answer as a configuration the server has; opening Preview performs the
+    same write Save does, baseline included, rather than previewing a persona
+    the agent does not have.
+
+- **`POST /api/agents/{agent_id}/builder/turn` accepts `apply` and `config`.**
+  `apply=false` runs the turn and returns the sanitized patch **without**
+  writing, which is what lets the page hold an unsaved working copy;
+  `config` carries that copy so the turn reasons about the configuration on
+  screen rather than the last-saved row. `config` is narrowed to the
+  `PATCHABLE` keys and only ever reaches the prompt — ids in the returned
+  patch are still gated against the caller's own RBAC-scoped candidate lists.
+  Both default to the previous behaviour (`apply=true`, no override), so
+  every existing caller is unaffected. Note the consequence for the page: the
+  panel now merges the patch client-side instead of re-rendering from the
+  applied row, so the enforced scope is re-derived at Save rather than at
+  each turn — an unsaved patch grants nothing, so nothing is enforced later
+  than it is shown.
+
+- **The `/agents` index separates ready agents from drafts, and a card's click
+  follows its state.** Ready agents render in a titled band above Drafts.
+  Clicking a ready card opens a conversation with that agent (what you came to
+  the page to do) and its footer carries **Edit** into the builder; clicking a
+  draft opens the builder (what you came to *it* to do) and its footer keeps
+  **Chat**. Neither route was lost in either state — marking an agent ready is
+  not a one-way door out of the builder, and a draft is still talk-to-able.
+
+- **The builder's two panes are an even 50/50 split.** The configuration was
+  previously capped at a third of the width, which left it a cramped sidebar
+  while the conversation had room to spare.
+
+- **A question about a figure on a dashboard now starts from the data app.** The workspace prompt tells Agnes to find the app the user means
+  (`agnes app list`, `agnes app show <slug>`) and read its description for
+  context before hunting for a definition — both are registry-only reads, so a
+  sleeping app is not woken. When the description doesn't cover the figure,
+  Agnes falls back to `agnes catalog --metrics` as before, but now flags in the
+  answer that it cannot see how the report builds the figure and that the
+  metric it picked is a best match for the label rather than the app's own
+  definition.
+
+- **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
+  now enforced, not just a label.** The credential a running data app calls
+  Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
+  claim that no code path read — so it was functionally a full-privilege PAT
+  for the app's owner, usable against the whole REST API by anything running
+  in the container, including an externally-cloned, less-trusted repo. Two
+  concrete consequences: `/api/admin/*` was reachable whenever the app owner
+  was an Admin, and `POST /cli/auth/rescope-surface` — admin-gated, but it
+  *requires* a PAT and mints a fresh 90-day `surface='all'` one — let a token
+  that is itself minted **without expiry** launder itself into a further
+  durable credential. (The `require_session_token` minting routes —
+  `/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token` — were
+  already closed to it: that guard rejects any PAT-typed credential
+  regardless of scope.) `app/auth/pat_resolver.py` now admits the scope only
+  on a fail-closed allowlist of the surface a hosted app actually uses:
+  `/api/query` (not `/api/query/hybrid`), `/api/data/…`, the `/api/catalog`
+  read routes, `/api/metrics`, `/api/glossary`, the read-only
+  `/api/semantic-models` members (not `/apply`), and the `/api/v2` catalog,
+  schema, sample and scan routes the `agnes` CLI calls from inside an app.
+  Entries are exact paths plus narrow subtrees rather than one per router,
+  because a per-router prefix silently admits every route that router later
+  grows; `tests/…::test_the_admitted_route_set_is_pinned` walks the real
+  route table so a new route under an allowed path can never be admitted
+  without a deliberate decision. The two sibling scopes (`data-app-git:`,
+  `data-app-preview:`) keep their per-surface booleans and are unaffected.
+  **Upgrade note:** an app calling anything outside that list now gets a 401
+  where it previously succeeded — including MCP-over-HTTP, which passes no
+  request path and is therefore fail-closed. Each refusal logs a warning
+  naming the scope and the refused path, because this failure is otherwise
+  invisible from the outside (the container stays healthy and the app
+  renders; only its API calls fail). Unchanged: within the allowed surface an
+  app still reads with the **owner's** grants, evaluated live — sharing an
+  app remains an act of publication.
+
+- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
+
+- **A four-tester pass over `/admin/access`, and the repairs it found.** The
+  page could grant a data package, a memory domain or a marketplace plugin and
+  never un-grant it — those three kinds rendered the Available/Required pair
+  *instead of* a Revoke, in both lenses, so an admin had to reach for the API
+  to undo a click. ADMIN CONTROL is now one shape for every row —
+  **`Available | Required | Revoke`** from a single `controlCell()` — with the
+  tier pair shown but disabled on kinds that have no tier, which also answers
+  the "why does this row have a choice and that one not" question the old
+  asymmetry raised and never addressed. Revoke now confirms first, naming the
+  resource, the group and how many people lose it. Alongside it: a group with
+  **zero grants had no way to receive its first one** (the empty state rendered
+  copy pointing at a checkbox list that no longer existed, and a dead "show
+  everything" link, but no Add control); **rename and delete were unreachable**
+  because the kebab's CSS was keyed on a `.ax-grow` wrapper the `<details>`
+  rewrite stopped emitting, leaving every kebab `opacity: 0` and positioned
+  against `<body>` off the top-left corner of the page; and the **person lens
+  told an admin they could not use things they can** — red "Cannot use" chips
+  rendered directly beneath the chip saying they reach everything regardless of
+  grants, on the one page whose job is answering exactly that.
+
+- **One vocabulary for the grant tier, and a guard that can actually see it.**
+  `tests/test_access_vocabulary.py` has retired *Optional* / *Automatic* since
+  the access-page definition landed, but it matched the label as a rendered
+  element — and the person lens wrote its tier as chip prose ("· Automatic — in
+  their stack"), so the retired pair survived there and one Required package
+  was described two ways within two inches of itself. A second test in
+  `tests/test_web_admin_access.py` had meanwhile been asserting the OPPOSITE —
+  that both retired words must be present — and both passed only because each
+  was reading a different half of the page. Reconciled onto the Library's
+  words, with the guard extended to the prose form. The tier toast is also
+  keyed on kind now and quotes the sentence the person will actually read,
+  instead of firing data-package language ("permanent, and always downloaded")
+  at memory domains and plugins.
+
+- **The access page's numbers agree with each other.** Five separate
+  "which denominator?" mistakes: the group row's `N granted` came from a
+  server-computed count that no mutation updated (three numbers for one fact on
+  one screen until a reload); a bundle's reach SUMMED its groups' member counts,
+  so anything granted to `Everyone` plus one other group reported more people
+  than the instance has; the kind filter's menu badges counted grants while the
+  lists count bundles and groups; the By-bundle tab badge counted distinct grant
+  rows of every type; and the `N of M` counter ignored the search box entirely.
+  Each now derives from the same source as the thing it describes. The overview
+  payload gained `member_ids` per group (excluding `Everyone`, whose roster is
+  every account) and an `account_total` so distinct reach is exact rather than
+  estimated.
+
+- **The URL carries the view.** An access audit's natural output is a link, but
+  the open group, the search term and the kind filter were all invisible to the
+  URL — a reload dropped you back to nothing, and because every navigation used
+  `replaceState`, Back walked out of the page instead of to the previous lens.
+  All three now round-trip, tab/group/filter changes push real history entries
+  (typing stays on replace), and a `popstate` handler restores the view rather
+  than just the address bar. `?user=<id>` on its own now implies the person lens
+  instead of being silently discarded.
+
+- **Search matches people, and rows say why they matched.** The box has
+  promised "groups, bundles or people" all along and never matched a person;
+  typing a colleague's address returned zero results on an instance where they
+  were in two groups. It now matches members (against the roster the person lens
+  already loads, fetched on first search), the placeholder describes the lens
+  you are actually on, and a row surfaced by something other than its own name
+  carries a `matched …` chip — searching "Delivery" and getting a group called
+  Admin looked like a bug until you knew it held an agent named Delivery Health.
+
+- **A grantable thing with no title shows its slug, not its id.** An agent saved
+  without a name rendered as `agt_797047742dec48998ce45792b9110ce1` — as a row
+  title, and as 12 of the 13 options in one group's picker, which made the
+  picker unusable for the kind that needs it most. The slug was already in the
+  payload and nothing read it.
+
+- **A group looks like a group, on every page that names one.** A group was
+  drawn four different ways depending on where you met it — a lettered square
+  on /admin/access, an origin-coloured pill on /admin/users and a profile, an
+  origin pill trailing the name on the MCP tool grants, and, on most surfaces,
+  nothing at all. That last one is the failure: in the access page's bundle
+  view the audience row carried no marker, so `Delivery` and `Board Materials`
+  sat one line apart in identical type with nothing saying which was the group
+  and which was the thing it reached; the same held in every share dialog,
+  every builder's scope list, and the person lens's prose. There is now one
+  mark, in the one shared glyph set (`kind_glyph()` / `AgnesKindGlyph`), in two
+  densities — a tile for the leading marker of a row, the bare glyph for inside
+  a chip, a link or a sentence — reached as `ds.group_mark()` from a template
+  and `AgnesKindGlyph.groupTile()` / `.groupGlyph()` from JS. It is
+  deliberately COLOURLESS: `--ds-kind-*` names types of content and a group is
+  not content, it is who the content reaches, so it is marked in neutral ink,
+  which is also what keeps it legible beside a coloured kind in a mixed row.
+  Applied to /admin/access (all three lenses, the sticky group header and the
+  share picker), /admin/users, a user's detail page (membership chips and the
+  "granted via" cell), /me/profile, the package detail's "shared with" rows,
+  the shared share dialog and package drawer, the linked-apps and MCP builders,
+  the MCP tool grants, /admin/tables, /admin/corporate-memory,
+  /admin/data-sources, the moderation hub and the skill-contribution result.
+  Two hand-rolled share/network glyphs (the data-package card's, the Library's
+  visibility chip) are retired onto the same shape — every state they cover is
+  an audience of groups.
+
+- **A group row in the By-bundle view no longer wears the bundle's colour.**
+  The row carries `data-kind` because the bundle overhead is what the kind
+  belongs to, and the leading kind accent was reading that attribute — so a
+  collection's coral ran down the side of "Delivery", claiming a colour that
+  means *collection* for a row that is an audience. The accent stays in the
+  group view, where those rows really are things of that kind.
+
+- **A group's People and Access counts sit beside their labels, and the body
+  stops restating them.** "2 members" was ~900px from the word *People*, far
+  enough that the two read as separate facts — and the provenance strip
+  directly below then opened with "**2** added by an admin", which is the same
+  number a second time. The count moves next to the title block; the strip
+  keeps its words (where the members came from is what decides whether they
+  can be removed here) and drops the number whenever a single source covers
+  everyone, since one bucket holding all of them is not a breakdown.
+
+- **People and Access, inside an opened group, now look like they open.** Each
+  was a bold label at the far left with a count and a 35%-opacity chevron
+  ~900px away at the far right and nothing in between, which reads as a heading
+  with a number after it. The disclosure marker moves to the left — the same
+  `›` the group row above it carries, one indent in, rotating the same way —
+  the redundant right-hand chevron goes, and the strip answers to the pointer.
+
+- **The access list has no frame.** Its white, bordered, rounded surface was
+  drawn when the page sat on the grey app background and a table needed its
+  own ground to be a table. The admin shell is a white sheet now, so that
+  surface matches the page under it and the border was the only card left —
+  an outline around content already the width of the page, reading as a
+  panel *on* a page rather than as the page's own list. The rows' hairlines
+  separate them. `overflow: clip` went with it: it was there to clip the
+  corner radius, and what it otherwise clips is anything that has to escape
+  the list (the member-search popover, a row menu near the bottom edge).
+
+- **One kind tag, one glyph set, across the platform.** A resource kind was
+  drawn three ways — the Library's tinted glyph tile, the access page's
+  worded chip, and the catalog card's icon — from two glyph sources that had
+  already drifted (the `KIND_GLYPH` copy in `catalog_card.js` was six kinds
+  behind the `kind_glyph()` macro it was documented to be in lockstep with).
+  The glyph set is now `static/js/kind_glyph.js` (`window.AgnesKindGlyph`,
+  loaded globally, a transcription of the macro and keyed by the
+  `--ds-kind-*` token names, so a caller that resolved a kind to its colour
+  has by construction resolved it to its glyph); `catalog_card.js` reads from
+  it rather than carrying its own. The mark itself is `.ds-kindtag` in
+  `components.css`, in two densities on purpose: **glyph + word** for a list
+  of MIXED kind (the access page, where the word is the only thing telling a
+  package from a plugin) and **glyph alone** for a list GROUPED by kind (the
+  Library, where the band overhead already said the word). Same glyph, same
+  colour, same corner — the label is the variable, not the identity. The
+  Library's row tile IS that component now rather than a lookalike of it:
+  `.lib-icon` survives only as the drag-and-drop hook and the carrier of the
+  collection ring, and hands the section's already-resolved `--lib-kind`
+  straight to the tag.
+
+- **The access page's rows carry their kind's colour, and its levels nest
+  visibly.** Rows take the leading kind accent the Library's rows have, so
+  "the packages" are findable in a mixed list without reading a word. The
+  bundle view's depth was inverted — the family eyebrow sat at 16px, the kind
+  band at 26px, and the rows they contain back at 12px, so the deepest level
+  looked like the shallowest; each level now starts inside the one above it
+  (16 → 26 → 36 → 46). The three add-rows span the full width of the list
+  they belong to rather than sitting inset like a card dropped into a table:
+  a `<button>` sizes to its content, so full width had to be asked for.
+
+- **The three ways to add on the access page are one control with three
+  labels.** "New group", "Add to this group" and "Share with another group"
+  were three near-misses of each other, and all three were ghost rows — on a
+  white sheet a borderless row reads as a divider, not as an offer, which
+  hid the thing a first-time admin most needs to find. They now share the
+  empty-slot vocabulary this product already uses for "there could be one
+  more of these here": a light tint of the primary inside a dashed border of
+  the same hue, mixed against `--ds-surface` rather than hard-coded so it
+  follows every theme its ink follows.
+
+- **A new group can be given its people while it is being created.** The
+  group drawer takes an optional people field — search (`GET /api/users`),
+  pick, chips — and seeds the memberships (`POST /api/admin/groups/{id}/members`)
+  once the group exists. Deliberately narrow, and creation-only: no roster,
+  no remove, no source column, and the field is gone the moment the group
+  does exist. That is what keeps it from becoming the third copy of the
+  member editor the drawer's steps 2-4 were deleted for — /admin/access
+  still owns membership; this owns only the moment before there is any. A
+  partial failure keeps the drawer open with the people who failed still in
+  the field, since the group itself was created either way.
+
+- **The level that folds is the level that wears the band.** A kind — Data
+  packages, Marketplace plugins, Agents — is what collapses on the access
+  page, and collapsing is what the Library's group band is for; it was the
+  quieter of the two levels, which left the page's one collapsible control
+  looking like a caption. It takes the Library's band verbatim now, leading
+  kind-colour accent included (from `--ds-kind-*`, so a newly registered
+  resource type inherits it without being named here). The family above it
+  becomes an eyebrow — no fill, no rule, small and lettered — because two
+  identical strips one inside the other say the two levels are peers.
+
+- **A group says who is in it before you open it.** The faces sit on the
+  People section's own header row, beside the word they answer — five
+  initials then a `+N`, because past five the initials stop being
+  recognisable one by one and start being a texture, which is what the count
+  says in less room. A count of 14 and fourteen initials are not the same
+  fact, and the header is where a fact you read at a glance belongs; the
+  provenance split ("11 added by an admin · 3 synced from Google", plus any
+  deactivated) stays inside the section, since "3 of these are Google's"
+  matters at the moment you go to edit.
+
+- **Admin pages are a white sheet, like every index page.** `base_index.html`
+  surfaces (Library, Agents, Chats) paint their whole shell `--ds-surface` —
+  `.idx`'s own comment gives the reason: the header zone should read as part
+  of the page surface, not as a grey band above it. Admin pages extend a
+  different base and so sat on the app background, which is why an admin page
+  and the Library read as two products even where their components already
+  matched. One rule in `admin_page.css` — a sheet loaded by the two admin
+  bases and nothing else, so it can only ever mean an admin shell — moves all
+  forty of them. The access page's search also grows to fill its bar: the
+  Library's is 300px because four more controls fill the rest of its row, and
+  at that width in a two-control bar it read as leftovers rather than a bar.
+
+- **The access toolbar and tables take the Library's own calibration.**
+  Measured against `ek/library-redesign` rather than matched by eye: `.fbar`
+  is shared, but the Library *scopes a calibration onto it* — 32px controls, a
+  search that is a tint rather than a bordered field, a filter button that is
+  plain text until it is on — and that calibration is most of what "looks like
+  the Library" means. The access page had 38px controls, a white bordered
+  search and a bold filter button. Those measurements now match, along with
+  the band (42px, title 13.5px/600) and the column header (10.5px/700, filled,
+  on the same 16px gutter as its rows). Category runs stop shouting: they wear
+  `.fbar-group__title` like every other group header instead of the uppercase,
+  letter-spaced treatment this page had invented, which made a sub-level louder
+  than the family band above it. **New group returns to the list's first row.**
+
+- **`/admin/access` and the redesigned Library share one toolbar and one band.**
+  The toolbar is `.fbar` itself — the same component the Library's browsing
+  block uses — so the row, its 10px gap, the search field and the filter button
+  come from `filter_toolbar.css` rather than from rules written twice. The
+  primary creation action sits at its right, where the Library keeps *+ Add*
+  (this reverses the earlier move of *New group* into the list: the point of
+  the pass is that the two toolbars read as one component). Under the bar, the
+  state line takes `.lib-browse__state`'s exact metrics — the count, then the
+  chips that produced it. Family bands are `.fbar-groupband` +
+  `.fbar-grouptoggle`, the Library's own group header, carrying a label, a live
+  count and one line of hint; the page keeps only the leading accent, which is
+  what separates one band from the next inside a single list.
+
+- **The toolbar follows the Library's, in order and in parts.** Tabs above;
+  then one row with the search and the **Filter** button grouped at the left
+  (it had drifted to the far right, where it read as a page control rather
+  than the list's); then the chip row, which now leads with the count —
+  `1 of 5 groups` — before the chips and `Clear all`, exactly as the Library
+  reads `1 of 6 items`. **The filter now narrows the list it sits above.** In
+  *By group* that list is groups, and the control had been filtering the rows
+  *inside* a group instead — invisible unless one happened to be open, which
+  is what made it feel pointless there. Picking *Data packages* now shows the
+  groups that hold one.
+
+- **The kind filter is a Filter button with applied chips, not a row of
+  segments.** A row of segments reads as tabs, and tabs say *this is what the
+  list is of*; a filter says *this is what I have hidden*, and that difference
+  has to survive a glance. It takes the Library's shape exactly — a `Filter`
+  button carrying a count badge, a checkbox menu of the kinds the active view
+  can show, and the choice restated beneath as `Kind: Data packages ×` with
+  `Clear all`. The same control serves the list and the Add / Share picker, so
+  filtering is one gesture wherever it appears.
+
+- **By group / By bundle / By person are tabs, and the lists get a filter.**
+  They were a segmented control, which says "narrow what you are looking at";
+  these change what the list is *of*, which is what a tab says. They use
+  `.tab-strip`, the component every other sectioned surface uses, and each
+  carries a count so switching is a decision made before the switch. Beside
+  the search — a different job, so a different control — the lists gain the
+  **kind filter** they never had: previously the only way to find every
+  package was to scroll. It offers only kinds the active view can actually
+  show (By bundle lists what an admin hands out as a unit, so it is never
+  offered *Cloud chat*, a chip that would empty the list). A bundle's category
+  runs fold, like the picker's sections and the Library's groups.
+
+- **The Add / Share picker is built from the app's own parts.** Its family
+  sections are `.fbar-grouptoggle` — the Library's group header — so a section
+  folds here exactly as it folds there, caret driven off `aria-expanded`. It
+  gains the filter it was missing: `.fbar-seg`, the segmented control every
+  filtered surface uses, offering the kinds actually on offer with their
+  counts. The counts are taken over the whole offerable set rather than the
+  filtered remainder, so every chip keeps describing the set it filters, and
+  the control stays visible once a kind is picked — hiding it whenever one
+  kind remained was a trap that removed the way back to *All*.
+
+- **The fact strip inside an open group is gone.** It restated the reach and
+  the grant count that the group's own row prints two words to the left, and
+  carried two things the row did not: the group's purpose and its age. Those
+  moved onto the row as its second line — the same shape a bundle row already
+  uses — so nothing was lost and the duplicate went with the strip. What
+  remains in that header is the Workspace address and the managed notice,
+  which a row genuinely cannot say, and it collapses to nothing when neither
+  applies. The group row's header is a flex row rather than a three-column
+  grid: it holds five children, and a grid of three silently wrapped the last
+  two onto a second line as soon as a description made the row tall enough —
+  `Everyone` rendered 97px against every other row's 65px.
+
+- **The People roster loses its header row, and the add actions move above the
+  column header.** An address, a name, a provenance line and a Remove button do
+  not need labelling — a header over four self-evident columns is chrome on a
+  list that is usually two rows long. And a column header labels the *rows*: an
+  action is not one of them, it makes one, so *Add to this group* and *Share
+  with another group* lead the table rather than sitting between the header and
+  the rows it describes.
+
+- **By bundle is grouped, not alphabetical.** A flat A–Z list interleaved a
+  plugin, a package, a memory domain and a collection — four different kinds
+  of decision — so the reader re-sorted them mentally on every pass. It now
+  carries the same two levels the group view does: **family** as a filled band
+  (Knowledge, Capabilities, Surfaces) and the **kind** as a quiet run inside it
+  with its own count, kinds in registry order and names alphabetical within a
+  kind. A row no longer repeats its family on the right, because the band it
+  sits under already says it.
+
+- **New group is the group list's first row.** It made a row of the list it
+  was sitting above, so it is a row of that list, on that list's geometry —
+  marker where each group's avatar sits, label where each group's name sits.
+  Bound by delegation rather than by id, since `#ax-groups` is rewritten on
+  every repaint and an element-bound listener would be lost the first time a
+  grant was written.
+
+- **Add / Share are the table's first row, not a link above it.** Outside the
+  table they read as page furniture; inside, on the table's own grid, they
+  read as something the table can do — the `+` in the Kind column where every
+  row's chip sits, the label aligned to the column that names things, and the
+  same hover as its neighbours. The pattern a data grid uses for "new row",
+  which is what it is. A bundle's table has no Kind column, so its marker sits
+  at the leading edge of the column that names groups. An empty bundle keeps
+  the shape too — header, action, no rows — rather than a button beside an
+  empty-state sentence.
+
+- **Access rows get a third state, and the headers stop competing.** An open
+  row wore the hover's own grey, so "the row I am pointing at" and "the row I
+  am inside" were the same colour: default white → hover `--ds-surface-dim` →
+  open `--ds-surface-sunken` is one scale in three steps, and the open row
+  stays distinct while the pointer moves over its contents. Two stacked grey
+  bands read as two headers of equal rank — the column header and the category
+  band — so the chrome (the header, once per table) drops its fill and keeps a
+  rule, while the structure (the band, once per category, repeating) keeps the
+  fill and gains rounded corners. Bands also gained the inset's left padding:
+  *KIND* had been sitting against the surface's own border. **In By bundle the
+  description moved onto the bundle's row**, where a closed list of bundles is
+  readable — it had been the first line *inside* the opened bundle, which is
+  the one place it is least needed.
+
+- **The whole access list is one table, four levels deep.** A group row, a
+  People / Access row and an item row are rows at different depths, and they
+  were drawn as three separate objects — the group on the page ground, the
+  sections on the page ground, the items on their own framed surface — so the
+  only cue for the relationship was indentation while every other signal said
+  "unrelated". One surface now holds the lot, the way `.lib-list` holds the
+  Library's groups: SYSTEM / GROUPS and the category bands are header rows of
+  it, depth is carried by indent and weight, and **every level answers a
+  pointer the same way**. The inner frame is gone (inside one surface a second
+  border reads as a second box) and the connective left rule with it.
+
+- **Access rows adopt the Library's row states.** Hover is the same grey the
+  rail uses for "the thing I am pointing at", so a row here and a destination
+  in the sidebar do not answer one gesture in two colours. Keyboard focus gets
+  the Library's treatment too — the row's own kind as an 8% wash plus a 2px
+  rail on the leading edge (`.lib-row:focus-within`) — so tabbing through the
+  table is as legible as pointing at it. Both views' tables are the same
+  surface, frame and header.
+
+- **A kind is the same colour in the admin table as in the Library.** Each row's
+  kind chip resolves one variable — `--kind: var(--ds-kind-<kind>)` — exactly as
+  the detail hero (`macros/_detail.html`) and the Library's bands (`--lib-kind`)
+  do, off the same canonical map the Library groups by (`_SECTION_KINDS`), so a
+  package is one colour wherever it appears. The tile is mixed from that ink into
+  the **current** surface rather than taken from `--ds-kind-*-soft`: those tints
+  are defined light-only while the ink flips, so the paired token would put light
+  ink on a light tile — the Library reaches them through an inline `style`
+  attribute, which the contrast guard cannot see. The table furniture matches too:
+  the column header takes the shared `.data-table` header treatment (dim fill,
+  11px/700 uppercase, muted ink) and each category band carries a 3px leading
+  accent the way a Library group does, with rows indented inside it so a row
+  belongs to the band above it.
+
+- **By group and By bundle are one list component.** They sat on the same
+  page looking like two products: a group was a collapsible row with counts
+  on the right, a bundle a permanently-open block with a table beneath it.
+  A bundle is now the same row — kind chip where the avatar sits, its family
+  where the counts sit — **collapsed on arrival**, opening to the groups that
+  hold it. Both views emit the same `.ax-r` row, so the switch changes what
+  the list is *about*, not what a list *is*. **The add action moved above the
+  list in both**: at the foot it cost a scroll through everything already
+  there to reach the control that adds one more, and the fuller the list the
+  further the control retreated. *Granted to nobody* is said in the closed
+  bundle row rather than only inside it.
+
+- **People and Access both start closed inside a group, and the expanded
+  group is quieter.** Opening a group is a step toward an answer, not the
+  answer, and unrolling the tallest thing on the page for someone who came to
+  check a member count repeats the mistake the two-pane layout made with the
+  group list. An open group is now three short lines — the identity line and
+  two section rows stating their counts — with one connective rule drawn from
+  the group's left edge so the content reads as hanging off the row above
+  rather than as the next thing on the page. Section rows get a real row
+  height, a hover and a rotating chevron; a closed section needs no divider
+  from its neighbour, an open one gets one.
+
+- **Custom groups sit above `Admin` and `Everyone` on `/admin/access`.**
+  System led while `Everyone` was the page's default selection — the row that
+  opened on load belonged at the top — and nothing is selected on arrival any
+  more, so that reason went with it. `Admin` and `Everyone` are the two rows
+  an admin can neither rename, delete, nor (under Workspace mapping) change
+  the membership of; the groups they actually work on come first, and the
+  fixed two sit at the foot. `Everyone` also stops being hoisted above its
+  own heading, which was the same default-selection rule showing through in
+  the sort.
+
+- **`/admin/access` gets a measure.** The page is `container--full`, so at
+  1920px the list ran 1864px wide with the name column alone taking 758px:
+  a group's counts sat a thousand pixels from the group's name, and a row's
+  control that far from the thing it controls. No amount of type refinement
+  fixes a line the eye cannot connect end to end. The list is capped at
+  1240px and left-aligned, and past the cap the two columns that carry
+  meaning — admin control and what the person receives — take the width back
+  from the name column instead of leaving a gulf. Full width remains right
+  for the shell; it was never right for a four-column list.
+
+- **`/admin/access` visual refinement — calmer, and uniform to scan.** Still
+  no behaviour or IA change. *See it as a person* leaves the group row (the
+  person view is a position in the switch), so the row carries three things
+  rather than seven. Every access row is now **exactly two lines** —
+  description and provenance share one line — where before a row was two or
+  three tall depending on whether anyone had recorded who wrote the grant,
+  which is what broke the vertical rhythm. The kind chip aligns to the name's
+  cap-height instead of floating in the row's middle. Three horizontal rules
+  inside the top of an open group become one: People and Access are separated
+  by weight and space, and the category band's tint is its own separator.
+  *New group* stops being a full-width dashed panel and becomes a normal
+  secondary button in the toolbar. Text steps down in four clear levels, with
+  the repeated per-row "In their Library" label at the quietest step rather
+  than competing with the value it labels, and an empty group's *Nobody*
+  keeping its warn ink but losing its bold.
+
+- **Visual polish on `/admin/access` — hierarchy, contrast, scanning.** No
+  behaviour, IA or vocabulary changed. Four levels now differ in kind rather
+  than by a few pixels: the open **group** row is tinted with an ink left
+  edge, its body indents to the group's own name so everything under it
+  visibly hangs off it; **People / Access** are sentence-case ruled
+  subsections; **Knowledge / Capabilities / Surfaces** are tinted bands
+  across the table's own grid rather than another row of content; **items**
+  are rows on one fixed four-column grid shared by header, bands and rows,
+  so a row can be scanned horizontally without losing the column. Text stops
+  being uniformly `--ds-text-muted`: names take `--ds-text-primary`,
+  descriptions `--ds-text-secondary`, and only incidental metadata stays
+  muted — the "everything is pale blue-grey" effect. Names, descriptions and
+  band blurbs clip to one line instead of wrapping, which is what was
+  breaking the vertical rhythm. Counts use tabular figures and a fixed
+  column so groups compare down the page. Kind chips take the design
+  system's own resource palette (`--ds-kind-*`) instead of one invented
+  colour — carried by ink and a hairline, never by the `-soft` fills, which
+  are defined light-only while their ink flips in dark mode (the contract
+  test caught exactly that).
+
+- **Granting is one act: + Add, choose, Apply.** The All/Granted segment and
+  the *Advanced* tree are both gone — they were two browsing surfaces
+  answering the same question in two places, and the segment named a
+  distinction that stopped existing when the list became the group's holding
+  rather than the instance's catalogue. Each open group ends with **+ Add to
+  this group**, opening a picker of everything it does not have, grouped by
+  family, searchable, applied together. **By bundle gets the same act in
+  reverse**: each bundle carries *Share with another group*, opening the same
+  overlay listing the groups that do not have it — a grant has no direction,
+  only the question you arrived with does. The picker counts what it is about
+  to do in **people, not groups** ("3 groups · 41 people"), since that is what
+  decides whether a share is small. A partial failure reports what did not
+  land, by name. Both use `.ds-drawer`, the app's own overlay, not a modal
+  invented here. **Deliberately dropped with the tree:** the tri-state bucket
+  checkbox that granted a whole bucket in one click; the picker takes many
+  selections but has no select-all-in-bucket. ~280 lines of dead renderer
+  (`typeHtml`, `itemRow`, `itemTable`, the block accordions) deleted with it.
+
+- **An open group shows what the group HAS, not the whole catalogue.** The
+  page listed every grantable resource with a dead control and the words *not
+  granted* beside most of them — so every row looked like a control and most
+  were not one, which is what made it unreadable. The open group is now the
+  holding: one column header for the whole group, families as labelled bands
+  with their own counts, and one row per thing the group actually has.
+  Granting moved to *Advanced*, where the checkboxes are. With only held rows
+  on screen there is nothing to tick, so the checkbox column is gone and the
+  control column is the affordance — a tier switch where the tier applies,
+  **Revoke** where it does not, **Revoke + *where it lives ↗*** where an
+  owner shared it. Each row's right column names where the person meets it
+  ("IN THEIR LIBRARY") above the words they read there.
+
+- **The open group is three levels deep, not seven.** It rendered
+  family → type accordion → block accordion → table, with the column headers
+  repeated once per type and eight disclosures on screen; measured, there
+  were seven levels of chrome between a group and one grant row. The default
+  view is now flat — family label, one header row, rows — with the type
+  demoted to a quiet mono chip on the row, which is what it always was: one
+  word. Advanced keeps the accordions, where browsing hundreds of tables by
+  bucket is what a tree is actually for. The People and Access cards became
+  small-caps strips; every family shares one fixed column grid, so *Admin
+  control* lands at the same x in Knowledge as in Capabilities instead of
+  each table sizing itself. Type scale is four distinct levels rather than
+  three different things at 11px/700 — the family label, the kind chip and a
+  column header were previously indistinguishable, which is why nothing read
+  as a hierarchy.
+
+- **Owner-shareable rows are oversight, not a second editor.** Collections,
+  agents, corpus files and data apps are shared by their owners through the
+  Library's Share dialog (`app/services/library_sharing.py`), which writes
+  the same `resource_grants` row an admin writes. A held one now offers
+  **Revoke** and a link to the item's own page — *Shared where it lives* —
+  instead of a checkbox quietly competing with the other editor, and its
+  kind chip is marked. Ungranted ones stay in Advanced, where the checkbox
+  still works and the admin has clearly gone looking. The tier control is now
+  defined **once** and rendered by all three surfaces; a guard pins that, and
+  caught the third copy this change would otherwise have created.
+
+- **`/admin/tables` → *Manage access* stops pointing at a lever that is not
+  connected.** A per-table grant no longer surfaces a table in an analyst's
+  manifest — the package grant does — so arriving on `/admin/access` with
+  `?resource=table:<id>` no longer says "tick this table". It names the
+  packages that carry the table and the groups each is granted to
+  ("`orders_2024` reaches people through one package: **Sales** — granted to
+  Delivery. Grant the package, not the table."), or says the table is in no
+  package at all and links to where one is made. The data-package projection
+  gains `contains` (its table ids) to answer it; both repository backends
+  already implement `list_tables` and the pair is contract-tested.
+
+- **The per-resource matrix moves behind *Advanced* on `/admin/access`.** The
+  default view now carries the four kinds an admin hands out as a unit — data
+  packages, memory domains, semantic models, marketplace plugins — plus
+  everything the group actually holds, whatever its kind. The ungranted long
+  tail (six hundred tables among it, on a real instance) sits behind one line
+  saying how much it is. **Nothing is migrated and nothing is revoked**: a
+  grant written one resource at a time still works, still shows because it is
+  held, and is still editable — what changed is that browsing the whole
+  grantable surface stopped being the first thing the page does. Kinds with
+  nothing registered stay silent unless they are one of the four, where "none
+  registered" is real news.
+
+- **Simulate speaks the person's words too.** Its Library-preview chips said
+  *In stack · Automatic* and *Not in stack yet · Optional* — the retired admin
+  vocabulary, on the one lens whose entire job is showing what somebody else
+  sees. They now read *Required by your admin*, *In their Library* and
+  *Available, no local copy yet*. A new guard
+  (`tests/test_access_vocabulary.py`) pins the tier labels, the Library
+  sentences and the admin-god-mode line, and reads the template **source** as
+  well as the rendered page — these chips are built in JS from a fetch, so a
+  response-body assertion could never have seen them, which is how they
+  drifted in the first place.
+
+- **A grant row says who wrote it.** `/api/admin/access-overview` now carries
+  `assigned_by` per grant — both writers already recorded it (the admin API an
+  email, the Library's owner-sharing path a user id) but the snapshot the page
+  reads dropped the column, so a grant an owner shared from the Library and
+  one an admin wrote looked identical. Both views render a muted *granted by
+  <name>* under the row, resolving either shape against the user list. It
+  names the person, not their role: an admin can share from the Library too,
+  so classifying a writer as "admin" or "owner" from one column would be a
+  guess, and the row states only what is recorded.
+
+- **`/admin/access` reads two ways — By group and By bundle** (`?by=bundle`).
+  The group view answers *what does this group get*; the bundle view answers
+  *who gets this*, one section per grantable thing and one row per group that
+  holds it, with the same tier control and the same sentence the person
+  reads. Two things only this direction can show: the same bundle held by two
+  groups — the comparison the two-pane layout made impossible — and the
+  bundles **granted to nobody**, invisible by construction when you are
+  looking one group at a time. Those collect behind one line at the foot,
+  counted by kind ("11 agents, 5 memory domains"), rather than floating to
+  the top and burying every row that carries a decision. Grant writes work in
+  both views: a row carries its own group, so the tier control and the revoke
+  checkbox act on the row's group rather than on a selection that does not
+  exist in the bundle view. The grant toasts stop saying *Optional* and
+  *Automatic* too.
+
+- **`/admin/access` is one list, not two panes.** The two-column workspace
+  answered one of the three questions an admin arrives with — *what does this
+  group get* — and made the other two (*who gets this bundle*, *why can she
+  see it*) start with a hunt for the right row to click, while spending a
+  fifth of the width permanently on navigation used for two seconds. Groups
+  are now sections of one full-width list, **collapsed on arrival**, each
+  closed row carrying origin, reach and a count per family so it can be
+  skipped without opening — a collapsed row that answers nothing is a shutter,
+  which is the state the Library redesign removed. Opening one is selecting
+  it, one at a time, with the neighbours left as lines to compare against.
+  The header search is now the only search: it matches a group by name,
+  description or Workspace address **and by anything the group holds**, so
+  "revenue" finds the groups granted Revenue Core instead of reporting no
+  match; typing opens the first hit and narrows it to the rows that matched.
+  A miss says it is a miss and names what was searched — an admin sees every
+  grant on the instance, so nothing here can be a permission problem.
+
+- **`/admin/access` groups what a group can use into Knowledge, Capabilities
+  and Surfaces**, the Library's own two families plus the one for types that
+  are neither — a chat and a Slack channel are where a group meets Agnes, not
+  something it holds. The tier control stops saying **Optional / Automatic**
+  and says **Available / Required**, the words the person on the other end
+  reads, and every row now shows that sentence beside the control: *Required
+  by your admin*, *Keep a local copy*, *Install*, *Ask Agnes*, *Open*, *Use as
+  template*, or a quiet *citable* / *shapes the answer* where the person has
+  no control at all. The tier tooltip stops describing it as an access control
+  — the grant already gave access (`stack_auto_membership` is default-on since
+  Wave 0), so it only decides whether the copy is permanent and downloaded or
+  the person's own choice. Design:
+  `docs/superpowers/specs/2026-08-28-access-page-definition.md`.
+
+### Fixed
+
+- **A persona'd agent never received the fact-tool guidance the default agent gets, so a who/what/relationship question that `fact_search` would answer directly instead failed.** The `facts.enabled`-gated "Facts — entity and relationship questions" section lives in the default Workspace Prompt template (`config/claude_md_template.txt`), but an agent persona REPLACES `CLAUDE.md` wholesale (`agent_profile.build_profile`, both the native `WorkdirManager._materialize_profile` seam and the embedded kai-agent engine's `_agent_workspace_members`) — so that guidance never reached a persona'd agent, which fell back to `agnes catalog` + SQL, found no matching table, and reported no data, while the same question against the empty default agent (unaltered rails) answered correctly. `build_profile` now appends a new `agent_profile.FACTS_ACCESS_RAILS` block after the existing `DATA_ACCESS_RAILS` catalog guidance whenever the `facts` switch is on for the instance — additive, not a replacement, and gated on the switch alone (no per-caller readability check, matching the default template's own gate: the fact tools already enforce per-caller visibility on every call).
+
+- **The extraction-worker deployment instructions promised a two-step setup that could not actually boot.** The `docker-compose.yml` comment, `config/instance.yaml.example`'s `extraction:` block, `docs/DEPLOYMENT.md`, `docs/architecture.md`, `docs/feature-flags.md`, and the `extraction` switch's `lock_reason` (`app/switches.py`) all said "flip `extraction.enabled` and start the `extraction-worker` compose profile" — but that service sets `AGNES_ROLE=worker`, a role split, which `app/startup_guards.py::validate_deployment` treats as a multi-process deployment requiring Postgres app-state, explicit `JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis`. Following the old instructions crash-loops the container on that guard. All six locations now name the multi-process prerequisite up front, and `validate_deployment`'s refusal message itself now names the concrete trigger (e.g. `AGNES_ROLE='worker' is a role split`) instead of a generic "AGNES_ROLE split or UVICORN_WORKERS>1" disjunction the reader had to resolve themselves. Docs + one error message; no behavior/guard change.
+
+- **The SharePoint connection editor also silently reset the in-Agnes extraction schedule.** A second instance of the fail-open pattern above, found the same day when TCRD-226 landed `config.extraction` (the schedule's `last_run_at`/`last_job_id` bookkeeping) onto the same connection row: an ordinary edit through the generic connection editor would have wiped it too, just like `scopes` did before the earlier fix. Closed the same way — carried forward unless explicitly supplied — and made self-enforcing: the list of SharePoint keys the editor must preserve now lives as one named constant (`SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`) next to the functions that actually write them, and a new static test fails whenever a future key is written there without being added to that constant, naming the exact fix instead of relying on someone remembering to update a second list.
+
+- **Security hardening: SharePoint anonymization could fail open silently.** Editing a SharePoint connection through the generic connection editor (`PUT /api/admin/source-connections/{id}`) with a config that omitted `scopes` used to wipe every confirmed scope's `anonymize` flag — `scopes` is server-written by the connect wizard's own endpoints and never rendered by the generic editor, but the editor replaced `config` wholesale. Wiped scopes emptied the `corpus-extraction` job's anonymize map, so neither the anonymize env vars nor the per-instance HMAC key were ever resolved and no error fired; the pipeline then shipped un-anonymized content into a collection an admin believed was anonymized, reported as a normal successful run. Two independent fixes: (1) the connection editor now preserves `scopes` across an update that does not mention it (an explicit `scopes: []`, or the wizard's own unselect endpoint, still clears it deliberately — same "explicit wins" contract already used for Keboola's `project_id`/`project_name`); (2) `POST /api/facts/ingest` now refuses (`403 anonymization_not_declared`) any batch that documents a corpus whose SharePoint scope is anonymize-marked unless that same batch's `anonymization` block declares the corpus — a typed, itemized rejection, enforced at the door before anything is written, so a wiped scope, a misconfigured env var, or a producer that forgets the declaration can no longer ship plaintext into an anonymize-marked collection undetected. A lookup failure while answering "is this corpus marked" is itself refused (`503 anonymization_check_unavailable`) rather than treated as "nothing is marked". See `docs/anonymization.md`.
+
+- **`corpus-extraction` no longer hands a role-split worker's producer its own dead loopback address.** The producer callback URL (`AGNES_API_URL`) falls back to `http://127.0.0.1:8000` when neither `SERVER_URL` nor `AGNES_INTERNAL_URL` is configured — correct for the default all-in-one process (the producer's parent process IS the app), but wrong for the `extraction-worker` compose service, a SEPARATE container (`AGNES_ROLE=worker`) whose own loopback is not the instance's real callback surface. The job now refuses cleanly with a named error before invoking the producer on that topology, instead of letting a crawl run to completion and only then fail trying to call back — which reads like a producer bug rather than a missing config value. A single-container deployment, and any deployment with `SERVER_URL`/`AGNES_INTERNAL_URL` already set, is unaffected.
+
+- **SharePoint connect wizard: one inaccessible site no longer kills the whole folder search.** `GET .../tree/search` walked every site in one pass and, when app-only Graph permissions were not uniform across the tenant (a routine fact — `Sites.Selected` grants, departmental sites, restricted libraries), a single 403/404 aborted the entire search with zero matches, even when every other site was perfectly readable. A 403/404 on a site (during "search everywhere" root selection) or on a folder discovered mid-walk is now skipped instead of fatal — and skipping a folder never discards matches already found deeper in the same walk. The response gains a `skipped` list (`{scope, reason, status_code, site_id, site_name, drive_id, item_id, display_path}`) naming exactly what was skipped and why, kept deliberately distinct from `truncated` (a depth/visited cap, a different fact with a different fix) — the wizard shows it as a quiet, factual note beside the results, never an alarm. A genuine auth-class failure (network error, 401, 429, 5xx) still propagates and fails the search outright, so a broken connection can never masquerade as an empty, successful-looking result.
+
+- **The fact-graph read path could show a display name minted from a document the caller cannot read.** A subject (e.g. an engagement or organization) becomes visible once the caller can read ANY one of its claims — but its alias/display name (`fact_aliases.natural_key`) was joined with no grant filter at all, so a caller who could see one unrelated, readable claim on a subject would also see a name that was minted purely from a *different*, restricted claim on the same subject. Each alias now carries its own per-corpus provenance (new `fact_alias_sources` table, populated going forward at ingest time from the evidence that actually established it — including a node with NO claims of its own, reachable only as the anchor of an evidenced edge, e.g. the ordinary "industry"/"sponsor"-shaped ontology row: its provenance now comes from the edge's own claim too, not just claims on the node directly) and is shown only when the caller can read at least one of those corpora, or the subject carries an admin `revealed` correction (same instance-wide bypass `attrs` already gets) — a visible-but-unnamed subject falls back to its opaque id rather than a 404. The free-text `q` search parameter is filtered the same way, so matching against a restricted-only alias can no longer be used to probe for a name's existence via hit count or result ranking. The migration backfills provenance for every alias that predates this release the same way — from that fact's own claims' corpora AND its incident edges' claims' corpora — deliberately BROADER than the live per-alias rule (it can't know which specific claim minted a legacy alias, so it credits every corpus a claim on the fact or an incident edge comes from), because a narrower backfill would silently blank real display names and break `q` search on existing data instead. New aliases minted after this release get the precise, narrow guarantee; a legacy alias's provenance is a best-effort reconstruction, not a promise. Because the original `0084` shipped with the own-claims-only backfill and an instance that already applied it will never re-run it, a follow-up migration (`0085_alias_edge_backfill`) replays the corrected backfill idempotently — a no-op on a fresh instance, and the only route to the fix for one that migrated early.
+
+- **A streamed answer no longer looks stuck while it finishes (TCRD-213).** The one-click follow-up chips are a fenced `next_actions` trailer inside the same streamed answer, not a second model call made after streaming ends — so once the prose finishes, tokens keep arriving for as long as the model spends on its `sources` and `next_actions` trailers, while the painter deliberately withholds a half-open fence and the text on screen cannot change. The only signal was a caret blinking under finished-looking prose, which is indistinguishable from a hang. That window is now named: while a trailer fence is open the caret is replaced, in place, by a quiet `Finishing…` label, so a turn that is still working says so. No change to when the chips appear — this makes the existing wait legible rather than shortening it.
+
+- **The session-files drawer explains its own buttons, and a saved file stays visibly saved (TCRD-212).** Every action in the drawer — download, save to Library, open in Library, refresh, close — moves off the native `title` attribute onto an instant, styled tooltip that also appears on keyboard focus; `title` had a ~1s delay, could not be styled, and never showed for a keyboard user, so the sentence explaining each icon was in practice unreachable. The bubble is positioned `fixed` on `document.body` because the file list is its own scroll container and would otherwise clip it, and its colour is an inversion of the theme's own text/surface pair rather than a picked value, so it cannot repeat the white-on-white tooltip failure (DES-134) in any of the four themes. Saving a file now also records the outcome in the row itself — a `Saved to Library` badge beside the filename — instead of only a toast that expires after 2.4s and an icon that explained itself on hover alone.
+
+- **Local dev: `/library` took minutes to load, because `LOCAL_DEV_MODE`
+  silently switched on the profiling debug toolbar.** `LOCAL_DEV_MODE=1`
+  implied `DEBUG=1`, mounting the FastAPI debug toolbar, whose per-request
+  instrumentation pegs CPU on heavy HTML pages — and every documented
+  local-dev command sets `LOCAL_DEV_MODE`. The heaviest template in the
+  product, `/library`, stopped answering within a request timeout while
+  `/api/version` stayed instant, which reads as a database or template
+  fault rather than a middleware one. Measured on one instance with one
+  variable changed: `>300s` with the toolbar armed, `1.4s` without. The
+  toolbar is now armed only by an explicitly truthy `DEBUG`; local dev
+  with it is `DEBUG=1 LOCAL_DEV_MODE=1`, as `docs/development.md` already
+  documented. Production never set `LOCAL_DEV_MODE`, so no deployed
+  instance was affected.
+
+- **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote grounded in the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The identity match itself must be a WHOLE unit — a folder name, the filename with or without its extension, or a contiguous run of whole path components (e.g. `"folder/filename.ext"`) — equality, never a bare substring: a same-day review round caught that `quote in path` also admitted a bare `.pptx`, a stray `/`, or any short fragment, letting a fabricated attribute self-certify as a confidently-cited quote via the document's own name. The whole-unit decomposition applies to BOTH `filename` and `path` (a cross-PR combination finding: a zip-bundle member stores its archive-relative path IN `filename`, with `path` NULL, so decomposing only `path` silently left a member's own folder name unmatchable — an ordinary, separator-free `filename` is unaffected either way). The run report still distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
+
+- **A duplicate-file claim could silently lose its `document_date`, breaking the latest-value-wins succession rule.** When a SharePoint duplicate's doc_id resolution (TCRD-241) fell to the deterministic indexed-preferred override, the claim wrote its `document_date` looked up by the corpus_file that override picked — which, for a batch whose own `documents[]` entry resolved to a DIFFERENT (unwinning) copy, was never a key that batch itself had set, so the date silently wrote `NULL`. An undated claim loses to any dated one in the per-key latest-`document_date`-wins projection, so a stale value could win forever over the newer one this batch actually declared — precisely the recurring-SharePoint-duplicate case the succession rule exists for. `document_date` is now looked up by the batch's own declared `doc_id`, not the resolved `corpus_file_id`, so it survives the override regardless of which copy wins.
+
+- **`FactsPgRepository.search()`'s free-text `q` had no minimum length and no statement timeout.** A 1-character `q` drove a full ILIKE scan over every `fact_aliases` row with no useful selectivity, and — unlike `neighbors()` — the query ran with no bound at all, a pool-stall risk on a large alias table. `q` now requires at least `MIN_SEARCH_Q_LENGTH` (2) non-blank characters (a `ValueError`, translated to the existing `422` by the REST layer) — enforced in the repository itself, not only the REST Pydantic model, so an MCP or CLI caller reaching `search()` directly gets the same floor. The query now runs under the same bounded Postgres `statement_timeout` `neighbors()` already used.
+
+- **The fact-graph verbatim gate accepted a degenerate quote — a bare file-extension fragment (`.pdf`) or a lone path separator (`/`) — as long as it happened to occur literally somewhere in the document.** A plain substring test has no notion of "meaningful": any character sequence that occurs anywhere in the text (or, for a quote the content check misses, in the document's own filename/path — nearly every file whose quote is its own extension) satisfies it, so a claim citing punctuation noise wrote and rendered as verified evidence. `POST /api/facts/ingest` now requires a quote to be at least 2 characters and to START with a word character (letter, digit, or underscore) before either half of the gate is tried — closing both paths with one check, since a length-only floor cannot tell a fragment like `.pdf` apart from a genuinely short quote of the same length (a metric name, a ticker, a year). Deliberately checks only the quote's start, not its end: a quote citing a whole sentence routinely — and legitimately — ends in terminal punctuation ("Acme Corp is the client."). A rejected degenerate quote gets its own `quote_not_meaningful` reason in `claims_rejected`, distinct from `verbatim_gate_failed` (the quote WAS present; it just isn't evidence of anything), surfaced under the same "rejected quotes" badge as the rest of the verbatim gate on the `/admin/data-sources` SharePoint source card. Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.4.
+
+- **Removed a committed `data` symlink pointing into a contributor's home
+
+- **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home
+  directory.** `data -> /Users/<contributor>/Documents/.../data` reached
+  `integration` as a tracked mode-120000 blob. It is broken for everyone
+  else, it can shadow the runtime `data/` directory, and it puts a personal
+  filesystem path into a source-available repo, which the vendor-neutrality
+  rule rules out. `.gitignore` had `data/` — the trailing-slash form matches
+  a **directory** only, so a symlink named `data` slipped straight past it;
+  `/data` is now listed too so the same file cannot come back.
+  The sibling `user -> /Users/<contributor>/.../user` came from the same
+  commit and slipped through the same way (`user/` in `.gitignore` matches a
+  directory only); `/user` is listed too.
+
+- **The fact-graph search API silently ignored an unrecognized request field instead of rejecting it.** `POST /api/facts/search` and `POST /api/facts/neighbors` now reject an unknown field with `422` (`extra="forbid"` on both request models) rather than pydantic's default of silently dropping it — a caller that (reasonably) guessed at an undocumented `q` parameter previously got back an unfiltered, id-ordered dump with no error, which is exactly the shape of a convincing wrong answer.
+
+- **The SharePoint source card no longer shows "(no connection URL)".** The
+  generic card subtitle rendered a connection's `stack_url`/host, which a
+  SharePoint connection has none of (Graph auth is tenant + app
+  registration, not a host) — every SharePoint card read as broken. It now
+  shows the tenant (shortened GUID) and a scope summary, e.g. `a1b2c3d4… ·
+  2 scopes · Communication site`, or `N sites` when the selected scopes span
+  more than one site.
+
+- **Corporate Memory: the nightly collector no longer queues duplicate
+  suggestions the catalog-refresh LLM failed to recognize as restatements of
+  an existing item.** Its own `existing_id` verdict was the only dedup
+  signal, so a paraphrase reported as brand new landed as a second item in
+  the triage queue. A deterministic, stdlib-only guard now re-checks every
+  `existing_id: null` item against same-category catalog items — both
+  already-approved items and suggestions still awaiting review — before it
+  is accepted: an exact match after normalization, or a normalized-token
+  Jaccard / `difflib.SequenceMatcher` similarity of 0.9 or higher, skips the
+  proposal (logged, and counted in the run's `items_duplicate_skipped`
+  stat, visible on `/admin/scheduler-runs` and in the CLI collector's
+  summary). Below that threshold nothing is skipped — a false "duplicate"
+  would silently drop a real finding.
+
+- The data-app git surface (`/data-apps.git/<slug>/…`) no longer answers a
+  restricted principal's credential with a raw 500. An agent-session or
+  co-session token resolves to a frozen principal dataclass with no single
+  caller identity; the route's owner/admin checks raised `AttributeError` on
+  it and surfaced as an unhandled server error (#1656). Such a caller now
+  fails closed with a clean 403 — the git surface is owner-authority, and a
+  restricted principal has no sound identity to run that check against.
+
+- **Security: direct `kbc."bucket"."table"` paths are now registry-, grant- and
+  policy-gated (#1492).** Every Keboola sync writes a `_remote_attach` row that
+  re-ATTACHes the `kbc` catalog onto the read-only analytics connection with
+  the *instance* storage token, so a qualified path used to read whatever that
+  token could see — no registration check, no `resource_grants` consultation,
+  no access-policy substitution — while `bq`/`sf`/`dbx` each had all three. A
+  new `_kbc_guardrail_inputs` (mirroring the Snowflake guard, the closer
+  precedent: extension-resolved, not a shipped-to engine) now refuses an
+  unregistered path (`kbc_path_not_registered`, admins included), an
+  ungranted one (`kbc_path_access_denied`), and a path naming the physical
+  source of a policied row (`kbc_path_policied`) on both `/api/query` and the
+  snapshot `--from-query` path; matching normalizes pre-fix wizard rows that
+  stored the full `<bucket>.<table>` id in `source_table`, so legitimately
+  registered tables keep working. Mixed internal + `kbc.*` statements get the
+  same explicit refusal `bq.*`/`sf.*` already had. **Operator note:** any
+  analyst workflow that queried `kbc.*` directly against an unregistered
+  table now gets a 403 with a register-or-use-catalog-name hint — that read
+  was riding the instance token, which is what this closes. The gate covers
+  `/api/query` and `/api/v2/scan`; `POST /api/query/hybrid` runs
+  admin-supplied SQL on the same connection without any of the three
+  prefix guards (pre-existing, equally true of `bq`/`sf`, admin-only) and is
+  left to a follow-up that can decide its registered-BQ sub-query contract.
+
+- **Security: a SQL comment no longer hides a `bq.*` / `sf.*` / `kbc.*` path
+  from its registry/grant/policy guard.** DuckDB treats `/* … */` as
+  insignificant whitespace — `SELECT * FROM kbc/*x*/."bucket"."table"` parses
+  and reaches the ATTACHed catalog — but the guards' `qualified_path_re` scan
+  matched only literal whitespace between segments, so a comment placed
+  between a prefix and its path (or between the two identifiers) slipped the
+  gate entirely and read an unregistered or ungranted table through the
+  instance-wide connector token. All three now scan comment-masked SQL, the
+  masking `_assert_no_ungranted_catalog_ref` has always applied for exactly
+  this reason. String literals are deliberately still visible to the scan, so
+  the documented strict-deny on a path-shaped literal (`WHERE c =
+  'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
+  another. `dbx` gates on a parse rather than a regex and was never affected.
+
+- **One vocabulary for empty vs blocked vs forbidden (TCRD-207).** Nine
+  design reviews independently found the same collapse: a search that ran and
+  matched nothing, an access denial, and a request that never completed all
+  rendered as the same quiet state on different surfaces, in different words.
+  Investigation found most of the nine already patched piecemeal (collections
+  search, `/admin/linked-apps`, `/admin/semantic-layer`, `/chat` sources,
+  `/me/connections`, `/admin/data-sources`, the corporate-memory review
+  queue) — each with its own wording, none sharing a component. One still-live
+  bug remained: `/chat`'s conversation list (both the rail's renderer and the
+  chat page's own boot path) caught a failed `GET /api/chat/sessions` and
+  showed the exact same "No conversations yet." a genuinely empty account
+  gets — indistinguishable from "your account cannot see the conversation
+  list," even though the conversations were still saved. Fixed with a new
+  shared component, `state.panel()` (`app/web/templates/macros/_state.html`,
+  `app/web/static/css/state_panel.css`) covering four states — nothing
+  matched a query, the collection is genuinely empty, a disclosed access
+  block, and a failed request — each visually distinct (neutral / warn /
+  danger tone, distinct icon), applied to the chat conversation list (adding
+  the missing FAILED state with a Retry action) and the admin moderation
+  queues. The remaining surfaces, `/library` among them, follow separately —
+  they already tell their states apart in copy; what they lack is the shared
+  component. Decision + the security tradeoff
+  on acknowledging blocked-vs-absent:
+  `docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md`.
+
+- **Security: config-resolution secrets are no longer valid connector-ATTACH
+  `token_env`s.** The single token-env allowlist fed two independent trust
+  boundaries: the settings resolvers that read a secret named in admin-written
+  connection config (SharePoint certificate private key, Snowflake key-pair
+  passphrase), and the `_remote_attach` gate that resolves a token_env a
+  *connector* wrote into its extract.duckdb and sends the value as
+  `ATTACH … TOKEN` to the row's own URL. Sharing the list meant a
+  malicious/compromised connector could name `SHAREPOINT_CERT_PRIVATE_KEY` (or
+  `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`) as its `token_env` and have the
+  orchestrator ship that secret to a connector-chosen host on every query. The
+  allowlist is now split per consumer class: the ATTACH gate accepts
+  data-source attach tokens only, config-driven resolvers check the new union
+  gate (`is_config_secret_env_allowed`), and a ratchet test keeps every
+  config-only secret out of the ATTACH set for good. Operators extend the
+  config-resolution side with `AGNES_CONFIG_SECRET_ENVS` (replaces the
+  config-only defaults; `AGNES_REMOTE_ATTACH_TOKEN_ENVS` keeps governing the
+  ATTACH side and still flows into the union, so existing overrides keep
+  working).
+
+- The profiler worker subprocess crashed with `TypeError: Object of type
+  Decimal is not JSON serializable` when a profiled table had DECIMAL/NUMERIC
+  columns (e.g. Snowflake `NUMBER`), failing the whole data-refresh job. Its
+  stdout `json.dumps` now uses the same `default=str` handler as the
+  parent-side profile writer.
+
+- **Security: `AGNES_REMOTE_ATTACH_TOKEN_ENVS` could resurrect a
+  config-resolution-only secret as a connector-ATTACH `token_env`.** The
+  override replaced the default allowlist wholesale with no scrub, so an
+  operator listing `SHAREPOINT_CERT_PRIVATE_KEY` (or the anonymization
+  producer key) there re-opened the exact hole the consumer-class split
+  above closes; `get_allowed_token_envs()` now always subtracts both other
+  boundaries back out, even from the override.
+
+- **`corporate_memory.distribution_mode` now actually gates what reaches a
+  caller (#1573).** The knob was documented, editable in
+  `/admin/server-config`, and read by nothing — every mode shipped every
+  approved item to every user. It now narrows the OPTIONAL (approved,
+  non-required) channel of `GET /api/memory/bundle` (both the JSON and the
+  per-domain markdown `agnes pull` writes) and the corresponding
+  `memory_domains[].md5` in `/api/sync/manifest`: `"mandatory_only"` and
+  `"admin_curated"` ship required items only (approved items stay
+  catalog-browsable, matching "distribution is always admin-driven"
+  for those two modes); `"hybrid"` (default, unchanged behavior for an
+  instance that has never voted) makes approved items personally opt-in via
+  upvote. An unrecognized value now logs a warning and falls back to
+  `"hybrid"` instead of silently doing nothing. Required (mandatory) items
+  are unaffected in every mode. All three surfaces share one selector
+  (`select_distributable_items`) so they can't independently drift out of
+  agreement — the manifest's md5 always corresponds to what the markdown
+  route would render, which is what lets `agnes pull` converge instead of
+  either serving a permanently stale bundle or refetching forever.
+
+- The group picker on `/admin/users/{id}` ("Add to group") showed only its
+  first option under themes that render the custom dropdown: the section
+  card's `overflow: hidden` clipped the popover at the card's bottom edge,
+  leaving every option past it invisible with no scroll or affordance. The
+  card's clip now yields while a dropdown menu inside it is open
+  (`section_card.css`), which fixes every ds-dropdown near the bottom of any
+  section card, not just this picker.
+
+- **MCP foundation-tool errors now carry the server's remedy, and the chat
+  approval card says what it is approving.** Every foundation tool used a bare
+  `raise_for_status()`, so a 4xx surfaced to the model as a generic
+  `Client error '400 Bad Request' for url …` while the response's `detail` —
+  the actionable part, e.g. `invalid_category` with the list of valid
+  categories — was discarded; the shared helper now appends it, letting the
+  model self-correct instead of dead-ending. The chat approval card now names
+  the tool being approved in its title (it previously said only "Approval
+  required", forcing the reader to infer the tool from a neighbouring card),
+  a no-args engine tool call no longer renders a code block containing just
+  `{}`, JSON args are pretty-printed, and while a call waits on the decision
+  its tool card reads "waiting for approval" instead of a contradictory
+  "running…".
+
+- **"Reset to default" on `/admin/prompts` asks before destroying the
+  override.** One click used to replace a customer's tuned install/workspace
+  prompt with the shipped default — no confirmation, nothing recoverable. The
+  reset now goes through the design-system confirm dialog (same idiom as every
+  other destructive admin action), naming what will be lost.
+
+- **Password managers can now fill and save on every auth form.** The login
+  identifier fields said `autocomplete="email"` — managers key saved logins on
+  `username` (the spec's token for the account identifier, even when it is an
+  email address), which is why the same login page offered credentials to one
+  person and nothing to another. And the setup/reset forms carried the account
+  email only as a hidden input, so a manager watching the `new-password` field
+  had no username to associate the credential with and never saved it; the
+  email is now a visible, readonly field in the same form (readonly inputs
+  still submit — the POST contract is unchanged).
+
+- **The marketplace token cell now says whose PAT it is, not just that one
+  exists.** Every sync on an instance can run under one person's personal
+  token, and the UI showed a bare yes/no dot — a rotation or expiry then
+  became an unattributable fleet-wide sync failure. The list payload gains
+  `token_env` (the variable name, never the value) plus `token_set_by` /
+  `token_set_at`, projected from the audit rows token writes already leave
+  (`marketplace.create`/`.update`); the admin table shows the saver and date
+  under the dot, full detail in the tooltip. Best-effort by design: a trail
+  pruned past the write degrades to the env name alone, and an audit-read
+  failure never breaks the marketplaces list.
+
+- **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
+  values.** Vertex validates the `anthropic-beta` header and refuses the whole
+  request on any value it does not recognize (the first-party API ignores
+  unknowns), and the kai-agent engine's SDK sends first-party betas like
+  `advisor-tool-2026-03-01` — so on `chat.llm.provider: vertex` every engine
+  chat turn died with `400 Unexpected value(s) … for the anthropic-beta
+  header`. The broker now filters the header in vertex mode to the values the
+  Vertex endpoint accepts (renaming where its spelling differs, e.g.
+  `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`), drops the
+  rest (logged; default-deny, so a future unknown beta degrades one optional
+  feature instead of 400-ing every turn), and omits the header entirely when
+  nothing survives.
+
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
+
+- **The `/admin` hub's "Marketplace sync" signal no longer counts bundled
+  rows.** A bundled row never syncs (it has no git remote), so its NULL
+  `last_synced_at` read as "no sync in 48h" and every instance showed a
+  permanent "Needs fixing" row for content that ships inside the image.
+
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
+- **A failed builder Preview now says why, instead of pointing at the browser
+  console.** Reported from a deployed instance: the agent builder's Preview
+  answered "The preview could not answer. The details are in the browser
+  console." — useless to the author, to the person they reported it to, and to
+  the engineer after that. Reproducing it against the scripted engine showed
+  what the copy was discarding: an `engine_error` frame carrying
+  `engine refused the turn (500): {"detail":"… KAI_HOST_JWT_SECRET is unset …
+  Set the SAME value here and on the Agnes process …"}` — a complete diagnosis,
+  thrown away because `engine_error` matched none of the recognised patterns
+  and the fallback named devtools rather than the reason. The unrecognised case
+  now puts the engine's own words on screen (unwrapping the upstream's JSON
+  `detail`, keeping the prefix that says which step failed), `kind` is read as
+  well as `message` since several frames carry the useful half in the kind, and
+  `runner_not_ready` — the 30-second engine-start timeout, usually nobody's
+  mistake on a cold instance — gets its own retryable sentence. The whole error
+  frame is logged as well, so devtools keeps everything it had.
+
+- **All four conversational builders now say when they are talking to the
+  scripted stand-in.** Every turn endpoint has always reported which engine
+  answered it — that is the whole point of naming the engine — but only the
+  Library and MCP-source builders rendered it; the agents and data-package
+  builders took `engine` off the wire and dropped it, so on those two a stub
+  still passed for a real model. The notice moved into the shared shell
+  (`BuilderShell.engineNotice`), replacing two near-identical copies, so a
+  builder gets it by using the shell rather than by remembering, and all four
+  word it the same. Guarded by `tests/test_every_builder_names_its_engine.py`,
+  which pins both halves — the render and the assignment — for each builder.
+
+- **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
+  did not type, not just a `url`.** All three name what the instance dials or
+  runs, and only `url` was guarded. `command` and `args` are the sharper pair:
+  on `stdio` transport they are what reach `StdioServerParameters` and are
+  launched as a subprocess on the server, so a patched `command` chooses the
+  binary — and `args` alone is enough, since a benign `npx` or `node` the admin
+  typed will run whatever it is handed. All three are now accepted only when
+  they read exactly as the draft already holds them, so a patch echoing the
+  panel back is harmless and a patch inventing a target is a no-op. Every one
+  stays settable the ordinary way: the panel's own inputs. This sanitizer had
+  no direct tests while its three siblings all did, which is how the gap
+  survived; it has 18 now.
+
+- **Saving in the MCP-source builder is resumable instead of duplicating the
+  source.** Save makes up to four calls — register the row, store the secret,
+  then one grant per group — so a failure in a later step left a registered
+  source on screen with an error, and pressing Save again re-ran the whole
+  sequence and registered a SECOND source: the only recovery from "secret
+  stored, grant failed" was a duplicate. Save now remembers the row it created
+  and resumes from the step that failed, and says so ("The source is registered
+  — press Save again to finish the rest").
+
+- **An already-granted group no longer fails a builder save.** Both the
+  MCP-source and link-external-apps builders grant in a batch, and a duplicate
+  grant answers `409` — which is the end state the save is asking for, not a
+  failure. Counting it as one was not cosmetic in the linked-apps builder:
+  `Promise.all` rejects on the first failure, so a single already-granted pair
+  failed the whole save, and every retry then failed identically because the
+  pairs that had succeeded were 409s too — Save became permanently unreachable.
+  Grants are now settled independently, a 409 counts as done, and a partial
+  failure names the app → group pairs that are still not granted instead of
+  reporting "some grants failed". (The pre-builder `/admin/linked-apps` wizard
+  already read 409 as done; the builder that replaced it had lost that.)
+
+- **The local-dev audience switch is admin-gated in code, not only in its
+  comment.** Both the partial and `_chrome_ctx` stated the switch was
+  LOCAL_DEV_MODE-and-admin, but `dev_preview_available` only ever checked dev
+  mode, so a non-admin on a local instance got the switch. It changes what
+  renders and never any permission, so this was cosmetic rather than a leak —
+  but the claim now matches the check (`session.user.is_admin`, the same one
+  the rail uses). The flag also had a dead first clause whose condition cannot
+  be true without its second.
+
+- **Collapsing or expanding a section in the builder's Configuration panel no
+  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
+  discarding its scroll position — so opening a section near the bottom
+  scrolled away from the thing you had just opened. Every section's body is
+  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
+  flips the class in place and re-renders nothing.
+
+- **The `/agents` builder's Configuration panel lists what the agent HAS, not
+  everything it could have.** Data & resources and Capabilities used to render
+  the caller's entire reachable pool — every data package, memory domain and
+  marketplace plugin — as a list of toggles, which made the panel a form to
+  fill in and buried the two or three things actually attached among the
+  dozens that were not. Both sections now show only what is connected (each
+  row's action is *Remove*), with the full pool one click behind a **+** in
+  the section header that opens a searchable picker over the shared
+  `.modal-backdrop` modal. The conversation stays the primary way to attach
+  things; the picker is the by-hand path. An attached id that has since left
+  the caller's scope is still listed, marked *Unavailable*, rather than
+  silently dropped — the panel must not disagree with the agent.
+
+- **The builder is full-bleed instead of a card inside the page column.** It
+  broke out of the index shell's centred `--width-wide` container (via a
+  `body.ag-building` class, cleared on the way back to the list, which is
+  still a document and keeps its column), so both panes get the screen. The
+  conversation keeps a 780px measure inside its pane so prose does not stretch
+  to 1200px lines. Each section's explanatory sentence moved from the header
+  into the body, where it is read when you open the section to act rather than
+  wrapping to four lines under all six collapsed titles.
+
+- **A completed sign-in is now recorded in `audit_log`, for every provider.**
+  `login_failed` was the only authentication event the trail carried: the
+  Google, Microsoft, email magic-link and Keboola providers wrote nothing at
+  all on their success paths, and the password provider audited only its
+  failures — so an instance whose people sign in through OAuth could not answer
+  "who signed in, and when" from its own audit log. Both password routes (the
+  browser form and the JSON route used by the CLI/desktop client, distinguished
+  by `client_kind`) and all four OAuth/magic-link callbacks now write a
+  `login_success` row carrying the provider and the trusted client IP. Two
+  adjacent gaps in the same lifecycle close with it: consuming an invite
+  (`/auth/password/setup/confirm`) writes `account_activated` alongside the
+  sign-in it also performs, and the self-service `/auth/password/setup/request`
+  writes `setup_link_requested` — whose anti-enumeration response is identical
+  whether or not the address matched, making the audit row the only place the
+  real outcome is visible. Completing a password reset
+  (`/auth/password/reset/confirm`) and the JSON `/auth/password/setup` sibling
+  both finish a sign-in too — one sets the cookie, the other hands back a
+  bearer token — and both wrote nothing; they record it now, the JSON one as
+  `client_kind="cli"` with `account_activated` beside it, matching its web
+  sibling. Two guards keep this from rotting: one walks `app/auth/providers/`
+  by source rather than a hand-maintained list, so the next provider to mint a
+  session cookie cannot ship without recording it, and a second checks
+  per-FUNCTION — the module-level walk is satisfied the moment a file audits
+  anywhere, which is exactly why those two routes were missed. Separately, the user-management
+  audit helper in `app/api/users.py` swallowed every write failure with a bare
+  `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
+  which keeps the same never-block-the-request policy but leaves a line in the
+  application log when a row is dropped.
+
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
+
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
+
+- **Logout now actually ends the session** (#1675, #1676). The user-menu
+  "Logout" item used to be a plain `GET /login` link — no route existed for
+  it, so it never cleared the 30-day `access_token` cookie or invalidated
+  anything; the app happily reopened on the next visit. `GET /auth/logout`
+  now renders a confirm form (mutating on a GET is forbidden by this repo's
+  CSRF rules) and `POST /auth/logout` — gated by the same double-submit
+  `web_csrf` token every other state-changing web form uses — clears the
+  cookie with the exact attributes it was set with (`path`, `domain`,
+  `samesite`, `secure`) and revokes the session server-side, so a copy of
+  the token captured before logout (a synced browser profile, host malware,
+  a shared machine) stops working too, not only the browser that clicked
+  Logout. Revocation is a new `users.session_revoked_before` timestamp
+  floor compared against each `typ="session"` JWT's `iat` on every
+  authenticated request — it rides the user row `pat_resolver` already
+  loads to check `active`, so it costs no extra query on this hot path.
+  **Postgres-only** (schema-freeze ratchet, A3): a DuckDB-backed instance
+  clears the cookie on logout but has no column to persist the revocation
+  floor against, so a token copied out before logout stays valid on that
+  backend until its own `exp` — same as before this fix, not a regression.
+  Deploying this column does not itself invalidate any existing session
+  (the floor starts unset); only a future `POST /auth/logout` click revokes
+  anything, and revoking one session revokes every other live session for
+  that account too (a per-user floor, not a per-session one — the
+  narrower, per-token design was rejected on the same per-request cost
+  grounds `pat_resolver`'s PAT chain already documents).
+
+- **A full chat host no longer locks every other user out for a week.** Paused
+  sandboxes count against `chat.docker_max_total_sandboxes` (a paused container
+  still holds its memory) but survive until `chat.paused_ttl_seconds` — 7 days
+  by default — so on an instance with a small cap a handful of parked
+  conversations filled the host and every subsequent attach failed with
+  `docker_max_total_sandboxes reached`, with no path back short of an operator
+  deleting containers by hand. The docker provider now raises a typed
+  `SandboxCapacityError`, and ChatManager answers it by destroying the
+  least-recently-paused sandbox (the paused-TTL sweep's own teardown, triggered
+  by pressure instead of by the clock — the evicted transcript is untouched and
+  respawns on its owner's next message) and retrying, up to three reclaims per
+  spawn. A session this process is actively serving is never evicted — and
+  neither is one being brought back: `_resume_live` holds a per-session lock
+  across `provider.resume()` + runner install while the session is still
+  PAUSED with a stale `sandbox_paused_at`, so both the reclaim and the
+  long-standing paused-TTL sweep now take that same lock, which closes a
+  window where either could have destroyed the sandbox of a conversation a
+  user was actively resuming. Any other spawn failure still propagates
+  untouched.
+
+- **Signing in dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app — on every provider, password included.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  The password provider's web-form POST handler — the terminal consumer of the
+  form `/login/password` renders, and the reason a *password* sign-in still
+  landed on the home route while OAuth and magic-link returned you to the app —
+  held a third copy of the same rule and now calls `safe_next_path` too. All
+  four sign-in paths (OAuth, magic-link, password form, login pages) resolve
+  `next` through the one implementation that knows about app origins.
+
+- **Facts ingest resolves a duplicate `doc_id` deterministically and within its declaring collection, instead of picking an arbitrary copy across ALL collections (TCRD-241).** A byte-identical SharePoint copy shares its sha-derived `doc_id` with every other copy of the same file, so more than one `corpus_file_sources` row can legally anchor the same `doc_id` — possibly in a different Collection. `FactsPgRepository.ingest_batch` previously resolved evidence with an unscoped `SELECT … WHERE source_doc_id = :doc_id LIMIT 1`, which could attach a claim to whichever collection's copy happened to sort first — mis-scoping the claim's visibility onto the wrong collection's grants and, on `full_documents` replace, leaving a stale claim behind on the copy that didn't win. Resolution is now corpus-scoped and deterministic (indexed copies preferred, `corpus_file_id` as a tiebreak): a claim resolves within the Collection its `documents[]` entry declared, then within the OTHER collections this same batch's `documents[]` touched. When this batch DID declare at least one collection but a cited `doc_id` is anchored only in some other, undeclared one, the claim is now REJECTED (`ambiguous_cross_collection_doc_id`, itemized in `claims_rejected`) rather than silently written under a collection wider than the producer's batch ever declared — a batch scoped to a restricted collection can no longer leak a claim into a more broadly-granted one. A `documents[]`-omitted batch (the documented "every doc_id already resolves" replay) has no batch-declared scope to escape and is unaffected. Replace mode now purges claims off every anchored copy within the declaring collection, not just the one resolution currently prefers.
+
+- **Customer-specific names scrubbed from the shipped surfaces.** This repo's
+  vendor-agnostic rule ("nothing customer-specific in code, config defaults,
+  comments, docs, commit messages") had drifted: the ontology builder's own
+  name field suggested a customer's ontology as its placeholder
+  (`e.g. cuesta_star`), `connectors/sharepoint/graph_client.py` named a
+  private producer repo in its module docstring, the fact-graph design spec
+  and its run log referenced that repo ten times, and two admin-doctor tests
+  used a customer's product name as their brand fixture. All now read as the
+  role rather than the customer — "the producer repo", "the producer
+  pipeline", `e.g. acme_knowledge`. No behaviour change; the eval fixtures
+  under `tests/fixtures/eval/` are deliberately untouched (see the PR body).
+
+- **Leaving the person lens no longer loses the person.** A row in "what
+  their Library shows" linked to the ANALYST page for that resource with
+  `?from=admin&user=` glued on — a param those pages ignore — so clicking a
+  package in *malcolm's* preview opened *your* Library view of it ("You have
+  access", "Add to stack") and its back link dropped him; the memory route had
+  no way back at all, a one-way exit out of an audit. Both now go to the admin
+  page for the resource carrying `?from=simulate&user=`, the contract the
+  working "Share it →" flow already used, so each lands with "← Back to
+  preview: <name>" and returns with "Re-check <name> →". That banner had been
+  written inline in the data-package route, which is precisely why only one
+  destination closed the loop; it is `_simulate_preview_ctx()` now and
+  `/admin/corporate-memory` renders it too.
+
+- **`role="tablist"` on the access page now behaves like one.** The tabs named
+  no panel, the panels claimed no role, and Left/Right did nothing — assistive
+  tech was told a tab set existed and given no way to operate it. Added
+  `aria-controls`/`role="tabpanel"`, a roving tabindex, and arrow/Home/End
+  navigation. The count badges also read as bare numbers ("By group 5" with
+  nothing saying what 5 counts) and now carry their own accessible text. The
+  new-group drawer's validation error is a `role="alert"` with
+  `aria-invalid`/`aria-describedby` on the field, and it clears as soon as you
+  type a name instead of sitting there until the next submit.
+
+- **The access page stopped scrolling sideways on a phone, and stopped hiding
+  the column that explains itself.** Two late rules were quietly undoing two
+  earlier media queries: `flex-wrap: nowrap` (there to stop a long description
+  making one row taller than its neighbours) also won inside the 720px block,
+  so a 375px viewport carried 445px of content; and "What they will see" was
+  `display: none` below 900px, removing the half of the row a reader is least
+  able to reconstruct. The row wraps on phones only, and that column moves
+  under the name with a label rather than vanishing.
+
+- **Keyboard focus survived nothing on `/admin/access`.** Every mutation
+  re-renders its section wholesale, so the control you were standing on stopped
+  existing and the browser dropped focus to `<body>` — invisible with a mouse,
+  and with a keyboard it threw you to the top of the document after every
+  single tier toggle. Focus is now carried across the repaint by the row's own
+  identity (`data-type` + `data-rid`, the same pair the click handlers resolve
+  grants by), falling to the section's Add control when the row itself is gone.
+  Separately, the People search advertises `role="combobox"` with
+  `aria-autocomplete="list"` and never told assistive tech which option was
+  current — the cursor lived in a CSS class alone, every row stayed
+  `aria-selected="false"`, and the input never pointed at one. Enter also now
+  commits a single unambiguous result without requiring an ArrowDown first.
+
+- **Copy that described a UI which no longer exists.** "Share with another
+  group" hard-coded the hint "every group in the list below already has it" on
+  every granted bundle — a button telling you not to press it, which then
+  opened a picker with four groups in it. The add/share drawers promised
+  "Added as Available — each person chooses whether to keep a local copy" for
+  agents, collections and chat, which have no tier and no local copy. The
+  create-group toast said the new group was "selected on the left" of a
+  single-column list. The granted-to-nobody roll-up said "1 memory domains".
+  The two invite buttons in the People search carried `btn--primary`, a class
+  this app does not define, and had been rendering as bare UA grey where a
+  primary action belongs — beside a comment claiming that bug was already
+  fixed. The By-person tab computed a count and then discarded it
+  (`? null : null`), leaving a badge that read as forever loading. And
+  `?group=<deleted id>` fell through in silence, which looks like the link
+  worked and the group is empty.
+
+- **/admin/access's search only repainted half the page.** The input handler
+  called `renderGroups()` and nothing else, so the list narrowed and
+  auto-opened its first match while the work pane beside it kept whatever it
+  last drew — an OPEN group sitting above "Open a group to see what it can
+  use." — and `syncQuery()`, which decides whether the query also narrows an
+  open group's rows, never ran at all. In the bundle lens the same handler
+  rendered the GROUP list into the bundle tab. Typing now repaints the whole
+  view, re-fetching the roster only when the query actually moved the
+  selection.
+
+- **The "N groups" count ignored the search box.** It kept its own copy of the
+  narrowing rules and that copy knew only about the kind chip, so a query that
+  cut the list to one group still read "5 groups". The count is now reported by
+  whoever rendered the list, so it cannot disagree with what is on screen.
+
+- **The By-bundle tab badge counted something else than the tab lists** —
+  distinct grant rows of every type (9) over a list of every leading bundle
+  including the ungranted ones (23). Both read from one place now, and the
+  three copies of the "kinds an admin hands out as a unit" set are one.
+
+- **/admin/access could hang on "Loading groups…" on a cold load.** The page's
+  date formatter reached straight through `window.AgnesTime`, which
+  `datetime.js` publishes on a `defer`d script — but `boot()` starts its fetch
+  during parse, so on a cold load the overview endpoint could answer first and
+  the resulting `TypeError` aborted `boot()` with nothing rendered and no
+  visible error. It now falls back to the raw timestamp, the way
+  `/admin/users/{id}` already did.
+
+- **The "Share with another group" action sat a few px below the middle of its
+  own tile.** Its padding was trimmed at the bottom back when it was a flat
+  ghost row butting up against the column header; once it became a bordered
+  tile with its own margin the trim just decentred it.
+
+- **A group's name was interpolated unescaped into `innerHTML`** in the
+  per-table RBAC grant rows (/admin/tables) and the memory-domain grant rows
+  (/admin/corporate-memory) — escaped now, like every sibling row on those
+  pages.
+
+### Removed
+
+- **The Knowledge Layer hero's leftovers.** Retiring it from the chat landing left the parts behind: `macros/_knowledge_layer.html` was still imported by `chat.html` and still defined the whole banner, and ~230 lines of `.klb-*` CSS in `style-custom.css` (plus a dead `.klb-hub-label--lead` block in `chat.css` styling a class no template emitted, and a `.klb-cta` paper-theme override) were still shipped to every page — so the framing could come back through a one-line call. All of it is deleted. The two things inside it that were still doing work survive with names that describe them: the near-white knowledge-surface gradient is now `.cbn--bar`'s own rule (its only consumer, and the fill `.cld-door--lead` deliberately imitates), and the trust caption "Secure. Private. Always in sync." is inlined into `chat.html` as `.cld-trust-claim` — it was a macro only so the hero and this line could share one caption, and its title half was dead code every caller opted out of. `tests/test_web_chat_empty_state.py` now guards the whole `klb` prefix out of the rendered page rather than the four class names someone thought to list.
+
+- **Two stale pointers into the retired hero.** `setup_advanced.html` sent readers to `/home § "connect your tools"` for Google Workspace setup — a section that page has never had since the orientation pages were consolidated; it now names the two surfaces that actually do the job (add the plugin from your Library, authorize it under My connections). `tour.js`'s "Connect my AI tools" button justified its destination by pointing at a CTA that no longer exists; the destination was and is right, so only the reason changed.
 
 ### Internal
 - Pillow is now a core dependency: cover-image variants are generated on the server.
 - Fixed the full-suite meta-guard for uploads-mount fetches: it matched the plain substring "seeded_app", which also matches "seeded_app_fresh" -- the very fixture its own failure message recommends -- so any test file using only the fresh fixture still tripped it. Swapped to a regex that excludes the "_fresh" suffix, and moved the three uploads-mount ?w= variant tests into the file that was already all fresh-fixture, so the guard can pass file-by-file.
+
+- **`RequiresPostgresBackend` is read at call time, not at collection time.** `tests/test_requires_postgres_backend.py` matched the exception class and the app's handler by object *identity*, but the backend parity sweeps call `importlib.reload(src.repositories)` (`tests/db_pg/_parity_sweep_util.py`) to re-resolve the factory against the other backend — which rebinds the class, so the symbol imported at collection time is a different object afterwards. `pytest.raises(RequiresPostgresBackend)` then failed to match the exception it had just asked for, and `shared_app.exception_handlers.get(...)` could not find a handler that was still registered and still correct. It only bit when both files landed on the same xdist worker in that order, so it surfaced as an intermittent shard failure rather than a reproducible one. The class is now re-read through the module and the handler matched by name, so the tests say what they mean regardless of who reloaded first.
+
+- **`test-pg` splits across 4 jobs instead of 2, roughly halving every CI
+  cycle's critical path.** Measured over four consecutive `integration` runs,
+  the eight main shards finished in 11-17 min while both `test-pg` jobs sat at
+  26-34 min — so every run in the repo waited on `test-pg` no matter how fast
+  the rest was. Widening the split is close to free: a job's step timings show
+  **26.3 of its 27 minutes is the pytest run itself** (checkout, setup-python
+  and uv are cached to ~0.1 min), and the committed `.test_durations` cut four
+  ways balances at 11.2 min per group, predicting ~13 min wall. The published
+  check names change from `test-pg (1..2)` to `test-pg (1..4)`;
+  `CONTRIBUTING.md`'s "confirm the check names are present" note is updated to
+  match, and the `test` aggregator needs no change because it depends on the
+  matrix result, not on individual groups.
+
+- **Every pull request runs the test suite, whatever branch it targets
+  (#1636).** `ci.yml`'s `pull_request` trigger was filtered to `main` and
+  `integration`, so a PR into a stack base — `mf/semantic-layer-v0`, a
+  `claude/*` branch — fired no workflow at all and showed a **green rollup
+  that asserted nothing**, which reads exactly like a passing run. The
+  semantic-layer stack took four PRs that way, over a base sitting at two
+  alembic heads with nothing to report it. The filter is gone rather than
+  extended with stack-base names: a naming convention nobody enforces fails
+  silently the first time someone picks a name outside it. `CONTRIBUTING.md`
+  now states the invariant and how to check for it (confirm the check NAMES
+  are present — "no red" is not "tested").
+
+- **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
+
+- **Local-dev audience switch on the chat landing page.** Under
+  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
+  Admin | Admin, empty instance | Member" toggle for reviewing each landing
+  state without keeping a second account or mutating data — `?preview=member`
+  hides the admin notice, `?preview=empty` forces it on an instance that has
+  data. It fakes the render only: no repo read is bypassed, nothing is
+  written, and no authority or grant changes. Off the dev gate every value is
+  ignored outright and the toggle is not rendered, so it adds no surface to a
+  real deployment.
+
+- **Vertex sweep of the remaining direct-Anthropic call sites (TCRD-242).**
+  Chat, vision ingest, and the guardrails reviewer were already Vertex-capable
+  through `connectors/llm/factory.py`; the offline eval harness's
+  `--llm-assist` grading pass (`scripts/eval/grade.py::llm_assist_grade`) was
+  the one remaining consumer that hard-required `ANTHROPIC_API_KEY` — it now
+  falls back to a raw `AnthropicVertex` client via
+  `connectors.llm.factory.vertex_config_or_none` /
+  `connectors.llm.vertex_provider.create_vertex_client` when no static key is
+  set, the same non-extractor pattern `app/chat/auto_title.py` and
+  `src/ingest/vision.py` already use. The agent-as-API runtime
+  (`POST /api/v1/agents/{slug}/responses`) needed no change — it spawns a
+  headless chat session through the same `ChatManager`/`app/api/broker.py`
+  path live chat uses, which already honors `chat.llm.provider: vertex`
+  end-to-end including pinned-model and budget enforcement against a
+  Vertex-shaped model path. The A0 "bare Anthropic API, no tools" eval arm
+  (`scripts/eval/arms.py::AnthropicArm`) is deliberately left on the
+  first-party API — its entire methodological point is measuring the vendor's
+  hosted baseline, independent of Agnes's own provider routing.
+
+- **Every grantable resource type now declares a family** — `Knowledge`,
+  `Capability` or `Surface` — as a required field on `ResourceTypeSpec`, with
+  the section copy in a matching `RESOURCE_FAMILIES` registry.
+  `/api/admin/access-overview` carries `family` / `family_display` per type
+  (sorted into render order, registry order preserved within a family) and a
+  `families` list, so `/admin/access` can group by the same two families the
+  Library uses without a second copy of the mapping in Jinja or JS. Required,
+  not optional, so a new resource type cannot be registered without someone
+  deciding where it belongs — and the two that belong to neither Library tab
+  (a chat, a Slack channel) are named as `Surface` rather than filed under
+  something they are not. Groundwork for the `/admin/access` redesign
+  (`docs/superpowers/specs/2026-08-28-access-page-definition.md`); no UI
+  change on its own.
 
 ## [0.92.0] - 2026-08-29
 

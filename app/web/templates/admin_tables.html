@@ -16,6 +16,9 @@
    bar all come from this sheet, and static/js/filter_toolbar.js (loaded at the
    foot of the page, before the page script that mounts it) does the filtering,
    the ordering and the chips. The page's private copy of that logic is gone. #}
+{# The builder workspace's rules — package_drawer grows into it when
+   opened from "+ New". Without the sheet the two panes stack. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 {# The shared right-side drawer — the chrome Connect-source, the Add-data
@@ -2392,7 +2395,8 @@
               '<div data-group-id="' + gid + '" '
               + 'style="display:flex; gap:8px; align-items:center; '
               +        'padding:6px; border:1px solid var(--border); border-radius:6px;">'
-              + '<span style="flex:1;">' + gname + '</span>'
+              + '<span style="flex:1; display:flex; align-items:center; gap:6px;">'
+              + (window.AgnesKindGlyph ? window.AgnesKindGlyph.groupGlyph() : '') + escapeHtml(gname) + '</span>'
               + '<select id="' + selId + '" class="edp-rbac-req ds-dropdown-native" style="padding:4px; border:1px solid var(--border); border-radius:4px;">'
               +   opt('', '(no grant)')
               +   opt('available', 'available')
@@ -3620,6 +3624,9 @@
 {# Create-a-package, as a component: the chip-input's `chip-create` handler and
    the `?new_package=1` entry point both go through it. NOT deferred — the
    auto-open on `?new_package=1` runs at DOMContentLoaded. #}
+{# package_drawer builds the shared builder workspace when opened
+   from "+ New", so the shell has to be defined before it runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>

@@ -177,45 +177,21 @@
     syncFade();
   }
 
-  // ---- Collapsible sections (Pinned · Chats) ---------------------------
+  // ---- Chat sections (Pinned · Recent) --------------------------------
   // Wired BEFORE the /chat bail, like the nav collapse, the onboarding popover
   // and the scroll fade: chat.js owns the ROWS on /chat, but the sections are
   // rail chrome and have exactly one owner on every rail page. chat.js reaches
   // this through `window.railChatSections.sync()` after it re-renders.
   //
-  // The open/closed state is per-section and persisted, because it is a
-  // statement about how the caller works ("I live in my pins", "hide the feed
-  // while I'm in the Library") rather than a per-page detail — and losing it on
-  // every navigation would make the disclosure feel broken. localStorage, not
-  // the server: it is per-device chrome state, like the theme choice and the
-  // topnav sidebar's own collapse.
+  // Neither section collapses any more, so there is no per-section open/closed
+  // state and nothing in localStorage: the labels are inert <h2>s (see
+  // _app_rail.html), and the ONLY thing decided here is which of the two
+  // sections renders at all, from how many rows each holds. `body` is still
+  // addressed because the fade observer above watches it.
   const SECTIONS = [
-    {
-      key: "pinned",
-      sec: "rail-pinned",
-      toggle: "rail-pinned-toggle",
-      body: "rail-pinned-body",
-      list: "pinned-chat-list",
-    },
-    {
-      key: "chats",
-      sec: "rail-chats",
-      toggle: "rail-chats-toggle",
-      body: "rail-chats-body",
-      list: "chat-list",
-    },
+    { key: "pinned", sec: "rail-pinned", body: "rail-pinned-body", list: "pinned-chat-list" },
+    { key: "chats", sec: "rail-chats", body: "rail-chats-body", list: "chat-list" },
   ];
-  const SEC_KEY = (key) => `agnes.rail.chatsec.${key}`;
-
-  function isSecOpen(key) {
-    // Default OPEN: a first-time caller must see their conversations without
-    // discovering a disclosure first. Only an explicit "0" closes a section.
-    try {
-      return localStorage.getItem(SEC_KEY(key)) !== "0";
-    } catch (_) {
-      return true;
-    }
-  }
 
   function railSectionsSync() {
     // Row counts first: whether a section renders at all depends on the OTHER
@@ -230,40 +206,18 @@
       return el ? el.querySelectorAll("li[data-id]").length : 0;
     };
     const pinnedRows = rowsIn("pinned-chat-list");
-    // No "View all chats" reveal here any more. That link was shown only once
-    // the caller had a conversation to view — sound for a footer link, fatal for
-    // a way to a page: it meant /chats had no entry point at all on a first run,
-    // and none on an admin page either (the link lived inside this region, which
-    // the collapsed rail hides). The Chats row above the lists is a plain
-    // destination and needs no state, so the only conditional chrome left here is
-    // which of the two SECTIONS renders.
+    // The "View all chats" link at the foot of the region is NOT touched here.
+    // It used to be revealed only once the caller had a conversation to view —
+    // sound for a footer link, fatal for a way to a page: it meant /chats had no
+    // entry point at all on a first run. It is static markup now, so emptiness
+    // is the only thing this function still decides.
     for (const s of SECTIONS) {
       const sec = document.getElementById(s.sec);
-      const toggle = document.getElementById(s.toggle);
-      const body = document.getElementById(s.body);
-      if (!sec || !toggle || !body) continue;
+      if (!sec) continue;
       const rows = rowsIn(s.list);
       sec.hidden = s.key === "pinned" ? rows === 0 : rows === 0 && pinnedRows > 0;
-      const open = isSecOpen(s.key);
-      body.hidden = !open;
-      sec.classList.toggle("is-collapsed", !open);
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
     }
     syncHistoryFade();
-  }
-
-  for (const s of SECTIONS) {
-    const toggle = document.getElementById(s.toggle);
-    if (!toggle) continue;
-    toggle.addEventListener("click", () => {
-      const next = !isSecOpen(s.key);
-      try {
-        localStorage.setItem(SEC_KEY(s.key), next ? "1" : "0");
-      } catch (_) {
-        /* private mode / quota — the toggle still works for this page */
-      }
-      railSectionsSync();
-    });
   }
 
   // The seam chat.js binds to on /chat (it owns the rows there, this file owns
@@ -292,6 +246,9 @@
   const pinnedList = document.getElementById("pinned-chat-list");
 
   const emptyEl = document.getElementById("cloud-chat-empty-state");
+  // TCRD-207 (DES-153): the FAILED sibling of emptyEl — a request that never
+  // completed must never render as "no conversations" (see load() below).
+  const failedEl = document.getElementById("cloud-chat-failed-state");
 
   // ---- Fetch helper ---------------------------------------------------
   async function api(path, init) {
@@ -472,12 +429,24 @@
   async function load() {
     try {
       const sessions = await api("/api/chat/sessions");
+      // A retry that succeeds must clear a failed state left over from an
+      // earlier attempt — otherwise a transient blip stays on screen forever.
+      if (failedEl) failedEl.hidden = true;
       render(Array.isArray(sessions) ? sessions : []);
     } catch (_) {
-      // Leave the list empty and reveal the empty-state; a failed fetch here
-      // shouldn't break the page the user actually navigated to.
-      if (emptyEl) emptyEl.hidden = false;
+      // TCRD-207 (DES-153): the fetch did NOT complete — a distinct FAILED
+      // state, never the EMPTY one. The conversations may well still be
+      // there; this page just couldn't confirm it, which used to read as
+      // "you have no conversations" (indistinguishable from an account that
+      // genuinely has none, or one that lost access to the list).
+      if (emptyEl) emptyEl.hidden = true;
+      if (failedEl) failedEl.hidden = false;
     }
+  }
+
+  if (failedEl) {
+    const retryBtn = failedEl.querySelector("[data-state-retry]");
+    if (retryBtn) retryBtn.addEventListener("click", load);
   }
 
   load();

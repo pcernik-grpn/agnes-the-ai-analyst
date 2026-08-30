@@ -110,7 +110,7 @@ async def suggest_domain(
         resource=f"memory_domain_suggestion:{sid}",
         params={"name": name},
         result="success",
-        client_kind="web",
+        # client_kind intentionally omitted (F0 audit-context autofill, Task 1).
     )
     return {"id": sid}
 
@@ -201,7 +201,7 @@ async def approve_suggestion(
         resource=f"memory_domain_suggestion:{sid}",
         params={"created_domain_id": new_id, "slug": slug},
         result="success",
-        client_kind="web",
+        # client_kind intentionally omitted (F0 audit-context autofill, Task 1).
     )
     return {"id": sid, "created_domain_id": new_id, "status": "approved"}
 
@@ -234,6 +234,6 @@ async def reject_suggestion(
         resource=f"memory_domain_suggestion:{sid}",
         params={"note": payload.note},
         result="success",
-        client_kind="web",
+        # client_kind intentionally omitted (F0 audit-context autofill, Task 1).
     )
     return {"id": sid, "status": "rejected"}

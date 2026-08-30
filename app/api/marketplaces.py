@@ -21,6 +21,7 @@ from app.resource_types import ResourceType
 from app.secrets import persist_overlay_token
 from src.marketplace import (
     MarketplaceNotFound,
+    MarketplaceNotSyncable,
     delete_marketplace_dir,
     is_valid_ref,
     is_valid_slug,
@@ -127,9 +128,21 @@ class MarketplaceResponse(BaseModel):
     last_commit_sha: Optional[str] = None
     last_error: Optional[str] = None
     has_token: bool = False
+    # TCRD-230: token provenance — the env var NAME (never the value) plus
+    # who saved the PAT and when, projected from the audit trail
+    # (marketplace.create carries has_token, marketplace.update carries
+    # token: rotated/cleared). Rows older than the audit retention window
+    # degrade to the env name alone.
+    token_env: Optional[str] = None
+    token_set_by: Optional[str] = None
+    token_set_at: Optional[str] = None
     plugin_count: int = 0
     curator_name: Optional[str] = None
     curator_email: Optional[str] = None
+    # Built-in rows (agnes-builtin, agnes-contributed) have no git remote:
+    # surfaced so the admin table can drop the "Sync now" button instead of
+    # offering an action the API refuses with 409.
+    is_builtin: bool = False
 
 
 # Liberal email regex — RFC 5322 is too permissive to be useful at the
@@ -158,9 +171,56 @@ def _validate_branch_ref_pair(branch: Optional[str], ref: Optional[str]) -> None
         )
 
 
-def _to_response(row: dict, plugin_count: int = 0) -> MarketplaceResponse:
+def _token_provenance(marketplace_ids: List[str]) -> dict[str, dict]:
+    """``{id: {"set_by": email|None, "set_at": iso|None}}`` from the audit
+    trail, for rows that currently hold a token.
+
+    The newest token-writing row per marketplace wins: ``marketplace.create``
+    with ``has_token`` truthy, or ``marketplace.update`` with ``token`` in
+    (``rotated``, ``cleared``). A ``cleared`` newest-write yields no
+    provenance (whatever is in the env now was not saved through this API).
+    Best-effort by design — a pruned trail degrades to no attribution, and
+    an audit read must never break the marketplaces list.
+    """
+    out: dict[str, dict] = {}
+    try:
+        from src.repositories import audit_repo, users_repo
+
+        rows = audit_repo().query_for_resources([f"marketplace:{i}" for i in marketplace_ids], limit=500)
+        emails: dict[str, str | None] = {}
+        for r in rows:  # newest first
+            resource = r.get("resource") or ""
+            mid = resource.split(":", 1)[1] if ":" in resource else ""
+            if not mid or mid in out:
+                continue
+            params = r.get("params") or {}
+            action = r.get("action")
+            wrote = (action == "marketplace.create" and params.get("has_token")) or (
+                action == "marketplace.update" and params.get("token") in ("rotated", "cleared")
+            )
+            if not wrote:
+                continue
+            if params.get("token") == "cleared":
+                out[mid] = {"set_by": None, "set_at": None}
+                continue
+            actor = r.get("user_id")
+            if actor not in emails:
+                u = users_repo().get_by_id(actor) if actor else None
+                emails[actor] = (u or {}).get("email")
+            ts = r.get("timestamp")
+            out[mid] = {
+                "set_by": emails[actor],
+                "set_at": ts.isoformat() if hasattr(ts, "isoformat") else (str(ts) if ts else None),
+            }
+    except Exception:
+        logger.exception("marketplace token provenance lookup failed; continuing without it")
+    return out
+
+
+def _to_response(row: dict, plugin_count: int = 0, provenance: Optional[dict] = None) -> MarketplaceResponse:
     token_env = row.get("token_env") or ""
     has_token = bool(token_env) and bool(os.environ.get(token_env, ""))
+    prov = (provenance or {}) if has_token else {}
     return MarketplaceResponse(
         id=row["id"],
         name=row["name"],
@@ -174,9 +234,13 @@ def _to_response(row: dict, plugin_count: int = 0) -> MarketplaceResponse:
         last_commit_sha=row.get("last_commit_sha"),
         last_error=row.get("last_error"),
         has_token=has_token,
+        token_env=token_env or None,
+        token_set_by=prov.get("set_by"),
+        token_set_at=prov.get("set_at"),
         plugin_count=plugin_count,
         curator_name=row.get("curator_name"),
         curator_email=row.get("curator_email"),
+        is_builtin=bool(row.get("is_builtin")),
     )
 
 
@@ -244,7 +308,10 @@ async def list_marketplaces(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     counts = marketplace_plugins_repo().count_by_marketplace()
-    return [_to_response(row, counts.get(row["id"], 0)) for row in marketplace_registry_repo().list_all()]
+    rows = marketplace_registry_repo().list_all()
+    # One audit read for the whole table, not one per row (TCRD-230).
+    provenance = _token_provenance([r["id"] for r in rows])
+    return [_to_response(row, counts.get(row["id"], 0), provenance.get(row["id"])) for row in rows]
 
 
 @router.get("/{marketplace_id}/plugins", response_model=List[PluginResponse])
@@ -504,6 +571,25 @@ async def delete_marketplace(
     if not existing:
         raise HTTPException(status_code=404, detail="marketplace not found")
 
+    # A built-in row is not an admin-registered pointer that can be dropped and
+    # re-added: `agnes-builtin` is re-seeded from the wheel on every boot (so the
+    # delete is a no-op the next restart undoes), and the contributed
+    # marketplace has NO re-seed at all — with `purge=true` its locally written
+    # skills are gone for good, which is the same content-destroying shape as
+    # the sync bug this release fixes. Retiring built-in content is what the
+    # per-plugin disable is for; it drops a plugin from every served surface
+    # without touching the row or the disk.
+    if existing.get("is_builtin"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"marketplace {marketplace_id!r} is built-in and cannot be deleted — its content "
+                "ships with the instance (or is written locally) and has no registered remote. "
+                "To retire its content, disable the individual plugins instead "
+                "(POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable)."
+            ),
+        )
+
     # Also clear any overlay token binding so a re-created marketplace of the
     # same slug doesn't accidentally inherit the old PAT.
     if existing.get("token_env"):
@@ -560,6 +646,13 @@ def trigger_sync(
         result = sync_one(marketplace_id)
     except MarketplaceNotFound:
         raise HTTPException(status_code=404, detail="marketplace not found")
+    except MarketplaceNotSyncable as e:
+        # 409, not 500: the row exists and is healthy — the action simply does
+        # not apply to it. Nothing was touched, so no sync_failed audit row and
+        # no `last_error` stamp (which the nightly sync would never clear,
+        # leaving the built-in row permanently red in the admin table and
+        # "error" in the marketplace-health report).
+        raise HTTPException(status_code=409, detail=str(e))
     except (RuntimeError, ValueError) as e:
         _audit(conn, user["id"], "marketplace.sync_failed", marketplace_id, {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))

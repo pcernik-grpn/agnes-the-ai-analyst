@@ -566,6 +566,34 @@ body.chat-page-body main { margin: 0; padding: 0; }
 }
 @keyframes cloudchat-blink { 50% { opacity: 0; } }
 
+/* The tail of a turn, made legible (TCRD-213). Once the answer's prose ends,
+   the model is still emitting its `sources` / `next_actions` trailer — the
+   painter withholds a half-open fence, so tokens keep arriving while the text
+   on screen cannot change. A caret blinking under finished-looking prose is
+   indistinguishable from a stall, so for that window the caret is replaced by
+   a label that says the turn is still going. Same element, so nothing reflows
+   underneath the reader; the compound selector means it disappears the moment
+   `is-streaming` does. */
+.msg.is-streaming.is-trailing .msg-body::after {
+  content: "Finishing\2026";
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  vertical-align: middle;
+  animation: cloudchat-tail-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cloudchat-tail-pulse { 50% { opacity: 0.55; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.is-streaming.is-trailing .msg-body::after { animation: none; }
+}
+
 /* Actions row (timestamp + copy) — revealed on hover or copy-button
    focus. Stays muted so it doesn't compete with the body. */
 .msg-actions {
@@ -2043,16 +2071,18 @@ html[data-ui-layout="rail"] .cloud-chat-capabilities {
      fraction around. */
   overflow: visible;
 }
-/* Empty-state layout order: greeting → composer → suggestions → banner →
-   footer credit (very bottom). The primary entry point (greeting + composer)
-   leads the page; the Knowledge Layer banner sits below the suggested actions,
-   and the credit pins to the very bottom (its own auto top-margin). Fixed
-   orders work in both states: in an active conversation the greeting + extras +
-   banner + credit are hidden and messages (order 0) precede the composer
-   (order 2), pinning it to the bottom. */
+/* Empty-state layout order: greeting → suggestions → composer → ways out →
+   footer credit (very bottom). The suggestions lead the composer rather than
+   trailing it: they are the answer to "what can I even ask", which is a
+   question the reader has BEFORE the input, not after it. The ways out
+   (#chat-empty-extras) still close the page. Fixed orders work in both states:
+   in an active conversation the greeting + suggestions + extras + banner +
+   credit are hidden and messages (order 0) precede the composer (order 3),
+   pinning it to the bottom. */
 html[data-ui-layout="rail"] .cloud-chat-main > #chat-capabilities { order: 1; }
-html[data-ui-layout="rail"] .cloud-chat-main > #chat-form { order: 2; }
-html[data-ui-layout="rail"] .cloud-chat-main > #chat-empty-extras { order: 3; }
+html[data-ui-layout="rail"] .cloud-chat-main > #chat-suggested { order: 2; }
+html[data-ui-layout="rail"] .cloud-chat-main > #chat-form { order: 3; }
+html[data-ui-layout="rail"] .cloud-chat-main > #chat-empty-extras { order: 4; }
 html[data-ui-layout="rail"] .cloud-chat-main > #chat-empty-banner { order: 0; }
 html[data-ui-layout="rail"] .cloud-chat-main > .cloud-chat-empty-foot { order: 5; }
 /* The dashboard is ONE centered content column (~1280px): greeting, composer,
@@ -2109,9 +2139,59 @@ html[data-ui-layout="rail"] #chat-capabilities .rdb-ask-heading {
    ``margin-top: auto`` (which centers it in an active conversation) for the
    empty state so banner → greeting → composer flow from the top; the footer's
    own ``margin-top: auto`` still pins the credit to the bottom. */
-html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-form {
-  margin-top: 22px;
+/* ── The empty state's vertical rhythm ────────────────────────────────────
+   FOUR steps, and the whole point is that they are ordered. Before this, the
+   gap between the composer and the suggestions (18px) was SMALLER than the gaps
+   inside the intro (25px, 28px) — so the page had no grouping the eye could
+   read: eight elements at roughly one distance apart, which is what made it
+   feel like a list of unrelated rows.
+
+   The page is TWO regions, not three. Everything down to the suggested
+   questions is "ask": the intro says what you can ask, the composer is where
+   you ask it, and the chips are ways to fill that composer — they are
+   suggestions FOR the input, so putting a section break between them said they
+   were a separate thing to consider. Below that, one break, then the ways out.
+
+   So: `tight`/`inner` inside one thought, `block` between the parts of the ask
+   region, and `section` — which must stay the largest value here — for the one
+   boundary that matters. Declared as tokens so the relationship is legible and
+   one change moves every surface sharing a step. */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) {
+  /* ONE measure for everything secondary — the chips and the cards. They were
+     640px and 660px: close enough that their left edges landed 10px apart,
+     which reads as misalignment rather than as two different widths. Two
+     measures on this page, and only two: the composer's full column, and this. */
+  --cld-measure: 660px;
+  --cld-gap-tight: 5px;    /* two halves of one line (greeting → heading) */
+  --cld-gap-inner: 10px;   /* a label and the thing it labels */
+  --cld-gap-block: 26px;   /* end of a block, same region */
+  --cld-gap-section: 40px; /* between the page's three sections */
 }
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-suggested {
+  /* The page's one SECTION break. Everything above is orientation — what this
+     is, what it answers from, the two doors, the promise — and everything below
+     is the act of asking. The break used to sit on #chat-form because the
+     composer opened that region; the suggestions open it now, so the boundary
+     moved up with them and the chips + input read as one block. */
+  margin-top: var(--cld-gap-section, 40px);
+}
+/* The section break above already opens the ask region, so the .rdb block gap
+   would double it — the chips carry the region's own top edge, not a second
+   one. (The .rdb in #chat-empty-extras keeps its gap: the ways out DO need
+   separating from the composer above them.) */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) #chat-suggested .rdb {
+  margin-top: 0;
+}
+/* …and the gap it gives up reappears here, INSIDE the ask region, between the
+   chips and the input they feed. Block gap, not section: these two are one
+   thing now — "here is what you could ask" immediately above "ask it". */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-form {
+  margin-top: var(--cld-gap-block, 26px);
+}
+/* Both drop the 24px inset in the empty state so their .rdb lands on the SAME
+   --rdb-col-narrow grid as the composer — an inset here would sit the chips a
+   hair inside the input they belong to. */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-suggested,
 html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-empty-extras {
   padding: 0;
 }
@@ -2125,8 +2205,10 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 /* Banner + extras + credit hide with the greeting panel once a conversation
    starts (all placed after #chat-capabilities in the DOM). */
 html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ #chat-empty-banner,
+html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ #chat-suggested,
 html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ #chat-empty-extras,
 html[data-ui-layout="rail"] #chat-capabilities[hidden] ~ .cloud-chat-empty-foot { display: none; }
+html[data-ui-layout="rail"] .cloud-chat-suggested,
 html[data-ui-layout="rail"] .cloud-chat-empty-extras {
   flex: 0 0 auto;
   display: flex;
@@ -2145,15 +2227,6 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   flex: 0 0 auto;
   margin: 12px 0 0;
 }
-/* The trust caption ("Secure. Private. Always in sync.") sits centered just
-   below the hero banner, leading the "Ask Agnes anything" heading. */
-html[data-ui-layout="rail"] #chat-capabilities .klb-hub-label--lead {
-  margin: 0;
-}
-html[data-ui-layout="rail"] #chat-capabilities .klb-hub-label--lead .klb-hub-caption {
-  justify-content: center;
-}
-
 /* Footer credit — pinned to the very bottom (margin-top:auto). No divider. */
 html[data-ui-layout="rail"] .cloud-chat-empty-foot {
   flex: 0 0 auto;
@@ -4018,49 +4091,13 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::after
   font-size: 0.85em;
 }
 
-/* ── Composer footer row ──────────────────────────────────────────────────
-   The strip UNDER the input, present in both states. Reads left to right as a
-   sentence about the conversation: the Stack context line (what it runs with,
-   dashboard only) leads, the agent (who it runs as) trails at the right edge,
-   under the send button.
-
-   The Stack line used to lead #chat-empty-extras and inherited that column's
-   centring (`align-self: center; width: var(--rdb-col-narrow)`). In this row
-   it is a flex item beside the picker, so those are unset below rather than
-   left to fight the row. */
-.cloud-chat-composer-foot {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  /* Matches the composer pill's own inset, so the leading text sits under the
-     input's text and the trailing agent lands under the send button rather
-     than past it. */
-  padding: 6px 8px 0;
-  min-width: 0;
-}
-/* The agent trails the row in every state — including the one where the Stack
-   line is hidden and it is the row's only occupant. `margin-left: auto` (not
-   `justify-content: flex-end`) is what makes both cases the same rule. */
-.cloud-chat-agent-wrap {
-  margin-left: auto;
-}
-html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
-  align-self: auto;
-  width: auto;
-  min-width: 0;
-  padding: 0;
-  /* The row already spaces its items; the line's own leading gap would double
-     the distance from the picker. */
-  flex: 0 1 auto;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-/* The context line belongs to the empty state — it hides with the dashboard,
-   leaving the picker alone on the row in a live conversation. #chat-form is a
-   later sibling of #chat-capabilities, which is what makes this reachable now
-   that the line no longer rides #chat-empty-extras. */
-#chat-capabilities[hidden] ~ #chat-form .rdb-context { display: none; }
+/* No `.cloud-chat-composer-foot` rules, and no row for them to style. It held
+   the agent picker — inside the composer pill now, beside Send — and then the
+   "Using N knowledge sources and M capabilities from your Stack" line, which is
+   retired: it spent a whole row under the input on a number nobody acts on, and
+   the space now belongs to the suggestions below. Nothing sits between the
+   composer and them. The rail override for that line and the two
+   `#chat-capabilities[hidden]` hide rules went with it. */
 
 /* ── Composer agent picker ────────────────────────────────────────────────
    Which agent the conversation runs AS. A low-emphasis text pill leading the
@@ -4084,15 +4121,37 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  max-width: 12rem;
-  height: 30px;
-  padding: 0 var(--space-2);
+  /* A cap remains as a backstop — a very long single word has to stop
+     somewhere and the label ellipsizes past this — but it is no longer
+     load-bearing: on the trailing side of the textarea a wider pill takes its
+     width from the end of the field rather than from where the text begins.
+     Long names are abbreviated to initials in `_agentLabel` (chat.js), so this
+     rarely binds. */
+  max-width: 9rem;
+  flex: 0 0 auto;
+  /* Matched to the send button beside it (44px, see `.cloud-chat-send-btn`), so
+     the trailing cluster is one pair of controls at one height rather than a
+     short pill floating beside a tall circle. */
+  height: 44px;
+  padding: 0 var(--space-3);
+  /* Transparent, not `none`: the 1px stays in the box so the pill keeps its
+     height and the row does not shift by 2px on hover. The FILL is the whole
+     signal — an outline around a tinted pill is two devices saying one thing,
+     and at this size it closed the shape in and made a 30px control look like a
+     tag. */
   border: 1px solid transparent;
   border-radius: var(--ds-radius-pill, 999px);
+  /* No resting fill — the tint arrives on hover. What marks this as a control
+     rather than a label at rest is its INK and weight (accent, 600) plus the
+     caret; a standing fill on the one row under the composer competed with the
+     input for the eye, and the row's job at rest is to be read, not clicked.
+     The fill is still the whole hover signal, so nothing is lost: the shape is
+     the same size in both states (the border stays 1px transparent), so the row
+     cannot shift when it lights up. */
   background: transparent;
-  color: var(--ds-text-secondary);
+  color: var(--ds-primary-dark, var(--ds-primary));
   font-size: var(--text-xs);
-  font-weight: var(--font-medium);
+  font-weight: var(--font-semibold, 600);
   font-family: inherit;
   cursor: pointer;
   transition:
@@ -4101,9 +4160,9 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
     border-color var(--ds-motion-fast, 120ms);
 }
 .cloud-chat-agent-btn:hover:not(:disabled) {
-  background: var(--ds-surface-dim);
-  border-color: var(--ds-border);
-  color: var(--ds-text-primary);
+  /* The one device this control spends, and only on hover. No border here
+     either — an outline around a tinted pill is two devices saying one thing. */
+  background: color-mix(in srgb, var(--ds-primary) 12%, var(--ds-surface));
 }
 .cloud-chat-agent-btn.is-open {
   background: var(--ds-accent-info-bg);
@@ -4129,6 +4188,18 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
   color: var(--ds-text-muted);
 }
 .cloud-chat-agent-label[hidden] { display: none; }
+/* Inside the composer the wrap is a flex item of the pill, not of the footer
+   row — it must not stretch or shrink, and its popover still escapes because
+   the pill does not clip (see `.cloud-chat-composer`). */
+html[data-ui-layout="rail"] .cloud-chat-composer > .cloud-chat-agent-wrap {
+  flex: 0 0 auto;
+}
+/* The trailing pair sits tight: the pill reads as Send's partner, not as a
+   third thing between the text and the button. */
+html[data-ui-layout="rail"] .cloud-chat-composer > .cloud-chat-agent-wrap + .cloud-chat-form-actions {
+  margin-left: 2px;
+}
+
 .cloud-chat-agent-btn-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4142,10 +4213,13 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
 
 .cloud-chat-agent-menu {
   position: absolute;
-  /* Anchored to the wrap's RIGHT edge and growing leftward: the button sits at
-     the row's right end, so a left-anchored menu would run off the composer. */
-  right: 0;
-  left: auto;
+  /* Anchored to the wrap's LEFT edge and growing rightward, because the button
+     leads the row now. It used to anchor `right: 0` and grow leftward, which was
+     correct while the picker trailed the row — and became a bug the moment it
+     moved: from the left end of the composer a leftward menu ran back across the
+     rail and off the window, so the agent names were clipped by the sidebar. */
+  left: 0;
+  right: auto;
   bottom: calc(100% + var(--space-2));
   z-index: 20;
   min-width: 240px;
@@ -4193,6 +4267,32 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   border-color: var(--ds-accent-info-line);
   outline: none;
 }
+/* The create row — a different KIND of row from the agents above it (they
+   switch this conversation; this one leaves the page), so a rule separates them
+   rather than a gap alone. */
+.cloud-chat-agent-menu-create {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--ds-border);
+}
+.cloud-chat-agent-menu-create-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8px var(--space-3);
+  border-radius: var(--ds-radius-md, 8px);
+  color: var(--ds-primary-dark, var(--ds-primary));
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold, 600);
+  text-decoration: none;
+}
+.cloud-chat-agent-menu-create-link:hover,
+.cloud-chat-agent-menu-create-link:focus-visible {
+  background: color-mix(in srgb, var(--ds-primary) 10%, var(--ds-surface));
+  outline: none;
+}
+.cloud-chat-agent-menu-create-ico { width: 15px; height: 15px; flex-shrink: 0; }
+
 .cloud-chat-agent-menu-item-text {
   flex: 1 1 auto;
   min-width: 0;
@@ -4228,4 +4328,71 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   padding: 8px var(--space-3);
   font-size: var(--text-xs);
   color: var(--ds-text-secondary);
+}
+
+/* ── Instant tooltips for icon-only controls (TCRD-212) ──────────────────────
+   Driven by `data-tip` and the `Tip` helper in chat.js. Lives on document.body
+   at `position: fixed` because `.cloud-chat-files-list` scrolls, and anything
+   drawn inside a row would be clipped by that scroll container.
+
+   Colour is an INVERSION of the page's own text/surface pair rather than a
+   picked value: `--ds-text-primary` is by definition legible against
+   `--ds-surface`, so using one as the other's background is contrast-correct
+   in the paper, blue, navy and dark themes alike, and cannot repeat the
+   white-on-white failure of DES-134. Compact and arrow-less so it reads as a
+   tooltip rather than a popover — the second half of that finding. */
+.ds-tip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 260px;
+  padding: 0.3rem 0.5rem;
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-text-primary);
+  color: var(--ds-surface);
+  font-family: var(--ds-font);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  text-align: center;
+  box-shadow: var(--ds-shadow-md);
+  pointer-events: none;
+  animation: ds-tip-in 90ms var(--ds-ease-enter);
+}
+
+.ds-tip[hidden] {
+  display: none;
+}
+
+@keyframes ds-tip-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.ds-tip.is-below {
+  animation-name: ds-tip-in-below;
+}
+
+@keyframes ds-tip-in-below {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-tip { animation: none; }
+}
+
+/* A saved file says so in the row itself, permanently — a toast expires and a
+   swapped icon only explains itself on hover (TCRD-212). */
+.cloud-chat-files-saved {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  margin-top: 0.2rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--ds-accent-success-line);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-accent-success-bg);
+  color: var(--ds-accent-success-ink);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  line-height: 1.5;
 }

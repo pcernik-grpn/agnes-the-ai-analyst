@@ -287,19 +287,26 @@ def stack_remove(
 
 
 # ---------------------------------------------------------------------------
-# `agnes stack artefacts …` — add "Artefacts to My Stack" (see the product
-# spec's Architecture decisions: artefacts are NOT routed through the
-# data_package/memory_domain surface above — no admin-RBAC "required" tier,
-# permission is ownership/sharing).
+# `agnes stack collections …` — add "Collections to My Stack" (see the
+# product spec's Architecture decisions: collections are NOT routed through
+# the data_package/memory_domain surface above — no admin-RBAC "required"
+# tier, permission is ownership/sharing).
+#
+# "Collection" is the canonical name for a file corpus (see `agnes
+# collections`); this group used to be named "artefacts", which read as a
+# second, unrelated noun for the same thing. `artefacts` is kept as a
+# DEPRECATED ALIAS — same Typer, same REST surface (`/api/stack/artefacts/*`
+# is unchanged; only the CLI-facing wording moved).
 # ---------------------------------------------------------------------------
 
-artefacts_app = typer.Typer(help="Add/remove artefacts (file collections) in your Stack")
-stack_app.add_typer(artefacts_app, name="artefacts")
+artefacts_app = typer.Typer(help="Add/remove collections (file corpora) in your Stack")
+stack_app.add_typer(artefacts_app, name="collections")
+stack_app.add_typer(artefacts_app, name="artefacts", help="(deprecated alias of `collections`)")
 
 
 @artefacts_app.command("list")
 def artefacts_candidates(as_json: bool = typer.Option(False, "--json")):
-    """List artefacts eligible to add to your Stack — accessible to you
+    """List collections eligible to add to your Stack — accessible to you
     (owned, shared with you/your team, or workspace-published) and not
     already in your Stack."""
     resp = api_get("/api/stack/artefacts/candidates")
@@ -313,9 +320,9 @@ def artefacts_candidates(as_json: bool = typer.Option(False, "--json")):
     if not items:
         total = body.get("total_accessible", 0)
         if total == 0:
-            typer.echo("No artefacts exist yet — create one first (`agnes` web UI → /artefacts).")
+            typer.echo("No collections exist yet — create one first (`agnes` web UI → /library).")
         else:
-            typer.echo("All artefacts you can access are already in your Stack.")
+            typer.echo("All collections you can access are already in your Stack.")
         return
     name_w = max(len("TITLE"), max((len(i.get("title", "")) for i in items), default=5))
     header = f"{'TITLE':<{name_w}}  {'TYPE':<10}  {'VISIBILITY':<10}  OWNER"
@@ -331,19 +338,19 @@ def artefacts_candidates(as_json: bool = typer.Option(False, "--json")):
 
 
 @artefacts_app.command("add")
-def artefacts_add(corpus_id: str = typer.Argument(..., help="Artefact (collection) id")):
-    """Add an artefact to your Stack so the default agent can use it."""
-    resp = api_post(f"/api/stack/artefacts/{corpus_id}")
+def artefacts_add(collection_id: str = typer.Argument(..., help="Collection id")):
+    """Add a collection to your Stack so the default agent can use it."""
+    resp = api_post(f"/api/stack/artefacts/{collection_id}")
     if resp.status_code != 200:
         _fail(resp)
-    typer.echo(f"Added {corpus_id} to your Stack.")
+    typer.echo(f"Added {collection_id} to your Stack.")
 
 
 @artefacts_app.command("remove")
-def artefacts_remove(corpus_id: str = typer.Argument(..., help="Artefact (collection) id")):
-    """Remove an artefact from your Stack — drops agent access only; the
-    artefact itself, its files, ownership and sharing are unaffected."""
-    resp = api_delete(f"/api/stack/artefacts/{corpus_id}")
+def artefacts_remove(collection_id: str = typer.Argument(..., help="Collection id")):
+    """Remove a collection from your Stack — drops agent access only; the
+    collection itself, its files, ownership and sharing are unaffected."""
+    resp = api_delete(f"/api/stack/artefacts/{collection_id}")
     if resp.status_code >= 300:
         _fail(resp)
-    typer.echo(f"Removed {corpus_id} from your Stack.")
+    typer.echo(f"Removed {collection_id} from your Stack.")

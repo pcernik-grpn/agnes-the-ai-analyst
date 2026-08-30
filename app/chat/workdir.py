@@ -42,8 +42,16 @@ WORKSPACE_LINK_ENTRIES = (".claude", "CLAUDE.md", "snapshots", "scripts", "scaff
 #: `agnes-data-apps-extras`, called `data_apps_list`, and got a 404
 #: `data_apps_disabled` — a wasted round trip, and worse, the skill had already
 #: aimed it at building a hosted dashboard for what was a one-off plot.
+# skill name -> (config section, key, env var, DEFAULT when unset).
+#
+# The default is per-entry, not a constant: `data_apps.enabled` is off until an
+# operator turns it on, but `mcp.connector_ui_enabled` is on until an operator
+# turns it OFF (app/instance_config.py). A shared `default=False` would have
+# pruned the connect skill from every instance that simply never mentioned the
+# flag — the common case — so each entry carries the default its own flag has.
 _FEATURE_GATED_SKILLS = {
-    "agnes-data-apps-extras": ("data_apps", "enabled", "AGNES_DATA_APPS_ENABLED"),
+    "agnes-data-apps-extras": ("data_apps", "enabled", "AGNES_DATA_APPS_ENABLED", False),
+    "connect-this-tool": ("mcp", "connector_ui_enabled", "AGNES_MCP_CONNECTOR_UI_ENABLED", True),
 }
 
 
@@ -61,8 +69,8 @@ def skill_disabled_on_this_instance(skill_name: str) -> bool:
     gate = _FEATURE_GATED_SKILLS.get(skill_name)
     if gate is None:
         return False
-    section, key, env_var = gate
-    return not feature_enabled(section, key, env_var=env_var, default=False)
+    section, key, env_var, default = gate
+    return not feature_enabled(section, key, env_var=env_var, default=default)
 
 
 def _reconcile_feature_gated_skills(ws: Path, bundled_template_dir: Path, *, allow_restore: bool = True) -> None:
@@ -218,9 +226,10 @@ def _prune_disabled_feature_skills(ws: Path) -> None:
     skills_root = ws / ".claude" / "skills"
     if not skills_root.is_dir():
         return
-    for skill_name, (section, key, _env_var) in _FEATURE_GATED_SKILLS.items():
+    for skill_name, gate in _FEATURE_GATED_SKILLS.items():
         if not skill_disabled_on_this_instance(skill_name):
             continue
+        section, key = gate[0], gate[1]
         target = skills_root / skill_name
         if not target.is_dir():
             continue
@@ -531,6 +540,81 @@ class WorkdirManager:
         skill_dir = claude_dst / "skills" / profile.skill_name
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(profile.skill_body, encoding="utf-8")
+
+    #: A draft skill body is a document, but it is also an untrusted string
+    #: being written to disk. Bounded here as well as at the API edge.
+    MAX_PREVIEW_BODY_CHARS = 40_000
+
+    @staticmethod
+    def safe_skill_dirname(raw: str) -> str:
+        """A directory name derived from an untrusted draft name.
+
+        The name is NOT sanitized — it is *replaced*. Everything outside
+        ``[a-z0-9-]`` is dropped rather than escaped, because the only correct
+        set here is the one Claude Code already accepts for a skill directory,
+        and an escaping scheme is a thing to get subtly wrong. ``..``, ``/``,
+        a leading ``~``, a drive letter and a NUL all vanish by construction
+        rather than by being matched.
+
+        An empty or entirely-unusable name falls back rather than raising:
+        the author is mid-draft and has every right not to have named it yet.
+        """
+        keep = [c if (c.isascii() and (c.isalnum() or c == "-")) else "-" for c in raw.strip().lower()]
+        slug = "".join(keep)
+        while "--" in slug:
+            slug = slug.replace("--", "-")
+        slug = slug.strip("-")[:64]
+        return slug or "draft-skill"
+
+    def materialize_preview_skill(self, sdir: Path, user_email: str, name: str, body: str) -> str:
+        """Put ONE draft skill into a session's own ``.claude/skills``.
+
+        This is how a skill that exists nowhere but the author's browser
+        becomes invokable: ``app/chat/skills_catalog.py`` only reports what is
+        actually on disk in the session's project scope, so a preview has to
+        put it there.
+
+        Two containment properties, both load-bearing:
+
+        ``.claude`` is forced to be a COPY. In a plain session it is a symlink
+        into the user's shared workspace; writing a draft through it would
+        leave the half-finished skill in every future session of theirs. The
+        profiled path already copies for the same reason — this reuses it.
+
+        The path is checked after resolution, not before. ``safe_skill_dirname``
+        already makes traversal unrepresentable, but the assertion costs
+        nothing and is what would catch a future change to that function. A
+        failure raises rather than falling back to some other directory.
+        """
+        import shutil
+
+        claude_dst = sdir / ".claude"
+        if claude_dst.is_symlink():
+            # Never write through into the shared workspace.
+            claude_dst.unlink()
+            src = self.user_workspace(user_email) / ".claude"
+            if src.exists():
+                shutil.copytree(src, claude_dst)
+        claude_dst.mkdir(parents=True, exist_ok=True)
+        skills_root = claude_dst / "skills"
+        skills_root.mkdir(parents=True, exist_ok=True)
+
+        safe = self.safe_skill_dirname(name)
+        target = (skills_root / safe).resolve()
+        root = skills_root.resolve()
+        if root != target and root not in target.parents:
+            raise ValueError(f"preview skill path escaped the session workspace: {name!r}")
+
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "SKILL.md").write_text((body or "")[: self.MAX_PREVIEW_BODY_CHARS], encoding="utf-8")
+        # Which of these directories is the draft. The native providers mount
+        # this tree and do not need to know; the kai-agent provider mounts
+        # nothing and packs a tarball instead, so it reads this marker to find
+        # the one skill to carry over (app/api/kai.py::_preview_skill_dir).
+        # A file rather than a naming convention: the author's own skills live
+        # in the same directory and must not be guessable-apart by prefix.
+        (skills_root / ".preview").write_text(safe, encoding="utf-8")
+        return safe
 
     def prepare_ephemeral_session_dir(
         self,

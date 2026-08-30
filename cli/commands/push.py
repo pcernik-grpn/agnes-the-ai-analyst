@@ -33,6 +33,13 @@ line of defense against the bootstrap heredoc pasting the raw PAT into the
 setup session's transcript. The upload ledger still records the on-disk
 file size (not the redacted upload size) so size-based dedup/grow detection
 is unaffected.
+
+Client-reported audit events (F3 — audit-full-coverage plan, Task 9): after
+sessions and CLAUDE.local.md, push also drains ``cli.lib.audit_spool`` (up
+to 500 events accumulated by offline ``agnes query``/``agnes explore`` local
+runs) and uploads them in one batch to ``POST /api/upload/audit-events``.
+Best-effort like everything else here — a failed upload leaves the spool
+intact for the next push to retry, never fails the command.
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ import typer
 from cli.client import api_get, api_post
 from cli.config import get_server_url, get_token, get_workspace_root
 from cli.error_render import render_error
+from cli.lib.audit_spool import commit_drain, drain_spool
 from cli.lib.private_list import read_all_private
 from cli.lib.push_lock import acquire_or_skip
 from cli.lib.session_paths import list_session_files
@@ -363,6 +371,21 @@ def push(
                     results["errors"].append({"file": "CLAUDE.local.md", "status": resp.status_code})
             except Exception as exc:
                 results["errors"].append({"file": "CLAUDE.local.md", "error": str(exc)})
+
+        # Client-reported CLI audit events (F3 — audit-full-coverage plan,
+        # Task 9). Best-effort, after sessions: drains up to 500 events
+        # spooled by `agnes query`/`agnes explore` local runs and uploads
+        # them in one batch. A server outage (or any other failure) must
+        # NOT fail `agnes push` — `commit_drain()` only runs on a 200, so a
+        # failed upload leaves the spool intact for the next push to retry.
+        try:
+            spooled_events = drain_spool(max_events=500)
+            if spooled_events:
+                resp = api_post("/api/upload/audit-events", json={"events": spooled_events})
+                if resp.status_code == 200:
+                    commit_drain()
+        except Exception:
+            pass
 
     # Render output.
     if as_json:

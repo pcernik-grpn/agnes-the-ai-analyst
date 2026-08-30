@@ -149,6 +149,67 @@ agnes query "SELECT ..."      # run the query
   `agnes skills show agnes-data-querying`.
 """
 
+#: Fact-graph rails appended after :data:`DATA_ACCESS_RAILS` — ONLY when the
+#: `facts` feature switch is on for this instance.
+#:
+#: `config/claude_md_template.txt` carries the equivalent
+#: "Facts — entity and relationship questions" section, but that template IS
+#: the ``CLAUDE.md`` a persona replaces (see :data:`DATA_ACCESS_RAILS`'s own
+#: docstring for why the replacement itself is correct and stays). Without
+#: this, a persona'd agent silently lost the ONLY text that ever told it to
+#: reach for `fact_search`/`fact_neighbors`/`fact_claims` on a who/what/
+#: relationship question — it fell back to `agnes catalog` + SQL, found no
+#: table shaped like the answer, and reported no data instead of walking the
+#: fact graph, while an agent with no persona (the default rails, unaltered)
+#: answered the same question correctly. That divergence is what made the
+#: product look random rather than genuinely lacking the data.
+#:
+#: Gated on the switch alone, deliberately not on the caller's actual fact
+#: read access: unlike ``DATA_ACCESS_RAILS`` — which just names a CLI, not a
+#: caller-specific slice of it — checking readability here would mean a
+#: repository call on every persona spawn for a fact that only teaches WHEN
+#: to try the tools; the tools (`facts_repo()`) already enforce per-caller
+#: visibility on every call regardless of what this text says. Same
+#: reasoning `src/claude_md.py::_facts_enabled` documents for the default
+#: template's own gate — this mirrors it rather than diverging.
+FACTS_ACCESS_RAILS = """
+
+---
+
+## Facts — entity and relationship questions
+
+Agnes also extracts typed facts (people, clients, organizations, and the
+relationships between them) into a queryable graph. For a question about
+**who, what, which entity, or how things relate** — "who owns X", "how do
+these two people connect", "which clients per industry" — reach for the
+fact tools FIRST, before writing SQL or searching documents by keyword:
+`fact_search` -> `fact_neighbors` -> `fact_claims` (the same calls as
+`agnes facts search|neighbors|claims` on the CLI).
+
+```
+agnes facts search <type> [query] [--filter key=value]   # find subjects by type, an optional name, and/or attrs
+agnes facts neighbors <subject_id>                        # traverse relationships (depth <= 2)
+agnes facts claims <subject_id>                           # the evidencing quote + document for one subject
+```
+
+Cite every fact you use — `agnes facts claims` gives you the exact quote and
+its source document, name both in your answer. Facts are filtered
+server-side to what YOU can read; a search returning nothing may exist
+outside your access, it is not evidence the fact is absent — fall back to
+`agnes collections search` rather than inventing an answer or refusing
+outright.
+"""
+
+
+def _facts_rails_enabled() -> bool:
+    """Whether this instance has the `facts` feature switched on — the sole
+    gate for appending :data:`FACTS_ACCESS_RAILS`. See that constant's
+    docstring for why this stays switch-only with no RBAC narrowing."""
+    from app.instance_config import feature_enabled
+
+    return feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+
+
 # agents.<field>_mode -> (scope key, agent_scope.item_type)
 _MODE_FIELD_TO_SCOPE = {
     "plugins_mode": ("plugins", "plugin"),
@@ -158,7 +219,7 @@ _MODE_FIELD_TO_SCOPE = {
 }
 
 
-def _context_skill(agent_row: dict) -> str:
+def _context_skill(agent_row: dict, *, advertise_memory_write: bool = True) -> str:
     """Render the small read-only SKILL.md describing this agent's identity.
 
     States the agent's name/description and that its capability is scoped
@@ -172,11 +233,16 @@ def _context_skill(agent_row: dict) -> str:
 
     Also advertises the "remember" write tool (V1c Task 4,
     `POST /api/v1/sessions/{id}/memories`) — but ONLY when this agent's
-    `memory_write_mode` is not `'off'`. The endpoint enforces the mode
+    `memory_write_mode` is not `'off'` AND the caller left
+    ``advertise_memory_write`` on. The endpoint enforces the mode
     regardless of what this text says (a stale/forged skill body can never
     grant a write `off` denies), but a well-behaved agent should never even
     attempt a call it knows is disabled — and telling an `off` agent about a
     tool it cannot use would just invite a wasted/failed call.
+    ``advertise_memory_write=False`` is for sandboxes that have no channel
+    to the endpoint at all (the embedded kai-agent engine: no ``agnes-api``
+    broker scope and no ``$AGNES_SERVER``/``$AGNES_SESSION_ID`` env), where
+    the curl recipe below would only ever fail.
 
     Includes a concrete curl invocation against `$AGNES_SERVER` +
     `$AGNES_SESSION_ID` — the two env vars `app/chat/runner.py` sets in the
@@ -209,7 +275,7 @@ def _context_skill(agent_row: dict) -> str:
     from app.instance_config import get_agent_profiles_enabled
 
     memory_write_mode = agent_row.get("memory_write_mode") or "propose"
-    if memory_write_mode != "off" and get_agent_profiles_enabled():
+    if advertise_memory_write and memory_write_mode != "off" and get_agent_profiles_enabled():
         lines.append(
             "\n## Remember\n\n"
             "You can save a durable note to your own memory notebook by "
@@ -233,7 +299,7 @@ def _context_skill(agent_row: dict) -> str:
     return "".join(lines)
 
 
-def build_profile(agent_row: dict) -> Optional[ChatProfile]:
+def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Optional[ChatProfile]:
     """Build a dynamic ``ChatProfile`` from an ``agents`` row.
 
     Returns ``None`` when ``system_prompt`` is empty/whitespace-only — the
@@ -244,20 +310,31 @@ def build_profile(agent_row: dict) -> Optional[ChatProfile]:
 
     The returned ``claude_md`` is the authored persona followed by
     :data:`DATA_ACCESS_RAILS` — see that constant for why a persona must
-    never be able to silently drop the platform's data-access floor. The
-    early return above means this only ever applies where a persona
-    actually replaces the workspace prompt; an agent with no persona keeps
-    the full symlinked rails and is untouched.
+    never be able to silently drop the platform's data-access floor — and,
+    when the `facts` feature switch is on, :data:`FACTS_ACCESS_RAILS` after
+    it (see that constant for why a persona needs its own copy of the
+    fact-tool guidance too). The early return above means this only ever
+    applies where a persona actually replaces the workspace prompt; an agent
+    with no persona keeps the full symlinked rails — including the
+    template's own facts section — and is untouched.
+
+    ``advertise_memory_write`` is threaded to :func:`_context_skill` — pass
+    ``False`` when the profile is materialized for a sandbox with no channel
+    to the remember endpoint (the embedded kai-agent engine's workspace
+    tarball, ``app/api/kai.py``).
     """
     system_prompt = (agent_row.get("system_prompt") or "").strip()
     if not system_prompt:
         return None
     slug = agent_row.get("slug") or agent_row.get("id") or "agent"
+    claude_md = system_prompt + DATA_ACCESS_RAILS
+    if _facts_rails_enabled():
+        claude_md += FACTS_ACCESS_RAILS
     return ChatProfile(
         slug=f"agent-{slug}",
-        claude_md=system_prompt + DATA_ACCESS_RAILS,
+        claude_md=claude_md,
         skill_name="agnes-agent-context",
-        skill_body=_context_skill(agent_row),
+        skill_body=_context_skill(agent_row, advertise_memory_write=advertise_memory_write),
     )
 
 
@@ -389,6 +466,54 @@ def _memory_date(memory: dict) -> str:
     return text[:10] if text else "unknown-date"
 
 
+def _rendered_memories_with_count(agent_row: dict) -> tuple[Optional[str], int]:
+    """``(document, count)`` for this agent's in-budget active memories —
+    ``(None, 0)`` when there is nothing to write. Shared never-raises core of
+    :func:`render_memories` and :func:`materialize_memories`."""
+    agent_id = agent_row.get("id")
+    try:
+        if not agent_id:
+            return None, 0
+
+        from src.repositories import agent_memories_repo
+
+        memories = agent_memories_repo().list_active(agent_id)
+        if not memories:
+            return None, 0
+
+        in_budget, _shadowed = select_in_budget(memories, _MEMORY_BUDGET_CHARS)
+        if not in_budget:
+            return None, 0
+
+        lines = ["# Agent memory\n\n"]
+        for memory in in_budget:
+            content = (memory.get("content") or "").strip()
+            lines.append(f"- **{_memory_date(memory)}** — {content}\n")
+        return "".join(lines), len(in_budget)
+    except Exception:
+        logger.exception(
+            "agent memory render failed for agent_id=%s — continuing without memories",
+            agent_id,
+        )
+        return None, 0
+
+
+def render_memories(agent_row: dict) -> Optional[str]:
+    """Render this agent's in-budget active memories as the ``agent-memory.md``
+    document, or ``None`` when there is nothing to write.
+
+    The single renderer behind both delivery shapes: the native session
+    workdir (:func:`materialize_memories` writes it to
+    ``.claude/agent-memory.md``) and the embedded engine's workspace tarball
+    (``app/api/kai.py`` packs the same bytes at the same arcname), so the two
+    sandboxes cannot drift in what an agent remembers.
+
+    Same never-raises posture as :func:`materialize_memories`: any failure
+    (repo error, malformed row) is logged and answered with ``None``.
+    """
+    return _rendered_memories_with_count(agent_row)[0]
+
+
 def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     """Write this agent's active memories into the session workdir.
 
@@ -397,10 +522,9 @@ def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     into the (remote) sandbox. A file written after spawn
     would never reach the agent; see the module docstring.
 
-    Reads ``agent_memories_repo().list_active(agent_id)`` (newest-first),
-    caps it to ``_MEMORY_BUDGET_CHARS`` via ``select_in_budget``, and
-    renders the in-budget set as a simple dated list at
-    ``session_dir / ".claude" / "agent-memory.md"``. No active memories
+    Renders via the shared memory renderer (newest-first, capped to
+    ``_MEMORY_BUDGET_CHARS`` via ``select_in_budget``) and writes the result
+    to ``session_dir / ".claude" / "agent-memory.md"``. No active memories
     (or nothing fits the budget) -> no file is written, returns ``0``.
 
     This is the read side of agent memory; the write side is the remember
@@ -411,32 +535,18 @@ def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     ``logger.exception`` and swallowed, so a memory-materialization bug can
     never block the chat spawn the user is waiting on.
     """
-    agent_id = agent_row.get("id")
     try:
-        if not agent_id:
-            return 0
-
-        from src.repositories import agent_memories_repo
-
-        memories = agent_memories_repo().list_active(agent_id)
-        if not memories:
-            return 0
-
-        in_budget, _shadowed = select_in_budget(memories, _MEMORY_BUDGET_CHARS)
-        if not in_budget:
+        rendered, count = _rendered_memories_with_count(agent_row)
+        if rendered is None:
             return 0
 
         claude_dir = session_dir / ".claude"
         claude_dir.mkdir(parents=True, exist_ok=True)
-        lines = ["# Agent memory\n\n"]
-        for memory in in_budget:
-            content = (memory.get("content") or "").strip()
-            lines.append(f"- **{_memory_date(memory)}** — {content}\n")
-        (claude_dir / "agent-memory.md").write_text("".join(lines), encoding="utf-8")
-        return len(in_budget)
+        (claude_dir / "agent-memory.md").write_text(rendered, encoding="utf-8")
+        return count
     except Exception:
         logger.exception(
             "agent memory materialization failed for agent_id=%s — spawn continues without memories",
-            agent_id,
+            agent_row.get("id"),
         )
         return 0

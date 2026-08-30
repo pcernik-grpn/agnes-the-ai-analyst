@@ -169,7 +169,22 @@ def _is_own_data_app_origin(candidate: str) -> bool:
     if not cfg.get("enabled"):
         return False
     base = (cfg.get("subdomain_base") or "").strip().strip(".").lower()
-    if not base:
+    # Refuse a base too short to be a plausible app origin. This is operator
+    # config, not user input — but it is one unvalidated string, and a wrong
+    # one turns this narrow exception into a general open redirect with no
+    # other symptom: a single-label base makes `session_cookie_domain()` return
+    # None (no cookie breakage) and `DataAppSubdomainMiddleware` still refuses
+    # to route the deployment's own host (no routing breakage), so the instance
+    # looks healthy while login redirects anywhere. `base="com"` would accept
+    # every `https://<anything>.com/`.
+    #
+    # Three labels is the documented shape's own minimum (`apps.<agnes-host>`,
+    # and a host is itself at least two labels), not an arbitrary bar. It does
+    # not make this a public-suffix check — `apps.co.uk` would still pass — so
+    # the base-selection guidance in `config/instance.yaml.example` still
+    # carries the real rule. Failing here only ever NARROWS to
+    # same-origin-paths-only, never widens.
+    if base.count(".") < 2:
         return False
 
     host = (parts.hostname or "").rstrip(".").lower()

@@ -315,3 +315,31 @@ class ChatSessionPgRepository:
                 .all()
             )
         return [_row_to_session(r) for r in rows]
+
+    def list_recently_active(self, *, limit: int = 200) -> list[ChatSession]:
+        """Sessions with at least one message, most-recently-active first,
+        capped at *limit*. Cross-user (no owner filter) — same shape as
+        ``list_paused_sessions`` above, just ordered/capped instead of
+        filtered on the pause marker. ``last_message_at`` is maintained
+        directly on this table on Postgres (see module docstring), so this
+        is a plain indexless scan+sort, no derived aggregate.
+
+        Used by the session-pipeline chat-export sweep
+        (``services/session_pipeline/runner.py``, F4 — audit-full-coverage
+        plan) to find export candidates without an O(users) fan-out over
+        every registered user.
+        """
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT * FROM chat_sessions "
+                        "WHERE last_message_at IS NOT NULL "
+                        "ORDER BY last_message_at DESC LIMIT :limit"
+                    ),
+                    {"limit": limit},
+                )
+                .mappings()
+                .all()
+            )
+        return [_row_to_session(r) for r in rows]

@@ -103,7 +103,7 @@ info() { INFOS+=("$1"); }
 # of those run app code, so the incident signatures below would never
 # match their logs anyway, and scanning them would just add noise to the
 # transcript for nothing.
-ROLE_CONTAINER_RE='^(app|worker|gateway|api[0-9]+)$'
+ROLE_CONTAINER_RE='^(app|worker|gateway|api[0-9]+|extraction-worker)$'
 list_role_containers() {
     local out
     out=$(docker compose ps --format '{{.Service}} {{.Name}}' 2>/dev/null)
@@ -134,11 +134,17 @@ fi
 # --- Coordination backend configured? -----------------------------------
 # Redis coordination is declared via instance.yaml::coordination.backend
 # (config/instance.mtier.yaml ships `backend: redis` for the m-tier
-# profile — see app/coordination/factory.py). Grepped host-side across
-# every mounted instance.yaml variant, same host-read-not-container-shell
-# style as agnes-db-backup.sh's PERSISTED_BACKEND check.
+# profile — see app/coordination/factory.py) OR via the
+# AGNES_COORDINATION_BACKEND env override in .env (env wins over yaml in
+# that same factory; the customer-instance module's extraction-lane opt-in
+# writes the env form so it never touches the applier-owned instance.yaml).
+# Grepped host-side across every mounted instance.yaml variant plus .env,
+# same host-read-not-container-shell style as agnes-db-backup.sh's
+# PERSISTED_BACKEND check.
 REDIS_CONFIGURED=0
 if grep -rlq 'backend:[[:space:]]*redis' config/instance*.yaml 2>/dev/null; then
+    REDIS_CONFIGURED=1
+elif grep -q '^AGNES_COORDINATION_BACKEND=redis$' .env 2>/dev/null; then
     REDIS_CONFIGURED=1
 fi
 

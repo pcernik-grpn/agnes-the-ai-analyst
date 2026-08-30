@@ -48,13 +48,15 @@ def _resolve_secret(name: str) -> str:
     if not name:
         return ""
 
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_token_env_allowed(name):
+    if not is_config_secret_env_allowed(name):
         logger.warning(
-            "snowflake: secret-ref env var %r is not on the remote-attach "
+            "snowflake: secret-ref env var %r is not on the config-secret "
             "allowlist; refusing to read it (add it to "
-            "AGNES_REMOTE_ATTACH_TOKEN_ENVS or use a vault secret)",
+            "AGNES_CONFIG_SECRET_ENVS — or AGNES_REMOTE_ATTACH_TOKEN_ENVS if "
+            "the name must also work as a remote-attach token_env — or use a "
+            "vault secret)",
             name,
         )
         return ""

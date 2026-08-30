@@ -107,11 +107,99 @@ SWITCHES: tuple[Switch, ...] = (
         config_keys=("studio", "enabled"),
         env_var="AGNES_STUDIO_ENABLED",
         kind="bool",
-        default=True,
+        default=False,
         effect="live",
         category="product",
         editable=True,
-        description="Authoring Studio surface (/admin/studio*). Grandfathered on by default.",
+        description=(
+            "Authoring Studio surface: /admin/studio, its per-domain builders, the "
+            "/admin/studio/suggestions moderation queue, their nav + command-palette "
+            "entries, and the public suggestion API. OFF by default since the admin "
+            "cleanup — the Studio's authoring jobs are done by the Library builders "
+            "(/library '+ New') now, so a second authoring surface offered two ways to "
+            "do one thing. The pages are intact, not deleted: set "
+            "AGNES_STUDIO_ENABLED=1 (or `studio.enabled: true`) to bring the whole "
+            "surface back."
+        ),
+    ),
+    # The three surfaces retired alongside Studio in the same admin cleanup.
+    # All under `features` rather than a section each: they are UI-visibility
+    # switches with no other configuration of their own, and a top-level yaml
+    # section holding exactly one boolean is a section nobody can guess the
+    # name of. Every one of them hides UI ONLY — the /api/admin/news/*,
+    # /api/admin/knowledge-digests/* and marketplace-publish APIs behind them
+    # keep serving, so the CLI and the digest scheduler job are unaffected.
+    Switch(
+        name="news",
+        config_keys=("features", "news_enabled"),
+        env_var="AGNES_NEWS_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "In-product news: the /admin/news editor, the /news reader, the /home "
+            '"What\'s new" strip, and their nav + command-palette entries. Off by '
+            "default since the admin cleanup. Hides UI only — /api/admin/news/* keeps "
+            "serving, and a published version is preserved, so turning this back on "
+            "restores the surface with its content intact."
+        ),
+    ),
+    Switch(
+        name="knowledge_digests",
+        config_keys=("features", "knowledge_digests_enabled"),
+        env_var="AGNES_KNOWLEDGE_DIGESTS_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Maintained knowledge digests admin page (/admin/knowledge-digests) and its "
+            "nav entry. Off by default since the admin cleanup. Hides that PAGE only: "
+            "/api/admin/knowledge-digests/*, `agnes admin digest`, the digest scheduler "
+            "job and `agnes pull`'s digest delivery all keep working, so an instance "
+            "already running digests keeps running them headlessly."
+        ),
+    ),
+    Switch(
+        name="contribute_skill",
+        config_keys=("features", "contribute_skill_enabled"),
+        env_var="AGNES_CONTRIBUTE_SKILL_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The paste-a-SKILL.md publish page (/admin/contribute-skill) and its nav "
+            'entry — the landing target for an external "Load skill to Agnes" button. '
+            "Off by default since the admin cleanup: the Library's skill builder "
+            "(/library '+ New') is the supported path, and this page duplicated it with "
+            "a worse flow. Its POST handlers are gated with the page, so a stale "
+            "external button gets a redirect home rather than a silent publish."
+        ),
+    ),
+    Switch(
+        name="store_moderation",
+        config_keys=("features", "store_moderation_enabled"),
+        env_var="AGNES_STORE_MODERATION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The Moderation & Trust hub (/admin/store) and its nav + command-palette "
+            "entries. Off by default: its three zones each have a better door — "
+            "submission review is its own nav row (/admin/store/submissions), "
+            "marketplace curation is /admin/marketplaces, and entity verification "
+            "already has its own switch (store.verification_enabled), so the hub was "
+            "a landing page for links the column already carries. Hides UI only: "
+            "/api/admin/share-requests* and the store APIs keep serving, so an admin "
+            "can still decide a queued agent share by API while the page is hidden."
+        ),
     ),
     Switch(
         name="guardrails",
@@ -194,6 +282,25 @@ SWITCHES: tuple[Switch, ...] = (
             "whose backing is absent, loudly, at the restart the save already requires. Pin "
             "it in infrastructure via the customer-instance module's per-VM `chat_provider` "
             "(AGNES_CHAT_PROVIDER) so a fresh data disk boots into the right engine."
+        ),
+    ),
+    Switch(
+        name="chat_broker_admin_reads",
+        config_keys=("chat", "broker_admin_reads"),
+        env_var="AGNES_CHAT_BROKER_ADMIN_READS",
+        kind="bool",
+        default=True,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Replay read-only (GET/HEAD) admin API routes through the chat secret broker "
+            "(`agnes admin list-users`/`list-tables`/… inside a chat sandbox). The replay "
+            "runs under the session user's own identity and the route's live `require_admin` "
+            "still decides — non-admin users and agent principals get 403 regardless. Admin "
+            "MUTATIONS are always refused from sandboxes, independent of this switch. Read "
+            "live per request by `app/api/broker.py` (no restart needed), unlike the other "
+            "chat.* switches that resolve through `load_chat_config` at boot."
         ),
     ),
     Switch(
@@ -453,6 +560,32 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="microsoft_group_sync",
+        config_keys=("auth", "microsoft", "group_sync_enabled"),
+        env_var="AGNES_MICROSOFT_GROUP_SYNC_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="operations",
+        editable=True,
+        description=(
+            "Mirror the signed-in user's Entra ID group memberships (Microsoft Graph "
+            "GET /me/memberOf) into user_group_members (source='microsoft_sync') on every "
+            "Microsoft sign-in — the same mechanism auth.keboola.* uses for Keboola, and "
+            "google_sync uses for Google Workspace. Off by default: turning it on for the "
+            "first time also widens the OAuth consent scope requested at "
+            "/auth/microsoft/login to include the delegated Graph permission "
+            "GroupMember.Read.All, which needs its own admin consent grant in the Entra "
+            "app registration (see docs/auth-microsoft-oauth.md) — the scope change only "
+            "takes effect after a restart, so flip this AND grant consent AND restart "
+            "before relying on it; the sync gate itself (whether apply_user_groups makes "
+            "the Graph call at all) is read live, so a stale token scope degrades to a "
+            "logged, fail-soft no-op rather than a login failure. AGNES_MICROSOFT_GROUP_PREFIX "
+            "(env-only, no instance.yaml key — mirrors AGNES_GOOGLE_GROUP_PREFIX) narrows "
+            "which fetched groups are mirrored/allowed to sign in."
+        ),
+    ),
+    Switch(
         name="mcp_source_url_runtime_enforce",
         config_keys=("mcp", "source_url_runtime_enforce"),
         env_var="AGNES_MCP_SOURCE_URL_RUNTIME_ENFORCE",
@@ -567,6 +700,34 @@ SWITCHES: tuple[Switch, ...] = (
             "collection (default). `all_evidence` — visible only if ALL of its claims "
             "are readable; hides strictly more within one grant snapshot. Facts and "
             "edges use the same rule."
+        ),
+    ),
+    Switch(
+        name="extraction",
+        config_keys=("extraction", "enabled"),
+        env_var="AGNES_EXTRACTION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=False,
+        lock_reason=(
+            "The flag itself is read per request, but the `corpus-extraction` job kind "
+            "it gates needs a configured `extraction.producer` command AND a worker "
+            "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
+            "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
+            "feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
+            "(a role split), which makes the deployment multi-process — it ALSO needs "
+            "Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET, and "
+            "coordination.backend=redis (docs/DEPLOYMENT.md#multi-process), or the "
+            "process refuses to boot. Enable the profile/producer, satisfy those "
+            "multi-process prerequisites, and this flag together."
+        ),
+        description=(
+            "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "
+            "own worker lane — gates the `corpus-extraction` job kind's handler, which "
+            "shells out to the operator-configured `extraction.producer` command/module. "
+            "New feature — off by default."
         ),
     ),
 )

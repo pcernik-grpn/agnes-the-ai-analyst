@@ -79,25 +79,31 @@
  * for. Capped in height so the fields under it stay reachable without
  * scrolling the drawer body past them.
  */
-.pdw-tables__search {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 7px 11px;
-  font: inherit;
-  font-size: 13px;
-  border: 1px solid var(--ds-border);
-  border-radius: var(--ds-radius-btn);
-  background: var(--ds-surface);
-  color: var(--ds-text-primary);
-  margin-bottom: 8px;
+/* The tables picker opens FROM the drawer, so it has to sit above it:
+   `.modal-backdrop` is z-index 1000 and `.ds-drawer` is 1200. Scoped to the
+   drawer's own host so no other modal on the page is affected. */
+#pdw-picker .modal-backdrop { z-index: 1300; }
+
+/* The member count, appended to the field label by renderTables. Reads like
+   the agent builder's section summary ("0 sources") rather than a bare digit
+   glued to the label — it is a summary of what is below, so it is worded and
+   coloured as one. */
+.pdw-count {
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 12.5px;
+  color: var(--ds-text-muted);
+  font-variant-numeric: tabular-nums;
 }
-.pdw-tables {
-  max-height: 260px;
-  overflow-y: auto;
-  border: 1px solid var(--ds-border);
-  border-radius: var(--ds-radius-btn);
-  background: var(--ds-surface);
-}
+/* The panel holds the package's own tables — a short list that grows with
+   what you picked — so it is not a scroll box. The 260px cap and the frame
+   belonged to the old full-registry tree, and with the panel showing only
+   members they clipped the list and scrolled '+ Add tables' out of sight.
+   The tree kept both, inside the picker, via .ag-pick-rows. */
+.pdw-tables { display: flex; flex-direction: column; gap: 2px; }
+/* The rows carry their own separators (.ag-row), so the last one would draw a
+   rule against the add button below it. */
+.pdw-tables .ag-rows > .ag-row:last-child { border-bottom: none; }
 .pdw-tables__row {
   display: flex;
   align-items: flex-start;
@@ -162,3 +168,47 @@
 .pdw-grp--project > .pdw-grp__sum { font-size: 13px; font-weight: 600; color: var(--ds-text-primary); }
 .pdw-grp--bucket > .pdw-grp__sum { padding-left: 26px; font-size: 12.5px; color: var(--ds-text-secondary); }
 .pdw-grp--bucket > .pdw-grp__sum .pdw-grp__name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* ── The two browser defaults this drawer was still showing ──
+   Both are in package_drawer.css rather than on the builder page, because the
+   markup is this component's: the compact drawer on /admin/tables was showing
+   them too.
+
+   Checkboxes take `accent-color`, the same one-liner .ch-* rows in chats.css
+   use — the brand tick rather than the OS blue, without replacing the control
+   with a div that has to reimplement focus and keyboard behaviour. */
+.pdw-pick input[type="checkbox"],
+.pdw-tree input[type="checkbox"],
+.ds-drawer__body input[type="checkbox"] {
+  accent-color: var(--ds-primary);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+/* And `<summary>` loses its raw ▶/▼ for the chevron the tree groups above
+   already use. Scoped to `.ds-drawer__disclose` on purpose: `.pdw-grp__sum`
+   has its own identical treatment a hundred lines up, and a broader selector
+   here out-specifies it and rotates the tree twisty the wrong way.
+
+   `list-style` alone is not enough — WebKit draws ::-webkit-details-marker
+   regardless (see chat.css, which hit the same thing). */
+.ds-drawer__disclose > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.ds-drawer__disclose > summary::-webkit-details-marker { display: none; }
+.ds-drawer__disclose > summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-right: 1.6px solid var(--ds-text-muted);
+  border-bottom: 1.6px solid var(--ds-text-muted);
+  transform: rotate(-45deg);
+  transition: transform var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
+}
+.ds-drawer__disclose[open] > summary::before { transform: rotate(45deg); }

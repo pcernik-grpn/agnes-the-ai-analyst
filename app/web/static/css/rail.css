@@ -312,7 +312,12 @@ html[data-ui-layout="rail"] .rail-logo-txt {
 html[data-ui-layout="rail"] .rail-nav {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    /* A custom property, not a literal, because the folded Chats row has to
+       cancel this exact value — `gap` is spent on a zero-height flex item just
+       the same, so without that the collapsed-only row leaves 3px of nothing
+       between New chat and the conversation list. */
+    --rail-nav-gap: 3px;
+    gap: var(--rail-nav-gap);
     flex-shrink: 0;
 }
 
@@ -586,14 +591,23 @@ html[data-ui-layout="rail"] .rail-search-empty {
    read as "next row in the same list"; 8px is all the separation the two need —
    and it is now the only thing between the verb and the first section label, so
    the label needs no top margin of its own (.rail-chatsec:first-child below). */
+/* The conversation list belongs TO New chat — start one, or return to one you
+   already had — so it sits directly under it. This was 8px, set when a "PINNED"
+   label headed the list and needed air above it to read as a heading; with the
+   labels gone that air just detached the list from the row it belongs to and
+   left it floating in the middle of the column. 3px is the same step the nav
+   rows use between themselves, which is what makes the list read as continuing
+   the ladder rather than starting a new block. */
 html[data-ui-layout="rail"] .rail-nav-top {
-    margin-bottom: 8px;
+    margin-bottom: 3px;
 }
 
 /* ── Conversations ─────────────────────────────────────────────────────
-   Two collapsible sections — Pinned, then Chats — inside ONE scroll box. The
-   region occupies the slack between the two fixed zones, so the bottom zone
-   stays pinned to the foot however long the lists get. The <ul id="chat-list">
+   ONE unlabelled list — pinned rows, then the feed, then the row that closes it
+   — rendered by two <section>s inside ONE scroll box (two render targets, no
+   labels, no gap; see "The two render targets" below). The region occupies the
+   slack between the two fixed zones, so the bottom zone stays pinned to the
+   foot however long the list gets. The <ul id="chat-list">
    reuses the chat page's ids/classes so chat.js renders straight into it on
    /chat; rail_history.js fills it (and <ul id="pinned-chat-list">) on every
    other page. Nothing truncates either list — see .rail-history-body. */
@@ -679,103 +693,60 @@ html[data-ui-layout="rail"] .rail-history-body.is-fade-bottom {
     }
 }
 
-/* ── The two sections (Pinned · Chats) ─────────────────────────────────
+/* ── The two render targets (pinned · feed) ────────────────────────────
    Both live inside the single scroll box above — deliberately NOT one fixed
    pinned block over a scrolling feed. A second scroll container in a 240px
    column means two scrollbars, two fade masks and a pinned block whose height
-   has to be capped by guesswork; one scroll box with a collapsible header per
-   section gets the same control into the user's hands and costs no geometry.
+   has to be capped by guesswork; one scroll box costs no geometry at all.
 
-   Whitespace does the separating, as everywhere else in the rail: no dividers
-   (see test_admin_is_the_only_divided_group — Admin owns the nav's only rule
-   line) and no fills. 18px between sections — a step up from the 14px the group
-   headers this replaces used, because these are now two independent things
-   rather than two groups of one list, and the gap is the only thing saying so. */
+   Nothing separates them any more. The labels are gone and so is the gap: the
+   two <section>s exist only because there are two RENDER TARGETS (chat.js and
+   rail_history.js both route pinned rows to their own <ul>), and to the eye they
+   have to be the single list they always were — pinned rows first, marked by
+   their pin glyph, then the feed, then the "View all chats" row that closes it.
+   A gap here would put a seam in the middle of one list. */
+/* The Chats row is the collapsed form of the conversation zone, so its DEFAULT
+   is folded: at every width where the lists are on screen, the stand-in is not.
+   Only the 56px icon strip unfolds it (see `.rail-i--collapsed-only` inside the
+   `min-width: 1025px` block at the foot of this file, which is also where the
+   full rationale and the timing live).
+
+   Deliberately outside that media query: below 1025px the rail is a bar with no
+   icon mode, so a default scoped to the strip would leave this row unstyled and
+   visible above the very lists it substitutes for. */
+html[data-ui-layout="rail"] .rail .rail-i--collapsed-only {
+    height: 0;
+    min-height: 0;
+    /* Zero height is not zero SPACE: the parent's `gap` is charged for this item
+       whatever its height, so a folded row still pushed the conversation list
+       3px down. Give that back, so folded means genuinely absent. */
+    margin: calc(-1 * var(--rail-nav-gap, 3px)) 0 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    opacity: 0;
+    visibility: hidden;
+    overflow: hidden;
+    transition: height var(--ds-motion-fast) var(--ds-ease-standard) var(--rail-peek-text-delay),
+                padding var(--ds-motion-fast) var(--ds-ease-standard) var(--rail-peek-text-delay),
+                opacity var(--ds-motion-fast) var(--ds-ease-standard) var(--rail-peek-text-delay),
+                visibility 0s linear calc(var(--rail-peek-text-delay) + var(--ds-motion-fast));
+}
+
 html[data-ui-layout="rail"] .rail-chatsec {
     display: block;
 }
 
 html[data-ui-layout="rail"] .rail-chatsec + .rail-chatsec {
-    margin-top: 18px;
-}
-
-/* The 8px under New chat is already the gap above the first label. */
-html[data-ui-layout="rail"] .rail-chatsec:first-child {
     margin-top: 0;
 }
 
-/* The <h2> exists for document structure only (the button inside it is the
-   control) — strip the heading's own type and spacing entirely. */
-html[data-ui-layout="rail"] .rail-chatsec-hd-wrap {
-    margin: 0;
-    font: inherit;
-}
-
-/* Section label — a LABEL that happens to be operable, not a row. Hence no
-   background in any state, no border, and the same 9px left padding as the
-   conversation rows below it so the label and the titles share one left edge.
-   Hover/focus spend INK (muted → secondary), which is the one channel still
-   free: the accent belongs to the active conversation and the neutral wash to
-   hovering an actual row, so a header that filled on hover would read as a
-   selectable row (see the COLOUR RULE at the top of this file). */
-html[data-ui-layout="rail"] .rail-chatsec-hd {
-    display: flex;
-    align-items: center;
-    /* Caret sits against the label (see below), so this is the only gap. */
-    gap: 3px;
-    width: 100%;
-    padding: 3px 9px 6px;
-    border: none;
-    background: none;
-    border-radius: 6px;
-    color: var(--ds-text-muted);
-    cursor: pointer;
-    text-align: left;
-    font-family: inherit;
-}
-
-html[data-ui-layout="rail"] .rail-chatsec-hd:hover {
-    color: var(--ds-text-secondary);
-}
-
-html[data-ui-layout="rail"] .rail-chatsec-hd:focus-visible {
-    outline: var(--ds-focus-outline);
-    outline-offset: var(--ds-focus-outline-offset);
-}
-
-/* Same type as the group headers this promotes — the rail already reads this
-   size/weight/tracking as "label for what follows". */
-html[data-ui-layout="rail"] .rail-chatsec-txt {
-    font-size: 10.5px;
-    font-weight: 700;
-    letter-spacing: 0.07em;
-    text-transform: uppercase;
-}
-
-/* Disclosure caret — the rail's existing idiom, rotated the same way as
-   Admin's (down = open, right = collapsed), one size quieter than Admin's 15px
-   because this is a label and that is a nav row.
-   Deliberately NOT pushed to the rail's right edge with `margin-left: auto`:
-   out there it read as a second column of controls next to the conversation
-   rows' own "⋮", and what it actually annotates is the word beside it. The
-   button still spans the full width, so the hit area is the whole line. */
-html[data-ui-layout="rail"] .rail-chatsec-caret {
-    width: 12px;
-    height: 12px;
-    flex-shrink: 0;
-    transform: rotate(90deg);
-    transition: transform 0.18s var(--ds-ease-standard, ease);
-}
-
-html[data-ui-layout="rail"] .rail-chatsec.is-collapsed .rail-chatsec-caret {
-    transform: rotate(0deg);
-}
-
-@media (prefers-reduced-motion: reduce) {
-    html[data-ui-layout="rail"] .rail-chatsec-caret {
-        transition: none;
-    }
-}
+/* No `.rail-chatsec-hd` / `.rail-chatsec-txt` rules, and no section labels to
+   need them. "Pinned" and "Recent" were a <button> with a disclosure caret, then
+   an inert <h2>, and are now nothing at all: what a pinned row is, its pin glyph
+   already says, and that the feed is a slice is said by the row that closes it
+   ("View all chats") in the place a caller looks for it — the bottom, once they
+   have run out of rows. Two labels over a five-row list were the chrome, not the
+   content. */
 
 /* The list itself doesn't scroll — its parent (.rail-history-body) does — so
    neutralize the base chat.css `.cloud-chat-list { overflow-y:auto; flex:1 }`
@@ -964,18 +935,50 @@ html[data-ui-layout="rail"] .rail-history .cloud-chat-list:not(:empty) + .rail-h
     display: none;
 }
 
-/* No `.rail-history-all` rules here any more, and none should come back. That
-   was the "View all chats" link at the foot of the scroll box: quieter than a
-   `.rail-i` on purpose (the recents are the thing to read), with no active state
-   and a trailing chevron for its "this goes somewhere" mark.
+/* ── "View all chats" ─────────────────────────────────────────────────
+   The link that closes the scroll box. Quieter than a `.rail-i` on purpose —
+   the conversations are the thing to read, and this offers "more of these"
+   rather than a fifth destination — so: no glyph, no fill, no active state on
+   /chats, and muted ink that comes up to secondary on hover. Same 9px left edge
+   as the section labels and the titles, so the whole region shares one margin.
 
-   Being quiet was not the problem — being INSIDE this region was. The region is
-   text-only, so the collapsed rail hides it, and the collapsed rail is the
-   default on /admin; the link was also revealed only once the caller had a
-   conversation. A way to a page cannot be conditional on either. /chats is a
-   destination row at the top of the zone now (`.rail-i`, its own glyph — see
-   _app_rail.html), which is reachable at both rail widths and on a first run,
-   and the lists below it are what the collapse hides. */
+   It is INSIDE the region, which is what sank the first version of this link:
+   the region is text-only, so the collapsed rail hides it, and the collapsed
+   rail is the default on /admin. That is now answered where it belongs — the
+   Chats row in the nav zone is this region's collapsed form
+   (`.rail-i--collapsed-only`, at the foot of this file) — and not by making a
+   way to a page conditional on having used it. */
+html[data-ui-layout="rail"] .rail-history-all {
+    /* Deliberately the conversation row's own box — same height off
+       `--rail-row-h`, same `4px 9px` padding, same 8px radius and the same
+       `--rail-hover-bg` on hover — because this IS the last row of that list,
+       not a footer beneath it. Only the ink and the weight differ: muted and
+       600, so it reads as the end of the list rather than one more entry in it
+       (a row at full strength would be a sixth conversation). */
+    display: flex;
+    align-items: center;
+    min-height: var(--rail-row-h);
+    padding: 4px 9px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    color: var(--ds-text-muted);
+    font-size: 12.5px;
+    font-weight: 600;
+    text-decoration: none;
+    transition: background var(--ds-motion-fast) var(--ds-ease-standard),
+                color var(--ds-motion-fast) var(--ds-ease-standard);
+}
+
+html[data-ui-layout="rail"] .rail-history-all:hover {
+    background: var(--rail-hover-bg);
+    color: var(--ds-text-secondary);
+}
+
+html[data-ui-layout="rail"] .rail-history-all:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: var(--ds-focus-outline-offset);
+    border-radius: 6px;
+}
 
 /* ── Admin ────────────────────────────────────────────────────────────
    The last section of the bottom zone. The border-top is the one divider
@@ -1655,7 +1658,6 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i-label,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-user-txt,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-history {
         /* `visibility`, NOT `display` — the whole choreography depends on it.
            `display: none` took every label and the conversation region OUT OF
@@ -1744,6 +1746,99 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-history {
         transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) 0s,
                     visibility 0s linear 0s;
+    }
+
+    /* ── The Chats row: this zone's COLLAPSED form ────────────────────
+       The conversation region above is text end to end and has no icon form, so
+       the 56px strip cannot show it — `.rail-history` is in the hide list above
+       for exactly that reason. `#nav-chats` is what the strip shows instead: one
+       speech-bubble glyph standing in for the whole zone while the rail is
+       narrow, folded away again the moment the rail opens and the real lists
+       (plus their own "View all chats") take over. The two are exact
+       complements, so the zone reads as ONE thing at either width and never as
+       an icon row stacked above the lists that repeat it.
+
+       Folded with HEIGHT, not `visibility` — the opposite choice from the labels
+       above, and for the opposite reason. `visibility: hidden` keeps a box in
+       flow, which is precisely what the hide list wants (nothing moves; the
+       column just grows around content that was always there). Here the box
+       must GO: an expanded rail with a `visibility: hidden` row above the lists
+       would carry a permanent 34px hole between New chat and Pinned. So height
+       (plus padding and the icon's own opacity) interpolates from the row's full
+       size to zero, which animates cleanly and leaves no gap at either end.
+
+       `overflow: hidden` clips the glyph while the row is mid-fold, and
+       `visibility` still steps at the far end of the transition so a folded row
+       takes no clicks and holds no tab stop.
+
+       Timing mirrors the reveal on purpose: folding OUT (rail opening) runs on
+       the same `--rail-peek-text-delay` as the text coming in, so the icon
+       leaves as its replacement arrives rather than before it; folding back IN
+       (rail closing) uses `--rail-peek-text-out` with no delay, matching the
+       "content releases, then the column closes" sequence.
+
+       On an ADMIN page the modifier is not emitted at all (_app_rail.html): the
+       lists are not rendered there, so there is nothing for this row to hand off
+       to, and folding it away on peek would leave an admin with no path to
+       /chats — the bug that put this row here to begin with.
+
+       The FOLDED default is not here — it is outside this media query, up with
+       the other `.rail-i` rules, because it has to hold below 1025px too. Down
+       there the rail is a bar with no icon mode at all, so a default that lived
+       in here would leave the row unstyled and this zone would show the stand-in
+       AND the lists it stands in for. These two rules are the icon-strip
+       exception to that default. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i--collapsed-only {
+        height: var(--rail-row-h);
+        min-height: var(--rail-row-h);
+        /* Unfolded, it is an ordinary row again and wants the ordinary gap. */
+        margin: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        opacity: 1;
+        visibility: visible;
+        transition: height var(--rail-peek-text-out) var(--ds-ease-standard, ease) 0s,
+                    padding var(--rail-peek-text-out) var(--ds-ease-standard, ease) 0s,
+                    opacity var(--rail-peek-text-out) var(--ds-ease-standard, ease) 0s,
+                    visibility 0s linear 0s;
+    }
+
+    /* Peek (hover) and persisted-expanded are the same state to this row: the
+       lists are on screen, so the stand-in folds. Same specificity dance as the
+       reveal rules above — `:is()` counts its most specific argument, so this
+       must stay AFTER the icon-mode rule to win. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i--collapsed-only {
+        height: 0;
+        min-height: 0;
+        /* Same gap cancellation as the folded default — without it the peek
+           re-charges the parent's `gap` for a zero-height row and the whole
+           conversation list lands 3px lower than it sits when the rail is
+           persisted open. Two ways to reach the same layout that disagree by
+           3px is exactly the kind of jitter a peek makes visible. */
+        margin: calc(-1 * var(--rail-nav-gap, 3px)) 0 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        opacity: 0;
+        visibility: hidden;
+        transition: height var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay),
+                    padding var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay),
+                    opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay),
+                    visibility 0s linear calc(var(--rail-peek-text-delay) + var(--ds-motion-fast, .16s));
+    }
+
+    /* Reduced motion: the stand-in SWAPS for the lists instead of folding.
+       Nested here, at the end of the strip's own rules, because the two
+       icon-mode selectors above carry a `.rail.rail-icon-mode` compound that
+       outranks the base `.rail` one — an opt-out written up beside the other
+       reduced-motion rules would simply lose to them. `visibility` keeps its 0s
+       step in every state so a folded row stays inert; only the interpolation
+       goes. */
+    @media (prefers-reduced-motion: reduce) {
+        html[data-ui-layout="rail"] .rail .rail-i--collapsed-only,
+        html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i--collapsed-only,
+        html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i--collapsed-only {
+            transition: visibility 0s linear 0s;
+        }
     }
 
     /* Centre the icon in the narrow column now that its label is hidden — as
@@ -1981,6 +2076,55 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
                     right var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) 0s;
     }
 
+
+    /* Collapsed search. These were at TOP LEVEL below the ≤1024px query,
+       where they won the cascade at narrow widths for any rail still
+       carrying `.rail-icon-mode` — the collapse is a remembered preference,
+       so narrowing the window hides the toggle without clearing the class.
+       Gated to desktop here, which is what
+       tests/test_web_admin_nav.py::test_icon_mode_rules_are_gated_to_desktop_only
+       pins. It must be THIS query and not the `(hover: none)` sibling below
+       it: from inside that one the rules are inert on a mouse desktop, and
+       the guard — which only checks file position — still passes. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search {
+        justify-content: center;
+    }
+    /* The input LEAVES THE FLOW rather than joining the `visibility: hidden`
+       list. That list keeps each box in place on purpose — which is right for
+       rows that should hold their shape, and wrong here: an invisible 42px input
+       still claims its width, so the 18px magnifier and it were sharing a 39px
+       row and the icon was pushed to left:-2px, clipped against the edge. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-input {
+        display: none;
+    }
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-input,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-input {
+        display: block;
+    }
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-icon {
+        position: static;
+        left: auto;
+        /* `flex: none` is load-bearing. Taken out of `position: absolute` this
+           becomes a flex item, and the collapse mechanism gives items `min-width:
+           0` precisely so they squeeze to nothing in the narrow column — which is
+           right for a label and wrong for the one glyph that is supposed to
+           survive. Without this the icon measures 0px wide and the row is empty
+           again, which is the bug this whole rule set exists to fix. */
+        flex: none;
+        width: 18px;
+        height: 18px;
+        color: var(--ds-text-secondary);
+        transition: opacity var(--rail-peek-text-out) var(--ds-ease-standard, ease);
+    }
+    /* Peeked open, the full box comes back and the icon returns to its slot. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-icon,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-icon {
+        position: absolute;
+        left: 9px;
+        width: 15px;
+        height: 15px;
+        color: var(--ds-text-muted);
+    }
 }
 
 /* No transition, full stop — combined (not nested) with the desktop-only
@@ -2239,3 +2383,17 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     }
 }
 
+
+
+/* Collapsed, the search row keeps its magnifier.
+
+   The row used to be hidden wholesale — `.rail-search` sat in the
+   `visibility: hidden` list, which keeps the BOX in flow by design, so the
+   collapsed column showed a row-height of nothing where the search had been.
+   The comment above that list already said the magnifier should stay put; it
+   just never did.
+
+   So the INPUT is what hides now, and the icon steps into the middle of the
+   narrow column to sit on the same centre line as every other icon in the
+   rail. Hovering the rail peeks it open and hands back the full box, exactly
+   as before. */

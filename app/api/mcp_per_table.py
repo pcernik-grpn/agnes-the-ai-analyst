@@ -32,6 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.auth.dependencies import _get_db, get_current_user
+from src.audit_helpers import identity_for_audit, log_safe
 from src.db import get_analytics_db_readonly
 from src.rbac import can_access_table
 from src.access_policy import (
@@ -222,6 +223,20 @@ def query_table(
         # Coerce dataframe scalars to native Python types — fastapi's JSON
         # encoder doesn't know about numpy / pandas scalars.
         result_records = _coerce_records(rows.to_dict(orient="records"))
+
+        # F2c (audit-full-coverage plan, Task 5): filter COLUMN NAMES only,
+        # never the filter values — those may be PII/business-sensitive.
+        user_id, _email = identity_for_audit(user)
+        log_safe(
+            user_id=user_id,
+            action="query.table_scoped",
+            resource=f"table:{table_id}",
+            params={
+                "row_count": len(result_records),
+                "filter_columns": sorted(body.filter.keys()),
+                "truncated": truncated,
+            },
+        )
 
         return TableQueryResponse(
             table_id=table_id,
