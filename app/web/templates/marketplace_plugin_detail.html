@@ -1082,6 +1082,21 @@
     return String(s ?? '').replace(/[&<>"']/g, ch => (
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   }
+  // JS mirror of app/web/router.py's cover_variant_url/has_cover_variant Jinja
+  // filters — same external-URL rule (an un-mirrored external cover has no
+  // variant, so the inner-card list below must skip srcset/sizes rather
+  // than repeat the same URL under two width descriptors; the hero uses
+  // coverW alone — see its fixed-480 comment). Our own serving routes are
+  // always relative, so any absolute http(s) URL is external — no URL
+  // parsing needed (and none safe: cover_photo_url is often already
+  // relative).
+  function isMirroredCoverUrl(url) {
+    return !/^https?:\/\//i.test(url);
+  }
+  function coverW(url, w) {
+    if (!isMirroredCoverUrl(url)) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'w=' + w;
+  }
   // Placeholder initials derived from the entity name. Mirrors initialsFor()
   // in marketplace.html: split on any non-alphanumeric separator, take the
   // first letter of the first two words (or first two letters of a single
@@ -1246,7 +1261,11 @@
     coverImg.fetchPriority = 'high';
     coverImg.width = 480;
     coverImg.height = 240;
-    coverImg.src = d.cover_photo_url;
+    // No srcset: the hero tile renders at 108x62 CSS px (detail-page.css
+    // .detail-hero__icon--cover), 324 device px even at DPR 3, so the 480
+    // variant is the honest fetch up to DPR 4.4 — a srcset here only
+    // invited a DPR-3 phone to grab the 960 for zero visible gain.
+    coverImg.src = coverW(d.cover_photo_url, 480);
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
       coverImg.remove();
@@ -1700,8 +1719,11 @@
     // initials from the entity name — same logic as the top-level card grid.
     const cards = items.map(it => {
       const itInitials = deriveInitials(it.name, type);
+      const itMirrored = it.cover_photo_url && isMirroredCoverUrl(it.cover_photo_url);
       const photoMarkup = it.cover_photo_url
-        ? `<div class="photo"><img src="${esc(it.cover_photo_url)}" alt="" loading="lazy" decoding="async" width="480" height="240"
+        ? `<div class="photo"><img src="${esc(coverW(it.cover_photo_url, 480))}" alt="" loading="lazy" decoding="async" width="480" height="240"
+              ${itMirrored ? `srcset="${esc(coverW(it.cover_photo_url, 480))} 480w, ${esc(coverW(it.cover_photo_url, 960))} 960w"
+              sizes="(max-width: 600px) 100vw, 320px"` : ''}
               onerror="this.parentElement.classList.add('photo-failed');
                        this.parentElement.textContent='${itInitials.replace(/'/g, "\\'")}';"></div>`
         : `<div class="photo">${itInitials}</div>`;

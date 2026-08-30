@@ -182,7 +182,14 @@
        per-kind sections below. A cover image, when set, overlays the
        glyph and removes itself on load error to reveal it. #}
     {{ cards.kind_glyph(glyph or kind) }}
-    {% if cover_image_url %}<img src="{{ cover_image_url }}" alt="" fetchpriority="high" width="480" height="240" onerror="this.parentElement.classList.remove('detail-hero__icon--cover'); this.remove();">{% endif %}
+    {# No srcset here: the cover tile renders at 108x62 CSS px
+       (static/css/detail-page.css .detail-hero__icon--cover), which is
+       324 device px even at DPR 3 — the 480 variant covers that up to
+       DPR 4.4 on its own. A srcset with a 600px/320px sizes guess doesn't
+       match the tile's real size and only invites a DPR-3 phone to fetch
+       the 960 for zero visible gain. #}
+    {% if cover_image_url %}<img src="{{ cover_image_url|cover_w(480) }}" alt="" fetchpriority="high" width="480" height="240"
+         onerror="this.parentElement.classList.remove('detail-hero__icon--cover'); this.remove();">{% endif %}
   </div>
   <div class="detail-hero__body">
     <div class="detail-hero__title-row">

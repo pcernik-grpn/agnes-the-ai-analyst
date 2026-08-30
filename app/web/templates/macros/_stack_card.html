@@ -168,7 +168,12 @@
             title="Lifecycle status: {{ _status_meta.label }}">{{ _status_meta.label }}</span>
     {% endif %}
     {% if entry.cover_image_url %}
-      <img src="{{ entry.cover_image_url }}" alt="" loading="lazy" decoding="async" width="480" height="240"
+      {# 960w earns its place at DPR 3 on a 320-px card. External (un-mirrored)
+         covers have no variant to request, so they skip srcset/sizes entirely
+         rather than repeat the same URL under two width descriptors. #}
+      <img src="{{ entry.cover_image_url|cover_w(480) }}" alt="" loading="lazy" decoding="async" width="480" height="240"
+           {% if entry.cover_image_url|has_cover_variant %}srcset="{{ entry.cover_image_url|cover_w(480) }} 480w, {{ entry.cover_image_url|cover_w(960) }} 960w"
+           sizes="(max-width: 600px) 100vw, 320px"{% endif %}
            onerror="this.parentElement.classList.add('stack-card__photo--failed');
                     this.parentElement.textContent=this.dataset.fallback;"
            data-fallback="{{ _initials }}">

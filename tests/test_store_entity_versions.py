@@ -3167,7 +3167,9 @@ class TestServerSideCoverHero:
         eid = self._upload_with_photo(web_client, cookies, entity_type="skill", name="coverskill")
         r = web_client.get(f"/marketplace/flea/{eid}", cookies=cookies)
         assert r.status_code == 200
-        assert f'src="/api/store/entities/{eid}/photo?v=1"' in r.text
+        # &w=480 is the responsive-srcset variant request (cover_w filter);
+        # a bare ?v=1 src would now be the pre-srcset shape.
+        assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
         assert 'fetchpriority="high"' in r.text
 
     def test_plugin_hero_carries_cover_img_server_side(self, web_client):
@@ -3175,7 +3177,7 @@ class TestServerSideCoverHero:
         eid = self._upload_with_photo(web_client, cookies, entity_type="plugin", name="coverplugin")
         r = web_client.get(f"/marketplace/flea/{eid}", cookies=cookies)
         assert r.status_code == 200
-        assert f'src="/api/store/entities/{eid}/photo?v=1"' in r.text
+        assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
         assert 'fetchpriority="high"' in r.text
 
     def test_inner_skill_hero_carries_cover_img_server_side(self, web_client):
@@ -3186,7 +3188,7 @@ class TestServerSideCoverHero:
         eid = self._upload_with_photo(web_client, cookies, entity_type="plugin", name="coverinner")
         r = web_client.get(f"/marketplace/flea/{eid}/skill/dummy", cookies=cookies)
         assert r.status_code == 200
-        assert f'src="/api/store/entities/{eid}/photo?v=1"' in r.text
+        assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
         assert 'fetchpriority="high"' in r.text
 
     def test_no_photo_no_cover_img(self, web_client):

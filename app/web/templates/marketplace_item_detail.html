@@ -1200,6 +1200,20 @@
     return String(s ?? '').replace(/[&<>"']/g, ch => (
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   }
+  // JS mirror of app/web/router.py's cover_variant_url/has_cover_variant Jinja
+  // filters — same external-URL rule (coverW skips the ?w= append for an
+  // un-mirrored external cover, which has no variant to request). Our own
+  // serving routes are always relative, so any absolute http(s) URL is
+  // external — no URL parsing needed (and none safe: cover_photo_url is
+  // often already relative). This page's hero is the only cover site here
+  // and fetches a fixed 480 — see its no-srcset comment below.
+  function isMirroredCoverUrl(url) {
+    return !/^https?:\/\//i.test(url);
+  }
+  function coverW(url, w) {
+    if (!isMirroredCoverUrl(url)) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'w=' + w;
+  }
   // Placeholder initials derived from the entity name. Mirrors initialsFor()
   // in marketplace.html (the card grid) so the detail hero shows the same
   // name-derived glyph ("Sales Dashboard" → "SD") instead of a generic
@@ -1314,7 +1328,11 @@
     coverImg.fetchPriority = 'high';
     coverImg.width = 480;
     coverImg.height = 240;
-    coverImg.src = d.cover_photo_url;
+    // No srcset: the hero tile renders at 108x62 CSS px (detail-page.css
+    // .detail-hero__icon--cover), 324 device px even at DPR 3, so the 480
+    // variant is the honest fetch up to DPR 4.4 — a srcset here only
+    // invited a DPR-3 phone to grab the 960 for zero visible gain.
+    coverImg.src = coverW(d.cover_photo_url, 480);
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
       coverImg.remove();

@@ -21,6 +21,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - Cover images can be requested as resized WebP variants with ?w=480 or ?w=960 on the upload, marketplace and store photo routes; other widths serve the original. Variants are generated once on first request and cached on disk.
 
 ### Changed
+- Grid cover cards now ship a responsive srcset, so phones download a 480-px WebP instead of the full upload; page heroes fetch the 480-px variant directly (their fixed tile size never benefits from a larger one).
 - Marketplace plugin and item pages now render the hero cover with the page instead of after a follow-up request, so it starts loading immediately.
 - Cover images on package, memory-domain, marketplace and store pages now declare their size, decode off the main thread and lazy-load below the fold; page heroes are fetched at high priority.
 - Uploaded cover images are now served with a 30-day immutable cache

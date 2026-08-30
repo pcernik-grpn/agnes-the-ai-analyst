@@ -228,6 +228,37 @@ def _store_display_name(name: str | None) -> str:
 templates.env.filters["store_display_name"] = _store_display_name
 
 
+def has_cover_variant(url: str) -> bool:
+    """True when ``url`` is one of our serving routes and can take a ``?w=`` variant.
+
+    Our own cover-serving routes (the ``/uploads`` static mount, the two
+    curated-marketplace asset routes, the store entity-photo route) are
+    always emitted as relative paths, never absolute URLs — so any
+    absolute ``http(s)://`` URL is by definition an external cover with no
+    variant to request. Templates use this to skip emitting
+    ``srcset``/``sizes`` for those (a duplicated URL under two width
+    descriptors would be a lying srcset).
+    """
+    return not url.lower().startswith(("http://", "https://"))
+
+
+def cover_variant_url(url: str, width: int) -> str:
+    """Point a served cover-image URL at its ``?w=<width>`` WebP variant.
+
+    An external absolute http(s) URL that isn't one of our own serving
+    routes is returned unchanged — it has no variant to request. Every
+    other URL gets the width appended, as ``&w=`` when it already carries
+    a query string (store photo URLs carry ``?v=<version>``).
+    """
+    if not has_cover_variant(url):
+        return url
+    return f"{url}{'&' if '?' in url else '?'}w={width}"
+
+
+templates.env.filters["cover_w"] = cover_variant_url
+templates.env.filters["has_cover_variant"] = has_cover_variant
+
+
 # ---- PostHog template wiring ----
 # Two Jinja globals injected into every render so the `_posthog.html` partial
 # (included from `base.html` and `base_login.html`) can render the browser

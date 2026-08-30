@@ -5,7 +5,9 @@ Project: Agnes — platform for analyzing structured data with extraction,
 Module: tests/test_cover_image_perf_contract.py
 Deps:   Pillow (PIL), fastapi.testclient
 Tested: covers src/images/variants.py + the ``?w=`` wiring in
-  app/web/cover_files.py, app/api/marketplace.py and app/api/store.py
+  app/web/cover_files.py, app/api/marketplace.py and app/api/store.py, plus
+  the ``cover_w`` Jinja filter (app/web/router.py) that points a rendered
+  cover ``<img>`` at those variants.
 
 Key responsibilities:
 - A 480/960 width request returns a resized WebP smaller than the original.
@@ -14,6 +16,11 @@ Key responsibilities:
 - Path containment on the uploads mount still refuses traversal with ``?w=``
   attached.
 - The variant is generated once and reused on a second request (cache hit).
+- Server-rendered cover ``<img>``s: the stack-card macro (grid layout,
+  width:100% of its column) carries a 480/960 srcset, and an un-mirrored
+  external cover URL is left without one; the package hero (fixed-size
+  tile, never a fluid grid column) fetches the 480 variant directly and
+  never carries a srcset.
 
 Design constraints:
 - Uses the session-shared ``seeded_app`` / fresh ``seeded_app_fresh``
@@ -276,3 +283,94 @@ def test_curated_mirrored_variant(seeded_app):
     r3 = client.get(f"{url}?w=480", headers=headers)
     assert r3.status_code == 200
     assert variant.stat().st_mtime_ns == mtime_before
+
+
+# --- templates ask for the variants (cover_w Jinja filter) -----------------
+
+
+def test_stack_card_cover_has_srcset_and_perf_attrs():
+    """d1: the shared stack-card macro's cover ``<img>`` carries the full
+    perf contract (lazy, async-decoded, sized) plus a 480/960 srcset built
+    from the ``cover_w`` filter. Rendered through the app's own Jinja
+    environment (``app.web.router.templates``) rather than a bare
+    ``jinja2.Environment`` (contrast tests/test_web_stack_card_macro.py) —
+    ``cover_w`` is registered on the app env only.
+    """
+    from app.web.router import templates
+
+    tmpl = templates.env.from_string('{% from "macros/_stack_card.html" import card %}{{ card(entry) }}')
+    html = tmpl.render(
+        entry={
+            "id": "p1",
+            "name": "Sales bundle",
+            "icon": "📦",
+            "color": "#fce7f3",
+            "requirement": "available",
+            "in_stack": False,
+            "cover_image_url": "/uploads/covers/abc123.png",
+        }
+    )
+    assert 'loading="lazy"' in html
+    assert 'decoding="async"' in html
+    assert 'width="480"' in html
+    assert 'height="240"' in html
+    assert "?w=480 480w" in html
+    assert "?w=960 960w" in html
+    assert "sizes=" in html
+
+
+def test_stack_card_cover_external_url_has_no_srcset():
+    """d3: an un-mirrored external cover URL passes through ``cover_w``
+    unchanged and never grows a ``?w=`` variant request."""
+    from app.web.router import templates
+
+    tmpl = templates.env.from_string('{% from "macros/_stack_card.html" import card %}{{ card(entry) }}')
+    html = tmpl.render(
+        entry={
+            "id": "p1",
+            "name": "Sales bundle",
+            "icon": "📦",
+            "color": "#fce7f3",
+            "requirement": "available",
+            "in_stack": False,
+            "cover_image_url": "https://example.com/cover.png",
+        }
+    )
+    assert "?w=" not in html
+    assert "srcset=" not in html
+    assert 'src="https://example.com/cover.png"' in html
+
+
+def test_catalog_package_hero_has_no_srcset_and_eager_high_priority(seeded_app):
+    """d2: GET /catalog/p/<slug> — the page hero cover is an admin-uploaded
+    (internal, relative) cover, so it gets ``fetchpriority="high"`` and no
+    ``loading`` attribute (a hero is above the fold), but fetches the fixed
+    480 variant directly: the hero tile is a fixed 108x62 CSS-px box (never
+    a fluid grid column like the stack card), so a srcset only offers a
+    960 the tile can never show a visible benefit from.
+    """
+    app_data = seeded_app
+    client = app_data["client"]
+    headers = _auth(app_data["admin_token"])
+    create = client.post(
+        "/api/admin/data-packages",
+        json={
+            "name": "Cover perf package",
+            "slug": "cover-perf-package",
+            "cover_image_url": "/uploads/covers/deadbeef.png",
+        },
+        headers=headers,
+    )
+    assert create.status_code == 201, create.text
+
+    r = client.get("/catalog/p/cover-perf-package", headers=headers)
+    assert r.status_code == 200
+    html = r.text
+    img_start = html.index('<img src="/uploads/covers/deadbeef.png')
+    hero_img = html[img_start : html.index(">", img_start) + 1]
+    assert 'fetchpriority="high"' in hero_img
+    assert "loading=" not in hero_img
+    assert 'width="480"' in hero_img
+    assert 'height="240"' in hero_img
+    assert "?w=480" in hero_img
+    assert "srcset=" not in hero_img
