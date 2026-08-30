@@ -391,6 +391,41 @@ def object_id(object_type: str, name: str) -> str:
     return f"{object_type}:{name}"
 
 
+def projected_metric_ids(row: dict) -> dict[str, str]:
+    """``{metric_definitions id: metric name}`` for every metric this stored
+    row's document declares — the join the two views of one metric need to
+    know about each other (#1707).
+
+    Keyed on the id the PROJECTOR writes (``src/semantic/projection.py::
+    projected_metric_id``), so the flat page can match a registry row by
+    equality instead of parsing a stored id whose every part may contain a
+    ``/``. A metric the projector skipped (no usable expression, an
+    unresolvable binding) simply has no registry row to match, so an extra
+    entry here costs nothing.
+
+    Iterates the document's models one by one rather than the aggregated
+    :func:`model_of` view: the id keys on the model the metric belongs to, and
+    a multi-model row's two models have two different keys.
+    """
+    from src.semantic.projection import projected_metric_id
+
+    doc = row.get("document_json") or {}
+    if not isinstance(doc, dict):
+        return {}
+    ids: dict[str, str] = {}
+    for model in doc.get("semantic_model") or []:
+        if not isinstance(model, dict):
+            continue
+        for metric in model.get("metrics") or []:
+            if not isinstance(metric, dict):
+                continue
+            name = metric.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            ids[projected_metric_id(row.get("source") or "", row.get("source_ref"), model, name)] = name
+    return ids
+
+
 __all__ = [
     "AI_GROUPS",
     "OBJECT_TYPE_LABELS",
@@ -408,6 +443,7 @@ __all__ = [
     "model_of",
     "object_counts",
     "object_id",
+    "projected_metric_ids",
     "source_label",
     "warehouse_only_metric_count",
 ]

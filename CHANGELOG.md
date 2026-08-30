@@ -10,6 +10,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **The two views of one metric now link to each other (#1707).** The metric
+  registry on `/catalog/semantics` (the flat projection) and the semantic
+  document browser on `/semantic-layer` render the same metric twice with no
+  path between them: a reader on either page had to know the other existed and
+  find the metric again by hand. A registry row projected from a document
+  object now carries an **"Open in the model →"** link to
+  `/semantic-layer/{slug}/metric:{name}`, and that object page carries **"Open
+  in the metric registry →"** back. Both directions are resolved through the
+  projector's own id formula, so a metric authored by hand or imported from
+  YAML — which has no document object — renders no link, and neither does one
+  whose model the caller cannot read. The registry link lands filtered
+  (`/catalog/semantics?q=<metric>`), on the row it means rather than on the
+  full list.
 - **A semantic source that syncs successfully and imports nothing is no longer
   indistinguishable from a healthy one (#1707).** `last_sync_status='ok'` says
   the fetch worked, not that it brought anything back — a `connection` source

@@ -357,6 +357,7 @@
 .sl-detail__desc table { border-collapse: collapse; margin: 0 0 8px; }
 .sl-detail__desc th, .sl-detail__desc td { border: 1px solid var(--ds-border); padding: 2px 8px; font-size: 12px; }
 .sl-detail__desc code { background: var(--ds-surface); padding: 0 4px; border-radius: var(--radius-sm); font-size: 11px; }
+.sl-detail__model-link { margin: 0 0 8px; font-size: 12px; }
 
 /* ── Glossary grid ───────────────────────────────────────────────────── */
 .sl-glossary-grid {
@@ -590,6 +591,14 @@
                 <pre><code>{{ variant_sql }}</code></pre>
                 {% endfor %}
                 {% endif %}
+                {# Door into the document this row was projected from — set
+                   only for a metric that HAS such an object and whose model
+                   the caller can read (app/web/router.py::
+                   _document_metric_hrefs). A hand-authored or yaml_import
+                   metric renders without it. #}
+                {% if m.model_href %}
+                <p class="sl-detail__model-link"><a href="{{ m.model_href }}">Open in the model &rarr;</a></p>
+                {% endif %}
                 {% if m.filters %}<p><strong>Filters</strong></p><ul>{% for f in m.filters %}<li><code>{{ f }}</code></li>{% endfor %}</ul>{% endif %}
                 {% if m.notes %}<p><strong>Notes:</strong></p><ul>{% for n in m.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
                 {% if m.validation %}<p><strong>Validation:</strong> <code>{{ m.validation }}</code></p>{% endif %}
@@ -717,6 +726,16 @@
             applyMetrics();
         });
     });
+
+    // The return leg of the deep link: a metric's object page links back here
+    // with `?q=<metric name>`, so the row it means is the one visible result
+    // instead of one entry in an unfiltered list. Read once on load; typing in
+    // the box afterwards is unaffected (the URL is not rewritten).
+    const initialQuery = new URLSearchParams(window.location.search).get('q');
+    if (initialQuery && metricFilter) {
+        metricFilter.value = initialQuery;
+        applyMetrics();
+    }
 
     // ── Glossary ──
     let glossaryLoaded = false;

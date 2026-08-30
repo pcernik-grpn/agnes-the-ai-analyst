@@ -677,3 +677,104 @@ class TestCatalogSemanticsDoorToTheDocument:
         self._seed_model()
         body = self._body(seeded_app, "analyst_token")
         assert _DOOR not in body
+
+
+class TestCatalogSemanticsDeepLinkIntoTheDocument:
+    """Per-row door into the document browser (#1707, N4).
+
+    The two views of one metric did not know about each other: this flat page
+    listed a projected metric with no way to reach the object it came from,
+    and the object page had no way back. A metric row that resolves to a
+    document object now carries an "in the model" link; a metric this
+    instance authored by hand or imported from YAML has no such object and
+    must carry none — a link that 404s is worse than no link.
+
+    The mapping is the projector's own id formula
+    (`src/semantic/projection.py::projected_metric_id`), not a guess at
+    parsing the stored id apart.
+    """
+
+    _SLUG = "retail"
+    _LINK = 'href="/semantic-layer/retail/metric:revenue"'
+
+    def _seed_model(self, *, slug: str | None = None, metric_name: str = "revenue") -> dict:
+        from src.repositories import semantic_model_repo
+
+        slug = slug or self._SLUG
+        return semantic_model_repo().upsert(
+            id=f"manual/_/{slug}",
+            slug=slug,
+            name=slug,
+            description="Retail domain.",
+            document="# fixture",
+            document_json={
+                "semantic_model": [
+                    {
+                        "name": slug,
+                        "datasets": [{"name": "orders", "source": "db.public.orders", "fields": []}],
+                        "metrics": [
+                            {
+                                "name": metric_name,
+                                "description": "Total order revenue.",
+                                "expression": {"dialects": [{"dialect": "duckdb", "expression": "SUM(amount)"}]},
+                            }
+                        ],
+                    }
+                ]
+            },
+            spec_version="0.2.0.dev0",
+            content_hash=f"hash-{slug}",
+            source="manual",
+            source_ref=None,
+            status="valid",
+            validation_errors=None,
+            validated_at=None,
+        )
+
+    def _body(self, seeded_app, token_key: str = "admin_token") -> str:
+        resp = seeded_app["client"].get("/catalog/semantics", headers=_auth(seeded_app[token_key]))
+        assert resp.status_code == 200
+        return resp.text
+
+    def test_document_owned_metric_row_links_to_its_object_page(self, seeded_app):
+        self._seed_model()
+        _make_metric(
+            id="manual/_/retail/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category="retail",
+            source="manual",
+            source_ref=None,
+        )
+        assert self._LINK in self._body(seeded_app)
+
+    def test_metric_with_no_document_object_gets_no_link(self, seeded_app):
+        """A yaml_import metric is a registry row with no document behind it —
+        it must render bare even on an instance that HAS a readable model."""
+        self._seed_model()
+        _make_metric(id="revenue/mrr", name="mrr", source="yaml_import")
+        body = self._body(seeded_app)
+        assert "Monthly Recurring Revenue" in body
+        assert "/semantic-layer/retail/metric:" not in body
+
+    def test_link_is_not_offered_to_a_caller_who_cannot_read_the_model(self, seeded_app):
+        """Same `_can_read_model` tier as the browse pages: an analyst without
+        a grant would 404 on the object page, so the row stays bare for them."""
+        self._seed_model()
+        _make_metric(
+            id="manual/_/retail/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category="retail",
+            source="manual",
+            source_ref=None,
+        )
+        assert self._LINK not in self._body(seeded_app, "analyst_token")
+
+    def test_filter_prefills_from_the_q_query_parameter(self, seeded_app):
+        """The other half of the round trip: the object page links back with
+        `?q=<metric name>`, which this page's client-side filter reads on
+        load. Without the reader the back link lands on an unfiltered list."""
+        body = self._body(seeded_app)
+        assert "URLSearchParams" in body
+        assert "metricFilter.value" in body

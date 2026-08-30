@@ -539,6 +539,22 @@ def _model_key(model: dict) -> str:
     return model.get("name") or ""
 
 
+def projected_metric_id(source: str, source_ref: Optional[str], model: dict, metric_name: str) -> str:
+    """The ``metric_definitions.id`` :func:`project_document` writes for
+    ``metric_name`` of ``model`` — the writer's own formula, exposed so a
+    READER can map a flat row back to the document object it came from.
+
+    The stored id is ``<source>/<source_ref or '_'>/<model key>/<name>``, and
+    every one of those parts may itself contain a ``/`` (a metric name, a
+    Keboola-style source_ref), so splitting a stored id apart is ambiguous.
+    Recomputing it from the document is not: the UI deep link
+    (``/catalog/semantics`` → ``/semantic-layer/{slug}/metric:{name}``) asks
+    this function for the id it would expect and matches on equality, which
+    keeps the link tied to the writer rather than to a parse of its output.
+    """
+    return _scoped_id(source, source_ref, _model_key(model), metric_name)
+
+
 @dataclass
 class ProjectionReport:
     metrics_written: int = 0
@@ -769,7 +785,10 @@ def project_document(
                     "(remote query or a materialized row) on the source warehouse."
                 ]
                 report.warehouse_only.append({"kind": "metric", "name": metric_name, "dialect": dialect_name})
-            metric_id = _scoped_id(source, source_ref, model_key, metric_name)
+            # Through the public helper, not `_scoped_id` inline: the readers
+            # that map a flat row back to its document object call the same
+            # function, so the two cannot drift.
+            metric_id = projected_metric_id(source, source_ref, model, metric_name)
             if _check_name_collision(metric_name, metric_id, source, source_ref):
                 report.name_collisions += 1
             metric_repo().create(
