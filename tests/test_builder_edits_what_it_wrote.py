@@ -103,3 +103,68 @@ def test_the_detail_page_sends_a_document_to_the_builder():
     assert "'Edit listing'" in src, (
         "the listing fields (photo, tagline, video) lost their entry point"
     )
+
+
+# ── The other three builders ────────────────────────────────────────────────
+#
+# Same rule, different surfaces: whatever a builder creates, that builder
+# edits. /agents already worked this way — the page IS the editor, every field
+# change writes back — which is why it appears nowhere below.
+
+MCP_JS = ROOT / "app" / "web" / "static" / "js" / "components" / "mcp_builder.js"
+PKG_JS = ROOT / "app" / "web" / "static" / "js" / "components" / "package_drawer.js"
+ROUTER = ROOT / "app" / "web" / "router.py"
+
+
+def test_both_edit_pages_refuse_an_id_that_is_not_a_row():
+    """An edit page pointed at nothing renders an empty builder — and an empty
+    builder CREATES on save. Both routes check before rendering."""
+    src = ROUTER.read_text(encoding="utf-8")
+    for fn, missing in (
+        ("admin_mcp_builder_edit", "mcp_source_not_found"),
+        ("admin_package_builder_edit", "data_package_not_found"),
+    ):
+        body = re.search(rf"async def {fn}\(.*?\n\n\n", src, re.S)
+        assert body, f"{fn} moved — re-point this guard"
+        assert missing in body.group(0), f"{fn} renders a builder for an id that does not exist"
+
+
+def test_the_mcp_edit_saves_a_difference_not_a_repost():
+    """The create path posts everything. Applied to an existing source that
+    would duplicate its tools and could never remove one, so the tool toggle
+    and the group picker would be decoration."""
+    src = MCP_JS.read_text(encoding="utf-8")
+    body = re.search(r"function saveEdit\(\) \{(.*?)\n  \}", src, re.S)
+    assert body, "saveEdit moved — re-point this guard"
+    b = body.group(1)
+    assert "method: 'DELETE'" in b and "TOOLS_API" in b, "a tool turned off is never deleted"
+    assert "/grants/'" in b, "a group unpicked is never revoked"
+    save = re.search(r"function save\(\) \{(.*?)\n  \}", src, re.S).group(1)
+    assert "if (editing) return saveEdit();" in save, "editing falls through to the create path"
+
+
+def test_neither_builder_greets_an_edit_with_its_create_script():
+    """"Tell me what you are connecting" and a set of fresh-start chips, on
+    something that exists, reads as though nothing had been done — and one
+    chip click lands on top of real work."""
+    mcp = MCP_JS.read_text(encoding="utf-8")
+    assert "This source is registered." in mcp, "the MCP builder still opens an edit with the create script"
+    pkg = PKG_JS.read_text(encoding="utf-8")
+    assert "OPENING_EDIT" in pkg, "the package builder still opens an edit with the create script"
+    chips = re.search(r"chips: \(convBusy \|\| llmUnavailable\) \? \[\](.*?),\n", pkg, re.S)
+    assert chips and "'edit'" in chips.group(1), "starter chips are offered on an edit"
+
+
+def test_the_package_edit_is_a_page_like_its_create():
+    """Authoring was a workspace and revising was an overlay on whatever page
+    you were on — one component at two sizes, which made the edit read as the
+    lesser thing. The drawer keeps the case it was built for."""
+    detail = (ROOT / "app" / "web" / "templates" / "admin_package_detail.html").read_text(encoding="utf-8")
+    assert "/edit`" in detail and "AgnesPackageDrawer.open({" not in detail.split("apd-edit-details")[1][:400], (
+        "Edit details still opens the overlay instead of the builder page"
+    )
+    tables = (ROOT / "app" / "web" / "templates" / "admin_tables.html").read_text(encoding="utf-8")
+    assert "AgnesPackageDrawer.open({" in tables, (
+        "the in-place drawer was removed from the one surface that needs it — "
+        "assigning a table to a package that does not exist yet"
+    )

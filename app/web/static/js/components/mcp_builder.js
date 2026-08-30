@@ -54,6 +54,10 @@
   var DRAFT_KEY = 'agnes_mcp_builder_draft_v1';
   function persistDraft() {
     if (!draft) return;
+    // An edit is not a draft: parking it here would overwrite whatever new
+    // source the admin had half-entered, and offer to "resume" one that is
+    // already registered.
+    if (editing) return;
     try {
       var keep = JSON.parse(JSON.stringify(draft));
       delete keep.secret_value;   // a credential does not belong in localStorage
@@ -468,6 +472,14 @@
      needs the registered source and used to be a second builder. */
   var registered = false;
   var DATA_APPS_ENABLED = false;
+  /* Set when this page opened on a source that already exists
+     (`/admin/mcp-sources/<id>/edit`). Registering was a builder and revising
+     was the detail page's own form, so the connection, the tool curation and
+     the grants were entered in one vocabulary and changed in another. What
+     `editing` holds is the state as the SERVER had it, so save can send the
+     difference — a tool turned off has to be deleted, a group unpicked has to
+     be revoked, and neither is expressible as "post everything again". */
+  var editing = null;
 
   /* 409 from the source-wide grant is not one thing.
      `no_tools_registered` means the source has no ENABLED tool row to grant,
@@ -530,8 +542,81 @@
     return draft.tools.filter(function (t) { return draft.enabled[t.name] !== false; });
   }
 
+  /* Revise an existing source. Every step is a diff against what the server
+     had, because the create path's "post it all" would duplicate tool rows
+     and could never remove anything. */
+  function saveEdit() {
+    saving = true; saveErr = null;
+    render();
+    var id = editing.id;
+    var wanted = enabledTools();
+    var wantedNames = {};
+    wanted.forEach(function (t) { wantedNames[t.name] = true; });
+    var haveNames = {};
+    editing.tools.forEach(function (t) { haveNames[t.name] = t.tool_id; });
+
+    postJson(SOURCES_API + '/' + encodeURIComponent(id), {
+      name: draft.name.trim(), scope: draft.scope,
+      transport: draft.transport,
+      url: draft.transport === 'stdio' ? null : draft.url.trim(),
+      command: draft.transport === 'stdio' ? draft.command.trim() : null,
+      args: draft.transport === 'stdio' ? draft.args : [],
+      auth_method: draft.auth_method || null,
+      auth_secret_env: draft.auth_secret_env || null,
+    }, 'PUT')
+      .then(function () {
+        if (!draft.secret_value.trim()) return null;
+        return postJson(SOURCES_API + '/' + encodeURIComponent(id) + '/secret',
+                        { value: draft.secret_value }, 'PUT');
+      })
+      .then(function () {
+        // Tools the admin turned on that the server does not have yet.
+        var added = wanted.filter(function (t) { return !haveNames[t.name]; });
+        if (!added.length) return null;
+        return Promise.all(added.map(function (t) { return registerTool(id, t); }));
+      })
+      .then(function () {
+        /* Tools the admin turned OFF. This is the half a re-post cannot do,
+           and leaving them behind would keep them callable — the toggle would
+           be decoration. */
+        var dropped = editing.tools.filter(function (t) { return !wantedNames[t.name]; });
+        if (!dropped.length) return null;
+        return Promise.all(dropped.map(function (t) {
+          return api(TOOLS_API + '/' + encodeURIComponent(t.tool_id), { method: 'DELETE' })
+            .catch(function (e) { if (e && e.status === 404) return null; throw e; });
+        }));
+      })
+      .then(function () {
+        var have = {};
+        editing.groups.forEach(function (g) { have[g.id] = true; });
+        var add = draft.groups.filter(function (g) { return !have[g.id]; });
+        if (!add.length) return null;
+        return Promise.all(add.map(function (g) { return grantGroup(id, g); }));
+      })
+      .then(function () {
+        var wantG = {};
+        draft.groups.forEach(function (g) { wantG[g.id] = true; });
+        var revoke = editing.groups.filter(function (g) { return !wantG[g.id]; });
+        if (!revoke.length) return null;
+        return Promise.all(revoke.map(function (g) {
+          return api(SOURCES_API + '/' + encodeURIComponent(id) + '/grants/' + encodeURIComponent(g.id),
+                     { method: 'DELETE' })
+            .catch(function (e) { if (e && e.status === 404) return null; throw e; });
+        }));
+      })
+      .then(function () {
+        window.location.href = '/admin/mcp-sources/' + encodeURIComponent(id);
+      })
+      .catch(function (e) {
+        saveErr = (e && e.message) || 'Could not save the changes.';
+        saving = false;
+        render();
+      });
+  }
+
   function save() {
     if (saving || !canSave()) return;
+    if (editing) return saveEdit();
     saving = true; saveErr = null;
     render();
     var body = Object.assign({ name: draft.name.trim(), enabled: true, scope: draft.scope },
@@ -871,6 +956,16 @@
     /* Once the row exists the slots are history: an admin looking at a
        registered source does not need to be told what is "still to settle",
        and the line would sit there naming fields that are now saved. */
+    if (editing) {
+      var extra = editing.partialGroups.length
+        ? editing.partialGroups.length + ' group' + (editing.partialGroups.length > 1 ? 's have' : ' has') +
+          ' access to some of its tools but not all — saving leaves those alone'
+        : 'change what you need and save';
+      return '<div class="ag-prog">' +
+        '<span class="ag-prog-n">Registered</span>' +
+        '<span class="ag-prog-t">' + esc(extra) + '</span>' +
+      '</div>';
+    }
     if (registered) {
       return '<div class="ag-prog">' +
         '<span class="ag-prog-n">Registered</span>' +
@@ -938,9 +1033,14 @@
   }
 
   function leftHtml() {
-    var rows = conv.length ? conv : (convBusy ? [] : [{ role: 'assistant', text:
-      'Connecting a tool server takes four things: where it lives, how it authenticates, ' +
-      'which of its tools to expose, and who may call them. Tell me what you are connecting.' }]);
+    var opening = editing
+      // Editing: the four things are already answered, and repeating the
+      // registration script here would read as though nothing had been done.
+      ? 'This source is registered. Change the endpoint, its authentication, which tools are ' +
+        'exposed or who may call them — tell me what should be different, or edit the panel directly.'
+      : 'Connecting a tool server takes four things: where it lives, how it authenticates, ' +
+        'which of its tools to expose, and who may call them. Tell me what you are connecting.';
+    var rows = conv.length ? conv : (convBusy ? [] : [{ role: 'assistant', text: opening }]);
     /* With no model configured the page used to render a greeting, a red
        error under it, and a live composer + chips — every one of which failed
        identically. One standing notice instead. */
@@ -963,7 +1063,7 @@
         readOnly: llmUnavailable,
         placeholder: llmUnavailable
           ? 'No AI is configured here — fill the configuration on the right by hand.'
-          : 'Tell me what you are connecting…',
+          : (editing ? 'Tell me what should change…' : 'Tell me what you are connecting…'),
         chips: convBusy || llmUnavailable ? [] : convChips,
       });
   }
@@ -972,9 +1072,20 @@
     if (!mount) return;
     mount.innerHTML =
       window.BuilderShell.head({
-        backLabel: 'Library', title: draft.name || 'New MCP source', titleId: 'mcp-title',
+        backLabel: 'Library',
+        title: editing ? (draft.name || 'MCP source') : (draft.name || 'New MCP source'),
+        titleHtml: editing
+          ? '<h2 id="mcp-title">' + esc(draft.name || 'MCP source') +
+            ' <span class="ag-title-mode">— editing</span></h2>'
+          : null,
+        titleId: 'mcp-title',
         actionsId: 'mcp-actions',
-        actions: registered
+        actions: editing
+          ? '<a class="cc-btn" href="/admin/mcp-sources/' + esc(editing.id) + '">Cancel</a>' +
+            '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
+            (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Saving…') + '"') + '>' +
+            (saving ? 'Saving…' : 'Save changes') + '</button>'
+          : registered
           ? '<button type="button" class="cc-btn cc-btn--primary" id="mcp-done"' +
             (saving ? ' disabled' : '') + '>' + (saving ? 'Sharing…' : 'Done') + '</button>'
           : '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
@@ -1102,10 +1213,78 @@
     });
   }
 
+  /* Open a source that already exists. What the server has becomes both the
+     panel's starting state AND `editing`, the baseline save diffs against. */
+  function openEdit(id) {
+    // Groups first: a grant is stored as an id, and a chip reading
+    // "f3a1c2…" is not access an admin can check at a glance.
+    return loadGroups()
+      .then(function () { return api(SOURCES_API + '/' + encodeURIComponent(id)); })
+      .then(function (src) {
+        var byId = {};
+        (groups || []).forEach(function (g) { byId[g.id] = g.name; });
+        var granted = (src.grants || []).map(function (gid) {
+          return { id: String(gid), name: byId[String(gid)] || String(gid) };
+        });
+        draft = newDraft();
+        draft.name = String(src.name || '');
+        draft.transport = String(src.transport || 'http');
+        draft.url = String(src.url || '');
+        draft.command = String(src.command || '');
+        draft.args = src.args || [];
+        draft.scope = String(src.scope || 'shared');
+        draft.auth_method = String(src.auth_method || '');
+        draft.auth_secret_env = String(src.auth_secret_env || '');
+        draft.auth_decided = true;   // whatever it is, it was decided once
+        draft.tools = (src.tools || []).map(function (t) {
+          return {
+            name: String(t.original_name || t.exposed_name || ''),
+            description: String(t.description || ''),
+            input_schema: t.input_schema || null,
+            // `mutating` is what registration wrote from the upstream's
+            // readOnlyHint; reading it back the same way keeps the "writes"
+            // marker honest instead of re-guessing it.
+            read_only: t.mutating === false ? true : null,
+          };
+        });
+        draft.enabled = {};
+        draft.tools.forEach(function (t) { draft.enabled[t.name] = true; });
+        draft.groups = granted;
+        // A registered source has been reached at least once; requiring a
+        // fresh check to edit its name would be theatre.
+        draft.introspected = draft.tools.length > 0;
+        editing = {
+          id: String(src.id),
+          tools: (src.tools || []).map(function (t) {
+            return { tool_id: String(t.tool_id), name: String(t.original_name || t.exposed_name || '') };
+          }),
+          groups: granted,
+          url: String(src.url || ''),
+          partialGroups: (src.partial_grants || []).map(String),
+        };
+        savedId = editing.id;
+        render();
+      })
+      .catch(function (e) {
+        saveErr = 'Could not open this source for editing: ' + ((e && e.message) || 'unknown error');
+        render();
+      });
+  }
+
   window.AgnesMcpBuilder = {
     open: function (opts) {
       mount = opts.mount;
       DATA_APPS_ENABLED = !!opts.dataAppsEnabled;
+      if (opts.editSourceId) {
+        // No greeting, no draft resume: this page is about one source that
+        // already exists, and restoring an unrelated half-typed one over it
+        // is how an edit turns into somebody else's connection.
+        draft = newDraft();
+        wire();
+        render();
+        openEdit(String(opts.editSourceId));
+        return;
+      }
       var saved = restoreDraft();
       draft = saved ? Object.assign(newDraft(), saved.draft) : newDraft();
       conv = (saved && Array.isArray(saved.conv)) ? saved.conv : [];

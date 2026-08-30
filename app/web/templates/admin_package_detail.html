@@ -748,14 +748,15 @@
   // A full reload on save rather than a patch of the DOM: the name shows in
   // the hero, the breadcrumb, the "Appears as" block and the page title, and
   // re-rendering four places by hand is how they drift apart.
+  /* Editing on purpose goes to the builder PAGE, not an overlay: authoring a
+     package was a workspace and revising it was a drawer on top of whatever
+     you were looking at — the same component at two sizes, which made the
+     edit read as the lesser thing. The drawer keeps the case it was built for
+     (mid-sentence on /admin/tables), and this button leaves. */
   const editBtn = $("apd-edit-details");
   if (editBtn) {
     editBtn.addEventListener("click", () => {
-      window.AgnesPackageDrawer.open({
-        mode: "edit",
-        pkgId: PKG_ID,
-        onSaved: () => window.location.reload(),
-      });
+      window.location.href = `/admin/data-packages/${encodeURIComponent(PKG_ID)}/edit`;
     });
   }
   const toastEl = $("apd-toast");

@@ -28,6 +28,7 @@ the sequence of HTTP calls the module makes.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -723,4 +724,112 @@ def test_the_structured_detail_survives_to_the_caller():
     assert "e.detail = d;" in src
     assert "kind !== 'no_tools_registered'" in src, (
         "the 409 swallow must exclude no_tools_registered by its stable error code"
+    )
+
+
+# ── Editing a registered source: save sends the DIFFERENCE ──────────────────
+
+
+def _edit_script(tail: str) -> str:
+    """Open the builder on a source that already exists and drive one edit.
+
+    Registering was a builder and revising was the detail page's own form, so
+    the connection, the tool curation and the grants were entered in one
+    vocabulary and changed in another. Now it is one surface — and the save it
+    performs cannot be the create path's "post everything", because a tool
+    turned off has to be DELETED and a group unpicked has to be REVOKED.
+    """
+    return (
+        _HARNESS
+        + _load(SHELL, MCP)
+        + r"""
+installFetch({
+  'GET /api/admin/groups': { status: 200, body: [
+    { id: 'g1', name: 'Analysts' }, { id: 'g2', name: 'Finance' },
+  ] },
+  'GET /api/admin/mcp-sources/s1': { status: 200, body: {
+    id: 's1', name: 'acme_crm', transport: 'http', url: 'https://mcp.example.com/sse',
+    auth_method: '', auth_secret_env: '', scope: 'shared',
+    tools: [
+      { tool_id: 's1__search', original_name: 'search', description: 'read', mutating: false },
+      { tool_id: 's1__write', original_name: 'write_row', description: 'writes', mutating: true },
+    ],
+    grants: ['g2'], partial_grants: [],
+  } },
+});
+window.AgnesMcpBuilder.open({ mount, editSourceId: 's1' });
+(async () => {
+  for (let i = 0; i < 10; i++) await flush();
+"""
+        + tail
+        + r"""
+})();
+"""
+    )
+
+
+def test_the_loaded_source_is_the_panel_and_the_baseline():
+    """Both, from one read: what the admin sees, and what save compares to."""
+    res = _node(_edit_script(r"""
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+"""))
+    assert "GET /api/admin/mcp-sources/s1" in res["all"], f"the source was never loaded: {res['all']}"
+    # The group list is fetched too — a grant is stored as an id, and a chip
+    # reading "g2" is not access an admin can check at a glance.
+    assert "GET /api/admin/groups" in res["all"], "grants would render as raw ids"
+
+
+def test_a_tool_turned_off_is_deleted_not_just_unsent():
+    """The half a re-post cannot do. Leaving the row behind keeps the tool
+    callable, which makes the toggle decoration."""
+    res = _node(_edit_script(r"""
+  fire('click', { 'data-mcp-tool': 'write_row' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS, href: window.location.href }));
+"""))
+    assert "DELETE /api/admin/mcp-tools/s1__write" in res["all"], (
+        f"the tool turned off stays registered and callable: {res['all']}"
+    )
+    assert "DELETE /api/admin/mcp-tools/s1__search" not in res["all"], (
+        "it deleted a tool that was left on"
+    )
+    assert res["href"] == "/admin/mcp-sources/s1", f"the save never finished: {res['all']}"
+
+
+def test_a_group_unpicked_is_revoked():
+    res = _node(_edit_script(r"""
+  fire('click', { 'data-mcp-unpick': 'g2' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+"""))
+    assert "DELETE /api/admin/mcp-sources/s1/grants/g2" in res["all"], (
+        f"unpicking a group left its access live: {res['all']}"
+    )
+
+
+def test_an_unchanged_edit_registers_nothing_twice():
+    """Saving without changing anything must not re-register the tools that
+    are already there — the create path's POST per tool would duplicate them."""
+    res = _node(_edit_script(r"""
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+"""))
+    assert "POST /api/admin/mcp-tools" not in res["all"], f"tools were re-registered: {res['all']}"
+    assert "POST /api/admin/mcp-sources" not in res["all"], f"a second source was created: {res['all']}"
+    assert "PUT /api/admin/mcp-sources/s1" in res["all"], "the source itself was never updated"
+
+
+def test_editing_never_overwrites_the_draft_slot():
+    """`persistDraft` is keyed on one localStorage entry shared with the create
+    path — writing an opened source into it would replace whatever half-typed
+    connection the admin had, and offer to resume one already registered."""
+    src = MCP.read_text(encoding="utf-8")
+    body = re.search(r"function persistDraft\(\) \{(.*?)\n  \}", src, re.S)
+    assert body and "if (editing) return" in body.group(1), (
+        "an edit is being parked as a draft"
     )

@@ -1233,6 +1233,8 @@ class TestStoreSmoke:
         "POST /api/store/entities/from-markdown",
         "POST /api/store/entities/from-components",
         "PUT /api/store/entities/{entity_id}",
+        "GET /api/store/entities/{entity_id}/markdown",
+        "PUT /api/store/entities/{entity_id}/from-markdown",
         "POST /api/store/entities/{entity_id}/install",
         "DELETE /api/store/entities/{entity_id}/install",
         "POST /api/store/entities/{entity_id}/rate",
@@ -1241,6 +1243,18 @@ class TestStoreSmoke:
         "GET /api/store/bundle.zip",
         "POST /api/store/import-bundle",
     }
+
+    def test_reading_and_writing_an_entity_document(self, seeded_app_both):
+        """The editing pair. Both refuse an unknown id the same way the rest of
+        the store does — 404, without admitting whether the row exists."""
+        c, h = seeded_app_both["client"], _admin_headers(seeded_app_both)
+        assert c.get("/api/store/entities/nope/markdown", headers=h).status_code == 404
+        r = c.put(
+            "/api/store/entities/nope/from-markdown",
+            json={"name": "whatever", "skill_md": "# hi"},
+            headers=h,
+        )
+        assert r.status_code == 404, r.text
 
     def test_categories(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/store/categories", headers=_admin_headers(seeded_app_both))
@@ -1367,9 +1381,28 @@ class TestMcpBuilderSmoke:
 
     COVERED_ROUTES = {
         "GET /admin/mcp-sources/new",
+        "GET /admin/mcp-sources/{source_id}/edit",
+        "GET /admin/data-packages/{pkg_id}/edit",
         "POST /api/admin/mcp-sources/builder/turn",
         "GET /admin/linked-apps/new",
     }
+
+    def test_editing_an_unknown_package_is_a_404(self, seeded_app_both):
+        """Same reason as the source below: an edit page pointed at nothing
+        would render an empty builder that CREATES on save."""
+        r = seeded_app_both["client"].get(
+            "/admin/data-packages/does-not-exist/edit", headers=_admin_headers(seeded_app_both)
+        )
+        assert r.status_code == 404, r.text
+
+    def test_editing_an_unknown_source_is_a_404(self, seeded_app_both):
+        """The edit page is the create page pointed at a row — so it has to
+        refuse an id that is not one, rather than rendering an empty builder
+        that would register a second source on save."""
+        r = seeded_app_both["client"].get(
+            "/admin/mcp-sources/does-not-exist/edit", headers=_admin_headers(seeded_app_both)
+        )
+        assert r.status_code == 404, r.text
 
     def test_builder_page_renders_for_an_admin(self, seeded_app_both):
         r = seeded_app_both["client"].get("/admin/mcp-sources/new", headers=_admin_headers(seeded_app_both))

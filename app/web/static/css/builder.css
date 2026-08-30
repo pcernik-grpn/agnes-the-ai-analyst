@@ -55,6 +55,9 @@ body.ag-building .ag-build-head { margin: 0; padding: 14px 28px; }
 /* A footer under a viewport-height workspace is dead scroll. */
 body.ag-building .idx > footer { display: none; }
 .ag-build-head h2 { font-size: 19px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Which mode the header is in, said quietly beside the name — the same
+   treatment /skills gives it, so the two builders read alike. */
+.ag-title-mode { color: var(--ds-text-muted); font-weight: 400; }
 /* What the thing IS, beside the title rather than as a panel section. */
 .ag-build-badge { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .ag-build-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; margin-top: 4px; }

@@ -6747,6 +6747,30 @@ async def admin_mcp_builder(
     return templates.TemplateResponse(request, "admin_mcp_builder.html", _build_context(request, user=user))
 
 
+@router.get("/admin/mcp-sources/{source_id}/edit", response_class=HTMLResponse)
+async def admin_mcp_builder_edit(
+    source_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The same builder, opened on a source that already exists.
+
+    Registering used to be a builder and revising was a different surface —
+    the detail page's own form — so the connection, the tool curation and the
+    grants were entered in one vocabulary and changed in another. The detail
+    page stays what it is (the operations console: secrets, per-user
+    connections, OAuth registration, classification, materialize); what moved
+    here is the part the builder created, so it is edited where it was made.
+    """
+    from src.repositories import mcp_sources_repo
+
+    if mcp_sources_repo().get(source_id) is None:
+        raise HTTPException(status_code=404, detail="mcp_source_not_found")
+    ctx = _build_context(request, user=user)
+    ctx["edit_source_id"] = source_id
+    return templates.TemplateResponse(request, "admin_mcp_builder.html", ctx)
+
+
 @router.get("/admin/data-packages/new", response_class=HTMLResponse)
 async def admin_package_builder(
     request: Request,
@@ -6768,6 +6792,30 @@ async def admin_package_builder(
     # theme and the rest of the app chrome. Without it the page renders as a
     # builder floating on nothing.
     return templates.TemplateResponse(request, "admin_package_builder.html", _build_context(request, user=user))
+
+
+@router.get("/admin/data-packages/{pkg_id}/edit", response_class=HTMLResponse)
+async def admin_package_builder_edit(
+    pkg_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The same builder page, opened on a package that already exists.
+
+    Authoring one was a workspace and revising it was an overlay on top of
+    whatever page you happened to be on — the same fields, the same component,
+    at two sizes, so the edit read as a smaller and lesser thing than the
+    create. The drawer keeps the case it was built for (mid-sentence on
+    /admin/tables, assigning a table to a package that does not exist yet);
+    editing on purpose gets the page.
+    """
+    from src.repositories import data_packages_repo
+
+    if data_packages_repo().get(pkg_id) is None:
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+    ctx = _build_context(request, user=user)
+    ctx["edit_pkg_id"] = pkg_id
+    return templates.TemplateResponse(request, "admin_package_builder.html", ctx)
 
 
 @router.get("/admin/data-packages", response_class=HTMLResponse)

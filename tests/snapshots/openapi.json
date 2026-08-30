@@ -13836,6 +13836,65 @@
         ]
       }
     },
+    "/admin/data-packages/{pkg_id}/edit": {
+      "get": {
+        "description": "The same builder page, opened on a package that already exists.\n\nAuthoring one was a workspace and revising it was an overlay on top of\nwhatever page you happened to be on \u2014 the same fields, the same component,\nat two sizes, so the edit read as a smaller and lesser thing than the\ncreate. The drawer keeps the case it was built for (mid-sentence on\n/admin/tables, assigning a table to a package that does not exist yet);\nediting on purpose gets the page.",
+        "operationId": "admin_package_builder_edit_admin_data_packages__pkg_id__edit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pkg_id",
+            "required": true,
+            "schema": {
+              "title": "Pkg Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Package Builder Edit",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/data-sources": {
       "get": {
         "description": "\"Add data source\" wizard (#755): paste a Keboola project's connection\nURL + storage token, validate, then browse buckets/tables and register\nthe ones you want \u2014 no SSH, no config-file edits. Also the home for\nper-project \"Set as default\" and \"Rotate token\" controls \u2014 the single\nplace to manage a Keboola connection end to end.\n\nDistinct from /admin/mcp-sources (MCP tool servers Agnes calls at\nruntime) and from /admin/datasource-credentials (GWS/BQ instance\nsecrets) \u2014 this page owns Keboola project connect/browse/register/\ndefault/rotate. Passes ``vault_key_configured`` so the template can\nrender the same blocking banner as /admin/datasource-credentials when\n``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without\nit).",
@@ -14545,6 +14604,65 @@
           }
         },
         "summary": "Admin Mcp Source Detail Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/mcp-sources/{source_id}/edit": {
+      "get": {
+        "description": "The same builder, opened on a source that already exists.\n\nRegistering used to be a builder and revising was a different surface \u2014\nthe detail page's own form \u2014 so the connection, the tool curation and the\ngrants were entered in one vocabulary and changed in another. The detail\npage stays what it is (the operations console: secrets, per-user\nconnections, OAuth registration, classification, materialize); what moved\nhere is the part the builder created, so it is edited where it was made.",
+        "operationId": "admin_mcp_builder_edit_admin_mcp_sources__source_id__edit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Mcp Builder Edit",
         "tags": [
           "web"
         ]

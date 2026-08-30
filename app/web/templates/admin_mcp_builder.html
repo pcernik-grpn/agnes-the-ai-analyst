@@ -44,6 +44,9 @@
       // separate linked-apps builder existed on instances where data apps are
       // switched off, and every path through it ended in `data_apps_disabled`.
       dataAppsEnabled: {{ 'true' if data_apps_enabled() else 'false' }},
+      {# Set by /admin/mcp-sources/<id>/edit. Absent on the create path, which
+         is the same page with nothing to load. #}
+      editSourceId: {{ (edit_source_id | tojson) if edit_source_id else 'null' }},
     });
   })();
 </script>

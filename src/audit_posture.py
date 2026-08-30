@@ -1049,6 +1049,8 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/marketplaces": "exempt:ui_support",
     "GET /admin/mcp-sources": "exempt:ui_support",
     "GET /admin/mcp-sources/new": "exempt:ui_support",
+    "GET /admin/mcp-sources/{source_id}/edit": "exempt:ui_support",
+    "GET /admin/data-packages/{pkg_id}/edit": "exempt:ui_support",
     "GET /admin/mcp-sources/{source_id}": "exempt:ui_support",
     "GET /admin/mcp-tools/{tool_id}/grants": "exempt:ui_support",
     "GET /admin/news": "exempt:ui_support",

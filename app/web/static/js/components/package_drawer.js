@@ -803,11 +803,17 @@
          (the one the Library's "+ Add" reaches) explained least. */
       '<p class="ag-cfg-blurb pdw-blurb">A data package is how governed tables reach an analyst. Tables are ' +
       'registered on this instance but reach nobody on their own: a package bundles them, you grant the package ' +
-      'to a group, and its members pull those tables to their laptop. Nothing is written until you press Create.</p>' +
+      'to a group, and its members pull those tables to their laptop. ' +
+      // Name the button that is actually on screen. In edit mode it reads
+      // "Save changes", and telling the admin to press Create was the page
+      // describing a different page.
+      (st && st.mode === 'edit'
+        ? 'Nothing is written until you press Save changes.'
+        : 'Nothing is written until you press Create.') + '</p>' +
       BuilderShell.conversation({
         id: 'pdw-conv-scroll',
         // With no model the opening line promises drafting that cannot happen.
-        rows: llmUnavailable ? conv : [{ role: 'assistant', text: OPENING }].concat(conv),
+        rows: llmUnavailable ? conv : [{ role: 'assistant', text: opening() }].concat(conv),
         busy: convBusy,
         err: llmUnavailable ? null : convErr,
       }) +
@@ -821,7 +827,11 @@
            last turn" put them back mid-conversation, so a nearly-finished
            package could be offered a fresh-start brief — one click from
            landing on top of real work. */
-        chips: (convBusy || llmUnavailable) ? [] : (convChips.length ? convChips : (authorHasSpoken() ? [] : STARTERS)),
+        chips: (convBusy || llmUnavailable) ? []
+          : (convChips.length ? convChips
+             // Starters describe a package that does not exist yet. On an
+             // edit they would offer to start over on top of real work.
+             : ((authorHasSpoken() || (st && st.mode === 'edit')) ? [] : STARTERS)),
       });
     var el = els.convHost.querySelector('#pdw-conv-scroll');
     if (el) el.scrollTop = el.scrollHeight;
@@ -829,6 +839,9 @@
 
   var OPENING = 'Tell me what this package should carry and who it is for. ' +
     'I will propose the tables and the groups — you review the access before anything is written.';
+  var OPENING_EDIT = 'This package already exists. Tell me what should change about what it carries or ' +
+    'who gets it — I will propose it, and nothing is written until you save.';
+  function opening() { return (st && st.mode === 'edit') ? OPENING_EDIT : OPENING; }
   var STARTERS = ['Our sales pipeline tables', 'Everything finance needs for invoicing', 'Which tables are not in a package yet?'];
 
   /* One turn. Proposes into the drawer; writes nothing. The reply is inserted
