@@ -2955,6 +2955,45 @@ class TestSourceCardRefreshWiring:
         page = self._page(seeded_app)
         assert page.count('fetch("/api/admin/source-pipelines"') == 1
 
+    # The strip is not the whole card. These handlers also change something
+    # the card BODY or head draws from the connection ROW (`config`, secret
+    # presence, chat-tools state, or the row's very existence), and the strip
+    # endpoint does not carry rows — so they re-read the list too.
+    REDRAWERS = {
+        "importKeboolaConnection": "the derived card becomes a real connection row",
+        "saveSpCertificate": "secret presence + certificate metadata on the row",
+        "setDefaultConn": "the `default` tag in the card head",
+        "saveRotatedToken": "secret presence badge",
+        "saveMasterToken": "secret presence badge",
+        "removeMasterToken": "secret presence badge",
+        "unbindProject": "`config.project_id` — the subtitle and the Unbind row",
+        "toggleChatTools": "`has_chat_tools` + `chat_tools_source_id`",
+        "runSpExtraction": "the dispatch stamps `config.extraction.last_run_at`",
+        "closeSpWizard": "`config.scopes` — the identity line and scope list",
+        "closeWizard": "a connection created in step 1 has no card at all yet",
+    }
+
+    def test_handlers_that_change_the_row_also_redraw_the_card_list(self, seeded_app):
+        page = self._page(seeded_app)
+        missing = [
+            f"{name} ({why})"
+            for name, why in self.REDRAWERS.items()
+            if "loadConnections(" not in self._js_function_body(page, name)
+        ]
+        assert not missing, (
+            "these handlers change what the card's ROW says, which the strip "
+            "endpoint does not carry — refreshing the strip alone leaves the "
+            "card body stale until a hard reload:\n" + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_delete_redraws_from_the_cached_list_on_purpose(self, seeded_app):
+        """The one deliberate exception to the rule above: the deleted row is
+        dropped from `_connections` locally, so re-fetching the list to learn
+        the same thing would be a round-trip for nothing."""
+        body = self._js_function_body(self._page(seeded_app), "deleteConn")
+        assert "renderConnList()" in body
+        assert "loadConnections(" not in body
+
 
 class TestRefreshSourcePipelinesBehavior:
     """`refreshSourcePipelines()` executed for real via `node` — the strip
@@ -2985,7 +3024,7 @@ class El {
 }
 """
 
-    def _run(self, *, fresh: dict, ok: bool = True) -> dict:
+    def _run(self, *, fresh: dict, ok: bool = True, break_repaint: bool = False, concurrent: int = 1) -> dict:
         import json
         import subprocess
         import tempfile
@@ -3007,6 +3046,7 @@ class El {
                 "function _repaintSourceCards() {",
             )
         )
+        break_repaint_js = "true" if break_repaint else "false"
         script = f"""
 {self._DOM_SHIM}
 {fns}
@@ -3019,6 +3059,9 @@ let SOURCE_PIPELINES = {{
           "feeds": {{"packages": 0, "groups": 0, "people": 0}}}}
 }};
 let _connections = [{{"id": "c1", "source_type": "keboola", "config": {{}}}}];
+// Declared beside the function in the template, so it is not part of what
+// `_extract_function` lifts out.
+let _pipelineRefreshInFlight = null;
 
 const card = new El("ds-src");
 const head = new El("ds-src__head");
@@ -3030,19 +3073,34 @@ const bodyEl = new El("ds-src__body");
 bodyEl.hidden = false;  // the admin has this card expanded
 card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip}};
 head.kids = {{".ds-src__health": chip, ".ds-src__acts": acts}};
-global.document = {{ getElementById: (id) => (id === "ds-conn-c1" ? card : null) }};
+const breakRepaint = {break_repaint_js};
+global.document = {{
+  getElementById: (id) => {{
+    if (breakRepaint) throw new Error("DOM is gone");
+    return id === "ds-conn-c1" ? card : null;
+  }},
+}};
 
 let fetched = null;
+let fetchCount = 0;
 global.fetch = async (url, opts) => {{
   fetched = {{ url, opts }};
+  fetchCount++;
+  await new Promise((res) => setTimeout(res, 5));
   return {{ ok: {str(ok).lower()}, status: {200 if ok else 500},
             json: async () => ({json.dumps(fresh)}) }};
 }};
 
 (async () => {{
-  const returned = await refreshSourcePipelines();
+  const results = await Promise.all(
+    Array.from({{ length: {concurrent} }}, () => refreshSourcePipelines()),
+  );
+  const returned = results[0];
   console.log(JSON.stringify({{
     returned,
+    results,
+    fetchCount,
+    inFlightCleared: _pipelineRefreshInFlight === null,
     fetchedUrl: fetched && fetched.url,
     credentials: fetched && fetched.opts && fetched.opts.credentials,
     stripWritten: strip.written,
@@ -3111,3 +3169,22 @@ global.fetch = async (url, opts) => {{
         assert out["stripWritten"] is None
         assert out["stripRemoved"] is False
         assert out["chipText"] == "No tables yet"
+
+    def test_a_throwing_repaint_is_a_failed_refresh_not_an_escaping_error(self):
+        """Two callers await this from inside a `finally` block. An exception
+        escaping the repaint would replace whatever error that block was
+        already unwinding — so the repaint lives inside the same `try` as the
+        read, and a broken DOM is simply `false`."""
+        out = self._run(fresh=self._FRESH, break_repaint=True)
+        assert out["returned"] is False
+        assert out["inFlightCleared"] is True
+
+    def test_concurrent_callers_share_one_read(self):
+        """A wizard exit reaches this from several places within a tick. Two
+        overlapping reads resolve last-response-wins, and the loser can be the
+        older snapshot — the exact staleness this function removes."""
+        out = self._run(fresh=self._FRESH, concurrent=3)
+        assert out["fetchCount"] == 1
+        assert out["results"] == [True, True, True]
+        # And the marker is cleared, so the NEXT mutation still gets a fresh read.
+        assert out["inFlightCleared"] is True

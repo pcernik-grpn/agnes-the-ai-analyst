@@ -1061,11 +1061,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   package creation and sharing, token saves, chat-tools toggles, unbinding a
   project. So an admin who registered two dozen tables kept reading "Add the
   first tables → / Never synced / 0 packages" until they hard-reloaded: the
-  setup was done and the app said nothing had happened. Every mutating action
-  on the page now re-reads the strip from a new read-only, admin-gated
+  setup was done and the app said nothing had happened. Each of those handlers
+  now re-reads the strip from a new read-only, admin-gated
   `GET /api/admin/source-pipelines` (the same fold the template inlines — no
   new data, no new authority) and repaints the affected card in place, so an
-  expanded card and the scroll position survive the update.
+  expanded card and the scroll position survive the update; the handlers that
+  also change what the card's own row says — a stored token, a cleared project
+  binding, chat tools, a queued SharePoint extraction, a connection created or
+  deleted — redraw the card list from that same fresh read.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,

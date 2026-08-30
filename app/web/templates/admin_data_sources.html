@@ -2622,17 +2622,36 @@ function renderConnList() {
    browse panel open is mid-task, and a reload throws that away along with
    their scroll position. A failed refresh keeps the stale strip and says
    nothing — a card that stops updating is recoverable, one that empties
-   itself is not. */
+   itself is not.
+
+   This carries the STRIP, not the connection rows. A handler that also
+   changed what the row itself says — a stored secret, a cleared project
+   binding, a queued extraction's timestamp, a connection that now exists at
+   all — pairs this with `loadConnections()`, in that order, so the redraw
+   below paints from the fresh dict. */
+let _pipelineRefreshInFlight = null;
+
 async function refreshSourcePipelines() {
-  try {
-    const r = await fetch("/api/admin/source-pipelines", { credentials: "include" });
-    if (!r.ok) return false;
-    SOURCE_PIPELINES = await r.json();
-  } catch (_) {
-    return false;
-  }
-  _repaintSourceCards();
-  return true;
+  // One read at a time. A wizard exit calls this from several places within a
+  // tick, and two overlapping reads would resolve last-response-wins — which,
+  // with the older response landing second, is the stale strip this whole
+  // function exists to remove. Everyone waiting gets the same promise.
+  if (_pipelineRefreshInFlight) return _pipelineRefreshInFlight;
+  _pipelineRefreshInFlight = (async () => {
+    try {
+      const r = await fetch("/api/admin/source-pipelines", { credentials: "include" });
+      if (!r.ok) return false;
+      SOURCE_PIPELINES = await r.json();
+      // Inside the try: a repaint that throws must report itself as a failed
+      // refresh, not escape into a caller's `finally` and replace whatever
+      // error that block was already unwinding.
+      _repaintSourceCards();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  })().finally(() => { _pipelineRefreshInFlight = null; });
+  return _pipelineRefreshInFlight;
 }
 
 /* Swap each drawn card's strip and status word for what the fresh dict says,
@@ -2798,7 +2817,11 @@ async function runSpExtraction(id) {
       resultEl.className = "ds-conn-test-result show ok";
       resultEl.textContent = `✓ Extraction queued (job ${body.job_id})`;
       showToast("Extraction queued.", true);
+      // The dispatch stamps `config.extraction.last_run_at` on the connection
+      // row, and the body's "In-Agnes extraction" line reads it — so this
+      // needs the rows re-read too, not just the strip.
       await refreshSourcePipelines();
+      await loadConnections();
     } else {
       const msg = detailMessage(body, "failed to start extraction");
       resultEl.className = "ds-conn-test-result show fail";
@@ -4308,8 +4331,11 @@ async function closeWizard() {
   document.body.style.overflow = "";
   // The wizard is where a source's whole pipeline gets built — connection,
   // tables, packages, grants — and every card behind it was drawn before any
-  // of that happened.
+  // of that happened. On EVERY exit, not only the Finish button: a connection
+  // created in step 1 and then dismissed with X/Escape is still a connection,
+  // and it has no card at all until the list is re-read.
   await refreshSourcePipelines();
+  await loadConnections();
 }
 
 async function connectAndValidate() {
@@ -4509,9 +4535,7 @@ async function finishWizard() {
   await closeWizard();
   if (_wizardSource === "snowflake") {
     window.location.reload();
-    return;
   }
-  loadConnections();
 }
 
 /* ── Step 2 (BigQuery): manual rows editor ────────────────────────────────
@@ -5871,8 +5895,11 @@ async function closeSpWizard() {
   document.body.style.overflow = "";
   // Same contract as the table wizard's own exit: this drawer connects a
   // source, scopes it and shares it, and every card behind it was drawn
-  // before any of that happened.
+  // before any of that happened. The rows too — scopes live in the
+  // connection's own `config`, so the card's identity line and its scope
+  // list are as stale as the strip.
   await refreshSourcePipelines();
+  await loadConnections();
 }
 
 function spGoStep(step) {
