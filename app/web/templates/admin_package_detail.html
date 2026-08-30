@@ -486,8 +486,18 @@
         </div>
         <div class="apd-fact">
           <span class="apd-fact__k">Reaches</span>
-          <span class="apd-fact__v" id="apd-fact-reach">
+          {# A draft reaches nobody and a coming-soon package delivers to
+             nobody, whatever the grants say — both are enforced in
+             app/services/stack_resolver.py. Printing the grant count here
+             unqualified is how this fact contradicted the panel below it. #}
+          <span class="apd-fact__v{{ ' is-warn' if delivery.withheld else '' }}" id="apd-fact-reach">
+            {%- if delivery.withheld == 'hidden' %}
+            Nobody — draft
+            {%- elif delivery.withheld == 'undeliverable' %}
+            Nobody yet — coming soon
+            {%- else %}
             {{ delivery.auto_people }} automatically
+            {%- endif %}
           </span>
         </div>
         {% if pkg.owner_name %}
@@ -889,6 +899,24 @@
       if (optCount) {
         lines.push(['none',
           `<b>${optCount}</b> group${optCount === 1 ? " can" : "s can"} add it themselves.`]);
+      }
+    } else if (DELIVERY.withheld) {
+      // A lifecycle status overrides the grant arithmetic. `draft` is hidden
+      // from analysts and `coming-soon` is undeliverable (both enforced in
+      // app/services/stack_resolver.py), so reporting "N people get this
+      // automatically" here would restate the exact claim that gate exists
+      // to stop. Say what the grants WOULD do, and why they currently do not.
+      const would = DELIVERY.auto_people + DELIVERY.optional_only;
+      if (DELIVERY.withheld === 'hidden') {
+        lines.push(['stale',
+          `Status is <b>draft</b> — this reaches <b>nobody</b>. It is hidden from every analyst Library and no table in it is delivered.`]);
+      } else {
+        lines.push(['stale',
+          `Status is <b>coming soon</b> — visible in the Library, but <b>not delivered</b>. No local copy is downloaded.`]);
+      }
+      if (would) {
+        lines.push(['none',
+          `<b>${would}</b> ${would === 1 ? "person is" : "people are"} already granted it, and will receive it as soon as the status changes.`]);
       }
     } else {
       if (DELIVERY.auto_people) {

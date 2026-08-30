@@ -30,12 +30,15 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 removes the row, leaves any
                                                                 already-created collection
                                                                 alone.
-  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the flat
-                                                                ``{source_scope_id: collection_id}``
-                                                                mapping ``ship_to_agnes.py
-                                                                --corpus-map`` consumes. Per-scope
-                                                                ``anonymize`` is NOT in this shape
-                                                                (kept flat/backward-compatible) —
+  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the
+                                                                ``{"<site>"|"<site>/<folder path>":
+                                                                collection_id}`` mapping
+                                                                ``ship_to_agnes.py --corpus-map``
+                                                                consumes, in the producer
+                                                                resolver's own key shape. 409
+                                                                ``corpus_map_ambiguous`` rather
+                                                                than a best-guess map. Per-scope
+                                                                ``anonymize`` is NOT in this shape —
                                                                 a producer that needs it reads the
                                                                 sibling ``GET .../scopes`` endpoint
                                                                 instead (each row already carries
@@ -120,6 +123,7 @@ from connectors.sharepoint.graph_client import (
     probe_unique_permissions,
     search_folders,
 )
+from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.repositories import (
     file_corpora_repo,
@@ -784,20 +788,34 @@ async def corpus_map(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
-    """Producer handoff (spec §13.2 / item 3): the flat
-    ``{source_scope_id: collection_id}`` mapping the external crawl pipeline
-    reads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside
-    Agnes. Not wrapped in an envelope key — the producer consumes this
-    verbatim as the mapping itself.
+    """Producer handoff (spec §13.2 / item 3): the corpus map the external
+    crawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in
+    the producer resolver's OWN shape — ``"<site display name>"`` or
+    ``"<site display name>/<drive-relative folder path>"`` — built by the
+    same shared translation the in-Agnes ``corpus-extraction`` job handler
+    uses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff
+    (``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot
+    drift. The earlier flat ``{source_scope_id: collection_id}`` shape was
+    unusable for routing: the resolver matches keys against crawler rows'
+    site/path components, which a Graph scope id never equals.
 
-    Deliberately does NOT carry ``anonymize`` — that would break this
-    endpoint's flat, backward-compatible shape. A producer that needs to
+    ``409 corpus_map_ambiguous`` when the confirmed scopes cannot form an
+    unambiguous map (e.g. a site scope plus a drive scope of the same
+    site) — never a best-guess map.
+
+    Deliberately does NOT carry ``anonymize`` — a producer that needs to
     know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
     row already carries ``anonymize``); Agnes's own ``corpus-extraction``
     job handler does the equivalent lookup internally
     (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
     row = _sharepoint_connection_or_404(connection_id)
-    return {s["source_scope_id"]: s["collection_id"] for s in _scopes(row) if s.get("source_scope_id")}
+    try:
+        return producer_corpus_map(_scopes(row))
+    except CorpusMapError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "corpus_map_ambiguous", "message": str(exc)},
+        ) from exc
 
 
 @router.get("/connections/{connection_id}/certificate")
