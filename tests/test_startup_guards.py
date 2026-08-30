@@ -76,6 +76,47 @@ def test_split_role_fully_configured_passes(monkeypatch):
     validate_deployment()
 
 
+def test_error_names_the_role_split_trigger_not_a_bare_disjunction(monkeypatch):
+    """A process whose own AGNES_ROLE is split (e.g. the extraction-worker
+    compose service, AGNES_ROLE=worker) gets an error naming ITS actual
+    trigger, not the generic "AGNES_ROLE split or UVICORN_WORKERS>1" the
+    reader previously had to resolve themselves — this is the exact
+    topology that motivated the more specific message."""
+    monkeypatch.setenv("AGNES_ROLE", "worker")
+    reset_roles_cache()
+    monkeypatch.setattr("app.startup_guards._use_pg", lambda: True)
+    monkeypatch.setattr("app.startup_guards._coordination_backend", lambda: "memory")
+    with pytest.raises(DeploymentConfigError) as exc:
+        validate_deployment()
+    message = str(exc.value)
+    prefix = message.split(")")[0]
+    assert "AGNES_ROLE='worker'" in prefix
+    assert "UVICORN_WORKERS" not in prefix  # not falsely blamed on a trigger that never fired
+
+
+def test_error_does_not_blame_role_split_when_coordination_backend_alone_triggers(monkeypatch):
+    """coordination.backend=redis alone (no role split, single worker) must
+    not be blamed on a role split it didn't cause."""
+    monkeypatch.setattr("app.startup_guards._use_pg", lambda: False)
+    monkeypatch.setattr("app.startup_guards._coordination_backend", lambda: "redis")
+    with pytest.raises(DeploymentConfigError) as exc:
+        validate_deployment()
+    message = str(exc.value)
+    prefix = message.split(")")[0]
+    assert "coordination.backend=redis" in prefix
+    assert "AGNES_ROLE" not in prefix
+    assert "UVICORN_WORKERS" not in prefix
+
+
+def test_error_names_worker_count_trigger(monkeypatch):
+    monkeypatch.setenv("UVICORN_WORKERS", "4")
+    reset_roles_cache()
+    monkeypatch.setattr("app.startup_guards._use_pg", lambda: False)
+    with pytest.raises(DeploymentConfigError) as exc:
+        validate_deployment()
+    assert "UVICORN_WORKERS=4 > 1" in str(exc.value).split(")")[0]
+
+
 def test_redis_coordination_alone_triggers_multi_process(monkeypatch):
     """coordination.backend=redis is itself multi-process intent, even in an
     otherwise all-in-one topology (no AGNES_ROLE split, single worker) —
