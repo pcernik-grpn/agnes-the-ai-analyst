@@ -168,3 +168,16 @@ def test_the_package_edit_is_a_page_like_its_create():
         "the in-place drawer was removed from the one surface that needs it — "
         "assigning a table to a package that does not exist yet"
     )
+
+
+def test_an_edit_does_not_announce_a_restored_draft(page):
+    """`openEdit` routes through `chooseType` to reset the panes, then
+    overwrites every field from the saved item — so the create path's
+    "Restored your saved skill draft." toast fired on a page showing something
+    else entirely."""
+    body = re.search(r"function chooseType\(k\) \{(.*?)\n  \}", page, re.S)
+    assert body, "chooseType moved — re-point this guard"
+    tail = body.group(1)
+    assert "if (editing) {" in tail and tail.index("if (editing) {") < tail.index("Restored your saved"), (
+        "an edit announces a restored draft again"
+    )

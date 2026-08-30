@@ -476,21 +476,31 @@
                         { value: draft.secret_value }, 'PUT');
       })
       .then(function () {
-        // Tools the admin turned on that the server does not have yet.
-        var added = wanted.filter(function (t) { return !haveNames[t.name]; });
+        // Tools the admin turned on that the server does not have AT ALL. A
+        // registered-but-disabled one is re-enabled below, not re-created.
+        var added = wanted.filter(function (t) { return haveNames[t.name] === undefined; });
         if (!added.length) return null;
         return Promise.all(added.map(function (t) { return registerTool(id, t); }));
       })
       .then(function () {
-        /* Tools the admin turned OFF. This is the half a re-post cannot do,
-           and leaving them behind would keep them callable — the toggle would
-           be decoration. */
-        var dropped = editing.tools.filter(function (t) { return !wantedNames[t.name]; });
-        if (!dropped.length) return null;
-        return Promise.all(dropped.map(function (t) {
-          return api(TOOLS_API + '/' + encodeURIComponent(t.tool_id), { method: 'DELETE' })
+        /* Tools the admin turned OFF are DISABLED, not deleted.
+           
+           The toggle reads "✓ On / Off", which is the vocabulary of a
+           reversible switch — and the detail page offers exactly that for the
+           same row. Deleting instead threw away the exposed-name override,
+           the description and the input schema, with no confirmation and no
+           undo, for someone doing the cautious thing. Disabling takes the
+           tool out of the callable set just as completely. */
+        var off = editing.tools.filter(function (t) { return t.enabled && !wantedNames[t.name]; });
+        var on = editing.tools.filter(function (t) { return !t.enabled && wantedNames[t.name]; });
+        if (!off.length && !on.length) return null;
+        return Promise.all(off.map(function (t) {
+          return postJson(TOOLS_API + '/' + encodeURIComponent(t.tool_id), { enabled: false }, 'PUT')
             .catch(function (e) { if (e && e.status === 404) return null; throw e; });
-        }));
+        }).concat(on.map(function (t) {
+          return postJson(TOOLS_API + '/' + encodeURIComponent(t.tool_id), { enabled: true }, 'PUT')
+            .catch(function (e) { if (e && e.status === 404) return null; throw e; });
+        })));
       })
       .then(function () {
         var have = {};
@@ -837,6 +847,29 @@
     return '<div class="ag-rows">' + rows + '</div>' + check;
   }
 
+  /* Groups holding SOME of this source's tools but not all.
+
+     They were excluded from the list entirely, so the section printed its
+     categorical "Nobody yet — registered and unreachable" over a source a
+     group could already reach, six inches under a progress line saying so.
+     They are shown, and not removable from here: this builder grants and
+     revokes source-wide, and offering a Remove that would silently widen its
+     meaning to "revoke the tools they do have" is worse than not offering it. */
+  function partialRows() {
+    if (!editing || !editing.partialGroups.length) return '';
+    var byId = {};
+    (groups || []).forEach(function (g) { byId[g.id] = g.name; });
+    return '<div class="ag-rows">' + editing.partialGroups.map(function (gid) {
+      return '<div class="ag-row">' +
+        '<div class="ag-row-body">' +
+          '<div class="ag-row-name">' + esc(byId[gid] || gid) + '</div>' +
+          '<div class="ag-row-desc">Has some of this source\'s tools, not all — granted per tool. ' +
+            'Change it on the source page.</div>' +
+        '</div>' +
+      '</div>';
+    }).join('') + '</div>';
+  }
+
   function accessBody() {
     var rows = draft.groups.length
       ? '<div class="ag-rows">' + draft.groups.map(function (g) {
@@ -845,12 +878,14 @@
             '<button type="button" class="ag-tglbtn ag-tglbtn--rm" data-mcp-unpick="' + esc(g.id) + '">Remove</button>' +
           '</div>';
         }).join('') + '</div>'
+      : (editing && editing.partialGroups.length)
+      ? ''
       : '<div class="ag-slot">' +
           '<p class="ag-slot-head">Nobody yet.</p>' +
           '<p class="ag-slot-body">Until you grant a group, this source is registered and unreachable — ' +
           'which is the safe state to save in if you are not sure.</p>' +
         '</div>';
-    return rows + '<button type="button" class="ag-addrow" data-mcp-openpick>+ Add groups</button>';
+    return rows + partialRows() + '<button type="button" class="ag-addrow" data-mcp-openpick>+ Add groups</button>';
   }
 
   function toolSummary() {
@@ -1142,8 +1177,14 @@
             read_only: t.mutating === false ? true : null,
           };
         });
+        /* The STORED flag, not `true`. Marking every returned tool enabled
+           made the panel misreport a tool an admin had deliberately switched
+           off — a write-capable one rendered "✓ On" with a "writes" badge
+           beside it, which is the opposite of what its owner decided. */
         draft.enabled = {};
-        draft.tools.forEach(function (t) { draft.enabled[t.name] = true; });
+        (src.tools || []).forEach(function (t) {
+          draft.enabled[String(t.original_name || t.exposed_name || '')] = t.enabled !== false;
+        });
         draft.groups = granted;
         // A registered source has been reached at least once; requiring a
         // fresh check to edit its name would be theatre.
@@ -1151,7 +1192,11 @@
         editing = {
           id: String(src.id),
           tools: (src.tools || []).map(function (t) {
-            return { tool_id: String(t.tool_id), name: String(t.original_name || t.exposed_name || '') };
+            return {
+              tool_id: String(t.tool_id),
+              name: String(t.original_name || t.exposed_name || ''),
+              enabled: t.enabled !== false,
+            };
           }),
           groups: granted,
           url: String(src.url || ''),

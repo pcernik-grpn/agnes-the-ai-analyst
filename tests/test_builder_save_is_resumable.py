@@ -793,23 +793,93 @@ def test_the_loaded_source_is_the_panel_and_the_baseline():
     assert "GET /api/admin/groups" in res["all"], "grants would render as raw ids"
 
 
-def test_a_tool_turned_off_is_deleted_not_just_unsent():
-    """The half a re-post cannot do. Leaving the row behind keeps the tool
-    callable, which makes the toggle decoration."""
+def test_a_tool_turned_off_is_disabled_not_deleted():
+    """Off has to take the tool out of the callable set — and nothing more.
+
+    It used to DELETE the registration. The toggle reads "✓ On / Off", which
+    is the vocabulary of a reversible switch, and the source's detail page
+    offers exactly that for the same row; deleting instead threw away the
+    exposed-name override, the description and the input schema, with no
+    confirmation and no undo, for an admin doing the cautious thing after
+    seeing a tool marked "writes".
+    """
     res = _node(_edit_script(r"""
   fire('click', { 'data-mcp-tool': 'write_row' });
   for (let i = 0; i < 4; i++) await flush();
   fire('click', { id: 'mcp-save' });
   for (let i = 0; i < 16; i++) await flush();
-  process.stdout.write(JSON.stringify({ all: CALLS, href: window.location.href }));
+  process.stdout.write(JSON.stringify({
+    all: CALLS, href: window.location.href,
+    body: (BODIES['PUT /api/admin/mcp-tools/s1__write'] || [])[0] || null,
+  }));
 """))
-    assert "DELETE /api/admin/mcp-tools/s1__write" in res["all"], (
-        f"the tool turned off stays registered and callable: {res['all']}"
+    assert not [c for c in res["all"] if c.startswith("DELETE /api/admin/mcp-tools")], (
+        f"turning a tool off still destroys its registration: {res['all']}"
     )
-    assert "DELETE /api/admin/mcp-tools/s1__search" not in res["all"], (
-        "it deleted a tool that was left on"
-    )
+    assert res["body"] == {"enabled": False}, f"the tool was not disabled: {res['body']}"
+    assert "PUT /api/admin/mcp-tools/s1__search" not in res["all"], "it touched a tool that was left on"
     assert res["href"] == "/admin/mcp-sources/s1", f"the save never finished: {res['all']}"
+
+
+def _mixed_source_script(tail: str) -> str:
+    """A source whose two tools disagree: one enabled, one deliberately not."""
+    return (
+        _HARNESS
+        + _load(SHELL, APPS_PANEL, MCP)
+        + r"""
+installFetch({
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'GET /api/admin/mcp-sources/s1': { status: 200, body: {
+    id: 's1', name: 'acme_crm', transport: 'http', url: 'https://mcp.example.com/sse',
+    auth_method: '', auth_secret_env: '', scope: 'shared',
+    tools: [
+      { tool_id: 's1__search', original_name: 'search', mutating: false, enabled: true },
+      { tool_id: 's1__danger', original_name: 'delete_customer', mutating: true, enabled: false },
+    ],
+    grants: [], partial_grants: [],
+  } },
+});
+window.AgnesMcpBuilder.open({ mount, editSourceId: 's1' });
+(async () => {
+  for (let i = 0; i < 10; i++) await flush();
+"""
+        + tail
+        + r"""
+})();
+"""
+    )
+
+
+def test_an_untouched_panel_does_not_rewrite_the_tool_rows():
+    """The loader marked every returned tool enabled, so a tool an admin had
+    deliberately switched off rendered "✓ On" — with a "writes" badge beside
+    it, on the one that matters most. Opening and saving would then have
+    silently re-enabled it."""
+    res = _node(_mixed_source_script(r"""
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    tools: CALLS.filter((c) => c.indexOf('/api/admin/mcp-tools') >= 0),
+  }));
+"""))
+    assert res["tools"] == [], f"opening and saving rewrote the tool rows: {res['tools']}"
+
+
+def test_switching_a_disabled_tool_back_on_re_enables_it():
+    """The other direction of the same toggle — and it must not create a
+    second registration for a row that already exists."""
+    res = _node(_mixed_source_script(r"""
+  fire('click', { 'data-mcp-tool': 'delete_customer' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    body: (BODIES['PUT /api/admin/mcp-tools/s1__danger'] || [])[0] || null,
+    posts: CALLS.filter((c) => c === 'POST /api/admin/mcp-tools').length,
+  }));
+"""))
+    assert res["body"] == {"enabled": True}, f"it was not re-enabled: {res['body']}"
+    assert res["posts"] == 0, "a registered-but-disabled tool was re-created instead of re-enabled"
 
 
 def test_a_group_unpicked_is_revoked():

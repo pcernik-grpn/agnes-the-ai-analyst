@@ -506,6 +506,10 @@
   // blocking pre-check and gates the real publish on the verdict.
   var GUARDRAILS_ENABLED = {{ 'true' if guardrails_enabled else 'false' }};
   var GUARDRAILS_LLM_READY = {{ 'true' if guardrails_llm_ready else 'false' }};
+  {# Whether the builder's assistant can answer. Known at render time so the
+     conversation opens in the right state on BOTH paths — see router's
+     _builder_llm_ready. #}
+  var BUILDER_LLM_READY = {{ 'true' if builder_llm_ready else 'false' }};
   var IS_ADMIN = {{ 'true' if session.user.is_admin else 'false' }};
   // Drafts never touch the store — they live only in this browser, one slot
   // per type, so an in-progress plugin can't clobber a half-written skill.
@@ -675,7 +679,10 @@
   /* Latched when a turn comes back saying this instance has no model. The
      builder used to open by failing and then keep inviting: a greeting, a red
      error under it, and three cheerful chips that all failed the same way. */
-  var llmUnavailable = false;
+  /* Seeded from the server, not discovered by a failed turn. A page that can
+     only learn "there is no model" by dispatching one has to invite the
+     author to type, take the message, and then withdraw the offer. */
+  var llmUnavailable = !BUILDER_LLM_READY;
   /* What the last turn reported. `engine` is which one answered — a scripted
      stand-in runs whenever AGNES_BUILDER_STUB (or TESTING) is set, and a
      degraded mode that looks identical to the real one is a lie the page
@@ -788,6 +795,14 @@
     // a localStorage draft, or the next visit will offer to "resume" a skill
     // that is already published (and a re-save would fail on a name conflict).
     if (reviewInProgress) return 'skipped';
+    /* Same rule for the OTHER post-save state. When guardrails are off a save
+       publishes immediately: `settle()` clears `reviewInProgress` and sets
+       `justSaved`, so this guard stopped applying at exactly the moment it
+       was still needed — the form stays on screen, one keystroke wrote a
+       fresh draft, and the Library then advertised an item that is already
+       published as "Saved in this browser only — not yet in your Library",
+       whose only link opened a create form that refused the name. */
+    if (justSaved) return 'skipped';
     // Emptying the last field is a way of throwing work away too — leaving the
     // old slot behind would resurrect the removed content on the next visit,
     // which is exactly what someone who just hit Remove did not ask for.
@@ -2094,13 +2109,20 @@
     // The builder speaks first. Once per type per page load: a re-render or a
     // switch back must not re-open a conversation that is already going, and a
     // resumed draft with work in it does not want to be greeted from scratch.
-    if (!openedFor[k] && !conv().length && isBlank()) {
+    // ...and not at all when there is no model to answer it: the turn would
+    // fail, and the standing notice already says so from first paint.
+    if (!llmUnavailable && !openedFor[k] && !conv().length && isBlank()) {
       openedFor[k] = true;
       sendBuilderTurn('');
     }
     // Say what happened to the work, in priority order: a restored draft is
     // the most surprising state, then a parked one.
-    if (incoming && cfg().source === 'bundle' && pluginSource() === 'upload') {
+    /* None of these apply to an edit: `openEdit` routes through here to reset
+       the panes, then overwrites every field from the saved item. Announcing
+       a restored draft there tells the author the panel holds something it
+       does not. */
+    if (editing) { /* nothing to say — the header already reads "— editing" */ }
+    else if (incoming && cfg().source === 'bundle' && pluginSource() === 'upload') {
       // Only the .zip route loses anything on a reload; a composed draft is
       // whole, and telling its author to re-attach a file would be nonsense.
       toast('Draft restored — re-attach the .zip to save it.', 'info', 7000);

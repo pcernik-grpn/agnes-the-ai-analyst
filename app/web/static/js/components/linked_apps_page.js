@@ -223,7 +223,11 @@
         render();
         return;
       }
-      window.location.href = '/library?kind=data_app';
+      // `section=`, not `kind=` — the Library validates the section against
+      // its own keys and opens the tab that holds it. `kind=` was read by
+      // nothing, so the only confirmation this action had was a page that
+      // looked exactly like not having done it.
+      window.location.href = '/library?section=data_app';
     });
   }
 

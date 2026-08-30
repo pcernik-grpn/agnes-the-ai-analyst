@@ -3899,6 +3899,14 @@ async def skills_page(
         guardrail=_guardrail_thresholds(),
         guardrails_enabled=_guardrails_enabled,
         guardrails_llm_ready=_guardrails_enabled and get_guardrails_llm_provider_ready(),
+        # Whether the BUILDER's assistant can answer at all — a different
+        # question from the guardrail reviewer's provider above. Resolved
+        # here so the page opens in the right state: it used to find out by
+        # dispatching a turn, which meant greeting the author, taking their
+        # message, and only then withdrawing the offer and discarding what
+        # they wrote. Worse on the edit path, which fires no opening turn, so
+        # the notice waited until they had typed.
+        builder_llm_ready=_builder_llm_ready(),
     )
     return templates.TemplateResponse(request, "skills.html", ctx)
 
@@ -6112,6 +6120,25 @@ async def install_redirect(request: Request):
 # ---------------------------------------------------------------------------
 # Store + My AI Stack — community marketplace + per-user composition page.
 # ---------------------------------------------------------------------------
+
+
+def _builder_llm_ready() -> bool:
+    """Whether a builder turn could reach a model, without building a client.
+
+    ``stub_enabled()`` counts as ready: the stub answers every turn, which is
+    what the page needs to know. Never raises — a page must render whatever
+    the config says.
+    """
+    try:
+        from app.api.builder_core import stub_enabled
+
+        if stub_enabled():
+            return True
+        from connectors.llm import llm_configured
+
+        return llm_configured()
+    except Exception:  # noqa: BLE001 - any failure here means "assume not configured"
+        return False
 
 
 def _guardrail_thresholds() -> dict[str, int]:
