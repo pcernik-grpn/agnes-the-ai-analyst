@@ -21,22 +21,34 @@ What matters, and so what is pinned here:
 
 from __future__ import annotations
 
+import re
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
 class TestAccessPage:
-    def test_admin_sees_both_tabs(self, seeded_app):
-        """TWO tabs. There were three while "Groups" was a separate list page
-        over the same rows the workspace's left column carries — a section
-        whose first two tabs were both "here are the groups"."""
+    def test_the_page_has_one_switch_and_no_tab_strip(self, seeded_app):
+        """Replaces `test_admin_sees_both_tabs`.
+
+        Three ways to read one set of grants — by group, by bundle, by
+        person — are three positions in one switch, not two tabs plus a
+        switch. Two navigation models on one page is what made "Groups" read
+        as a destination when it had become a grouping.
+        """
         c = seeded_app["client"]
         resp = c.get("/admin/access", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
-        assert "Groups" in resp.text
-        assert "Simulate a person" in resp.text
-        assert "Who can use what" not in resp.text
+        body = resp.text
+        assert 'data-by="group"' in body
+        assert 'data-by="bundle"' in body
+        assert 'data-by="person"' in body
+        assert 'class="admin-tabs"' not in body
+        # The lens URL still lands on the person view — links into Simulate
+        # outnumber the tab that used to point at it.
+        assert c.get("/admin/access?lens=simulate",
+                     headers=_auth(seeded_app["admin_token"])).status_code == 200
 
     def test_non_admin_is_refused(self, seeded_app):
         c = seeded_app["client"]
@@ -71,14 +83,27 @@ class TestAccessPage:
         assert r.status_code == 404
 
     def test_tiers_are_worded_as_what_they_do(self, seeded_app):
-        """`available`/`required` is the API's vocabulary; an admin reads
-        Optional/Automatic. Both must be present — the plain-language label
-        for the reader, the system word for the control's title so the two
-        vocabularies stay connected."""
+        """The label an admin reads and the word the API stores, together.
+
+        This test used to require the OPPOSITE labels — it asserted that
+        "Optional" and "Automatic" were present, while
+        `tests/test_access_vocabulary.py` asserted they were absent. Both
+        passed for a while only because one matched the rendered element and
+        the other matched a chip's prose, so each was seeing a different half
+        of the page. That is exactly the split those labels caused for
+        readers too: one Required package described two ways on one screen.
+
+        The Library's words win, per
+        `docs/superpowers/specs/2026-08-28-access-page-definition.md` — the
+        person on the other end reads "Required by your admin", so the admin
+        setting it reads Required. The wire words are unchanged; renaming
+        those would be a data migration.
+        """
         c = seeded_app["client"]
         body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
-        assert "Optional" in body and "Automatic" in body
+        assert ">Available<" in body and ">Required<" in body
         assert '"available"' in body and '"required"' in body
+        assert ">Optional<" not in body and ">Automatic<" not in body
 
     def test_simulate_uses_the_effective_access_endpoint(self, seeded_app):
         """The reason chain is derived from the explicit grant graph the API
@@ -147,13 +172,14 @@ class TestAccessIsInTheNav:
         access = next((s for s in ADMIN_NAV_SECTIONS if s["key"] == "access"), None)
         assert access is not None, "the Access section is missing from the nav inventory"
         assert access["href"] == "/admin/access"
-        assert [t["label"] for t in access["tabs"]] == [
-            "Groups",
-            "Simulate a person",
-        ]
-        # The row lands where its first tab does — see the guard in
-        # test_web_admin_nav.py::test_a_destination_row_lands_on_its_own_first_tab.
-        assert access["tabs"][0]["href"] == access["href"]
+        # No tabs and no items: the section is one page read three ways,
+        # and it owns its own match prefixes because there is no child left
+        # to carry them.
+        assert "tabs" not in access
+        assert "/admin/access" in access["match"]
+        # With no tabs, the row lands on the section's own href — there is no
+        # first tab for it to agree with any more.
+        assert access["href"] == "/admin/access"
 
         # Every path sits in the section, including the two redirects — a 308
         # is followed by the browser, but anything resolving a section from a
@@ -163,12 +189,11 @@ class TestAccessIsInTheNav:
         assert resolve_active_section_key("/admin/grants") == "access"
 
         # The strip lights exactly one tab per page.
-        for path, query, lit in (
-            ("/admin/access", "", "Groups"),
-            ("/admin/access", "lens=simulate", "Simulate a person"),
-        ):
-            active = [t["label"] for t in resolve_section_tabs(path, query) if t["active"]]
-            assert active == [lit], (path, query, active)
+        # The tab strip is gone: `resolve_section_tabs` returns nothing for
+        # this section, and which of the three readings is showing is the
+        # page's own switch (`?by=`), not a nav concern.
+        for path, query in (("/admin/access", ""), ("/admin/access", "lens=simulate")):
+            assert resolve_section_tabs(path, query) == [], (path, query)
 
     def test_the_page_renders_the_nav_row_as_active(self, seeded_app):
         c = seeded_app["client"]
@@ -179,12 +204,14 @@ class TestAccessIsInTheNav:
         assert nav.count("is-active") == 1
         assert 'class="admin-nav__link admin-nav__link--dest is-active"' in nav
         assert 'href="/admin/access"' in nav
-        # The page renders the SECTION's strip — not the local button strip the
-        # two lenses used to be. `data-tab="…"` was that strip's pane-switch
-        # hook, on the buttons AND on the one handler that clicked them; both
-        # are gone, so Simulate is reached by URL and by nothing else.
-        assert 'class="admin-tabs"' in body
-        assert 'href="/admin/access?lens=simulate"' in body
+        # No strip at all now: the page's three readings are one switch on
+        # the list. The sidebar row is still the thing that says where you
+        # are, and it lights off the section key rather than an entry href.
+        assert 'class="admin-tabs"' not in body
+        # Simulate is reached from the switch and from each group's row, not
+        # from a link in the page chrome. `?lens=simulate` still resolves —
+        # covered by test_the_page_has_one_switch_and_no_tab_strip.
+        assert 'data-by="person"' in body
         assert 'data-tab="' not in body
 
     def test_the_simulate_lens_opens_server_side(self, seeded_app):
@@ -194,13 +221,23 @@ class TestAccessIsInTheNav:
         c = seeded_app["client"]
         auth = _auth(seeded_app["admin_token"])
 
+        # Asserted on the CLASS of each pane, not on the whole opening tag.
+        # This used to match the exact literal `<div class="ax-pane is-on"
+        # data-axpane="edit">`, so adding the `role="tabpanel"` / `id` /
+        # `aria-labelledby` the tablist needs broke a test about server-side
+        # lens selection — which is not what those attributes changed.
+        def pane_classes(html: str, pane: str) -> str:
+            m = re.search(rf'<div class="([^"]*)"[^>]*data-axpane="{pane}"', html)
+            assert m, f"no {pane} pane in the response"
+            return m.group(1)
+
         bare = c.get("/admin/access", headers=auth).text
-        assert '<div class="ax-pane is-on" data-axpane="edit">' in bare
-        assert '<div class="ax-pane" data-axpane="sim">' in bare
+        assert "is-on" in pane_classes(bare, "edit")
+        assert "is-on" not in pane_classes(bare, "sim")
 
         sim = c.get("/admin/access?lens=simulate", headers=auth).text
-        assert '<div class="ax-pane" data-axpane="edit">' in sim
-        assert '<div class="ax-pane is-on" data-axpane="sim">' in sim
+        assert "is-on" not in pane_classes(sim, "edit")
+        assert "is-on" in pane_classes(sim, "sim")
 
 
 class TestMembersInContext:
@@ -233,14 +270,34 @@ class TestMembersInContext:
         assert "/members" in body
         assert '"POST"' in body and '"DELETE"' in body
 
-    def test_adding_a_stranger_routes_to_People_instead_of_failing_blankly(self, seeded_app):
-        """The common miss is a person with no account yet. That is a People
-        job, so BOTH dead ends name it: the search that finds nobody, and the
-        add that comes back 404 anyway (a race, or an account deactivated
-        between the two calls)."""
+    def test_a_stranger_can_be_invited_from_here(self, seeded_app):
+        """Replaces `test_adding_a_stranger_routes_to_People_instead_of_failing_blankly`.
+
+        The common miss is a person with no account yet, and the page used to
+        end the job there — a link to People, where the admin started again
+        with the query and the group both lost. "Add someone to this group"
+        and "invite someone" are one intent; the second half is now inline.
+
+        The 404-on-add path keeps its People wording: that one is a race (an
+        account deactivated between the search and the add), not a person who
+        was never invited, so it is a different answer to a different case.
+        """
         body = self._body(seeded_app)
+        # A typed address invites in one click…
+        assert "Invite and add to this group" in body
+        # …and a partial name offers the field that completes it.
+        assert 'class="ax-invite__mail"' in body
+        assert "data-invite-typed" in body
+        # It says what inviting does, because it creates an account.
+        assert "added to this group, and to Everyone" in body
+        # Nobody types the same text twice: the search query is carried into
+        # the field, completed with the instance's sign-in domain when there
+        # is exactly one, and Enter finishes the job from the search box.
+        assert "const seed = looksLikeEmail" in body
+        assert 'value="${esc(seed)}"' in body
+        assert "INVITE_DOMAINS" in body
+        # The add-path race still routes to People.
         assert "invite them on People first" in body
-        assert "Invite them on People first" in body
 
     def test_everyone_is_explained_not_enumerated(self, seeded_app):
         """`Everyone` has automatic membership — every account is in it by
@@ -337,7 +394,14 @@ class TestTheGroupItself:
         body = self._body(seeded_app)
         assert 'id="ax-sec-people"' in body
         assert 'id="ax-people-sum"' in body
-        assert "How they got here" in body
+        # The column LABEL is gone — an address, a name, a provenance line
+        # and a Remove button do not need labelling, and a header over four
+        # obvious columns is chrome on a list that is usually two rows long.
+        # What the test is actually about is that each row still says how the
+        # person got there, which is the roster's whole job.
+        assert '"added by admin"' in body
+        assert '"synced from Google"' in body
+        assert '"system-managed"' in body
         # The avatar row and its disclosure are gone, not merely collapsed.
         assert "ax-faces" not in body
         assert "Show all " not in body
@@ -346,38 +410,45 @@ class TestTheGroupItself:
         for label in ("added by admin", "synced from Google", "system-managed"):
             assert label in body, f"roster lost the {label!r} origin"
 
-    def test_the_grant_tree_is_nested_by_block(self, seeded_app):
-        """A type arrives from the API already grouped into blocks — buckets
-        for tables, marketplaces for plugins — and the editor used to flatten
-        them into one list with the block name as a row suffix. At six tables
-        that is tidy; at six hundred it is why nobody can find one bucket,
-        and granting a whole bucket means ticking every row in it."""
-        body = self._body(seeded_app)
-        # The bucket level, its bulk control, and the three states that
-        # control has to be able to show.
-        assert "ax-blk" in body
-        assert "data-bucket=" in body
-        assert "paintBucketBoxes" in body
-        assert "indeterminate" in body
-        # A type whose blocks are decorative (one block named after the type)
-        # must NOT grow a disclosure holding the only thing under it.
-        assert "isNested" in body
+    def test_adding_is_one_act_not_a_tree_to_browse(self, seeded_app):
+        """Replaces `test_the_grant_tree_is_nested_by_block`.
 
-    def test_a_bucket_grants_through_the_same_endpoints(self, seeded_app):
-        """There is no bulk grant API, and inventing one for this control
-        would put a second write path behind the page. The bucket loops the
-        per-item endpoints the single rows already use."""
-        body = self._body(seeded_app)
-        assert "writeGrant" in body and "deleteGrant" in body
-        assert "/api/admin/grants" in body
+        The nested bucket tree (and the Advanced tree it later became) was
+        the page's way to grant: browse every grantable resource, tick rows
+        in place. The open group now shows only what the group HAS, and
+        adding is one deliberate act — a + Add row opening a picker of
+        everything it does not have, chosen and applied together.
 
-    def test_the_grant_tree_can_be_filtered(self, seeded_app):
-        """The detail page had this and the workspace did not — the one place
-        the collapse would have cost a capability, since "give Finance the
-        revenue package" means finding one row among hundreds."""
+        Capability deliberately dropped with the tree: the tri-state bucket
+        checkbox that granted a whole bucket in one click. The picker takes
+        many selections at once, but there is no select-all-in-bucket. If
+        that is missed, it belongs in the picker, not in a second tree.
+        """
         body = self._body(seeded_app)
-        assert 'id="ax-rfind"' in body
-        assert "Filter by name, marketplace, category" in body
+        assert "data-add-grant" in body          # the one way in, per group
+        assert "openPicker" in body              # …opens the picker
+        assert "data-share-bundle" in body       # and the same act by bundle
+        assert "openBundlePicker" in body
+        # The tree and its bulk control are gone, not hidden.
+        assert "data-bucket=" not in body
+        assert 'class="ax-blk"' not in body
+
+    def test_finding_one_row_among_hundreds_still_works(self, seeded_app):
+        """Replaces `test_the_grant_tree_can_be_filtered`.
+
+        "Give Finance the revenue package" still has to mean finding one row
+        among hundreds — the capability the per-group filter existed for.
+        Two controls carry it now, and neither is a second search box beside
+        the first: the header search narrows the group list *and* what an
+        open group shows, and the picker has its own search over everything
+        not yet granted.
+        """
+        body = self._body(seeded_app)
+        assert 'id="ax-group-find"' in body       # the one page-level search
+        assert "Search everything grantable" in body   # the picker's own
+        # The per-group input is gone: two search boxes on one surface, one
+        # of them hidden, was the ambiguity this collapse removed.
+        assert 'id="ax-rfind"' not in body
 
     def test_the_resource_deep_link_still_lands(self, seeded_app):
         """/admin/tables' per-row Manage-access sent `#table:<id>` to the

@@ -486,7 +486,7 @@
     var rows = draft.groups.length
       ? '<div class="ag-rows">' + draft.groups.map(function (g) {
           return '<div class="ag-row">' +
-            '<div class="ag-row-body"><div class="ag-row-name">' + esc(g.name) + '</div></div>' +
+            '<div class="ag-row-body"><div class="ag-row-name">' + (window.AgnesKindGlyph ? window.AgnesKindGlyph.groupGlyph() : '') + esc(g.name) + '</div></div>' +
             '<button type="button" class="ag-tglbtn ag-tglbtn--rm" data-mcp-unpick="' + esc(g.id) + '">Remove</button>' +
           '</div>';
         }).join('') + '</div>'

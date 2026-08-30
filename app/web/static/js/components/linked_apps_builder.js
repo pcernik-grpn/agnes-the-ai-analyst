@@ -260,7 +260,7 @@
     return rows.map(function (g) {
       var on = groupPicked(g.id);
       return '<div class="ag-row"><div class="ag-row-body">' +
-        '<div class="ag-row-name">' + esc(g.name) + '</div>' +
+        '<div class="ag-row-name">' + (window.AgnesKindGlyph ? window.AgnesKindGlyph.groupGlyph() : '') + esc(g.name) + '</div>' +
         (typeof g.members === 'number'
           ? '<div class="ag-row-desc">' + g.members + (g.members === 1 ? ' member' : ' members') + '</div>' : '') +
         '</div><button type="button" class="ag-tglbtn' + (on ? ' on' : '') +
@@ -388,7 +388,7 @@
     var rows = grantGroups.length
       ? '<div class="ag-rows">' + grantGroups.map(function (g) {
           return '<div class="ag-row"><div class="ag-row-body">' +
-            '<div class="ag-row-name">' + esc(g.name) + '</div></div>' +
+            '<div class="ag-row-name">' + (window.AgnesKindGlyph ? window.AgnesKindGlyph.groupGlyph() : '') + esc(g.name) + '</div></div>' +
             '<button type="button" class="ag-tglbtn ag-tglbtn--rm" data-la-unpick="' + esc(g.id) + '">Remove</button></div>';
         }).join('') + '</div>'
       : '<div class="ag-slot">' +
