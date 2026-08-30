@@ -42,12 +42,17 @@ class TestAccessPage:
         assert resp.status_code == 200
         body = resp.text
         assert 'data-by="group"' in body
-        assert 'data-by="bundle"' in body
+        assert 'data-by="resource"' in body
         assert 'data-by="person"' in body
         assert 'class="admin-tabs"' not in body
         # The lens URL still lands on the person view — links into Simulate
         # outnumber the tab that used to point at it.
         assert c.get("/admin/access?lens=simulate",
+                     headers=_auth(seeded_app["admin_token"])).status_code == 200
+        # `?by=bundle` was the old name for this lens and stays readable, for
+        # the same reason: it is in shared links and bookmarks. Everything the
+        # page WRITES is `resource`.
+        assert c.get("/admin/access?by=bundle",
                      headers=_auth(seeded_app["admin_token"])).status_code == 200
 
     def test_non_admin_is_refused(self, seeded_app):
@@ -94,16 +99,27 @@ class TestAccessPage:
         readers too: one Required package described two ways on one screen.
 
         The Library's words win, per
-        `docs/superpowers/specs/2026-08-28-access-page-definition.md` — the
-        person on the other end reads "Required by your admin", so the admin
-        setting it reads Required. The wire words are unchanged; renaming
-        those would be a data migration.
+        `docs/superpowers/specs/2026-08-28-access-page-definition.md`. That
+        rule chose Required / Available in the first pass and **Automatic /
+        Optional** in the reversal on 2026-08-30 (spec section 2, TCRD-208):
+        the rule did not change, the Library's words moved under it. *In
+        stack* / *Add to stack* became **Keep a local copy**, so "Required by
+        your admin" is no longer the sentence this control mirrors — and what
+        was left was *Available*'s own flaw, unweighed the first time: BOTH
+        tiers are available. Both granted, both reachable, both queryable the
+        moment the grant exists, which is what the tooltip on this very page
+        says. The wire words are unchanged; renaming those would be a data
+        migration.
+
+        `>Required<` is deliberately not asserted absent: a memory item's
+        `is_required` means *required reading*, a different axis that shares
+        only the word.
         """
         c = seeded_app["client"]
         body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
-        assert ">Available<" in body and ">Required<" in body
+        assert ">Automatic<" in body and ">Optional<" in body
         assert '"available"' in body and '"required"' in body
-        assert ">Optional<" not in body and ">Automatic<" not in body
+        assert ">Available<" not in body
 
     def test_simulate_uses_the_effective_access_endpoint(self, seeded_app):
         """The reason chain is derived from the explicit grant graph the API
