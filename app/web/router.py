@@ -2817,6 +2817,40 @@ async def library_page(
             logger.warning("/library: could not resolve %s grants: %s", rt, e)
             return set()
 
+    # Why the caller has a granted row, cached per resource type. The row
+    # already said WHAT it is and that an admin put it there; the one thing a
+    # member could not learn anywhere in the product was through WHICH of
+    # their groups — which is also the only part they can act on, because it
+    # is what they ask their admin to change.
+    _via_cache: dict[str, dict[str, list[str]]] = {}
+
+    def _granted_via(rt: str) -> dict[str, list[str]]:
+        if rt not in _via_cache:
+            try:
+                _via_cache[rt] = resolver.granting_groups(uid, ResourceType(rt))
+            except Exception as e:
+                logger.warning("/library: could not resolve %s grant groups: %s", rt, e)
+                _via_cache[rt] = {}
+        return _via_cache[rt]
+
+    def _because_of(type_key: str, item_id: str) -> str:
+        """The trailing clause naming the caller's granting groups.
+
+        Appended to the membership tooltip rather than replacing it, because
+        the existing sentence answers "can I remove this" and this answers a
+        different question. Capped at three names — past that the list stops
+        being a fact a person holds in their head and the count is the more
+        useful shape.
+        """
+        names = _granted_via(type_key).get(item_id) or []
+        if not names:
+            return ""
+        if len(names) == 1:
+            return f" You have it because you are in {names[0]}."
+        if len(names) <= 3:
+            return " You have it because you are in " + ", ".join(names[:-1]) + f" and {names[-1]}."
+        return f" You have it through {len(names)} of your groups, including {names[0]} and {names[1]}."
+
     def _add_shared_row(
         *,
         item_id,
@@ -2913,10 +2947,11 @@ async def library_page(
             # and in the Access facet.
             items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
+            _why = _because_of(type_key, item_id)
             if requirement == "required":
-                items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
+                items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP + _why
             else:
-                items[-1]["stack_title"] = _GRANTED_STACK_TOOLTIP
+                items[-1]["stack_title"] = _GRANTED_STACK_TOOLTIP + _why
         else:
             # Classic non-member: a real Add control, not a dead pill (Devin
             # Review on #1199, round 4). The generic subscribe endpoint takes
@@ -4344,6 +4379,18 @@ async def catalog_package_detail(
     if not pkg:
         raise HTTPException(status_code=404, detail="data_package_not_found")
 
+    # A draft is hidden from every member-facing list (StackResolver's
+    # HIDDEN_STATUSES, applied in _fetch_entries), so its detail page has to be
+    # hidden too — otherwise the page an admin has not published yet is one
+    # guessed slug away from any member with a grant, and it reads as shipped.
+    # 404, not 403: browse behaves as though it does not exist, and a 403 would
+    # confirm the name of an unpublished package. Admins author drafts, so
+    # theirs still opens.
+    from app.services.stack_resolver import HIDDEN_STATUSES
+
+    if (pkg.get("status") or "prod") in HIDDEN_STATUSES and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+
     # Admin bypass via is_user_admin; otherwise require a grant (any tier).
     # The detail token is DISTINCT (same pattern as admin_elevation_paused)
     # so error.html can answer with language and a request-access action
@@ -4354,7 +4401,7 @@ async def catalog_package_detail(
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.DATA_PACKAGE.value, pkg["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail=f"package_not_shared:{pkg['name']}")
+        raise HTTPException(status_code=403, detail=f"not_shared:data package:{pkg['name']}")
 
     # Telemetry: emit data_package.view (Section 9.2). source=browse|my-stack
     # passed as ?source=…; default 'direct' for typed/bookmarked navigation.
@@ -4645,7 +4692,10 @@ async def catalog_table_detail(
     except Exception:
         logger.warning("could not enumerate parent packages for %s", table_id, exc_info=True)
     if not (is_admin or has_grant):
-        raise HTTPException(status_code=403, detail="access_denied")
+        # Same door the package 403 opens, same reason: the route 404s a table
+        # that does not exist, so a 403 already confirms existence and naming
+        # it leaks nothing while making the request-access copy worth sending.
+        raise HTTPException(status_code=403, detail=f"not_shared:table:{table.get('name') or table_id}")
 
     # Resolve any pairs_well_with ids to (id, name) pairs the template
     # can render as links. Unknown ids (deleted tables) silently dropped.
@@ -5066,7 +5116,7 @@ async def memory_domain_detail(
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.MEMORY_DOMAIN.value, domain["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail="access_denied")
+        raise HTTPException(status_code=403, detail=f"not_shared:memory domain:{domain['name']}")
 
     source_hint = request.query_params.get("source", "direct")
     try:
@@ -5420,7 +5470,7 @@ async def data_app_detail_page(
     if not row or row.get("state") == "linked_hidden":
         raise HTTPException(status_code=404, detail="data_app_not_found")
     if not _can_view(user, row):
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise HTTPException(status_code=403, detail=f"not_shared:data app:{row.get('name') or slug}")
 
     is_admin = is_user_admin(user["id"])
     is_owner = user["id"] == row["owner_user_id"]
