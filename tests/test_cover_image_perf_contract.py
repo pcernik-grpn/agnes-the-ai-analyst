@@ -5,16 +5,18 @@ Project: Agnes — platform for analyzing structured data with extraction,
 Module: tests/test_cover_image_perf_contract.py
 Deps:   Pillow (PIL), fastapi.testclient
 Tested: covers src/images/variants.py + the ``?w=`` wiring in
-  app/web/cover_files.py, app/api/marketplace.py and app/api/store.py, plus
-  the ``cover_w`` Jinja filter (app/web/router.py) that points a rendered
-  cover ``<img>`` at those variants.
+  app/api/marketplace.py and app/api/store.py, plus the ``cover_w`` Jinja
+  filter (app/web/router.py) that points a rendered cover ``<img>`` at those
+  variants. The ``/uploads`` StaticFiles mount's own ``?w=`` wiring (incl.
+  its traversal guard) is tested in tests/test_cover_files.py instead --
+  that mount is frozen to the app's DATA_DIR at construction time, which the
+  session-shared ``seeded_app`` used elsewhere in this file cannot honor
+  (see tests/test_shared_app_uploads_binding.py).
 
 Key responsibilities:
 - A 480/960 width request returns a resized WebP smaller than the original.
 - Any other width value serves the original bytes untouched.
 - The disk-fill / CPU guards (oversized source, no upscale) hold.
-- Path containment on the uploads mount still refuses traversal with ``?w=``
-  attached.
 - The variant is generated once and reused on a second request (cache hit).
 - Server-rendered cover ``<img>``s: the stack-card macro (grid layout,
   width:100% of its column) carries a 480/960 srcset, and an un-mirrored
@@ -57,17 +59,7 @@ def _noise_png() -> bytes:
     return buf.getvalue()
 
 
-def _small_png() -> bytes:
-    """A 320x160 PNG — smaller than either allowed width, for the
-    never-upscale case."""
-    im = Image.new("RGB", (320, 160), color="blue")
-    buf = io.BytesIO()
-    im.save(buf, format="PNG")
-    return buf.getvalue()
-
-
 _NOISE_PNG = _noise_png()
-_SMALL_PNG = _small_png()
 
 
 def _flea_skill_zip() -> bytes:
@@ -86,73 +78,6 @@ def _flea_skill_zip() -> bytes:
             f"---\n\n{body}\n",
         )
     return buf.getvalue()
-
-
-# --- /uploads/covers/*.png?w= (StaticFiles mount) -------------------------
-
-
-def test_upload_cover_variant_resizes_and_caches(seeded_app_fresh):
-    """c1/c2/c5: a 480 variant is a small WebP; an unlisted width serves the
-    original; the cache file lands once and a repeat GET doesn't rewrite it.
-    """
-    app_data = seeded_app_fresh
-    client = app_data["client"]
-    files = {"file": ("noise.png", io.BytesIO(_NOISE_PNG), "image/png")}
-    upload = client.post(
-        "/api/admin/uploads/cover-image",
-        files=files,
-        headers=_auth(app_data["admin_token"]),
-    )
-    assert upload.status_code == 200
-    cover_url = upload.json()["url"]
-
-    # c1: allowed width -> resized WebP, immutable cache header, small body.
-    r = client.get(f"{cover_url}?w=480")
-    assert r.status_code == 200
-    assert r.headers.get("content-type") == "image/webp"
-    assert "immutable" in r.headers.get("cache-control", "").lower()
-    assert len(r.content) < 60_000
-
-    # c2: an unlisted width serves the original bytes untouched.
-    r2 = client.get(f"{cover_url}?w=333")
-    assert r2.status_code == 200
-    assert r2.content == _NOISE_PNG
-
-    # c5: the variant is cached to disk, and a second hit doesn't rewrite it.
-    data_dir = Path(app_data["env"]["data_dir"])
-    cache_dir = data_dir / "cache" / "img"
-    variants = list(cache_dir.glob("*-w480.webp"))
-    assert len(variants) == 1
-    mtime_before = variants[0].stat().st_mtime_ns
-
-    r3 = client.get(f"{cover_url}?w=480")
-    assert r3.status_code == 200
-    assert variants[0].stat().st_mtime_ns == mtime_before
-
-
-def test_upload_cover_variant_traversal_still_blocked(seeded_app_fresh):
-    """c3: a ``?w=`` query string doesn't loosen the existing traversal guard."""
-    client = seeded_app_fresh["client"]
-    resp = client.get("/uploads/covers/%2e%2e/%2e%2e/etc/passwd?w=480")
-    assert resp.status_code == 404
-
-
-def test_upload_cover_variant_never_upscales(seeded_app_fresh):
-    """c4: a source narrower than the requested width serves the original."""
-    app_data = seeded_app_fresh
-    client = app_data["client"]
-    files = {"file": ("small.png", io.BytesIO(_SMALL_PNG), "image/png")}
-    upload = client.post(
-        "/api/admin/uploads/cover-image",
-        files=files,
-        headers=_auth(app_data["admin_token"]),
-    )
-    assert upload.status_code == 200
-    cover_url = upload.json()["url"]
-
-    r = client.get(f"{cover_url}?w=480")
-    assert r.status_code == 200
-    assert r.content == _SMALL_PNG
 
 
 def test_variant_path_uses_post_transpose_dimensions(tmp_path):

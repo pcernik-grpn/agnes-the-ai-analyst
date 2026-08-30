@@ -32,6 +32,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 - Pillow is now a core dependency: cover-image variants are generated on the server.
+- Fixed the full-suite meta-guard for uploads-mount fetches: it matched the plain substring "seeded_app", which also matches "seeded_app_fresh" -- the very fixture its own failure message recommends -- so any test file using only the fresh fixture still tripped it. Swapped to a regex that excludes the "_fresh" suffix, and moved the three uploads-mount ?w= variant tests into the file that was already all fresh-fixture, so the guard can pass file-by-file.
 
 ## [0.92.0] - 2026-08-29
 

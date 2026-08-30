@@ -4,21 +4,30 @@ Project: Agnes — platform for analyzing structured data with extraction,
   facts, and semantic search; operates offline, in-app.
 Module: tests/test_cover_files.py
 Deps:   Pillow (PIL), fastapi.testclient
-Tested: covers the app/web/cover_files.py CoverFiles class
+Tested: covers the app/web/cover_files.py CoverFiles class, incl. its
+  ``?w=`` resize-variant wiring on the ``/uploads`` StaticFiles mount.
 
 Key responsibilities:
 - Verify 200 responses carry Cache-Control: immutable.
 - Verify 404 and other errors do not carry the immutable cache header.
-- Verify path containment (no directory traversal).
+- Verify path containment (no directory traversal), including with a
+  ``?w=`` query string attached.
+- Verify a 480 width request returns a resized WebP smaller than the
+  original, an unlisted width serves the original bytes untouched, and
+  the resized variant is cached to disk and reused on a repeat GET.
 
 Design constraints:
-- Use seeded_app_fresh because the upload test must read from the disk-mounted
-  /uploads/ directory, which StaticFiles points to at app construction time.
+- Use seeded_app_fresh because every test here reads from the disk-mounted
+  /uploads/ directory, which StaticFiles points to at app construction time
+  (see tests/test_shared_app_uploads_binding.py -- the session-shared
+  sibling fixture can't honor this mount).
 """
 
 from __future__ import annotations
 
 import io
+import os
+from pathlib import Path
 
 from PIL import Image
 
@@ -26,6 +35,29 @@ from PIL import Image
 def _auth(token: str) -> dict:
     """Build an Authorization header from a Bearer token."""
     return {"Authorization": f"Bearer {token}"}
+
+
+def _noise_png() -> bytes:
+    """A 1500x800 random-noise PNG — incompressible, lands at ~3-4 MB, under
+    the 5 MiB source cap so the resize path (not the size guard) is exercised.
+    """
+    im = Image.frombytes("RGB", (1500, 800), os.urandom(1500 * 800 * 3))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _small_png() -> bytes:
+    """A 320x160 PNG — smaller than either allowed width, for the
+    never-upscale case."""
+    im = Image.new("RGB", (320, 160), color="blue")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_NOISE_PNG = _noise_png()
+_SMALL_PNG = _small_png()
 
 
 def test_cover_image_200_carries_immutable_cache_header(seeded_app_fresh):
@@ -80,3 +112,70 @@ def test_cover_image_path_containment(seeded_app_fresh):
     resp = client.get("/uploads/covers/%2e%2e/%2e%2e/etc/passwd")
     # Starlette's StaticFiles still enforces containment, so this returns 404.
     assert resp.status_code == 404
+
+
+# --- /uploads/covers/*.png?w= (StaticFiles mount) -------------------------
+
+
+def test_upload_cover_variant_resizes_and_caches(seeded_app_fresh):
+    """c1/c2/c5: a 480 variant is a small WebP; an unlisted width serves the
+    original; the cache file lands once and a repeat GET doesn't rewrite it.
+    """
+    app_data = seeded_app_fresh
+    client = app_data["client"]
+    files = {"file": ("noise.png", io.BytesIO(_NOISE_PNG), "image/png")}
+    upload = client.post(
+        "/api/admin/uploads/cover-image",
+        files=files,
+        headers=_auth(app_data["admin_token"]),
+    )
+    assert upload.status_code == 200
+    cover_url = upload.json()["url"]
+
+    # c1: allowed width -> resized WebP, immutable cache header, small body.
+    r = client.get(f"{cover_url}?w=480")
+    assert r.status_code == 200
+    assert r.headers.get("content-type") == "image/webp"
+    assert "immutable" in r.headers.get("cache-control", "").lower()
+    assert len(r.content) < 60_000
+
+    # c2: an unlisted width serves the original bytes untouched.
+    r2 = client.get(f"{cover_url}?w=333")
+    assert r2.status_code == 200
+    assert r2.content == _NOISE_PNG
+
+    # c5: the variant is cached to disk, and a second hit doesn't rewrite it.
+    data_dir = Path(app_data["env"]["data_dir"])
+    cache_dir = data_dir / "cache" / "img"
+    variants = list(cache_dir.glob("*-w480.webp"))
+    assert len(variants) == 1
+    mtime_before = variants[0].stat().st_mtime_ns
+
+    r3 = client.get(f"{cover_url}?w=480")
+    assert r3.status_code == 200
+    assert variants[0].stat().st_mtime_ns == mtime_before
+
+
+def test_upload_cover_variant_traversal_still_blocked(seeded_app_fresh):
+    """c3: a ``?w=`` query string doesn't loosen the existing traversal guard."""
+    client = seeded_app_fresh["client"]
+    resp = client.get("/uploads/covers/%2e%2e/%2e%2e/etc/passwd?w=480")
+    assert resp.status_code == 404
+
+
+def test_upload_cover_variant_never_upscales(seeded_app_fresh):
+    """c4: a source narrower than the requested width serves the original."""
+    app_data = seeded_app_fresh
+    client = app_data["client"]
+    files = {"file": ("small.png", io.BytesIO(_SMALL_PNG), "image/png")}
+    upload = client.post(
+        "/api/admin/uploads/cover-image",
+        files=files,
+        headers=_auth(app_data["admin_token"]),
+    )
+    assert upload.status_code == 200
+    cover_url = upload.json()["url"]
+
+    r = client.get(f"{cover_url}?w=480")
+    assert r.status_code == 200
+    assert r.content == _SMALL_PNG
