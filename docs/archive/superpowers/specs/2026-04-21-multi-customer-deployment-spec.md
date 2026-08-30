@@ -26,7 +26,7 @@ Zavést *production-grade* nasazení Agnes, které:
 
 Keboola jako upstream **nemá žádný přístup k zákaznickým GCP projektům**. Zákazník zodpovídá za svoje nasazení.
 
-Keboola interní produkční Agnes instance je **speciální případ zákazníka** — Keboola IT vlastní `internal-prod` GCP projekt a spravuje tam svou Agnes stejně jako to bude dělat another-customer ve svém GCP.
+Keboola interní produkční Agnes instance je **speciální případ zákazníka** — Keboola IT vlastní `<gcp-project>` GCP projekt a spravuje tam svou Agnes stejně jako to bude dělat another-customer ve svém GCP.
 
 ### 2.2 Budoucí rozšíření (out of scope pro tuto vlnu)
 
@@ -99,7 +99,7 @@ Přesně ta samá struktura jako template, jen s konkrétními hodnotami v `terr
 # keboola/agnes-infra-keboola/terraform/terraform.tfvars
 # (gitignored, nebo lokálně v Secret Manageru — viz §6)
 
-gcp_project_id  = "internal-prod"
+gcp_project_id  = "<gcp-project>"
 region          = "europe-west1"
 zone            = "europe-west1-b"
 
@@ -117,7 +117,7 @@ dev_instances = [
   # přidávat další dev VMs per branch/developer
 ]
 
-seed_admin_email = "zdenek.srotyr@keboola.com"
+seed_admin_email = "admin@example.com"
 
 # Keboola-specific
 data_source        = "keboola"
@@ -407,7 +407,7 @@ Všechny designové otázky, které vznikly během brainstormingu, jsou vyřeše
 | Prod upgrade režim | Per-instance volba auto/pinned, default auto |
 | TLS | Caddy default, flex na gcp-lb/cloudflare |
 | DNS | Zákazník si řeší sám, default jen IP |
-| GCP projekt pro Keboola | `internal-prod` zůstává |
+| GCP projekt pro Keboola | `<gcp-project>` zůstává |
 | Dev VM model | Seznam `dev_instances` v tfvars, per-položka image_tag |
 | `ZdenekSrotyr/tmp_oss` | Smazat po Fázi 1 |
 
