@@ -364,6 +364,41 @@ class TestModelDetail:
         assert "customers" in r.text
         assert ">orders<" not in r.text
 
+    def test_active_filter_renders_a_removable_chip(self, seeded_app):
+        """A8 (issue #1707): tabs drop `q` on click with no way to see it was
+        ever applied. A removable chip above the table makes the active
+        filter visible; its "x" links to the same tab without `q`."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics&q=Orders", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-testid="slb-filter-chip"' in r.text
+        assert "Orders" in r.text
+        assert f"/semantic-layer/{_SLUG}?tab=metrics" in r.text
+        # The remove link must drop `q`, not merely restate it.
+        chip_start = r.text.index('data-testid="slb-filter-chip"')
+        chip_html = r.text[chip_start : chip_start + 400]
+        assert f'href="/semantic-layer/{_SLUG}?tab=metrics"' in chip_html
+        assert "q=Orders" not in chip_html
+
+    def test_no_filter_chip_when_q_is_absent(self, seeded_app):
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-testid="slb-filter-chip"' not in r.text
+
+    def test_filter_chip_escapes_special_characters_in_q(self, seeded_app):
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(
+            f"/semantic-layer/{_SLUG}?tab=metrics&q=%3Cscript%3Ealert(1)%3C/script%3E",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+
     def test_constraints_filter_matches_the_constraints_own_name(self, seeded_app):
         """Devin #1398: the constraint's own name (the linked first column) must
         be searchable, not only the metric names it applies to."""
