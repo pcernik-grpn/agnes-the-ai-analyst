@@ -438,7 +438,7 @@ def _step(
         "cta": cta,
         "done_cta": done_cta or cta,
         # …and when the maintenance verb names a DIFFERENT place, the click has
-        # to follow it: "Bundle tables" belongs on the Tables lens, "Manage
+        # to follow it: "Group tables" belongs on the Tables lens, "Manage
         # packages" on the Packages workspace. Sharing one href made the done
         # row's label a promise the click broke — the same defect the verify
         # step had with "Simulate a person".
@@ -520,7 +520,7 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
         ),
         _step(
             "package",
-            "Bundle tables into packages",
+            "Group tables into packages",
             area=data,
             done=bool(d.get("packages_with_tables")),
             detail=(
@@ -550,7 +550,7 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
                 else {"level": "ok", "text": "Every distributable table is in a package."}
             ),
             href="/admin/tables",
-            cta="Bundle tables",
+            cta="Group tables",
             done_cta="Manage packages",
             # Bundling happens on the Tables lens (that is where the tables
             # are); managing the packages themselves is the Packages
