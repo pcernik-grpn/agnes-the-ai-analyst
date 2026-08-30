@@ -1054,6 +1054,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **A Keboola token the stack refuses now says so in a sentence (#1707).**
+  Saving a semantic-layer (master/owner) token that the stack does not
+  recognise toasted the raw upstream error — the internal
+  `/v2/storage/tokens/verify` URL, `HTTP 401` and Keboola's JSON body down to
+  its `exceptionId` — which is all true and none of it the answer. A Keboola
+  token only exists on the stack that issued it, so a token refused outright
+  is nearly always from another stack; the message now names the stack this
+  connection is configured for and asks that question directly. Applies to
+  both token slots on `PUT /api/admin/source-connections/{id}/secret`, worded
+  per kind (the master token is the project owner's; the storage token is
+  not), and is recognised by Keboola's own `storage.tokenInvalid` code as well
+  as the 401, so a proxy that rewrites the status does not defeat it. The raw
+  upstream text is not lost — it moves to `detail.upstream`, out of the
+  message, for logs and bug reports. Only a flat refusal is translated: an
+  outage, a 5xx or a network failure still reports what it said, because
+  there the upstream text IS the diagnosis. Unchanged: the preflight itself,
+  which already refused to store the token or badge it "SET", and the
+  project-mismatch message, which stays its own distinct sentence — a
+  mismatch is a token the stack knows perfectly well that opens a different
+  project, and it needs a different fix.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,

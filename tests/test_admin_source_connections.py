@@ -305,7 +305,11 @@ class TestSeedFromInstanceCredentials:
         assert resp.status_code == 201, resp.text
         body = resp.json()
         assert body["token_seeded"] is False
-        assert "storage.tokenInvalid" in body["token_seed_error"]
+        # The reported reason is the human one (A16), not the wire text — a
+        # `str()` of the structured detail would have dragged the whole
+        # upstream body back into an admin-facing field.
+        assert "does not recognise this storage token" in body["token_seed_error"]
+        assert "storage.tokenInvalid" not in body["token_seed_error"]
         assert body["has_secret"] is False
 
     def test_a_non_http_seed_error_also_reports_failure_without_failing_the_create(self, seeded_app, monkeypatch):
@@ -1513,7 +1517,9 @@ class TestSourceConnectionsMasterSecret:
         Reported from a live instance: pasting a non-Storage token returned
         502, the operator read "Bad Gateway", and the incident was chased as
         an Agnes outage for a day. The detail still carries the upstream
-        reason; only the status changes.
+        reason; only the status changes. Since A16 the reason travels under
+        `detail.upstream` — see `TestARefusedTokenGetsAHumanMessage` for the
+        sentence that replaced it in `detail.message`.
         """
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
@@ -1538,7 +1544,7 @@ class TestSourceConnectionsMasterSecret:
                 headers=_auth(token),
             )
         assert resp.status_code == 400, resp.text
-        assert "storage.tokenInvalid" in resp.json()["detail"]
+        assert "storage.tokenInvalid" in resp.json()["detail"]["upstream"]
 
     def test_master_secret_upstream_5xx_is_still_a_502(self, seeded_app):
         """The gateway status survives for what it actually means."""
@@ -1613,6 +1619,214 @@ class TestSourceConnectionsMasterSecret:
         assert resp2.status_code == 204
 
         assert connection_secrets_repo().has(master_secret_key(conn_id)) is False
+
+
+class TestARefusedTokenGetsAHumanMessage:
+    """A16 on #1707: what an admin reads when the stack refuses the token.
+
+    The preflight itself was already right — nothing is stored and the badge
+    stays "unset" — but the toast was the exception text: the internal
+    ``/v2/storage/tokens/verify`` URL, ``HTTP 401`` and Keboola's JSON body
+    down to its ``exceptionId``. None of that says the thing that is almost
+    always true, and is the actual fix: the token was issued on a different
+    stack. The raw text is not thrown away — it moves to ``detail.upstream``,
+    out of the message, for logs and bug reports.
+    """
+
+    STACK = "https://connection.example.com"
+
+    @pytest.fixture(autouse=True)
+    def _stable_vault_key(self, monkeypatch):
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        yield
+        _reset_ephemeral_key_for_tests()
+
+    def _create_keboola(self, c, token, *, name):
+        resp = c.post(
+            BASE,
+            json={"name": name, "source_type": "keboola", "config": {"stack_url": self.STACK}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    def _refusal(self, *, status=401, code="storage.tokenInvalid", message=None):
+        """A verbatim-shaped Storage API refusal: status, code, exceptionId."""
+        from connectors.keboola.storage_api import StorageApiError
+
+        body = {"error": "Invalid access token", "code": code, "exceptionId": "storage-abc123"}
+        return StorageApiError(
+            message or f"GET {self.STACK}/v2/storage/tokens/verify -> HTTP {status}: {body}",
+            status=status,
+            body=body,
+        )
+
+    def _put_secret(self, c, token, conn_id, *, kind, value, exc):
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                side_effect=exc,
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            return c.put(
+                f"{BASE}/{conn_id}/secret",
+                json={"value": value, "kind": kind},
+                headers=_auth(token),
+            )
+
+    def test_a_refused_master_token_names_the_stack_instead_of_the_verify_url(self, seeded_app):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-master")
+
+        resp = self._put_secret(
+            c, token, conn_id, kind="master", value="token-from-another-stack", exc=self._refusal()
+        )
+
+        assert resp.status_code == 400, resp.text
+        message = resp.json()["detail"]["message"]
+        assert message == (
+            "Keboola connection.example.com does not recognise this master token. "
+            "Master (owner) tokens are valid only on their own stack and project — "
+            "is this token from connection.example.com?"
+        )
+        # Nothing from the wire is in the sentence the admin reads.
+        for leak in ("HTTP 401", "/v2/storage/tokens/verify", "exceptionId", "storage.tokenInvalid"):
+            assert leak not in message, leak
+
+    def test_the_raw_upstream_text_is_carried_but_out_of_the_message(self, seeded_app):
+        """Losing it would trade one bad debugging experience for another —
+        it just must not be the thing an admin is asked to read."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-upstream")
+
+        resp = self._put_secret(c, token, conn_id, kind="master", value="wrong-stack-token", exc=self._refusal())
+
+        detail = resp.json()["detail"]
+        assert "storage.tokenInvalid" in detail["upstream"]
+        assert "storage-abc123" in detail["upstream"]
+        assert detail["error"] == "storage_api_error"
+
+    def test_the_refused_token_is_still_redacted_out_of_the_response(self, seeded_app):
+        """The new shape must not become a way around the client's redaction —
+        a proxy in front of a stack can echo the token into the body."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-redact")
+
+        resp = self._put_secret(
+            c,
+            token,
+            conn_id,
+            kind="master",
+            value="super-secret-master-token",
+            exc=self._refusal(message="HTTP 401: {'token': 'super-secret-master-token'}"),
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "super-secret-master-token" not in resp.text
+
+    def test_a_refused_storage_token_gets_its_own_wording(self, seeded_app):
+        """The storage token is not the owner's, so the master-token hint
+        would send the admin looking for the wrong thing."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-storage")
+
+        resp = self._put_secret(
+            c, token, conn_id, kind="storage", value="token-from-another-stack", exc=self._refusal()
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["message"] == (
+            "Keboola connection.example.com does not recognise this storage token. "
+            "A Keboola token is valid only on the stack and project it was created in — "
+            "is this token from connection.example.com?"
+        )
+
+    def test_keboolas_own_code_is_enough_when_the_status_was_rewritten(self, seeded_app):
+        """A reverse proxy in front of a stack can relay the body under its
+        own status; the code is what identifies the refusal either way."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-code-only")
+
+        resp = self._put_secret(
+            c, token, conn_id, kind="master", value="wrong-stack-token", exc=self._refusal(status=403)
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "does not recognise this master token" in resp.json()["detail"]["message"]
+
+    def test_a_refused_token_is_still_not_stored(self, seeded_app):
+        """A16 confirmed the behaviour was already correct — pinned here so a
+        message fix can never quietly become a "store it anyway"."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-not-stored")
+
+        self._put_secret(c, token, conn_id, kind="master", value="wrong-stack-token", exc=self._refusal())
+
+        row = c.get(f"{BASE}/{conn_id}", headers=_auth(token)).json()
+        assert row["has_master_secret"] is False
+        assert row["has_secret"] is False
+
+    def test_a_project_mismatch_keeps_its_own_distinct_sentence(self, seeded_app):
+        """Two different failures, two different fixes: a refusal means the
+        stack has never heard of the token, a mismatch means it knows it
+        perfectly well and it opens someone else's project."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-mismatch")
+
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                return_value={"isMasterToken": False, "owner": {"id": 1234, "name": "Acme Analytics"}},
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            c.put(
+                f"{BASE}/{conn_id}/secret",
+                json={"value": "storage-token", "kind": "storage"},
+                headers=_auth(token),
+            )
+
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                return_value={"isMasterToken": True, "owner": {"id": 9999, "name": "Other Project"}},
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            resp = c.put(
+                f"{BASE}/{conn_id}/secret",
+                json={"value": "master-token-of-another-project", "kind": "master"},
+                headers=_auth(token),
+            )
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert "project_mismatch" in detail
+        assert "9999" in detail and "1234" in detail
+        assert "does not recognise" not in detail
+
+    def test_an_upstream_failure_that_is_not_a_refusal_still_surfaces(self, seeded_app):
+        """Only the refusal is translated. A stack that is merely broken must
+        still report what it said, or the translation would have swallowed
+        the one case where the raw text IS the diagnosis."""
+        from connectors.keboola.storage_api import StorageApiError
+
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._create_keboola(c, token, name="test-a16-outage")
+
+        resp = self._put_secret(
+            c,
+            token,
+            conn_id,
+            kind="master",
+            value="a-real-master-token",
+            exc=StorageApiError("HTTP 500: Internal Server Error", status=500),
+        )
+
+        assert resp.status_code == 502, resp.text
+        assert "Internal Server Error" in resp.json()["detail"]
 
 
 class TestProjectIdentityBinding:
@@ -2281,3 +2495,31 @@ def test_the_wizard_rejects_http_the_way_the_server_does():
     ).read_text(encoding="utf-8")
     assert 'startsWith("https://")' in src
     assert 'startsWith("http")' not in src.replace('startsWith("https://")', "")
+
+
+def test_the_token_save_toasts_read_the_structured_detail():
+    """A16: the refusal message is only useful if the page shows it.
+
+    A structured `detail` pasted into a template literal renders
+    "[object Object]" — the failure `detailMessage()` was introduced to fix.
+    The two token-save handlers went straight to `body.detail`, so they must
+    go through that one reader too.
+    """
+    import pathlib
+    import re
+
+    src = (
+        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
+    ).read_text(encoding="utf-8")
+    for name in ("saveMasterToken", "saveRotatedToken"):
+        start = src.index(f"async function {name}(")
+        end = src.index("\nasync function ", start + 1)
+        body = src[start:end]
+        assert re.search(r"detailMessage\(\s*body", body), f"{name} does not read detailMessage()"
+        assert "body.detail" not in body, f"{name} still stringifies a structured detail"
+    # The wizard stores the storage token on the same endpoint, so its
+    # own banner reads the same shape.
+    start = src.index("async function connectAndValidate(")
+    wizard = src[start : src.index("\nasync function ", start + 1)]
+    assert 'detailMessage(sb, "unknown error")' in wizard
+    assert "sb.detail" not in wizard

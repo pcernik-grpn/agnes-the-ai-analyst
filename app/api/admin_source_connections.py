@@ -56,7 +56,13 @@ Surface (all gated by ``Depends(require_admin)``):
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
                                                        kind=master is keboola-only and validated
-                                                       live via a verify_token preflight
+                                                       live via a verify_token preflight. A token
+                                                       the stack REFUSES answers 400 with a
+                                                       structured detail — ``{error, message,
+                                                       upstream}``, the wire text confined to
+                                                       ``upstream`` (see ``_preflight_error``);
+                                                       every other detail on this route is a
+                                                       plain string
   DELETE /api/admin/source-connections/{id}/secret  — clear vault secret (?kind=storage|master)
   POST   /api/admin/source-connections/{id}/test    — verify connectivity, per source type:
                                                        ``keboola`` verifies the storage token against
@@ -700,6 +706,94 @@ def _reject_project_mismatch(row: Dict[str, Any], payload: Dict[str, Any], *, wh
         raise HTTPException(status_code=400, detail=message)
 
 
+#: Keboola's own error code for "no such token on this stack". Checked
+#: alongside the 401 rather than instead of it: the status is what every
+#: stack answers, the code is what survives a reverse proxy that relays the
+#: body under a status of its own.
+_TOKEN_REFUSED_CODE = "storage.tokenInvalid"
+
+#: Why a refused token is nearly always a token from somewhere else, phrased
+#: per kind — the master token is the project owner's and the one the
+#: semantic layer needs, so pointing at the wrong hint sends the admin
+#: looking for the wrong thing.
+_TOKEN_REFUSED_HINTS = {
+    "master token": "Master (owner) tokens are valid only on their own stack and project",
+    "storage token": "A Keboola token is valid only on the stack and project it was created in",
+}
+
+
+def _is_token_refused(exc: Exception) -> bool:
+    """True when the Storage API answered "I have never seen this token".
+
+    Deliberately narrow. It is NOT a project mismatch — that is a token this
+    stack knows and accepts, which merely opens a different project — and it
+    is not an outage. Three different failures needing three different
+    fixes, so they must not collapse into one sentence.
+    """
+    if getattr(exc, "status", None) == 401:
+        return True
+    body = getattr(exc, "body", None)
+    return isinstance(body, dict) and body.get("code") == _TOKEN_REFUSED_CODE
+
+
+def token_refused_message(stack_url: str, *, what: str) -> str:
+    """What to tell an admin whose token the stack refused.
+
+    The raw ``StorageApiError`` text used to be the whole toast: an internal
+    ``/v2/storage/tokens/verify`` URL, ``HTTP 401`` and Keboola's JSON body
+    down to its ``exceptionId``. All of it true, none of it the answer —
+    which is that a Keboola token only exists on the stack that issued it,
+    so a token refused outright is nearly always from another stack. Naming
+    the stack this connection is configured for is what makes that
+    checkable.
+    """
+    host = _log_host(stack_url)
+    hint = _TOKEN_REFUSED_HINTS.get(what, _TOKEN_REFUSED_HINTS["storage token"])
+    return f"Keboola {host} does not recognise this {what}. {hint} — is this token from {host}?"
+
+
+def _preflight_error(exc: Exception, redacted: str, stack_url: str, *, what: str) -> HTTPException:
+    """The HTTP error for a failed ``verify_token`` preflight.
+
+    A 4xx means the Storage API understood us and said no — the admin's to
+    fix, so it must not come back as 502: a Bad Gateway reads as "Agnes is
+    broken" and sends people hunting infrastructure instead of re-reading
+    the error.
+
+    A refusal additionally gets a translated ``detail.message``; every other
+    upstream failure keeps the raw passthrough, because there the upstream
+    text IS the diagnosis and inventing a sentence for it would only hide
+    it. The raw text is never lost either way — on the translated path it
+    moves to ``detail.upstream``, which the page's ``detailMessage()``
+    reader (and :func:`_detail_text`) deliberately do not show.
+    """
+    status = 400 if is_upstream_client_error(exc) else 502
+    if _is_token_refused(exc):
+        return HTTPException(
+            status_code=status,
+            detail={
+                "error": "storage_api_error",
+                "message": token_refused_message(stack_url, what=what),
+                "upstream": redacted,
+            },
+        )
+    return HTTPException(status_code=status, detail=f"storage_api_error: {redacted}")
+
+
+def _detail_text(detail: Any) -> str:
+    """The human line out of an ``HTTPException.detail`` that may be a plain
+    string or the structured ``{error, message, upstream}`` shape.
+
+    The server-side twin of the page's ``detailMessage()``: same preference
+    order, same reason for existing — ``str()`` on the structured shape
+    renders a stringified dict and drags the raw upstream text back into
+    whatever an admin reads.
+    """
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("error") or detail)
+    return detail if isinstance(detail, str) else str(detail)
+
+
 class _VerifiedTokenInfo:
     """Adapts an already-fetched ``verify_token()`` response so it can be
     passed to ``connectors.keboola.semantic_layer.require_master_token``
@@ -1229,11 +1323,9 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
             # programming error should surface as a 500, not be mistaken for
             # an upstream outage.
             #
-            # A 4xx means the Storage API understood us and said no — the
-            # pasted token is invalid, expired, or belongs to another stack.
-            # That is the admin's to fix, so it must not come back as 502:
-            # a Bad Gateway reads as "Agnes is broken" and sends people
-            # hunting infrastructure instead of re-reading the error.
+            # Status and wording both live in `_preflight_error`: a 4xx is the
+            # admin's to fix (400, not a 502 that reads as "Agnes is broken"),
+            # and a flat refusal gets a sentence instead of the wire text.
             redacted = client._redact(exc)
             logger.warning(
                 "master-token preflight failed for connection %s (%s): %s",
@@ -1241,8 +1333,7 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                 _log_host(stack_url),
                 redacted,
             )
-            status = 400 if is_upstream_client_error(exc) else 502
-            raise HTTPException(status_code=status, detail=f"storage_api_error: {redacted}") from exc
+            raise _preflight_error(exc, redacted, stack_url, what="master token") from exc
         if not info.get("isMasterToken"):
             # Reuse require_master_token's exact message rather than duplicating
             # it — it already fetched isMasterToken, so hand it the cached
@@ -1289,8 +1380,7 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                         _log_host(stack_url),
                         redacted,
                     )
-                    status = 400 if is_upstream_client_error(exc) else 502
-                    raise HTTPException(status_code=status, detail=f"storage_api_error: {redacted}") from exc
+                    raise _preflight_error(exc, redacted, stack_url, what="storage token") from exc
                 _reject_project_mismatch(row, info, what="storage token")
         key = connection_id
 
@@ -1383,7 +1473,7 @@ async def _seed_keboola_instance_credential(connection_id: str, row: Dict[str, A
     try:
         await _store_connection_secret(connection_id, row, value, "storage")
     except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        detail = _detail_text(exc.detail)
         logger.warning(
             "Keboola import for connection %s: could not seed the instance-vault token: %s",
             connection_id,

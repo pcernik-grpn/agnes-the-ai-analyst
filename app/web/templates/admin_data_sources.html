@@ -2865,7 +2865,7 @@ async function saveRotatedToken(id) {
       const body = await r.json().catch(() => ({}));
       const msg = r.status === 409
         ? "Server vault key missing — set AGNES_VAULT_KEY first."
-        : "Failed: " + (body.detail || "unknown error");
+        : "Failed: " + detailMessage(body, "unknown error");
       showToast(msg, false);
     }
   } catch (_) {
@@ -2906,7 +2906,7 @@ async function saveMasterToken(id) {
       const body = await r.json().catch(() => ({}));
       const msg = r.status === 409
         ? "Server vault key missing — set AGNES_VAULT_KEY first."
-        : "Failed: " + (body.detail || "unknown error");
+        : "Failed: " + detailMessage(body, "unknown error");
       showToast(msg, false);
     }
   } catch (_) {
@@ -4317,7 +4317,7 @@ async function connectAndValidate() {
     });
     if (!secretResp.ok && secretResp.status !== 204) {
       const sb = await secretResp.json().catch(() => ({}));
-      errEl.innerHTML = "Connection saved but storing the token failed: " + _esc(sb.detail || "unknown error") +
+      errEl.innerHTML = "Connection saved but storing the token failed: " + _esc(detailMessage(sb, "unknown error")) +
         `. Fix the token and retry — this connection is reused, not duplicated — or ` +
         `<a href="#" onclick="deleteConn('${connId}'); closeWizard(); return false;">discard it</a>.`;
       errEl.style.display = "block";
