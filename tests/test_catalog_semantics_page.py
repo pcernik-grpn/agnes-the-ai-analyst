@@ -601,7 +601,9 @@ _DOOR = 'href="/semantic-layer"'
 class TestCatalogSemanticsDoorToTheDocument:
     """This page renders the FLAT projection (`metric_definitions` +
     `glossary_terms`); the stored Ossie document itself is browsed at
-    `/semantic-layer`. Both are titled "Semantic layer", and this is the more
+    `/semantic-layer`. Both were once titled "Semantic layer" (this page is
+    now "Metrics & glossary", that one "Semantic models" — see
+    tests/test_semantic_page_names_contract.py), and this is the more
     reachable of the two, so a model with datasets and relationships but no
     metrics rendered "No metrics registered yet" here with nothing pointing at
     the document — the page read as "there is no semantic layer" while there

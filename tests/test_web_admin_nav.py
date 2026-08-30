@@ -1287,9 +1287,13 @@ class TestDataLensFlowStrip:
         """ "Semantic" is an adjective with no noun, and "Packages" collides
         with the marketplace's plugin packages — both shipped with a caption
         under them explaining what they meant, which is the tell that the name
-        was doing too little. The names carry it now; there are no captions."""
+        was doing too little. The names carry it now; there are no captions.
+
+        The tab is "Semantic layer health" rather than plain "Semantic layer"
+        because three pages wore the latter at once — see
+        tests/test_semantic_page_names_contract.py."""
         tabs = self._data_tabs()
-        semantic = next(t for t in tabs if t["label"] == "Semantic layer")
+        semantic = next(t for t in tabs if t["label"] == "Semantic layer health")
         assert semantic["chain"] is False
 
     def test_no_tab_carries_a_purpose_caption(self) -> None:

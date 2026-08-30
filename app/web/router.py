@@ -3705,8 +3705,10 @@ async def catalog_semantics(
         metric_categories=metric_categories,
         metric_count=len(metrics),
         glossary_count=glossary_count,
-        # The door to /semantic-layer. Both pages are titled "Semantic layer"
-        # and this is the reachable one, so without the link a document with
+        # The door to Semantic models (/semantic-layer). Both pages were once
+        # titled "Semantic layer" (this one is now "Metrics & glossary", see
+        # tests/test_semantic_page_names_contract.py) and this is the more
+        # reachable one, so without the link a document with
         # datasets and relationships but no metrics rendered as "there is no
         # semantic layer here". Same gate /library's Definitions footer uses —
         # a readable document, never this page's own metric/glossary counts.
