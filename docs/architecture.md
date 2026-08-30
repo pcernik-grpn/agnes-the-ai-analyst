@@ -762,7 +762,15 @@ deps — never built by default; `docker build .` with no `--target` still
 produces the ordinary `app` image) and the `extraction-worker` compose
 service (`docker-compose.yml`, profile-gated, `AGNES_WORKER_LANES
 =extraction`) let a deployment run extraction in its own process/container
-instead of adding it to the main `app` service's lanes.
+instead of adding it to the main `app` service's lanes. That service sets
+`AGNES_ROLE=worker`, which is a role split — running it makes the
+deployment multi-process, requiring Postgres app-state, explicit
+`JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis` (same
+as any other role-split process; see
+[`DEPLOYMENT.md#multi-process`](DEPLOYMENT.md#multi-process)). Flipping
+`extraction.enabled` and starting the profile is not sufficient on its
+own — `app/startup_guards.py::validate_deployment` refuses to boot
+otherwise.
 
 **Cross-process rebuild lease**: `SyncOrchestrator`'s `_rebuild_lock` is
 an in-process `threading.Lock` — invisible across processes. In a
