@@ -501,6 +501,22 @@
     background: color-mix(in srgb, var(--ds-agnes) 18%, var(--ds-surface));
   }
   .ds-wexisting[hidden] { display: none; }
+  /* Registered but not usable. The default panel is a success shape — a soft
+     brand fill and a forward CTA — and wearing it for a connection with no
+     token is what let "Keboola is already connected" sit above a dead end.
+     The blocked variant keeps the layout and drops the success signals. */
+  .ds-wexisting.is-blocked {
+    background: var(--ds-accent-warning-bg, #fdf6e3);
+    border: 1px solid var(--ds-accent-warning-ink, #8a5a00);
+  }
+  /* Nothing in this state is selectable, so the picker goes with the CTA —
+     emptying the <select> alone left a working-looking dropdown with no
+     options in it, which reads as a control that failed to load. */
+  .ds-wexisting.is-blocked .ds-wexisting__act { display: none; }
+  .ds-wexisting.is-blocked .ds-wexisting__tile {
+    background: color-mix(in srgb, var(--ds-accent-warning-ink, #8a5a00) 14%, transparent);
+    color: var(--ds-accent-warning-ink, #8a5a00);
+  }
   /* The connector's own mark, in the connector's own PAIR of tokens — the
      same `-soft` fill under the same ink the picker's Keboola tile above it
      uses. A lifted white tile (the `.cbn-bar-icon` look) would have been
@@ -1173,7 +1189,7 @@
                it. Saying "N Keboola projects" here would also re-plant the
                exact phrase this page was rebuilt to stop using — the guard in
                TestSourcesIsEveryConnector reads the whole body. #}
-            <div class="ds-wexisting__title">Keboola is already connected.</div>
+            <div class="ds-wexisting__title" id="ds-wexisting-title">Keboola is already connected.</div>
             <p class="ds-wexisting__copy" id="ds-wexisting-copy">Go straight to its tables — no URL, no token to paste again.</p>
           </div>
           <div class="ds-wexisting__act">
@@ -4069,7 +4085,17 @@ function openWizard(connector) {
   // picker against an id the API has never heard of.
   const existing = document.getElementById("ds-wexisting");
   const orRule = document.getElementById("ds-wor");
-  const browsable = _connections.filter((c) => !c.derived && c.source_type === "keboola");
+  // A connection can only be BROWSED if it holds a credential. This filter
+  // checked `source_type` and nothing else, so a connection whose token
+  // failed validation was offered under "Keboola is already connected — no
+  // token to paste again", and Choose tables then dead-ended on
+  // "no token available (vault empty, token_env unset)" with a green tick on
+  // the step behind it. Same predicate the source card and the setup
+  // checklist use, so the three cannot disagree about what "connected" means.
+  const _hasCredential = (c) => c.has_secret === true || !!(c.token_env || "").trim();
+  const keboolaConns = _connections.filter((c) => !c.derived && c.source_type === "keboola");
+  const browsable = keboolaConns.filter(_hasCredential);
+  const needsToken = keboolaConns.filter((c) => !_hasCredential(c));
   if (browsable.length) {
     // The option carries what the project already holds. "Keboola AI" alone
     // does not say whether picking it is worth anything; "· 3 tables" does,
@@ -4083,10 +4109,38 @@ function openWizard(connector) {
       })
       .join("");
     _syncDropdownRebuild(wexistingSel);
-    document.getElementById("ds-wexisting-copy").textContent = browsable.length === 1
+    const alsoBroken = needsToken.length
+      ? ` ${needsToken.length} other project${needsToken.length === 1 ? "" : "s"} still need${needsToken.length === 1 ? "s" : ""} a token.`
+      : "";
+    document.getElementById("ds-wexisting-copy").textContent = (browsable.length === 1
       ? "Go straight to its tables — no URL, no token to paste again."
-      : `Pick one of your ${browsable.length} connected projects and go straight to its tables.`;
+      : `Pick one of your ${browsable.length} connected projects and go straight to its tables.`) + alsoBroken;
+    existing.classList.remove("is-blocked");
+    document.getElementById("ds-wexisting-title").textContent = "Keboola is already connected.";
+    document.getElementById("ds-wexisting-btn").hidden = false;
     existing.hidden = false;
+    orRule.hidden = false;
+  } else if (needsToken.length) {
+    // Connections exist but none can be read. Saying nothing here sent the
+    // admin to "connect a new project" while the half-finished one sat on
+    // the page behind the drawer; claiming they were connected sent them
+    // into the dead end. Name the state and where it is fixed.
+    const one = needsToken.length === 1;
+    document.getElementById("ds-wexisting-copy").textContent = one
+      ? `“${needsToken[0].name || needsToken[0].id}” is registered but has no token stored, so its tables cannot be listed. `
+        + `Add a token on its card below, or connect a new project.`
+      : `${needsToken.length} projects are registered but have no token stored, so their tables cannot be listed. `
+        + `Add a token on their cards below, or connect a new project.`;
+    document.getElementById("ds-wexisting-title").textContent = one
+      ? "A Keboola project is registered, but not usable yet."
+      : "Keboola projects are registered, but none are usable yet.";
+    document.getElementById("ds-wexisting-select").innerHTML = "";
+    _syncDropdownRebuild(document.getElementById("ds-wexisting-select"));
+    // No "Choose tables" — that button led straight to
+    // "Failed to list tables: no token available".
+    document.getElementById("ds-wexisting-btn").hidden = true;
+    existing.hidden = false;
+    existing.classList.add("is-blocked");
     orRule.hidden = false;
   } else {
     existing.hidden = true;
