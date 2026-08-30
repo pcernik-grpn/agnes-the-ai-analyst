@@ -4133,7 +4133,11 @@ function openWizard(connector) {
         + `Add a token on their cards below, or connect a new project.`;
     document.getElementById("ds-wexisting-title").textContent = one
       ? "A Keboola project is registered, but not usable yet."
-      : "Keboola projects are registered, but none are usable yet.";
+      // Deliberately does not name the connector in the plural: that phrasing
+      // is banned outright by TestSourcesIsEveryConnector, which reads the
+      // whole served body (comments included), because it re-plants the
+      // single-connector framing this page was rebuilt to drop.
+      : "None of the registered projects are usable yet.";
     document.getElementById("ds-wexisting-select").innerHTML = "";
     _syncDropdownRebuild(document.getElementById("ds-wexisting-select"));
     // No "Choose tables" — that button led straight to
