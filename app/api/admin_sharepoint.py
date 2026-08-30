@@ -92,8 +92,10 @@ Surface (all gated by ``Depends(require_admin)``):
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
 backends). Each row is ``{source_scope_id, display_path, anonymize,
-collection_id, access_mode, drive_id}`` (spec §13.2, extended by §2.5/§5 for
-ACL mirroring); group grants are NOT duplicated here — they are ordinary
+collection_id, access_mode, drive_id, audience_classes}`` (spec §13.2,
+extended by §2.5/§5 for ACL mirroring and §4.1-4.3 for the per-scope
+audience-class mapping — 2026-08-30 plan, Task 8); group grants are NOT
+duplicated here — they are ordinary
 ``resource_grants`` rows on the collection, same primitive ``/admin/access``
 already reads (spec: "facts are never granted... zero new grant type"),
 except a ``sharepoint-acl-sync``-written (sentinel-owned, ``assigned_by
@@ -152,6 +154,18 @@ router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
 # ---------------------------------------------------------------------------
 
 
+class AudienceClassIn(BaseModel):
+    """One per-scope audience-class row (2026-08-30 plan, Task 8; spec
+    §4.1-4.3) — ``name`` is the tag Slice 4b's ``claims.audience`` column
+    will carry (same identifier pattern that column's ingest validation
+    uses), ``group_ids`` is the set of Agnes groups whose membership defines
+    "holds this class". Order carries no ordinal field of its own — position
+    in ``ConfirmScopeBody.audience_classes``'s list IS the privilege rank."""
+
+    name: str = Field(..., min_length=1, pattern=r"^[a-z0-9_-]{1,64}$")
+    group_ids: List[str] = Field(default_factory=list)
+
+
 class ConfirmScopeBody(BaseModel):
     source_scope_id: str = Field(..., min_length=1)
     display_path: str = Field(..., min_length=1)
@@ -189,6 +203,17 @@ class ConfirmScopeBody(BaseModel):
     # Always persisted on confirm, same "not omitted-means-unchanged"
     # semantics as ``access_mode``/``anonymize`` above.
     include_excluded_subtrees: bool = False
+    # Per-scope audience-class mapping (2026-08-30 plan, Task 8; spec
+    # §4.1-4.3) — index-time claim variants (Slice 4b) select among these by
+    # caller membership (Slice 3). ORDERED MOST-PRIVILEGED FIRST: the order
+    # is the privilege ranking Slice 4b's projection dedup and the tiered-
+    # collections document-text gate both rank by, not just presentation.
+    # ``None`` (omitted) leaves the scope's existing mapping untouched;
+    # ``[]`` explicitly clears it (back to non-tiered) — the SAME omitted-
+    # vs-empty semantics as ``group_ids`` above, for the same reason: a step
+    # 2/step 3 confirm that says nothing about audience tiers must not
+    # silently wipe a configured mapping.
+    audience_classes: Optional[List[AudienceClassIn]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +391,25 @@ def _acl_sync_summary(connection: Optional[Dict[str, Any]], scope: Dict[str, Any
     }
 
 
+def _scope_audience_classes_out(scope: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Projects a scope row's stored ``audience_classes`` — ``[{"name":
+    str, "group_ids": [str]}]`` in the wizard-persisted privilege order
+    (most-privileged first). A pre-Task-8 row (or one whose mapping was
+    explicitly cleared with ``[]``) has no key or an empty list; either
+    reads as ``[]`` here, never a null. This is the WIZARD's read shape only
+    — the runtime read path Tasks 9-11 consume is
+    ``src.audience_classes.audience_class_map()``, which scans the same
+    stored field but is keyed by collection id across every connection."""
+    raw = scope.get("audience_classes")
+    if not isinstance(raw, list):
+        return []
+    return [
+        {"name": cls.get("name"), "group_ids": list(cls.get("group_ids") or [])}
+        for cls in raw
+        if isinstance(cls, dict) and cls.get("name")
+    ]
+
+
 def _scope_out(
     scope: Dict[str, Any],
     declared_corpus_ids: Optional[set] = None,
@@ -415,6 +459,12 @@ def _scope_out(
         ],
         "include_excluded_subtrees": bool(scope.get("include_excluded_subtrees")),
     }
+    audience_classes = _scope_audience_classes_out(scope)
+    out["audience_classes"] = audience_classes
+    # Non-empty audience_classes IS tiered (2026-08-30 plan, Task 8; spec
+    # §4.1-4.3) — Slice 4b's predicate and Slice 4c's document-text gate
+    # both key off this flag via src.audience_classes.tiered_collection_ids.
+    out["tiered"] = bool(audience_classes)
     summary = _acl_sync_summary(connection, scope)
     if summary is not None:
         out["acl_sync_last_run"] = summary
@@ -835,9 +885,31 @@ async def confirm_scope(
                 },
             )
 
-    if body.group_ids:
+    if body.audience_classes is not None:
+        names = [cls.name for cls in body.audience_classes]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "duplicate_audience_class", "names": duplicates},
+            )
+
+    # Every group id referenced anywhere in this request — the share-step
+    # checkboxes AND each audience class's membership — must already exist.
+    # One check, one error shape (``invalid_group_id``), for both sources.
+    _group_ids_to_check: List[str] = list(body.group_ids or [])
+    for cls in body.audience_classes or []:
+        _group_ids_to_check.extend(cls.group_ids)
+    if _group_ids_to_check:
         groups_repo = user_groups_repo()
-        unknown = [gid for gid in body.group_ids if groups_repo.get(gid) is None]
+        seen: set = set()
+        unknown = []
+        for gid in _group_ids_to_check:
+            if gid in seen:
+                continue
+            seen.add(gid)
+            if groups_repo.get(gid) is None:
+                unknown.append(gid)
         if unknown:
             raise HTTPException(status_code=400, detail={"error": "invalid_group_id", "group_ids": unknown})
 
@@ -871,6 +943,20 @@ async def confirm_scope(
                 "include_excluded_subtrees": body.include_excluded_subtrees,
             }
         )
+
+    # Audience-class mapping (2026-08-30 plan, Task 8): omitted (``None``)
+    # leaves whatever is already on the row untouched — a step 2/step 3
+    # confirm that says nothing about audience tiers must not wipe a
+    # configured mapping; ``[]`` explicitly clears it. Same
+    # omitted-vs-empty contract as ``group_ids`` above, applied to the ONE
+    # scope row this request is confirming (new or existing — `existing`
+    # is `None` for a brand-new scope, whose freshly appended dict is the
+    # last entry of `scopes`).
+    target_scope = existing if existing is not None else scopes[-1]
+    if body.audience_classes is not None:
+        target_scope["audience_classes"] = [
+            {"name": cls.name, "group_ids": list(cls.group_ids)} for cls in body.audience_classes
+        ]
 
     # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
     # adding a new key here rather than editing this one.

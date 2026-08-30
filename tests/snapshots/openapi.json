@@ -506,6 +506,29 @@
         "title": "ArchiveSessionBody",
         "type": "object"
       },
+      "AudienceClassIn": {
+        "description": "One per-scope audience-class row (2026-08-30 plan, Task 8; spec\n\u00a74.1-4.3) \u2014 ``name`` is the tag Slice 4b's ``claims.audience`` column\nwill carry (same identifier pattern that column's ingest validation\nuses), ``group_ids`` is the set of Agnes groups whose membership defines\n\"holds this class\". Order carries no ordinal field of its own \u2014 position\nin ``ConfirmScopeBody.audience_classes``'s list IS the privilege rank.",
+        "properties": {
+          "group_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Group Ids",
+            "type": "array"
+          },
+          "name": {
+            "minLength": 1,
+            "pattern": "^[a-z0-9_-]{1,64}$",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "AudienceClassIn",
+        "type": "object"
+      },
       "AuditEventIn": {
         "properties": {
           "action": {
@@ -1870,6 +1893,20 @@
             "default": false,
             "title": "Anonymize",
             "type": "boolean"
+          },
+          "audience_classes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AudienceClassIn"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audience Classes"
           },
           "display_path": {
             "minLength": 1,

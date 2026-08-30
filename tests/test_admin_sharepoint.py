@@ -1715,3 +1715,211 @@ class TestSubtreeOverride:
         )
         assert r.status_code == 201, r.text
         assert r.json()["include_excluded_subtrees"] is False
+
+
+# ---------------------------------------------------------------------------
+# SharePoint ACL mirroring (2026-08-30 plan, Task 8) — per-scope
+# audience-class mapping (wizard data): ConfirmScopeBody.audience_classes,
+# _scope_out's audience_classes/tiered, and src.audience_classes' runtime
+# read path.
+# ---------------------------------------------------------------------------
+
+
+class TestAudienceClasses:
+    """``ConfirmScopeBody.audience_classes`` / ``_scope_out``'s
+    ``audience_classes``+``tiered`` fields (spec §4.1-4.3)."""
+
+    def test_round_trip_preserves_order_and_sets_tiered(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-conn")
+        full = c.post("/api/admin/groups", json={"name": "aud-full"}, headers=_auth(token)).json()["id"]
+        redacted = c.post("/api/admin/groups", json={"name": "aud-redacted"}, headers=_auth(token)).json()["id"]
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud1",
+                "display_path": "Aud",
+                "audience_classes": [
+                    {"name": "full", "group_ids": [full]},
+                    {"name": "redacted", "group_ids": [redacted]},
+                ],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == [
+            {"name": "full", "group_ids": [full]},
+            {"name": "redacted", "group_ids": [redacted]},
+        ]
+        assert r.json()["tiered"] is True
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["audience_classes"] == r.json()["audience_classes"]
+        assert listed["tiered"] is True
+
+    def test_defaults_to_empty_and_not_tiered(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-default")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud2", "display_path": "Aud"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == []
+        assert r.json()["tiered"] is False
+
+    def test_omitting_leaves_existing_mapping_untouched(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-omit")
+        gid = c.post("/api/admin/groups", json={"name": "aud-omit-group"}, headers=_auth(token)).json()["id"]
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud3",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "full", "group_ids": [gid]}],
+            },
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud3", "display_path": "Renamed"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == [{"name": "full", "group_ids": [gid]}]
+        assert r.json()["tiered"] is True
+        assert r.json()["display_path"] == "Renamed"
+
+    def test_empty_list_clears_the_mapping(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-clear")
+        gid = c.post("/api/admin/groups", json={"name": "aud-clear-group"}, headers=_auth(token)).json()["id"]
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud4",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "full", "group_ids": [gid]}],
+            },
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud4", "display_path": "Aud", "audience_classes": []},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == []
+        assert r.json()["tiered"] is False
+
+    def test_unknown_group_id_in_audience_class_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-bad-group")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud5",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "full", "group_ids": ["does-not-exist"]}],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_group_id"
+
+    def test_duplicate_class_names_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-dup")
+        gid = c.post("/api/admin/groups", json={"name": "aud-dup-group"}, headers=_auth(token)).json()["id"]
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud6",
+                "display_path": "Aud",
+                "audience_classes": [
+                    {"name": "full", "group_ids": [gid]},
+                    {"name": "full", "group_ids": []},
+                ],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "duplicate_audience_class"
+
+    def test_bad_class_name_pattern_is_422(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-bad-name")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud7",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "Full Detail!", "group_ids": []}],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+
+class TestAudienceClassMap:
+    """``src.audience_classes`` — Slice 4a's runtime read path (Task 8),
+    consumed by Tasks 9-11. Exercised here (not ``test_audience_classes.py``,
+    which Task 9 owns) because it reads back the exact wizard-persisted shape
+    this file's other tests write through the API."""
+
+    def test_reflects_stored_scopes_in_privilege_order(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-map-conn")
+        full = c.post("/api/admin/groups", json={"name": "aud-map-full"}, headers=_auth(token)).json()["id"]
+        redacted = c.post("/api/admin/groups", json={"name": "aud-map-redacted"}, headers=_auth(token)).json()["id"]
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud-map1",
+                "display_path": "Map",
+                "audience_classes": [
+                    {"name": "full", "group_ids": [full]},
+                    {"name": "redacted", "group_ids": [redacted]},
+                ],
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        from src.audience_classes import audience_class_map, tiered_collection_ids
+
+        mapping = audience_class_map()
+        assert mapping[collection_id] == [
+            ("full", frozenset({full})),
+            ("redacted", frozenset({redacted})),
+        ]
+        assert collection_id in tiered_collection_ids()
+
+    def test_non_tiered_scope_is_absent(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-map-plain")
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud-map2", "display_path": "Plain"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        from src.audience_classes import audience_class_map, tiered_collection_ids
+
+        assert collection_id not in audience_class_map()
+        assert collection_id not in tiered_collection_ids()
