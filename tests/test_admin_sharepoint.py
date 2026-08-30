@@ -1081,28 +1081,69 @@ class TestCertificateMetadata:
 
 
 class TestCorpusMap:
-    def test_corpus_map_is_the_flat_scope_to_collection_mapping(self, seeded_app):
+    def test_corpus_map_keys_are_producer_resolver_shaped(self, seeded_app):
+        """Keys must be what the producer's corpus_for() resolver matches
+        against crawler rows: the site display name, with the document-
+        library segment DROPPED for folder scopes — never the raw scope id
+        (which matches no row) and never display_path verbatim."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="map-conn")
 
+        # Folder scope (item id): breadcrumb carries the library segment.
         r1 = c.post(
             f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:a", "display_path": "A"},
+            json={
+                "source_scope_id": "01SO3DIHVJLOMDRMYCA5B37XU577X4KL57",
+                "display_path": "Site One/Documents/Project Kemp",
+            },
             headers=_auth(token),
         )
+        # Site scope (composite id): bare site name is the key.
         r2 = c.post(
             f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:b", "display_path": "B"},
+            json={
+                "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
+                "display_path": "Site Two",
+            },
             headers=_auth(token),
         )
 
         mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
         assert mapping.status_code == 200
         assert mapping.json() == {
-            "drive:a": r1.json()["collection_id"],
-            "drive:b": r2.json()["collection_id"],
+            "Site One/Project Kemp": r1.json()["collection_id"],
+            "Site Two": r2.json()["collection_id"],
         }
+
+    def test_corpus_map_ambiguous_scopes_are_409(self, seeded_app):
+        """A site scope plus a drive scope of the same site collapse to the
+        same key with different collections — a typed 409, never a
+        best-guess map."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="map-ambiguous-conn")
+
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
+                "display_path": "Site One",
+            },
+            headers=_auth(token),
+        )
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
+                "display_path": "Site One / Documents",
+            },
+            headers=_auth(token),
+        )
+
+        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert mapping.status_code == 409, mapping.text
+        assert mapping.json()["detail"]["error"] == "corpus_map_ambiguous"
 
     def test_corpus_map_empty_for_connection_with_no_scopes(self, seeded_app):
         c = seeded_app["client"]

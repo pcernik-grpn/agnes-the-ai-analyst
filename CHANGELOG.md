@@ -16,6 +16,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **Unattended SharePoint extraction runs finally know where documents go.** The `corpus-extraction` job handler now hands the producer a corpus map built from the connection's own confirmed scopes (`AGNES_EXTRACTION_CORPUS_MAP`) — the standard enqueue paths (`POST /api/admin/sharepoint/connections/{id}/extract` and the scheduled sweep) send only a connection id, so every unattended run previously failed the producer's preflight with "nothing says which collection documents go to". Keys are translated to the producer resolver's crawler-row shape (site display name + drive-relative folder path — the wizard's stored `display_path` includes the document-library segment, which crawler paths never carry, so passing it verbatim would have silently routed nothing). `GET .../corpus-map` now serves the same resolver-shaped map through the same shared helper instead of the flat `{source_scope_id: collection_id}` mapping, which no crawler row could ever match. Overlapping scopes that collapse to one key with different collections (a site scope plus a drive scope of the same site) are refused loudly — job failure / `409 corpus_map_ambiguous` — never routed on a best guess, and a connection with no confirmed scopes refuses the run by name instead of failing opaquely in the producer.
+
 ### Removed
 
 ### Internal
