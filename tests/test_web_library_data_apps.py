@@ -35,12 +35,13 @@ def test_band_lists_visible_app_under_rail(seeded_app, monkeypatch):
     resp = c.get("/library", headers=_auth(seeded_app["admin_token"]))
     assert resp.status_code == 200
     body = resp.text
-    # Inside the Artefacts band (the caller's files + agent outputs + apps),
-    # not a band of its own — the Type facet still says "Data app" (rows
-    # keep type_key=data_app).
-    assert 'data-lib-sec="files"' in body
-    assert ">Artefacts<" in body
-    assert 'data-lib-sec="data_app"' not in body
+    # Its OWN band, on the Knowledge tab. Apps used to render inside the
+    # Artefacts band (router `_SECTION_OF`), which forced that band's hint to
+    # call an app a file the caller had uploaded. Rows still carry
+    # type_key=data_app either way, so the Type facet is unaffected.
+    assert 'data-lib-sec="data_app"' in body
+    assert ">Apps<" in body
+    assert 'data-tab="knowledge"' in body
     assert 'href="/apps/detail/revenue-dash"' in body
     assert "Revenue dashboard" in body
     assert 'data-type="data_app"' in body
@@ -96,9 +97,13 @@ def test_soon_badge_gone_from_files_band(seeded_app, monkeypatch):
     assert "Data apps coming soon" not in body
 
 
-def test_app_rows_trail_the_files_inside_artefacts(seeded_app, monkeypatch):
-    """Sub-kinds stay grouped inside the Artefacts band: folders, then loose
-    files, then data apps — not interleaved by recency."""
+def test_app_band_follows_the_artefacts_band(seeded_app, monkeypatch):
+    """Apps read AFTER the caller's own files, as their own band.
+
+    They used to be a trailing block inside Artefacts; the reading order that
+    guarded (your files first, then what runs on them) is the same, but it is
+    now carried by the section order rather than by row order within one
+    band."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
     monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "1")
     _seed_app(slug="order-app", name="Ordering app")
@@ -106,8 +111,11 @@ def test_app_rows_trail_the_files_inside_artefacts(seeded_app, monkeypatch):
     r = c.post("/api/collections", json={"name": "Order probe"}, headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 201, r.text
     body = c.get("/library", headers=_auth(seeded_app["admin_token"])).text
-    sec_at = body.index('data-lib-sec="files"')
-    assert body.index("Order probe", sec_at) < body.index('href="/apps/detail/order-app"', sec_at)
+    files_at = body.index('data-lib-sec="files"')
+    apps_at = body.index('data-lib-sec="data_app"')
+    assert files_at < apps_at
+    # The app row is inside its own band, not the Artefacts one.
+    assert body.index('href="/apps/detail/order-app"') > apps_at
 
 
 def test_admin_sees_only_own_and_granted_apps(seeded_app, monkeypatch):
