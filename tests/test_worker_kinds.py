@@ -978,7 +978,7 @@ class TestCorpusExtractionHandler:
             {
                 # Site scope: Graph composite id "<host>,<siteGuid>,<webGuid>".
                 "source_scope_id": "host.sharepoint.com,f0259dd4-6abe-451b-9b7c-6760d1cdcb5f,aaac162f-d03a-4137-9b64-b56386e26ff0",
-                "display_path": "Cuesta Star Test",
+                "display_path": "Northwind Star Test",
                 "anonymize": False,
                 "collection_id": "col_site",
             },
@@ -999,7 +999,7 @@ class TestCorpusExtractionHandler:
         env = calls[0]["env"]
         assert json.loads(env["AGNES_EXTRACTION_CORPUS_MAP"]) == {
             "Communication site/Project Kemp": "col_kemp",
-            "Cuesta Star Test": "col_site",
+            "Northwind Star Test": "col_site",
         }
         # Collection routing is data, not command line — never on argv.
         argv_joined = " ".join(calls[0]["argv"])
@@ -1016,7 +1016,7 @@ class TestCorpusExtractionHandler:
             "scopes": [
                 {
                     "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
-                    "display_path": "Cuesta Star Test / Documents",
+                    "display_path": "Northwind Star Test / Documents",
                     "anonymize": False,
                     "collection_id": "col_drive",
                 }
@@ -1031,7 +1031,7 @@ class TestCorpusExtractionHandler:
         handler({"connection_id": "conn1"})
 
         env = calls[0]["env"]
-        assert json.loads(env["AGNES_EXTRACTION_CORPUS_MAP"]) == {"Cuesta Star Test": "col_drive"}
+        assert json.loads(env["AGNES_EXTRACTION_CORPUS_MAP"]) == {"Northwind Star Test": "col_drive"}
 
     def test_colliding_corpus_map_keys_refuse_loudly(self, monkeypatch):
         """A site scope and a drive scope of the SAME site resolve to the
@@ -1044,13 +1044,13 @@ class TestCorpusExtractionHandler:
             "scopes": [
                 {
                     "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
-                    "display_path": "Cuesta Star Test",
+                    "display_path": "Northwind Star Test",
                     "anonymize": False,
                     "collection_id": "col_site",
                 },
                 {
                     "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
-                    "display_path": "Cuesta Star Test / Documents",
+                    "display_path": "Northwind Star Test / Documents",
                     "anonymize": False,
                     "collection_id": "col_drive",
                 },
