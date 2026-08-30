@@ -1,4 +1,5 @@
-{% extends "base_page.html" %}
+{% extends "base_index.html" %}
+{% from "macros/_fbar_card.html" import fbar_card %}
 {% import "macros/_state.html" as state %}
 
 {# NAME: "Semantic models", never "Semantic layer" — that name was worn by
@@ -8,75 +9,60 @@
    Guarded by tests/test_semantic_page_names_contract.py. #}
 {% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
-{% set page_hero_eyebrow = "Semantic layer" %}
-{% set page_hero_title = "Semantic models" %}
-{% set page_hero_plain = True %}
-{% set page_hero_subtitle = "Browse your organization's datasets, metrics, relationships and glossary — the stored document itself, not just the flat metric list." %}
+{# The `base_index.html` shell (one unbroken --ds-surface, identity-led head
+   band + a full-width card band below) — most other resource lists on this
+   branch (Library, Skills, Agents, Chats, Profile, My connections, the admin
+   builders) extend it; this page used to extend `base_page.html`'s hero shell
+   instead (a shell a few other non-list pages — Data apps, Studio — also use
+   deliberately), which is why it looked unlike the rest of the *list* pages.
 
+   The cards are `fbar_card()` (macros/_fbar_card.html) — the SAME macro
+   `/admin/data-packages` renders and the Library projects client-side, not
+   the unused `catalog_card()` in macros/_catalog_card.html (zero template
+   callers). What stays page-local (`.sl-*`) is content that macro has no
+   slot for: the invalid-model tint and its stored error list — a `<ul>`
+   never inside the title's `<a>`, which is the one thing the pre-shell
+   `slb-card` got wrong. #}
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <style>
-/* ── Model cards ─────────────────────────────────────────────────────── */
-.slb-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: var(--space-4);
-    margin: var(--space-5) 0 var(--space-9);
-}
-.slb-card {
-    display: block;
-    padding: var(--space-4) var(--space-5);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
-    background: var(--ds-surface);
-    text-decoration: none;
-    color: inherit;
-    transition: border-color 0.12s, box-shadow 0.12s;
-}
-.slb-card:hover {
-    border-color: var(--ds-primary);
-    box-shadow: 0 2px 10px color-mix(in srgb, var(--ds-primary) 10%, transparent);
-}
-.slb-card--invalid { border-color: var(--ds-accent-danger-line); }
-.slb-card__head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-3);
-    margin-bottom: 4px;
-}
-.slb-card__name { font-size: 15px; font-weight: 700; color: var(--ds-text-primary); }
-.slb-card__desc {
-    font-size: 12.5px;
-    color: var(--ds-text-secondary);
-    margin: 4px 0 var(--space-3);
-    min-height: 1em;
-}
-.slb-card__dialects {
-    font-size: 11px;
-    color: var(--ds-text-muted);
-    margin-bottom: var(--space-3);
-}
-.slb-counts {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-}
-.slb-count {
-    font-size: 11px;
-    color: var(--ds-text-muted);
-    background: var(--ds-surface-dim);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-full);
-    padding: 2px 8px;
-}
-.slb-errors {
-    margin: var(--space-3) 0 0;
+/* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
+.sl-head { margin: 2px 0 0; }
+.sl-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
+.sl-head h1 { font-size: 24px; margin: 2px 0 0; }
+.sl-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 6px 0 0; max-width: 64ch; }
+
+/* `.fbar-grid` (filter_toolbar.css) is fixed at 3 columns; auto-fill reads
+   better for a collection this short and matches the pre-shell grid's own
+   sizing — same page-specific-override pattern as admin_data_packages'
+   own `.adp-grid`. */
+.sl-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+
+/* An invalid document is still a real card, flagged rather than styled
+   away — an attribute selector rather than a second class on the `<article>`
+   `fbar_card()` already stamps with `class="fbar-card"` (a caller-supplied
+   class would collide with it). Survives `:hover` (which only touches
+   `box-shadow`, never `border-color`) and defers to `:focus-within`'s own
+   primary-colored ring, same as every other card. */
+.fbar-card[data-status="invalid"] { border-color: var(--ds-accent-danger-line); }
+
+/* The invalid state's footer content: the "Invalid" badge plus its stored
+   validation errors — rendered instead of the object-count tags, since an
+   invalid document's `document_json` may be stale or absent. */
+.sl-invalid { display: flex; flex-direction: column; gap: 4px; }
+.sl-errors {
+    margin: 0;
     padding: 0 0 0 18px;
     font-size: 12px;
     color: var(--ds-accent-danger-ink);
 }
-.slb-errors li { margin-bottom: 2px; }
-.slb-empty-related-link {
+.sl-errors li { margin-bottom: 2px; }
+
+/* The cross-link under the empty panel — a plain body line, deliberately not
+   the panel's CTA (see the note on the empty block below). Renamed into this
+   page's `.sl-*` vocabulary along with the rest of the page-local CSS. */
+.sl-empty-related-link {
     margin: var(--space-3) 0 0;
     font-size: 12.5px;
     color: var(--ds-text-secondary);
@@ -84,40 +70,55 @@
 </style>
 {% endblock %}
 
-{% block page %}
+{% block page_head %}
+<div class="sl-head">
+  <div class="sl-kicker">Semantic layer</div>
+  <h1>Semantic models</h1>
+  <p class="lede">Browse your organization's datasets, metrics, relationships and glossary — the stored document itself, not just the flat metric list.</p>
+</div>
+{% endblock %}
+
+{% block page_surface %}
 {% if models %}
-<div class="slb-grid">
+<div class="fbar-grid sl-grid">
     {% for m in models %}
-    <a class="slb-card{% if m.status == 'invalid' %} slb-card--invalid{% endif %}" href="/semantic-layer/{{ m.slug }}">
-        <div class="slb-card__head">
-            <span class="slb-card__name">{{ m.name }}</span>
-            {% if m.is_imported %}
-            <span class="badge">Imported from {{ m.source_label }}</span>
-            {% endif %}
-        </div>
-        <p class="slb-card__desc">{{ m.description or "" }}</p>
-        {% if m.dialects %}
-        <div class="slb-card__dialects">SQL dialect{{ '' if m.dialects | length == 1 else 's' }}: {{ m.dialects | join(', ') }}</div>
-        {% endif %}
-        {% if m.status == 'invalid' %}
+    {% set _is_invalid = m.status == 'invalid' %}
+    {% set _card = {
+         'kind': 'data',
+         'title': m.name,
+         'href': '/semantic-layer/' ~ m.slug,
+         'description': m.description or '',
+         'meta': ('SQL dialect' ~ ('' if m.dialects | length == 1 else 's') ~ ': ' ~ (m.dialects | join(', '))) if m.dialects else '',
+         'tags': [] if _is_invalid else [
+             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's'),
+             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's'),
+             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's'),
+             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's'),
+             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's'),
+         ],
+         'attrs': 'data-status="invalid"' if _is_invalid else None,
+       } %}
+    {% if m.is_imported or _is_invalid %}
+    {% call fbar_card(_card) %}
+      {% if m.is_imported %}
+      <span class="badge">Imported from {{ m.source_label }}</span>
+      {% endif %}
+      {% if _is_invalid %}
+      <div class="sl-invalid">
         <span class="badge badge--danger">Invalid</span>
         {% if m.validation_errors %}
-        <ul class="slb-errors">
+        <ul class="sl-errors">
             {% for err in m.validation_errors %}
             <li>{{ err }}</li>
             {% endfor %}
         </ul>
         {% endif %}
-        {% else %}
-        <div class="slb-counts">
-            <span class="slb-count">{{ m.counts.datasets }} dataset{{ '' if m.counts.datasets == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.metrics }} metric{{ '' if m.counts.metrics == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.constraints }} constraint{{ '' if m.counts.constraints == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.relationships }} relationship{{ '' if m.counts.relationships == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.glossary }} glossary term{{ '' if m.counts.glossary == 1 else 's' }}</span>
-        </div>
-        {% endif %}
-    </a>
+      </div>
+      {% endif %}
+    {% endcall %}
+    {% else %}
+    {{ fbar_card(_card) }}
+    {% endif %}
     {% endfor %}
 </div>
 {% else %}
@@ -140,6 +141,6 @@
 {{ state.panel('empty', 'No semantic model available',
                body='Ask an admin to import or author one, or to grant you access to an existing one.') }}
 {% endif %}
-<p class="slb-empty-related-link"><a href="/catalog/semantics">Metrics &amp; glossary</a> is a related, separate view.</p>
+<p class="sl-empty-related-link"><a href="/catalog/semantics">Metrics &amp; glossary</a> is a related, separate view.</p>
 {% endif %}
 {% endblock %}

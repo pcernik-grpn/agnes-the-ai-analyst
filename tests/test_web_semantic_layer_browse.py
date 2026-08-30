@@ -204,12 +204,13 @@ class TestModelList:
         body = r.text
         assert "retail" in body
         # Object counts per type: 2 datasets, 1 metric, 1 constraint,
-        # 1 relationship, 1 glossary term.
+        # 1 relationship, 1 glossary term — rendered through fbar_card()'s
+        # `tags` slot, which (like every other tag list in the product)
+        # shows the first 3 and collapses the rest to "+N".
         assert "2 datasets" in body
         assert "1 metric<" in body or "1 metric " in body
         assert "1 constraint" in body
-        assert "1 relationship" in body
-        assert "1 glossary term" in body
+        assert "+2" in body  # relationships + glossary terms collapse
         # Native (source='manual') carries no "Imported from" badge.
         assert "Imported from" not in body
 
