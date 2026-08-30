@@ -945,6 +945,95 @@ DATA_APPS_RUNTIME_IMAGE="${data_apps_runtime_image}"
 APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 %{ endif ~}
 %{ endif ~}
+%{ if extraction_worker_enabled ~}
+# --- 4b2. Opt-in extraction lane: Redis coordination + extraction-worker ---
+# Two halves that only work together, so one flag engages both:
+#
+#   1. A `redis` compose service — the multi-process coordination backend
+#      (app/coordination/redis_backend.py). `extraction-worker` runs with
+#      AGNES_ROLE=worker, which makes the deployment role-split, which the
+#      startup guard (app/startup_guards.py::validate_deployment) refuses
+#      unless the coordination backend is redis. Ephemeral on purpose
+#      (`--save "" --appendonly no`, same as docker-compose.mtier.yml):
+#      leases, WS tickets and rate-limit windows are all reconstructible,
+#      and the job queue itself lives in Postgres — nothing here belongs on
+#      the data disk.
+#
+#   2. The `extraction-worker` service re-pinned to the producer-bundled
+#      image. The base docker-compose.yml hides the service behind the
+#      `extraction-worker` compose profile; `profiles: !reset []` in the
+#      overlay clears that, so the OVERLAY's presence in COMPOSE_FILE is the
+#      entire switch — no --profile plumbing through the startup/upgrade/
+#      applier scripts, all of which disagree about profile handling.
+#      docker-compose.prod.yml pins the service to the plain app image
+#      (source-less VMs can't `build:`), which silently bypasses the
+#      Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg — the re-pin to
+#      $${AGNES_EXTRACTION_WORKER_IMAGE} (below, via .env) is what actually
+#      puts a producer on the lane's PATH.
+#
+# The coordination declaration rides .env (AGNES_COORDINATION_BACKEND +
+# AGNES_REDIS_URL, written into the .env heredoc below) and NOT
+# instance.yaml: env overrides yaml (app/coordination/factory.py), .env is
+# this script's to rewrite, and /data/state/instance.yaml belongs to
+# agnes-state-applier — writing a second server-side owner into that file is
+# exactly the config-erasure class TCRD-226 hit. Every service with
+# `env_file: .env` (app, scheduler, extraction-worker) sees the same
+# declaration, so the guard's requirements hold on all of them, and the
+# state-applier's `up -d --no-deps --force-recreate app scheduler` — which
+# builds its COMPOSE_FILE from the managed resolver list WITHOUT this
+# overlay — still recreates the app with redis coordination intact. For the
+# same reason this overlay must NEVER override the app/scheduler services:
+# anything it added to them would be silently stripped on the applier's next
+# recreate.
+#
+# The lifecycle rides the existing scripts like the dispatcher's overlay:
+# agnes-auto-upgrade honors COMPOSE_FILE from .env and its reconcile keeps
+# unmanaged overlays; agnes-state-applier only targets named services with
+# --no-deps, so it neither starts nor removes redis/extraction-worker.
+#
+# NOTE the startup guard's other requirements bind at the APP's next boot:
+# Postgres app-state backend and explicit JWT_SECRET_KEY/SESSION_SECRET (both
+# already in .env here). On an instance still running the frozen DuckDB
+# app-state backend the app will refuse to start with a named error —
+# migrate the backend first, then enable this flag.
+EXTRACTION_IMAGE="${extraction_worker_image}"
+EXTRACTION_IMAGE_HOST="$${EXTRACTION_IMAGE%%/*}"
+case "$EXTRACTION_IMAGE_HOST" in
+    *-docker.pkg.dev) gcloud auth configure-docker "$EXTRACTION_IMAGE_HOST" --quiet \
+        || echo "WARN: gcloud auth configure-docker $EXTRACTION_IMAGE_HOST failed — the extraction-worker image pull will likely fail below" >&2 ;;
+esac
+
+# Quoted heredoc: the $${...} below are resolved by docker compose from
+# /opt/agnes/.env at `compose up` time, not by this shell.
+cat > "$APP_DIR/docker-compose.extraction.yml" <<'EXTRYAML'
+services:
+  redis:
+    image: redis:7-alpine
+    # Coordination data is ephemeral by design — see the overlay comment in
+    # the startup script that writes this file.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: always
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  extraction-worker:
+    image: $${AGNES_EXTRACTION_WORKER_IMAGE}
+    # Clears the base compose's `profiles: ["extraction-worker"]` so the
+    # service is always-on whenever this overlay is in COMPOSE_FILE. No
+    # mem_limit/cpus here — the base service already interpolates
+    # AGNES_EXTRACTION_WORKER_MEM_LIMIT / _CPUS from .env.
+    profiles: !reset []
+    # Additive merge on top of the base service's `app: service_healthy`.
+    depends_on:
+      redis:
+        condition: service_healthy
+EXTRYAML
+
+COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.extraction.yml"
+%{ endif ~}
 %{ if kai_agent_enabled ~}
 # --- 4c. Opt-in embedded kai-agent turn engine ---
 # Runs the kai-agent turn engine (an external Claude-Agent-SDK engine that
@@ -1232,6 +1321,13 @@ KAI_AGENT_PG_MEM_LIMIT=${kai_agent_pg_mem_limit}
 KAI_BROKER_MCP_ENABLED=true
 %{ endif ~}
 %{ endif ~}
+%{ if extraction_worker_enabled ~}
+AGNES_COORDINATION_BACKEND=redis
+AGNES_REDIS_URL=redis://redis:6379/0
+AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
+AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
+AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
+%{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}
 AGNES_DATA_APPS_ENABLED=true
@@ -1326,6 +1422,20 @@ export COMPOSE_FILE="$${COMPOSE_FILE:-$COMPOSE_FILE_DEFAULT}"
 # then bring the engine up tolerantly after the strict block.
 KAI_FULL_COMPOSE_FILE="$COMPOSE_FILE"
 export COMPOSE_FILE="$${COMPOSE_FILE%:docker-compose.kai-agent.yml}"
+%{ endif ~}
+%{ if extraction_worker_enabled ~}
+# Same never-gate-the-machine posture for the extraction lane: its worker
+# image comes from a private registry, so an unpullable image would fail the
+# strict pull below and abort this script before cron and the watchdog are
+# installed. Strip the overlay for the strict phase (it was appended in
+# section 4b2, directly before kai's — so after kai's own strip above it is
+# the list's suffix in every enabled combination) and bring the lane up
+# tolerantly after the strict block. The .env keeps the FULL list either
+# way: the coordination env lines and the overlay must engage together on
+# every later tick, or the app boots multi-process without a redis to
+# coordinate through.
+EXTRACTION_FULL_COMPOSE_FILE="$COMPOSE_FILE"
+export COMPOSE_FILE="$${COMPOSE_FILE%:docker-compose.extraction.yml}"
 %{ endif ~}
 
 docker compose $COMPOSE_PROFILES_ARG pull
@@ -1437,6 +1547,25 @@ if [ "$KAI_AGENT_MATERIALIZE" = "1" ]; then
         || ! docker compose $COMPOSE_PROFILES_ARG up -d kai-agent; then
         echo "WARN: kai-agent engine sidecar failed to pull or start; base stack is up — fix the engine image/migration and re-run docker compose up -d (or wait for the auto-upgrade tick)" >&2
     fi
+fi
+%{ endif ~}
+%{ if extraction_worker_enabled ~}
+# Now the extraction lane, tolerantly (same posture as the kai engine
+# above). Redis FIRST and in its own step: the strict phase just started the
+# app with redis coordination declared in .env, so every second without the
+# redis service is a second of degraded coordination (leases/tickets) — and
+# a broken WORKER image must not take redis down with it. The worker's own
+# pull is where a private-registry failure would land; on failure the .env
+# keeps the FULL list, so the next auto-upgrade tick (and any operator
+# `docker compose up -d`) retries with no state to repair.
+export COMPOSE_FILE="$EXTRACTION_FULL_COMPOSE_FILE"
+if ! docker compose $COMPOSE_PROFILES_ARG pull redis \
+    || ! docker compose $COMPOSE_PROFILES_ARG up -d redis; then
+    echo "WARN: redis coordination backend failed to pull or start; the app runs with degraded coordination until it appears — re-run docker compose up -d redis (or wait for the auto-upgrade tick)" >&2
+fi
+if ! docker compose $COMPOSE_PROFILES_ARG pull extraction-worker \
+    || ! docker compose $COMPOSE_PROFILES_ARG up -d extraction-worker; then
+    echo "WARN: extraction-worker failed to pull or start; base stack is up — check the image ref/registry access and re-run docker compose up -d (or wait for the auto-upgrade tick)" >&2
 fi
 %{ endif ~}
 
