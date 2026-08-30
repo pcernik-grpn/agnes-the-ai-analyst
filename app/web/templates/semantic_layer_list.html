@@ -1,4 +1,5 @@
-{% extends "base_page.html" %}
+{% extends "base_index.html" %}
+{% from "macros/_catalog_card.html" import kind_glyph %}
 
 {# NAME: "Semantic models", never "Semantic layer" — that name was worn by
    three of the four semantic surfaces at once (this page, /catalog/semantics
@@ -7,60 +8,45 @@
    Guarded by tests/test_semantic_page_names_contract.py. #}
 {% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
-{% set page_hero_eyebrow = "Semantic layer" %}
-{% set page_hero_title = "Semantic models" %}
-{% set page_hero_plain = True %}
-{% set page_hero_subtitle = "Browse your organization's datasets, metrics, relationships and glossary — the stored document itself, not just the flat metric list." %}
+{# The `base_index.html` shell (one unbroken --ds-surface, identity-led head
+   band + a full-width card band below) — every other resource list on this
+   branch (Library, Skills, Agents, Chats, Profile, My connections, the admin
+   builders) extends it; this page used to extend `base_page.html`'s hero
+   shell instead, which is why it looked unlike the rest of the app.
 
+   The cards ride the shared catalog-card vocabulary (`css/catalog_card.css`
+   + `kind_glyph`) so a model card looks like a Library card. What stays
+   page-local (`.sl-*`) is content this component has no slot for: the SQL
+   dialect line, the five per-type object-count pills, and the invalid-model
+   error list — none of that is generic catalog-card shape. #}
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <style>
-/* ── Model cards ─────────────────────────────────────────────────────── */
-.slb-grid {
+/* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
+.sl-head { margin: 2px 0 0; }
+.sl-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
+.sl-head h1 { font-size: 24px; margin: 2px 0 0; }
+.sl-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 6px 0 0; max-width: 64ch; }
+
+/* ── Model grid — catalog_card.css has no shared grid class (every card
+   collection defines its own, e.g. .ag-grid, .lib-grid); this is that. ── */
+.sl-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: var(--space-4);
-    margin: var(--space-5) 0 var(--space-9);
 }
-.slb-card {
-    display: block;
-    padding: var(--space-4) var(--space-5);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
-    background: var(--ds-surface);
-    text-decoration: none;
-    color: inherit;
-    transition: border-color 0.12s, box-shadow 0.12s;
-}
-.slb-card:hover {
-    border-color: var(--ds-primary);
-    box-shadow: 0 2px 10px color-mix(in srgb, var(--ds-primary) 10%, transparent);
-}
-.slb-card--invalid { border-color: var(--ds-accent-danger-line); }
-.slb-card__head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-3);
-    margin-bottom: 4px;
-}
-.slb-card__name { font-size: 15px; font-weight: 700; color: var(--ds-text-primary); }
-.slb-card__desc {
-    font-size: 12.5px;
-    color: var(--ds-text-secondary);
-    margin: 4px 0 var(--space-3);
-    min-height: 1em;
-}
-.slb-card__dialects {
-    font-size: 11px;
-    color: var(--ds-text-muted);
-    margin-bottom: var(--space-3);
-}
-.slb-counts {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-}
-.slb-count {
+/* An invalid document is still a real card, flagged rather than styled away
+   — no generic `.cc-card` modifier for "this resource failed validation". */
+.cc-card--invalid { border-color: var(--ds-accent-danger-line); }
+
+/* SQL dialect(s) — a one-line fact specific to a semantic model, not part of
+   the generic catalog-card body. */
+.sl-dialects { font-size: 11px; color: var(--ds-text-muted); }
+
+/* Per-object-type counts (datasets/metrics/constraints/relationships/
+   glossary terms) — five distinct counters no other catalog card shows. */
+.sl-counts { display: flex; flex-wrap: wrap; gap: 6px; }
+.sl-count {
     font-size: 11px;
     color: var(--ds-text-muted);
     background: var(--ds-surface-dim);
@@ -68,50 +54,68 @@
     border-radius: var(--radius-full);
     padding: 2px 8px;
 }
-.slb-errors {
-    margin: var(--space-3) 0 0;
+
+/* Stored validation errors for an invalid document — rendered instead of
+   counts, since document_json may be stale or absent for that row. */
+.sl-errors {
+    margin: 0;
     padding: 0 0 0 18px;
     font-size: 12px;
     color: var(--ds-accent-danger-ink);
 }
-.slb-errors li { margin-bottom: 2px; }
+.sl-errors li { margin-bottom: 2px; }
 </style>
 {% endblock %}
 
-{% block page %}
+{% block page_head %}
+<div class="sl-head">
+  <div class="sl-kicker">Semantic layer</div>
+  <h1>Semantic models</h1>
+  <p class="lede">Browse your organization's datasets, metrics, relationships and glossary — the stored document itself, not just the flat metric list.</p>
+</div>
+{% endblock %}
+
+{% block page_surface %}
 {% if models %}
-<div class="slb-grid">
+<div class="sl-grid">
     {% for m in models %}
-    <a class="slb-card{% if m.status == 'invalid' %} slb-card--invalid{% endif %}" href="/semantic-layer/{{ m.slug }}">
-        <div class="slb-card__head">
-            <span class="slb-card__name">{{ m.name }}</span>
-            {% if m.is_imported %}
-            <span class="badge">Imported from {{ m.source_label }}</span>
-            {% endif %}
+    <article class="cc-card{% if m.status == 'invalid' %} cc-card--invalid{% endif %}">
+        <div class="cc-head">
+            <span class="cc-icon cc-icon--data">{{ kind_glyph('data') }}</span>
+            <div class="cc-titlewrap">
+                <h3 class="cc-title"><a href="/semantic-layer/{{ m.slug }}">{{ m.name }}</a></h3>
+                <div class="cc-eyebrow">
+                    <span class="cc-kind cc-kind--data">Semantic model</span>
+                    {% if m.is_imported %}
+                    <span class="cc-sep">·</span>
+                    <span class="badge">Imported from {{ m.source_label }}</span>
+                    {% endif %}
+                </div>
+            </div>
         </div>
-        <p class="slb-card__desc">{{ m.description or "" }}</p>
+        <p class="cc-desc">{{ m.description or "No description provided yet." }}</p>
         {% if m.dialects %}
-        <div class="slb-card__dialects">SQL dialect{{ '' if m.dialects | length == 1 else 's' }}: {{ m.dialects | join(', ') }}</div>
+        <div class="sl-dialects">SQL dialect{{ '' if m.dialects | length == 1 else 's' }}: {{ m.dialects | join(', ') }}</div>
         {% endif %}
         {% if m.status == 'invalid' %}
         <span class="badge badge--danger">Invalid</span>
         {% if m.validation_errors %}
-        <ul class="slb-errors">
+        <ul class="sl-errors">
             {% for err in m.validation_errors %}
             <li>{{ err }}</li>
             {% endfor %}
         </ul>
         {% endif %}
         {% else %}
-        <div class="slb-counts">
-            <span class="slb-count">{{ m.counts.datasets }} dataset{{ '' if m.counts.datasets == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.metrics }} metric{{ '' if m.counts.metrics == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.constraints }} constraint{{ '' if m.counts.constraints == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.relationships }} relationship{{ '' if m.counts.relationships == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.glossary }} glossary term{{ '' if m.counts.glossary == 1 else 's' }}</span>
+        <div class="sl-counts">
+            <span class="sl-count">{{ m.counts.datasets }} dataset{{ '' if m.counts.datasets == 1 else 's' }}</span>
+            <span class="sl-count">{{ m.counts.metrics }} metric{{ '' if m.counts.metrics == 1 else 's' }}</span>
+            <span class="sl-count">{{ m.counts.constraints }} constraint{{ '' if m.counts.constraints == 1 else 's' }}</span>
+            <span class="sl-count">{{ m.counts.relationships }} relationship{{ '' if m.counts.relationships == 1 else 's' }}</span>
+            <span class="sl-count">{{ m.counts.glossary }} glossary term{{ '' if m.counts.glossary == 1 else 's' }}</span>
         </div>
         {% endif %}
-    </a>
+    </article>
     {% endfor %}
 </div>
 {% else %}
