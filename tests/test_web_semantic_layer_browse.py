@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
+
+import pytest
 
 from src.db import get_system_db
 
@@ -110,6 +113,7 @@ def _seed_model(
     id: str = f"manual/_/{_SLUG}",
     slug: str = _SLUG,
     source: str = "manual",
+    source_ref: str | None = None,
     status: str = "valid",
     validation_errors=None,
 ) -> dict:
@@ -129,7 +133,7 @@ def _seed_model(
         spec_version="0.2.0.dev0",
         content_hash=f"hash-{slug}",
         source=source,
-        source_ref=None,
+        source_ref=source_ref,
         status=status,
         validation_errors=validation_errors,
         validated_at=None,
@@ -201,12 +205,13 @@ class TestModelList:
         body = r.text
         assert "retail" in body
         # Object counts per type: 2 datasets, 1 metric, 1 constraint,
-        # 1 relationship, 1 glossary term.
+        # 1 relationship, 1 glossary term — rendered through fbar_card()'s
+        # `tags` slot, which (like every other tag list in the product)
+        # shows the first 3 and collapses the rest to "+N".
         assert "2 datasets" in body
         assert "1 metric<" in body or "1 metric " in body
         assert "1 constraint" in body
-        assert "1 relationship" in body
-        assert "1 glossary term" in body
+        assert "+2" in body  # relationships + glossary terms collapse
         # Native (source='manual') carries no "Imported from" badge.
         assert "Imported from" not in body
 
@@ -255,6 +260,29 @@ class TestModelList:
         r = c.get("/semantic-layer", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
         assert "retail" not in r.text
+
+    def test_empty_list_offers_a_creation_cta_only_to_an_admin(self, seeded_app):
+        """A3 follow-up (issue #1707): the empty-list panel's primary CTA must
+        be a path that can actually succeed (spec §3, "never a CTA that
+        can't succeed") — only an admin can act on "no semantic model
+        available" (import/register a source), so only an admin gets the
+        primary CTA; anyone else gets the neutral ask-an-admin copy and the
+        `Metrics & glossary` cross-link stays a plain body link either way,
+        never the CTA itself (it can just as easily be empty)."""
+        c = seeded_app["client"]
+        admin_r = c.get("/semantic-layer", headers=_auth(seeded_app["admin_token"]))
+        assert admin_r.status_code == 200
+        assert 'href="/admin/semantic-sources"' in admin_r.text
+        assert "Add a semantic source" in admin_r.text
+        assert 'href="/catalog/semantics"' in admin_r.text
+
+        # A non-admin with nothing readable sees the same empty panel, but
+        # the primary CTA (an admin-only action) is absent.
+        no_grant_r = c.get("/semantic-layer", headers=_auth(seeded_app["analyst_token"]))
+        assert no_grant_r.status_code == 200
+        assert 'href="/admin/semantic-sources"' not in no_grant_r.text
+        assert "Add a semantic source" not in no_grant_r.text
+        assert 'href="/catalog/semantics"' in no_grant_r.text
 
     def test_non_admin_with_a_direct_grant_sees_the_model(self, seeded_app):
         row = _seed_model()
@@ -573,6 +601,75 @@ class TestModelDetail:
         assert "alpha_ds" in r.text
         assert "beta_ds" not in r.text
 
+    @pytest.mark.parametrize("tab", ["datasets", "metrics", "constraints", "relationships", "glossary"])
+    def test_filtered_no_match_renders_nothing_found_not_empty(self, seeded_app, tab):
+        """A3 (issue #1707): a `q` that matches nothing IN A NON-EMPTY
+        collection is a filter collapse, not a genuinely empty collection —
+        the exact distinction the shared `state.panel` vocabulary exists to
+        keep visible. Must render `nothing_found`, never `empty`, with the
+        filter value itself part of the copy (the removable chip above the
+        table also carries it). `_seed_model()` carries one row of every
+        object type, so every tab's universe is non-empty here."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(
+            f"/semantic-layer/{_SLUG}?tab={tab}&q=no_such_thing_at_all",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert 'data-state-kind="nothing_found"' in r.text
+        assert 'data-state-kind="empty"' not in r.text
+        assert "no_such_thing_at_all" in r.text
+
+    @pytest.mark.parametrize("tab", ["datasets", "metrics", "constraints", "relationships", "glossary"])
+    def test_unfiltered_empty_collection_renders_empty_not_nothing_found(self, seeded_app, tab):
+        """A3 (issue #1707): a tab with no `q` and zero rows is the collection
+        itself being empty, never a filter collapse. Must render `empty`."""
+        _seed_document(
+            "blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": [], "relationships": []}]}
+        )
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/blank?tab={tab}", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-state-kind="empty"' in r.text
+        assert 'data-state-kind="nothing_found"' not in r.text
+
+    def test_empty_collection_with_a_nonblank_filter_still_renders_empty(self, seeded_app):
+        """A3 follow-up (issue #1707): NOTHING_FOUND is defined as zero matches
+        out of a NON-EMPTY universe. A `q` present against an ALREADY-empty
+        collection (zero datasets regardless of any filter) must still render
+        `empty`, not `nothing_found` — the filter isn't what's to blame here,
+        the collection is. Guards the `counts.<type>` half of the predicate."""
+        _seed_document(
+            "blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": [], "relationships": []}]}
+        )
+        c = seeded_app["client"]
+        r = c.get(
+            "/semantic-layer/blank?tab=datasets&q=anything",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert 'data-state-kind="empty"' in r.text
+        assert 'data-state-kind="nothing_found"' not in r.text
+
+    def test_whitespace_only_filter_on_empty_collection_still_renders_empty(self, seeded_app):
+        """A3 follow-up (issue #1707): the router only filters on `q.strip()`
+        (a whitespace-only `q` filters nothing), but the template used to
+        branch on the raw, unstripped `q` — so a whitespace `q` against an
+        empty collection rendered `nothing_found` naming a "filter" that
+        never actually ran. Guards the `q.strip()` half of the predicate."""
+        _seed_document(
+            "blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": [], "relationships": []}]}
+        )
+        c = seeded_app["client"]
+        r = c.get(
+            "/semantic-layer/blank?tab=datasets&q=%20%20%20",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert 'data-state-kind="empty"' in r.text
+        assert 'data-state-kind="nothing_found"' not in r.text
+
 
 class TestObjectDetail:
     def test_dataset_object_renders_fields_table_and_all_five_ai_groups(self, seeded_app):
@@ -683,7 +780,9 @@ class TestObjectDetail:
         with the other `[data-tip]` sites in the repo, none of which use it."""
         _seed_model()
         c = seeded_app["client"]
-        r = c.get(f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"]))
+        r = c.get(
+            f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"])
+        )
         assert r.status_code == 200
         body = r.text
         span_match = re.search(r'<span class="badge[^"]*"[^>]*>error</span>', body)
@@ -771,6 +870,179 @@ class TestObjectDetail:
         c = seeded_app["client"]
         r = c.get(f"/semantic-layer/{_SLUG}/dataset:orders", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 404
+
+
+def _side_row(body: str, key: str) -> str | None:
+    """The value of one `detail.side_rows` row in the right rail, or None when
+    the row was not rendered (the macro drops a row with an empty value)."""
+    m = re.search(
+        r'<span class="detail-side__key">' + re.escape(key) + r"</span>\s*"
+        r'<span class="detail-side__val">(.*?)</span>',
+        body,
+        re.DOTALL,
+    )
+    return m.group(1).strip() if m else None
+
+
+class TestObjectDetailScaffold:
+    """A5/N6 (issue #1707): the object page renders through the SHARED detail
+    scaffold (`macros/_detail.html`) like the dozen other detail pages, instead
+    of hand-building `.slb-panel` cards.
+
+    Two consequences a reader can see: the model's provenance is in the right
+    rail (`detail.side_rows`), which is where every other detail page keeps its
+    facts; and an admin gets a `detail.manage` cluster with the doors to the
+    pages that own the model's source, health and sync — previously URLs they
+    had to type by hand.
+    """
+
+    _MANAGE = re.compile(r'<section class="detail-side detail-manage" data-manage>.*?</section>', re.DOTALL)
+
+    def _object(self, seeded_app, token: str, path: str = f"/semantic-layer/{_SLUG}/dataset:orders"):
+        return seeded_app["client"].get(path, headers=_auth(token))
+
+    def test_object_sections_render_through_the_shared_section_macro(self, seeded_app):
+        _seed_model()
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert 'class="ds-card detail-section"' in body
+        assert '<h2 class="detail-section__title">' in body
+        # The hand-rolled panel container is gone — that was the finding.
+        assert "slb-panel" not in body
+
+    def test_every_object_type_uses_the_section_macro(self, seeded_app):
+        _seed_model()
+        for object_id in (
+            "dataset:orders",
+            "metric:revenue",
+            "relationship:orders_to_customers",
+            "constraint:region_filter_required",
+            "glossary:ARR",
+        ):
+            r = self._object(seeded_app, seeded_app["admin_token"], f"/semantic-layer/{_SLUG}/{object_id}")
+            assert r.status_code == 200, object_id
+            assert '<h2 class="detail-section__title">' in r.text, object_id
+            assert "slb-panel" not in r.text, object_id
+
+    def test_rail_carries_the_models_provenance(self, seeded_app):
+        _seed_model(
+            id="manual/_/kb3",
+            slug="kb_retail3",
+            source="keboola_metastore",
+            source_ref="workspace-1",
+        )
+        r = self._object(seeded_app, seeded_app["admin_token"], "/semantic-layer/kb_retail3/dataset:orders")
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert _side_row(body, "Source") == "Keboola"
+        assert _side_row(body, "Source ref") == "workspace-1"
+        model_row = _side_row(body, "Model") or ""
+        assert 'href="/semantic-layer/kb_retail3"' in model_row
+        assert "kb_retail3" in model_row
+        # `sync_mode` is a Postgres-only column, so a DuckDB-backed instance
+        # reads back as the synced default rather than blowing up.
+        assert "Synced" in (_side_row(body, "Sync") or "")
+
+    def test_source_ref_row_is_dropped_when_the_model_has_none(self, seeded_app):
+        _seed_model()
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert _side_row(r.text, "Source ref") is None
+
+    def test_native_model_has_no_source_row(self, seeded_app):
+        """The hero badge already says Native; a rail row repeating it teaches
+        the reader that the rail restates the header."""
+        _seed_model()
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert ">Native<" in r.text  # the header still states it
+        assert _side_row(r.text, "Source") is None
+
+    def test_detached_model_says_so_in_the_rail(self, seeded_app, monkeypatch):
+        """A model an admin took off sync is the case this row exists for. The
+        `sync_mode` column is Postgres-only (A3 ratchet), so the detached row is
+        injected here rather than seeded — what is under test is that the
+        template renders the state, which is where it was missing."""
+        import app.web.router as web_router
+
+        _seed_model()
+        real = web_router._readable_model_by_slug
+
+        def _detached(slug, user, conn):
+            row = real(slug, user, conn)
+            return None if row is None else {**row, "sync_mode": "detached"}
+
+        monkeypatch.setattr(web_router, "_readable_model_by_slug", _detached)
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        sync = _side_row(r.text, "Sync") or ""
+        assert "Detached" in sync
+        assert "Synced" not in sync
+
+    def test_admin_gets_the_manage_cluster_with_one_door(self, seeded_app):
+        """`manage()`'s contract: instance-scoped work goes behind ONE
+        `admin_href`, and `actions` are reserved for actions on the object
+        itself — which this read-only page has none of."""
+        _seed_model()
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        block = self._MANAGE.search(r.text)
+        assert block, "admin is missing the manage cluster"
+        manage = block.group(0)
+        assert 'href="/admin/semantic-layer"' in manage
+        assert "Semantic layer health" in manage
+        assert "detail-manage__body" not in manage, "the cluster grew an action list again"
+
+    def test_non_admin_gets_no_manage_cluster(self, seeded_app):
+        row = _seed_model()
+        _grant_model(row["id"])
+        r = self._object(seeded_app, seeded_app["analyst_token"])
+        assert r.status_code == 200, r.text
+        assert not self._MANAGE.search(r.text), "non-admin was offered admin management links"
+        assert "/admin/semantic-layer" not in r.text
+
+
+class TestObjectDetailLegacyTheme:
+    """The scaffold's gating rule: the rail and the redesign-only header
+    affordances do not exist on a non-paper instance, so anything they carry
+    must still reach the legacy page through an ungated slot. The object type
+    is the one such fact here — the header this page replaced printed it
+    ungated as part of "<model> · <type>"."""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_theme(self, monkeypatch):
+        monkeypatch.setenv("AGNES_INSTANCE_THEME", "blue")
+
+    def test_legacy_header_still_names_the_object_type(self, seeded_app):
+        _seed_model()
+        r = seeded_app["client"].get(
+            f"/semantic-layer/{_SLUG}/constraint:region_filter_required",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert "detail-cols" not in body, "the rail must not render on the legacy path"
+        # The type, in the hero's ungated meta line...
+        meta = re.search(r'<div class="detail-hero__meta">(.*?)</div>', body, re.DOTALL)
+        assert meta, "legacy hero has no meta line"
+        assert "Constraint" in meta.group(1)
+        # ...and the model name, still in the ungated back link.
+        assert f'class="detail-back" href="/semantic-layer/{_SLUG}?tab=constraints"' in body
+        assert _SLUG in body
+
+    def test_legacy_dataset_source_heading_is_not_reworded(self, seeded_app):
+        """ "Source table" disambiguates the heading from the rail's provenance
+        row; with no rail there is no collision, so the legacy heading keeps
+        the word it has always had."""
+        _seed_model()
+        r = seeded_app["client"].get(
+            f"/semantic-layer/{_SLUG}/dataset:orders",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert "Source table" not in r.text
+        assert re.search(r'<h2 class="detail-section__title">.*?Source</h2>', r.text, re.DOTALL)
 
 
 class TestLibraryEntryPoint:
@@ -902,3 +1174,21 @@ class TestRegistryBackLink:
         r = self._object(seeded_app, f"/semantic-layer/{_SLUG}/dataset:orders")
         assert r.status_code == 200, r.text
         assert "/catalog/semantics?q=" not in r.text
+
+
+class TestEmptyStateVocabulary:
+    """A3 (issue #1707): the legacy `.empty-state`/`.empty-state__*` markup
+    across the three browse templates is retired in favor of the shared
+    `macros/_state.html` → `state.panel(kind, ...)` vocabulary, which alone
+    can tell a filter collapse (`nothing_found`) apart from a genuinely empty
+    collection (`empty`) — the distinction the legacy markup could not
+    express."""
+
+    def test_no_legacy_empty_state_class_in_semantic_layer_templates(self):
+        templates_dir = Path(__file__).resolve().parents[1] / "app" / "web" / "templates"
+        offenders = {}
+        for path in sorted(templates_dir.glob("semantic_layer_*.html")):
+            text = path.read_text(encoding="utf-8")
+            if "empty-state" in text:
+                offenders[path.name] = text.count("empty-state")
+        assert not offenders, f"legacy .empty-state markup still present: {offenders}"

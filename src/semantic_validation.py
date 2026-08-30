@@ -96,6 +96,17 @@ _STATICALLY_CHECKABLE_CONSTRAINT_TYPES = frozenset({"required_filter"})
 # target's usable set.
 _UNIVERSAL_DIALECT = "ansi_sql"
 
+# Disclosure of the LIMITATIONS above, carried in the wire result so every
+# surface that wraps ``validate_query`` (the REST endpoint, the ``/api/query``
+# soft-enforce advisory, the CLI, MCP) says the same thing rather than each
+# inventing -- or omitting -- its own caveat. Issue #1707 finding A18: the
+# REST endpoint used to ship ``used_datasets``/``used_metrics`` with no such
+# disclosure at all, so a heuristic name-match read as a confirmed fact.
+DETECTION_NOTE_LONG = (
+    "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
+    "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
+)
+
 
 def _normalize_for_presence(text: str) -> str:
     """Normalize SQL-ish text for the required_filter presence check:
@@ -537,9 +548,12 @@ def check_dialects(
     for metric in document.get("metrics") or []:
         if not isinstance(metric, dict) or not metric.get("name"):
             continue
-        if str(metric["name"]).casefold() in used and _declares_unusable_expression(metric):
-            if str(metric["name"]) not in not_executable:
-                not_executable.append(str(metric["name"]))
+        if (
+            str(metric["name"]).casefold() in used
+            and _declares_unusable_expression(metric)
+            and str(metric["name"]) not in not_executable
+        ):
+            not_executable.append(str(metric["name"]))
 
     return {
         "sql_dialects": declared,
@@ -751,6 +765,14 @@ def validate_query(
         # happened to mention. Empty when ``locally_executable`` is True.
         "not_executable_metrics": not_executable_metrics,
         "summary": summary,
+        # Issue #1707 finding A18: every caller of this function ships
+        # ``used_datasets``/``used_metrics`` as if they were confirmed facts;
+        # without this, a heuristic hit (e.g. a WHERE clause on a column named
+        # ``status`` matching a dataset that merely shares the word) reads as
+        # a proven touch. Set here, once, so it travels with the result
+        # regardless of which surface (REST endpoint, ``/api/query`` advisory,
+        # CLI, MCP) forwards it.
+        "detection": DETECTION_NOTE_LONG,
     }
 
     if expected is not None:
@@ -766,6 +788,7 @@ def validate_query(
 
 __all__ = [
     "AGNES_VENDOR_NAME",
+    "DETECTION_NOTE_LONG",
     "check_dialects",
     "detect_used_objects",
     "evaluate_constraints",

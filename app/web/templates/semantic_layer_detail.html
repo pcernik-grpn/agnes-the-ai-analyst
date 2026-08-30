@@ -1,4 +1,5 @@
 {% extends "base_page.html" %}
+{% import "macros/_state.html" as state %}
 
 {% block title %}{{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
@@ -205,8 +206,10 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.datasets %}
+    {{ state.panel('nothing_found', 'No datasets match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No datasets{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No datasets.') }}
     {% endif %}
 
 {% elif active_tab == 'metrics' %}
@@ -230,8 +233,10 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.metrics %}
+    {{ state.panel('nothing_found', 'No metrics match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No metrics{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No metrics.') }}
     {% endif %}
 
 {% elif active_tab == 'constraints' %}
@@ -257,8 +262,10 @@
         </tbody>
     </table>
     <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
+    {% elif q.strip() and counts.constraints %}
+    {{ state.panel('nothing_found', 'No constraints match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No constraints{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No constraints.') }}
     {% endif %}
 
 {% elif active_tab == 'relationships' %}
@@ -278,8 +285,10 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.relationships %}
+    {{ state.panel('nothing_found', 'No relationships match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No relationships{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No relationships.') }}
     {% endif %}
 
 {% elif active_tab == 'glossary' %}
@@ -298,8 +307,10 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.glossary %}
+    {{ state.panel('nothing_found', 'No glossary terms match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No glossary terms{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No glossary terms.') }}
     {% endif %}
 {% endif %}
 {% endblock %}
