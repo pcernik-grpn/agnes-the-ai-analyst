@@ -1385,6 +1385,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 
 ### Internal
+- **`RequiresPostgresBackend` is read at call time, not at collection time.** `tests/test_requires_postgres_backend.py` matched the exception class and the app's handler by object *identity*, but the backend parity sweeps call `importlib.reload(src.repositories)` (`tests/db_pg/_parity_sweep_util.py`) to re-resolve the factory against the other backend — which rebinds the class, so the symbol imported at collection time is a different object afterwards. `pytest.raises(RequiresPostgresBackend)` then failed to match the exception it had just asked for, and `shared_app.exception_handlers.get(...)` could not find a handler that was still registered and still correct. It only bit when both files landed on the same xdist worker in that order, so it surfaced as an intermittent shard failure rather than a reproducible one. The class is now re-read through the module and the handler matched by name, so the tests say what they mean regardless of who reloaded first.
 - **`test-pg` splits across 4 jobs instead of 2, roughly halving every CI
   cycle's critical path.** Measured over four consecutive `integration` runs,
   the eight main shards finished in 11-17 min while both `test-pg` jobs sat at
