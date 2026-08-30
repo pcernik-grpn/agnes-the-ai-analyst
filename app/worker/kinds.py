@@ -137,6 +137,19 @@ distribution mirror, and the api-role write conversions) map onto:
   ``webhook-deliver``'s posture above) but only ever CLAIMED by a lane
   slot that opted into ``AGNES_WORKER_LANES=extraction`` — see
   ``app/worker/runtime.py``'s ``selected_lanes()``.
+- ``sharepoint-acl-sync`` (LIGHT) — 2026-08-30 plan, Task 4. Mirrors
+  SharePoint scope-root permissions into Agnes groups/memberships/collection
+  grants (spec 2026-08-28-sharepoint-acl-mirroring-design.md §5) — network-
+  bound Graph paging + a few hundred repo writes per connection, not a
+  DuckDB rebuild, so LIGHT rather than HEAVY. The sync body (read →
+  classify → resolve → diff → write, per-connection failure isolation, the
+  must_not/should_not staleness fork) lives entirely in
+  ``connectors.sharepoint.acl_sync.run_acl_sync`` — this kind's handler is a
+  thin delegate, same posture as every OTHER kind here. Registered
+  UNCONDITIONALLY: ``run_acl_sync``'s own ``acl_mirroring.enabled`` gate
+  makes an accidental/scheduled claim on an instance that hasn't turned the
+  feature on harmless, identical to ``ducklake-maintenance``'s and
+  ``corpus-extraction``'s no-op postures above.
 
 Every handler below is a THIN ADAPTER — it imports and calls the existing
 function/method and does not reimplement any of its logic — EXCEPT
@@ -1601,6 +1614,18 @@ def _run_corpus_extraction(payload: dict) -> dict:
     }
 
 
+def _run_sharepoint_acl_sync(payload: dict) -> dict:
+    """Thin delegate to ``connectors.sharepoint.acl_sync.run_acl_sync`` — the
+    sync body (read → classify → resolve → diff → write, per-connection
+    failure isolation, the must_not/should_not staleness fork) lives entirely
+    in that module (2026-08-30 plan, Task 4); this handler imports and calls
+    it and does not reimplement any of its logic, same as every other kind
+    in this file."""
+    from connectors.sharepoint.acl_sync import run_acl_sync
+
+    return run_acl_sync(payload)
+
+
 def dispatch_job(job: dict) -> Optional[dict]:
     """THE single dispatch-level entry point for running one claimed job's
     handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
@@ -1834,6 +1859,15 @@ def register_all_kinds() -> None:
             # crawl error, timeout) needs an operator to look at it, not an
             # unattended re-run against the same corpus a few minutes later.
             retry_in_seconds=None,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="sharepoint-acl-sync",
+            handler=_run_sharepoint_acl_sync,
+            lane=LIGHT_LANE,
+            lease_seconds=_DEFAULT_LIGHT_LEASE_S,
+            retry_in_seconds=300,
         )
     )
     from app.chat.manager import get_current_chat_manager

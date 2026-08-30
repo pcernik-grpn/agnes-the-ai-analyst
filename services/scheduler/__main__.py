@@ -512,6 +512,12 @@ _ENQUEUE_BODIES: dict[str, dict[str, str]] = {
     # API request per organization. The handler no-ops when Jira is unconfigured, so
     # this row is harmless on an instance without Jira ingest.
     "jira-org-refresh": {"kind": "jira-org-refresh", "idempotency_key": "jira-org-refresh"},
+    # 2026-08-30 plan, Task 4: SharePoint ACL mirroring's nightly sweep. The
+    # handler (connectors/sharepoint/acl_sync.py::run_acl_sync) no-ops when
+    # acl_mirroring.enabled is false, so this row is harmless on an instance
+    # that hasn't turned the feature on — same posture as
+    # ducklake-maintenance/jira-org-refresh above.
+    "sharepoint-acl": {"kind": "sharepoint-acl-sync", "idempotency_key": "sharepoint-acl-sync"},
 }
 
 # HTTP timeout for a ``/api/jobs`` enqueue call. Short on purpose: enqueueing
@@ -689,6 +695,25 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
             "POST",
             _ENQUEUE_TIMEOUT_SEC,
             _ENQUEUE_BODIES["ducklake-maintenance"],
+        ),
+        # 2026-08-30 plan, Task 4: SharePoint ACL mirroring's nightly sweep
+        # (connectors/sharepoint/acl_sync.py::run_acl_sync). Daily rather
+        # than interval-driven, same reasoning as jira-org-refresh — the
+        # drift window this bounds (spec §5.2/§5.3) is stated in hours, not
+        # minutes. 06:00 UTC is offset from every other daily row above
+        # (marketplaces 03:00, store-blocked-purge 04:00, ducklake-
+        # maintenance 04:30, jira-org-refresh/store-lint-audit 05:00,
+        # audit-prune 05:30, retention-prune 05:45) so none of them fire on
+        # the same tick. The handler no-ops when acl_mirroring.enabled is
+        # false, so this row is harmless on an instance that hasn't turned
+        # the feature on.
+        (
+            "sharepoint-acl",
+            "daily 06:00",
+            "/api/jobs",
+            "POST",
+            _ENQUEUE_TIMEOUT_SEC,
+            _ENQUEUE_BODIES["sharepoint-acl"],
         ),
         # Stuck-review reaper (#7). A submission stays at
         # status='pending_llm' until the BackgroundTasks worker writes

@@ -91,6 +91,7 @@ class TestRegisterAllKinds:
         "collections-purge",
         "webhook-deliver",
         "corpus-extraction",
+        "sharepoint-acl-sync",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):
@@ -123,6 +124,7 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["analytics-rebuild"].lane == HEAVY_LANE
         assert JOB_KINDS["collections-purge"].lane == HEAVY_LANE
         assert JOB_KINDS["corpus-extraction"].lane == EXTRACTION_LANE
+        assert JOB_KINDS["sharepoint-acl-sync"].lane == LIGHT_LANE
 
     def test_idempotent_reregistration(self):
         """Calling register_all_kinds() twice (e.g. test re-imports, or a

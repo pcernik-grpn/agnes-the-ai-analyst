@@ -498,6 +498,10 @@ class TestEnqueueMigratedJobs:
                 "ducklake-maintenance",
                 {"kind": "ducklake-maintenance", "idempotency_key": "ducklake-maintenance"},
             ),
+            (
+                "sharepoint-acl",
+                {"kind": "sharepoint-acl-sync", "idempotency_key": "sharepoint-acl-sync"},
+            ),
         ],
     )
     def test_migrated_row_posts_to_jobs_queue(self, name, expected_body):
@@ -518,6 +522,7 @@ class TestEnqueueMigratedJobs:
             "corporate-memory",
             "ducklake-maintenance",
             "jira-org-refresh",
+            "sharepoint-acl",
         ],
     )
     def test_migrated_row_uses_short_enqueue_timeout(self, name):
@@ -541,6 +546,7 @@ class TestEnqueueMigratedJobs:
             "corporate-memory",
             "ducklake-maintenance",
             "jira-org-refresh",
+            "sharepoint-acl",
         }
         for j in build_jobs():
             if j[0] in migrated:
