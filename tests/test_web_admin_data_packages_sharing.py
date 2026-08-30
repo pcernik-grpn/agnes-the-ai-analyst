@@ -190,6 +190,72 @@ class TestTheRowIsTheSharedAdminTable:
         assert "Automatic" not in row and "Optional" not in row
 
 
+class TestTheToolbarIsTheSharedOne:
+    """Two lists, two toolbars, one engine.
+
+    The page had no search and no filter at all: on an instance with forty
+    packages the only way to answer "which of these reaches nobody" was to
+    read every row. Both lists now carry the shared `.fbar` — the same
+    component and the same `filter_toolbar.js` the Library, My Stack and the
+    package builder's picker run on.
+    """
+
+    def test_each_list_has_its_own_toolbar_and_engine(self, seeded_app):
+        """Two instances, not one spanning both. A single engine would let a
+        Category chosen for packages hide memory domains, which never had a
+        category to match — filtering one list by another list's vocabulary.
+
+        A package is created first because the toolbar renders WITH its list
+        and not beside it: a search box over an empty page is a control that
+        can only disappoint, and the empty state is the right thing there."""
+        _mk_pkg("toolbar", "Toolbar Pkg")
+        body = seeded_app["client"].get(
+            "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+        ).text
+        assert 'id="adp-pkg-search"' in body and 'id="adp-dom-search"' in body
+        assert 'id="adp-pkg-filter-menu"' in body and 'id="adp-dom-filter-menu"' in body
+        assert "js/filter_toolbar.js" in body, "the shared engine is not loaded"
+        # TWO inits — one per list. That is the assertion this test exists to
+        # make: one engine spanning both tbodies would apply every facet to
+        # every row.
+        assert body.count("FilterToolbar.init(") == 2, "expected one engine per list"
+        assert "#adp-pkg-rows tr" in body and "#adp-dom-rows tr" in body
+
+    def test_the_rows_carry_what_the_facets_read(self, seeded_app):
+        """The engine reads facet values off `data-*`. A facet whose attribute
+        is missing from the rows silently matches nothing, which looks exactly
+        like "no packages are shared" — so the attributes are pinned here
+        rather than trusted to stay in step with the menu."""
+        pkg_id = _mk_pkg("facet-attrs", "Facet Attrs Pkg")
+        body = seeded_app["client"].get(
+            "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+        ).text
+        row = _row_of(body, pkg_id)
+        for attr in ("data-search", "data-shared", "data-contents", "data-tier", "data-cat"):
+            assert attr in row, f"rows do not carry {attr}, so its facet matches nothing"
+        # Unshared and empty, so: no tier at all. An empty value is deliberate —
+        # a third token would put "None" in the Access menu meaning "unshared",
+        # which the Sharing category already says, better.
+        assert 'data-shared="Not shared"' in row
+        assert 'data-contents="Empty"' in row
+        assert 'data-tier=""' in row
+
+    def test_access_is_a_filter_not_a_column(self, seeded_app):
+        """It was a column and was blank on every row that is unshared or
+        empty — nearly all of them on a young instance — while saying one
+        thing about a package that can be Automatic for one group and Optional
+        for another. The tier reads inside "Shared with", where it qualifies
+        the fact it belongs to, and survives in the Filter menu, where a
+        mostly-blank axis is exactly what you want."""
+        body = seeded_app["client"].get(
+            "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+        ).text
+        head = body[body.index("<thead>") : body.index("</thead>")]
+        assert "Access" not in head, "Access is a column again"
+        assert "Shared with" in head
+        assert 'data-facet="tier"' in body, "…and it is no longer offered as a filter either"
+
+
 class TestUnpackagedTray:
     """The unpackaged pile, now stated as the shared `.apg-strip--warn` line
     every Data lens uses for a standing fact worth acting on.
