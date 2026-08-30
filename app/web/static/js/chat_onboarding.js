@@ -702,6 +702,18 @@ function tourModule() {
 function maybeAutoLaunchTour() {
   if (!chatMode) return; // the first step anchors on /chat's composer
   if (!isNewcomer()) return;
+  // An admin whose instance is not set up yet is not the audience for this.
+  // The welcome tour teaches the ANALYST product — "ask a question", "your
+  // Library", "data packages your admin set up appear here on their own" —
+  // to the person who has to be that admin, before any of it is true. It ran
+  // over the top of a first-run instance and left them 2/6 through a
+  // "setup" that never mentions connecting a source or granting anything.
+  //
+  // Deliberately narrow: this suppresses the tour for an admin with an
+  // INCOMPLETE chain only. A non-admin still gets it on their first visit —
+  // that is who it was written for — and so does an admin once the instance
+  // is actually set up, because by then they are also just a user.
+  if (window._agAdminSetupPending === true) return;
   // A deep link into an existing conversation is not a first look at the
   // product — and the empty-state composer the first step points at isn't even
   // the thing on screen.

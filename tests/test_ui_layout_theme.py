@@ -2298,17 +2298,68 @@ class TestRedesignedPageContracts:
             conn.close()
         return web_client.get("/chat", cookies=admin_cookie)
 
-    def test_chat_keeps_upload_menu_journey_and_row_menu(self, web_client, admin_cookie, monkeypatch):
-        """The composer "+" menu and the row menu render on the page; the
-        journey checklist is the rail's own ``railGetStarted`` card
-        (chat.html's ``#chat-journey`` div is the retired topnav sidebar's
-        slot — the live page never renders it)."""
+    def test_chat_keeps_upload_menu_and_row_menu(self, web_client, admin_cookie, monkeypatch):
+        """The composer "+" menu and the row menu render on the page."""
         resp = self._chat(web_client, admin_cookie)
         assert resp.status_code == 200
         assert 'id="chat-plus-menu"' in resp.text
-        assert 'id="railGetStarted"' in resp.text
         assert "chat_row_menu.js" in resp.text
         assert 'id="chat-copy-transcript"' in resp.text
+
+    def test_the_analyst_journey_yields_to_an_unfinished_admin_chain(
+        self, web_client, admin_cookie, monkeypatch
+    ):
+        """Two six-step "setup" journeys must never render together.
+
+        The rail's ``railGetStarted`` card is the ANALYST journey (ask a
+        question, explore your Library, put knowledge in your stack…). The
+        hero card on the same page is the ADMIN chain (connect a source,
+        choose tables, bundle, invite, share, verify). They share no steps,
+        and rendering both put two "of 6" counters with different numerators
+        on one screen — the one the front door drove being the one that never
+        mentions the admin's actual job.
+
+        So for an admin whose chain is unfinished the analyst journey yields.
+        This asserts the narrowing in BOTH directions: it is not "the journey
+        is gone", it is "the journey is not shown to the wrong person at the
+        wrong time". A non-admin, and an admin who has finished, still get it.
+        """
+        resp = self._chat(web_client, admin_cookie)
+        assert resp.status_code == 200
+        # This fixture's instance has no source and no tables, so the admin
+        # chain is unfinished and the analyst journey must stand down.
+        assert 'id="railGetStarted"' not in resp.text
+        assert "window._agAdminSetupPending = true" in resp.text
+
+    def test_the_analyst_journey_is_untouched_for_a_non_admin(self):
+        """The narrowing keys off `admin_setup`, which the chat route computes
+        only for an admin — so a member's render is bit-for-bit unchanged.
+
+        Asserted on the template condition itself rather than through a second
+        seeded user: the condition IS the contract, and a member fixture would
+        test the seeding as much as the rule.
+        """
+        from jinja2 import Environment
+
+        env = Environment()
+        pill = env.from_string(
+            "{% if not (admin_setup and not admin_setup.complete) %}PILL{% else %}NONE{% endif %}"
+        )
+        flag = env.from_string(
+            "{% if admin_setup and not admin_setup.complete %}FLAG{% else %}NONE{% endif %}"
+        )
+        # A non-admin never gets `admin_setup` at all.
+        assert pill.render() == "PILL"
+        assert flag.render() == "NONE"
+        assert pill.render(admin_setup=None) == "PILL"
+        # An admin who has finished is, for this purpose, just a user again.
+        done = {"done": 6, "total": 6, "complete": True}
+        assert pill.render(admin_setup=done) == "PILL"
+        assert flag.render(admin_setup=done) == "NONE"
+        # Only the unfinished admin yields.
+        mid = {"done": 2, "total": 6, "complete": False}
+        assert pill.render(admin_setup=mid) == "NONE"
+        assert flag.render(admin_setup=mid) == "FLAG"
 
     # ── Wave 2 (spec 2026-08-07-default-chrome-ux-parity): the page rewrites. ──
 

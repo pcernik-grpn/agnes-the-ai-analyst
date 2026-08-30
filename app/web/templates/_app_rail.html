@@ -652,6 +652,18 @@
        /api/chat/journey resolves, so without the resolved brand reaching the
        script a rebranded instance would show its own name for one frame and
        then have "Agnes" written over it. See `brandShort()` there. #}
+    {# Hidden for an admin whose instance is not set up yet. This row and the
+       hero card on /chat are two different six-step "setup" journeys with
+       ZERO shared steps — the analyst one (ask a question, explore your
+       Library, put knowledge in your stack…) and the admin chain (connect a
+       source, choose tables, bundle, invite, share, verify). Rendering both
+       put two "of 6" counters with different numerators on one screen, and
+       the one the front door drove was the one that never mentions the
+       admin's actual job.
+       `admin_setup` is only defined on /chat and only for an admin, so a
+       non-admin — and every other page — is unaffected: the row renders
+       exactly as before. It comes back on its own once the chain completes. #}
+    {% if not (admin_setup and not admin_setup.complete) %}
     <div class="rail-getstarted" id="railGetStarted"
          data-brand-short="{{ instance_brand_short or 'Agnes' }}">
         <button type="button" class="rail-i rail-getstarted-btn"
@@ -699,6 +711,7 @@
             <div id="chat-journey" class="cloud-chat-journey" hidden></div>
         </div>
     </div>
+    {% endif %}{# admin-setup-pending gate #}
     {% endif %}
 
         {# User row + pop-up menu — same ids/classes as the header's user

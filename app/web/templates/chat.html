@@ -369,6 +369,15 @@
          card would be a chore they are not allowed to finish. They get the
          one move they do have — see what is already here. #}
       <nav class="cld-doors" aria-label="Where to go next">
+{# The analyst welcome tour teaches "ask a question / your Library / your
+   admin set this up for you" — to the admin, on an instance where none of it
+   is true yet. `chat_onboarding.js` reads this flag and skips its unattended
+   first-visit launch; a NON-ADMIN is unaffected and still gets the tour on
+   their first visit, which is who it was written for. Cleared automatically
+   once the chain completes, because `admin_setup.complete` flips. #}
+{% if admin_setup and not admin_setup.complete %}
+<script>window._agAdminSetupPending = true;</script>
+{% endif %}
         {% if admin_setup %}
         {# The WHOLE card is the link, so the action inside it is a <span>
          styled as one — an anchor inside an anchor is neither valid nor

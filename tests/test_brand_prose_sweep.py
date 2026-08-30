@@ -139,8 +139,15 @@ def test_rail_hands_the_resolved_brand_to_the_onboarding_script(branded):
 
     The seam is `data-brand-short` on `#railGetStarted` (read by
     `brandShort()`); this pins that the attribute is emitted with the
-    operator's value, not the fallback."""
-    resp = branded["client"].get("/chat", headers=_auth(branded["admin_token"]))
+    operator's value, not the fallback.
+
+    Read on /library rather than /chat. The rail is on every page, but only
+    /chat computes `admin_setup` — and the analyst journey now stands down
+    there for an admin whose setup chain is unfinished, because two six-step
+    journeys must not render together. Any other page renders the card
+    exactly as before, so this keeps testing the brand seam instead of
+    accidentally testing that suppression rule."""
+    resp = branded["client"].get("/library", headers=_auth(branded["admin_token"]))
     assert resp.status_code == 200, resp.text
     assert 'id="railGetStarted"' in resp.text, "rail onboarding card did not render — the widget under test is absent"
     assert f'data-brand-short="{CUSTOM_BRAND}"' in resp.text, (
