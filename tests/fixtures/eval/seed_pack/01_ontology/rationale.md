@@ -1,7 +1,7 @@
 # Ontology rationale
 
 Machine-readable source of truth: `ontology.yaml` in this same directory
-(Cuesta Star knowledge-graph ontology, TCRD-185, v0.2.0, draft-for-agreement,
+(Northwind Star knowledge-graph ontology, TCRD-185, v0.2.0, draft-for-agreement,
 2026-08-26). This file explains *why* each type is there -- adapted from the
 producer repo's own `docs/ONTOLOGY.md`.
 
