@@ -3967,6 +3967,23 @@
 
   async function addMember(email) {
     if (!email) return;
+    // Admin is a god-mode short-circuit on every authorization check, so the
+    // usual toast — "they now get everything granted to this group" — is
+    // materially wrong for it: the grants are not the point, the bypass is.
+    // /admin/users/{id} already confirms this correctly, so the two surfaces
+    // disagreed about the most consequential membership on the instance.
+    const grp = (overview.groups || []).find((g) => g.id === selectedGroup);
+    const isAdminGroup = grp && (grp.is_admin === true || grp.name === "Admin");
+    if (isAdminGroup) {
+      const ok = await window.confirmModal({
+        title: `Add ${email} to Admin?`,
+        message: `Admin is not an ordinary group: it grants full access to all `
+          + `data and every admin action on this instance, regardless of what is `
+          + `granted to it. Reversible — you can remove them again.`,
+        confirmText: "Add to Admin",
+      });
+      if (!ok) return;
+    }
     const r = await fetch(`/api/admin/groups/${encodeURIComponent(selectedGroup)}/members`, {
       method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json" },
@@ -3980,7 +3997,9 @@
       return;
     }
     membersCache.delete(selectedGroup);
-    toast(`${email} added — they now get everything granted to this group.`, true);
+    toast(isAdminGroup
+      ? `${email} added to Admin — they now reach everything on this instance.`
+      : `${email} added — they now get everything granted to this group.`, true);
     await afterMembershipChange();
   }
 

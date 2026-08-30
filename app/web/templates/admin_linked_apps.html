@@ -266,7 +266,17 @@
         }
         out.textContent = line;
       } else {
-        out.textContent = "Materialized, but this tool wrote no table to project from.";
+        // The response carries `errors[]` with the real cause — an upstream
+        // validation failure, a missing argument — and this line used to
+        // discard it and report the symptom instead, then reveal step 3 with
+        // an empty pool and no explanation.
+        const errs = (res && res.errors) || [];
+        if (errs.length) {
+          out.textContent = "Materialize failed: "
+            + errs.map((e) => `${e.tool ? e.tool + ": " : ""}${e.error || e.code || "unknown error"}`).join(" · ");
+        } else {
+          out.textContent = "Materialized, but this tool wrote no table to project from.";
+        }
       }
       renderMapping(proj);
       $("wiz-step-3").hidden = false;

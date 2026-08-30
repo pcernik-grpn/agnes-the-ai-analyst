@@ -68,11 +68,26 @@
       if (!r.ok) {
         return r.json().catch(function () { return {}; }).then(function (b) {
           var d = b && b.detail;
-          throw new Error(typeof d === 'string' ? d : 'HTTP ' + r.status);
+          throw new Error(typeof d === 'string' ? humanError(d) : 'HTTP ' + r.status);
         });
       }
       return r.status === 204 ? null : r.json();
     });
+  }
+
+  // The API answers with machine codes and this helper rethrows `detail`
+  // verbatim, so a slug clash reached the admin as "Could not create the
+  // package: slug_exists" — the symptom, with no mention of which field
+  // fixes it. CLAUDE.md's own command-UX rule says a not-found error must
+  // hint the next step; these are the drawer's three.
+  var ERROR_SENTENCES = {
+    slug_exists: 'That URL slug is already used by another data package — edit the Slug field and try again.',
+    table_not_found: 'That table is no longer registered. Refresh the page and pick it again.',
+    data_package_not_found: 'That data package no longer exists — someone may have deleted it. Refresh the page.',
+  };
+
+  function humanError(code) {
+    return ERROR_SENTENCES[code] || code;
   }
 
   function esc(s) {

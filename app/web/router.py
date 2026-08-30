@@ -7571,7 +7571,15 @@ async def admin_datasource_credentials_page(
     here — the JS loads presence/source status from
     ``GET /api/admin/datasource-secrets`` and writes via PUT/DELETE.
     """
-    from app.secrets_vault import vault_key_configured
+    # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
+    # guards on the former (app/api/admin_source_connections.py), and the
+    # latter is the narrower "is a real key set" question that answers False
+    # in LOCAL_DEV_MODE where the write in fact succeeds. Using the narrow one
+    # here rendered a blocking "Vault key not configured" banner and a
+    # disabled "+ Add source" on an instance whose API would have accepted the
+    # credential — the UI refusing what the server allows. `secrets_vault`'s
+    # own docstring flags the distinction.
+    from app.secrets_vault import can_store_secrets as vault_key_configured
 
     ctx = _build_context(request, user=user)
     ctx["vault_key_configured"] = vault_key_configured()
@@ -7597,7 +7605,15 @@ async def admin_data_sources_page(
     ``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without
     it).
     """
-    from app.secrets_vault import vault_key_configured
+    # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
+    # guards on the former (app/api/admin_source_connections.py), and the
+    # latter is the narrower "is a real key set" question that answers False
+    # in LOCAL_DEV_MODE where the write in fact succeeds. Using the narrow one
+    # here rendered a blocking "Vault key not configured" banner and a
+    # disabled "+ Add source" on an instance whose API would have accepted the
+    # credential — the UI refusing what the server allows. `secrets_vault`'s
+    # own docstring flags the distinction.
+    from app.secrets_vault import can_store_secrets as vault_key_configured
 
     ctx = _build_context(request, user=user)
     ctx["vault_key_configured"] = vault_key_configured()
