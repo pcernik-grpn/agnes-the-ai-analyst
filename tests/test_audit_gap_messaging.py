@@ -203,7 +203,15 @@ def test_slack_command_is_audited(monkeypatch, e2e_env):
     import services.slack_bot.commands as cmds
     from services.slack_bot.binding import _ensure_table
 
-    monkeypatch.setattr(cmds, "_cmd_status", AsyncMock())
+    # Stub at the REGISTRY, not the module attribute. `dispatch_command` used
+    # to look each handler up as a module global at call time, so patching
+    # `cmds._cmd_status` reached it; it now routes through
+    # `SLACK_COMMAND_HANDLERS`, which bound the original function objects at
+    # import time. Patching the attribute would leave the real handler wired
+    # into the dict — it would run for real, reach for `app.state.chat_manager`
+    # and POST to an empty `response_url`. The registry is the dispatch seam
+    # now, so that is where the stub goes.
+    monkeypatch.setitem(cmds.SLACK_COMMAND_HANDLERS, "/agnes-status", AsyncMock())
 
     class _FakeState:
         pass
@@ -232,7 +240,8 @@ def test_slack_command_unbound_user_gets_synthetic_identity(monkeypatch, e2e_env
     """No bound Agnes account — still one searchable row, never a dropped one."""
     import services.slack_bot.commands as cmds
 
-    monkeypatch.setattr(cmds, "_cmd_new", AsyncMock())
+    # Registry, not module attribute — see test_slack_command_is_audited.
+    monkeypatch.setitem(cmds.SLACK_COMMAND_HANDLERS, "/agnes-new", AsyncMock())
 
     class _FakeState:
         pass
