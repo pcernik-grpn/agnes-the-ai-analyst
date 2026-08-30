@@ -99,10 +99,36 @@ jobs:
             --description "Automated daily version bump + CHANGELOG rename — a human merges it, never auto-merged" \
             2>/dev/null || true
 
+          # GitHub caps a PR body at 65,536 characters. The 0.93.0 cut carried
+          # 214 bullets — 216 KB of them, this repo writes long ones — so
+          # `gh pr create` failed AFTER the branch was already pushed: the cut
+          # was computed, committed and pushed, but no PR ever opened, which
+          # reads as "the cut broke" rather than "the announcement did".
+          #
+          # The list is therefore budgeted. Trimming happens at BULLET
+          # boundaries (never mid-bullet), and stops for good once the budget
+          # is spent rather than cherry-picking whichever later bullets still
+          # fit — a list interleaved by length would be worse than a short
+          # one. The CHANGELOG diff on the PR is the complete list regardless.
+          BULLET_COUNT=$(jq -r '.bullets | length' /tmp/plan.json)
+
           {
-            echo "Automated daily batch cut. Ships every bullet merged into \`[Unreleased]\` since the last cut:"
+            echo "Automated daily batch cut. Ships every bullet merged into \`[Unreleased]\` since the last cut (**${BULLET_COUNT}** in this batch):"
             echo
-            jq -r '.bullets[]' /tmp/plan.json
+            jq -r '.bullets[]' /tmp/plan.json | awk -v LIMIT=55000 '
+              function flush() {
+                if (buf == "") return
+                if (!stopped && used + length(buf) <= LIMIT) { printf "%s", buf; used += length(buf); kept++ }
+                else stopped = 1
+                buf = ""
+              }
+              /^- / { flush(); total++ }
+              { buf = buf $0 "\n" }
+              END {
+                flush()
+                if (stopped) printf "\n_… and %d of %d bullets omitted to keep this body under the 65,536-character GitHub limit — the CHANGELOG diff on this PR is the complete list._\n", total - kept, total
+              }
+            '
             echo
             echo "**Merge this PR yourself when ready — it is never auto-merged.**"
             echo
