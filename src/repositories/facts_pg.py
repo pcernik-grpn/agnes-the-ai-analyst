@@ -64,6 +64,12 @@ MAX_NEIGHBORS_DEPTH = 2
 MAX_NEIGHBORS_FANOUT = 100
 MAX_NEIGHBORS_RESULT = 500
 MAX_SEARCH_FILTERS = 20
+# P2 review finding: a 1-char `q` drives a full-scan ILIKE over every
+# fact_aliases row with no useful selectivity. Enforced here (repo layer),
+# not only in the REST Pydantic model, so an MCP/CLI caller reaching
+# `search()` directly cannot bypass it. A blank/whitespace `q` is exempt —
+# that already degrades to "no filter" (pre-existing contract).
+MIN_SEARCH_Q_LENGTH = 2
 
 # Ingest batch caps (spec §7.2): "≤500 documents, ≤5000 claims per request".
 # A single document's evidence count over MAX_INGEST_CLAIMS is a protocol
@@ -187,6 +193,58 @@ def _readable_ids(caller) -> Optional[frozenset]:
     if ids is None:
         return None
     return frozenset(ids)
+
+
+def _add_path_component_candidates(candidates: Set[str], value: str) -> None:
+    """Decompose ``value`` (a stored ``path`` OR a stored ``filename`` — see
+    ``_identity_candidates``) into whole-unit candidates and add them to
+    ``candidates`` in place: the string itself; every single whole
+    ``/``-separated component (a folder name, or the final segment); and
+    every CONTIGUOUS run of whole components (e.g. ``"folder/name.ext"``) —
+    the run ending at the final segment also gets an extension-stripped
+    variant. A separator-free ``value`` (the ordinary case) decomposes to
+    exactly ``{value, stem}``, identical to the pre-bundle-support shape."""
+    candidates.add(value)
+    parts = [p for p in value.split("/") if p]
+    n = len(parts)
+    for i in range(n):
+        for j in range(i + 1, n + 1):
+            candidates.add("/".join(parts[i:j]))
+            if j == n:  # this run ends at the final segment
+                last = parts[j - 1]
+                dot = last.rfind(".")
+                if dot > 0:
+                    candidates.add("/".join(parts[i : j - 1] + [last[:dot]]))
+
+
+def _identity_candidates(filename: Optional[str], path: Optional[str]) -> Set[str]:
+    """Whole-unit identity-evidence candidates for the verbatim gate (spec
+    §8, P0 review finding). A quote counts as identity-grounded evidence
+    only when it EQUALS one of these — never merely CONTAINS one as a
+    substring, which let a fabricated quote self-certify on any fragment of
+    the document's own name (a bare ``".pptx"``, a stray ``"/"``, a 2-char
+    slice). Both ``filename`` and ``path`` are decomposed the SAME way
+    (``_add_path_component_candidates``) — an ordinary ``filename`` has no
+    ``/`` so this changes nothing for it, but a bundle member's stored
+    ``filename`` IS itself a path (``src/ingest/bundle.py`` stores the
+    archive-relative member path there, with no ``path`` at all), so
+    decomposing only ``path`` silently starved that case of any component
+    candidates (live cross-PR regression: a zip member's own folder name
+    was rejected). Candidates: each of ``filename``/``path`` in full; each
+    with its extension stripped; every single whole ``/``-separated
+    component of each (a folder name, or the final segment); and every
+    CONTIGUOUS run of whole components (e.g. ``"folder/filename.ext"``, the
+    folder+filename shape a `part_of` edge legitimately cites) — the run
+    ending at the final segment also gets an extension-stripped variant. No
+    normalization anywhere: matches the chunk-text comparison exactly (an
+    NFC/NFD quote fails identically on both sides)."""
+    candidates: Set[str] = set()
+    if filename:
+        _add_path_component_candidates(candidates, filename)
+    if path:
+        _add_path_component_candidates(candidates, path)
+    candidates.discard("")
+    return candidates
 
 
 _WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
@@ -798,7 +856,12 @@ class FactsPgRepository:
         extension) similarity ranking: this schema does not enable one, and
         this repo intentionally does not add the operational dependency —
         this deterministic CASE-based tiering needs nothing beyond stock
-        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"."""
+        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"; a
+        non-blank ``q`` shorter than ``MIN_SEARCH_Q_LENGTH`` raises
+        ``ValueError`` (P2 review finding — a 1-char query has no useful
+        selectivity against a full ILIKE scan). The query itself runs under
+        a bounded Postgres statement timeout, same mechanism as
+        ``neighbors()``."""
         filters = filters or {}
         if len(filters) > MAX_SEARCH_FILTERS:
             raise ValueError(f"too many filters (max {MAX_SEARCH_FILTERS})")
@@ -817,6 +880,8 @@ class FactsPgRepository:
         )
 
         q_clean = (q or "").strip()
+        if q_clean and len(q_clean) < MIN_SEARCH_Q_LENGTH:
+            raise ValueError(f"q must be at least {MIN_SEARCH_Q_LENGTH} characters")
         q_norm = q_clean.casefold().replace(" ", "-") if q_clean else None
         q_substr: Optional[str] = None
         q_prefix: Optional[str] = None
@@ -965,7 +1030,13 @@ class FactsPgRepository:
             LIMIT :limit_plus_one
             """
         )
-        with self._engine.connect() as conn:
+        # P2 review finding: bound this statement the same way `neighbors()`
+        # is bounded (spec §12) — an ILIKE-driven candidate scan with no cap
+        # could stall a connection out of the pool. `.begin()` (not
+        # `.connect()`) so `SET LOCAL` applies to the query that follows in
+        # the same transaction.
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             rows = conn.execute(sql, params).mappings().all()
 
         limit_applied = len(rows) > limit
@@ -2280,6 +2351,21 @@ class FactsPgRepository:
         # the first's resolution.
         doc_id_resolution: Dict[Tuple[str, str], str] = {}
         doc_declared_pairs: Set[Tuple[str, str]] = set()  # {(corpus_id, doc_id)} this batch's documents[] touched
+        # RBAC review follow-up (P1): every corpus a `documents[]` entry
+        # NAMED, regardless of whether that entry actually resolved to a
+        # corpus_file_id. `doc_declared_pairs` alone under-counts this on a
+        # rename race (stable_id/path match nothing yet, no prior
+        # corpus_file_sources row either) — the entry silently fails to
+        # resolve, so its corpus never lands in `doc_declared_pairs`, and a
+        # batch with exactly one such entry would otherwise present as
+        # "documents[] omitted" to `_resolve_doc` and fall through to its
+        # unrestricted tier-3 scan. `declared_corpus_ids` is the batch's
+        # true declared scope: the gate for tier 3 below.
+        declared_corpus_ids: Set[str] = set()
+        # doc_id -> this batch's own declared `modified` date. Keyed by
+        # doc_id, NOT corpus_file_id (P2 review finding) — see the write
+        # site below for why a file_id key silently drops the date on a
+        # TCRD-241 duplicate-copy override.
         doc_dates: Dict[str, date] = {}
         # O7 follow-up: a `source_url` the validator dropped — itemized so a
         # non-zero count on the run report tells the operator "your producer
@@ -2295,6 +2381,7 @@ class FactsPgRepository:
                 corpus_id = doc.get("corpus_id")
                 if not doc_id or not corpus_id:
                     continue
+                declared_corpus_ids.add(corpus_id)
                 stable_id = doc.get("stable_id") or None
                 path = doc.get("path") or None
 
@@ -2354,7 +2441,17 @@ class FactsPgRepository:
                 if file_id is not None:
                     parsed = _parse_document_date(doc.get("modified"))
                     if parsed is not None:
-                        doc_dates[file_id] = parsed
+                        # P2 review finding: keyed by `doc_id`, NOT `file_id`.
+                        # TCRD-241's deterministic override (below) can
+                        # re-point a doc_id's resolution at a DIFFERENT
+                        # corpus_file_id than the one THIS entry resolved to
+                        # (an older, already-indexed copy winning over the
+                        # fresh one THIS batch declared) — a file_id-keyed
+                        # date would then look up a key nothing set,
+                        # silently writing `document_date=NULL` and handing
+                        # the succession/latest-wins projection a stale,
+                        # dated claim over the new undated one.
+                        doc_dates[doc_id] = parsed
 
         def _copies_for(corpus_id: str, doc_id: str, conn) -> List[Dict[str, Any]]:
             """Every ``corpus_files`` row anchored to ``(corpus_id, doc_id)``
@@ -2402,7 +2499,13 @@ class FactsPgRepository:
             if doc_id not in doc_id_to_corpus or corpus_id < doc_id_to_corpus[doc_id]:
                 doc_id_to_corpus[doc_id] = corpus_id
 
-        batch_corpus_ids = sorted({corpus_id for corpus_id, _ in doc_declared_pairs})
+        # P1 review follow-up: gate tier 3 on whether `documents[]` was
+        # DECLARED AT ALL (`declared_corpus_ids`, every corpus a documents[]
+        # entry NAMED, whether or not that entry went on to resolve) —
+        # never on `doc_declared_pairs` alone, which only holds entries that
+        # actually resolved and so silently drops the scope of a rename-race
+        # entry (see the ladder docstring's 3a).
+        batch_corpus_ids = sorted(declared_corpus_ids)
         # RBAC review (PR #1736, TCRD-241 follow-up): a doc_id that resolves
         # ONLY by escaping every corpus THIS batch's `documents[]` declared
         # is rejected, never written — see the ladder docstring below.
@@ -2412,31 +2515,42 @@ class FactsPgRepository:
             """Corpus-scoped, deterministic doc_id -> corpus_file_id
             resolution (TCRD-241). Ladder:
 
-            1. This batch's OWN `documents[]` declared (corpus_id, doc_id) —
-               indexed-preferred among any duplicate copies within it.
-            2. Not declared this batch: scan only the corpora THIS batch's
-               `documents[]` touched — a producer batch is normally scoped
-               to one collection, so an omitted-but-already-resolved doc_id
-               from the SAME crawl run is overwhelmingly likely to live
-               there too.
+            1. This batch's OWN `documents[]` declared (corpus_id, doc_id)
+               AND it resolved — indexed-preferred among any duplicate
+               copies within it.
+            2. Not declared this batch (or declared but unresolved — a
+               rename race the upsert loop tolerates without erroring):
+               scan only the corpora THIS batch's `documents[]` NAMED
+               (`declared_corpus_ids` — every entry's own corpus_id,
+               regardless of whether that entry itself resolved) — a
+               producer batch is normally scoped to one collection, so an
+               omitted-but-already-resolved doc_id from the SAME crawl run
+               is overwhelmingly likely to live there too.
             3a. This batch's `documents[]` declared at LEAST ONE corpus
                 (`batch_corpus_ids` non-empty) but this doc_id isn't
                 anchored in ANY of them: refuse to escape to some OTHER,
                 possibly more broadly-granted corpus — that would grant the
                 claim wider visibility than the producer's batch ever
-                declared (RBAC review PR #1736). A probe checks whether the
-                doc_id resolves ANYWHERE at all, purely to distinguish the
-                rejection reason (`ambiguous_cross_collection_doc_id` — it
-                exists, just outside this batch's scope) from a doc_id that
-                plain doesn't exist (`unresolved_doc_id`, existing
-                behavior) — nothing is ever written on this path.
-            3b. This batch's `documents[]` is EMPTY (no batch-declared scope
-                to escape at all) — the documented "documents may be
-                omitted when every doc_id already resolves" replay flow
-                (spec §7.2). Tier 3 here is the SOLE resolution mechanism by
-                design (dozens of existing callers depend on it), so it
-                still resolves via an unrestricted, deterministically
-                ordered global scan, unchanged from before this review.
+                declared (RBAC review PR #1736). This also covers a
+                documents[] entry that named a corpus but never itself
+                resolved (P1 follow-up) — `declared_corpus_ids` still
+                carries that corpus, so the scoped scan below (not tier 3)
+                runs even though `doc_declared_pairs` has no matching pair.
+                A probe checks whether the doc_id resolves ANYWHERE at all,
+                purely to distinguish the rejection reason
+                (`ambiguous_cross_collection_doc_id` — it exists, just
+                outside this batch's scope) from a doc_id that plain
+                doesn't exist (`unresolved_doc_id`, existing behavior) —
+                nothing is ever written on this path.
+            3b. This batch's `documents[]` is EMPTY — no entry named ANY
+                corpus at all, i.e. `documents` itself was omitted or every
+                entry lacked a `doc_id`/`corpus_id` (no batch-declared scope
+                to escape) — the documented "documents may be omitted when
+                every doc_id already resolves" replay flow (spec §7.2).
+                Tier 3 here is the SOLE resolution mechanism by design
+                (dozens of existing callers depend on it), so it still
+                resolves via an unrestricted, deterministically ordered
+                global scan, unchanged from before this review.
             """
             if not doc_id:
                 return None
@@ -2643,11 +2757,15 @@ class FactsPgRepository:
                         # RESOLVE which row this evidence is about, never as
                         # evidence itself, or a producer could self-certify
                         # an invented quote by declaring whatever string it
-                        # likes. No normalization is applied here, matching
-                        # the chunk-text check above exactly — an NFC/NFD
-                        # form mismatch fails identically on both sides.
-                        identity_haystack = [s for s in (frow.get("filename"), frow.get("path")) if s]
-                        if any(quote in s for s in identity_haystack):
+                        # likes. P0 review finding: the quote must EQUAL a
+                        # whole identity unit (`_identity_candidates`) —
+                        # never merely a substring of one, which admitted a
+                        # bare ".pptx" or "/" and let a fabricated attribute
+                        # ride in as a confidently-cited quote. No
+                        # normalization is applied here, matching the
+                        # chunk-text check above exactly — an NFC/NFD form
+                        # mismatch fails identically on both sides.
+                        if quote in _identity_candidates(frow.get("filename"), frow.get("path")):
                             accepted_via_identity = True
                         else:
                             claims_rejected.append(
@@ -2672,7 +2790,14 @@ class FactsPgRepository:
                         # ever supplies one (forward-compatible, unused
                         # today).
                         attrs=ev.get("attrs") or row_attrs or {},
-                        document_date=doc_dates.get(file_id),
+                        # P2 review finding: looked up by the EVIDENCE'S OWN
+                        # `doc_id`, not the resolved `file_id` — the
+                        # TCRD-241 deterministic override can resolve this
+                        # doc_id to a corpus_file_id THIS batch never itself
+                        # declared a date for (see `doc_dates`' definition
+                        # above), which previously wrote `document_date` as
+                        # silently NULL.
+                        document_date=doc_dates.get(doc_id),
                     )
                     for alias_type, alias_natural_key in alias_targets or []:
                         # Recorded regardless of `written_id` (a replayed,
