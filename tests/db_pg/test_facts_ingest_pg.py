@@ -216,6 +216,9 @@ def test_verbatim_gate_accepts_a_real_substring(pg_env, repo):
 
 
 def test_verbatim_gate_accepts_a_quote_grounded_in_the_stored_filename(pg_env, repo):
+    """A `part_of` edge citing the document's FULL folder + filename (a
+    contiguous run of whole path components) counts as verbatim evidence —
+    the exact scenario PR #1767 widened the gate for."""
     file_id = "cf_identity1"
     doc_id = "doc_identity1"
     _seed_collection(collection_id=CORPUS_A)
@@ -234,7 +237,174 @@ def test_verbatim_gate_accepts_a_quote_grounded_in_the_stored_filename(pg_env, r
                 "type": "part_of",
                 "src": "engagement:kemp",
                 "dst": "project:kemp",
-                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp/Parts Authority"}],
+                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp/Parts Authority — Overview.pptx"}],
+            }
+        ],
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+    assert report["claims_accepted_via_identity"] == 1
+
+
+# ---------------------------------------------------------------------------
+# P0 review finding: the identity gate must match a WHOLE unit (a folder
+# name, the filename with/without its extension, or a contiguous run of
+# whole path components) — never an arbitrary substring. `quote in path`
+# admitted `.pptx`, `/`, or any fragment, letting a fabricated attribute
+# self-certify as a cited quote via the document's own identity.
+# ---------------------------------------------------------------------------
+
+
+def _seed_identity_doc(file_id: str = "cf_identity_unit", doc_id: str = "doc_identity_unit") -> str:
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(
+        file_id=file_id,
+        filename="Parts Authority — Overview.pptx",
+        path="Project Kemp/Parts Authority — Overview.pptx",
+    )
+    _seed_chunk(file_id=file_id, text="Nothing about the filename appears in the extracted text.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+    return doc_id
+
+
+def _identity_edge_report(repo, doc_id: str, quote: str) -> dict:
+    return repo.ingest_batch(
+        nodes=[{"id": "engagement:kemp2", "type": "engagement", "attrs": {}, "evidence": []}],
+        edges=[
+            {
+                "type": "part_of",
+                "src": "engagement:kemp2",
+                "dst": "project:kemp2",
+                "evidence": [{"doc_id": doc_id, "quote": quote}],
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "Parts Authority — Overview.pptx",  # full filename, with extension
+        "Parts Authority — Overview",  # full filename, without extension
+        "Project Kemp",  # a whole folder name
+        "Project Kemp/Parts Authority — Overview.pptx",  # folder + filename
+    ],
+)
+def test_verbatim_gate_accepts_whole_identity_units(pg_env, repo, quote):
+    doc_id = _seed_identity_doc()
+    report = _identity_edge_report(repo, doc_id, quote)
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+    assert report["claims_accepted_via_identity"] == 1
+
+
+@pytest.mark.parametrize(
+    "quote,reason",
+    [
+        # Degenerate SHAPES — the meaningfulness floor runs ahead of both halves
+        # of the gate, so these never reach the identity comparison at all and
+        # carry its own reason.
+        (".pptx", "quote_not_meaningful"),  # bare extension: starts with punctuation
+        ("/", "quote_not_meaningful"),  # bare path separator
+        # Meaningful shapes that are nonetheless only FRAGMENTS of the identity.
+        # These pass the floor and DO reach the identity gate, which is what this
+        # test exists to prove — if every case here were degenerate, the identity
+        # gate would silently stop being exercised.
+        ("ho", "verbatim_gate_failed"),  # 2-char fragment of "Authority", absent from the chunk text
+        ("rts Authority — Overvi", "verbatim_gate_failed"),  # mid-word slice of the filename
+    ],
+)
+def test_verbatim_gate_rejects_partial_identity_fragments(pg_env, repo, quote, reason):
+    doc_id = _seed_identity_doc()
+    report = _identity_edge_report(repo, doc_id, quote)
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == reason
+    assert report["claims_accepted_via_identity"] == 0
+
+
+def test_verbatim_gate_counter_only_counts_identity_accepted_claims(pg_env, repo):
+    """A batch mixing a chunk-grounded claim, an identity-grounded claim,
+    and a fabricated one: `claims_accepted_via_identity` must count ONLY
+    the identity one."""
+    doc_id = _seed_identity_doc(file_id="cf_identity_mixed", doc_id="doc_identity_mixed")
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:mixed",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [
+                    {"doc_id": doc_id, "quote": "Nothing about the filename appears"},  # chunk-grounded
+                    {"doc_id": doc_id, "quote": "Parts Authority — Overview.pptx"},  # identity-grounded
+                    # A MEANINGFUL fabrication, not a degenerate one: it has to
+                    # reach the identity gate for this test to prove anything
+                    # about the identity counter. A bare ".pptx" is now stopped
+                    # by the meaningfulness floor before it ever gets there.
+                    {"doc_id": doc_id, "quote": "Overview"},  # fabricated fragment
+                ],
+            }
+        ],
+    )
+    assert report["claims_written"] == 2
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+    assert report["claims_accepted_via_identity"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-PR regression (caught by merging with #1773, zip-member citability):
+# a zip member's stored `filename` IS itself a path
+# (`src/ingest/bundle.py::cf_repo.add(..., filename=member_path)`, no
+# `path=` at all) — `_identity_candidates` must decompose `filename` the
+# SAME way it decomposes `path`, not only `path`. Direct unit tests on the
+# function (no DB), plus one ingest-level reproduction of the exact shape
+# a bundle member's `corpus_files` row has.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_candidates_decomposes_a_separator_bearing_filename():
+    from src.repositories.facts_pg import _identity_candidates
+
+    candidates = _identity_candidates("Project Kemp/Overview.pptx", None)
+    assert "Project Kemp" in candidates  # a whole path component
+    assert "Project Kemp/Overview.pptx" in candidates  # the full string
+    assert "Project Kemp/Overview" in candidates  # the stem
+    # finding 1's tightening must still hold when the filename has a "/":
+    assert ".pptx" not in candidates
+    assert "/" not in candidates
+    assert "ve" not in candidates  # 2-char slice
+
+
+def test_identity_candidates_ordinary_filename_is_unaffected():
+    """A separator-free `filename` (the pre-bundle-support, ordinary case)
+    must decompose to EXACTLY `{filename, stem}` — proves the bundle fix
+    changed nothing for it, and that a bare extension is still rejected."""
+    from src.repositories.facts_pg import _identity_candidates
+
+    assert _identity_candidates("deck.pptx", None) == {"deck.pptx", "deck"}
+
+
+def test_verbatim_gate_accepts_a_component_of_a_separator_bearing_filename(pg_env, repo):
+    """Reproduces the actual #1773 cross-PR failure at the repo level,
+    without cherry-picking `src/ingest/bundle.py`: a `corpus_files` row
+    whose `filename` is itself an archive-relative path (a zip member,
+    `path` NULL) must still ground an identity claim on ANY of its whole
+    path components, not just the filename as one indivisible unit."""
+    file_id = "cf_zip_member"
+    doc_id = "doc_zip_member"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id, filename="Project Kemp/Overview.pptx", path=None)
+    _seed_chunk(file_id=file_id, text="Nothing about the member name appears in the extracted text.")
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[{"id": "engagement:zipmember", "type": "engagement", "attrs": {}, "evidence": []}],
+        edges=[
+            {
+                "type": "part_of",
+                "src": "engagement:zipmember",
+                "dst": "project:zipmember",
+                "evidence": [{"doc_id": doc_id, "quote": "Project Kemp"}],
             }
         ],
     )
@@ -1285,6 +1455,82 @@ def test_dup_doc_id_indexed_copy_preferred_over_pending_not_deferred(pg_env, rep
     assert report["deferred"] == []
 
 
+def test_dup_doc_id_document_date_survives_the_indexed_preference_override(pg_env, repo):
+    """P2 review finding: `document_date` was looked up by the FILE this
+    batch's own `documents[]` entry resolved to, but a SECOND indexed copy
+    landing later (TCRD-241) makes the deterministic override pick a
+    DIFFERENT winner file -- one this batch never touched, so it has no
+    entry in that batch's `doc_dates`. The claim then silently wrote
+    `document_date=NULL`, breaking the succession rule (latest date wins):
+    an undated claim is treated as inferior to any dated one, so a stale
+    value would win forever. `document_date` must travel with the batch's
+    OWN declared doc_id, not the resolved file id, so it survives the
+    override."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_1_old", status="indexed", path="docs/old.docx")
+    text = "Acme Corp renewal status: in_progress. Later note: Acme Corp renewal status: renewed."
+    _seed_chunk(file_id="cf_1_old", text=text)
+
+    # Batch 1: the ONLY copy at this point -- establishes doc_id -> cf_1_old
+    # with an early document_date; no TCRD-241 override in play yet.
+    r1 = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": "dupdocdate",
+                "corpus_id": CORPUS_A,
+                "path": "docs/old.docx",
+                "stable_id": "path-old",
+                "modified": "2026-01-01",
+            }
+        ],
+        nodes=[
+            {
+                "id": "engagement:dupdocdate",
+                "type": "engagement",
+                "attrs": {"status": "in_progress"},
+                "evidence": [{"doc_id": "dupdocdate", "quote": "Acme Corp renewal status: in_progress."}],
+            }
+        ],
+    )
+    assert r1["claims_written"] == 1
+
+    # A SECOND copy of the SAME doc_id lands, not yet indexed (a fresh
+    # SharePoint duplicate just uploaded) -- `cf_1_old` still wins the
+    # deterministic (indexed-preferred) tiebreak, even though THIS batch's
+    # own documents[] entry resolves to the NEW copy.
+    _seed_corpus_file(file_id="cf_2_new", status="processing", path="docs/new.docx")
+
+    r2 = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": "dupdocdate",
+                "corpus_id": CORPUS_A,
+                "path": "docs/new.docx",
+                "stable_id": "path-new",
+                "modified": "2026-03-01",
+            }
+        ],
+        nodes=[
+            {
+                "id": "engagement:dupdocdate",
+                "type": "engagement",
+                "attrs": {"status": "renewed"},
+                "evidence": [{"doc_id": "dupdocdate", "quote": "Acme Corp renewal status: renewed."}],
+            }
+        ],
+    )
+    assert r2["claims_written"] == 1
+    assert r2["deferred"] == []  # resolved to the indexed cf_1_old, not the pending cf_2_new
+
+    result = repo.search(_admin(), type="engagement")
+    subject = next(s for s in result["subjects"] if "engagement:dupdocdate" in s["aliases"])
+    assert subject["attrs"]["status"]["value"] == "renewed"  # succession picked the LATER date
+
+    claims = repo.claims(_admin(), subject["id"])
+    dates = sorted(c["document_date"] for c in claims["claims"])
+    assert dates == ["2026-01-01", "2026-03-01"]  # neither claim's date silently dropped to null
+
+
 def test_dup_doc_id_undeclared_doc_id_resolving_only_outside_batch_corpora_is_rejected(pg_env, repo):
     """RBAC review (PR #1736): a claim's doc_id has NO `documents[]` entry
     in THIS batch, and the corpora this batch's `documents[]` DID declare
@@ -1316,6 +1562,48 @@ def test_dup_doc_id_undeclared_doc_id_resolving_only_outside_batch_corpora_is_re
     _make_group_with_grant(pg_env, group_name="group-a-broad", collection_id=CORPUS_A, member_user_id="dana")
     dana_view = repo.search({"id": "dana", "email": "dana@test.com"}, type="engagement")
     assert dana_view["subjects"] == []  # nothing was ever written under col_a either
+
+
+def test_dup_doc_id_documents_present_but_unresolved_entry_does_not_escape_to_global_scan(pg_env, repo):
+    """P1 review finding, follow-up to PR #1736: `documents[]` is PRESENT
+    (not omitted) but its ONLY entry fails to resolve -- a rename race the
+    code tolerates (neither `stable_id` nor `path` matches an existing
+    row, and no PRIOR `corpus_file_sources` row exists for this
+    (corpus_id, doc_id) either). Because that entry never resolved,
+    `batch_corpus_ids` must still be scoped to the corpus THIS batch
+    declared -- it must never fall through to tier 3's unrestricted global
+    scan and resolve the doc_id under some OTHER, undeclared (possibly
+    confidential) collection. Same rejection contract as the
+    documents-omitted case: `ambiguous_cross_collection_doc_id`, nothing
+    ever written."""
+    from src.repositories import users_repo
+
+    corpus_b = "col_b"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_collection(collection_id=corpus_b)
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_b_confidential")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_b_confidential", text="Confidential financials for the deal.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_b_confidential", source_doc_id="renamed_doc")
+
+    report = repo.ingest_batch(
+        documents=[
+            {
+                "doc_id": "renamed_doc",
+                "corpus_id": CORPUS_A,
+                "stable_id": "stale-stable-id-from-before-the-rename",
+            }
+        ],
+        nodes=[_node("engagement:rename-race", "renamed_doc", "Confidential financials for the deal.")],
+    )
+    assert report["claims_written"] == 0
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "ambiguous_cross_collection_doc_id"
+    assert report["claims_rejected"][0]["doc_id"] == "renamed_doc"
+
+    users_repo().create(id="carl", email="carl@test.com", name="Carl")
+    _make_group_with_grant(pg_env, group_name="group-b-confidential", collection_id=corpus_b, member_user_id="carl")
+    carl_view = repo.search({"id": "carl", "email": "carl@test.com"}, type="engagement")
+    assert carl_view["subjects"] == []  # nothing was ever written under col_b
 
 
 def test_dup_doc_id_tier2_hit_resolves_within_another_batch_declared_corpus(pg_env, repo):

@@ -496,8 +496,11 @@ class TestRailOptIn:
         # Every "add something" path sits behind ONE chevron button.
         assert 'id="lib-new-btn"' in text
         assert 'id="lib-new-menu"' in text
+        # Matched on the closing bracket, not the closing tag: every item now
+        # carries a `<small>` description, so the label is no longer the whole
+        # span. Same trick the agent-template check below uses.
         for label in ("Build a skill", "Build a plugin", "Upload a file"):
-            assert f"<span>{label}</span>" in text
+            assert f">{label}<" in text
         # The page-head `.pnote` caveats are retired, and so are the two tinted
         # panels that replaced them. What is left above the inventory is ONE thin
         # row (the caveat about the list), and Data apps states its schedule as a

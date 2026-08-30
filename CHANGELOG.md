@@ -9,7 +9,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ---
 
 ## [Unreleased]
-
 ### Added
 - **Invite someone into a group without leaving the page.** Searching a group's
   People for a person with no account ended the job: a link to `/admin/users`,
@@ -257,6 +256,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   other file type); and a concurrent double-mint race on the same member no
   longer 500s the whole ingest.
 
+- **The Knowledge tab opens on what the graph knows (TCRD-250).** Node types with live, caller-scoped counts sit at the head of the tab, each one a way in — the counts come from `GET /api/facts/type-map`, so a type shows what *you* can reach and a type nobody can see is absent rather than zero. It follows the active tab through the Library's own `onApply` chain (the filter engine slices rows by `data-tab`; a non-row element has no such hook) and starts hidden, so it never flashes on Capabilities before the first apply. Renders nothing at all when the facts feature is off, the app-state backend is DuckDB, or the graph is empty — the Library must not fail because a decoration is unavailable.
 ### Changed
 - **A four-tester pass over `/admin/access`, and the repairs it found.** The
   page could grant a data package, a memory domain or a marketplace plugin and
@@ -1422,6 +1422,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   app remains an act of publication.
 - **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 
+- **The Library says what your agents get, not what the server does.** Every
+  control in the Access column named a mechanism — *Install*, *Add to stack*,
+  *In stack*, *Required by your admin*, *Granted to your group* — which told a
+  reader what happens internally and left them to infer what they get. Each now
+  names the outcome: **Add to my agents** (was Install / Add to stack), *Agents
+  can use this* (was Installed / In stack), and one state for governed data,
+  *Agents can query this*, replacing the pair of pills that promised two
+  different things about removal for what is a single, identical capability —
+  the tier survives in the tooltip, where it explains why rather than posing as
+  a different power. The two toolbar toggles follow (*Agents use it*, *Not added
+  yet*), so the page no longer says "stack" anywhere, and a permanent one-line
+  lede under the title states the rule the whole page turns on: your admin
+  decides what data you can reach, you choose what your agents can do with it.
+- **Every row in the Library's + Add menu says what it makes.** Four of the
+  eight — skill, plugin, agent template, upload — were a verb and nothing else,
+  so the menu told you the shape of the thing only where someone had happened to
+  write a sub-line. Each now carries the builder's own one-line description,
+  compressed, so the menu and the page it opens describe the same object the
+  same way. The menu widens 214px → 320px to fit them on one line each.
 ### Fixed
 - **Leaving the person lens no longer loses the person.** A row in "what
   their Library shows" linked to the ANALYST page for that resource with
@@ -2008,6 +2027,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   pipeline", `e.g. acme_knowledge`. No behaviour change; the eval fixtures
   under `tests/fixtures/eval/` are deliberately untouched (see the PR body).
 
+- **A duplicate-file claim could silently lose its `document_date`, breaking the latest-value-wins succession rule.** When a SharePoint duplicate's doc_id resolution (TCRD-241) fell to the deterministic indexed-preferred override, the claim wrote its `document_date` looked up by the corpus_file that override picked — which, for a batch whose own `documents[]` entry resolved to a DIFFERENT (unwinning) copy, was never a key that batch itself had set, so the date silently wrote `NULL`. An undated claim loses to any dated one in the per-key latest-`document_date`-wins projection, so a stale value could win forever over the newer one this batch actually declared — precisely the recurring-SharePoint-duplicate case the succession rule exists for. `document_date` is now looked up by the batch's own declared `doc_id`, not the resolved `corpus_file_id`, so it survives the override regardless of which copy wins.
+- **`FactsPgRepository.search()`'s free-text `q` had no minimum length and no statement timeout.** A 1-character `q` drove a full ILIKE scan over every `fact_aliases` row with no useful selectivity, and — unlike `neighbors()` — the query ran with no bound at all, a pool-stall risk on a large alias table. `q` now requires at least `MIN_SEARCH_Q_LENGTH` (2) non-blank characters (a `ValueError`, translated to the existing `422` by the REST layer) — enforced in the repository itself, not only the REST Pydantic model, so an MCP or CLI caller reaching `search()` directly gets the same floor. The query now runs under the same bounded Postgres `statement_timeout` `neighbors()` already used.
 ### Removed
 - **The Knowledge Layer hero's leftovers.** Retiring it from the chat landing left the parts behind: `macros/_knowledge_layer.html` was still imported by `chat.html` and still defined the whole banner, and ~230 lines of `.klb-*` CSS in `style-custom.css` (plus a dead `.klb-hub-label--lead` block in `chat.css` styling a class no template emitted, and a `.klb-cta` paper-theme override) were still shipped to every page — so the framing could come back through a one-line call. All of it is deleted. The two things inside it that were still doing work survive with names that describe them: the near-white knowledge-surface gradient is now `.cbn--bar`'s own rule (its only consumer, and the fill `.cld-door--lead` deliberately imitates), and the trust caption "Secure. Private. Always in sync." is inlined into `chat.html` as `.cld-trust-claim` — it was a macro only so the hero and this line could share one caption, and its title half was dead code every caller opted out of. `tests/test_web_chat_empty_state.py` now guards the whole `klb` prefix out of the rendered page rather than the four class names someone thought to list.
 - **Two stale pointers into the retired hero.** `setup_advanced.html` sent readers to `/home § "connect your tools"` for Google Workspace setup — a section that page has never had since the orientation pages were consolidated; it now names the two surfaces that actually do the job (add the plugin from your Library, authorize it under My connections). `tour.js`'s "Connect my AI tools" button justified its destination by pointing at a CTA that no longer exists; the destination was and is right, so only the reason changed.

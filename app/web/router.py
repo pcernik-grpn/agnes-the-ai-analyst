@@ -2096,8 +2096,34 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: rather than literals at each site because they are the same sentence
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
-_LOCKED_STACK_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-_GRANTED_STACK_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
+_LOCKED_STACK_TOOLTIP = (
+    "Required by your admin — your agents get this automatically, and you cannot remove it."
+)
+_GRANTED_STACK_TOOLTIP = (
+    "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
+)
+
+#: The Access column asks ONE question — *can my agent use this* — and the
+#: three kinds answer it differently, which is the honest shape of the
+#: product rather than an inconsistency to paper over: a capability is the
+#: caller's to add, granted data is the admin's to give. The old copy named
+#: the MECHANISM instead ("Install", "Add to stack", "In stack"), which said
+#: what the server does and left the reader to infer what they get. Named
+#: once, because this column has already collected four spellings of one
+#: state and every extra literal is how a fifth arrives.
+_AGENT_ADD = "Add to my agents"
+_AGENT_REMOVE = "Remove"
+# The resting states drop the possessive the ACTION keeps ("Add to my
+# agents"): the action is a sentence about you, the state is a fact about the
+# row, and repeating "your agents" on every line both clipped the 142px cell
+# and said nothing the lede above the list has not already said.
+_AGENT_HAS = "Agents can use this"
+_AGENT_CAN_QUERY = "Agents can query this"
+_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
+_AGENT_HAS_TOOLTIP = (
+    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
+    "sees what that scope allows."
+)
 
 
 def _library_row_base(
@@ -2235,6 +2261,30 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
         return False
 
 
+def _library_type_map(user: dict) -> list[dict]:
+    """Node types with caller-scoped counts for the Knowledge tab's head.
+
+    Fails soft on every axis, because this is a decoration on a page that
+    must render without it: the `facts` feature can be off, the app-state
+    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
+    and the graph can simply be empty. Any of those renders the Library
+    exactly as it does today, with no type map — never a 500 on the
+    caller's main inventory page.
+    """
+    try:
+        from app.instance_config import feature_enabled
+
+        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+            return []
+        from src.repositories import facts_repo
+
+        counts = facts_repo().count_visible_facts_by_type(user)
+    except Exception:  # noqa: BLE001 - decoration must never break the page
+        logger.debug("library: type map unavailable", exc_info=True)
+        return []
+    return [{"type": t, "count": n} for t, n in counts.items()]
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -2293,6 +2343,29 @@ async def library_page(
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
 
+    # ── What could not be read ────────────────────────────────────────────
+    # Every content block below is wrapped so one broken source cannot take the
+    # page down — the right instinct, wrongly finished: a band that raised is
+    # simply ABSENT, and every count on the page is derived from what survived,
+    # so a library whose data packages failed to load looks exactly like a
+    # library that has none. Bad enough and it renders "Your library is empty"
+    # to someone whose library is not. Recorded here so the page can say so.
+    #
+    # Only CONTENT losses are recorded. A failed fact count, grant lookup or
+    # item count degrades a detail on rows that are still there; a notice for
+    # those would cry wolf and teach people to ignore the one that matters.
+    _load_errors: list[str] = []
+
+    #: What a lost content group is CALLED to the person reading the page —
+    #: the internal type name means nothing to them.
+    _ETYPE_LABELS = {"skill": "skills", "plugin": "plugins", "agent": "agent templates"}
+    _RT_LABELS = {"data_package": "data packages", "memory_domain": "memory"}
+
+    def _lost(label: str, exc: Exception) -> None:
+        logger.warning("/library: could not resolve %s: %s", label, exc)
+        if label not in _load_errors:
+            _load_errors.append(label)
+
     # The onboarding step is literally "Explore your Library" — so looking at it
     # completes it. It used to need a click on the checklist row instead, which
     # made the row a box to tick rather than a thing to do: someone who had spent
@@ -2342,14 +2415,25 @@ async def library_page(
     items: list = []
 
     # ── Artefacts (file_corpora) ──────────────────────────────────────────
-    fc_repo = file_corpora_repo()
-    cf_repo = corpus_files_repo()
+    # Resolving the repos and listing the collections sits INSIDE the guard
+    # below, not above it: outside, a backend that cannot answer took the whole
+    # page down with a 500, which is the one outcome this block's try/except
+    # exists to prevent. The guard only ever protected the loop, so it covered
+    # every failure except the one most likely to happen.
+    fc_repo = None
+    cf_repo = None
     # Resolved ONCE, not per collection: the flag/backend check is the same
     # for every row, and a fresh count query per row is only worth paying
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
-    _all_cols = fc_repo.list()
+    _all_cols: list = []
+    try:
+        fc_repo = file_corpora_repo()
+        cf_repo = corpus_files_repo()
+        _all_cols = fc_repo.list()
+    except Exception as e:
+        _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
     # count re-resolved the caller's readable-collection set (a grants query
     # plus a full owned-collections scan), so the page cost grew with the
@@ -2406,8 +2490,16 @@ async def library_page(
             file_type_key, file_type_label = _artefact_type(file_count, first_file)
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
-            fname = first_file.get("filename") if first_file else ""
             is_folder = file_count != 1
+            # What this row can be FOUND by. Nobody searches for the folder —
+            # they search for the file inside it ("kpis"), and until now the
+            # engine saw only the folder's own name, so a file sitting visibly
+            # on screen answered "Nothing matches these filters". A folder is
+            # therefore searchable by every filename it holds; the client then
+            # opens it and hides the siblings, so the hit reads as the file.
+            fname = " ".join(f.get("filename") or "" for f in files) if is_folder else (
+                first_file.get("filename") if first_file else ""
+            )
             row = _library_row_base(
                 item_id=col["id"],
                 kind="artefact",
@@ -2439,17 +2531,15 @@ async def library_page(
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
-            row["stack_title"] = (
-                "The default agent can use this artefact"
-                if row["in_stack"]
-                else "You can reach this, but the default agent can't until you add it"
-            )
+            row["stack_title"] = _AGENT_HAS_TOOLTIP if row["in_stack"] else _AGENT_ADD_TOOLTIP
             # An artefact is the one kind whose membership IS the caller's to
             # set (no admin grant tier exists for a personal upload), so its
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
             # a folder shows its folder's state as a plain badge.
-            row["stack_pill"] = "In stack"
+            row["stack_pill"] = _AGENT_HAS
+            row["stack_action"] = _AGENT_ADD
+            row["stack_undo"] = _AGENT_REMOVE
             # Membership here is a `user_stack_subscriptions` row, and it is the
             # caller's to add or drop either way. Children deliberately inherit
             # neither flag: Stack membership is per collection, so a file inside a
@@ -2468,6 +2558,17 @@ async def library_page(
             # file count there instead, so it needs none.
             row["file_format"] = "" if is_folder else _artefact_format(first_file)
             row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
+            # `file_format` is what the row PRINTS (a folder prints its file
+            # count instead, so it has none). `format_keys` is what the row can
+            # be FILTERED by, which for a folder is every format inside it —
+            # the same reason its search text holds every filename. Keeping the
+            # two apart is what lets a folder answer "show me PDFs" without
+            # claiming to be a PDF.
+            row["format_keys"] = (
+                sorted({fmt for f in files if (fmt := _artefact_format(f))})
+                if is_folder
+                else ([row["file_format"]] if row["file_format"] else [])
+            )
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2518,6 +2619,7 @@ async def library_page(
                     # nested rows are files too, and the retired Type column is
                     # where their format used to show.
                     child["file_format"] = _artefact_format(f)
+                    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
                     # Whether the extraction pass actually got text out of this
                     # file. Only surfaced when it is NOT `indexed`: a healthy
                     # file saying "indexed" on every row is noise, but a file
@@ -2541,7 +2643,7 @@ async def library_page(
                     row["children"].append(child)
             items.append(row)
     except Exception as e:
-        logger.warning("/library: could not enumerate artefacts: %s", e)
+        _lost("files and collections", e)
 
     # ── Store entities the caller may see: SKILLS and PLUGINS ─────────────
     # The Library is the single source of truth for what a user can reach, so it
@@ -2568,7 +2670,7 @@ async def library_page(
         for inst in user_store_installs_repo().list_for_user(uid):
             installed_store[inst["id"]] = inst
     except Exception as e:
-        logger.warning("/library: could not resolve store installs: %s", e)
+        _lost("skills, plugins and agent templates", e)
 
     for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
         try:
@@ -2579,7 +2681,7 @@ async def library_page(
                 limit=1000,
             )
         except Exception as e:
-            logger.warning("/library: could not enumerate %ss: %s", _etype, e)
+            _lost(_ETYPE_LABELS.get(_etype, _etype + "s"), e)
             continue
         for s in _entities:
             status = s.get("visibility_status") or "pending"
@@ -2674,20 +2776,21 @@ async def library_page(
             # The endpoint is ``/install`` and a store entity was never a stack
             # member (``/api/stack`` takes only data_package and memory_domain),
             # so the row says what the click actually does.
-            items[-1]["stack_action"] = "Install"
-            items[-1]["stack_undo"] = "Uninstall"
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             if _inst:
                 items[-1]["stack_state"] = "in_stack"
-                items[-1]["stack_pill"] = "Installed"
+                items[-1]["stack_pill"] = _AGENT_HAS
                 items[-1]["stack_removable"] = True
-                items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+                items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
             else:
                 items[-1]["stack_state"] = "available"
                 items[-1]["stack_addable"] = True
+                # An author looking at their own unadded skill needs the extra
+                # fact that authoring it did not add it; everyone else needs
+                # only the general one.
                 items[-1]["stack_title"] = (
-                    "Yours, but not part of your Stack"
-                    if owned
-                    else "Available to you, but the default agent can't use it until you add it"
+                    "You wrote this, but your agents cannot use it until you add it." if owned else _AGENT_ADD_TOOLTIP
                 )
 
     # ── Everything else the caller has ACCESS to ──────────────────────────
@@ -2736,11 +2839,11 @@ async def library_page(
     ) -> None:
         """Append one access-granted row (never owner-shareable).
 
-        ``droppable``: the membership is the caller's own subscription
-        (classic mode, optional tier) — render the REMOVE control, exactly
-        as /catalog offers for the same membership. Callers whose
-        membership is the grant itself (auto-membership, recipes, plugins)
-        leave it False and get the locked pill."""
+        ``droppable``: the membership is the caller's own subscription, which
+        only exists under CLASSIC membership — there, subscribing is what makes
+        a granted resource queryable, so the control is real and the caller may
+        undo it. Under auto-membership (the default) the grant IS the
+        membership and callers leave this False."""
         items.append(
             _library_row_base(
                 item_id=item_id,
@@ -2765,54 +2868,50 @@ async def library_page(
                 owner_key=owner_key or "workspace",
             )
         )
-        # Membership is the caller's mode-resolved reality, not the grant
-        # (Devin Review on #1199): under auto-membership every granted row IS
-        # in the Stack (``in_stack`` arrives True, rendering exactly as
-        # before); under the classic default a granted-but-unsubscribed
-        # ``available`` resource is NOT a member — claiming "In stack" there
-        # would label rows the agent cannot actually query (membership also
-        # drives ``get_accessible_tables``). Callers whose membership
-        # genuinely is the grant (recipes, plugins) omit the argument.
+        # What this column can offer depends on which membership mode the
+        # instance runs, because the two modes disagree about what a
+        # subscription DOES.
+        #
+        # Auto-membership (the default since Wave 0): the grant already put the
+        # resource in reach — StackResolver.stack returns required ∪ available
+        # regardless of any subscription — so there is nothing here for the
+        # caller to add. The only thing a subscription still decides is whether
+        # `agnes pull` writes a local copy, which changes how fast THEIR
+        # queries run and nothing about what their agents can do; that is a
+        # workspace question and it lives on the package's own page
+        # (/catalog/p/<slug>, sourced from `entry.materialized`) and in
+        # `agnes stack add`. An "Add to my agents" control here would claim to
+        # grant access the admin's grant already gave.
+        #
+        # Classic membership: subscribing is exactly what makes the resource
+        # queryable (membership drives get_accessible_tables), so the control
+        # is real, the verb is true, and a self-subscription is the caller's to
+        # drop — rendering it as a locked admin mandate is what Devin Review
+        # #1199 was about.
         if in_stack and droppable:
-            # Classic self-subscription: the caller added it, the caller can
-            # remove it — HERE, not just on /catalog. This row used to render
-            # the locked pill ("only an admin can remove it"), which was
-            # false for a self-subscription and read as a required mandate;
-            # /catalog offered Remove for the very same membership. The lock
-            # is driven by droppability, and this membership IS droppable.
             import json as _json
 
             items[-1]["stack_state"] = "in_stack"
-            # Not a membership: auto-membership (default since Wave 0) means the
-            # GRANT already put this in the stack. All that is left to the caller
-            # is whether `agnes pull` keeps a copy on disk — which is exactly what
-            # `StackResolver.browse()` calls the Download / Remove-local-copy
-            # affordance.
-            items[-1]["stack_pill"] = "Local copy"
-            items[-1]["stack_action"] = "Keep a local copy"
-            items[-1]["stack_undo"] = "Remove local copy"
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
-            # Remove is a path-param DELETE; re-add (after a remove, without
-            # a reload) POSTs the generic subscribe endpoint with a body —
-            # the row carries both so the click handler can cycle.
+            # Remove is a path-param DELETE; re-add (after a remove, without a
+            # reload) POSTs the generic subscribe endpoint with a body — the
+            # row carries both so the click handler can cycle.
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Added by you — click to remove it from your stack"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
         elif in_stack:
             items[-1]["stack_state"] = "in_stack"
-            # Every non-droppable member row says the same thing about
-            # membership — "In stack" — and is LOCKED: there is no per-user
-            # membership to drop, only a grant an admin can revoke (required
-            # tier, or auto-membership where the grant IS the membership).
-            # The lock is driven by *droppability*, not by the grant tier:
-            # keying it on ``requirement == 'required'`` (as this once did)
-            # left an optional grant rendering the success-tinted check that
-            # a REMOVABLE row wears at rest. The tier stays legible in the
-            # tooltip and the Optional/Required facet.
-            # Granted, therefore already queryable: the pill states the tier
-            # rather than claiming a membership the caller could add.
-            items[-1]["stack_pill"] = "Required by your admin" if requirement == "required" else "Granted to your group"
+            # ONE pill for both grant tiers, because the caller can do exactly
+            # the same thing with either: query it, and not remove it. The
+            # tiers differ only in WHY, which is what the tooltip is for — two
+            # pills promising two different things about removal is what made
+            # a single state read as two. The tier stays legible in the tooltip
+            # and in the Access facet.
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
             if requirement == "required":
                 items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
@@ -2831,12 +2930,12 @@ async def library_page(
 
             items[-1]["stack_state"] = "available"
             items[-1]["stack_addable"] = True
-            items[-1]["stack_action"] = "Keep a local copy"
-            items[-1]["stack_undo"] = "Remove local copy"
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Granted to you, but not in your stack — add it to make it queryable"
+            items[-1]["stack_title"] = _AGENT_ADD_TOOLTIP
 
     # Governed data packages + memory domains — StackResolver.browse() is
     # exactly "required ∪ available for my groups" for these two types.
@@ -2866,9 +2965,7 @@ async def library_page(
     except Exception as e:
         logger.warning("/library: could not count memory-domain items: %s", e)
         dom_counts = None
-    # Membership mode decides droppability below: classic optional members
-    # are the caller's own subscriptions (removable here, as on /catalog);
-    # under auto-membership the grant IS the membership, nothing to drop.
+    # Only classic membership has a subscription to drop; see _add_shared_row.
     from app.instance_config import get_stack_auto_membership
 
     _auto_membership = get_stack_auto_membership()
@@ -2929,7 +3026,7 @@ async def library_page(
                     droppable=(not _auto_membership and e.in_stack and e.requirement != "required"),
                 )
         except Exception as e:
-            logger.warning("/library: could not resolve %s: %s", rt.value, e)
+            _lost(_RT_LABELS.get(rt.value, rt.value), e)
 
     # Recipes — granted, resolved straight off the repo (no _fetch_entries
     # support for this type in StackResolver).
@@ -2954,7 +3051,7 @@ async def library_page(
                     owner_label="Your workspace",
                 )
     except Exception as e:
-        logger.warning("/library: could not resolve recipes: %s", e)
+        _lost("recipes", e)
 
     # Curated marketplace plugins — grant resource_id is the canonical
     # "<marketplace_slug>/<plugin_name>" path, so match on that.
@@ -3051,22 +3148,22 @@ async def library_page(
                 # are precisely the two cases `curated_uninstall` answers 409
                 # to, so the lock promises exactly what the API enforces.
                 locked = bool(pl.get("is_system")) or key in plugin_required
+                row["stack_action"] = _AGENT_ADD
+                row["stack_undo"] = _AGENT_REMOVE
                 if key in plugin_in_stack:
                     row["stack_state"] = "in_stack"
-                    row["stack_pill"] = "Installed"
+                    row["stack_pill"] = _AGENT_HAS
                     row["stack_locked"] = locked
                     row["stack_removable"] = not locked
-                    row["stack_title"] = (
-                        _LOCKED_STACK_TOOLTIP if locked else "The default agent can use this — click to remove it"
-                    )
+                    row["stack_title"] = _LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP
                 else:
                     row["stack_state"] = "available"
                     row["stack_pill"] = ""
                     row["stack_locked"] = False
                     row["stack_addable"] = True
-                    row["stack_title"] = "Granted to you, but the default agent can't use it until you add it"
+                    row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve marketplace plugins: %s", e)
+        _lost("plugins from your organization", e)
 
     # Installed AGENTS. Skills and plugins are already covered by the store sweep
     # above — whether installed or not — so listing them here again would double
@@ -3095,14 +3192,14 @@ async def library_page(
             # Installing a store item IS its Stack membership, and the caller may
             # undo it — the same install endpoint, removed.
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "Installed"
-            items[-1]["stack_action"] = "Install"
-            items[-1]["stack_undo"] = "Uninstall"
+            items[-1]["stack_pill"] = _AGENT_HAS
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
-            items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve installed agents: %s", e)
+        _lost("agent templates", e)
 
     # ── Hosted data apps ───────────────────────────────────────────────
     # Same visibility set as the /apps page (data_apps_list_page): the
@@ -3225,7 +3322,7 @@ async def library_page(
                     )
                 )
         except Exception as e:
-            logger.warning("/library: could not list data apps: %s", e)
+            _lost("apps", e)
 
     # ── Definitions — the semantic layer, as a page FOOTER ────────────────
     # Deliberately NOT rows in the list above. Metrics and glossary terms are
@@ -3331,6 +3428,16 @@ async def library_page(
             counts[k] = counts.get(k, 0) + 1
             labels[k] = c.get(label_key) or k
         return sorted(((k, labels[k], n) for k, n in counts.items()), key=lambda x: x[1])
+
+    def _present_multi(attr_key: str) -> list:
+        """Tally a list-valued key. The count is top-level ROWS, not files:
+        it must equal what clicking the option leaves on screen, and the
+        engine returns rows."""
+        counts: dict = {}
+        for c in items:
+            for k in c.get(attr_key) or []:
+                counts[k] = counts.get(k, 0) + 1
+        return sorted(((k, k, n) for k, n in counts.items()), key=lambda x: x[1])
 
     library_origins = _present("origin", "origin_label")
     library_requirements = _present("requirement", "requirement_label")
@@ -3620,8 +3727,9 @@ async def library_page(
         #: filtering: it tells you where a kind is, not how to see only it.
         #: File formats, from the rows that have one. Rendered on every file row
         #: already and filterable by nothing until now.
-        library_formats=_present("file_format", "file_format"),
+        library_formats=_present_multi("format_keys"),
         library_ownerships=library_ownerships,
+        library_load_errors=_load_errors,
         library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
@@ -3665,6 +3773,9 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
+        # TCRD-250: node types with live, caller-scoped counts at the head
+        # of the Knowledge tab. Empty list = render nothing, see helper.
+        library_type_map=_library_type_map(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
