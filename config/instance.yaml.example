@@ -1392,6 +1392,12 @@ studio:
 #   # standing before they are suspended (deleted until the next successful
 #   # sync rewrites them). Env override: AGNES_ACL_MAX_STALE_HOURS.
 #   max_stale_hours: 72
+#   # Days between full sharepoint-subtree-sweep passes (broken-inheritance
+#   # folder detection) for one connection's mirrored scopes. The scheduler
+#   # row itself already fires weekly (native cron) — this is a
+#   # per-connection self-guard against a restart-refire, not the primary
+#   # cadence. Env override: AGNES_ACL_SWEEP_INTERVAL_DAYS.
+#   sweep_interval_days: 7
 
 
 # --- Initial Workspace Template (optional) ---

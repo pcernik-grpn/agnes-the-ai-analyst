@@ -1857,6 +1857,15 @@
       },
       "ConfirmScopeBody": {
         "properties": {
+          "access_mode": {
+            "default": "manual",
+            "enum": [
+              "manual",
+              "mirrored"
+            ],
+            "title": "Access Mode",
+            "type": "string"
+          },
           "anonymize": {
             "default": false,
             "title": "Anonymize",
@@ -1866,6 +1875,17 @@
             "minLength": 1,
             "title": "Display Path",
             "type": "string"
+          },
+          "drive_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drive Id"
           },
           "group_ids": {
             "anyOf": [
@@ -1880,6 +1900,11 @@
               }
             ],
             "title": "Group Ids"
+          },
+          "include_excluded_subtrees": {
+            "default": false,
+            "title": "Include Excluded Subtrees",
+            "type": "boolean"
           },
           "source_scope_id": {
             "minLength": 1,
@@ -12631,7 +12656,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.91.0"
+    "version": "0.93.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -29339,6 +29364,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/acl-sync": {
+      "post": {
+        "description": "Admin-triggered one-off run of the ``sharepoint-acl-sync`` job for\nthis connection (spec \u00a75.1's \"sync now\" action; 2026-08-30 plan, Task\n5) \u2014 enqueues ``connectors.sharepoint.acl_sync.run_acl_sync`` (via\n``app/worker/kinds.py::_run_sharepoint_acl_sync``) with\n``{\"connection_id\": connection_id}``, the SAME mechanics as\n:func:`trigger_extraction`.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work. Then\nrefuses cleanly with ``409 feature_disabled`` when ``acl_mirroring\n.enabled`` is off \u2014 the job handler itself would just no-op (spec \u00a75.1\n\"the scheduler enqueues this kind unconditionally\"), but a manual\ntrigger should tell the admin why nothing happened rather than return a\n202 for a run that will do nothing.\n\nDeduped on a STABLE per-connection idempotency key\n(:func:`_acl_sync_idempotency_key`) \u2014 a second trigger while one is\nalready queued/running for this connection gets ``409\nacl_sync_already_running`` instead of a second job.",
+        "operationId": "trigger_acl_sync_api_admin_sharepoint_connections__connection_id__acl_sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Acl Sync",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/certificate": {
       "get": {
         "description": "Read-only certificate metadata for the connection's already-stored\nPEM \u2014 thumbprint (the ``x5t`` value the client actually presents, plus\nthe conventional uppercase-hex fingerprint), subject/issuer, validity\nwindow, and a derived ``ok``/``expiring_soon``/``expired`` status. Two\nreal failure modes this closes: a registered certificate that does not\nmatch what the connection actually presents (opaque provider auth\nerror), and a certificate expiring silently (crawl/sync fails with no\nwarning).\n\nNever the private key \u2014 only :func:`connectors.sharepoint.graph_client.\ncertificate_metadata`'s CERTIFICATE-block parse reaches the response.\nNo certificate configured, or a certificate that fails to resolve or\nparse, is a typed absence (``certificate: null`` plus ``reason``) \u2014\nnever a 500.",
@@ -29656,7 +29744,7 @@
         ]
       },
       "post": {
-        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, **if the field is present**, is the complete\nset of groups for this collection (step 3): listed groups are granted,\nand any other group's grant on this collection is revoked. The wizard's\ncheckboxes are pre-checked from the grants that exist and its row warns\nthe moment the last one is unticked, so the screen already promises that\nunticking removes access \u2014 making the handler additive-only meant the\nadmin was shown a revocation that never happened. Omitting the field\ntouches no grant at all, which is what keeps a rename or an anonymize\ntoggle from stripping access as a side effect.",
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize``/``access_mode``/``drive_id`` in place \u2014 a\nrename or move in the source does not fork a second collection (\u00a76\napplied to the wizard's own bookkeeping). ``group_ids``, **if the field\nis present**, is the complete set of groups for this collection (step\n3): listed groups are granted, and any other group's grant on this\ncollection is revoked \u2014 EXCEPT a mirrored (sentinel-owned) grant, which\nthis checkbox can never touch (see the revoke loop below); \"stop\nmirroring\" is ``access_mode``, not a checkbox. The wizard's checkboxes\nare pre-checked from the grants that exist and its row warns the moment\nthe last one is unticked, so the screen already promises that unticking\nremoves access \u2014 making the handler additive-only meant the admin was\nshown a revocation that never happened. Omitting the field touches no\ngrant at all, which is what keeps a rename or an anonymize toggle from\nstripping access as a side effect.\n\n``access_mode='mirrored'`` (spec \u00a72.5) opts this scope into the\n``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``\n(``400 missing_drive_id`` otherwise \u2014 the sync needs both a drive id and\nan item id to address the scope root on Graph). Switching an already-\nmirrored scope back to ``manual`` deletes the sync's own sentinel-owned\ngrants for this collection and converts nothing \u2014 the admin re-grants\nmanually, same as any other scope that was never mirrored.\n\n``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to\n\"include anyway\" a broken-inheritance subtree the\n``sharepoint-subtree-sweep`` job detected on this scope and excluded from\nthe crawl by default (spec \u00a73(b)). Refused with ``409\nmust_not_forbids_subtree_override`` under the ``must_not`` guarantee mode\n(the fail-closed default \u2014 \u00a71.2 disqualifies this override outright);\naccepted and audited (``sharepoint_acl.subtree_override``) under\n``should_not``. This handler writes that ONE audit row INSTEAD of\nrelying on the route's declared fallback action\n(``sharepoint_connection.scope_confirm``) for a request that turns the\noverride on \u2014 see the audit playbook's \"never write both for the same\nevent\" rule; every other confirm (no override transition) is still\ncovered by the fallback, unchanged.",
         "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
         "parameters": [
           {
@@ -30481,7 +30569,7 @@
         ]
       },
       "put": {
-        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.\n\nSharePoint connections: ``config.scopes`` (the connect wizard's\nserver-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and\n``config.extraction`` (the in-Agnes extraction schedule's own\n``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried\nforward when the request's ``config`` omits the key \u2014 the same\n\"explicit wins\" contract as Keboola's ``project_id``/``project_name``\nabove \u2014 since this endpoint's wholesale ``config`` replace would\notherwise let an ordinary edit through the generic connection editor\n(which renders neither field) silently erase every confirmed scope's\n``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or\nreset the extraction schedule's clock. An explicit ``scopes: []`` (or\n``extraction: null``) in the request still clears it deliberately. The\nfull set of keys is ``app.api.admin_sharepoint.\nSHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by\n``tests/test_sharepoint_config_carry_forward_ratchet.py``.",
+        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.\n\nSharePoint connections: ``config.scopes`` (the connect wizard's\nserver-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and\n``config.extraction`` (the in-Agnes extraction schedule's own\n``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried\nforward when the request's ``config`` omits the key \u2014 the same\n\"explicit wins\" contract as Keboola's ``project_id``/``project_name``\nabove \u2014 since this endpoint's wholesale ``config`` replace would\notherwise let an ordinary edit through the generic connection editor\n(which renders neither field) silently erase every confirmed scope's\n``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or\nreset the extraction schedule's clock. An explicit ``scopes: []`` (or\n``extraction: null``) in the request still clears it deliberately. The\nfull set of keys is ``app.api.admin_sharepoint.\nSHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by\n``tests/test_sharepoint_config_carry_forward_ratchet.py``. Two more keys\n\u2014 ``config.acl_sync_last_run``/``config.acl_sync_last_success_at``,\nwritten by the ``sharepoint-acl-sync`` WORKER JOB rather than an\n``admin_sharepoint.py`` endpoint (``connectors.sharepoint.acl_sync\n.ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``) \u2014 get the same carry-forward\ntreatment just below, kept as a separate hand-maintained list because\nthat ratchet's static scan is deliberately scoped to one file and\ncannot see a different module's writes.",
         "operationId": "update_connection_api_admin_source_connections__connection_id__put",
         "parameters": [
           {

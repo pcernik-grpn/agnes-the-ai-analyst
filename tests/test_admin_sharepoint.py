@@ -25,6 +25,16 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _audit_params(row: dict) -> dict:
+    """``audit_repo().query()`` returns ``params`` as the raw stored JSON
+    string, not a parsed dict — decode it here so tests can assert on the
+    structured fields (same helper as ``tests/test_agent_memory_write_api.py``)."""
+    import json
+
+    v = row.get("params")
+    return json.loads(v) if isinstance(v, str) else (v or {})
+
+
 def _self_signed_pem() -> str:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agnes-test")])
@@ -1570,3 +1580,138 @@ class TestExtractionRunDue:
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["dispatched"] == []
+
+
+class TestExcludedSubtreeAdvisory:
+    """``_scope_out``'s advisory surface for the ``sharepoint-subtree-sweep``
+    job's findings (2026-08-30 plan, Task 7) — ``excluded_subtree_count`` and
+    ``excluded_subtrees`` (id + path only, never the raw ``detected_at``)."""
+
+    def test_scope_out_reports_zero_when_no_sweep_has_run(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sweep-advisory-empty")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sweep1", "display_path": "Sweep"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["excluded_subtree_count"] == 0
+        assert r.json()["excluded_subtrees"] == []
+        assert r.json()["include_excluded_subtrees"] is False
+
+    def test_scope_out_surfaces_excluded_subtrees_written_by_the_sweep(self, seeded_app):
+        """Simulates the sweep job's own write (connectors/sharepoint/
+        acl_sync.py::_sweep_connection persists into config.scopes[*]
+        .excluded_subtrees) and asserts the wizard's read path (_scope_out)
+        projects only {item_id, path} — never the raw detected_at
+        timestamp."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sweep-advisory-populated")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sweep2", "display_path": "Sweep"},
+            headers=_auth(token),
+        )
+
+        from src.repositories import source_connections_repo
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        scopes = row["config"]["scopes"]
+        scopes[0]["excluded_subtrees"] = [
+            {"item_id": "item-A", "path": "Sweep/A", "detected_at": "2026-08-30T00:00:00+00:00"},
+        ]
+        repo.update(conn_id, config={**row["config"], "scopes": scopes})
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["excluded_subtree_count"] == 1
+        assert listed["excluded_subtrees"] == [{"item_id": "item-A", "path": "Sweep/A"}]
+
+
+class TestSubtreeOverride:
+    """``ConfirmScopeBody.include_excluded_subtrees`` — the ``should_not``-only
+    per-subtree "include anyway" escape hatch (2026-08-30 plan, Task 7, spec
+    §3(b)/§1.2)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_guarantee_mode_env(self, monkeypatch):
+        monkeypatch.delenv("AGNES_ACL_GUARANTEE_MODE", raising=False)
+
+    def test_must_not_refuses_the_override(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "must_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-must-not")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:override1",
+                "display_path": "Override",
+                "include_excluded_subtrees": True,
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "must_not_forbids_subtree_override"
+
+    def test_should_not_accepts_and_audits_the_override(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "should_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-should-not")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:override2",
+                "display_path": "Override",
+                "include_excluded_subtrees": True,
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["include_excluded_subtrees"] is True
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_acl.subtree_override", limit=50)
+        assert len(rows) == 1
+        assert _audit_params(rows[0])["source_scope_id"] == "drive:override2"
+
+    def test_reconfirming_an_active_override_does_not_re_audit(self, seeded_app, monkeypatch):
+        """Only the FALSE -> TRUE transition is audited — a re-confirm that
+        resends an already-active override must not spam the audit log."""
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "should_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-idempotent")
+        body = {
+            "source_scope_id": "drive:override3",
+            "display_path": "Override",
+            "include_excluded_subtrees": True,
+        }
+        c.post(f"{BASE}/{conn_id}/scopes", json=body, headers=_auth(token))
+        r = c.post(f"{BASE}/{conn_id}/scopes", json=body, headers=_auth(token))
+        assert r.status_code == 201, r.text
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_acl.subtree_override", limit=50)
+        assert len(rows) == 1
+
+    def test_default_false_never_triggers_the_guard(self, seeded_app, monkeypatch):
+        """A plain confirm (no override requested) must succeed under
+        must_not too — the guard only fires on an explicit True."""
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "must_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-default-false")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:override4", "display_path": "Plain"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["include_excluded_subtrees"] is False

@@ -1101,6 +1101,18 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin manually triggered a SharePoint ACL sync for one connection (POST .../acl-sync).",
     ),
+    # -- 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The
+    # sweep job itself (connectors/sharepoint/acl_sync.py::run_subtree_sweep)
+    # writes no audit row of its own (state persisted into the connection's
+    # config, no log_safe call) -- only the admin-facing per-subtree
+    # "include anyway" override gets one, since it is a deliberate,
+    # security-relevant decision (spec §3(b)'s should_not-only escape hatch).
+    "sharepoint_acl.subtree_override": AuditEvent(
+        "sharepoint_acl.subtree_override",
+        "mutation",
+        "An admin overrode a detected broken-inheritance subtree exclusion "
+        "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
+    ),
 }
 
 

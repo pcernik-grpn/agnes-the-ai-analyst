@@ -779,6 +779,22 @@ SWITCHES: tuple[Switch, ...] = (
             "sync rewrites them)."
         ),
     ),
+    Switch(
+        name="acl_sweep_interval_days",
+        config_keys=("acl_sync", "sweep_interval_days"),
+        env_var="AGNES_ACL_SWEEP_INTERVAL_DAYS",
+        kind="int",
+        default=7,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Days between full sharepoint-subtree-sweep passes (broken-inheritance "
+            "folder detection, spec §3(b)) for one connection's mirrored scopes. The "
+            "scheduler row itself already fires weekly (native cron); this is a "
+            "per-connection self-guard against a restart-refire, not the primary cadence."
+        ),
+    ),
 )
 
 _BY_NAME: dict[str, Switch] = {s.name: s for s in SWITCHES}

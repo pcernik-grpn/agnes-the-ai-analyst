@@ -518,6 +518,14 @@ _ENQUEUE_BODIES: dict[str, dict[str, str]] = {
     # that hasn't turned the feature on — same posture as
     # ducklake-maintenance/jira-org-refresh above.
     "sharepoint-acl": {"kind": "sharepoint-acl-sync", "idempotency_key": "sharepoint-acl-sync"},
+    # 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The handler
+    # (connectors/sharepoint/acl_sync.py::run_subtree_sweep) no-ops when
+    # acl_mirroring.enabled is false, same harmless-unconditional-enqueue
+    # posture as sharepoint-acl above.
+    "sharepoint-subtree-sweep": {
+        "kind": "sharepoint-subtree-sweep",
+        "idempotency_key": "sharepoint-subtree-sweep",
+    },
 }
 
 # HTTP timeout for a ``/api/jobs`` enqueue call. Short on purpose: enqueueing
@@ -714,6 +722,30 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
             "POST",
             _ENQUEUE_TIMEOUT_SEC,
             _ENQUEUE_BODIES["sharepoint-acl"],
+        ),
+        # 2026-08-30 plan, Task 7: broken-inheritance subtree sweep
+        # (connectors/sharepoint/acl_sync.py::run_subtree_sweep). WEEKLY —
+        # native cron, same grammar store-lint-audit already uses for its own
+        # weekly row — rather than daily/nightly: a full probe pass over a
+        # large library is multi-hour (spec §6.2's cost model), so a nightly
+        # cadence would starve the shared per-app-per-tenant Graph throttle
+        # budget the content crawl also depends on. Monday 07:00 UTC — offset
+        # from store-lint-audit's own Monday 05:00 row and from
+        # sharepoint-acl's daily 06:00 row so none of them share a tick. The
+        # handler no-ops when acl_mirroring.enabled is false (same posture as
+        # sharepoint-acl above) and each connection additionally self-guards
+        # against a restart-refire via its own acl_sweep_last_full/
+        # acl_sync.sweep_interval_days check (connectors/sharepoint/
+        # acl_sync.py::_sweep_due) — the same restart-refire risk
+        # store-lint-audit's admin endpoint guards against for its own weekly
+        # row.
+        (
+            "sharepoint-subtree-sweep",
+            "cron 0 7 * * 1",
+            "/api/jobs",
+            "POST",
+            _ENQUEUE_TIMEOUT_SEC,
+            _ENQUEUE_BODIES["sharepoint-subtree-sweep"],
         ),
         # Stuck-review reaper (#7). A submission stays at
         # status='pending_llm' until the BackgroundTasks worker writes

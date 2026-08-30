@@ -134,6 +134,7 @@ from connectors.sharepoint.graph_client import (
     search_folders,
 )
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+from src.audit_helpers import log_safe
 from src.repositories import (
     file_corpora_repo,
     resource_grants_repo,
@@ -178,6 +179,16 @@ class ConfirmScopeBody(BaseModel):
     # the last group — the very state the row's "indexed but invisible"
     # warning describes, so it has to be honoured rather than read as silence.
     group_ids: Optional[List[str]] = None
+    # Broken-inheritance subtree sweep (2026-08-30 plan, Task 7 —
+    # ``connectors/sharepoint/acl_sync.py::run_subtree_sweep``). ``should_not``
+    # guarantee mode ONLY: "include anyway" a subtree the sweep detected as
+    # broken-inheritance and (by default) excluded from the crawl — an
+    # advisory override, audited (``sharepoint_acl.subtree_override``).
+    # Under ``must_not`` (the fail-closed default) this is REFUSED with
+    # ``409 must_not_forbids_subtree_override`` — see :func:`confirm_scope`.
+    # Always persisted on confirm, same "not omitted-means-unchanged"
+    # semantics as ``access_mode``/``anonymize`` above.
+    include_excluded_subtrees: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +402,18 @@ def _scope_out(
         # reads as `manual` too, never a bare null.
         "access_mode": scope.get("access_mode") or "manual",
         "drive_id": scope.get("drive_id"),
+        # Broken-inheritance subtree sweep (2026-08-30 plan, Task 7) — the
+        # advisory surface's data: how many subtrees the sweep excluded from
+        # the crawl, each as {item_id, path} (never the raw {detected_at}
+        # timestamp — the wizard doesn't need it), plus whether an admin has
+        # overridden the exclusion for this scope (`should_not` mode only).
+        "excluded_subtree_count": len(scope.get("excluded_subtrees") or []),
+        "excluded_subtrees": [
+            {"item_id": item.get("item_id"), "path": item.get("path")}
+            for item in (scope.get("excluded_subtrees") or [])
+            if isinstance(item, dict)
+        ],
+        "include_excluded_subtrees": bool(scope.get("include_excluded_subtrees")),
     }
     summary = _acl_sync_summary(connection, scope)
     if summary is not None:
@@ -769,6 +792,20 @@ async def confirm_scope(
     mirrored scope back to ``manual`` deletes the sync's own sentinel-owned
     grants for this collection and converts nothing — the admin re-grants
     manually, same as any other scope that was never mirrored.
+
+    ``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to
+    "include anyway" a broken-inheritance subtree the
+    ``sharepoint-subtree-sweep`` job detected on this scope and excluded from
+    the crawl by default (spec §3(b)). Refused with ``409
+    must_not_forbids_subtree_override`` under the ``must_not`` guarantee mode
+    (the fail-closed default — §1.2 disqualifies this override outright);
+    accepted and audited (``sharepoint_acl.subtree_override``) under
+    ``should_not``. This handler writes that ONE audit row INSTEAD of
+    relying on the route's declared fallback action
+    (``sharepoint_connection.scope_confirm``) for a request that turns the
+    override on — see the audit playbook's "never write both for the same
+    event" rule; every other confirm (no override transition) is still
+    covered by the fallback, unchanged.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
@@ -783,6 +820,21 @@ async def confirm_scope(
     if body.drive_id:
         _validate_graph_id(body.drive_id, "drive_id")
 
+    if body.include_excluded_subtrees:
+        from app.switches import switch_value
+
+        if switch_value("acl_guarantee_mode") == "must_not":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "must_not_forbids_subtree_override",
+                    "message": (
+                        "acl_sync.guarantee_mode=must_not forbids including an excluded "
+                        "broken-inheritance subtree — switch to should_not to allow this override."
+                    ),
+                },
+            )
+
     if body.group_ids:
         groups_repo = user_groups_repo()
         unknown = [gid for gid in body.group_ids if groups_repo.get(gid) is None]
@@ -792,6 +844,7 @@ async def confirm_scope(
     scopes = _scopes(row)
     existing = next((s for s in scopes if s.get("source_scope_id") == body.source_scope_id), None)
     previous_access_mode = (existing or {}).get("access_mode") or "manual"
+    previous_override = bool((existing or {}).get("include_excluded_subtrees"))
 
     if existing is not None:
         collection_id = existing["collection_id"]
@@ -799,6 +852,7 @@ async def confirm_scope(
         existing["anonymize"] = body.anonymize
         existing["access_mode"] = body.access_mode
         existing["drive_id"] = body.drive_id
+        existing["include_excluded_subtrees"] = body.include_excluded_subtrees
     else:
         collection_id = _create_scope_collection(
             connection_name=row.get("name") or connection_id,
@@ -814,6 +868,7 @@ async def confirm_scope(
                 "collection_id": collection_id,
                 "access_mode": body.access_mode,
                 "drive_id": body.drive_id,
+                "include_excluded_subtrees": body.include_excluded_subtrees,
             }
         )
 
@@ -821,6 +876,21 @@ async def confirm_scope(
     # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": scopes}
     source_connections_repo().update(connection_id, config=new_config)
+
+    # Audit the override TRANSITION only (false -> true) — never on a
+    # re-confirm that resends an already-active override, same
+    # avoid-audit-noise posture as _replace_membership_and_audit in
+    # connectors/sharepoint/acl_sync.py. See this function's own docstring
+    # for why this REPLACES the route's declared fallback action for this
+    # one request.
+    if body.include_excluded_subtrees and not previous_override:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_acl.subtree_override",
+            resource=f"file_corpus:{collection_id}",
+            params={"source_scope_id": body.source_scope_id},
+            result="success",
+        )
 
     grants = resource_grants_repo()
 

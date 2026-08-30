@@ -150,6 +150,21 @@ distribution mirror, and the api-role write conversions) map onto:
   makes an accidental/scheduled claim on an instance that hasn't turned the
   feature on harmless, identical to ``ducklake-maintenance``'s and
   ``corpus-extraction``'s no-op postures above.
+- ``sharepoint-subtree-sweep`` (LIGHT) — 2026-08-30 plan, Task 7. Walks each
+  mirrored scope's folder tree, probing ``hasUniqueRoleAssignments`` per
+  folder, to find and exclude broken-inheritance subtrees (spec §3(b),
+  §6.2) — a full pass over a large library is MULTI-HOUR (§6.2's cost
+  model), so this gets a much longer lease
+  (``AGNES_SP_SWEEP_LEASE_S``, default 4h) than every other LIGHT kind and
+  NO automatic retry, same "an operator looks at a failed multi-hour run"
+  rationale as ``corpus-extraction`` above. The walk/probe/persist body
+  lives entirely in ``connectors.sharepoint.acl_sync.run_subtree_sweep``
+  (own ``acl_mirroring.enabled`` gate, own per-connection cadence
+  self-guard) — this kind's handler is a thin delegate. Registered
+  UNCONDITIONALLY, same no-op posture as ``sharepoint-acl-sync`` above. Its
+  output (each mirrored scope's ``excluded_subtrees``) feeds
+  ``_run_corpus_extraction``'s ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` env
+  handoff below.
 
 Every handler below is a THIN ADAPTER — it imports and calls the existing
 function/method and does not reimplement any of its logic — EXCEPT
@@ -240,6 +255,13 @@ _DEFAULT_EXTRACTION_TIMEOUT_S = 3600
 # (not-yet-timed-out) producer call — same pattern as _agent_response_job
 # _timeout_seconds()'s lease_seconds below.
 _EXTRACTION_LEASE_MARGIN_S = 120
+# 2026-08-30 plan, Task 7: a full sharepoint-subtree-sweep pass (probing
+# hasUniqueRoleAssignments over every folder in a mirrored scope) is
+# multi-hour on a large library (spec §6.2's ~98k-folder reference) — same
+# "generous ceiling, not a hard timeout" reasoning as
+# _DEFAULT_DATA_REFRESH_LEASE_S, just a much larger default since this job's
+# own cost model is an order of magnitude bigger than any other LIGHT kind.
+_DEFAULT_SP_SWEEP_LEASE_S = 14400  # 4h
 
 # Non-secret operational env vars forwarded to the producer subprocess from
 # THIS process's own environment, when present. Deliberately a NARROW
@@ -285,6 +307,16 @@ def _data_refresh_lease_seconds() -> int:
         return max(int(raw), 1)
     except ValueError:
         return _DEFAULT_DATA_REFRESH_LEASE_S
+
+
+def _sp_sweep_lease_seconds() -> int:
+    raw = os.environ.get("AGNES_SP_SWEEP_LEASE_S")
+    if raw is None:
+        return _DEFAULT_SP_SWEEP_LEASE_S
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return _DEFAULT_SP_SWEEP_LEASE_S
 
 
 def _run_data_refresh(payload: dict) -> None:
@@ -1292,6 +1324,44 @@ def _anonymize_marked_scope_map(connection: dict) -> dict[str, str]:
     return out
 
 
+def _excluded_subtree_scope_map(connection: dict) -> dict[str, list[str]]:
+    """``{source_scope_id: [item_id, ...]}`` for every scope THIS
+    connection's ``sharepoint-subtree-sweep`` job (2026-08-30 plan, Task 7 —
+    ``connectors.sharepoint.acl_sync.run_subtree_sweep``) found at least one
+    broken-inheritance subtree in — the producer handoff for which
+    item-id subtrees it must skip during its own crawl (spec §6.3's division
+    of labor: Agnes detects, the producer decides how to honor it — see
+    :func:`_run_corpus_extraction`'s docstring for the repo-boundary note).
+
+    A scope carrying ``include_excluded_subtrees=True`` (the ``should_not``
+    per-subtree override, ``app/api/admin_sharepoint.py::confirm_scope``) is
+    DELIBERATELY OMITTED here even if it has detected exclusions — "include
+    anyway" means the admin decided the scope's audience may see that
+    content, so the crawler must not be told to skip it.
+
+    Same "read the connection row's own config.scopes directly" posture as
+    :func:`_anonymize_marked_scope_map` right above — no dependency on the
+    admin API surface.
+    """
+    scopes = (connection.get("config") or {}).get("scopes")
+    if not isinstance(scopes, list):
+        return {}
+    out: dict[str, list[str]] = {}
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        if scope.get("include_excluded_subtrees"):
+            continue
+        source_scope_id = scope.get("source_scope_id")
+        excluded = scope.get("excluded_subtrees")
+        if not source_scope_id or not isinstance(excluded, list) or not excluded:
+            continue
+        item_ids = [str(item["item_id"]) for item in excluded if isinstance(item, dict) and item.get("item_id")]
+        if item_ids:
+            out[str(source_scope_id)] = item_ids
+    return out
+
+
 def _resolve_anonymization_key() -> str:
     """Resolve this instance's per-instance anonymization HMAC key (spec
     §9.2): an admin-configurable env var NAME
@@ -1462,6 +1532,20 @@ def _run_corpus_extraction(payload: dict) -> dict:
     anonymize-marked — an instance that never anonymizes never resolves or
     forwards a key it does not need.
 
+    Broken-inheritance subtree exclusion handoff (2026-08-30 plan, Task 7):
+    when the ``sharepoint-subtree-sweep`` job
+    (``connectors.sharepoint.acl_sync.run_subtree_sweep``) has found at
+    least one broken-inheritance subtree on any of this connection's
+    scopes, the child env additionally carries
+    ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` (a JSON object, ``{source_scope_id:
+    [item_id, ...]}`` — see :func:`_excluded_subtree_scope_map`). Agnes only
+    ever DETECTS these subtrees and ships the list; HONORING it (actually
+    skipping those item ids during crawl) is the external producer's own
+    responsibility (spec §6.3's division of labor) — this repo does not
+    implement or verify that the producer obeys it. Never set when no
+    scope has a detected exclusion, same "no var unless needed" posture as
+    the anonymize vars above.
+
     Security (playbook F7): every secret this handler resolves —
     tenant id, client id, certificate private key, the anonymization HMAC
     key (when needed), and the producer's own Agnes-API callback token (see
@@ -1553,6 +1637,15 @@ def _run_corpus_extraction(payload: dict) -> dict:
         child_env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"] = json.dumps(anonymize_scopes, sort_keys=True)
         child_env["AGNES_ANONYMIZATION_HMAC_KEY"] = _resolve_anonymization_key()
 
+    # Broken-inheritance subtree exclusion handoff (2026-08-30 plan, Task 7):
+    # item ids the sharepoint-subtree-sweep job detected as broken-
+    # inheritance roots on THIS connection's scopes — the producer's own
+    # crawl should skip them. Agnes only ships the list (detection); HONORING
+    # it is external-producer work (see this function's own docstring).
+    excluded_subtrees = _excluded_subtree_scope_map(connection)
+    if excluded_subtrees:
+        child_env["AGNES_SP_EXCLUDED_SUBTREE_IDS"] = json.dumps(excluded_subtrees, sort_keys=True)
+
     # Producer callback credential (TCRD-226): the crawl -> convert ->
     # anonymize -> extract -> ingest pipeline calls BACK into Agnes's own
     # REST API (corpus-map, scopes, POST /api/facts/ingest) to do its actual
@@ -1624,6 +1717,17 @@ def _run_sharepoint_acl_sync(payload: dict) -> dict:
     from connectors.sharepoint.acl_sync import run_acl_sync
 
     return run_acl_sync(payload)
+
+
+def _run_sharepoint_subtree_sweep(payload: dict) -> dict:
+    """Thin delegate to ``connectors.sharepoint.acl_sync.run_subtree_sweep``
+    — the walk/probe/persist body (broken-inheritance subtree detection,
+    2026-08-30 plan, Task 7) lives entirely in that module; this handler
+    imports and calls it and does not reimplement any of its logic, same as
+    every other kind in this file."""
+    from connectors.sharepoint.acl_sync import run_subtree_sweep
+
+    return run_subtree_sweep(payload)
 
 
 def dispatch_job(job: dict) -> Optional[dict]:
@@ -1868,6 +1972,22 @@ def register_all_kinds() -> None:
             lane=LIGHT_LANE,
             lease_seconds=_DEFAULT_LIGHT_LEASE_S,
             retry_in_seconds=300,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="sharepoint-subtree-sweep",
+            handler=_run_sharepoint_subtree_sweep,
+            lane=LIGHT_LANE,
+            # Tracks the module docstring's lease/retry tuning note — a full
+            # probe pass over a large library is multi-hour (spec §6.2), so
+            # this gets its own, much longer lease than the default LIGHT
+            # kind.
+            lease_seconds=_sp_sweep_lease_seconds(),
+            # No automatic retry — same rationale as corpus-extraction: a
+            # failed multi-hour sweep (throttling, a Graph outage mid-walk)
+            # needs an operator to look at it, not an unattended re-run.
+            retry_in_seconds=None,
         )
     )
     from app.chat.manager import get_current_chat_manager

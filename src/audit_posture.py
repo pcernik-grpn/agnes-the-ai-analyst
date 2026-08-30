@@ -1322,6 +1322,15 @@ JOB_POSTURE: dict[str, str] = {
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
+    # Both of these ALSO write their own more-specific rows internally
+    # (connectors/sharepoint/acl_sync.py -- e.g. sharepoint_acl.sync_completed/
+    # sync_failed for the sync job; the sweep job persists state without a
+    # log_safe call of its own) -- per the "Names a more specific action"
+    # bullet above, the generic `job.run` row still fires too (no dedup
+    # across these three transports), so `job.run` remains the correct
+    # declaration here.
+    "sharepoint-acl-sync": "job.run",
+    "sharepoint-subtree-sweep": "job.run",
     # Conditionally registered (only on a process hosting a live ChatManager
     # -- see register_all_kinds()'s docstring) but still a real, enumerable
     # kind name when it IS registered, so it still needs an entry here.

@@ -44,6 +44,22 @@ ONLY rows carrying these tags, so a hand-assigned admin grant, group, or
 membership is never clobbered by this sync, and vice versa — the same
 writer-segregation pattern ``google_sync``/``microsoft_sync`` already use
 (see ``docs/auth-groups.md``).
+
+**Subtree sweep (2026-08-30 plan, Task 7 — ``run_subtree_sweep``), a THIRD
+half added here.** Spec §3(b)'s recommendation: a SharePoint folder can
+break permission inheritance at a grain finer than Agnes's collection model
+can express, so this walks each ``access_mode='mirrored'`` scope's folder
+tree (``graph_client.list_item_children`` + the already-``$batch``-based
+``graph_client.probe_unique_permissions``) and EXCLUDES — never descends
+into, never crawls — every broken-inheritance subtree it finds, by ROOT.
+Detection only; deciding what to do with the exclusion list (the actual
+crawl) is the external producer's job (§6.3's division of labor) — this
+module writes the list, ``app/worker/kinds.py::_run_corpus_extraction``
+hands it to the producer via ``AGNES_SP_EXCLUDED_SUBTREE_IDS``, and
+HONORING it is out of this repo's scope (see that function's docstring).
+Own job kind (``sharepoint-subtree-sweep``), own weekly scheduler cadence
+(§6.2's cost model: a full probe pass over a large library is multi-hour,
+not a nightly job) — see :func:`run_subtree_sweep`'s own docstring.
 """
 
 from __future__ import annotations
@@ -79,19 +95,33 @@ ACL_SYNC_SOURCE = "sharepoint_sync"
 this sync writes — the scope ``replace_group_members_for_source`` DELETEs
 within (never another source's rows for the same group)."""
 
-ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS = ("acl_sync_last_run", "acl_sync_last_success_at")
+ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS = (
+    "acl_sync_last_run",
+    "acl_sync_last_success_at",
+    # 2026-08-30 plan, Task 7 — written by :func:`_sweep_connection`.
+    "acl_sweep_last_run",
+    "acl_sweep_last_full",
+)
 """Keys THIS module (a worker job, not an ``app/api/admin_sharepoint.py``
 endpoint) writes into a SharePoint connection's ``config`` — see
-:func:`_sync_connection`. ``app/api/admin_source_connections.py::
-update_connection`` carries these two forward by hand (imported from here)
-the same way it carries forward ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``
-(``app/api/admin_sharepoint.py``) — but deliberately NOT added to that
-OTHER tuple: ``tests/test_sharepoint_config_carry_forward_ratchet.py``
-statically scans ``admin_sharepoint.py``'s own writers only (its own module
-docstring states the one-file scope), so a key written from this module
-would show up there as "declared but no writer found" and fail the ratchet
-in the wrong direction. Carried forward without a mechanical ratchet across
-this module boundary — reviewed by hand instead."""
+:func:`_sync_connection` and :func:`_sweep_connection`.
+``app/api/admin_source_connections.py::update_connection`` carries these
+forward by hand (imported from here) the same way it carries forward
+``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`` (``app/api/admin_sharepoint.py``)
+— but deliberately NOT added to that OTHER tuple:
+``tests/test_sharepoint_config_carry_forward_ratchet.py`` statically scans
+``admin_sharepoint.py``'s own writers only (its own module docstring states
+the one-file scope), so a key written from this module would show up there
+as "declared but no writer found" and fail the ratchet in the wrong
+direction. Carried forward without a mechanical ratchet across this module
+boundary — reviewed by hand instead.
+
+Note the sweep does NOT add anything to ``SHAREPOINT_SERVER_WRITTEN_CONFIG_
+KEYS`` even though it rewrites the ``scopes`` key too (each scope row's own
+``excluded_subtrees``) — that key is already declared there (written by
+``admin_sharepoint.py``'s own ``confirm_scope``/``remove_scope``), so the
+carry-forward already covers it; only the two genuinely NEW top-level keys
+above need adding."""
 
 
 def entra_group_name(oid: str) -> str:
@@ -657,3 +687,331 @@ def _suspend_connection_grants(connection: Dict[str, Any]) -> int:
             grants.delete(grant["id"])
             removed += 1
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Broken-inheritance subtree sweep (2026-08-30 plan, Task 7). See the module
+# docstring's "Subtree sweep" paragraph for the wider picture.
+# ---------------------------------------------------------------------------
+
+#: must_not/should_not-independent default cadence (days) between two full
+#: sweeps of one connection's mirrored scopes — overridable via the
+#: ``acl_sweep_interval_days`` switch (``acl_sync.sweep_interval_days``).
+#: The scheduler row itself already fires WEEKLY (native cron, see
+#: services/scheduler/__main__.py) rather than nightly — this per-connection
+#: self-guard is defense-in-depth against a restart-refire (scheduler
+#: ``last_run`` state can be lost across a container recreate), the same
+#: risk ``app/api/store_lint_admin.py``'s own min-interval self-guard
+#: protects against for its weekly row.
+_DEFAULT_SWEEP_INTERVAL_DAYS = 7
+
+#: Safety cap on folders visited in ONE scope's walk — a pathological or
+#: misconfigured tenant tree must not pin a worker slot forever. The real
+#: reference library (spec §6.2) is ~98k folders TOTAL across the whole
+#: crawl; this leaves ample headroom per scope while still bounding the
+#: worst case. Hitting it sets ``truncated: true`` in the scope's report
+#: rather than looping forever.
+_MAX_SWEEP_FOLDERS_VISITED = 200_000
+
+
+def _sweep_interval_days() -> int:
+    from app.switches import switch_value
+
+    value = switch_value("acl_sweep_interval_days")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_SWEEP_INTERVAL_DAYS
+
+
+def _sweep_due(connection: Dict[str, Any]) -> bool:
+    """Whether this connection's mirrored scopes are due for a full subtree
+    sweep — never synced yet, or the last FULL (error-free) sweep is older
+    than :func:`_sweep_interval_days`. A connection whose last attempt
+    FAILED (``acl_sweep_last_run.ok`` false) but never completed keeps
+    ``acl_sweep_last_full`` at its previous value (or absent), so a failed
+    run does not push the next attempt a further week out."""
+    last_full_raw = (connection.get("config") or {}).get("acl_sweep_last_full")
+    if not last_full_raw:
+        return True
+    try:
+        last_full = datetime.fromisoformat(last_full_raw)
+    except ValueError:
+        return True
+    if last_full.tzinfo is None:
+        last_full = last_full.replace(tzinfo=timezone.utc)
+    elapsed_days = (datetime.now(timezone.utc) - last_full).total_seconds() / 86400
+    return elapsed_days >= _sweep_interval_days()
+
+
+async def _walk_subtree_sweep(token: str, drive_id: str, root_item_id: str, root_path: str) -> Dict[str, Any]:
+    """Breadth-first walk of one scope's folder tree, probing
+    ``hasUniqueRoleAssignments`` per folder (``graph_client
+    .probe_unique_permissions``, already ``$batch``-based — 20 items per
+    call) and collecting the ROOT of every broken-inheritance subtree —
+    **never descending into a detected subtree** (spec §3(b): its children
+    are excluded wholesale, never individually probed or crawled).
+
+    The scope ROOT ITSELF is never probed or excluded here — its own
+    permissions are what :func:`_sync_scope` already mirrors; this sweep
+    only ever excludes something FINER than the scope.
+
+    A folder whose probe comes back ``None`` ("unknown" —
+    ``probe_unique_permissions``'s own honest answer when the signal could
+    not be read) is treated THE SAME as a detected break: fail-closed, never
+    silently rendered as "clean" just because the signal was unavailable.
+
+    Raises :class:`SharePointGraphError` on a fatal read failure partway
+    through the walk — the caller (:func:`_sweep_scope`) treats that as
+    "leave this scope's previous exclusion list untouched" (fail-closed, no
+    partial diff is ever persisted), mirroring :func:`_sync_scope`'s own
+    "a scope-root read failure aborts that scope's reconciliation entirely"
+    posture.
+    """
+    excluded: List[Dict[str, Any]] = []
+    requests = 0
+    unknown_probes = 0
+    visited = 0
+    truncated = False
+    queue: List[tuple] = [(root_item_id, root_path)]
+
+    while queue:
+        if visited >= _MAX_SWEEP_FOLDERS_VISITED:
+            truncated = True
+            break
+        item_id, path = queue.pop(0)
+        visited += 1
+
+        children = await graph_client.list_item_children(token, drive_id, item_id)
+        requests += 1
+        folders = [c for c in children if c.get("is_folder")]
+        if not folders:
+            continue
+
+        ids = [f["id"] for f in folders]
+        flags = await graph_client.probe_unique_permissions(token, drive_id, ids)
+        # One `$batch` POST per up-to-20 items (graph_client._GRAPH_BATCH_SIZE_CAP)
+        # — matches probe_unique_permissions's own batching exactly, so the
+        # request count here is observed against the SAME chunking, not a
+        # separate guess.
+        requests += -(-len(ids) // graph_client._GRAPH_BATCH_SIZE_CAP)
+
+        for folder in folders:
+            child_path = f"{path}/{folder['name']}" if path else folder["name"]
+            flag = flags.get(folder["id"])
+            if flag is None:
+                unknown_probes += 1
+            if flag is None or flag is True:
+                excluded.append(
+                    {
+                        "item_id": folder["id"],
+                        "path": child_path,
+                        "detected_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                continue  # never descend into a detected/unknown subtree
+            queue.append((folder["id"], child_path))
+
+    return {
+        "excluded_subtrees": excluded,
+        "requests": requests,
+        "unknown_probes": unknown_probes,
+        "truncated": truncated,
+    }
+
+
+async def _sweep_scope(token: str, scope: Dict[str, Any]) -> Dict[str, Any]:
+    """Sweep one mirrored scope. Returns ``{"source_scope_id",
+    "excluded_subtrees", "requests", "unknown_probes", "truncated",
+    "error"}`` — ``excluded_subtrees`` is ``None`` on a fatal error (missing
+    ``drive_id``, or a Graph read failure partway through the walk): the
+    caller must then leave this scope's PREVIOUSLY recorded exclusion list
+    untouched rather than persist a partial/incomplete one.
+    """
+    source_scope_id = scope.get("source_scope_id")
+    drive_id = scope.get("drive_id")
+    root_path = scope.get("display_path") or source_scope_id or ""
+
+    base: Dict[str, Any] = {
+        "source_scope_id": source_scope_id,
+        "excluded_subtrees": None,
+        "requests": 0,
+        "unknown_probes": 0,
+        "truncated": False,
+        "error": None,
+    }
+    if not drive_id or not source_scope_id:
+        # See the module docstring's "Gap closed" note (Task 5) — a scope
+        # confirmed before drive_id existed. Skip rather than crash the
+        # connection's sweep.
+        return {**base, "error": "missing_drive_id"}
+
+    try:
+        walk = await _walk_subtree_sweep(token, drive_id, source_scope_id, root_path)
+    except SharePointGraphError as exc:
+        return {**base, "error": str(exc)}
+
+    return {
+        **base,
+        "excluded_subtrees": walk["excluded_subtrees"],
+        "requests": walk["requests"],
+        "unknown_probes": walk["unknown_probes"],
+        "truncated": walk["truncated"],
+    }
+
+
+async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
+    """Sweep one connection's mirrored scopes; persists each swept scope's
+    ``excluded_subtrees`` and the connection's own ``acl_sweep_last_run``/
+    ``acl_sweep_last_full`` bookkeeping. See :func:`run_subtree_sweep` for
+    the full contract."""
+    connection_id = connection["id"]
+    scopes = _mirrored_scopes(connection)
+    t0 = time.monotonic()
+
+    error: Optional[str] = None
+    token: Optional[str] = None
+    try:
+        settings = resolve_sharepoint_settings(connection)
+        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key)
+    except (SharePointSettingsError, SharePointGraphError) as exc:
+        error = str(exc)
+
+    excluded_total = 0
+    requests_total = 0
+    unknown_total = 0
+    truncated_any = False
+    exclusions_by_scope: Dict[str, List[Dict[str, Any]]] = {}
+
+    if token is not None:
+        for scope in scopes:
+            report = await _sweep_scope(token, scope)
+            requests_total += report["requests"]
+            unknown_total += report["unknown_probes"]
+            truncated_any = truncated_any or report["truncated"]
+            if report["excluded_subtrees"] is not None:
+                excluded_total += len(report["excluded_subtrees"])
+                exclusions_by_scope[report["source_scope_id"]] = report["excluded_subtrees"]
+            if report.get("error") and error is None:
+                error = report["error"]
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    all_scopes = list((connection.get("config") or {}).get("scopes") or [])
+    updated_scopes = [
+        {**s, "excluded_subtrees": exclusions_by_scope[s["source_scope_id"]]}
+        if s.get("source_scope_id") in exclusions_by_scope
+        else s
+        for s in all_scopes
+    ]
+
+    new_config = dict(connection.get("config") or {})
+    new_config["scopes"] = updated_scopes
+    new_config["acl_sweep_last_run"] = {
+        "at": now_iso,
+        "ok": error is None,
+        "scopes": len(scopes),
+        "excluded": excluded_total,
+        # Request count is exact (one $batch POST per up-to-20 folders, plus
+        # one "list children" call per visited folder). A literal 429-vs-
+        # other-failure breakdown is NOT available without deeper
+        # instrumentation of graph_client.probe_unique_permissions (which
+        # collapses every failure mode — network error, non-200, malformed
+        # body, AND 429 — into the same "unknown" answer, by design: see its
+        # own docstring); `unknown_probes` is the honest proxy this module
+        # can report today, not a literal 429 counter.
+        "requests": requests_total,
+        "unknown_probes": unknown_total,
+        "truncated": truncated_any,
+        "error": error,
+        "duration_ms": duration_ms,
+    }
+    if error is None:
+        new_config["acl_sweep_last_full"] = now_iso
+    source_connections_repo().update(connection_id, config=new_config)
+
+    return {"scopes": len(scopes), "excluded": excluded_total, "error": error}
+
+
+def run_subtree_sweep(payload: dict) -> dict:
+    """Entry point for the ``sharepoint-subtree-sweep`` worker job kind
+    (spec §3(b), §6.2, §6.3).
+
+    ``payload = {"connection_id": str | None}`` — same shape as
+    :func:`run_acl_sync`. A specific id sweeps just that connection and
+    BYPASSES the per-connection cadence self-guard below (explicit demand
+    wins — same posture as ``app/api/store_lint_admin.py``'s own ``force``
+    flag); ``None`` sweeps every ``source_type='sharepoint'`` connection
+    with at least one mirrored scope THAT IS DUE (see :func:`_sweep_due`).
+
+    Cadence: the scheduler row fires this job WEEKLY via native cron (see
+    ``services/scheduler/__main__.py`` — the same grammar
+    ``store-lint-audit`` already uses for its own weekly row), not nightly —
+    §6.2's cost model puts one full probe pass over a large library at
+    multi-hour, so nightly would starve the shared per-app-per-tenant Graph
+    throttle budget the content crawl also depends on. Each connection ALSO
+    tracks its own ``config["acl_sweep_last_full"]`` and is skipped by the
+    unconditional sweep-all payload (``connection_id=None``) until
+    ``acl_sync.sweep_interval_days`` (default 7) has elapsed since its last
+    FULL (error-free) sweep — defense-in-depth against a restart-refire, not
+    a second scheduling mechanism.
+
+    Detection only — this job decides WHAT is excluded (writes each mirrored
+    scope's ``excluded_subtrees``: ``{item_id, path, detected_at}`` per
+    detected root) but never crawls or decides access on its own. The
+    exclusion list is handed to the external producer via
+    ``app/worker/kinds.py::_run_corpus_extraction``'s
+    ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` env var — HONORING the list (actually
+    skipping those subtrees during crawl) is external-producer work (spec
+    §6.3's division of labor; §10's repo boundary), out of this repo.
+
+    Feature-gated by ``acl_mirroring.enabled`` (same flag as
+    :func:`run_acl_sync`) — disabled instance returns ``{"skipped":
+    "acl_mirroring disabled"}``, harmless for the scheduler's unconditional
+    weekly enqueue.
+
+    Returns ``{"connections": N, "scopes": M, "excluded": X, "skipped_not_due":
+    Y, "errors": [...]}`` aggregated across every connection actually swept.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
+        return {"skipped": "acl_mirroring disabled"}
+
+    return asyncio.run(_run_subtree_sweep_async(payload))
+
+
+async def _run_subtree_sweep_async(payload: dict) -> dict:
+    connections_repo = source_connections_repo()
+    connection_id = payload.get("connection_id")
+
+    errors: List[Dict[str, Any]] = []
+    targets: List[tuple] = []  # (connection, explicit) — explicit bypasses the due-check
+    if connection_id:
+        row = connections_repo.get(connection_id)
+        if row is not None and row.get("source_type") == "sharepoint":
+            targets = [(row, True)]
+        else:
+            errors.append({"connection_id": connection_id, "error": "connection_not_found"})
+    else:
+        targets = [(c, False) for c in connections_repo.list(source_type="sharepoint") if _mirrored_scopes(c)]
+
+    totals: Dict[str, Any] = {
+        "connections": 0,
+        "scopes": 0,
+        "excluded": 0,
+        "skipped_not_due": 0,
+        "errors": errors,
+    }
+    for connection, explicit in targets:
+        if not explicit and not _sweep_due(connection):
+            totals["skipped_not_due"] += 1
+            continue
+        result = await _sweep_connection(connection)
+        totals["connections"] += 1
+        totals["scopes"] += result["scopes"]
+        totals["excluded"] += result["excluded"]
+        if result.get("error"):
+            totals["errors"].append({"connection_id": connection["id"], "error": result["error"]})
+    return totals
