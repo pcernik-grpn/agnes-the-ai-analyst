@@ -2231,7 +2231,18 @@ function _sharepointFactsHtml(row) {
   // run"/"no schedule configured" default rather than throwing.
   const inAgnes = fs.schedule.in_agnes || {};
   const inAgnesParts = [];
-  if (!inAgnes.enabled) inAgnesParts.push(`<span class="ds-badge badge-unset">extraction.enabled is off</span>`);
+  // Honest-UI gate: `extraction_ready`/`extraction_unready_reason` are the
+  // SAME two gates the manual trigger itself checks before enqueueing
+  // (`app/api/admin_sharepoint.py::_extraction_readiness`) — never offer a
+  // button whose click can only 409. Missing on an older/degraded cell
+  // shape (no such key at all) reads as "not ready" — fail closed, same
+  // posture as every other sub-block on this card.
+  const extractionReady = inAgnes.extraction_ready === true;
+  if (!extractionReady) {
+    inAgnesParts.push(
+      `<span class="ds-badge badge-unset">${_esc(_extractionUnreadyReasonText(inAgnes.extraction_unready_reason))}</span>`
+    );
+  }
   inAgnesParts.push(
     inAgnes.last_run_at ? `last run ${_esc(new Date(inAgnes.last_run_at).toLocaleString())}` : "never run"
   );
@@ -2249,7 +2260,7 @@ function _sharepointFactsHtml(row) {
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — a separate lane from the external producer's own crawl schedule above.">In-Agnes extraction</span>
     <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
-    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" ${extractionReady ? "" : "disabled"} onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
   </div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Certificate</span>
@@ -2315,6 +2326,20 @@ const SP_REJECTION_REASON_TEXT = {
 };
 function _spRejectionReasonText(reason) {
   return SP_REJECTION_REASON_TEXT[reason] || reason || "";
+}
+
+/* "Run extraction now" honest-UI gate — `extraction_unready_reason` carries
+   the SAME slug `POST .../extract`'s 409 body uses
+   (`app/api/admin_sharepoint.py::_extraction_readiness`); this maps it to
+   the sentence the card shows instead of letting the click 409. */
+const EXTRACTION_UNREADY_REASON_TEXT = {
+  extraction_disabled:
+    "Extraction is disabled on this instance — set extraction.enabled: true in instance.yaml first.",
+  extraction_producer_not_configured:
+    "No extraction producer is configured — set extraction.producer.command or extraction.producer.module in instance.yaml.",
+};
+function _extractionUnreadyReasonText(reason) {
+  return EXTRACTION_UNREADY_REASON_TEXT[reason] || "Extraction is not ready on this instance.";
 }
 
 /* Duplicate (doc_id, reason) pairs collapse into one row with a "2×" count
