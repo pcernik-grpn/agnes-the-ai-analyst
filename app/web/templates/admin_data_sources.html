@@ -1213,6 +1213,8 @@
           <div class="ds-field ds-wsl-opt__field" hidden>
             <label for="ds-new-master">Semantic-layer token <span class="optional">(project owner)</span></label>
             <input type="password" id="ds-new-master" placeholder="paste owner token" autocomplete="off">
+            <div class="field-hint">Keboola calls this the project's <strong>master</strong> token — search your
+               Keboola project for that term if "owner token" turns up nothing.</div>
           </div>
         </div>
         </div>
@@ -1789,7 +1791,7 @@ function _masterTokenFactHtml(row) {
   const hasMaster = row.has_master_secret === true;
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Keboola calls this the project MASTER (owner) token. Required only for the semantic layer — metrics and glossary.">Semantic-layer token</span>
+    <span class="ds-src__fact-k" role="note" data-tip="Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary." aria-label="Semantic-layer token. Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary.">Semantic-layer token</span>
     <span class="ds-src__fact-v"><span class="ds-badge ${hasMaster ? "badge-vault" : "badge-unset"}">${hasMaster ? "set" : "not set"}</span></span>
     <span class="ds-src__fact-a">
       <button type="button" class="btn btn-secondary" onclick="toggleMasterToken('${id}')">${hasMaster ? "Rotate" : "Set token"}</button>
@@ -1811,7 +1813,7 @@ function _masterTokenFactHtml(row) {
    admin can act on: "no tables yet", "never synced", "token not set",
    "0 packages — nobody can pull this". A missing cell (BigQuery has no
    semantic layer) simply is not rendered — the strip is per-connector. */
-const SOURCE_PIPELINES = {{ source_pipelines | tojson }};
+let SOURCE_PIPELINES = {{ source_pipelines | tojson }};
 
 /* Connectors that produce tables but keep no `source_connections` row —
    BigQuery (credentialed once, at instance level), Jira (webhooks), uploaded
@@ -1984,11 +1986,27 @@ function _pipelineStripHtml(row) {
         ? `✓ ${sem.metrics} metric${sem.metrics === 1 ? "" : "s"} · ${sem.terms} term${sem.terms === 1 ? "" : "s"}`
         : "Nothing imported yet";
     const semTone = !sem.token ? "is-warn" : (sem.metrics || sem.terms) ? "is-ok" : "is-warn";
-    cells.push(`
-      <a class="ds-pipe__cell" href="/admin/semantic-layer">
-        <span class="ds-pipe__k">Semantic layer</span>
-        <span class="ds-pipe__v ${semTone}">${semText}</span>
-      </a>`);
+    // "Token not set" cannot be fixed on /admin/semantic-layer — the page
+    // renders fine, it just has no token field; the token is set on this
+    // same card (Actions → Semantic-layer token), so a STORED connection's
+    // cell calls that action directly instead of navigating to a page that
+    // cannot help. A derived card (no stored connection — see `row.derived`
+    // above) carries no such widget at all — `_masterTokenFactHtml` is never
+    // rendered for it — so it keeps the base link; there is nothing on the
+    // card itself to point at instead.
+    if (!sem.token && !row.derived) {
+      cells.push(`
+        <button type="button" class="ds-pipe__cell" onclick="toggleMasterToken('${row.id}')">
+          <span class="ds-pipe__k">Semantic layer health</span>
+          <span class="ds-pipe__v ${semTone}">${semText}</span>
+        </button>`);
+    } else {
+      cells.push(`
+        <a class="ds-pipe__cell" href="/admin/semantic-layer">
+          <span class="ds-pipe__k">Semantic layer health</span>
+          <span class="ds-pipe__v ${semTone}">${semText}</span>
+        </a>`);
+    }
   }
 
   // Feeds — the end of the chain: who actually gets this source's data.
@@ -2574,6 +2592,7 @@ async function importKeboolaConnection(id) {
       // real one it just replaced.
       const idx = DERIVED_SOURCES.findIndex((d) => d.source_type === "keboola");
       if (idx !== -1) DERIVED_SOURCES.splice(idx, 1);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       showToast("Import failed: " + (data.detail || `HTTP ${r.status}`), false);
@@ -2601,6 +2620,90 @@ function renderConnList() {
   list.innerHTML = _connections.map(_connectionCardHtml).join("");
   _fillGrantPickers();
   loadTokenMismatchWarnings();
+}
+
+/* ── Keeping the strip true after a mutation ───────────────────────────────
+   `SOURCE_PIPELINES` is a snapshot of a server-side fold, taken when this
+   HTML was built — but everything on this page happens over fetch. The
+   wizard registers tables, creates packages and writes grants; the cards
+   save tokens and toggle chat tools; none of it touched that snapshot, so a
+   card went on saying "Add the first tables → / Never synced / 0 packages"
+   after two dozen tables had landed, until somebody hard-reloaded.
+
+   `GET /api/admin/source-pipelines` re-reads the same fold. Every handler
+   that mutates anything calls THIS function afterwards — the rule is
+   deliberately blunt ("a mutation re-reads the strip") rather than a
+   per-handler judgment about which cells that particular write can move,
+   because the per-handler judgment is what silently rots.
+
+   Repainted in place, never reloaded: an admin with a card expanded or a
+   browse panel open is mid-task, and a reload throws that away along with
+   their scroll position. A failed refresh keeps the stale strip and says
+   nothing — a card that stops updating is recoverable, one that empties
+   itself is not.
+
+   This carries the STRIP, not the connection rows. A handler that also
+   changed what the row itself says — a stored secret, a cleared project
+   binding, a queued extraction's timestamp, a connection that now exists at
+   all — pairs this with `loadConnections()`, in that order, so the redraw
+   below paints from the fresh dict. */
+let _pipelineRefreshInFlight = null;
+
+async function refreshSourcePipelines() {
+  // One read at a time. A wizard exit calls this from several places within a
+  // tick, and two overlapping reads would resolve last-response-wins — which,
+  // with the older response landing second, is the stale strip this whole
+  // function exists to remove. Everyone waiting gets the same promise.
+  if (_pipelineRefreshInFlight) return _pipelineRefreshInFlight;
+  _pipelineRefreshInFlight = (async () => {
+    try {
+      const r = await fetch("/api/admin/source-pipelines", { credentials: "include" });
+      if (!r.ok) return false;
+      SOURCE_PIPELINES = await r.json();
+      // Inside the try: a repaint that throws must report itself as a failed
+      // refresh, not escape into a caller's `finally` and replace whatever
+      // error that block was already unwinding.
+      _repaintSourceCards();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  })().finally(() => { _pipelineRefreshInFlight = null; });
+  return _pipelineRefreshInFlight;
+}
+
+/* Swap each drawn card's strip and status word for what the fresh dict says,
+   and leave the rest of the card — including whether it is open — exactly as
+   the admin left it. A source the list has not drawn yet (a connection the
+   wizard just created) is skipped here; `loadConnections()` draws it from the
+   same fresh dict. */
+function _repaintSourceCards() {
+  for (const row of _connections) {
+    const card = document.getElementById(`ds-conn-${row.id}`);
+    if (!card) continue;
+    const head = card.querySelector(".ds-src__head");
+
+    const stripHtml = _pipelineStripHtml(row);
+    const strip = card.querySelector(":scope > .ds-pipe");
+    if (strip && stripHtml) strip.outerHTML = stripHtml;
+    else if (strip) strip.remove();
+    else if (stripHtml && head) head.insertAdjacentHTML("afterend", stripHtml);
+
+    if (!head) continue;
+    const health = _sourceHealth(row);
+    const chip = head.querySelector(".ds-src__health");
+    if (chip && health) {
+      chip.className = `ds-src__health ${health.tone}`;
+      chip.textContent = health.label;
+    } else if (chip) {
+      chip.remove();
+    } else if (health) {
+      const acts = head.querySelector(".ds-src__acts");
+      const chipHtml = `<span class="ds-src__health ${health.tone}">${health.label}</span>`;
+      if (acts) acts.insertAdjacentHTML("beforebegin", chipHtml);
+      else head.insertAdjacentHTML("beforeend", chipHtml);
+    }
+  }
 }
 
 // A connection whose storage token and master token resolve to DIFFERENT
@@ -2732,6 +2835,11 @@ async function runSpExtraction(id) {
       resultEl.className = "ds-conn-test-result show ok";
       resultEl.textContent = `✓ Extraction queued (job ${body.job_id})`;
       showToast("Extraction queued.", true);
+      // The dispatch stamps `config.extraction.last_run_at` on the connection
+      // row, and the body's "In-Agnes extraction" line reads it — so this
+      // needs the rows re-read too, not just the strip.
+      await refreshSourcePipelines();
+      await loadConnections();
     } else {
       const msg = detailMessage(body, "failed to start extraction");
       resultEl.className = "ds-conn-test-result show fail";
@@ -2774,6 +2882,7 @@ async function saveSpCertificate(id) {
       showToast("Certificate updated.", true);
       input.value = "";
       toggleSpCertRow(id);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2801,6 +2910,9 @@ async function deleteConn(id) {
     if (r.ok || r.status === 204) {
       showToast(`"${name}" deleted.`, true);
       _connections = _connections.filter(c => c.id !== id);
+      // Not only about the card that just went away: with one connection of a
+      // type left, that type's unlinked tables become attributable to it.
+      await refreshSourcePipelines();
       renderConnList();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2820,6 +2932,7 @@ async function setDefaultConn(id) {
     });
     if (r.ok) {
       showToast("Default project updated.", true);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2860,6 +2973,7 @@ async function saveRotatedToken(id) {
       showToast("Token rotated.", true);
       input.value = "";
       toggleRotate(id);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2901,6 +3015,7 @@ async function saveMasterToken(id) {
       showToast("Master token saved.", true);
       input.value = "";
       toggleMasterToken(id);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2920,6 +3035,7 @@ async function removeMasterToken(id) {
     const r = await fetch(`${API_CONNECTIONS}/${id}/secret?kind=master`, { method: "DELETE", credentials: "include" });
     if (r.ok || r.status === 204) {
       showToast("Master token removed.", true);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2948,6 +3064,7 @@ async function unbindProject(id) {
     });
     if (r.ok) {
       showToast("Project binding cleared.", true);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -3109,6 +3226,7 @@ async function grantChatTools(id, sourceId) {
       const gated = body.admin_only ? ` ${body.admin_only} are mutating and stay locked until opted in per tool (agnes admin mcp tool grant <tool_id> --group <g> --allow-mutating).` : "";
       const off = body.skipped_disabled ? ` ${body.skipped_disabled} disabled tools were skipped.` : "";
       showToast(`Granted ${body.granted} of ${body.total} tools${extra}.${gated}${off}`, true);
+      await refreshSourcePipelines();
     } else {
       showToast("Failed: " + detailMessage(body, `HTTP ${r.status}`), false);
     }
@@ -3146,6 +3264,7 @@ async function toggleChatTools(id, isOn, resync) {
                 + (allAdminOnly ? " All are recorded as mutating (no read-only annotations upstream); mutating tools stay locked for a group until an admin opts each in per tool (allow_mutating on the tool grant)." : "")),
         true,
       );
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -3584,6 +3703,9 @@ async function registerSelected(connId, errElId) {
     const done = okCount + alreadyCount;
     showToast(`${done} ready, ${failCount} failed. See per-row status.`, false);
   }
+  // The whole point of the strip: "No tables yet" must stop being the
+  // answer the moment it stops being true.
+  await refreshSourcePipelines();
   return { ok: registered, failed: failCount };
 }
 
@@ -4222,9 +4344,16 @@ function openWizard(connector) {
   document.querySelector("#ds-wizard-overlay .ds-drawer__body").scrollTop = 0;
 }
 
-function closeWizard() {
+async function closeWizard() {
   document.getElementById("ds-wizard-overlay").classList.remove("show");
   document.body.style.overflow = "";
+  // The wizard is where a source's whole pipeline gets built — connection,
+  // tables, packages, grants — and every card behind it was drawn before any
+  // of that happened. On EVERY exit, not only the Finish button: a connection
+  // created in step 1 and then dismissed with X/Escape is still a connection,
+  // and it has no card at all until the list is re-read.
+  await refreshSourcePipelines();
+  await loadConnections();
 }
 
 async function connectAndValidate() {
@@ -4419,13 +4548,11 @@ async function _loadWizardTables(connId) {
   }
 }
 
-function finishWizard() {
-  closeWizard();
+async function finishWizard() {
+  await closeWizard();
   if (_wizardSource === "snowflake") {
     window.location.reload();
-    return;
   }
-  loadConnections();
 }
 
 /* ── Step 2 (BigQuery): manual rows editor ────────────────────────────────
@@ -4522,6 +4649,7 @@ async function _registerBqRows() {
       failed++;
     }
   }
+  await refreshSourcePipelines();
   return { ok: registered, failed };
 }
 
@@ -4859,6 +4987,7 @@ async function _registerSfRows() {
       failed++;
     }
   }
+  await refreshSourcePipelines();
   return { ok: registered, failed };
 }
 
@@ -5087,6 +5216,9 @@ async function _createPackagesAndContinue() {
     await _renderShareStep();
   } finally {
     btn.disabled = false;
+    // In `finally`: a tray that failed halfway still created the packages
+    // before it, and the Feeds cell behind the drawer is stale either way.
+    await refreshSourcePipelines();
   }
 }
 
@@ -5183,6 +5315,9 @@ async function _shareAndFinish() {
     _showDoneSlab();
   } finally {
     btn.disabled = false;
+    // Grants are the end of the chain — "0 packages" becomes "1 package →
+    // 4 people" here, and the card behind the receipt should say so.
+    await refreshSourcePipelines();
   }
 }
 
@@ -5772,9 +5907,16 @@ function _spHighlightShareRow(scopeId) {
   setTimeout(() => row.classList.remove("sp-share-row--highlight"), 2500);
 }
 
-function closeSpWizard() {
+async function closeSpWizard() {
   document.getElementById("sp-wizard-overlay").classList.remove("show");
   document.body.style.overflow = "";
+  // Same contract as the table wizard's own exit: this drawer connects a
+  // source, scopes it and shares it, and every card behind it was drawn
+  // before any of that happened. The rows too — scopes live in the
+  // connection's own `config`, so the card's identity line and its scope
+  // list are as stale as the strip.
+  await refreshSourcePipelines();
+  await loadConnections();
 }
 
 function spGoStep(step) {
@@ -6379,7 +6521,7 @@ document.getElementById("spw-finish-btn").addEventListener("click", () => {
     }
     btn.style.display = "none";
     document.getElementById("spw-done-btn").style.display = "";
-    loadConnections();
+    refreshSourcePipelines().then(loadConnections);
   });
 });
 

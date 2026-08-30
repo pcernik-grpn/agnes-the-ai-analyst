@@ -149,6 +149,76 @@ agnes query "SELECT ..."      # run the query
   `agnes skills show agnes-data-querying`.
 """
 
+
+def _semantic_layer_section(user_email: Optional[str]) -> str:
+    """The same minimal semantic-layer pointer the sandbox/CLAUDE.md path
+    gets (``src.claude_md``'s "## Semantic layer" section), condensed for a
+    persona: slug + description + the model author's own truncated
+    ``ai_context.instructions``, no full metric/glossary dump — a named
+    agent profile REPLACES the workspace CLAUDE.md the same way a persona
+    replaces it natively (see :data:`DATA_ACCESS_RAILS`), so without this a
+    named agent (persona web chat, Slack, ``agnes chat``, the one-shot agent
+    API) got zero semantic context while the sandbox path always has.
+
+    Empty string — never raises, never appended — when ``user_email`` is
+    unset, the user can't be resolved, no readable model exists, or
+    anything else goes wrong: this is a nice-to-have addition to a persona
+    prompt, not a reason to fail a spawn the user is waiting on.
+
+    Opens its own DuckDB connection when the active backend is DuckDB
+    (Postgres reads need none) — the same ``conn = None if use_pg() else
+    get_system_db()`` pattern ``app/main.py``'s workspace-prompt renderer
+    uses, since this module otherwise opens no connection of its own and
+    would need no ``get_system_db()`` grandfather entry.
+    """
+    if not user_email:
+        return ""
+    conn = None
+    try:
+        from src.claude_md import _semantic_layer_models
+        from src.repositories import use_pg, users_repo
+
+        u = users_repo().get_by_email(user_email)
+        if not u:
+            return ""
+        if not use_pg():
+            from src.db import get_system_db
+
+            conn = get_system_db()
+        models = _semantic_layer_models(conn, user=u)
+        if not models:
+            return ""
+        lines = [
+            "\n---\n\n"
+            "## Semantic layer\n\n"
+            "This instance has at least one semantic model you can read — a "
+            "structured document of datasets, metrics, relationships, and "
+            "constraints that is the authoritative source of business "
+            "meaning here. Prefer its definitions over inferring meaning "
+            "from table or column names.\n\n"
+            "Registered models:\n"
+        ]
+        for m in models:
+            line = f"- `{m['slug']}`"
+            if m.get("description"):
+                line += f" — {m['description']}"
+            lines.append(line + "\n")
+            if m.get("instructions"):
+                lines.append(f"  - Model author's note about this data: {m['instructions']}\n")
+        lines.append(
+            "\nDiscover more: `agnes semantic-model context <type>` (or the "
+            "MCP `get_semantic_context` tool). Always check a query against "
+            "it first with `agnes semantic-model validate-query \"<SQL>\"`.\n"
+        )
+        return "".join(lines)
+    except Exception:
+        logger.exception("semantic layer section unavailable for agent persona (user=%s)", user_email)
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 # agents.<field>_mode -> (scope key, agent_scope.item_type)
 _MODE_FIELD_TO_SCOPE = {
     "plugins_mode": ("plugins", "plugin"),
@@ -238,7 +308,9 @@ def _context_skill(agent_row: dict, *, advertise_memory_write: bool = True) -> s
     return "".join(lines)
 
 
-def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Optional[ChatProfile]:
+def build_profile(
+    agent_row: dict, *, advertise_memory_write: bool = True, user_email: Optional[str] = None
+) -> Optional[ChatProfile]:
     """Build a dynamic ``ChatProfile`` from an ``agents`` row.
 
     Returns ``None`` when ``system_prompt`` is empty/whitespace-only — the
@@ -248,16 +320,22 @@ def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Op
     chat's generic rails.
 
     The returned ``claude_md`` is the authored persona followed by
-    :data:`DATA_ACCESS_RAILS` — see that constant for why a persona must
-    never be able to silently drop the platform's data-access floor. The
-    early return above means this only ever applies where a persona
-    actually replaces the workspace prompt; an agent with no persona keeps
-    the full symlinked rails and is untouched.
+    :data:`DATA_ACCESS_RAILS`, then :func:`_semantic_layer_section` — see
+    that constant for why a persona must never be able to silently drop the
+    platform's data-access floor. The early return above means this only
+    ever applies where a persona actually replaces the workspace prompt; an
+    agent with no persona keeps the full symlinked rails (semantic layer
+    section included) and is untouched.
 
     ``advertise_memory_write`` is threaded to :func:`_context_skill` — pass
     ``False`` when the profile is materialized for a sandbox with no channel
     to the remember endpoint (the embedded kai-agent engine's workspace
     tarball, ``app/api/kai.py``).
+
+    ``user_email`` threads into :func:`_semantic_layer_section` for the
+    RBAC-filtered model summary — omit it (or pass ``None``) where the
+    caller has no session identity handy; the persona still builds, just
+    without that section, exactly as before this parameter existed.
     """
     system_prompt = (agent_row.get("system_prompt") or "").strip()
     if not system_prompt:
@@ -265,7 +343,7 @@ def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Op
     slug = agent_row.get("slug") or agent_row.get("id") or "agent"
     return ChatProfile(
         slug=f"agent-{slug}",
-        claude_md=system_prompt + DATA_ACCESS_RAILS,
+        claude_md=system_prompt + DATA_ACCESS_RAILS + _semantic_layer_section(user_email),
         skill_name="agnes-agent-context",
         skill_body=_context_skill(agent_row, advertise_memory_write=advertise_memory_write),
     )

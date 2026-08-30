@@ -1167,6 +1167,20 @@ source lands with **no** `tool_grants`, so nothing is exposed until an admin
 grants the tools to a group. CLI: `agnes admin connection chat-tools [--disable]`.
 Deliberately not MCP-exposed (credential-provisioning exemption, `CONTRIBUTING.md`).
 
+### `/api/admin/source-pipelines` — Source-card pipeline strip (read-only)
+
+Admin-only, read-only. Returns the per-source pipeline strip keyed by connection
+id — `{connection_id: {tables, sync, semantic?, cost?, feeds, file_source?}}` —
+which is the same fold `/admin/data-sources` inlines into its own HTML at render
+time. It exists because every mutation on that page (the Add-tables wizard,
+package creation, token saves, chat-tools toggles) happens over `fetch`, so the
+baked strip went stale the moment the admin did anything: a card kept reporting
+"Add the first tables → / Never synced / 0 packages" after two dozen tables had
+been registered. The page re-reads this after each mutation and repaints the
+card in place. No new data and no new authority — same admin gate as the page.
+
+- /api/admin/source-pipelines
+
 ### `/api/admin/sharepoint/connections/{connection_id}` — SharePoint connect wizard (spec 2026-08-27 §13.2)
 
 Admin-only surface behind the "connect → scope → share" file-source wizard on

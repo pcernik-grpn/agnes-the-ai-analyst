@@ -235,9 +235,7 @@ class TestSemanticModelCrud:
         assert "git" in body["message"], "the error must name where to go and edit it"
         # no shadow manual/_/<slug> row was created
         listed = c.get("/api/admin/semantic-models", headers=_auth(seeded_app["admin_token"])).json()
-        assert not any(
-            m["slug"] == git_backed_model["slug"] and m["source"] == "manual" for m in listed
-        )
+        assert not any(m["slug"] == git_backed_model["slug"] and m["source"] == "manual" for m in listed)
 
 
 class TestPackageLinking:
@@ -263,6 +261,14 @@ class TestPackageLinking:
         )
         assert r.status_code == 200, r.text
         assert r.json()["package_ids"] == [pkg_id]
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="semantic_model.link_package", resource=model["id"])
+        assert rows, "linking a package must write an audit row"
+        params = rows[0]["params"]
+        params = json.loads(params) if isinstance(params, str) else params
+        assert params["package_id"] == pkg_id
 
     def test_relinking_the_same_package_is_idempotent(self, seeded_app):
         c = seeded_app["client"]
@@ -302,6 +308,14 @@ class TestPackageLinking:
         )
         assert r.status_code == 200, r.text
         assert r.json()["package_ids"] == []
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="semantic_model.unlink_package", resource=model["id"])
+        assert rows, "unlinking a package must write an audit row"
+        params = rows[0]["params"]
+        params = json.loads(params) if isinstance(params, str) else params
+        assert params["package_id"] == pkg_id
 
     def test_unlink_is_idempotent_on_an_already_unlinked_pair(self, seeded_app):
         c = seeded_app["client"]
@@ -387,6 +401,39 @@ class TestPackageLinking:
             headers=_auth(seeded_app["analyst_token"]),
         )
         assert r.status_code == 403
+
+    def test_link_via_the_real_endpoint_grants_read_through_the_real_endpoint(self, seeded_app):
+        """End-to-end proof that a real caller can actually create the link
+        the RBAC tests in TestExport/TestSearch assume exists: create the
+        link via the real admin POST, then read the model via the real
+        export endpoint as a non-admin with only a package grant — no direct
+        `semantic_model_repo().link_package(...)` call anywhere in this test.
+
+        `TestExport.test_export_succeeds_via_a_linked_package_grant` and
+        `TestSearch.test_search_only_returns_accessible_models` prove the
+        READ side of this chain but wire the link in directly on the repo,
+        which would keep passing even if the linking endpoint above were
+        dead code — the exact shape PR #1633 flagged as the reason the
+        original bug survived review this long."""
+        c = seeded_app["client"]
+        model = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+        _grant_package(pkg_id)
+
+        link = c.post(
+            f"/api/admin/semantic-models/{model['slug']}/packages",
+            json={"package_id": pkg_id},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert link.status_code == 200, link.text
+
+        r = c.get(f"/api/semantic-models/{model['slug']}.yaml", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 200
+        assert r.text == DOC
 
 
 class TestSemanticSourceCrud:

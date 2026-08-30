@@ -1,7 +1,11 @@
 {% extends "base_ds.html" %}
 {% import "macros/_icon.html" as ico %}
 
-{% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# NAME: "Metrics & glossary" — what this page actually shows (the flat
+   `metric_definitions` + `glossary_terms` projection). It used to be titled
+   "Semantic layer", the same name /semantic-layer and /admin/semantic-layer
+   carried. Guarded by tests/test_semantic_page_names_contract.py. #}
+{% block title %}Metrics &amp; glossary — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {#- Source badge -#}
 {% macro source_badge(source) -%}
@@ -72,8 +76,8 @@
     margin: 0;
     max-width: 60ch;
 }
-/* The door to /semantic-layer — this page is the flat projection, that one is
-   the stored document. Both are titled "Semantic layer". */
+/* The door to Semantic models (/semantic-layer) — this page is the flat
+   projection, that one is the stored document. */
 .sl-page-head__door {
     font-size: 13px;
     margin: 8px 0 0;
@@ -357,6 +361,7 @@
 .sl-detail__desc table { border-collapse: collapse; margin: 0 0 8px; }
 .sl-detail__desc th, .sl-detail__desc td { border: 1px solid var(--ds-border); padding: 2px 8px; font-size: 12px; }
 .sl-detail__desc code { background: var(--ds-surface); padding: 0 4px; border-radius: var(--radius-sm); font-size: 11px; }
+.sl-detail__model-link { margin: 0 0 8px; font-size: 12px; }
 
 /* ── Glossary grid ───────────────────────────────────────────────────── */
 .sl-glossary-grid {
@@ -452,10 +457,9 @@
 
 {% block content %}
 {# ── Back link ───────────────────────────────────────────────────────────
-   This page is reached from a link (the Library's Definitions block, the
-   Catalog's Semantic layer card, a chat citation, global search) but is not
-   itself a nav destination in either chrome — so without this the only way
-   out was the browser's Back button. `detail_back` resolves it per layout:
+   This page is reached from a link (the Library's Definitions block, a chat
+   citation, global search) but is not itself a nav destination in either
+   chrome — so without this the only way out was the browser's Back button. `detail_back` resolves it per layout:
    topnav keeps /catalog (the entry it links from, and the nav item its own
    /catalog/* path highlights); rail has no key for this kind and falls
    through to /library, which is both the rail's one browse surface and the
@@ -470,11 +474,11 @@
 <div class="sl-page-head">
   <div class="sl-page-head__left">
     <p class="sl-page-head__eyebrow">Data</p>
-    <h1>Semantic layer</h1>
+    <h1>Metrics &amp; glossary</h1>
     <p class="sl-page-head__sub">Business metrics and the glossary — the shared vocabulary your team's queries and dashboards should agree on.</p>
     {% if has_semantic_models %}
     <p class="sl-page-head__door">
-      <a href="/semantic-layer">Browse the full semantic layer — datasets, relationships and constraints →</a>
+      <a href="/semantic-layer">Semantic models — datasets, relationships and constraints →</a>
     </p>
     {% endif %}
   </div>
@@ -495,7 +499,7 @@
 
   {# Sidebar #}
   <aside class="sl-sidebar">
-    <div class="sl-tab-row" role="tablist" aria-label="Semantic layer sections">
+    <div class="sl-tab-row" role="tablist" aria-label="Metrics &amp; glossary sections">
       <button type="button" class="sl-tab is-active" id="tab-metrics" data-tab="metrics" role="tab" aria-selected="true">
         Metrics <span class="sl-tab-count">({{ metric_count }})</span>
       </button>
@@ -590,6 +594,14 @@
                 <pre><code>{{ variant_sql }}</code></pre>
                 {% endfor %}
                 {% endif %}
+                {# Door into the document this row was projected from — set
+                   only for a metric that HAS such an object and whose model
+                   the caller can read (app/web/router.py::
+                   _document_metric_hrefs). A hand-authored or yaml_import
+                   metric renders without it. #}
+                {% if m.model_href %}
+                <p class="sl-detail__model-link"><a href="{{ m.model_href }}">Open in the model &rarr;</a></p>
+                {% endif %}
                 {% if m.filters %}<p><strong>Filters</strong></p><ul>{% for f in m.filters %}<li><code>{{ f }}</code></li>{% endfor %}</ul>{% endif %}
                 {% if m.notes %}<p><strong>Notes:</strong></p><ul>{% for n in m.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
                 {% if m.validation %}<p><strong>Validation:</strong> <code>{{ m.validation }}</code></p>{% endif %}
@@ -606,7 +618,7 @@
              empty state has to explain the split — otherwise the page reads as
              "nothing was imported" while the document sits next door. #}
           No metrics registered yet — but this instance has a semantic model.<br>
-          <a href="/semantic-layer">Browse its datasets and relationships →</a><br>
+          <a href="/semantic-layer">Semantic models — its datasets and relationships →</a><br>
           Metrics are a separate projection; import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
           {% else %}
           No metrics registered yet.<br>Import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
@@ -717,6 +729,16 @@
             applyMetrics();
         });
     });
+
+    // The return leg of the deep link: a metric's object page links back here
+    // with `?q=<metric name>`, so the row it means is the one visible result
+    // instead of one entry in an unfiltered list. Read once on load; typing in
+    // the box afterwards is unaffected (the URL is not rewritten).
+    const initialQuery = new URLSearchParams(window.location.search).get('q');
+    if (initialQuery && metricFilter) {
+        metricFilter.value = initialQuery;
+        applyMetrics();
+    }
 
     // ── Glossary ──
     let glossaryLoaded = false;

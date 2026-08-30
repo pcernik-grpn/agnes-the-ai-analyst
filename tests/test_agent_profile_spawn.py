@@ -91,6 +91,71 @@ def test_build_profile_rails_are_not_added_without_a_persona():
     assert agent_profile.build_profile(_agent_row(system_prompt="")) is None
 
 
+def test_build_profile_appends_a_readable_semantic_model_when_user_email_is_given(tmp_path, monkeypatch):
+    """P1-3: a named agent profile REPLACES the workspace CLAUDE.md, so
+    without this it got zero semantic-layer context while the sandbox path
+    (`src/claude_md.py`) always has — asserting `DATA_ACCESS_RAILS in md`
+    alone would not catch this section being silently empty."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from src.db import get_system_db
+    from src.repositories import semantic_model_repo, user_groups_repo, users_repo
+    from src.repositories.user_group_members import UserGroupMembersRepository
+
+    users_repo().create(id="u1", email="reader@example.com", name="Reader")
+    conn = get_system_db()
+    admin_group = user_groups_repo().get_by_name("Admin")
+    UserGroupMembersRepository(conn).add_member("u1", admin_group["id"], source="test")
+    conn.close()
+
+    doc = (
+        "version: '0.2.0.dev0'\n"
+        "semantic_model:\n"
+        "  - name: retail\n"
+        "    datasets:\n"
+        "      - name: orders\n"
+        "        source: db.public.orders\n"
+        "        fields: []\n"
+    )
+    semantic_model_repo().upsert(
+        id="manual/_/retail",
+        slug="retail",
+        name="retail",
+        description="Retail sales model.",
+        document=doc,
+        document_json={
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "ai_context": {"instructions": "Always exclude test orders."},
+                    "datasets": [{"name": "orders", "source": "db.public.orders", "fields": []}],
+                }
+            ]
+        },
+        spec_version="0.2.0.dev0",
+        content_hash="h1",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+
+    row = _agent_row(system_prompt="You are a sales assistant.")
+    profile = agent_profile.build_profile(row, user_email="reader@example.com")
+    md = profile.claude_md
+    assert "## Semantic layer" in md
+    assert "retail" in md
+    assert "Always exclude test orders." in md
+
+
+def test_build_profile_omits_semantic_layer_section_without_user_email():
+    """Default behavior (no ``user_email``) must stay unchanged — no section,
+    no lookup attempted."""
+    row = _agent_row(system_prompt="You are a sales assistant.")
+    profile = agent_profile.build_profile(row)
+    assert "## Semantic layer" not in profile.claude_md
+
+
 def test_build_profile_skill_body_is_valid_skill_md():
     row = _agent_row(system_prompt="Be helpful.")
     profile = agent_profile.build_profile(row)

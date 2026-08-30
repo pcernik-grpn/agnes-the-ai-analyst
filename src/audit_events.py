@@ -558,13 +558,23 @@ CATALOG: dict[str, AuditEvent] = {
     "semantic_model.detach": AuditEvent(
         "semantic_model.detach",
         "mutation",
-        "An admin detached a semantic model from its source, freezing it against "
-        "further syncs.",
+        "An admin detached a semantic model from its source, freezing it against further syncs.",
     ),
     "semantic_model.reattach": AuditEvent(
         "semantic_model.reattach",
         "mutation",
         "An admin re-attached a detached semantic model to its source.",
+    ),
+    "semantic_model.link_package": AuditEvent(
+        "semantic_model.link_package",
+        "mutation",
+        "An admin linked a semantic model to a Data Package, granting read access "
+        "to everyone with a grant on that package.",
+    ),
+    "semantic_model.unlink_package": AuditEvent(
+        "semantic_model.unlink_package",
+        "mutation",
+        "An admin unlinked a semantic model from a Data Package.",
     ),
     "semantic_health_mute.create": AuditEvent(
         "semantic_health_mute.create",
@@ -579,8 +589,7 @@ CATALOG: dict[str, AuditEvent] = {
     "semantic_feedback.submit": AuditEvent(
         "semantic_feedback.submit",
         "mutation",
-        "Someone (person or agent) flagged an answer as wrong against the "
-        "semantic layer.",
+        "Someone (person or agent) flagged an answer as wrong against the semantic layer.",
     ),
     "semantic_feedback.resolved": AuditEvent(
         "semantic_feedback.resolved",

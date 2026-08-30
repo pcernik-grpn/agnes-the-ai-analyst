@@ -1,6 +1,6 @@
 {% extends "base_page.html" %}
 
-{% block title %}{{ object_name }} — {{ model_name }} — Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ object_name }} — {{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <style>
@@ -90,6 +90,24 @@
 }
 .slb-rel-sides a { font-weight: 600; }
 .slb-rel-arrow { color: var(--ds-text-muted); }
+
+.slb-severity-note {
+    margin: var(--space-2) 0 0;
+    font-size: 12px;
+    color: var(--ds-text-secondary);
+}
+.slb-registry-link {
+    margin: var(--space-3) 0 0;
+    font-size: 12.5px;
+}
+.slb-rule-code {
+    font-family: var(--ds-font-mono, monospace);
+    font-size: 12px;
+    background: var(--ds-surface-dim);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-sm);
+    padding: 2px 6px;
+}
 </style>
 {% endblock %}
 
@@ -156,6 +174,12 @@
     {% else %}
     <p class="empty-state__description">No expression declared.</p>
     {% endif %}
+    {# The way back to the flat registry: the same metric's row there carries
+       the SQL Agnes composed from this expression, its synonyms and its
+       source badge. Rendered only when the metric actually projected. #}
+    {% if registry_href %}
+    <p class="slb-registry-link"><a href="{{ registry_href }}">Open in the metric registry &rarr;</a></p>
+    {% endif %}
 </div>
 {% endif %}
 
@@ -182,9 +206,10 @@
 {% if object_type == 'constraint' %}
 <div class="slb-panel">
     <h2>Rule</h2>
-    <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}" title="warning: recorded for reference, never blocks a query. error: blocks validate-query, but only when the constraint type is statically checkable (currently just required_filter) and the rule is missing from the query — any other type is advisory only regardless of severity.">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
+    <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}" data-tip="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft." aria-label="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft.">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
     <pre class="slb-expr">{{ obj.rule or "" }}</pre>
     <p>Applies to metrics: {{ (obj.metrics or []) | join(', ') }}</p>
+    <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
 </div>
 {% endif %}
 

@@ -4,7 +4,7 @@
 {# Section-level and PLAIN, matching /admin/semantic-layer: the h1 names the
    section, the tab strip below names the lens. #}
 {% set page_hero_title = "Data" %}
-{% set page_hero_subtitle = "Where semantic-layer documents come from — a git repo, an upload, or a data-source connection's own native models (Keboola Metastore, Snowflake semantic views, Databricks Unity Catalog metric views). Each source can be synced independently; see the imported result at <a href=\"/semantic-layer\">Semantic layer</a>." %}
+{% set page_hero_subtitle = "Where semantic-layer documents come from — a git repo, an upload, or a data-source connection's own native models (Keboola Metastore, Snowflake semantic views, Databricks Unity Catalog metric views). Each source can be synced independently; see the imported result at <a href=\"/semantic-layer\">Semantic models</a>." %}
 {% set page_hero_plain = True %}
 
 {% block head_extra %}
@@ -47,6 +47,14 @@
   .ss-models-neutral { background: var(--ds-surface-dim); color: var(--ds-text-secondary); }
   .ss-models-empty { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .ss-models-unknown { color: var(--ds-text-muted); }
+
+  /* What this source actually SCANNED, beside the sync result. A count of 0
+     cannot separate "there is nothing upstream" from "the role I connect as
+     cannot see it" (finding A17 on #1707) — naming the database/schema/role,
+     project, catalog or repository is what makes the second checkable.
+     Informational: muted, never an accent, because a scope is neither good
+     nor bad news on its own. */
+  .ss-scope { color: var(--ds-text-muted); font-size: 12px; white-space: nowrap; }
 
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap; }
 
@@ -121,7 +129,7 @@
           <th>Enabled</th>
           <th>Last sync</th>
           <th>Models</th>
-          <th style="text-align:right">Actions</th>
+          <th class="num">Actions</th>
         </tr>
       </thead>
       <tbody id="ss-tbody"></tbody>
@@ -294,6 +302,18 @@ function fmtLastSync(s) {
   return esc(when);
 }
 
+function fmtScanScope(s) {
+  // Derived server-side from the source's own config (src/semantic/
+  // scan_scope.py). `null` — no scope could be stated for this source, or a
+  // server too old to send the field — renders nothing at all rather than a
+  // guess: an empty scope line would be a claim of its own.
+  // Tense-neutral on purpose: this cell also renders on a "never synced" row,
+  // where the scope is what the FIRST sync will look at, not what a past one
+  // did — a tooltip saying "last sync" would contradict the row beside it.
+  if (typeof s.scan_scope !== "string" || !s.scan_scope) return "";
+  return ` · <span class="ss-scope" title="What this source's sync looks at.">scanned ${esc(s.scan_scope)}</span>`;
+}
+
 function fmtOwnedModels(s) {
   const n = s.owned_model_count;
   if (typeof n !== "number") {
@@ -339,7 +359,7 @@ function renderSources() {
       <td><span class="ss-kind-pill ss-kind-${esc(s.kind || "git")}">${esc(s.kind || "")}</span></td>
       <td><span class="ss-adapter">${esc(s.adapter || "native")}</span></td>
       <td><span class="ss-status-pill ${enabled ? "" : "ss-status-disabled"}">${enabled ? "Enabled" : "Disabled"}</span></td>
-      <td>${fmtLastSync(s)}</td>
+      <td>${fmtLastSync(s)}${fmtScanScope(s)}</td>
       <td>${fmtOwnedModels(s)}</td>
       <td>
         <div class="row-actions">

@@ -280,8 +280,8 @@ class TestCatalogSemanticsLinkFromCatalog:
         """The Definitions block in the Library is the way in.
 
         This asked /catalog for a rendered link, which the classic template's
-        Semantic layer card supplied. The unified Catalog offers only what the
-        caller does not already have, and the semantic layer is not one of
+        (now retired) Semantic layer card supplied. The unified Catalog offers
+        only what the caller does not already have, and the semantic layer is not one of
         those — the rail's own IA note names the Library's Definitions block as
         the door instead.
 
@@ -300,8 +300,8 @@ class TestCatalogSemanticsLinkFromCatalog:
 
 class TestCatalogSemanticsWayOut:
     """The page is link-only — reached from the Library's Definitions block,
-    the Catalog's Semantic layer card, a chat citation or global search — and
-    is a nav destination in neither chrome. Without a back link the browser's
+    a chat citation or global search (the classic Catalog's card is retired,
+    see the class above) — and is a nav destination in neither chrome. Without a back link the browser's
     Back button was the only way out, and under the rail no nav item lit up
     either, so the chrome read as "nowhere"."""
 
@@ -601,7 +601,9 @@ _DOOR = 'href="/semantic-layer"'
 class TestCatalogSemanticsDoorToTheDocument:
     """This page renders the FLAT projection (`metric_definitions` +
     `glossary_terms`); the stored Ossie document itself is browsed at
-    `/semantic-layer`. Both are titled "Semantic layer", and this is the more
+    `/semantic-layer`. Both were once titled "Semantic layer" (this page is
+    now "Metrics & glossary", that one "Semantic models" — see
+    tests/test_semantic_page_names_contract.py), and this is the more
     reachable of the two, so a model with datasets and relationships but no
     metrics rendered "No metrics registered yet" here with nothing pointing at
     the document — the page read as "there is no semantic layer" while there
@@ -677,3 +679,157 @@ class TestCatalogSemanticsDoorToTheDocument:
         self._seed_model()
         body = self._body(seeded_app, "analyst_token")
         assert _DOOR not in body
+
+
+class TestCatalogSemanticsDeepLinkIntoTheDocument:
+    """Per-row door into the document browser (#1707, N4).
+
+    The two views of one metric did not know about each other: this flat page
+    listed a projected metric with no way to reach the object it came from,
+    and the object page had no way back. A metric row that resolves to a
+    document object now carries an "in the model" link; a metric this
+    instance authored by hand or imported from YAML has no such object and
+    must carry none — a link that 404s is worse than no link.
+
+    The mapping is the projector's own id formula
+    (`src/semantic/projection.py::projected_metric_id`), not a guess at
+    parsing the stored id apart.
+    """
+
+    _SLUG = "retail"
+    _LINK = 'href="/semantic-layer/retail/metric:revenue"'
+
+    def _seed_model(self, *, slug: str | None = None, metric_name: str = "revenue") -> dict:
+        from src.repositories import semantic_model_repo
+
+        slug = slug or self._SLUG
+        return semantic_model_repo().upsert(
+            id=f"manual/_/{slug}",
+            slug=slug,
+            name=slug,
+            description="Retail domain.",
+            document="# fixture",
+            document_json={
+                "semantic_model": [
+                    {
+                        "name": slug,
+                        "datasets": [{"name": "orders", "source": "db.public.orders", "fields": []}],
+                        "metrics": [
+                            {
+                                "name": metric_name,
+                                "description": "Total order revenue.",
+                                "expression": {"dialects": [{"dialect": "duckdb", "expression": "SUM(amount)"}]},
+                            }
+                        ],
+                    }
+                ]
+            },
+            spec_version="0.2.0.dev0",
+            content_hash=f"hash-{slug}",
+            source="manual",
+            source_ref=None,
+            status="valid",
+            validation_errors=None,
+            validated_at=None,
+        )
+
+    def _body(self, seeded_app, token_key: str = "admin_token") -> str:
+        resp = seeded_app["client"].get("/catalog/semantics", headers=_auth(seeded_app[token_key]))
+        assert resp.status_code == 200
+        return resp.text
+
+    def test_document_owned_metric_row_links_to_its_object_page(self, seeded_app):
+        self._seed_model()
+        _make_metric(
+            id="manual/_/retail/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category="retail",
+            source="manual",
+            source_ref=None,
+        )
+        assert self._LINK in self._body(seeded_app)
+
+    def test_metric_with_no_document_object_gets_no_link(self, seeded_app):
+        """A yaml_import metric is a registry row with no document behind it —
+        it must render bare even on an instance that HAS a readable model."""
+        self._seed_model()
+        _make_metric(id="revenue/mrr", name="mrr", source="yaml_import")
+        body = self._body(seeded_app)
+        assert "Monthly Recurring Revenue" in body
+        assert "/semantic-layer/retail/metric:" not in body
+
+    def test_link_is_not_offered_to_a_caller_who_cannot_read_the_model(self, seeded_app):
+        """Same `_can_read_model` tier as the browse pages: an analyst without
+        a grant would 404 on the object page, so the row stays bare for them."""
+        self._seed_model()
+        _make_metric(
+            id="manual/_/retail/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category="retail",
+            source="manual",
+            source_ref=None,
+        )
+        assert self._LINK not in self._body(seeded_app, "analyst_token")
+
+    def test_the_readable_model_sweep_runs_once_per_request(self, seeded_app, monkeypatch):
+        """The deep-link map and the page header's browse-link gate are two
+        answers off ONE `_can_read_model` sweep.
+
+        The check resolves a model's Data Packages per row, so a second sweep
+        doubles this page's semantic-layer cost for an answer it already had —
+        invisible in output, which is why it is asserted on the call count."""
+        import app.api.semantic_models as semantic_models
+
+        self._seed_model(slug="retail")
+        self._seed_model(slug="finance")
+
+        real = semantic_models._can_read_model
+        seen: list[str] = []
+
+        def counting(user, row, conn):
+            seen.append(str(row.get("slug")))
+            return real(user, row, conn)
+
+        monkeypatch.setattr(semantic_models, "_can_read_model", counting)
+        self._body(seeded_app)
+        assert len(seen) == 2, f"expected one sweep over the two models, got {len(seen)} checks: {seen}"
+
+    def test_the_back_links_q_value_matches_what_this_page_filters_on(self, seeded_app):
+        """The round trip's data agreement, end to end.
+
+        The object page PRODUCES `?q=<term>`; this page's filter CONSUMES it
+        against each row's `data-ft` index (lowercased on both sides). Asserted
+        as one dataflow rather than by grepping for the JS: a `q` the index
+        does not contain lands the reader on an empty list, and neither half
+        can see that on its own."""
+        import re
+        from urllib.parse import unquote
+
+        self._seed_model()
+        _make_metric(
+            id="manual/_/retail/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category="retail",
+            source="manual",
+            source_ref=None,
+        )
+        c = seeded_app["client"]
+        headers = _auth(seeded_app["admin_token"])
+
+        obj = c.get("/semantic-layer/retail/metric:revenue", headers=headers)
+        assert obj.status_code == 200, obj.text
+        produced = re.search(r'href="/catalog/semantics\?q=([^"#]*)#metrics"', obj.text)
+        assert produced, "the metric object page emitted no registry back link"
+        term = unquote(produced.group(1)).lower()
+
+        body = self._body(seeded_app)
+        rows = re.findall(r'data-ft="([^"]*)"', body)
+        assert any(term in row for row in rows), (
+            f"no metric row indexes {term!r} — the back link would land on an empty filter"
+        )
+        # ...and the consumer end is wired at all: without this read the term
+        # arrives in the URL and the list renders unfiltered.
+        assert "URLSearchParams(window.location.search).get('q')" in body

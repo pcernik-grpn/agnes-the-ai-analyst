@@ -14,6 +14,7 @@ increment).
 from __future__ import annotations
 
 import json
+import re
 
 from src.db import get_system_db
 
@@ -296,6 +297,40 @@ class TestModelDetail:
             assert r.status_code == 200, tab
             assert needle in r.text, f"tab={tab} did not render {needle!r}"
 
+    def test_constraints_severity_header_uses_fast_tooltip_not_title(self, seeded_app):
+        """A7 (issue #1707): the 257-char severity explanation lived in a
+        native `title=` on `<th>Severity</th>` — a 600ms+ OS-controlled show
+        delay, no styling, and prone to clipping in a scrollable ancestor.
+        Converted to the shared `[data-tip]` fast-tooltip (components.css)
+        with `aria-label` carrying the same text (the repo convention —
+        `title` is never used alongside `data-tip`) and a short one-sentence
+        summary; the fuller nuance moved to a note under the table. No
+        `role="note"` on the `<th>` — that would override its implicit
+        `columnheader` role and break screen-reader table navigation."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=constraints", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        body = r.text
+        th_match = re.search(r"<th[^>]*>Severity</th>", body)
+        assert th_match, "Severity <th> not found"
+        th_tag = th_match.group(0)
+        assert "title=" not in th_tag
+        assert 'role="note"' not in th_tag, "role=note would override the <th>'s implicit columnheader role"
+        tip_match = re.search(r'data-tip="([^"]+)"', th_tag)
+        assert tip_match, "Severity <th> is missing data-tip"
+        tip_text = tip_match.group(1)
+        assert len(tip_text) < 160
+        # Soft-enforce: an error never blocks a query, only flips the
+        # validate-query verdict — the copy must not claim otherwise.
+        assert "enforcement is soft" in tip_text
+        aria_match = re.search(r'aria-label="([^"]+)"', th_tag)
+        assert aria_match, "Severity <th> is missing aria-label"
+        assert aria_match.group(1) == tip_text
+        # The fuller nuance (which constraint types are checkable today) now
+        # lives in a short note under the table, not squeezed into the tooltip.
+        assert "statically checkable today" in body
+
     def test_default_tab_is_datasets(self, seeded_app):
         _seed_model()
         c = seeded_app["client"]
@@ -328,6 +363,72 @@ class TestModelDetail:
         assert r.status_code == 200
         assert "customers" in r.text
         assert ">orders<" not in r.text
+
+    @staticmethod
+    def _chip_html(body: str) -> str:
+        """Slice out just the filter-chip element, so assertions on its
+        href/classes can't be satisfied by an unrelated `?tab=` link
+        elsewhere on the page (the tab nav, cross-links, ...)."""
+        start = body.index('data-testid="slb-filter-chip"')
+        # back up to the start of the enclosing <div ...>
+        start = body.rindex("<div", 0, start)
+        end = body.index("</div>", start) + len("</div>")
+        return body[start:end]
+
+    def test_active_filter_renders_a_removable_chip(self, seeded_app):
+        """A8 (issue #1707): tabs drop `q` on click with no indication it was
+        ever applied. A removable chip above the table makes the active
+        filter visible; its "x" links to the same tab without `q`. It is now
+        the page's only removable-filter control — the old `Clear`
+        link/search-box combo was redundant with it and was removed."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics&q=Orders", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-testid="slb-filter-chip"' in r.text
+        chip_html = self._chip_html(r.text)
+        assert "Orders" in chip_html
+        # The remove link must drop `q`, not merely restate it — scoped to
+        # the chip element, not the page (the tab nav also links `?tab=metrics`).
+        assert f'href="/semantic-layer/{_SLUG}?tab=metrics"' in chip_html
+        assert "q=Orders" not in chip_html
+        # The redundant `Clear` control next to the search box is gone.
+        assert ">Clear<" not in r.text
+
+    def test_no_filter_chip_when_q_is_absent(self, seeded_app):
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-testid="slb-filter-chip"' not in r.text
+
+    def test_filter_chip_escapes_special_characters_in_q(self, seeded_app):
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(
+            f"/semantic-layer/{_SLUG}?tab=metrics&q=%3Cscript%3Ealert(1)%3C/script%3E",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+
+    def test_filter_chip_caps_width_and_ellipsizes_a_long_value(self, seeded_app):
+        """A long `q` must not overflow the chip's fixed-height pill — the
+        value span carries the same max-width + ellipsis guard as the
+        library page's `.fbar-chip__vals` (filter_toolbar.css)."""
+        _seed_model()
+        c = seeded_app["client"]
+        long_q = "x" * 400
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=metrics&q={long_q}", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        chip_html = self._chip_html(r.text)
+        assert long_q in chip_html
+        assert "slb-filter-chip__value" in chip_html
+        style_block = r.text[: r.text.index("</style>")]
+        assert "max-width: 22rem" in style_block
+        assert "text-overflow: ellipsis" in style_block
+        assert "white-space: nowrap" in style_block
 
     def test_constraints_filter_matches_the_constraints_own_name(self, seeded_app):
         """Devin #1398: the constraint's own name (the linked first column) must
@@ -574,6 +675,33 @@ class TestObjectDetail:
         assert "never on email" in r.text
         assert "orders.customer_id = customers.customer_id" in r.text
 
+    def test_constraint_object_severity_uses_fast_tooltip_not_title(self, seeded_app):
+        """A7 (issue #1707): same fix as the constraints tab header, applied to
+        the badge on the constraint object page — no `title=`, a `[data-tip]`
+        + `aria-label` pair (same text, the repo convention) and a short
+        one-sentence summary. No `role="note"` here either, for consistency
+        with the other `[data-tip]` sites in the repo, none of which use it."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        body = r.text
+        span_match = re.search(r'<span class="badge[^"]*"[^>]*>error</span>', body)
+        assert span_match, "severity badge not found"
+        span_tag = span_match.group(0)
+        assert "title=" not in span_tag
+        assert 'role="note"' not in span_tag
+        tip_match = re.search(r'data-tip="([^"]+)"', span_tag)
+        assert tip_match, "severity badge is missing data-tip"
+        tip_text = tip_match.group(1)
+        assert len(tip_text) < 160
+        assert "enforcement is soft" in tip_text
+        aria_match = re.search(r'aria-label="([^"]+)"', span_tag)
+        assert aria_match, "severity badge is missing aria-label"
+        assert aria_match.group(1) == tip_text
+        # The fuller nuance moved to a short note under the panel.
+        assert "statically checkable today" in body
+
     def test_object_name_with_a_slash_is_reachable(self, seeded_app):
         """Devin #1398: an object name/term carrying a `/` (a glossary phrase
         like "ARR/MRR") must open its detail page — the object_id is a `:path`
@@ -693,3 +821,84 @@ class TestLibraryEntryPoint:
         r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         assert 'href="/semantic-layer"' in r.text
+
+
+class TestRegistryBackLink:
+    """The other half of the #1707 N4 deep link: a metric object page points
+    back at the same metric's row in the flat registry (`/catalog/semantics`),
+    which carries the SQL Agnes composed, the synonyms and the source badge
+    this page does not show.
+
+    Offered only when the metric actually projected — a metric whose only
+    expression is in an unusable dialect, or one the projector skipped, has no
+    registry row to return to."""
+
+    _BACK = 'href="/catalog/semantics?q=revenue#metrics"'
+
+    def _seed_projected_metric(self) -> None:
+        from src.repositories import metric_repo
+
+        # The id `src/semantic/projection.py::projected_metric_id` writes for
+        # the fixture document's `revenue` metric.
+        metric_repo().create(
+            id=f"manual/_/{_SLUG}/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category=_SLUG,
+            sql="SELECT SUM(amount) FROM orders",
+            source="manual",
+        )
+
+    def _object(self, seeded_app, path: str = f"/semantic-layer/{_SLUG}/metric:revenue"):
+        return seeded_app["client"].get(path, headers=_auth(seeded_app["admin_token"]))
+
+    def test_metric_object_page_links_back_to_its_registry_row(self, seeded_app):
+        _seed_model()
+        self._seed_projected_metric()
+        r = self._object(seeded_app)
+        assert r.status_code == 200, r.text
+        assert self._BACK in r.text
+
+    def test_no_back_link_when_the_metric_never_projected(self, seeded_app):
+        _seed_model()
+        r = self._object(seeded_app)
+        assert r.status_code == 200, r.text
+        assert "/catalog/semantics?q=" not in r.text
+
+    def test_no_back_link_when_the_registry_row_is_rbac_hidden(self, seeded_app):
+        """`/catalog/semantics` drops a metric whose table is outside the
+        caller's Data Package stack (#953), so an analyst who can read the
+        model but not the table would land on an empty filter."""
+        from src.repositories import metric_repo, table_registry_repo
+
+        row = _seed_model()
+        _grant_model(row["id"])
+        table_registry_repo().register(
+            id="orders_tbl",
+            name="orders_tbl",
+            description="test table",
+            source_type="keboola",
+            query_mode="materialized",
+        )
+        metric_repo().create(
+            id=f"manual/_/{_SLUG}/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category=_SLUG,
+            sql="SELECT SUM(amount) FROM orders_tbl",
+            table_name="orders_tbl",
+            source="manual",
+        )
+        r = seeded_app["client"].get(
+            f"/semantic-layer/{_SLUG}/metric:revenue",
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert "/catalog/semantics?q=" not in r.text
+
+    def test_non_metric_object_carries_no_registry_link(self, seeded_app):
+        _seed_model()
+        self._seed_projected_metric()
+        r = self._object(seeded_app, f"/semantic-layer/{_SLUG}/dataset:orders")
+        assert r.status_code == 200, r.text
+        assert "/catalog/semantics?q=" not in r.text

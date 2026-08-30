@@ -429,6 +429,138 @@ class TestTheSyncStrip:
         assert "semantic sources sweep exploded: boom" in body
 
 
+class TestTheStripAfterARestart:
+    """A10 (#1707): `_refresh_state` is in-memory BY DESIGN — "since last
+    process restart" — so every redeploy empties it. The strip then read
+    "Never synced yet." while /admin/semantic-sources listed the very same
+    sources synced that morning, two of them with errors.
+
+    The decision not to add a table stands; the SENTENCE was the bug. With no
+    sweep in this process the strip falls back to what the source rows already
+    carry durably — `max(last_sync_at)` across the ones actually imported from
+    — and says what that is: the last sync of ANY source, not a sweep. "Never
+    synced yet." survives for the one case where it is finally true.
+    """
+
+    def _body(self, seeded_app) -> str:
+        return seeded_app["client"].get("/admin/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
+
+    @staticmethod
+    def _register(source_id: str):
+        from src.repositories import semantic_source_repo
+
+        repo = semantic_source_repo()
+        repo.create(id=source_id, kind="upload", name=source_id, adapter="native", config={})
+        return repo
+
+    @classmethod
+    def _synced(cls, *ids: str, status: str = "ok") -> None:
+        for source_id in ids:
+            cls._register(source_id).record_sync(source_id, status=status, error=None)
+
+    def test_a_sweep_in_this_process_still_wins(self, seeded_app):
+        """The in-memory view is the richer one (counts, per-source results),
+        so it is never displaced by the fallback — even with synced rows
+        sitting right there to derive one from."""
+        from app.api.semantic_sources_refresh import _record_completion
+
+        self._synced("src-a")
+        _record_completion("ok", {"synced": 1, "failed": 0})
+
+        body = self._body(seeded_app)
+        assert "Last run" in body
+        assert "Last source sync" not in body
+        assert "Never synced yet" not in body
+
+    def test_a_failed_sweep_in_this_process_also_wins(self, seeded_app):
+        """Both in-memory states outrank the fallback, not just the happy one:
+        a sweep that blew up minutes ago is more urgent than a source that
+        synced this morning, and burying it under the older, calmer line would
+        be its own misreport."""
+        from app.api.semantic_sources_refresh import _record_completion
+
+        self._synced("src-a")
+        _record_completion("error", "semantic sources sweep exploded: boom")
+
+        body = self._body(seeded_app)
+        assert "semantic sources sweep exploded: boom" in body
+        assert "Last source sync" not in body
+
+    def test_no_sweep_but_synced_sources_reports_the_sources_own_last_sync(self, seeded_app):
+        from src.repositories import semantic_source_repo
+
+        self._synced("src-a", "src-b")
+        # A third row that has never synced is not part of the claim — but it
+        # IS part of the total, which is why the sentence says "N of M".
+        self._register("src-never")
+
+        body = self._body(seeded_app)
+        assert "Never synced yet" not in body
+        assert "Last source sync" in body
+        assert "no sweep since this instance restarted" in body
+        assert "across 2 of 3 sources" in body
+
+        newest = max(s["last_sync_at"] for s in semantic_source_repo().list_all() if s["last_sync_at"])
+        # Second precision: microseconds are noise, and the strip must print
+        # the stamp it actually compared.
+        assert newest.isoformat(timespec="seconds") in body
+        assert newest.isoformat() not in body or newest.microsecond == 0
+
+    def test_the_total_is_pluralized_on_the_registered_count(self, seeded_app):
+        self._synced("src-only")
+
+        body = self._body(seeded_app)
+        assert "across 1 of 1 source " in body
+        assert "across 1 of 1 sources" not in body
+
+    def test_a_skipped_row_is_not_a_sync(self, seeded_app):
+        """`record_sync(status='skipped')` — the duplicate-upstream skip —
+        stamps `last_sync_at` on a source nothing was ever imported from. Left
+        in, it inflates the count and can BE the max: a source that has never
+        been read setting the "last source sync" time is the same over-claim
+        this fallback removes."""
+        self._synced("src-skipped", status="skipped")
+
+        body = self._body(seeded_app)
+        assert "Last source sync" not in body
+        assert "Never synced yet" in body
+
+    def test_an_errored_sync_still_counts_as_a_sync(self, seeded_app):
+        """Unlike a skip, a failure means the source WAS read. The fallback is
+        "last sync of any kind", which is exactly why the sentence never says
+        it went well."""
+        self._synced("src-failed", status="error")
+
+        body = self._body(seeded_app)
+        assert "Last source sync" in body
+        # The strip's only success wording belongs to the sweep line.
+        assert "— OK." not in body
+
+    def test_sources_that_never_synced_still_read_never_synced_yet(self, seeded_app):
+        """The one state the old sentence was always true for: rows exist,
+        none of them has ever synced, no sweep has ever run."""
+        self._register("src-never")
+
+        body = self._body(seeded_app)
+        assert "Never synced yet" in body
+        assert "Last source sync" not in body
+
+    def test_sources_that_cannot_be_read_are_not_reported_as_never_synced(self, seeded_app, monkeypatch):
+        """A read that fails says nothing about history. Answering "Never
+        synced yet." from it would be the original bug in a second costume."""
+        import app.api.semantic_sources_refresh as sweep_module
+
+        def _boom():
+            raise RuntimeError("app-state unreachable")
+
+        monkeypatch.setattr(sweep_module, "semantic_source_repo", _boom)
+
+        body = self._body(seeded_app)
+        assert "Sync status unavailable" in body
+        assert "Never synced yet" not in body
+        assert "Last source sync" not in body
+
+
 def test_the_data_sources_page_shows_both_mismatch_codes():
     """Devin Review on #1248: the more serious warning was filtered out.
 
@@ -487,3 +619,60 @@ class TestTheHealthTabReportsSilentlyEmptySources:
         section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
         assert "danger" not in section
         assert "error" not in section
+
+    def test_the_finding_names_what_the_source_scanned(self, seeded_app):
+        """A17: "imported nothing" is the symptom; the scope is what the
+        admin can act on."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        assert "scan_scope" in section
+        assert "scanned ${s.scan_scope}" in section
+
+    def test_an_absent_scope_adds_nothing_to_the_finding(self, seeded_app):
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        assert 'typeof s.scan_scope === "string"' in section
+
+    def test_the_scope_is_rendered_as_text_never_as_markup(self, seeded_app):
+        """It is composed from admin-supplied config (a repo URL, a database
+        name), so it goes through createTextNode, never innerHTML."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        scoped_line = [line for line in section.splitlines() if "scanned ${s.scan_scope}" in line]
+        assert scoped_line, section
+        assert all("innerHTML" not in line for line in section.splitlines())
+
+
+class TestTheHealthTabReportsSkippedSources:
+    """The page twin of the CLI section: `hlRender` filtered `sources` on
+    `error` and `ok`+0 only, so a source the sweep permanently SKIPS (its
+    connector deconfigured) produced no section AND left the headline reading
+    "No sync failures, disconnected models, or invalid documents."
+
+    Client-rendered, so what is pinned is the shell it renders FROM.
+    """
+
+    def _body(self, seeded_app) -> str:
+        return (
+            seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
+        )
+
+    def test_the_report_has_its_own_section(self, seeded_app):
+        assert "Sources that are not syncing (skipped)" in self._body(seeded_app)
+
+    def test_the_section_selects_skipped_rows(self, seeded_app):
+        predicate = self._body(seeded_app).split("const skippedSources")[1].split(";")[0]
+        assert 'last_sync_status === "skipped"' in predicate
+
+    def test_the_finding_suppresses_the_nothing_is_wrong_headline(self, seeded_app):
+        nothing_wrong = self._body(seeded_app).split("const nothingWrong")[1].split(";")[0]
+        assert "skippedSources" in nothing_wrong
+
+    def test_it_is_not_rendered_with_error_styling(self, seeded_app):
+        """Nothing failed — the sweep declined to try — so it must not borrow
+        the failure vocabulary (design system: no danger accent for an
+        attention state)."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that are not syncing (skipped)"')[1].split("});")[0]
+        assert "danger" not in section
+        assert "error" not in section.replace("last_sync_error", "")

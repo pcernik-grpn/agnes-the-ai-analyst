@@ -224,6 +224,15 @@ def ensure_semantic_source() -> str | None:
     unconfigured instance would otherwise carry a semantic source that fails
     on every run, forever, for a warehouse it does not have.
 
+    That gate covers CREATION only — an existing row short-circuits above it,
+    by design (see below), so a workspace deconfigured AFTER registration
+    reaches the same broken state from the other direction. What covers it is
+    the sweep: ``DatabricksMetricViewAdapter.unconfigured_reason`` reports the
+    missing configuration and the sweep skips the row
+    (``skipped_not_configured``) instead of importing it into a guaranteed
+    failure. Skipped, never deleted — this function must not "clean up" a row
+    an admin may be one credential away from using again.
+
     Never a get-or-*replace*: an existing row keeps whatever an admin did to
     it (rename, disable, narrower ``config.catalogs``).
 

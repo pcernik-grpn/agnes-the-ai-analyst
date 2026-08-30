@@ -1077,7 +1077,7 @@ class ChatManager:
             dynamic_prof = None
             if agent_row:
                 try:
-                    dynamic_prof = agent_profile.build_profile(agent_row)
+                    dynamic_prof = agent_profile.build_profile(agent_row, user_email=session.user_email)
                 except Exception:
                     logger.exception(
                         "agent profile build failed for agent_id=%s — falling back to static/default profile",

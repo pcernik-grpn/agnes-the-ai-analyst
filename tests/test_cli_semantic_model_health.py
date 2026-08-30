@@ -148,3 +148,116 @@ class TestSourcesThatSyncedButImportedNothing:
         """`null` means "cannot say", not "owns nothing"."""
         result = self._run([self._source("murky", status="ok", owned=None)])
         assert "synced but imported nothing" not in result.output
+
+
+class TestSourcesTheSweepIsSkipping:
+    """A source the sweep SKIPS lands in no section at all: this renderer
+    filtered `sources` on `error` and `ok`+0 only, so a Databricks/Snowflake
+    source whose connector was deconfigured — permanently skipped, never
+    synced again until an admin acts — read as "No sync failures…", the exact
+    all-clear the skip was introduced to stop being noisy about.
+
+    One section for every `skipped` row, each carrying its OWN recorded
+    reason: the sweep records `last_sync_status='skipped'` for a
+    not-configured connector and for a duplicate upstream project, and the
+    row carries no machine-readable discriminator between them — naming the
+    section after one of the two would mislabel the other.
+    """
+
+    @staticmethod
+    def _skipped(source_id: str, reason: str) -> dict:
+        return {
+            "source_id": source_id,
+            "name": source_id.title(),
+            "last_sync_status": "skipped",
+            "last_sync_at": "2026-08-30T10:00:00Z",
+            "last_sync_error": reason,
+            "owned_model_count": 2,
+        }
+
+    def _run(self, sources: list[dict]):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, _health_body(sources=sources))):
+            return runner.invoke(app, ["semantic-model", "health"])
+
+    def test_a_skipped_source_is_reported_with_its_reason(self):
+        result = self._run([self._skipped("warehouse", "Databricks is not configured on this instance")])
+        assert result.exit_code == 0
+        assert "Sources that are not syncing (skipped) (1):" in result.output
+        assert "Warehouse" in result.output
+        assert "Databricks is not configured on this instance" in result.output
+
+    def test_it_suppresses_the_nothing_is_wrong_line(self):
+        result = self._run([self._skipped("warehouse", "Databricks is not configured on this instance")])
+        assert "No sync failures, disconnected models, or invalid documents." not in result.output
+
+    def test_it_is_not_styled_as_a_failure(self):
+        """Nothing failed — the sweep declined to try. It must not borrow the
+        failure vocabulary, same rule as the empty-sync section."""
+        result = self._run([self._skipped("warehouse", "Databricks is not configured on this instance")])
+        assert "Sync failures" not in result.output
+
+    def test_a_healthy_source_is_not_reported(self):
+        healthy = {
+            "source_id": "warehouse",
+            "name": "Warehouse",
+            "last_sync_status": "ok",
+            "last_sync_at": "2026-08-30T10:00:00Z",
+            "last_sync_error": None,
+            "owned_model_count": 4,
+        }
+        result = self._run([healthy])
+        assert "not syncing (skipped)" not in result.output
+        assert "No sync failures, disconnected models, or invalid documents." in result.output
+
+
+class TestTheScanScopeOnTheEmptySourceFinding:
+    """Finding A17 on #1707: the finding says a source imported nothing; the
+    scope says where it looked, which is the half the admin can act on."""
+
+    @staticmethod
+    def _source(source_id: str, *, scope: str | None) -> dict:
+        return {
+            "source_id": source_id,
+            "name": source_id.title(),
+            "last_sync_status": "ok",
+            "last_sync_at": None,
+            "last_sync_error": None,
+            "owned_model_count": 0,
+            "scan_scope": scope,
+        }
+
+    def _run(self, sources: list[dict]):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, _health_body(sources=sources))):
+            return runner.invoke(app, ["semantic-model", "health"])
+
+    def test_the_finding_names_what_was_scanned(self):
+        result = self._run([self._source("warehouse", scope="ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE")])
+        assert result.exit_code == 0
+        assert "scanned ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE" in result.output
+
+    def test_it_keeps_the_forward_hint(self):
+        result = self._run([self._source("warehouse", scope="ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE")])
+        assert "check this source's scope/config" in result.output
+
+    def test_a_source_with_no_derivable_scope_still_reports_the_finding(self):
+        result = self._run([self._source("warehouse", scope=None)])
+        assert "Sources that synced but imported nothing (1):" in result.output
+        assert "scanned" not in result.output
+
+    def test_a_skipped_source_is_untouched_by_this_field(self):
+        """The two sections landed in the same release (#1828 + A17) and read
+        the same `sources` list: a skipped row belongs to the skip section
+        only, and carries no scan-scope claim into it."""
+        skipped = {
+            "source_id": "warehouse",
+            "name": "Warehouse",
+            "last_sync_status": "skipped",
+            "last_sync_at": "2026-08-30T10:00:00Z",
+            "last_sync_error": "Databricks is not configured on this instance",
+            "owned_model_count": 0,
+            "scan_scope": "ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE",
+        }
+        result = self._run([skipped])
+        assert "Sources that are not syncing (skipped) (1):" in result.output
+        assert "synced but imported nothing" not in result.output
+        assert "scanned" not in result.output

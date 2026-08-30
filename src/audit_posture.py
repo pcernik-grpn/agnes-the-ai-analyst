@@ -425,21 +425,21 @@ POSTURE: dict[str, str] = {
     "POST /api/semantic-feedback": "semantic_feedback.submit",
     # -- app.api.semantic_layer_coverage ---------------------------------------
     # The coverage-tag pair writes no row of its own yet — the generic
-    # AuditFallbackMiddleware is its only coverage, same as the sibling
-    # semantic-model writes below. The mute pair does write its own row.
+    # AuditFallbackMiddleware is its only coverage. The mute pair and the
+    # semantic-model package link/unlink pair below do write their own rows.
     "DELETE /api/admin/semantic-layer/mutes/{mute_id}": "semantic_health_mute.delete",
     "DELETE /api/admin/semantic-model/coverage/tags/{tag_id}": "fallback",
     "POST /api/admin/semantic-layer/mutes": "semantic_health_mute.create",
     "POST /api/admin/semantic-model/coverage/tags": "fallback",
     # -- app.api.semantic_models -----------------------------------------------
     "DELETE /api/admin/semantic-models/{model_id:path}": "fallback",
-    "DELETE /api/admin/semantic-models/{slug}/packages/{package_id}": "fallback",
+    "DELETE /api/admin/semantic-models/{slug}/packages/{package_id}": "semantic_model.unlink_package",
     "DELETE /api/admin/semantic-sources/{source_id}": "fallback",
     "POST /api/admin/semantic-auto-draft-sweep": "semantic_auto_draft_sweep",
     "POST /api/admin/semantic-models": "fallback",
     "POST /api/admin/semantic-models/{model_id:path}/detach": "semantic_model.detach",
     "POST /api/admin/semantic-models/{model_id:path}/reattach": "semantic_model.reattach",
-    "POST /api/admin/semantic-models/{slug}/packages": "fallback",
+    "POST /api/admin/semantic-models/{slug}/packages": "semantic_model.link_package",
     "POST /api/admin/semantic-sources": "fallback",
     "POST /api/admin/semantic-sources/{source_id}/sync": "fallback",
     "POST /api/semantic-models/apply": "authoring_suggestion.submit",
@@ -548,4 +548,17 @@ POSTURE: dict[str, str] = {
     "POST /auth/logout": "fallback",
     "POST /me/profile/refetch-groups": "exempt:debug_dry_run_no_write",
     "POST /slack/bind": "slack.bind",
+}
+
+# Forward declaration for the #1802 wave-2 read-posture ratchet, which lives
+# on `integration` (READ_POSTURE + tests/test_audit_read_posture.py) and has
+# not reached this branch yet. Deliberately NOT named READ_POSTURE: a second
+# module-level binding of that name would silently shadow integration's real
+# ~400-row dict if a merge resolution keeps both sides (last binding wins).
+# Nothing on this base reads this dict. On the merge, union these rows into
+# integration's READ_POSTURE and delete this block.
+PENDING_READ_POSTURE: dict[str, str] = {
+    # Same fold the /admin/data-sources template inlines at render time, for
+    # the page's own repaint — no data content, secrets, or other users' data.
+    "GET /api/admin/source-pipelines": "exempt:ui_support",
 }

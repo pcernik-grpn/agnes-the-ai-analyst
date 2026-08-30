@@ -2198,7 +2198,32 @@ def _library_row_base(
     }
 
 
-def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
+def _readable_semantic_model_rows(user: dict, conn, *, surface: str) -> list[dict]:
+    """Every ``semantic_models`` row this caller can read — the ONE
+    ``_can_read_model`` sweep a request is allowed to pay for.
+
+    ``_can_read_model`` resolves a model's Data Packages per row, so the sweep
+    is O(models) repository reads: a page that ran it twice (the browse-link
+    gate and the per-metric deep-link map, #1707) doubled that for an answer it
+    already had. Callers that need both take this list once and derive both
+    from it; nothing here is cached beyond the request, since a grant revoked
+    mid-session must take effect on the next page load.
+
+    Best-effort by contract: every caller renders LINKS off this, so a
+    ``semantic_models`` read failure degrades to "no readable rows" and leaves
+    the rest of the page intact rather than 500ing it. ``surface`` only labels
+    the log.
+    """
+    try:
+        from app.api.semantic_models import _can_read_model
+
+        return [row for row in semantic_model_repo().list_all() if _can_read_model(user, row, conn)]
+    except Exception as e:  # noqa: BLE001 - the links are best-effort
+        logger.warning("%s: semantic-model existence check failed: %s", surface, e)
+        return []
+
+
+def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Optional[list[dict]] = None) -> bool:
     """Whether to offer this caller the ``/semantic-layer`` browse pages.
 
     The same ``_can_read_model`` gate those pages apply, so a caller who can
@@ -2216,14 +2241,13 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
     header + empty state. One reader, because the two disagreeing is exactly
     how the standalone page came to claim "no metrics registered yet" on an
     instance whose Library was already offering the document next door.
-    """
-    try:
-        from app.api.semantic_models import _can_read_model
 
-        return any(_can_read_model(user, row, conn) for row in semantic_model_repo().list_all())
-    except Exception as e:  # noqa: BLE001 - the link is best-effort
-        logger.warning("%s: semantic-model existence check failed: %s", surface, e)
-        return False
+    ``rows`` passes in a sweep the caller already did this request (see
+    :func:`_readable_semantic_model_rows`) — same answer, no second sweep.
+    """
+    if rows is None:
+        rows = _readable_semantic_model_rows(user, conn, surface=surface)
+    return bool(rows)
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -3612,6 +3636,103 @@ async def skills_page(
     return templates.TemplateResponse(request, "skills.html", ctx)
 
 
+def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
+    """``{metric_definitions id: object-page URL}`` for every metric of every
+    semantic model the caller can read (#1707).
+
+    The two views of one metric — the flat registry on ``/catalog/semantics``
+    and the document object at ``/semantic-layer/{slug}/metric:{name}`` — had
+    no link between them. The join is the projector's own id formula
+    (``app/web/semantic_layer_view.py::projected_metric_ids`` →
+    ``src/semantic/projection.py::projected_metric_id``): a row whose id is a
+    key here came out of a document object and gets the link, a hand-authored
+    or ``yaml_import`` row has no object and gets none.
+
+    ``readable_rows`` is the caller's own ``_readable_semantic_model_rows``
+    sweep — taken as an argument rather than re-swept here, because the pages
+    that want these links also want the browse-link gate off the same list.
+
+    Built from the NEWEST readable row per slug — the row
+    ``_readable_model_by_slug`` resolves the link to — so a link this map
+    offers cannot land on a different row than the one it was computed from
+    (the same same-slug hazard the model list dedupes for, Devin #1398).
+
+    Best-effort by contract, like ``_has_readable_semantic_model``: every
+    caller renders LINKS off this, so a document that will not parse must
+    degrade to "no links" rather than 500 the page.
+    """
+    from urllib.parse import quote
+
+    try:
+        from app.web.semantic_layer_view import object_id, projected_metric_ids
+
+        newest_by_slug: dict[str, dict] = {}
+        for row in readable_rows:
+            current = newest_by_slug.get(row["slug"])
+            if current is None or str(row.get("updated_at") or "") > str(current.get("updated_at") or ""):
+                newest_by_slug[row["slug"]] = row
+
+        hrefs: dict[str, str] = {}
+        for slug, row in newest_by_slug.items():
+            for metric_id, metric_name in projected_metric_ids(row).items():
+                # The NAME is percent-encoded, the `<type>:` prefix is not —
+                # the route splits `object_id` on its first literal colon, so
+                # encoding the composed segment whole would 404.
+                hrefs[metric_id] = f"/semantic-layer/{quote(slug)}/{object_id('metric', quote(metric_name))}"
+        return hrefs
+    except Exception as e:  # noqa: BLE001 - the links are best-effort
+        logger.warning("/catalog/semantics: metric → document link resolution failed: %s", e)
+        return {}
+
+
+def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> Optional[str]:
+    """The ``/catalog/semantics`` URL that lands on this document metric's
+    projected row, or ``None`` when the metric has no row this caller would
+    see there (#1707).
+
+    The return leg of ``_document_metric_hrefs``, resolved the same way: the
+    id the projector would have written for this ``(row, metric)`` either
+    exists in ``metric_definitions`` or it does not. Skipped metrics (no
+    usable expression, unresolvable binding) legitimately have no row, and a
+    link into a filter that matches nothing is worse than no link.
+
+    The row must also survive the metric RBAC filter that page applies
+    (``_first_inaccessible_table``, #953) — a caller whose Data Package stack
+    hides the projected metric's tables would land on an empty filter.
+    Nothing is leaked either way: they are already reading the metric's own
+    object page.
+
+    Best-effort for the same reason as the forward map: a repository failure
+    must cost the link, not the page.
+    """
+    from urllib.parse import quote
+
+    try:
+        from app.api.metrics import _first_inaccessible_table
+        from app.web.semantic_layer_view import projected_metric_ids
+        from src.rbac import get_accessible_tables
+
+        expected = sorted(mid for mid, name in projected_metric_ids(row).items() if name == metric_name)
+        rows = [r for r in (metric_repo().get(mid) for mid in expected) if r]
+        if not rows:
+            return None
+        accessible_ids = get_accessible_tables(user, conn)
+        allowed = None if accessible_ids is None else set(accessible_ids)
+        visible = [r for r in rows if _first_inaccessible_table(r, allowed) is None]
+        if not visible:
+            return None
+        # The filter term is the REGISTRY row's own `name`, not the document's
+        # — identical today (the projector writes one from the other), but the
+        # row can be renamed through `POST /api/admin/metrics` under the same
+        # id, and this link has to match what `/catalog/semantics` indexes.
+        # `expected` is sorted so a document declaring the same metric name in
+        # two models resolves to the same row on every render.
+        return f"/catalog/semantics?q={quote(str(visible[0].get('name') or metric_name))}#metrics"
+    except Exception as e:  # noqa: BLE001 - the link is best-effort
+        logger.warning("/semantic-layer: registry back-link resolution failed: %s", e)
+        return None
+
+
 @router.get("/catalog/semantics", response_class=HTMLResponse)
 async def catalog_semantics(
     request: Request,
@@ -3675,12 +3796,24 @@ async def catalog_semantics(
     # what the text looks like — see its docstring). Rendered as pure markdown,
     # an HTML-dialect description escaped into entities and then unescaped back
     # into visible `<p><strong>` characters in both projections.
+    #
+    # `model_href` is the per-row door into the document browser: set only for
+    # a row projected from a document object this caller can read, absent for
+    # a hand-authored or yaml_import metric that has no such object.
+    #
+    # ONE `_can_read_model` sweep per request, shared with the page header's
+    # browse-link gate below — the check costs a Data Package resolution per
+    # model, so running it once for the links and again for the gate doubled
+    # the page's semantic-layer cost for an answer it already had.
+    readable_models = _readable_semantic_model_rows(user, conn, surface="/catalog/semantics")
+    document_hrefs = _document_metric_hrefs(readable_models)
     metrics = [
         {
             **m,
             "description_html": render_safe(m.get("description"), html_source=stores_html(m)),
             "description_text": render_plain(m.get("description"), html_source=stores_html(m)),
             "sql_variants": _variants(m.get("sql_variants")),
+            "model_href": document_hrefs.get(m.get("id")),
         }
         for m in metrics
     ]
@@ -3705,12 +3838,16 @@ async def catalog_semantics(
         metric_categories=metric_categories,
         metric_count=len(metrics),
         glossary_count=glossary_count,
-        # The door to /semantic-layer. Both pages are titled "Semantic layer"
-        # and this is the reachable one, so without the link a document with
+        # The door to Semantic models (/semantic-layer). Both pages were once
+        # titled "Semantic layer" (this one is now "Metrics & glossary", see
+        # tests/test_semantic_page_names_contract.py) and this is the more
+        # reachable one, so without the link a document with
         # datasets and relationships but no metrics rendered as "there is no
         # semantic layer here". Same gate /library's Definitions footer uses —
         # a readable document, never this page's own metric/glossary counts.
-        has_semantic_models=_has_readable_semantic_model(user, conn, surface="/catalog/semantics"),
+        has_semantic_models=_has_readable_semantic_model(
+            user, conn, surface="/catalog/semantics", rows=readable_models
+        ),
     )
     return templates.TemplateResponse(request, "catalog_semantics.html", ctx)
 
@@ -4057,6 +4194,17 @@ async def semantic_layer_object(
         ai_instructions_and_examples(obj) if object_type in ("dataset", "metric", "relationship") else (None, [])
     )
 
+    # The way back to the flat registry (#1707): this page renders the
+    # document object, `/catalog/semantics` renders the projected row (the
+    # composed SQL, synonyms, source badge). Offered only when the metric
+    # actually projected — the projector skips a metric with no usable
+    # expression or an unresolvable binding, and a link to a registry that
+    # never received the row lands on an empty filter. `?q=` is the filter
+    # prefill that page's client-side search reads; `#metrics` selects the tab.
+    registry_href = None
+    if object_type == "metric":
+        registry_href = _registry_href_for_metric(row, obj.get("name") or object_name, user, conn)
+
     # Keyed case-insensitively to match find_object's resolution — otherwise a
     # relationship spelling a dataset with different casing renders as unlinked
     # text even though its target page resolves fine (Devin #1398).
@@ -4081,6 +4229,7 @@ async def semantic_layer_object(
         ai_instructions=instructions,
         ai_examples=examples,
         expressions=metric_expressions(obj) if object_type == "metric" else None,
+        registry_href=registry_href,
         from_dataset=datasets_by_name.get(str(obj.get("from") or "").casefold())
         if object_type == "relationship"
         else None,
@@ -7381,7 +7530,7 @@ def _source_inventory(user: dict | None = None) -> dict:
     different table and the client would otherwise need four more round-trips
     per card. The strip is what makes a source card answer "is this project
     healthy AND is anyone getting its data", which previously took four pages
-    (Data sources, Tables, Sync, Semantic layer) to assemble by hand.
+    (Data sources, Tables, Sync, Semantic layer health) to assemble by hand.
 
     Per-connector by construction rather than a fixed four: the semantic cell
     is Keboola-only (the Metastore is a Keboola API) and the cost cell is
@@ -8228,7 +8377,7 @@ async def admin_semantic_layer_page(
     connected sources, so a scope the picker offers is always a scope something
     is actually scored on.
     """
-    from app.api.semantic_sources_refresh import get_last_refresh_summary
+    from app.api.semantic_sources_refresh import get_sync_status_summary
     from app.resource_types import RESOURCE_TYPES, ResourceType
     from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
@@ -8307,7 +8456,10 @@ async def admin_semantic_layer_page(
     # The whole-sweep status the strip renders, and what its "Sync now"
     # button triggers: since #1707 Block 3 step 4 there is ONE scheduled
     # semantic refresh over every registered source, not a per-connector one.
-    ctx["semantic_refresh_summary"] = get_last_refresh_summary()
+    # Composed, not raw: the sweep summary is in-memory and therefore empty
+    # after every redeploy, so this carries a durable fallback derived from
+    # the sources' own `last_sync_at` for the strip to label as what it is.
+    ctx["semantic_refresh_summary"] = get_sync_status_summary()
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
 
 

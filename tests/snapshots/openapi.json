@@ -29279,7 +29279,7 @@
     },
     "/api/admin/semantic-sources": {
       "get": {
-        "description": "Every registered source, each with the number of semantic models it\nOWNS (``owned_model_count``).\n\nThe count is derived, never stored (see ``src/semantic/ownership.py``):\n``last_sync_status='ok'`` answers \"did the fetch work\", not \"did it bring\nanything back\", so a source scoped at an upstream with nothing in it is\notherwise indistinguishable from a healthy one (#1707). ``null`` means the\nsource's provenance could not be resolved \u2014 \"cannot say\", not \"owns none\".",
+        "description": "Every registered source, each with the number of semantic models it\nOWNS (``owned_model_count``) and what it SCANS (``scan_scope``).\n\nBoth are derived, never stored (``src/semantic/ownership.py``,\n``src/semantic/scan_scope.py``). ``last_sync_status='ok'`` answers \"did\nthe fetch work\", not \"did it bring anything back\", so a source scoped at\nan upstream with nothing in it is otherwise indistinguishable from a\nhealthy one (#1707); and a count of 0 alone still cannot separate \"there\nis nothing upstream\" from \"the role I connect as cannot see it\", which is\nwhy the scope names the database/schema/role (or project, catalog,\nrepository) the sync actually looked at. ``owned_model_count: null`` means\nthe source's provenance could not be resolved \u2014 \"cannot say\", not \"owns\nnone\"; ``scan_scope: null`` means no scope could be derived from this\nsource's config.",
         "operationId": "list_semantic_sources_api_admin_semantic_sources_get",
         "parameters": [
           {
@@ -29459,7 +29459,7 @@
         ]
       },
       "get": {
-        "description": "One source, same shape as the list row \u2014 ``owned_model_count`` and all.",
+        "description": "One source, same shape as the list row \u2014 ``owned_model_count``,\n``scan_scope`` and all.",
         "operationId": "get_semantic_source_api_admin_semantic_sources__source_id__get",
         "parameters": [
           {
@@ -32081,6 +32081,60 @@
           }
         },
         "summary": "Test Connection",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/source-pipelines": {
+      "get": {
+        "description": "The per-source pipeline strip \u2014 tables \u2192 sync \u2192 semantic \u2192 feeds.\n\nRead-only, and deliberately no new data: it returns exactly the dict\n``/admin/data-sources`` inlines into its own HTML (``SOURCE_PIPELINES``),\nfrom the same ``_source_pipelines()`` fold. The page needs it because\neverything on it \u2014 the Add-tables wizard, package creation, token\nsaves \u2014 happens over fetch, so a strip baked at render time kept\nreporting \"Add the first tables \u2192 / Never synced / 0 packages\" long\nafter the admin had registered two dozen tables. Same admin gate as the\npage, so this exposes nothing the caller could not already read there.\n\n``user`` is threaded through for the one caller-scoped cell (a\nSharePoint source's facts/edges counts); every other cell is\ncaller-independent.",
+        "operationId": "get_source_pipelines_api_admin_source_pipelines_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Source Pipelines",
         "tags": [
           "admin"
         ]

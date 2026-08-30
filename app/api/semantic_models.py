@@ -52,6 +52,7 @@ from src.semantic.cache_render import DEFAULT_TTL_SECONDS
 from src.semantic.document_validation import validate_document
 from src.semantic.ownership import with_owned_model_count
 from src.semantic.projection import project_document, prune_model
+from src.semantic.scan_scope import with_scan_scope
 from src.semantic_context import get_semantic_context as _get_semantic_context
 from src.semantic_context import get_semantic_schema as _get_semantic_schema
 from src.semantic_validation import validate_query
@@ -991,6 +992,13 @@ async def link_semantic_model_package(
     if not data_packages_repo().get(body.package_id):
         raise HTTPException(status_code=404, detail="data_package_not_found")
     repo.link_package(body.package_id, model["id"])
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_model.link_package",
+        resource=model["id"],
+        params={"slug": slug, "package_id": body.package_id},
+    )
     return {"package_ids": repo.list_packages_for_model(model["id"])}
 
 
@@ -1018,6 +1026,13 @@ async def unlink_semantic_model_package(
     if model is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{slug}' not found")
     repo.unlink_package(package_id, model["id"])
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_model.unlink_package",
+        resource=model["id"],
+        params={"slug": slug, "package_id": package_id},
+    )
     return {"package_ids": repo.list_packages_for_model(model["id"])}
 
 
@@ -1044,24 +1059,45 @@ async def delete_semantic_model(model_id: str, user: dict = Depends(require_admi
 # ---------------------------------------------------------------------------
 # Admin: semantic-sources CRUD + sync
 #
-# Every read AND write response goes through `with_owned_model_count`, so a
-# caller that renders any of them into the same table never has to special-
-# case a missing field (#1707).
+# Every read AND write response goes through `_annotated`, so a caller that
+# renders any of them into the same table never has to special-case a missing
+# field (#1707).
 # ---------------------------------------------------------------------------
+
+
+def _annotated(sources: list[dict]) -> list[dict]:
+    """Source rows as the API publishes them: the repository row plus the two
+    derived fields every surface shows beside its sync status (#1707).
+
+    `owned_model_count` (src/semantic/ownership.py) answers "did the last sync
+    bring anything back"; `scan_scope` (src/semantic/scan_scope.py) answers
+    "what did it look at". Neither is stored, and the pair is what separates
+    "upstream really is empty" from "the role/scope cannot see it" — a
+    Snowflake source whose role holds no grant on an existing semantic view
+    syncs `ok`, owns 0 models, and is otherwise indistinguishable from a
+    healthy one.
+    """
+    return with_scan_scope(with_owned_model_count(sources))
 
 
 @router.get("/api/admin/semantic-sources")
 async def list_semantic_sources(enabled_only: bool = False, user: dict = Depends(require_admin)):
     """Every registered source, each with the number of semantic models it
-    OWNS (``owned_model_count``).
+    OWNS (``owned_model_count``) and what it SCANS (``scan_scope``).
 
-    The count is derived, never stored (see ``src/semantic/ownership.py``):
-    ``last_sync_status='ok'`` answers "did the fetch work", not "did it bring
-    anything back", so a source scoped at an upstream with nothing in it is
-    otherwise indistinguishable from a healthy one (#1707). ``null`` means the
-    source's provenance could not be resolved — "cannot say", not "owns none".
+    Both are derived, never stored (``src/semantic/ownership.py``,
+    ``src/semantic/scan_scope.py``). ``last_sync_status='ok'`` answers "did
+    the fetch work", not "did it bring anything back", so a source scoped at
+    an upstream with nothing in it is otherwise indistinguishable from a
+    healthy one (#1707); and a count of 0 alone still cannot separate "there
+    is nothing upstream" from "the role I connect as cannot see it", which is
+    why the scope names the database/schema/role (or project, catalog,
+    repository) the sync actually looked at. ``owned_model_count: null`` means
+    the source's provenance could not be resolved — "cannot say", not "owns
+    none"; ``scan_scope: null`` means no scope could be derived from this
+    source's config.
     """
-    return with_owned_model_count(semantic_source_repo().list_all(enabled_only=enabled_only))
+    return _annotated(semantic_source_repo().list_all(enabled_only=enabled_only))
 
 
 @router.post("/api/admin/semantic-sources", status_code=201)
@@ -1088,17 +1124,19 @@ async def create_semantic_source(body: SemanticSourceCreate, user: dict = Depend
     )
     # Same shape as the list row — a caller that renders the POST response
     # straight into the table must not have to special-case a missing field
-    # (it is 0 here by definition: nothing has synced yet).
-    return with_owned_model_count([created])[0]
+    # (`owned_model_count` is 0 here by definition: nothing has synced yet,
+    # while `scan_scope` already says what the first sync will look at).
+    return _annotated([created])[0]
 
 
 @router.get("/api/admin/semantic-sources/{source_id}")
 async def get_semantic_source(source_id: str, user: dict = Depends(require_admin)):
-    """One source, same shape as the list row — ``owned_model_count`` and all."""
+    """One source, same shape as the list row — ``owned_model_count``,
+    ``scan_scope`` and all."""
     row = semantic_source_repo().get(source_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
-    return with_owned_model_count([row])[0]
+    return _annotated([row])[0]
 
 
 @router.put("/api/admin/semantic-sources/{source_id}")
@@ -1108,11 +1146,11 @@ async def update_semantic_source(source_id: str, body: SemanticSourceUpdate, use
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
     fields = body.model_dump(exclude_unset=True)
     if not fields:
-        return with_owned_model_count([repo.get(source_id)])[0]
+        return _annotated([repo.get(source_id)])[0]
     if fields.get("adapter") is not None:
         _assert_known_adapter(fields["adapter"])
     _assert_no_provenance_override(fields.get("config"))
-    return with_owned_model_count([repo.update(source_id, **fields)])[0]
+    return _annotated([repo.update(source_id, **fields)])[0]
 
 
 @router.delete("/api/admin/semantic-sources/{source_id}", status_code=204)

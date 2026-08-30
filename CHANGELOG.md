@@ -10,6 +10,47 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **The two views of one metric now link to each other (#1707).** The metric
+  registry on `/catalog/semantics` (the flat projection) and the semantic
+  document browser on `/semantic-layer` render the same metric twice with no
+  path between them: a reader on either page had to know the other existed and
+  find the metric again by hand. A registry row projected from a document
+  object now carries an **"Open in the model →"** link to
+  `/semantic-layer/{slug}/metric:{name}`, and that object page carries **"Open
+  in the metric registry →"** back. Both directions are resolved through the
+  projector's own id formula, so a metric authored by hand or imported from
+  YAML — which has no document object — renders no link, and neither does one
+  whose model the caller cannot read. The registry link lands filtered
+  (`/catalog/semantics?q=<metric>`), on the row it means rather than on the
+  full list.
+- **A semantic source now reports WHAT it scanned, not only that the scan
+  worked (#1707).** Observed live: a Snowflake semantic view existed, the role
+  Agnes connects as held no privilege on it, `SHOW SEMANTIC VIEWS` came back
+  empty — and the source reported `ok` with zero owned models, identical to a
+  correctly-scoped source pointed at an upstream that genuinely holds nothing.
+  "There is nothing upstream" and "I cannot see it, and I am not saying so"
+  are different statements, and the second is a misconfiguration an admin has
+  to fix. The four surfaces that already show `owned_model_count` now also
+  carry `scan_scope`: `GET /api/admin/semantic-sources` (list, single-source
+  `GET`, and the `POST`/`PUT` responses), the `sources` block of `GET
+  /api/admin/semantic-layer/health`, the **Last sync** cell on
+  `/admin/semantic-sources` (`✓ ok · <when> · scanned ESHOP_DEMO.RAW as
+  ESHOP_DEMO_ROLE`), and `agnes admin semantic source list`. The health
+  report's **"Sources that synced but imported nothing"** finding names the
+  scope too — on the `/admin/semantic-layer` Health tab and in `agnes admin
+  semantic health` — so the finding points at the grant to check instead of
+  ending at "check this source's config". Per adapter: Snowflake reports
+  database, schema (or `(whole database)`) and the ROLE it connects as;
+  Keboola the project its connection is bound to; Databricks the Unity
+  Catalog catalogs and workspace; a git source its repository, ref and file
+  glob (stated even when it is the default — a repo of `*.yml` documents
+  against the default `**/*.yaml` clones fine and matches nothing, which is
+  the same failure in git shape); an upload source its document count. Derived from the source's own config at
+  read time (`src/semantic/scan_scope.py`) and never stored — the scope is a
+  property of the row, not of a run — so nothing can drift, and an adapter
+  with no resolver reports `null` and every surface omits it. Coordinates
+  only: no token, no credential env-var name, and any URL echoed has its
+  `user:pass@` userinfo stripped first.
 - **A semantic source that syncs successfully and imports nothing is no longer
   indistinguishable from a healthy one (#1707).** `last_sync_status='ok'` says
   the fetch worked, not that it brought anything back — a `connection` source
@@ -451,6 +492,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
 ### Changed
+- **Each semantic-layer page has a name of its own (#1707).** Three of the four
+  rendered the identical title "Semantic layer", so a browser tab, a bookmark
+  or a history entry could not tell them apart, and a link's label routinely
+  disagreed with its target's name. They are now **Semantic models**
+  (`/semantic-layer` — the stored documents), **Metrics & glossary**
+  (`/catalog/semantics` — the flat projection), **Semantic layer health**
+  (`/admin/semantic-layer`, also the admin-nav tab) and **Semantic sources**
+  (`/admin/semantic-sources`, unchanged); every link label pointing at them —
+  on the two admin pages, the data-source card's pipeline strip, and the
+  browse pages themselves — now says the target's name. URLs are unchanged, so
+  existing links and bookmarks keep working. The health page's "browse" link
+  also stopped disagreeing with its neighbour: it opened the metric/glossary
+  projection while `/admin/semantic-sources` pointed at the documents — it
+  now points at **Semantic models**, which is what it reports on.
 - **The semantic layer is two CLI groups instead of five.** `agnes
   semantic-model`, `agnes admin semantic-model`, `agnes admin semantic-source`,
   `agnes admin semantic-layer` and `agnes admin data-semantics` all read as
@@ -1086,6 +1141,213 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "SET", and the project-mismatch message, which stays its own distinct
   sentence — a mismatch is a token the stack knows perfectly well that opens
   a different project, and it needs a different fix.
+- **The semantic-layer soft-enforce advisory now reaches the hybrid query
+  endpoint and the web chat UI.** `POST /api/query/hybrid` — the one query
+  path that joins BigQuery and local data — never called
+  `semantic_validation_for_query`, so a constraint violation or a
+  not-locally-executable metric went unmentioned on exactly the query shape
+  most likely to touch modeled data. It now runs the same check `POST
+  /api/query` does (`target_engine="duckdb"`, since a hybrid query always
+  executes as DuckDB SQL against the analytics connection), guarded the
+  same way so a validator failure only logs a warning and never breaks the
+  delivered result. Separately, the web chat UI had no visual element for
+  the `semantic_validation` field at all — the CLI (stderr) and the MCP
+  tool result already surfaced it, but a chat turn that ran `agnes query`
+  over Bash (the primary path the workspace prompt teaches) or called the
+  `query` MCP tool directly showed nothing. A small amber advisory note
+  (the same `--ds-accent-warn-*` vocabulary `.callout-rec` uses elsewhere)
+  now renders under a tool-result card whenever the field carries a
+  warning, whether the result arrived as a JSON object or as the JSON text
+  a Bash-executed CLI command actually returns.
+- **A named agent profile now gets the same semantic-layer context a plain
+  sandbox session always has.** `src/claude_md.py` injects a summary of
+  every readable model (slug, description, the author's own `ai_context
+  .instructions`) into the sandbox's CLAUDE.md, but `app/chat/agent_profile
+  .py`'s `DATA_ACCESS_RAILS` — appended to a persona instead, since a
+  persona replaces the workspace CLAUDE.md — had no equivalent, so a named
+  agent (web chat with a persona, Slack, `agnes chat`, the one-shot agent
+  API) got zero semantic context. `build_profile` now accepts the caller's
+  `user_email` and appends the same condensed, RBAC-filtered summary via a
+  new `_semantic_layer_section`; omitted (the default) it behaves exactly
+  as before. Documented in `docs/semantic-layer.md` → "Reaching an agent:
+  CLAUDE.md injection".
+- **The semantic-layer column-metadata prune no longer collides across two
+  sources of the same kind, on Postgres.** `_prune_columns`
+  (`src/semantic/projection.py`) scoped only on `(table_id, source)`, so two
+  writers sharing a `source` value but not a `source_ref` — two registered
+  `ossie_git` sources, or two Keboola connections — whose documents describe
+  datasets resolving to the same table deleted each other's column
+  descriptions on every sync. Postgres already had the `source_ref` column
+  (`0075_column_meta_source_ref`); the prune now reads it too. DuckDB's
+  frozen app-state schema has no such column and keeps the pre-existing,
+  coarser scoping — an accepted asymmetry, not a regression.
+- **Linking/unlinking a semantic model to a Data Package is now audited.**
+  `POST`/`DELETE /api/admin/semantic-models/{slug}/packages[/{package_id}]`
+  change who can read a model — the same class of change `reattach` already
+  audits — but wrote no row and had no cataloged action. Added
+  `semantic_model.link_package`/`semantic_model.unlink_package` to the audit
+  catalog and route-posture map, and a test proving the link created by the
+  real endpoint (not a direct repo call) is what grants a non-admin caller
+  read access through the real export endpoint.
+- **Security: the sandbox Bash approval gate now covers semantic-layer
+  mutations, not just data-app and access-control ones.** #1707 Block 1
+  fixed this same class of bug on the MCP door (the chat approval gate now
+  routes by tool annotation, not by name), but the exact same gap survived
+  one door over: the bundled `PreToolUse` hook's hand-maintained prefix
+  lists prompt for admin and data-app mutations, but nothing named
+  `agnes semantic-model apply` / `agnes admin semantic import|delete|
+  detach|reattach|link-package|unlink-package|source …|mute|unmute|coverage
+  tag|untag|feedback resolve` existed — an admin-identity chat session
+  could overwrite or delete a live semantic model, mute a health check, or
+  re-tag coverage via Bash with no confirmation at all. The auto-draft
+  sweep's own prompt (`src/semantic_autodraft.py`) even instructs an agent
+  to apply a draft this way, though it runs under the non-admin
+  semantic-drafter identity, which still lands in the review queue rather
+  than going live. A new `SEMANTIC_LAYER_PROMPT_PREFIXES` list mirrors the
+  MCP approval gate's own non-read-only semantic tools one-for-one
+  (`apply_semantic_model`, `mute_semantic_check`/`unmute_semantic_check`,
+  `semantic_model_coverage_tag`/`untag`, `semantic_feedback_resolve`),
+  including the deprecated one-release command-group aliases Block 6 of
+  #1707 left behind (`admin semantic-model …`, `admin semantic-source …`,
+  `semantic-model mute/unmute/coverage/feedback resolve`), since those still
+  execute and delegate to the exact same functions.
+- **Semantic layer browse: the active `q` filter is now visible and has one
+  removable control, not three partial ones (#1707, A8).** `/semantic-layer
+  /{slug}` tabs are plain links (`?tab={t}`, no `q`), so arriving at
+  `?tab=metrics&q=Orders` and clicking any tab silently dropped the filter
+  with no indication it had ever applied — and the page still had no single
+  place that stated "a filter is active" (a search box showing the value, a
+  `Clear` link, and the tabs disagreeing about whether it survives a click).
+  Carrying `q` across tabs was rejected as the fix — a filter scoped to one
+  tab's fields rarely still means the same thing on another — so tabs still
+  drop it exactly as before. Instead, a removable filter chip (`filter:
+  Orders ×`) now renders above the table whenever `q` is active, making the
+  active filter visible; its `×` links to the same tab without `q` and
+  replaces the redundant `Clear` link that used to sit next to the search
+  box (now the page's only removable-filter control). The chip does not
+  survive a tab switch — that loss is still silent by design.
+- **`/admin/semantic-layer` claimed "Never synced yet." on instances whose
+  sources had synced that morning (#1707).** The status strip read the
+  whole-sweep summary, which is deliberately in-memory ("since this process
+  started") — so every redeploy emptied it and turned a fact about the
+  process into a false claim about history. The strip now falls back to what
+  the `semantic_sources` rows already carry durably, and labels it as the
+  different claim it is: "Last source sync <time> across N of M sources — no
+  sweep since this instance restarted". A sweep that ran in this process still
+  wins, succeeded or failed (it is the richer view); a source that was only
+  *skipped* is excluded, since nothing was ever imported from it; sources that
+  cannot be read report "Sync status unavailable." rather than a history claim
+  made from a failed read; and "Never synced yet." survives for the one case
+  where it is true — nothing, anywhere, has ever synced. Derived at read time
+  from `max(last_sync_at)` through the existing repository factory, so no new
+  table and no schema change, and a DuckDB instance reports it exactly as a
+  Postgres one does.
+- **A source card on `/admin/data-sources` no longer reports the state the page
+  was born in.** The per-source pipeline strip (tables → sync → semantic →
+  feeds) was baked into the page's HTML at render time, but everything that
+  changes it happens on that same page over `fetch` — the Add-tables wizard,
+  package creation and sharing, token saves, chat-tools toggles, unbinding a
+  project. So an admin who registered two dozen tables kept reading "Add the
+  first tables → / Never synced / 0 packages" until they hard-reloaded: the
+  setup was done and the app said nothing had happened. Each of those handlers
+  now re-reads the strip from a new read-only, admin-gated
+  `GET /api/admin/source-pipelines` (the same fold the template inlines — no
+  new data, no new authority) and repaints the affected card in place, so an
+  expanded card and the scroll position survive the update; the handlers that
+  also change what the card's own row says — a stored token, a cleared project
+  binding, chat tools, a queued SharePoint extraction, a connection created or
+  deleted — redraw the card list from that same fresh read.
+- **A Databricks or Snowflake semantic source no longer fails forever once the
+  connector is deconfigured (#1707).** Both connectors refuse to CREATE their
+  semantic source row when the warehouse is not configured — exactly so
+  nothing carries a source that fails on every run for a warehouse it does not
+  have — but an existing row short-circuits before that check, so a connector
+  deconfigured AFTER registration (credentials rotated out, connection
+  removed) landed in that state from the other direction: every scheduled
+  sweep imported the row, the adapter raised "… is not configured", and the
+  source accrued a fresh error and a fresh warning, every run, indefinitely.
+  Both rows are auto-registered — the Databricks one by the sweep's own
+  migration, the Snowflake one by the /admin/data-sources wizard's opt-in — so
+  neither needed an admin to set up the state that then broke. The sweep now
+  asks each source's adapter whether its connector is configured at all and
+  skips the ones that are not — counted as `skipped_not_configured` in the
+  `POST /api/admin/run-semantic-sources-refresh` response, the sweep's log
+  line and its audit row, and recorded on the source itself as
+  `last_sync_status='skipped'` with the reason, so `/admin/semantic-sources`
+  shows a muted "skipped" with the explanation instead of a red failure
+  nothing is trying to reach any more. The reason names both places a
+  connector can be configured (a registered connection under Admin → Data
+  sources, or the legacy `data_source.*` config), rather than sending a
+  wizard-configured admin off to edit a file that was never their source of
+  truth. The row is never deleted: a rotated credential is an outage, not
+  consent to discard a source an admin named, scoped and enabled — it resumes
+  syncing on the first sweep after the configuration returns. A manual sync of
+  such a source still fails loudly, since that one was explicitly asked for.
+  The check is a new optional adapter method (`unconfigured_reason`), so any
+  connector-backed adapter opts in with one function and git/upload sources
+  need no opinion.
+- **The semantic-layer health report no longer says "No sync failures,
+  disconnected models, or invalid documents" for an instance whose only source
+  is permanently skipped (#1707).** Both renderers — the `/admin/semantic-layer`
+  Health tab and `agnes admin semantic health` — filtered `sources` on
+  "failed" and "synced but owns nothing" alone, so a source the sweep skips
+  (its connector deconfigured, or another source already importing the same
+  upstream project) appeared in no section at all and still counted as
+  all-clear. Both now list them under **"Sources that are not syncing
+  (skipped)"** with the reason recorded on each row, without failure styling
+  (nothing failed — the sweep declined to try), and a skipped source
+  suppresses the all-clear headline.
+- **A Keboola table that is empty upstream no longer reports as a failed
+  sync — and a lost sliced export no longer reports as a clean one.** A
+  sliced export of a table with no rows comes back as a manifest with zero
+  entries. The Storage API client's two sliced download paths treated that
+  as an unconditional error, so a table that is simply empty (a form-fields
+  table with no attachments, say) stayed permanently red and looked exactly
+  like a broken extraction; the legacy client's own third consumer had the
+  opposite failure, reporting any entries-less manifest as a clean 0-row
+  export. All three now share one decision. Empty and successful: the export
+  carries the table's declared columns (a header-only CSV / a zero-row
+  parquet, honouring a `columns` projection when one was requested), so the
+  sync succeeds with 0 rows and the downstream view still resolves its
+  columns — either because upstream's `rowsCount` is 0, or because the
+  export carried a row filter (`whereFilters` / `changedSince` /
+  `changedUntil` / `limit`), which may legitimately match nothing on a table
+  that has rows. Otherwise an error: `rowsCount > 0` on an unfiltered export
+  now says plainly that upstream claims N rows while the export returned no
+  slices. **Contract change on the legacy client:** when `rowsCount` cannot
+  be read at all — no table id to ask about, the detail call failed, the
+  field is absent — that path now fails where it used to report 0 rows
+  successfully. Unknown must never present itself as empty.
+- **Semantic layer browse: the constraint Severity tooltip is now a fast
+  `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
+  ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
+  severity badge carried a 257-character explanation in `title=` — a
+  600ms+ OS-controlled show delay, no styling, and prone to clipping in a
+  scrollable ancestor. Both now use the shared `[data-tip]` mechanism, paired
+  with `aria-label` carrying the same text (never `title` alongside it, and
+  never `role="note"` on a `<th>` — that would override its implicit
+  `columnheader` role), with a single-sentence summary that also corrects the
+  original wording: an error-severity violation is a *missing filter in the
+  query*, not a *missing rule* on the constraint, and — soft-enforce — it
+  only flips `validate-query`'s verdict, it never blocks anything. The fuller
+  nuance (only `required_filter` is statically checkable today, so any other
+  type is advisory regardless of severity) moved to a short note under the
+  table/panel instead.
+- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
+  admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+  knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+  their table in `<div class="data-table-wrap">`, but no CSS rule ever
+  backed the class — so a wide table dragged the whole page into horizontal
+  scroll in a narrow window instead of just itself. Fixing the overflow
+  naively would have broken sticky table headers on all ten pages —
+  `overflow-x: auto` makes the wrap a nearer scrolling ancestor than the
+  viewport, and with no height cap the header would silently stop sticking
+  at all instead of visibly failing — so sticky is now consciously disabled
+  for any thead inside `.data-table-wrap` rather than left in that
+  ambiguous, silently-broken state. Also replaced seven admin pages' inline
+  `style="text-align:right"` on a header (semantic sources, marketplaces,
+  mcp_sources, mcp_source_detail, knowledge_digests, initial_workspace,
+  access) with the existing `.num` class.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
@@ -1113,6 +1375,36 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   denies too — but on an SDK with no `PreToolUse` hook support at all nothing
   can be registered and tool calls run ungated (logged loudly). The `kai-agent`
   provider is unaffected; its engine raises its own approvals.
+- **Semantic-layer detail page: the detach toolbar's "Export detached
+  version" link 404'd, and its two buttons rendered as unstyled text
+  (#1707).** The link pointed at the HTML detail route
+  (`/semantic-layer/{slug}.yaml`), which the `{slug}` path parameter catches
+  literally and 404s on; it now points at the route that actually serves the
+  document, `GET /api/semantic-models/{slug}.yaml`. The Re-attach/Detach
+  buttons used a `.btn--sm` class that has no rule in any app stylesheet,
+  so they had no borders or button chrome; they now use the same
+  `btn-secondary`/`btn-primary` + `btn-sm` classes as the rest of the page.
+  Added page-level test coverage for the detach toolbar (PG-only, since
+  `sync_mode='detached'` is a Postgres-only column), which is what let both
+  issues ship unguarded.
+- **/admin/data-sources: the master token is now named at the point of
+  entry, and "Token not set" no longer links to a page that cannot set it
+  (#1707, A12/A13).** The "+ Add source" wizard's semantic-layer token field
+  said only "project owner" — Agnes's own phrasing, not Keboola's, so an
+  admin searching their Keboola project for "project owner token" found
+  nothing. The field now carries a hint naming Keboola's own term, the
+  project **master** token. The connection card's matching hint moved off a
+  native `title=` (600ms+ show delay, invisible on touch) onto the shared
+  `[data-tip]` fast-tooltip, paired with `aria-label` per the design-system
+  convention (`aria-label` prefixed with the visible "Semantic-layer token"
+  label, per WCAG 2.5.3, not replaced by the tip). Separately, a **stored**
+  source with no token set rendered "Token not set" as a link to
+  `/admin/semantic-layer`, which renders fine but has no token field — the
+  token is set on the card itself; that cell now calls the same
+  `toggleMasterToken` action already reachable from the card's Actions menu
+  instead of navigating to a page that cannot help. A source with a token
+  set, and a **derived** card (no stored connection, so no such widget to
+  call), both keep the health-page link unchanged.
 - **Testing a non-Keboola data connection no longer fails with a Keboola error.**
   `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
   /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and
@@ -1809,17 +2101,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `CONTRIBUTING.md`'s "confirm the check names are present" note is updated to
   match, and the `test` aggregator needs no change because it depends on the
   matrix result, not on individual groups.
-- **Every pull request runs the test suite, whatever branch it targets
-  (#1636).** `ci.yml`'s `pull_request` trigger was filtered to `main` and
-  `integration`, so a PR into a stack base — `mf/semantic-layer-v0`, a
-  `claude/*` branch — fired no workflow at all and showed a **green rollup
-  that asserted nothing**, which reads exactly like a passing run. The
-  semantic-layer stack took four PRs that way, over a base sitting at two
-  alembic heads with nothing to report it. The filter is gone rather than
-  extended with stack-base names: a naming convention nobody enforces fails
-  silently the first time someone picks a name outside it. `CONTRIBUTING.md`
-  now states the invariant and how to check for it (confirm the check NAMES
-  are present — "no red" is not "tested").
 - **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
 - **Local-dev audience switch on the chat landing page.** Under
   `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:

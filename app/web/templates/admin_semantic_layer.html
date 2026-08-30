@@ -1,5 +1,11 @@
 {% extends "base_admin_page.html" %}
-{% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# NAME: "Semantic layer health" — the question this page answers (is what
+   was imported complete and healthy), not the layer itself. Plain "Semantic
+   layer" was worn by three pages at once. The h1 stays the SECTION name
+   ("Data", below) per tests/test_web_admin_page_pattern.py; the page name
+   lives in the <title> and in the admin-nav tab (app/web/admin_nav.py).
+   Guarded by tests/test_semantic_page_names_contract.py. #}
+{% block title %}Semantic layer health — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {# Section-level and PLAIN, matching /admin/data-sources: the h1 names the
    section, the tab strip below names the lens (Sources · Tables · Packages ·
@@ -149,12 +155,28 @@
         Last run {{ rs.last_completed_at }} — OK.
       {% elif rs.last_status == 'error' %}
         Last run ({{ rs.last_completed_at }}) failed: {{ rs.last_result }}
+      {% elif rs.fallback_last_sync_at %}
+        {# No sweep in this process — a redeploy empties that state — so this
+           reports what the source rows durably carry. Different claim,
+           different sentence: the last sync of any source, not a sweep, and
+           not an assertion that it succeeded. "N of M" because N alone reads
+           as the total. #}
+        Last source sync {{ rs.fallback_last_sync_at }} across {{ rs.fallback_synced_count }} of {{ rs.fallback_source_count }} source{{ '' if rs.fallback_source_count == 1 else 's' }} — no sweep since this instance restarted.
+      {% elif rs.fallback_unavailable %}
+        {# The sources could not be read. Not "never synced" — that would be
+           the same bug again: a claim about history from a failure to read. #}
+        Sync status unavailable.
       {% else %}
         Never synced yet.
       {% endif %}
     </span>
     <span class="apg-strip__end">
-      <a href="/catalog/semantics">Browse the layer →</a>
+      {# This page reports on the stored DOCUMENTS, so its door opens the
+         documents — the same target /admin/semantic-sources links to. It
+         used to point at /catalog/semantics (the flat metric/glossary
+         projection) while its neighbour pointed here, so two adjacent admin
+         pages disagreed about where "the layer" was. #}
+      <a href="/semantic-layer">Semantic models →</a>
       <button type="button" class="btn btn-primary" id="sl-refresh-btn">Sync now</button>
     </span>
   </div>
@@ -169,7 +191,7 @@
     <span class="apg-strip__end"><a href="/admin/ontology">Ontology builder →</a></span>
   </div>
 
-  <div class="sl-lenses">{{ ds.tabs(items=lens_tabs, aria_label='Semantic layer lens') }}</div>
+  <div class="sl-lenses">{{ ds.tabs(items=lens_tabs, aria_label='Semantic layer health lens') }}</div>
 
   {% if active_tab == 'coverage' %}
   <section id="sl-coverage">
@@ -421,7 +443,12 @@ document.getElementById("sl-refresh-btn").addEventListener("click", async () => 
       showToast(
         `Synced ${body.synced ?? 0} source(s)` +
           (failed ? `, ${failed} failed` : "") +
-          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : ""),
+          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : "") +
+          // Called out beside "disabled" because it is the other STANDING
+          // skip: a source whose connector is no longer configured syncs
+          // nothing on every run until an admin acts, and a bare
+          // "Synced 0 source(s)" would not say so.
+          (body.skipped_not_configured ? `, ${body.skipped_not_configured} not configured` : ""),
         failed === 0,
       );
       setTimeout(() => window.location.reload(), 1200);
@@ -1120,6 +1147,16 @@ function hlRender(body) {
   const emptySources = (body.sources || []).filter(
     (s) => s.last_sync_status === "ok" && typeof s.owned_model_count === "number" && s.owned_model_count === 0
   );
+  // A source the SWEEP DECLINED to sync — its connector is no longer
+  // configured on this instance, or another source already imported the same
+  // upstream this run. Neither failed, so neither belongs under "Sync
+  // failures"; but neither is importing anything either, and without a
+  // section of its own an instance whose only source is permanently skipped
+  // read "No sync failures, disconnected models, or invalid documents."
+  // One section for both producers, each row carrying its OWN recorded
+  // reason: a `skipped` row has no machine-readable kind, so a heading named
+  // after one of the two would mislabel the other.
+  const skippedSources = (body.sources || []).filter((s) => s.last_sync_status === "skipped");
   const orphaned = body.orphaned_models || [];
   const tableBindings = body.orphaned_table_bindings || [];
   const invalid = body.invalid_models || [];
@@ -1131,6 +1168,7 @@ function hlRender(body) {
   const nothingWrong =
     !failedSources.length &&
     !emptySources.length &&
+    !skippedSources.length &&
     !orphaned.length &&
     !tableBindings.length &&
     !invalid.length &&
@@ -1168,7 +1206,24 @@ function hlRender(body) {
   hlSection(container, "Sources that synced but imported nothing", emptySources, (li, s) => {
     const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
     li.appendChild(hlEl("strong", null, s.name || s.source_id));
-    li.appendChild(document.createTextNode(" — check this source's scope/config"));
+    // A17: naming what was scanned is the actionable half of this finding —
+    // "0 models" alone cannot say whether the upstream is empty or whether
+    // the role/scope simply cannot see it. Absent (`null`, or a server too
+    // old to send it) adds nothing rather than an empty parenthesis.
+    const scanned = typeof s.scan_scope === "string" && s.scan_scope ? ` (scanned ${s.scan_scope})` : "";
+    li.appendChild(document.createTextNode(`${scanned} — check this source's scope/config`));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  // Same posture as the section above: neutral text, no failure vocabulary.
+  // The reason is whatever the sweep recorded on the row, so an admin reads
+  // "Databricks is not configured on this instance (…)" rather than a
+  // heading that guesses which skip this was.
+  hlSection(container, "Sources that are not syncing (skipped)", skippedSources, (li, s) => {
+    const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
+    li.appendChild(hlEl("strong", null, s.name || s.source_id));
+    li.appendChild(document.createTextNode(": " + (s.last_sync_error || "reason not recorded")));
     const badge = hlMutedBadge(muted);
     if (badge) li.appendChild(badge);
   });

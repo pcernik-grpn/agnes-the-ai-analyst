@@ -134,6 +134,36 @@ confident `0` — the resolver validates against live state, so an
 unresolvable override means "cannot say", not "owns nothing" (it is logged as
 a warning server-side, renders as `—` on the page and `-` in the CLI).
 
+### What did the sync actually look at?
+
+A count of zero still leaves two very different explanations open: the
+upstream really is empty, or its contents are invisible to the credentials
+Agnes syncs with. Both read `ok · 0 models`. The second was observed live — a
+Snowflake semantic view existed and the role the adapter connects as held no
+privilege on it, so `SHOW SEMANTIC VIEWS` returned nothing — and it is a
+misconfiguration an admin has to fix, not a state to accept.
+
+The same four surfaces therefore also carry **`scan_scope`**: one line naming
+what the source scans, derived from its own config at read time
+(`src/semantic/scan_scope.py`), never stored — the scope is a property of the
+row, not of a run. Per adapter:
+
+| Source | `scan_scope` |
+|---|---|
+| Snowflake semantic views | `ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE` — database, schema (or `ESHOP_DEMO (whole database)` when unscoped, plus `matching '<pattern>'` when a `like` narrows it) and the role that decides what is visible |
+| Keboola Metastore | `Keboola project 4321 (Demo Project)` — the project the pinned connection is bound to |
+| Databricks UC metric views | `Unity Catalog catalogs main, sales on <workspace host>` |
+| git | `https://example.com/acme/semantics.git @ main matching '**/*.yaml'` — repository, ref (`default branch` when unset) and the glob, stated even when it is the default: a repo of `*.yml` documents against the default `*.yaml` pattern clones fine and matches nothing |
+| upload / native | `uploaded documents (3)` |
+
+`null` means no scope could be derived (an adapter with no resolver, or a
+config too incomplete to name one) and every surface simply omits it — a new
+adapter is additive here too. The string carries coordinates only: no token,
+no credential env-var name, and any URL it echoes has its `user:pass@`
+userinfo stripped first.
+
+### Which sources the sweep runs
+
 `enabled: false` (`--disabled` on `add`, or `PUT .../sources/{id}` with
 `enabled: false`) excludes a source from **both** this scheduled sweep and the
 manual `agnes admin semantic-source sync <id>` / `POST .../sources/{id}/sync`
@@ -179,13 +209,33 @@ the label must be a migrated legacy one, the source must run that label's
 adapter, and the `source_ref` must be the source's own connection (or, for the
 legacy env-credential row, the pair that path has ever stamped).
 
-Two things the sweep skips rather than syncs, both carried over from guards
-the retired triggers had built in:
+Three things the sweep skips rather than syncs — two carried over from guards
+the retired triggers had built in, one for a source that outlived the
+connector it reads:
 
 | Skip | When | Where it shows |
 |---|---|---|
+| `skipped_not_configured` | the connector behind a `connection`-kind source reports that it is not configured on this instance at all (its credentials/connection are gone), so importing would raise that connector's own "not configured" on every run, forever. The row is never deleted: skipping is reversible when the configuration returns. **Per-adapter opt-in** — the sweep asks the source's adapter through the optional `unconfigured_reason` hook, which `databricks_metric_views` and `snowflake_semantic` implement; an adapter without it is always "ready" and its failures stay failures (`keboola_metastore`, for instance, raises "re-point or delete this source" for a connection that is gone, which is a finding an admin must see, not a skip) | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row, and the "Sources that are not syncing (skipped)" section of the health report (`/admin/semantic-layer` Health tab, `agnes admin semantic health`) |
 | `skipped_running` | a Keboola source whose rows the login-triggered sync (`run_semantic_layer_refresh_background`) is writing right now — the two share one single-flight guard, so they can never overlap | the sweep's response only; the row keeps its last real sync state and the next sweep picks it up |
 | `skipped_duplicate_project` | a second source resolving to the SAME upstream Keboola project as one already imported this sweep (two connections may point at one project) — importing both would write one project's rows under two refs that then delete each other's | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
+
+**`skipped_duplicate_project` is Keboola-specific, on purpose (P2-2 of the
+post-#1707 remediation).** `duplicate_upstream_reason()`
+(`src/semantic/legacy_migration.py`) only resolves upstream identity for the
+`keboola_metastore` adapter (`sweep_project_identity()`); a manually-added
+`connection`-kind source of a *different* adapter pointed at the same
+upstream project has no equivalent check. This was a deliberate scope
+decision, not an oversight: Databricks avoids the problem structurally (one
+workspace resolves to a singleton `databricks_default` source, so there is
+nothing to duplicate); `git`/`upload`/native sources have no "upstream
+project identity" the same way a warehouse connection does, so a generic
+identity resolver would have nothing to compare. The remaining risk is an
+admin manually registering two Snowflake (or future-adapter) connections at
+the same warehouse/database — a narrow operator-error window that requires
+deliberate misconfiguration, not something a scheduled sweep can trigger on
+its own — so it is accepted rather than built against. Revisit if a second
+adapter after Keboola turns out to have the same "one credential, many
+connections" shape that makes the duplicate real.
 
 ## Adapters — adding a source format
 
@@ -201,6 +251,28 @@ class MyAdapter:
 
 Register it in `src/semantic/adapters/__init__.py`. That is the whole contract —
 which is the point: a new format is one function, not a new write path.
+
+An adapter backed by a **connector** may add one optional method, and should
+when "this connector is not configured here" is a state an admin can reach:
+
+```python
+    def unconfigured_reason(self, config: dict) -> str | None:
+        """Why this connector cannot be read on this instance right now."""
+```
+
+It answers only "is the connector configured at all" — never "is the upstream
+reachable", which is a failure and belongs on the row. The scheduled sweep
+asks it before importing and skips the source (`skipped_not_configured`)
+instead of failing it on every run once an admin deconfigures the connector
+under a source that already exists.
+
+`databricks_metric_views` and `snowflake_semantic` implement it — both are
+auto-registered (the Databricks sweep migration; the Snowflake opt-in in the
+/admin/data-sources wizard), so both can outlive the connection they read.
+An adapter that does not implement it is always "ready", which is the right
+default: `keboola_metastore` answers a missing connection with an error
+telling the admin to re-point or delete the source, and that is a finding to
+surface, not a skip.
 
 Return the document text **as produced**, never re-serialized through a YAML
 dumper. Export hands that exact text back out, so a round-trip through
@@ -336,6 +408,30 @@ This is not bureaucracy. A scheduled sync prunes what upstream no longer has, so
 an edit made downstream would be reverted on the next run — silently, and at an
 unpredictable time.
 
+**"The document is the owner" has three intentional exceptions (P2-3 of the
+post-#1707 remediation).** Every connector-sourced writer (Keboola,
+Snowflake, Databricks, native/manual) converged onto `project_document` —
+metrics are a *projection* of a stored Ossie document, never written
+directly. Three older, independent writers remain outside that model and
+write straight to `metric_definitions`:
+
+- `POST /api/admin/metrics` (generic REST create/update)
+- `POST /api/admin/metrics/import` (ad-hoc YAML upload, its own parser)
+- `agnes admin metrics import docs/metrics/` (the CLI "starter pack",
+  direct repository write — see the "Business Metrics" section of the root
+  `CLAUDE.md`)
+
+These are accepted as permanent, intentional parallel paths, not a
+migration backlog — a decision, not an oversight. A metrics-catalog-as-code
+workflow (hand-authored YAML, or a REST call from an external tool) does
+not need a full semantic document's datasets/relationships/constraints
+machinery, and forcing one through that ceremony for a single ad-hoc metric
+adds ritual without a corresponding benefit. They stay held together, as
+they always have, purely by the `(source, source_ref)` convention every
+writer — old and new — respects for pruning. Revisit only if one of these
+three paths grows a real need for document-level features (relationships,
+constraints, glossary) it currently has no way to declare.
+
 ## Provenance and pruning
 
 Every projected row is stamped with the model's `source` and `source_ref`, and a
@@ -371,6 +467,33 @@ GET /api/semantic-models/retail.yaml
 ```
 
 The bytes you get back are the bytes that were stored.
+
+## Reaching an agent: CLAUDE.md injection
+
+An agent should learn a semantic model exists without being told to go
+look — so every RBAC-filtered-readable ``status='valid'`` model gets a
+one-line summary (slug, description, the author's own truncated
+``ai_context.instructions``) injected into the agent's own ``CLAUDE.md``, on
+every surface that spawns one:
+
+- The workspace/chat sandbox's rendered CLAUDE.md (``src/claude_md.py::
+  _semantic_layer_models``, via ``config/claude_md_template.txt``'s
+  "## Semantic layer" section) — the default surface, always on.
+- A named agent profile's persona prompt (``app/chat/agent_profile.py::
+  _semantic_layer_section``) — condensed to the same minimal shape (no full
+  metric/glossary dump), since a persona *replaces* the workspace CLAUDE.md
+  rather than extending it. Covers web chat with a persona, Slack, `agnes
+  chat`, and the one-shot agent API — every surface a named `agents` row can
+  spawn from. This closed a real asymmetry (P1-3 of the post-#1707
+  remediation): before it existed, a named agent got zero semantic context
+  while a plain sandbox session always had it.
+
+Not covered: a user's own local Claude Code session connected to Agnes only
+as an MCP source (no Agnes-rendered CLAUDE.md exists there at all — that
+project's CLAUDE.md is the user's own, unrelated to this instance). Such a
+session can still reach the same information live via the
+`get_semantic_context`/`semantic_model_search` MCP tools or the `agnes
+semantic-model` CLI; it just never gets it injected ambiently.
 
 ## Query validation
 
@@ -472,6 +595,52 @@ Three things about it are deliberate:
   feature"), so on the frozen DuckDB app-state backend these routes answer
   `501 requires_postgres_backend`.
 
+## Auto-draft sweep: how coverage gaps get filled without a human starting it
+
+Coverage (above) only *reports* a table with zero semantic-layer coverage; a
+scheduled sweep (`POST /api/admin/semantic-auto-draft-sweep`,
+`services/scheduler/__main__.py` fires it every 55 minutes; an admin can also
+trigger it on demand) is what actually tries to close the gap, unattended.
+
+Each tick takes up to three uncovered, eligible tables and runs a headless
+`semantic-model-builder` chat session per table
+(`app.chat.headless.run_one_shot`), authenticated as the non-admin
+**`semantic-drafter`** system identity (`app.auth.system_users`) — never an
+admin, and never the caller who happened to trigger the tick. That identity
+is what makes the rest of the design safe: every draft the session produces
+lands in the `authoring_suggestions` moderation queue exactly like a
+human-submitted proposal, **never applied directly**, no matter what the
+session's own trigger prompt tells it to do (`src/semantic_autodraft.py`'s
+`build_trigger_prompt` explicitly instructs the agent to call
+`apply_semantic_model` itself, unattended — safe only because the caller's
+own authority caps the outcome at "queued for review", not "live").
+
+Dedup uses a `table_registry.semantic_draft_pending_at` stamp (**Postgres-only**
+— see `docs/migrations.md` → "Adding a PG-only feature"; the sweep answers a
+clean `501 requires_postgres_backend` on a DuckDB-backend instance before any
+table scan or chat session runs), set BEFORE a table's session is invoked so
+two overlapping ticks can never draft the same table twice. The stamp clears
+the moment an admin resolves the resulting suggestion, approve or reject
+alike — a rejected draft is eligible again immediately, on the theory that a
+human just told the system something concrete about that table. Absent a
+resolution, a stamp only goes stale after **7 days**, which is what actually
+gives a table another try when its session filed nothing: a session that
+merely timed out (60s, `_SWEEP_SESSION_TIMEOUT_S`) or genuinely finished
+without calling `apply_semantic_model` both keep their stamp rather than
+being retried on the very next tick, so a handful of tables the drafter keeps
+declining can never occupy every batch forever. Never-stamped tables always
+sort ahead of stale-stamped ones, so this retry stream can't starve a table
+that has not been tried once.
+
+The session is told it is fine — preferred, even — to submit a minimal,
+explicitly-flagged-for-review model rather than invent structure the data
+does not support, and to survey with `agnes schema`/`agnes describe` before
+drafting anything. It is also pinned to a specific dataset-identity contract
+(`dataset.source` must be the Agnes table id verbatim, never the upstream
+native identifier) — without it, a drafted document would resolve to nothing
+for both coverage credit and dedup-flag clearing, silently excluding the
+table from every later sweep.
+
 ## Health: is the layer trustworthy right now
 
 Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
@@ -479,11 +648,13 @@ Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
 stale, or internally inconsistent" — a different question, in one response:
 
 - **`sources`** — every `semantic_sources` row's last sync outcome, verbatim,
-  plus `owned_model_count` (see above): a source can sync `ok` and import
-  nothing, and the status alone cannot say so. A dedicated **"Sources that
-  synced but imported nothing"** section lists exactly those, so a
-  silently-empty source is a finding rather than a number the reader has to
-  notice — reported without error styling, because nothing failed.
+  plus `owned_model_count` and `scan_scope` (see above): a source can sync
+  `ok` and import nothing, and the status alone cannot say so — nor can the
+  count say whether the upstream was empty or merely invisible. A dedicated
+  **"Sources that synced but imported nothing"** section lists exactly those,
+  naming what each one scanned, so a silently-empty source is an actionable
+  finding rather than a number the reader has to notice — reported without
+  error styling, because nothing failed.
 - **`orphaned_models`** — non-`manual` models whose `source_ref` names no live
   source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
   not cascade to the models it fed, so a project can vanish and leave its
@@ -514,6 +685,19 @@ before any of the other, backend-agnostic checks run — so a DuckDB-backed
 instance answers one clean `501 requires_postgres_backend` for the whole
 report rather than a partial one that silently drops the one field muting
 exists to keep visible.
+
+**`orphaned_table_bindings` stays detection-only, forever, pending a real
+product decision (P3-2 of the post-#1707 remediation).** There is no
+"clean this up" action anywhere — no UI button, no CLI command, no API
+endpoint — so an admin who sees the finding today resolves it by hand
+(direct DB/API edits to the flagged `metric_definitions`/`column_metadata`
+rows). This is confirmed as the CURRENT state, not endorsed as the RIGHT
+one: whether semantic-layer hygiene should stay this hands-on, or whether
+it deserves at least a guided cleanup command (e.g. `agnes admin semantic
+health fix-orphan <id>` that deletes or re-points the specific flagged
+row), is a genuine open product question with no recommendation attached
+here — flag it in the next planning conversation rather than deciding it
+silently in a documentation pass.
 
 ## Muting: turning a check off is a signature
 
