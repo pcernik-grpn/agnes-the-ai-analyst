@@ -1262,10 +1262,11 @@ def _anonymize_marked_scope_map(connection: dict) -> dict[str, str]:
     ``app/api/admin_sharepoint.py`` writes and reads:
     ``{source_scope_id, display_path, anonymize, collection_id}``) rather
     than importing that admin router — this worker handler must not gain a
-    dependency on the admin API surface. ``GET .../corpus-map`` stays the
-    flat ``{source_scope_id: collection_id}`` producers already consume;
-    this is the SAME mapping, narrowed to anonymize-marked rows, used only
-    internally to build the child env below.
+    dependency on the admin API surface. Keys here stay the raw
+    ``source_scope_id`` — the producer's anonymize stage consumes only the
+    VALUES (the collection-id set); routing rows to collections is the job
+    of the corpus map (``connectors/sharepoint/corpus_map.py``), whose keys
+    are resolver-shaped, not scope ids.
     """
     scopes = (connection.get("config") or {}).get("scopes")
     if not isinstance(scopes, list):
@@ -1539,6 +1540,31 @@ def _run_corpus_extraction(payload: dict) -> dict:
     if anonymize_scopes:
         child_env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"] = json.dumps(anonymize_scopes, sort_keys=True)
         child_env["AGNES_ANONYMIZATION_HMAC_KEY"] = _resolve_anonymization_key()
+
+    # Corpus-map handoff: the standard enqueue paths (POST .../extract and
+    # the scheduled sweep) send only {"connection_id"}, so without this the
+    # producer has nothing saying which collection documents go to and its
+    # preflight fails every unattended run. Keys are translated to the
+    # producer resolver's crawler-row shape (site display name + DRIVE-
+    # relative folder path) by the shared helper — see
+    # connectors/sharepoint/corpus_map.py for why display_path verbatim
+    # would silently route nothing.
+    from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
+
+    scopes = (connection.get("config") or {}).get("scopes")
+    scope_rows = scopes if isinstance(scopes, list) else []
+    if scope_rows:
+        try:
+            scope_map = producer_corpus_map(scope_rows)
+        except CorpusMapError as exc:
+            raise RuntimeError(f"corpus-extraction: {exc}") from exc
+        child_env["AGNES_EXTRACTION_CORPUS_MAP"] = json.dumps(scope_map, sort_keys=True)
+    elif not corpus_id:
+        raise RuntimeError(
+            f"corpus-extraction: connection {connection_id!r} has no confirmed scopes and the "
+            "payload carries no corpus_id — nothing says which collection documents go to; "
+            "confirm at least one scope in the SharePoint connect wizard first"
+        )
 
     # Producer callback credential (TCRD-226): the crawl -> convert ->
     # anonymize -> extract -> ingest pipeline calls BACK into Agnes's own

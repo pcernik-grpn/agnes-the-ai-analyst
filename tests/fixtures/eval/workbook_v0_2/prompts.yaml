@@ -1,5 +1,5 @@
 frozen: '2026-08-27'
-source: eval_scoring_workbook_v0.2.xlsx, Prompts sheet, owner Shan Wang
+source: eval_scoring_workbook_v0.2.xlsx, Prompts sheet, owner A. Rivera
 note: 10 core prompts. Frozen once R0 starts — do not edit prompt text after the first run.
 legend: 'Legend: blue text = you enter this. Black text = fixed design content, do not casually edit after R0 freeze. Underlined blue in Source = live SharePoint link.'
 prompts:
@@ -8,10 +8,10 @@ prompts:
   service_line: Broad search
   text: What was our utilization by business unit last month?
   tests: Structured-data accuracy on a single, unambiguous numeric answer.
-  why_baselines_struggle: Requires a live connection to Kantata (time tracking) rather than anything in SharePoint documents. An unstructured-only system has no path to a correct answer at all.
+  why_baselines_struggle: Requires a live connection to Woodgrove PSA (time tracking) rather than anything in SharePoint documents. An unstructured-only system has no path to a correct answer at all.
   traps: Answering from a stale or unrelated document (e.g. an old staffing deck) instead of pulling from the actual structured source. Presenting a number with no source system named.
-  key_elements: Correct answer is single-valued, sourced from live Kantata utilization/hours data, per Zach's 26 Aug guidance to use Kantata as the structured test dataset.
-  source_ref: Kantata (time tracking) — not SharePoint
+  key_elements: Correct answer is single-valued, sourced from live Woodgrove PSA utilization/hours data, per Zach's 26 Aug guidance to use Woodgrove PSA as the structured test dataset.
+  source_ref: Woodgrove PSA (time tracking) — not SharePoint
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'
@@ -20,10 +20,10 @@ prompts:
   service_line: AIVB – Full Backlog Assessment
   text: Have we done an AI Value Backlog assessment for an industrial manufacturing business in the last 18 months? For each one, tell me the client, the sponsor, when it ran, and what the headline scope was.
   tests: Joining engagement type + industry + recency; correctly separating AIVB engagements from Diligence-type engagements filed under the same client name.
-  why_baselines_struggle: MyersEPS has two live folders — 202507_Myers_AI_Value_Backlog and 202607_Myers_Sell-Side Diligence. Keyword search on “Myers” + “manufacturing” hits both. Filtering by engagement type requires reading folder-path structure, not just document text.
-  traps: (1) Counting Myers' Sell-Side Diligence engagement as AIVB — highest-risk trap, both folders share the client name and topic. (2) Missing Rapid Roadmap engagements (e.g. ARCO, Mickey Truck Bodies) whose own deliverables never say “AI Value Backlog” verbatim. (3) Counting PolyVision as delivered — SOW not located, still a pursuit.
-  key_elements: 'Should surface multiple manufacturing-adjacent engagements across both AIVB sub-types (at minimum: Myers EPS — Kohlberg — Jun 2025; several IOP Rapid Roadmap portfolio companies). Must NOT include the Myers Diligence engagement. Must correctly name PE sponsor ≠ client for each.'
-  source_ref: 00_Customers/MyersEPS/ (both folders); 00_Customers/_Private Equity/IOP/Portfolio Companies/
+  why_baselines_struggle: FabrikamEPS has two live folders — 202507_Fabrikam_AI_Value_Backlog and 202607_Fabrikam_Sell-Side Diligence. Keyword search on “Fabrikam” + “manufacturing” hits both. Filtering by engagement type requires reading folder-path structure, not just document text.
+  traps: (1) Counting Fabrikam' Sell-Side Diligence engagement as AIVB — highest-risk trap, both folders share the client name and topic. (2) Missing Rapid Roadmap engagements (e.g. Proseware, Adventure Works Bodies) whose own deliverables never say “AI Value Backlog” verbatim. (3) Counting Clearpane as delivered — SOW not located, still a pursuit.
+  key_elements: 'Should surface multiple manufacturing-adjacent engagements across both AIVB sub-types (at minimum: Fabrikam EPS — Litware — Jun 2025; several SIP Rapid Roadmap portfolio companies). Must NOT include the Fabrikam Diligence engagement. Must correctly name PE sponsor ≠ client for each.'
+  source_ref: 00_Customers/FabrikamEPS/ (both folders); 00_Customers/_Private Equity/SIP/Portfolio Companies/
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'
@@ -32,10 +32,10 @@ prompts:
   service_line: AIVB – Rapid Roadmap
   text: A prospect is a building-products manufacturer, PE-owned, and wants to know if we've done this kind of rapid AI roadmap work before. What's our closest precedent and why is it close?
   tests: Scenario-to-precedent matching within a specific sub-type (Rapid Roadmap), not just industry keyword match.
-  why_baselines_struggle: “Building products” literally matches Forte Opening Solutions (doors), Greenfiber (insulation), and York Design Group (wallcoverings) — three separate 2-week IOP engagements with a different cadence and deliverable format than the Full Backlog Assessment line.
-  traps: Blending an AIVB – Full Backlog Assessment precedent (e.g. Myers) into the answer without flagging the methodology difference. Naming only one of the three real matches and presenting it as the only precedent.
-  key_elements: Should name at least Forte Opening Solutions and ideally Greenfiber and/or York Design Group, note they are all 2-week Rapid Roadmap engagements under IOP, and explain “close” in terms of both industry and engagement format.
-  source_ref: 00_Customers/_Private Equity/IOP/Portfolio Companies/1 - Forte Opening Solutions; .../3 - Greenfiber; .../3 - York Design Group
+  why_baselines_struggle: “Building products” literally matches Wingtip Openings (doors), Everleaf Insulation (insulation), and Tailspin Design Group (wallcoverings) — three separate 2-week SIP engagements with a different cadence and deliverable format than the Full Backlog Assessment line.
+  traps: Blending an AIVB – Full Backlog Assessment precedent (e.g. Fabrikam) into the answer without flagging the methodology difference. Naming only one of the three real matches and presenting it as the only precedent.
+  key_elements: Should name at least Wingtip Openings and ideally Everleaf Insulation and/or Tailspin Design Group, note they are all 2-week Rapid Roadmap engagements under SIP, and explain “close” in terms of both industry and engagement format.
+  source_ref: 00_Customers/_Private Equity/SIP/Portfolio Companies/1 - Wingtip Openings; .../3 - Everleaf Insulation; .../3 - Tailspin Design Group
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'
@@ -46,7 +46,7 @@ prompts:
   tests: Cross-engagement synthesis. No single document answers this; it requires combining multiple final reports/readouts into one view.
   why_baselines_struggle: No document is titled or scoped as a cross-engagement retrospective. A system that only retrieves top-matching chunks will likely summarize one engagement and present it as “the” takeaway.
   traps: Presenting a single engagement's readout as if it were the aggregate finding. Treating Week-0/kickoff content (forward-looking) as a retrospective takeaway.
-  key_elements: Should draw from more than one completed engagement (e.g. Myers EPS final report, Mickey Truck Bodies Week 2 readout, ARCO Week 2 readout) and should distinguish recurring patterns from one-off observations.
+  key_elements: Should draw from more than one completed engagement (e.g. Fabrikam EPS final report, Adventure Works Bodies Week 2 readout, Proseware Week 2 readout) and should distinguish recurring patterns from one-off observations.
   source_ref: Deliverables/Reports and Deliverables/Week 2 folders across multiple client folders
   gradeable: true
   built_by: S. Wang
@@ -54,12 +54,12 @@ prompts:
 - id: T2
   category: Takeaways
   service_line: AIVB – Rapid Roadmap
-  text: What feedback did Mickey Truck Bodies' leadership give during our Rapid AI Roadmap engagement, and which topics did we go deeper on in the second week?
+  text: What feedback did Adventure Works Bodies' leadership give during our Rapid AI Roadmap engagement, and which topics did we go deeper on in the second week?
   tests: Extracting client feedback/discussion content that is embedded inside an executive readout deck, not filed as a standalone “feedback” document.
-  why_baselines_struggle: 'The relevant content sits inside “Mickey_Week 2.pptx” (“Rapid AI Roadmap Executive Readout #2”), mixed in with agenda and opportunity-list content — there is no separate feedback artifact to point at.'
+  why_baselines_struggle: 'The relevant content sits inside “AdventureWorks_Week 2.pptx” (“Rapid AI Roadmap Executive Readout #2”), mixed in with agenda and opportunity-list content — there is no separate feedback artifact to point at.'
   traps: Confusing Week 0 kickoff content with the Week 2 readout. Inventing specific feedback language not actually present in the readout deck.
   key_elements: Should reference the Week 2 Executive Readout specifically, note topics gone deeper on (e.g. SIOP, ERP per the deck's own framing), and not fabricate direct quotes not present in the source.
-  source_ref: 00_Customers/_Private Equity/IOP/Portfolio Companies/2 - Mickey Truck Bodies/Deliverables/Week 2/Mickey_Week 2.pptx
+  source_ref: 00_Customers/_Private Equity/SIP/Portfolio Companies/2 - Adventure Works Bodies/Deliverables/Week 2/AdventureWorks_Week 2.pptx
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'
@@ -78,12 +78,12 @@ prompts:
 - id: L1
   category: Long-tail
   service_line: AIVB – Full Backlog Assessment
-  text: What industry is CCS in, and where does that information actually come from?
+  text: What industry is VDS in, and where does that information actually come from?
   tests: Honest sourcing when no document states the fact directly — the system must say where an inference came from, not manufacture a citation.
-  why_baselines_struggle: No SOW or summary document states CCS's industry. It is only inferable from interview-debrief filenames (ccs-facility-services) and discovery-call content (Troy Coker, founder; growth plan from $300M to $1B) — i.e. from unstructured notes, not a formal record.
+  why_baselines_struggle: No SOW or summary document states VDS's industry. It is only inferable from interview-debrief filenames (ccs-facility-services) and discovery-call content (J. Okafor, founder; growth plan from $300M to $1B) — i.e. from unstructured notes, not a formal record.
   traps: Citing a confident industry classification as if it came from a formal document, when it does not. The opposite failure — refusing to answer at all — is also wrong, since the information is genuinely derivable, just not from where a naive system would expect.
   key_elements: Should identify “facility services” (or equivalent) and explicitly attribute it to interview/discovery notes rather than a formal SOW or profile document.
-  source_ref: 00_Customers/CCS/VAB (May 2026)/Notes/ and .../AIVB Automation Pilot/01_Debriefs/
+  source_ref: 00_Customers/VDS/VAB (May 2026)/Notes/ and .../AIVB Automation Pilot/01_Debriefs/
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'
@@ -92,9 +92,9 @@ prompts:
   service_line: AIVB
   text: Have we done an AI Value Backlog assessment for a retail or commercial banking client?
   tests: Honest refusal — does the system say “no match” instead of forcing one.
-  why_baselines_struggle: No project in the corpus is retail or banking. Schellman (cybersecurity, compliance, and audit services) is the nearest semantic neighbor — “audit” and “compliance” invite a false association with financial services.
-  traps: Classifying Schellman as a banking or financial-services client to manufacture a match.
-  key_elements: Correct answer is “no matching engagement”; a strong answer proactively notes Schellman as the closest-but-not-matching case and explains why it doesn't qualify.
+  why_baselines_struggle: No project in the corpus is retail or banking. Certwise (cybersecurity, compliance, and audit services) is the nearest semantic neighbor — “audit” and “compliance” invite a false association with financial services.
+  traps: Classifying Certwise as a banking or financial-services client to manufacture a match.
+  key_elements: Correct answer is “no matching engagement”; a strong answer proactively notes Certwise as the closest-but-not-matching case and explains why it doesn't qualify.
   source_ref: Full 24-project corpus — absence is the finding
   gradeable: true
   built_by: S. Wang
@@ -104,22 +104,22 @@ prompts:
   service_line: AIVB – Rapid Roadmap
   text: Which PE sponsor has driven the most AI Value Backlog engagements for us this year, and across all of those engagements, what industries have we touched?
   tests: 'Two-step aggregation: group and count by sponsor, then enumerate a distinct, de-duplicated industry list within that winning subset. This is the question the knowledge-graph architecture argument (Monday workshop) exists to win.'
-  why_baselines_struggle: Flat MCP-style retrieval is good at single-document keyword hits, not at “count, rank, then re-filter.” Industrial Opportunity Partners sponsors the large majority of the 24 engagements — correctly identifying the winner requires a real count, and enumerating industries requires touching every one of ~14 IOP-sponsored folders without dropping or double-counting any.
-  traps: Naming a plausible-sounding sponsor without having actually counted. Listing only 3-4 example industries and stopping instead of a complete, de-duplicated set. Missing that some IOP folders are still in pursuit stage (PolyVision) and should be handled consistently with however the question intends “engagements.”
-  key_elements: Winner should be Industrial Opportunity Partners. Industry list should be extensive (doors, truck bodies, insulation, engineered films, ladders, wallcoverings, specialty food x2, metal fabrication/building products distribution, engineered foam, frozen/prepared food, aviation components, at minimum) — missing several is a real recall failure, not a rounding error.
-  source_ref: 00_Customers/_Private Equity/IOP/Portfolio Companies/ (all subfolders)
+  why_baselines_struggle: Flat MCP-style retrieval is good at single-document keyword hits, not at “count, rank, then re-filter.” Summit Industrial Partners sponsors the large majority of the 24 engagements — correctly identifying the winner requires a real count, and enumerating industries requires touching every one of ~14 SIP-sponsored folders without dropping or double-counting any.
+  traps: Naming a plausible-sounding sponsor without having actually counted. Listing only 3-4 example industries and stopping instead of a complete, de-duplicated set. Missing that some SIP folders are still in pursuit stage (Clearpane) and should be handled consistently with however the question intends “engagements.”
+  key_elements: Winner should be Summit Industrial Partners. Industry list should be extensive (doors, truck bodies, insulation, engineered films, ladders, wallcoverings, specialty food x2, metal fabrication/building products distribution, engineered foam, frozen/prepared food, aviation components, at minimum) — missing several is a real recall failure, not a rounding error.
+  source_ref: 00_Customers/_Private Equity/SIP/Portfolio Companies/ (all subfolders)
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'
 - id: G2
   category: Relational / Entity resolution (tricky)
   service_line: AIVB – Rapid Roadmap
-  text: Is ARCO Innovations the same thing as N.B. Handy? Walk me through the actual corporate structure we're working with.
+  text: Is Proseware Innovations the same thing as N.B. Handy? Walk me through the actual corporate structure we're working with.
   tests: Correctly resolving a real parent/subsidiary structure, not a binary same-or-different judgment.
-  why_baselines_struggle: Per ARCO's own Porter's Five Forces analysis, ARCO Innovations is the IOP portfolio company; N.B. Handy Distribution is only one of ARCO's four operating companies, alongside Sentrigard Metal Systems, RAM Fabrication, and MACH Solutions. A flat retriever tends to either collapse this into “yes, same thing” or, if the two names don't co-occur in a hit document, wrongly conclude they're unrelated.
+  why_baselines_struggle: Per Proseware's own Porter's Five Forces analysis, Proseware Innovations is the SIP portfolio company; N.B. Relay Distribution is only one of Proseware's four operating companies, alongside Ironclad Metal Systems, Alpine Fabrication, and Vector Solutions. A flat retriever tends to either collapse this into “yes, same thing” or, if the two names don't co-occur in a hit document, wrongly conclude they're unrelated.
   traps: Answering a flat “yes” or “no” without describing the hierarchy. Naming only N.B. Handy and omitting the other three operating companies. Concluding they are unrelated engagements.
-  key_elements: 'Should state that ARCO Innovations is the portfolio company / holding entity and that it has four operating companies: HANDY Distribution, Sentrigard Metal Systems, RAM Fabrication, and MACH Solutions. Missing any one of the four is an incomplete answer.'
-  source_ref: 00_Customers/_Private Equity/IOP/Portfolio Companies/6 - ARCO Innovations (N.B. Handy Holdings)/Notes/ARCO_Innovations_-_Porters_5_Forces.docx
+  key_elements: 'Should state that Proseware Innovations is the portfolio company / holding entity and that it has four operating companies: HANDY Distribution, Ironclad Metal Systems, Alpine Fabrication, and Vector Solutions. Missing any one of the four is an incomplete answer.'
+  source_ref: 00_Customers/_Private Equity/SIP/Portfolio Companies/6 - Proseware Innovations (N.B. Handy Holdings)/Notes/Proseware_Innovations_-_Porters_5_Forces.docx
   gradeable: true
   built_by: S. Wang
   date_built: '2026-08-27'

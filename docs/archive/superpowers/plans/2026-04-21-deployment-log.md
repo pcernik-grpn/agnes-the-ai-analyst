@@ -16,7 +16,7 @@ Startup stav: Keboola prod/dev Agnes běžel z osobního forku `padak/tmp_oss` (
 
 - **Public repo:** `keboola/agnes-the-ai-analyst` (app + TF modul)
 - **Privátní repo:** `keboola/agnes-infra-{customer}` (pro Keboolu `keboola/agnes-infra-keboola`)
-- **GCP projekt:** `internal-prod` (Keboola) — pozn.: ponechán, owner `petr@keboola.com`
+- **GCP projekt:** `<gcp-project>` (Keboola) — pozn.: ponechán, owner `owner@example.com`
 - **Deploy SA:** `agnes-deploy@<project>.iam.gserviceaccount.com`
 - **TF state bucket:** `gs://agnes-<project>-tfstate/<customer>/`
 - **VM SA:** `agnes-<customer>-vm@<project>.iam.gserviceaccount.com` (scope: secretmanager.secretAccessor)
@@ -32,16 +32,16 @@ Startup stav: Keboola prod/dev Agnes běžel z osobního forku `padak/tmp_oss` (
 
 ### 2026-04-21 odpoledne — Fáze 0 + 1 (MVP)
 
-1. **Ověření IAM přes operativu:** `gcloud iam service-accounts create test...` — funguje i bez přímé role na projektu. Keboola má org-level inherited perms. Owner zůstává `petr@keboola.com`.
+1. **Ověření IAM přes operativu:** `gcloud iam service-accounts create test...` — funguje i bez přímé role na projektu. Keboola má org-level inherited perms. Owner zůstává `owner@example.com`.
 2. **GHCR image public:** `docker manifest inspect ghcr.io/keboola/agnes-the-ai-analyst:stable` funguje bez auth.
 3. **Snapshot boot disku:** `data-analyst-pre-migration-20260421` (safety net před Fází 2).
 4. **Per-branch tagging v release.yml:** commit `0ade45c` — přidává `:dev-<slug>` tag. **Nepushnuto** do origin kvůli chybějícímu `workflow` scope; uložen jako patch `~/.agnes-keys/0ade45c-workflow-per-branch-tag.patch`.
-5. **bootstrap-gcp.sh:** Vytváří SA + role + tfstate bucket + SA key. Spuštěno na `internal-prod`. Vytvořen `agnes-deploy` SA, bucket `gs://agnes-internal-prod-tfstate`, klíč uložen do `~/.agnes-keys/agnes-deploy-internal-prod-key.json`.
+5. **bootstrap-gcp.sh:** Vytváří SA + role + tfstate bucket + SA key. Spuštěno na `<gcp-project>`. Vytvořen `agnes-deploy` SA, bucket `gs://agnes-<gcp-project>-tfstate`, klíč uložen do `~/.agnes-keys/agnes-deploy-<gcp-project>-key.json`.
 6. **Secret Manager:** `keboola-storage-token`, `jwt-secret-key` nahrány (obě s PŘEDCHOZÍMI hodnotami — `jwt-secret-key` aby existing JWT tokeny zůstaly validní; `keboola-storage-token` pro kontinuitu syncu). Rotace tokenu odložena do Fáze 2 completion.
 7. **fetch-env-from-secrets.sh:** VM-side skript, který stahuje secrets a skládá `.env`.
 8. **Deploy MVP na staré VM `data-analyst`:** 
    - `docker compose down` → `git remote set-url origin https://github.com/keboola/agnes-the-ai-analyst.git` → `git fetch + reset --hard origin/main` → scp fetch-env.sh → `fetch-env.sh` → `docker compose pull + up -d`
-   - Ověřeno: `/api/health` `status: degraded` (stale tables, OK), image `ghcr.io/keboola/agnes-the-ai-analyst:stable`, login `zdenek.srotyr@keboola.com / 1234` funguje.
+   - Ověřeno: `/api/health` `status: degraded` (stale tables, OK), image `ghcr.io/keboola/agnes-the-ai-analyst:stable`, login `admin@example.com / <password>` funguje.
 9. **Deploy MVP na staré VM `data-analyst-dev`:** App dir je `/opt/data-analyst/` pod userem `zdeneksrotyr` (jiná struktura než prod). Scope VM je omezený — `fetch-env.sh` selhal, ale .env zůstal beze změny (stejné hodnoty), app běží na `:stable`.
 10. **tmp_oss smazán:** Starý osobní fork už neexistoval.
 
@@ -69,11 +69,11 @@ Startup stav: Keboola prod/dev Agnes běžel z osobního forku `padak/tmp_oss` (
     - Firewall `agnes-keboola-allow-web`
     - `agnes-keboola-vm` SA + IAM binding
     - `agnes-keboola-jwt-secret` + version
-    - TF state v `gs://agnes-internal-prod-tfstate/keboola/`
+    - TF state v `gs://agnes-<gcp-project>-tfstate/keboola/`
 15. **Data migration starý prod → nový prod (~2 min):**
     - `docker compose down` na starém prod VM
     - `tar czf /tmp/agnes-data.tar.gz -C /var/lib/docker/volumes/app_data/_data .` (1.8 GB)
-    - `gsutil cp` do `gs://agnes-internal-prod-tfstate/migration/agnes-data-20260421-1624.tar.gz`
+    - `gsutil cp` do `gs://agnes-<gcp-project>-tfstate/migration/agnes-data-20260421-1624.tar.gz`
     - **Problém:** `agnes-keboola-vm` SA neměl `storage.objectViewer` na bucketu → `gsutil iam ch serviceAccount:...:objectViewer gs://...` (dočasné, pro download)
     - `docker compose down` na novém prod VM
     - `gsutil cp` z bucketu na nový VM + `tar xzf ... -C /data`
@@ -83,12 +83,12 @@ Startup stav: Keboola prod/dev Agnes běžel z osobního forku `padak/tmp_oss` (
 ## Klíčové hodnoty (kopíruj pro další zákazníky)
 
 ```
-GCP_PROJECT_ID        = internal-prod
+GCP_PROJECT_ID        = <gcp-project>
 CUSTOMER_NAME         = keboola
-DEPLOY_SA             = agnes-deploy@internal-prod.iam.gserviceaccount.com
-TFSTATE_BUCKET        = gs://agnes-internal-prod-tfstate
+DEPLOY_SA             = agnes-deploy@<gcp-project>.iam.gserviceaccount.com
+TFSTATE_BUCKET        = gs://agnes-<gcp-project>-tfstate
 TFSTATE_PREFIX        = keboola
-VM_SA                 = agnes-keboola-vm@internal-prod.iam.gserviceaccount.com
+VM_SA                 = agnes-keboola-vm@<gcp-project>.iam.gserviceaccount.com
 JWT_SECRET            = agnes-keboola-jwt-secret (TF-managed)
 KEBOOLA_TOKEN_SECRET  = keboola-storage-token (manuálně vytvořený)
 INFRA_MODULE_REF      = infra-v1.0.0 (github.com/keboola/agnes-the-ai-analyst)
@@ -122,14 +122,14 @@ Staré `data-analyst-dev` má omezené compute SA scope bez Secret Manageru. V F
 ### Starý Keboola token nerotován
 Nový token v SM je stále ten stejný, co byl v `.env` na starém VM. Po ověření stability nového proudu v Keboola UI vygenerovat nový + `gcloud secrets versions add keboola-storage-token` + restart containerů. Starý pak invalidovat.
 
-### Admin heslo `1234` na starém prod
+### Admin heslo `<password>` na starém prod
 Migrace dat zkopírovala users table, takže heslo je platné i na novém prod. Rotace je uživatelův úkon přes UI. Nové dev VM má jiný state → jiné hesla.
 
 ## Co zbývá (uživatelské akce)
 
 - [ ] **Approve prod environment** v `apply.yml` runu (https://github.com/keboola/agnes-infra-keboola/actions/runs/24731681502) — jinak se state neaplikuje na prod
-- [ ] **Změnit heslo admin usera** z `1234` (http://<prod-vm-ip>:8000/login → profil)
-- [ ] **Rotovat Keboola Storage token** v Keboola UI → `gcloud secrets versions add keboola-storage-token --data-file=- --project=internal-prod` → restart app containerů na obou VMs (cron to zachytí při dalším tiku nebo `sudo /usr/local/bin/agnes-auto-upgrade.sh`)
+- [ ] **Změnit heslo admin usera** z `<password>` (http://<prod-vm-ip>:8000/login → profil)
+- [ ] **Rotovat Keboola Storage token** v Keboola UI → `gcloud secrets versions add keboola-storage-token --data-file=- --project=<gcp-project>` → restart app containerů na obou VMs (cron to zachytí při dalším tiku nebo `sudo /usr/local/bin/agnes-auto-upgrade.sh`)
 
 ## Aktualizace průběhu (2026-04-21 pozdně)
 
@@ -199,15 +199,15 @@ Migrace dat zkopírovala users table, takže heslo je platné i na novém prod. 
 | **Image tagy** | prod `:stable`, dev `:dev`, feature branches `:dev-<slug>` (aktivní po v1.4) |
 | **Auto-upgrade** | Cron `*/5 * * * *` — reads AGNES_TAG z .env, digest change → restart |
 | **Prod health** | `degraded` (stale tables), 103 tables, 9.3M rows, 2 users |
-| **Dev DB** | 99 tables v registry, admin user `admin@keboola.com` |
+| **Dev DB** | 99 tables v registry, admin user `admin@example.com` |
 | **Backups** | Daily snapshot @ 02:00, 30-day retention (oba data disky) |
 | **Monitoring** | uptime check 60s/10s per VM, alert > 5 min failure (notification channels nenapojené) |
 | **Firewall** | Web 80/443 + 8000 (jen když TLS off); SSH na IAP range only |
-| **Login prod** | `zdenek.srotyr@keboola.com` / `1234` *(pending: user rotate)* |
-| **Login dev** | `admin@keboola.com` / `1234` *(pending: user rotate)* |
-| **TF state** | `gs://agnes-internal-prod-tfstate/keboola/` (versioned, GCS backend) |
-| **Deploy SA** | `agnes-deploy@internal-prod.iam.gserviceaccount.com` |
-| **VM SA** (scope: secretmanager.secretAccessor per-secret) | `agnes-keboola-vm@internal-prod.iam.gserviceaccount.com` |
+| **Login prod** | `admin@example.com` / `<password>` *(pending: user rotate)* |
+| **Login dev** | `admin@example.com` / `<password>` *(pending: user rotate)* |
+| **TF state** | `gs://agnes-<gcp-project>-tfstate/keboola/` (versioned, GCS backend) |
+| **Deploy SA** | `agnes-deploy@<gcp-project>.iam.gserviceaccount.com` |
+| **VM SA** (scope: secretmanager.secretAccessor per-secret) | `agnes-keboola-vm@<gcp-project>.iam.gserviceaccount.com` |
 | **Secrets** | `keboola-storage-token` (manual), `agnes-keboola-jwt-secret` (TF), `jwt-secret-key` (legacy) |
 | **Public upstream repo** | https://github.com/keboola/agnes-the-ai-analyst |
 | **Template repo** | https://github.com/keboola/agnes-infra-template (is_template=true, ref infra-v1.4.0) |

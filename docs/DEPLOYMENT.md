@@ -638,6 +638,23 @@ explicit secrets, `coordination.backend: redis`) must already hold, or
 `validate_deployment` refuses to boot that container exactly like any other
 role-split process.
 
+On a VM provisioned by the Terraform module
+(`infra/modules/customer-instance`), none of this is assembled by hand —
+the startup script owns `.env` and `COMPOSE_FILE`, so hand edits are
+reverted on the next recreate. Instead set the per-instance
+`extraction_worker_enabled = true` (default off) together with the
+module-level `extraction_worker_image` (a worker image that carries your
+extraction producer — the plain app image has no producer on PATH, and the
+module refuses the flag without an image at plan time). The module then
+renders the Redis coordination backend, the `.env` coordination
+declaration, and an always-on `extraction-worker` service into the boot
+path. The startup script is under `lifecycle.ignore_changes`, so flipping
+the flag on an existing VM takes effect only through a VM recreate
+(`terraform apply -replace=<vm address>`); the Postgres app-state and
+explicit-secrets prerequisites above remain yours to satisfy — on a
+DuckDB app-state instance the app still refuses to boot, naming the
+missing piece.
+
 ### Coordination backend
 
 `coordination.backend` (`instance.yaml`) / `AGNES_COORDINATION_BACKEND`
