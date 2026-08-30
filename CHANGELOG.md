@@ -26,6 +26,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **A recorded sync failure cannot carry the credential that caused it.** The new extractor-crash recorder persists the last stderr line into `sync_state`, which the admin UI renders — and DuckDB echoes the offending statement for a whole class of errors (a Catalog error renders `LINE 1: <statement>` verbatim), while the Keboola path builds `ATTACH '<url>' AS kbc (TYPE keboola, TOKEN '<token>')`. A credential failure would therefore have moved the storage token out of the process's stdout and into the app-state database. Literals following a credential keyword are redacted before anything is stored — matching identifiers that merely CONTAIN the keyword (`BEARER_TOKEN`, `KEBOOLA_STORAGE_TOKEN`), not just the bare word — and the detail is capped at 500 characters, since it is a UI cell written once per attempted table. Ordinary causes pass through untouched; that is the point of recording them.
+
 - **The daily cut PR opens even when the batch is large.** `daily-cut.yml` embedded every shipped bullet in the PR body; the 0.93.0 cut carried 214 of them (216 KB) and blew past GitHub's 65,536-character limit, so `gh pr create` failed *after* the branch was already computed, committed and pushed — which reads as a broken cut rather than a broken announcement. The list is now budgeted, trimmed at bullet boundaries and stopping once the budget is spent (never interleaving whichever later bullets still fit), with a line naming how many were omitted. The CHANGELOG diff on the PR remains the complete list.
 
 ## [0.93.0] - 2026-08-30

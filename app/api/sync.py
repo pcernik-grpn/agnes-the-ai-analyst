@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -732,6 +733,31 @@ def _run_materialized_pass(
     return summary
 
 
+# Credential-bearing statements the extractor may echo back. DuckDB puts the
+# offending SQL in the message for a whole class of errors -- a Catalog error
+# renders `LINE 1: <the statement>` verbatim -- and the Keboola path builds
+# `ATTACH '<url>' AS kbc (TYPE keboola, TOKEN '<token>')`. That text reaches
+# stderr, and `_record_extractor_crash` persists it to `sync_state`, where the
+# admin UI renders it: a failure would move the storage token out of the
+# process's stdout and into the app-state database. Redact the literal that
+# follows a credential keyword before anything is stored.
+# The keyword may be part of a larger identifier (`BEARER_TOKEN`,
+# `storage_token`), so match any word CONTAINING it rather than the bare word.
+_SECRET_LITERAL_RE = re.compile(
+    r"(?i)([\w-]*(?:token|secret|password|passwd|pwd|apikey|api[_-]key|bearer)[\w-]*)"
+    r"(\s*[:=]?\s*)('[^']*'|\"[^\"]*\"|[^\s,()]+)"
+)
+
+#: Cap the stored detail: an error is a UI cell, not a log sink, and a
+#: multi-kilobyte message would be written once per attempted table.
+_MAX_ERROR_DETAIL = 500
+
+
+def _redact_secrets(text: str) -> str:
+    """Blank out credential literals in a message bound for `sync_state`."""
+    return _SECRET_LITERAL_RE.sub(r"\1\2[REDACTED]", text or "")[:_MAX_ERROR_DETAIL]
+
+
 def _record_extractor_crash(*, table_configs: list, returncode: int, stderr: str) -> None:
     """Persist an error state for every table a DEAD extractor run attempted.
 
@@ -749,7 +775,7 @@ def _record_extractor_crash(*, table_configs: list, returncode: int, stderr: str
     exception here would turn a reportable sync failure into a 500.
     """
     tail = (stderr or "").strip().splitlines()
-    detail = tail[-1].strip() if tail else ""
+    detail = _redact_secrets(tail[-1].strip()) if tail else ""
     message = (
         f"extractor failed (exit {returncode}): {detail}"
         if detail

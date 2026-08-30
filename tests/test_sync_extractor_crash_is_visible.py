@@ -82,14 +82,13 @@ class TestExtractorCrashFallback:
     def test_it_never_raises_and_never_blocks_the_run(self, captured, monkeypatch):
         """This runs on the failure path — it must not turn a failed sync into
         a crashed request."""
+
         class _Boom:
             def set_error(self, *a, **k):
                 raise RuntimeError("db gone")
 
         monkeypatch.setattr(sync_api, "sync_state_repo", lambda: _Boom())
-        sync_api._record_extractor_crash(
-            table_configs=[{"id": "orders", "name": "orders"}], returncode=1, stderr="x"
-        )
+        sync_api._record_extractor_crash(table_configs=[{"id": "orders", "name": "orders"}], returncode=1, stderr="x")
 
 
 class TestRealExtractorPathReachesIt:
@@ -120,3 +119,52 @@ class TestRealExtractorPathReachesIt:
             "reports sync health reads it, so the failure is invisible"
         )
         assert "exit" in state.errors["orders"]
+
+
+class TestCrashDetailIsRedacted:
+    """The recorded cause must never carry the credential that caused it.
+
+    `_record_extractor_crash` persists the last stderr line into `sync_state`,
+    which the admin UI renders. DuckDB echoes the offending statement for a
+    whole class of errors — a Catalog error renders `LINE 1: <statement>`
+    verbatim — and the Keboola path builds
+    `ATTACH '<url>' AS kbc (TYPE keboola, TOKEN '<token>')`. Without redaction
+    a credential failure would move the storage token out of the process's
+    stdout and into the app-state database.
+    """
+
+    @pytest.mark.parametrize(
+        "message, secret",
+        [
+            (
+                (
+                    "Catalog Error: LINE 1: ATTACH 'https://example.com' AS kbc "
+                    "(TYPE keboola, TOKEN 'SUPERSECRET-abc123')"
+                ),
+                "SUPERSECRET-abc123",
+            ),
+            ("IO Error: HTTP 401 Unauthorized for token=SUPERSECRET-abc123", "SUPERSECRET-abc123"),
+            # The keyword is part of a larger identifier, not a bare word.
+            ('CREATE SECRET s (TYPE http, BEARER_TOKEN "SUPERSECRET-abc123")', "SUPERSECRET-abc123"),
+            ("KEBOOLA_STORAGE_TOKEN=SUPERSECRET-abc123 rejected", "SUPERSECRET-abc123"),
+            ("password: hunter2 was rejected", "hunter2"),
+        ],
+    )
+    def test_credential_literals_are_redacted(self, message, secret):
+        from app.api.sync import _redact_secrets
+
+        assert secret not in _redact_secrets(message)
+        assert "[REDACTED]" in _redact_secrets(message)
+
+    def test_ordinary_causes_survive_intact(self):
+        """Redaction must not eat the diagnostic — that is the whole point."""
+        from app.api.sync import _redact_secrets
+
+        assert _redact_secrets("extractor failed: connection refused") == ("extractor failed: connection refused")
+
+    def test_detail_is_capped(self):
+        """An error is a UI cell, not a log sink, and it is written once per
+        attempted table."""
+        from app.api.sync import _redact_secrets
+
+        assert len(_redact_secrets("x" * 5000)) == 500
