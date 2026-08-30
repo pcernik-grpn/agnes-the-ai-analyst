@@ -1096,6 +1096,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   denies too — but on an SDK with no `PreToolUse` hook support at all nothing
   can be registered and tool calls run ungated (logged loudly). The `kai-agent`
   provider is unaffected; its engine raises its own approvals.
+- **Semantic-layer detail page: the detach toolbar's "Export detached
+  version" link 404'd, and its two buttons rendered as unstyled text
+  (#1707).** The link pointed at the HTML detail route
+  (`/semantic-layer/{slug}.yaml`), which the `{slug}` path parameter catches
+  literally and 404s on; it now points at the route that actually serves the
+  document, `GET /api/semantic-models/{slug}.yaml`. The Re-attach/Detach
+  buttons used a `.btn--sm` class that has no rule in any app stylesheet,
+  so they had no borders or button chrome; they now use the same
+  `btn-secondary`/`btn-primary` + `btn-sm` classes as the rest of the page.
+  Added page-level test coverage for the detach toolbar (PG-only, since
+  `sync_mode='detached'` is a Postgres-only column), which is what let both
+  issues ship unguarded.
 - **Testing a non-Keboola data connection no longer fails with a Keboola error.**
   `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
   /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and

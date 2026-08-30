@@ -94,12 +94,12 @@
         {%- elif source_changed_since_detach %} · source changed since detach
         {%- endif %}
     </span>
-    <a href="/semantic-layer/{{ slug }}.yaml" class="slb-cross-link">Export detached version</a>
+    <a href="/api/semantic-models/{{ slug }}.yaml" class="slb-cross-link">Export detached version</a>
     {% if user.is_admin and not source_missing_since %}
-    <button type="button" class="btn btn--sm" id="slb-reattach-btn">Re-attach</button>
+    <button type="button" class="btn btn-secondary btn-sm" id="slb-reattach-btn">Re-attach</button>
     {% endif %}
     {% elif is_imported and user.is_admin %}
-    <button type="button" class="btn btn--sm" id="slb-detach-btn">Detach to edit</button>
+    <button type="button" class="btn btn-primary btn-sm" id="slb-detach-btn">Detach to edit</button>
     {% endif %}
 </div>
 {{ ds.tabs(items=tabs, aria_label='Semantic model object types') }}
