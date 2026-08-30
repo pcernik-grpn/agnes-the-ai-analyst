@@ -201,12 +201,13 @@ class TestModelList:
         body = r.text
         assert "retail" in body
         # Object counts per type: 2 datasets, 1 metric, 1 constraint,
-        # 1 relationship, 1 glossary term.
+        # 1 relationship, 1 glossary term — rendered through fbar_card()'s
+        # `tags` slot, which (like every other tag list in the product)
+        # shows the first 3 and collapses the rest to "+N".
         assert "2 datasets" in body
         assert "1 metric<" in body or "1 metric " in body
         assert "1 constraint" in body
-        assert "1 relationship" in body
-        assert "1 glossary term" in body
+        assert "+2" in body  # relationships + glossary terms collapse
         # Native (source='manual') carries no "Imported from" badge.
         assert "Imported from" not in body
 
@@ -683,7 +684,9 @@ class TestObjectDetail:
         with the other `[data-tip]` sites in the repo, none of which use it."""
         _seed_model()
         c = seeded_app["client"]
-        r = c.get(f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"]))
+        r = c.get(
+            f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"])
+        )
         assert r.status_code == 200
         body = r.text
         span_match = re.search(r'<span class="badge[^"]*"[^>]*>error</span>', body)

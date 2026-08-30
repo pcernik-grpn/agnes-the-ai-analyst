@@ -493,15 +493,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 - **`/semantic-layer` now extends the shared list-page shell (#1707).** It
-  previously extended `base_page.html`'s hero shell — the one page-shell
-  outlier among the app's resource lists (Library, Skills, Agents, Chats,
-  Profile, My connections, and the admin builders all extend
-  `base_index.html`) — with ~60 lines of bespoke card CSS duplicating the
-  shared `catalog_card.css` component. The model grid now renders through
-  that shared card vocabulary (`.cc-card`, `kind_glyph`), so a model card
-  looks like a Library card; only what the shared card has no slot for stays
-  page-local — the SQL dialect line, the five per-type object-count pills,
-  and the invalid-model error list.
+  previously extended `base_page.html`'s hero shell — the shell most of the
+  app's *list* pages had already left behind (Library, Skills, Agents,
+  Chats, Profile, My connections and the admin builders all extend
+  `base_index.html`; `base_page.html` remains correct for non-list pages
+  like Data apps and Studio) — with ~60 lines of bespoke card CSS. The model
+  grid now renders through `fbar_card()` (`macros/_fbar_card.html`), the
+  same macro `/admin/data-packages` renders server-side and the Library
+  projects client-side — not the unused `catalog_card()` in
+  `macros/_catalog_card.html`, which has no template callers. Only what
+  that macro has no slot for stays page-local: the invalid-model tint and
+  its stored validation-error list.
 - **Each semantic-layer page has a name of its own (#1707).** Three of the four
   rendered the identical title "Semantic layer", so a browser tab, a bookmark
   or a history entry could not tell them apart, and a link's label routinely

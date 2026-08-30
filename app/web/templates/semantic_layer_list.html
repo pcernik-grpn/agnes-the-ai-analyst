@@ -1,5 +1,5 @@
 {% extends "base_index.html" %}
-{% from "macros/_catalog_card.html" import kind_glyph %}
+{% from "macros/_fbar_card.html" import fbar_card %}
 
 {# NAME: "Semantic models", never "Semantic layer" — that name was worn by
    three of the four semantic surfaces at once (this page, /catalog/semantics
@@ -9,17 +9,21 @@
 {% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {# The `base_index.html` shell (one unbroken --ds-surface, identity-led head
-   band + a full-width card band below) — every other resource list on this
+   band + a full-width card band below) — most other resource lists on this
    branch (Library, Skills, Agents, Chats, Profile, My connections, the admin
-   builders) extends it; this page used to extend `base_page.html`'s hero
-   shell instead, which is why it looked unlike the rest of the app.
+   builders) extend it; this page used to extend `base_page.html`'s hero shell
+   instead (a shell a few other non-list pages — Data apps, Studio — also use
+   deliberately), which is why it looked unlike the rest of the *list* pages.
 
-   The cards ride the shared catalog-card vocabulary (`css/catalog_card.css`
-   + `kind_glyph`) so a model card looks like a Library card. What stays
-   page-local (`.sl-*`) is content this component has no slot for: the SQL
-   dialect line, the five per-type object-count pills, and the invalid-model
-   error list — none of that is generic catalog-card shape. #}
+   The cards are `fbar_card()` (macros/_fbar_card.html) — the SAME macro
+   `/admin/data-packages` renders and the Library projects client-side, not
+   the unused `catalog_card()` in macros/_catalog_card.html (zero template
+   callers). What stays page-local (`.sl-*`) is content that macro has no
+   slot for: the invalid-model tint and its stored error list — a `<ul>`
+   never inside the title's `<a>`, which is the one thing the pre-shell
+   `slb-card` got wrong. #}
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <style>
 /* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
@@ -28,35 +32,24 @@
 .sl-head h1 { font-size: 24px; margin: 2px 0 0; }
 .sl-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 6px 0 0; max-width: 64ch; }
 
-/* ── Model grid — catalog_card.css has no shared grid class (every card
-   collection defines its own, e.g. .ag-grid, .lib-grid); this is that. ── */
-.sl-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: var(--space-4);
-}
-/* An invalid document is still a real card, flagged rather than styled away
-   — no generic `.cc-card` modifier for "this resource failed validation". */
-.cc-card--invalid { border-color: var(--ds-accent-danger-line); }
+/* `.fbar-grid` (filter_toolbar.css) is fixed at 3 columns; auto-fill reads
+   better for a collection this short and matches the pre-shell grid's own
+   sizing — same page-specific-override pattern as admin_data_packages'
+   own `.adp-grid`. */
+.sl-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
 
-/* SQL dialect(s) — a one-line fact specific to a semantic model, not part of
-   the generic catalog-card body. */
-.sl-dialects { font-size: 11px; color: var(--ds-text-muted); }
+/* An invalid document is still a real card, flagged rather than styled
+   away — an attribute selector rather than a second class on the `<article>`
+   `fbar_card()` already stamps with `class="fbar-card"` (a caller-supplied
+   class would collide with it). Survives `:hover` (which only touches
+   `box-shadow`, never `border-color`) and defers to `:focus-within`'s own
+   primary-colored ring, same as every other card. */
+.fbar-card[data-status="invalid"] { border-color: var(--ds-accent-danger-line); }
 
-/* Per-object-type counts (datasets/metrics/constraints/relationships/
-   glossary terms) — five distinct counters no other catalog card shows. */
-.sl-counts { display: flex; flex-wrap: wrap; gap: 6px; }
-.sl-count {
-    font-size: 11px;
-    color: var(--ds-text-muted);
-    background: var(--ds-surface-dim);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-full);
-    padding: 2px 8px;
-}
-
-/* Stored validation errors for an invalid document — rendered instead of
-   counts, since document_json may be stale or absent for that row. */
+/* The invalid state's footer content: the "Invalid" badge plus its stored
+   validation errors — rendered instead of the object-count tags, since an
+   invalid document's `document_json` may be stale or absent. */
+.sl-invalid { display: flex; flex-direction: column; gap: 4px; }
 .sl-errors {
     margin: 0;
     padding: 0 0 0 18px;
@@ -77,27 +70,31 @@
 
 {% block page_surface %}
 {% if models %}
-<div class="sl-grid">
+<div class="fbar-grid sl-grid">
     {% for m in models %}
-    <article class="cc-card{% if m.status == 'invalid' %} cc-card--invalid{% endif %}">
-        <div class="cc-head">
-            <span class="cc-icon cc-icon--data">{{ kind_glyph('data') }}</span>
-            <div class="cc-titlewrap">
-                <h3 class="cc-title"><a href="/semantic-layer/{{ m.slug }}">{{ m.name }}</a></h3>
-                <div class="cc-eyebrow">
-                    <span class="cc-kind cc-kind--data">Semantic model</span>
-                    {% if m.is_imported %}
-                    <span class="cc-sep">·</span>
-                    <span class="badge">Imported from {{ m.source_label }}</span>
-                    {% endif %}
-                </div>
-            </div>
-        </div>
-        <p class="cc-desc">{{ m.description or "No description provided yet." }}</p>
-        {% if m.dialects %}
-        <div class="sl-dialects">SQL dialect{{ '' if m.dialects | length == 1 else 's' }}: {{ m.dialects | join(', ') }}</div>
-        {% endif %}
-        {% if m.status == 'invalid' %}
+    {% set _is_invalid = m.status == 'invalid' %}
+    {% set _card = {
+         'kind': 'data',
+         'title': m.name,
+         'href': '/semantic-layer/' ~ m.slug,
+         'description': m.description or '',
+         'meta': ('SQL dialect' ~ ('' if m.dialects | length == 1 else 's') ~ ': ' ~ (m.dialects | join(', '))) if m.dialects else '',
+         'tags': [] if _is_invalid else [
+             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's'),
+             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's'),
+             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's'),
+             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's'),
+             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's'),
+         ],
+         'attrs': 'data-status="invalid"' if _is_invalid else None,
+       } %}
+    {% if m.is_imported or _is_invalid %}
+    {% call fbar_card(_card) %}
+      {% if m.is_imported %}
+      <span class="badge">Imported from {{ m.source_label }}</span>
+      {% endif %}
+      {% if _is_invalid %}
+      <div class="sl-invalid">
         <span class="badge badge--danger">Invalid</span>
         {% if m.validation_errors %}
         <ul class="sl-errors">
@@ -106,16 +103,12 @@
             {% endfor %}
         </ul>
         {% endif %}
-        {% else %}
-        <div class="sl-counts">
-            <span class="sl-count">{{ m.counts.datasets }} dataset{{ '' if m.counts.datasets == 1 else 's' }}</span>
-            <span class="sl-count">{{ m.counts.metrics }} metric{{ '' if m.counts.metrics == 1 else 's' }}</span>
-            <span class="sl-count">{{ m.counts.constraints }} constraint{{ '' if m.counts.constraints == 1 else 's' }}</span>
-            <span class="sl-count">{{ m.counts.relationships }} relationship{{ '' if m.counts.relationships == 1 else 's' }}</span>
-            <span class="sl-count">{{ m.counts.glossary }} glossary term{{ '' if m.counts.glossary == 1 else 's' }}</span>
-        </div>
-        {% endif %}
-    </article>
+      </div>
+      {% endif %}
+    {% endcall %}
+    {% else %}
+    {{ fbar_card(_card) }}
+    {% endif %}
     {% endfor %}
 </div>
 {% else %}
