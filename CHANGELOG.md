@@ -29,8 +29,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ending at "check this source's config". Per adapter: Snowflake reports
   database, schema (or `(whole database)`) and the ROLE it connects as;
   Keboola the project its connection is bound to; Databricks the Unity
-  Catalog catalogs and workspace; a git source its repository and ref; an
-  upload source its document count. Derived from the source's own config at
+  Catalog catalogs and workspace; a git source its repository, ref and file
+  glob (stated even when it is the default — a repo of `*.yml` documents
+  against the default `**/*.yaml` clones fine and matches nothing, which is
+  the same failure in git shape); an upload source its document count. Derived from the source's own config at
   read time (`src/semantic/scan_scope.py`) and never stored — the scope is a
   property of the row, not of a run — so nothing can drift, and an adapter
   with no resolver reports `null` and every surface omits it. Coordinates

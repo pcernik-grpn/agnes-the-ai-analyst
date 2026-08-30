@@ -74,28 +74,55 @@ def _without_credentials(value: str) -> str:
     scheme, sep, rest = value.partition("://")
     if not sep:
         scheme, rest = "", value
+
     authority, slash, path = rest.partition("/")
     if "@" in authority:
         # Partition on the LAST "@": userinfo may itself contain one.
-        authority = authority.rpartition("@")[2]
-    return f"{scheme}{sep}{authority}{slash}{path}"
+        return f"{scheme}{sep}{authority.rpartition('@')[2]}{slash}{path}"
+
+    # Userinfo is not supposed to carry an unencoded "/" — but a base64
+    # token does, and a URL written by hand is not required to percent-encode
+    # it. The "@" then lands AFTER the first "/" and the authority split above
+    # misses it entirely, which is precisely the case that would leak a
+    # credential onto an admin page. Treat what precedes the last "@" as
+    # userinfo only when it opens `name:secret`: a `host:port` (digits) or a
+    # path that merely contains an "@" (an npm-style `/@scope/`, an address)
+    # must survive intact rather than lose its host to a false positive.
+    before, at, after = rest.rpartition("@")
+    if at:
+        _name, colon, secret = before.split("/", 1)[0].partition(":")
+        if colon and secret and not secret.isdigit():
+            return f"{scheme}{sep}{after}"
+    return f"{scheme}{sep}{rest}"
 
 
-def _cached(cache: Dict[str, Any], key: str, loader: Callable[[], Any]) -> Any:
+def _cached(cache: Dict[str, Any], key: str, loader: Callable[[], Any], *, strict: bool = False) -> Any:
     """Resolve ``key`` once per batch.
 
     Connection settings are per-instance, not per-source, and resolving them
     reads the connection registry and the vault — so a list of ten Snowflake
-    sources must not mean ten resolutions. A failed load is cached as ``None``
-    for the same reason: it will fail the same way for every other row.
+    sources must not mean ten resolutions. A failure is cached too, for the
+    same reason: it will fail identically for every other row.
+
+    ``strict`` re-raises that failure (once cached and once logged) instead of
+    handing back ``None``. It is for a lookup whose ``None`` already carries a
+    meaning of its own — "this connection is not registered any more" — where
+    collapsing an unreadable database into that answer would report a deletion
+    that never happened. The caller's own ``scan_scope`` guard then turns it
+    into "cannot say", naming the source.
     """
     if key not in cache:
         try:
             cache[key] = loader()
-        except Exception as exc:  # noqa: BLE001 - unresolvable settings are "cannot say"
-            logger.warning("Semantic scan scope: could not resolve %s settings: %s", key, exc)
-            cache[key] = None
-    return cache[key]
+        except Exception as exc:  # noqa: BLE001 - an unresolvable lookup is "cannot say"
+            logger.warning("Semantic scan scope: could not resolve %s: %s", key, exc)
+            cache[key] = exc
+    value = cache[key]
+    if isinstance(value, BaseException):
+        if strict:
+            raise value
+        return None
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -104,15 +131,28 @@ def _cached(cache: Dict[str, Any], key: str, loader: Callable[[], Any]) -> Any:
 
 
 def _git_scope(config: Dict[str, Any], cache: Dict[str, Any]) -> Optional[str]:
-    """Repository + ref — what ``transports._clone`` clones, minus the
-    credential a URL may embed. No ``ref`` means git's own default branch,
-    which is what ``--branch`` being omitted resolves to.
+    """Repository, ref and glob — what ``transports._clone`` clones and what
+    ``_documents_from_clone`` then reads out of it, minus the credential a URL
+    may embed. No ``ref`` means git's own default branch, which is what
+    ``--branch`` being omitted resolves to.
+
+    The glob is stated even when it is the default (``**/*.yaml``), unlike the
+    Snowflake ``like`` clause which only appears when set. It is not decoration
+    here: a repository of ``*.yml`` documents against the default ``*.yaml``
+    pattern clones fine, matches nothing and syncs ``ok`` with zero models —
+    the git-shaped A17. Hiding the pattern precisely when nobody chose it would
+    hide the most likely cause of that.
     """
     repo_url = _text(config.get("repo_url"))
     if not repo_url:
         return None
     ref = _text(config.get("ref"))
-    return f"{_without_credentials(repo_url)} @ {ref or 'default branch'}"
+    # Same fallback as `transports.load_documents`, sourced from it so the two
+    # cannot drift into stating different defaults.
+    from src.semantic.transports import _DEFAULT_GLOB
+
+    glob = _text(config.get("glob")) or _DEFAULT_GLOB
+    return f"{_without_credentials(repo_url)} @ {ref or 'default branch'} matching '{glob}'"
 
 
 def _upload_scope(config: Dict[str, Any], cache: Dict[str, Any]) -> Optional[str]:
@@ -188,16 +228,33 @@ def _keboola_scope(config: Dict[str, Any], cache: Dict[str, Any]) -> Optional[st
     against, and ``config.legacy_credentials`` means the environment pair. The
     stack URL and token that connection holds are deliberately not echoed —
     the project is the coordinate, and the rest is credential surface.
+
+    The connection's ``source_type`` is checked for the same reason
+    ``_connection_master_credentials`` checks it before reading a Metastore:
+    a source re-pointed at, say, a BigQuery connection has no Keboola project
+    at all, and rendering "Keboola project …" for it would state a scope that
+    does not exist. That sync raises; this says so.
     """
     connection_id = _text(config.get("connection_id"))
     if connection_id:
-        from src.repositories import source_connections_repo
 
-        connection = source_connections_repo().get(connection_id)
+        def _load() -> Any:
+            from src.repositories import source_connections_repo
+
+            return source_connections_repo().get(connection_id)
+
+        # Keyed per connection: two sources on the same connection are one
+        # lookup, two sources on different ones stay two. `strict`, because
+        # `None` below means "deregistered" — an unreadable registry must not
+        # be reported as one.
+        connection = _cached(cache, f"keboola_connection:{connection_id}", _load, strict=True)
         if connection is None:
             # The sync raises the same way; saying so here is what tells the
             # admin the scope is gone rather than empty.
             return f"Keboola connection {connection_id} (no longer registered)"
+        source_type = _text(connection.get("source_type"))
+        if source_type != "keboola":
+            return f"connection {connection_id} (a {source_type or 'unknown'} connection, not a Keboola one)"
         connection_config = connection.get("config") or {}
         project_id = _text(connection_config.get("project_id"))
         project_name = _text(connection_config.get("project_name"))

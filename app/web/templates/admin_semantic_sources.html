@@ -307,8 +307,11 @@ function fmtScanScope(s) {
   // scan_scope.py). `null` — no scope could be stated for this source, or a
   // server too old to send the field — renders nothing at all rather than a
   // guess: an empty scope line would be a claim of its own.
+  // Tense-neutral on purpose: this cell also renders on a "never synced" row,
+  // where the scope is what the FIRST sync will look at, not what a past one
+  // did — a tooltip saying "last sync" would contradict the row beside it.
   if (typeof s.scan_scope !== "string" || !s.scan_scope) return "";
-  return ` · <span class="ss-scope" title="What this source's last sync looked at.">scanned ${esc(s.scan_scope)}</span>`;
+  return ` · <span class="ss-scope" title="What this source's sync looks at.">scanned ${esc(s.scan_scope)}</span>`;
 }
 
 function fmtOwnedModels(s) {

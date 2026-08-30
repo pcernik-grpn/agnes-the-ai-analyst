@@ -82,12 +82,12 @@ class TestTheGitTransport:
     def test_repository_and_ref(self):
         scope = scan_scope(_row("git", config={"repo_url": "https://example.com/acme/semantics.git", "ref": "main"}))
 
-        assert scope == "https://example.com/acme/semantics.git @ main"
+        assert scope == "https://example.com/acme/semantics.git @ main matching '**/*.yaml'"
 
     def test_no_ref_says_default_branch_rather_than_nothing(self):
         scope = scan_scope(_row("git", config={"repo_url": "https://example.com/acme/semantics.git"}))
 
-        assert scope == "https://example.com/acme/semantics.git @ default branch"
+        assert scope == "https://example.com/acme/semantics.git @ default branch matching '**/*.yaml'"
 
     def test_a_credential_embedded_in_the_url_is_never_rendered(self):
         """A repo URL that still carries a PAT from before the marketplace
@@ -98,7 +98,7 @@ class TestTheGitTransport:
 
         assert "ghp_secret" not in scope
         assert "someone" not in scope
-        assert scope == "https://example.com/acme/semantics.git @ default branch"
+        assert scope == "https://example.com/acme/semantics.git @ default branch matching '**/*.yaml'"
 
     def test_a_token_env_name_is_not_echoed_either(self):
         scope = scan_scope(
@@ -109,6 +109,87 @@ class TestTheGitTransport:
 
     def test_no_repo_url_is_unknown_not_a_made_up_scope(self):
         assert scan_scope(_row("git", config={})) is None
+
+    def test_an_explicit_glob_is_part_of_the_scope(self):
+        """The clone is only half the scan: `_documents_from_clone` reads the
+        files the glob matches, so a glob is as much "what was looked at" as
+        the ref is."""
+        scope = scan_scope(
+            _row(
+                "git",
+                config={
+                    "repo_url": "https://example.com/acme/semantics.git",
+                    "ref": "main",
+                    "glob": "models/*.yaml",
+                },
+            )
+        )
+
+        assert scope == "https://example.com/acme/semantics.git @ main matching 'models/*.yaml'"
+
+    def test_the_default_glob_is_stated_too_because_it_is_the_one_that_surprises(self):
+        """A repository of `*.yml` documents against the default `**/*.yaml`
+        clones fine, matches nothing and syncs `ok` with zero models — the
+        git-shaped A17. Hiding the pattern exactly when nobody chose it would
+        hide the likeliest cause."""
+        scope = scan_scope(_row("git", config={"repo_url": "https://example.com/acme/semantics.git"}))
+
+        assert "matching '**/*.yaml'" in scope
+
+    def test_the_default_it_states_is_the_one_the_fetch_uses(self):
+        """Sourced from the transport, not restated — the two cannot drift
+        into advertising different defaults."""
+        from src.semantic.transports import _DEFAULT_GLOB
+
+        scope = scan_scope(_row("git", config={"repo_url": "https://example.com/acme/semantics.git"}))
+
+        assert f"matching '{_DEFAULT_GLOB}'" in scope
+
+
+class TestUrlsAreRenderedWithoutCredentials:
+    """`_without_credentials` is structural, not token-dependent: the value
+    most in need of sanitising is a repo URL carrying a PAT from before the
+    marketplace fix, and the token to redact against may already be rotated."""
+
+    @staticmethod
+    def _git(repo_url: str) -> str:
+        return scan_scope(_row("git", config={"repo_url": repo_url}))
+
+    def test_scheme_less_userinfo_is_stripped(self):
+        """`urlparse` finds no hostname here, which is why the marketplace
+        helper could not be reused as-is."""
+        assert self._git("someone:ghp_secret@example.com/acme/a.git").startswith("example.com/acme/a.git @")
+
+    def test_userinfo_containing_an_unencoded_slash_is_stripped(self):
+        """A base64 token contains "/", which pushes the "@" past the first
+        path separator — the case a naive authority split misses entirely."""
+        scope = self._git("https://someone:pa/ss+tok@example.com/acme/a.git")
+
+        assert "pa/ss+tok" not in scope
+        assert scope.startswith("https://example.com/acme/a.git @")
+
+    def test_a_userinfo_containing_an_at_sign_is_stripped_whole(self):
+        scope = self._git("https://someone@corp:tok@example.com/acme/a.git")
+
+        assert "someone@corp" not in scope
+        assert "tok" not in scope
+
+    def test_a_path_that_merely_contains_an_at_sign_keeps_its_host(self):
+        """An npm-style `/@scope/` path is not a credential; mangling it into
+        a different host would be a wrong claim of its own."""
+        assert self._git("https://example.com/@acme/semantics.git").startswith(
+            "https://example.com/@acme/semantics.git @"
+        )
+
+    def test_a_port_is_not_mistaken_for_a_password(self):
+        assert self._git("https://example.com:8443/scm/@team/a.git").startswith(
+            "https://example.com:8443/scm/@team/a.git @"
+        )
+
+    def test_a_query_string_is_dropped(self):
+        """Nothing should ever put a secret there, which is exactly why a
+        value that does must not be rendered."""
+        assert "token=" not in self._git("https://example.com/a.git?token=ghp_secret")
 
 
 class TestTheUploadTransport:
@@ -225,6 +306,49 @@ class TestTheKeboolaMetastore:
 
         assert scope == "Keboola connection conn-gone (no longer registered)"
 
+    def test_a_connection_of_another_type_is_never_called_a_keboola_project(self, system_db):
+        """Same check `_connection_master_credentials` makes before reading a
+        Metastore: a source re-pointed at a BigQuery connection has no Keboola
+        project at all, and claiming one would state a scope that does not
+        exist."""
+        _connection("conn-bq", source_type="bigquery", config={"project_id": 4321})
+
+        scope = scan_scope(_row("connection", adapter="keboola_metastore", config={"connection_id": "conn-bq"}))
+
+        assert "Keboola project" not in scope
+        assert scope == "connection conn-bq (a bigquery connection, not a Keboola one)"
+
+    def test_two_sources_on_one_connection_are_one_lookup(self, system_db):
+        """The registry read goes through the same per-batch cache the
+        settings resolvers use."""
+        import src.repositories as repositories
+
+        _connection("conn-1", config={"project_id": 4321})
+        rows = [
+            {
+                "id": f"ss_{i}",
+                "kind": "connection",
+                "adapter": "keboola_metastore",
+                "config": {"connection_id": "conn-1"},
+            }
+            for i in range(3)
+        ]
+
+        with patch.object(repositories, "source_connections_repo", wraps=repositories.source_connections_repo) as repo:
+            scopes = scan_scopes(rows)
+
+        assert repo.call_count == 1
+        assert set(scopes.values()) == {"Keboola project 4321"}
+
+    def test_an_unreadable_registry_is_not_reported_as_a_deleted_connection(self, system_db):
+        """"I could not read the registry" and "this connection is gone" are
+        different statements — the second would send an admin looking for a
+        deletion that never happened."""
+        with patch("src.repositories.source_connections_repo", side_effect=RuntimeError("state db unreadable")):
+            scope = scan_scope(_row("connection", adapter="keboola_metastore", config={"connection_id": "conn-1"}))
+
+        assert scope is None
+
     def test_the_legacy_environment_credential_path_is_named(self, system_db):
         scope = scan_scope(_row("connection", adapter="keboola_metastore", config={"legacy_credentials": True}))
 
@@ -336,7 +460,7 @@ class TestTheBatchHelpers:
         ]
 
         assert scan_scopes(rows) == {
-            "ss_a": "https://example.com/a.git @ default branch",
+            "ss_a": "https://example.com/a.git @ default branch matching '**/*.yaml'",
             "ss_b": "uploaded documents (1)",
         }
 
@@ -377,7 +501,7 @@ class TestTheListEndpoint:
 
         assert resp.status_code == 200, resp.text
         by_id = {r["id"]: r for r in resp.json()}
-        assert by_id["ss_git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main"
+        assert by_id["ss_git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main matching '**/*.yaml'"
         assert by_id["ss_upload"]["scan_scope"] == "uploaded documents (1)"
 
     def test_the_scope_rides_beside_the_owned_model_count(self, seeded_app, system_db):
@@ -437,7 +561,7 @@ class TestTheOtherSourceResponses:
         )
 
         assert resp.status_code == 201, resp.text
-        assert resp.json()["scan_scope"] == "https://example.com/acme/semantics.git @ main"
+        assert resp.json()["scan_scope"] == "https://example.com/acme/semantics.git @ main matching '**/*.yaml'"
 
     def test_update_returns_the_field(self, seeded_app, system_db):
         c, token = seeded_app["client"], seeded_app["admin_token"]
@@ -464,7 +588,10 @@ class TestTheOtherSourceResponses:
         resp = c.get("/api/admin/semantic-sources/ss_a", headers=_auth(token))
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["scan_scope"] == "https://example.com/acme/semantics.git @ default branch"
+        assert (
+            resp.json()["scan_scope"]
+            == "https://example.com/acme/semantics.git @ default branch matching '**/*.yaml'"
+        )
 
 
 class TestTheHealthReportsSourcesBlock:
@@ -483,7 +610,7 @@ class TestTheHealthReportsSourcesBlock:
 
         by_id = {s["source_id"]: s for s in _sync_status(sources)}
 
-        assert by_id["ss_git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main"
+        assert by_id["ss_git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main matching '**/*.yaml'"
         assert by_id["ss_unknown"]["scan_scope"] is None
 
     def test_the_scope_sits_beside_the_owned_model_count(self, system_db):

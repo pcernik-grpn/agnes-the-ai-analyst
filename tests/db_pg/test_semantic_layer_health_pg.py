@@ -180,7 +180,6 @@ class TestOwnedModelCount:
         assert by_id["src-b"]["owned_model_count"] == 1
 
 
-
 class TestScanScope:
     """Finding A17 on #1707: a source owning zero models may be pointed at an
     empty upstream, or at one whose contents its role/scope cannot see. The
@@ -200,7 +199,7 @@ class TestScanScope:
         _source("src-upload", name="Pasted")
 
         by_id = {s["source_id"]: s for s in compute_semantic_layer_health()["sources"]}
-        assert by_id["src-git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main"
+        assert by_id["src-git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main matching '**/*.yaml'"
         assert by_id["src-upload"]["scan_scope"] == "uploaded documents (0)"
 
     def test_it_rides_beside_the_owned_model_count(self, pg_state):

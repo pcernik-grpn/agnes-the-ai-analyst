@@ -118,6 +118,22 @@ report (page + CLI). Never with error styling — the fetch worked, so nothing
 failed — and never for a source that has not synced at all: owning nothing
 before the first run is "has not run", not "imported nothing".
 
+The count is derived at read time, never stored: it counts `semantic_models`
+rows stamped with the exact `(source, source_ref)` provenance this source's
+imports write under (`src/semantic/ownership.py`). "Owns" means that and
+nothing more — in particular it is **not** "its next sync could delete this
+many": the prune is keyed on the same pair but is narrower (it skips
+`sync_mode='detached'` rows on Postgres, and a `safe_prune` source skips the
+prune entirely on a run that produced no valid document).
+
+Invalid documents count as owned: the count answers "did this source bring
+anything in", and whether what it brought in parses is a separate question
+the health report's `invalid_models` already answers. A source whose
+`config.provenance` override cannot be resolved reports `null` rather than a
+confident `0` — the resolver validates against live state, so an
+unresolvable override means "cannot say", not "owns nothing" (it is logged as
+a warning server-side, renders as `—` on the page and `-` in the CLI).
+
 ### What did the sync actually look at?
 
 A count of zero still leaves two very different explanations open: the
@@ -137,7 +153,7 @@ row, not of a run. Per adapter:
 | Snowflake semantic views | `ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE` — database, schema (or `ESHOP_DEMO (whole database)` when unscoped, plus `matching '<pattern>'` when a `like` narrows it) and the role that decides what is visible |
 | Keboola Metastore | `Keboola project 4321 (Demo Project)` — the project the pinned connection is bound to |
 | Databricks UC metric views | `Unity Catalog catalogs main, sales on <workspace host>` |
-| git | `https://example.com/acme/semantics.git @ main` — repository + ref (`default branch` when unset) |
+| git | `https://example.com/acme/semantics.git @ main matching '**/*.yaml'` — repository, ref (`default branch` when unset) and the glob, stated even when it is the default: a repo of `*.yml` documents against the default `*.yaml` pattern clones fine and matches nothing |
 | upload / native | `uploaded documents (3)` |
 
 `null` means no scope could be derived (an adapter with no resolver, or a
@@ -146,21 +162,7 @@ adapter is additive here too. The string carries coordinates only: no token,
 no credential env-var name, and any URL it echoes has its `user:pass@`
 userinfo stripped first.
 
-The count is derived at read time, never stored: it counts `semantic_models`
-rows stamped with the exact `(source, source_ref)` provenance this source's
-imports write under (`src/semantic/ownership.py`). "Owns" means that and
-nothing more — in particular it is **not** "its next sync could delete this
-many": the prune is keyed on the same pair but is narrower (it skips
-`sync_mode='detached'` rows on Postgres, and a `safe_prune` source skips the
-prune entirely on a run that produced no valid document).
-
-Invalid documents count as owned: the count answers "did this source bring
-anything in", and whether what it brought in parses is a separate question
-the health report's `invalid_models` already answers. A source whose
-`config.provenance` override cannot be resolved reports `null` rather than a
-confident `0` — the resolver validates against live state, so an
-unresolvable override means "cannot say", not "owns nothing" (it is logged as
-a warning server-side, renders as `—` on the page and `-` in the CLI).
+### Which sources the sweep runs
 
 `enabled: false` (`--disabled` on `add`, or `PUT .../sources/{id}` with
 `enabled: false`) excludes a source from **both** this scheduled sweep and the

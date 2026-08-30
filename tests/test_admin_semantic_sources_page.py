@@ -126,6 +126,14 @@ class TestScanScopeBesideTheSyncResult:
         renderer = self._body(seeded_app).split("function fmtScanScope")[1].split("\nfunction ")[0]
         assert "${s.scan_scope}" not in renderer
 
+    def test_the_tooltip_holds_for_a_never_synced_row_too(self, seeded_app):
+        """The cell also renders on a row that has never synced, where the
+        scope is what the FIRST sync will look at — a tooltip saying "last
+        sync" would contradict the "never synced" beside it."""
+        renderer = self._body(seeded_app).split("function fmtScanScope")[1].split("\nfunction ")[0]
+        title = renderer.split('title="')[1].split('"')[0]
+        assert "last sync" not in title.lower()
+
     def test_it_is_informational_not_a_status_accent(self, seeded_app):
         """A scope is neither good nor bad news — it must not borrow the
         success/warn/danger vocabulary."""
