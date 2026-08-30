@@ -5570,6 +5570,16 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     background: var(--ds-surface-dim);
 }
 
+/* `.data-table-wrap` — the wrapper several admin pages already put around a
+   `.data-table` (semantic sources, users, sync, marketplaces, mcp_sources,
+   knowledge_digests, linked_apps, initial_workspace, data_apps) so a
+   wide/many-column table scrolls horizontally instead of taking the whole
+   page with it. No CSS rule ever backed the class (#1707 A6), so the
+   overflow silently landed on the page instead of the table. */
+.data-table-wrap {
+    overflow-x: auto;
+}
+
 /* ─── Badges — accent vocabulary ──────────────────────────────────────
    The canonical .badge above gets neutral chrome (chip on
    `--ds-surface-dim`). These modifiers add the cross-pattern accent

@@ -1564,3 +1564,41 @@ def test_dsec_clip_yields_to_open_dropdown_menu() -> None:
         "off after its first item. Pair the clip with "
         "`.dsec:has(.ds-dropdown-menu:not([hidden])) { overflow: visible; }`."
     )
+
+
+# --------------------------------------------------------------------------- #
+# #1707 A6 — `.data-table-wrap` needs an overflow rule.
+#
+# Nine admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+# knowledge_digests, linked_apps, initial_workspace, data_apps) wrap a
+# `.data-table` in `<div class="data-table-wrap">` so a wide/many-column
+# table scrolls horizontally instead of dragging the whole page with it — but
+# no CSS rule ever backed the class, so the wrapper did nothing and the page
+# itself scrolled in a narrow window.
+# --------------------------------------------------------------------------- #
+
+_DATA_TABLE_WRAP_RULE_RE = re.compile(r"\.data-table-wrap\s*\{[^}]*overflow-x\s*:\s*auto[^}]*\}", re.DOTALL)
+
+
+def test_data_table_wrap_has_overflow_rule() -> None:
+    """`.data-table-wrap` must set `overflow-x: auto` — the whole reason nine
+    admin pages wrap their table in this div (#1707 A6)."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _DATA_TABLE_WRAP_RULE_RE.search(css), (
+        ".data-table-wrap has no `overflow-x: auto` rule in style-custom.css — the "
+        "wrapper div nine admin pages use silently does nothing, and a wide table "
+        "drags the whole page into horizontal scroll instead (#1707 A6)"
+    )
+
+
+def test_admin_semantic_sources_table_header_has_no_inline_style() -> None:
+    """`admin_semantic_sources.html` must use the `.num` class for a
+    right-aligned header, not an inline `style="text-align:right"` (#1707
+    A6) — the design system's canonical way to right-align a `<th>`/`<td>`
+    (style-custom.css's `.ds-table th.num, .ds-table td.num` rule)."""
+    text = (TEMPLATES / "admin_semantic_sources.html").read_text(encoding="utf-8")
+    offenders = re.findall(r"<th[^>]*\sstyle=", text)
+    assert not offenders, (
+        f"inline style= found on a <th> in admin_semantic_sources.html: {offenders} — "
+        "use the `.num` class instead (#1707 A6)"
+    )
