@@ -1054,7 +1054,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
-- **Security: the cloud-chat approval gate now covers mutating MCP tools, not
+- **Semantic-layer detail page: the detach toolbar's "Export detached
+  version" link 404'd, and its two buttons rendered as unstyled text
+  (#1707).** The link pointed at the HTML detail route
+  (`/semantic-layer/{slug}.yaml`), which the `{slug}` path parameter catches
+  literally and 404s on; it now points at the route that actually serves the
+  document, `GET /api/semantic-models/{slug}.yaml`. The Re-attach/Detach
+  buttons used a `.btn--sm` class that has no CSS rule anywhere in the repo,
+  so they had no borders or button chrome; they now use the same
+  `btn-secondary`/`btn-primary` + `btn-sm` classes as the rest of the page.
+  Added page-level test coverage for the detach toolbar (PG-only, since
+  `sync_mode='detached'` is a Postgres-only column), which is what let both
+  issues ship unguarded.
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
   deploying one, `pull` — executed without the approve/deny round-trip its own
