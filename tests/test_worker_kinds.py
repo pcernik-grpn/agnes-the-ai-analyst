@@ -1158,6 +1158,82 @@ class TestCorpusExtractionHandler:
         assert calls[0]["env"]["AGNES_API_URL"] == "http://127.0.0.1:8000"
 
 
+class TestExtractionProducerArgvEnvOverride:
+    """``AGNES_EXTRACTION_PRODUCER_COMMAND`` / ``AGNES_EXTRACTION_PRODUCER_MODULE``
+    (deploy-time knobs so a Terraform module can activate the extraction
+    lane's producer without an applier-owned edit of ``instance.yaml`` on
+    the VM) — env wins over instance.yaml, per field, mirroring
+    ``app/coordination/factory.py``'s env-overrides-yaml posture."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_COMMAND", raising=False)
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_MODULE", raising=False)
+
+    def test_command_env_wins_over_yaml_command(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"extraction": {"producer": {"command": "python -m yaml_producer"}}}),
+        )
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == ["python", "/opt/producer/agnes_lane.py"]
+
+    def test_command_env_is_shlex_split(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py --flag 'a b'")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == [
+            "python",
+            "/opt/producer/agnes_lane.py",
+            "--flag",
+            "a b",
+        ]
+
+    def test_module_env_wins_over_yaml_module(self, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"extraction": {"producer": {"module": "yaml_producer.run"}}}),
+        )
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_MODULE", "env_producer.run")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == [sys.executable, "-m", "env_producer.run"]
+
+    def test_command_env_wins_over_module_env(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_MODULE", "env_producer.run")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == ["python", "/opt/producer/agnes_lane.py"]
+
+    def test_no_env_falls_back_to_yaml(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"extraction": {"producer": {"command": "python -m yaml_producer"}}}),
+        )
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == ["python", "-m", "yaml_producer"]
+
+    def test_neither_env_nor_yaml_returns_none(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() is None
+
+
 class TestJiraWebhookEnqueues:
     """The Jira incremental-transform path must enqueue a ``jira-refresh``
     job instead of calling ``SyncOrchestrator().rebuild_source`` inline.

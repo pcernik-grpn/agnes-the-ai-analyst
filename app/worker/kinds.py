@@ -1185,7 +1185,7 @@ def _extraction_timeout_seconds() -> int:
 
 def _extraction_producer_argv() -> list[str] | None:
     """Build the producer's argv from ``extraction.producer`` config
-    (``config/instance.yaml.example``).
+    (``config/instance.yaml.example``), or its env overrides.
 
     ``command`` (a full command line — either a YAML list, taken verbatim,
     or a string split with ``shlex.split``) wins when both are set;
@@ -1194,16 +1194,34 @@ def _extraction_producer_argv() -> list[str] | None:
     ``EXTRACTION_PRODUCER_INSTALL`` build-arg). Returns ``None`` when
     neither is configured — the caller turns that into a clear "not
     configured" failure rather than a confusing subprocess error.
+
+    Env overrides — ``AGNES_EXTRACTION_PRODUCER_COMMAND`` /
+    ``AGNES_EXTRACTION_PRODUCER_MODULE`` — exist so a deployment can
+    activate the producer purely at deploy time (e.g. a Terraform module
+    rendering ``/opt/agnes/.env``) without an applier-owned edit of
+    ``instance.yaml`` on the VM. Resolution is env-wins-over-yaml PER
+    FIELD, mirroring ``app/coordination/factory.py``'s
+    env-overrides-instance.yaml posture — not a single "env replaces the
+    whole producer block" switch. ``AGNES_EXTRACTION_PRODUCER_COMMAND`` is
+    always a STRING split with ``shlex.split``; unlike the yaml key, a
+    JSON/YAML list is NOT supported via env — the env surface stays one
+    scalar per knob, same as every other env override in this module.
+    ``command`` (from either source) still wins over ``module`` (from
+    either source), same precedence as before this override existed.
     """
     from app.instance_config import get_value
 
-    command = get_value("extraction", "producer", "command", default=None)
+    command = os.environ.get("AGNES_EXTRACTION_PRODUCER_COMMAND") or get_value(
+        "extraction", "producer", "command", default=None
+    )
     if command:
         if isinstance(command, list):
             return [str(c) for c in command]
         return shlex.split(str(command))
 
-    module = get_value("extraction", "producer", "module", default=None)
+    module = os.environ.get("AGNES_EXTRACTION_PRODUCER_MODULE") or get_value(
+        "extraction", "producer", "module", default=None
+    )
     if module:
         import sys
 
