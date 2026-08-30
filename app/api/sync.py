@@ -732,6 +732,41 @@ def _run_materialized_pass(
     return summary
 
 
+def _record_extractor_crash(*, table_configs: list, returncode: int, stderr: str) -> None:
+    """Persist an error state for every table a DEAD extractor run attempted.
+
+    The per-table ``set_error`` path fires only when the subprocess printed a
+    parseable stats line. A credential failure kills the extractor at startup,
+    so nothing is parsed and nothing is recorded -- and every admin surface
+    that reports sync health reads ``sync_state``: the registry's error
+    column, the source card's failing cell, and ``_resolve_sync_failures``,
+    which feeds the ``/admin`` Needs-fixing zone. Without this the only copy
+    of the cause was the server process's stdout, so the UI showed a green
+    "Sync started" and then, indefinitely, "Never synced" with no error
+    anywhere.
+
+    Deliberately best-effort: this runs ON the failure path, and a second
+    exception here would turn a reportable sync failure into a 500.
+    """
+    tail = (stderr or "").strip().splitlines()
+    detail = tail[-1].strip() if tail else ""
+    message = (
+        f"extractor failed (exit {returncode}): {detail}"
+        if detail
+        else f"extractor failed (exit {returncode}) -- see server logs for the cause"
+    )
+    try:
+        state = sync_state_repo()
+        registry_by_name = {r["name"]: r for r in table_registry_repo().list_all()}
+        for tc in table_configs or []:
+            name = tc.get("name") or tc.get("id")
+            if not name:
+                continue
+            state.set_error(resolve_sync_state_key_for_row(name, registry_by_name.get(name)), message)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not record extractor crash in sync_state: %s", exc)
+
+
 def _invoke_keboola_extractor_subprocess(
     table_configs: List[dict],
     env: dict,
@@ -971,6 +1006,14 @@ sys.exit(compute_exit_code(result, len(configs)))
                         "error": "partial failure (exit 2) — see server logs for per-table errors",
                     }
                 )
+                # Same blind spot as the exit-1 branch below: no stats line
+                # was recovered, so without this nothing reaches sync_state
+                # and the partial failure is invisible to every admin surface.
+                _record_extractor_crash(
+                    table_configs=table_configs,
+                    returncode=result.returncode,
+                    stderr=result.stderr or "",
+                )
         else:
             print(f"[SYNC] Extractor FAILED (exit {result.returncode})", file=_sys.stderr, flush=True)
             if not extractor_table_errors:
@@ -979,6 +1022,16 @@ sys.exit(compute_exit_code(result, len(configs)))
                         "table": "(keboola extractor)",
                         "error": f"extractor failed (exit {result.returncode}) — see server logs",
                     }
+                )
+                # …and record it where the ADMIN UI looks. `collected_errors`
+                # only ever reached `notify_sync_failure`, which no-ops without
+                # an alert webhook, so a run that died before printing stats
+                # left every surface reporting "Never synced" and nothing
+                # wrong. Every table this run attempted gets the cause.
+                _record_extractor_crash(
+                    table_configs=table_configs,
+                    returncode=result.returncode,
+                    stderr=result.stderr or "",
                 )
 
         # Record which of THIS run's attempted tables actually landed
