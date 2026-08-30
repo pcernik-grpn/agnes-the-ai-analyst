@@ -20,6 +20,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **The daily cut PR opens even when the batch is large.** `daily-cut.yml` embedded every shipped bullet in the PR body; the 0.93.0 cut carried 214 of them (216 KB) and blew past GitHub's 65,536-character limit, so `gh pr create` failed *after* the branch was already computed, committed and pushed — which reads as a broken cut rather than a broken announcement. The list is now budgeted, trimmed at bullet boundaries and stopping once the budget is spent (never interleaving whichever later bullets still fit), with a line naming how many were omitted. The CHANGELOG diff on the PR remains the complete list.
+
 ## [0.93.0] - 2026-08-30
 
 ### Added
