@@ -1971,17 +1971,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `CONTRIBUTING.md`'s "confirm the check names are present" note is updated to
   match, and the `test` aggregator needs no change because it depends on the
   matrix result, not on individual groups.
-- **Every pull request runs the test suite, whatever branch it targets
-  (#1636).** `ci.yml`'s `pull_request` trigger was filtered to `main` and
-  `integration`, so a PR into a stack base — `mf/semantic-layer-v0`, a
-  `claude/*` branch — fired no workflow at all and showed a **green rollup
-  that asserted nothing**, which reads exactly like a passing run. The
-  semantic-layer stack took four PRs that way, over a base sitting at two
-  alembic heads with nothing to report it. The filter is gone rather than
-  extended with stack-base names: a naming convention nobody enforces fails
-  silently the first time someone picks a name outside it. `CONTRIBUTING.md`
-  now states the invariant and how to check for it (confirm the check NAMES
-  are present — "no red" is not "tested").
 - **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
 - **Local-dev audience switch on the chat landing page.** Under
   `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
