@@ -393,4 +393,4 @@ class TestTheLibraryShapedPreview:
         # could least afford to say it. See tests/test_access_vocabulary.py.
         assert "Required by your admin" in src
         assert "In their Library" in src
-        assert "Available, no local copy yet" in src
+        assert "Optional — no local copy yet" in src

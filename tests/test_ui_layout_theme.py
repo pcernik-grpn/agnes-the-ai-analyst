@@ -569,7 +569,7 @@ class TestRailOptIn:
         assert "data, memory & files" in text
         # Available-but-not-yet-added marketplace items are surfaced and the
         # ones already in the stack are marked (not filtered out).
-        assert "In your stack" in text
+        assert "Agents can use this" in text
         assert "any plugin or skill available to you" in text.lower()
         # The "work in progress" notice is GONE (AGT-6). It said agents were
         # saved but that running them was still to come — and running them is

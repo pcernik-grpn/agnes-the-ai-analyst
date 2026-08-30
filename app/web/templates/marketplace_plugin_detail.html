@@ -33,7 +33,7 @@
      action row; the buttons themselves share one row (.actions-row) so
      install / remove / Cowork sit next to each other. The column sizes to
      its widest child (no width cap) so the row never wraps and the layout
-     stays put when the install state toggles between "+ Add to my stack"
+     stays put when the install state toggles between "+ Add to my agents"
      and "In your stack · Remove · Cowork". */
   .plugin-detail .detail-hero__actions {
     flex-direction: column; align-items: flex-end; align-self: flex-start;
@@ -809,8 +809,8 @@
   {# Three-element install state — see renderInstallState() below. Only one of
      {installBtn} vs {statusPill + removeBtn} is visible at a time. #}
   <div class="actions-row">
-    <button class="btn-install" id="install-btn" type="button" hidden>+ Add to my stack</button>
-    <span class="status-pill" id="status-pill" hidden>✓ In your stack</span>
+    <button class="btn-install" id="install-btn" type="button" hidden>+ Add to my agents</button>
+    <span class="status-pill" id="status-pill" hidden>✓ Agents can use this</span>
     <button class="btn-remove" id="remove-btn" type="button" hidden>✕ Remove from stack</button>
     {# Legacy keeps Cowork as a header button; the redesign moves it into the
        overflow menu above, so the header carries one action. #}
@@ -820,7 +820,7 @@
   </div>
   <div class="stack-hint" id="stack-hint" hidden>
     <div class="head">
-      <span class="title" id="stack-hint-title">✓ Added to your stack</span>
+      <span class="title" id="stack-hint-title">✓ Added to your agents</span>
       <button class="dismiss" id="stack-hint-dismiss" type="button">Don’t show again</button>
     </div>
     <div>Run in Claude Code:</div>
@@ -1045,7 +1045,7 @@
     {{ detail.side_panel_open('') }}
       <span id="rail-stack-status">{{ detail.status('Checking…') }}</span>
       <p class="detail-side__note" id="rail-stack-note">
-        Looking up whether this plugin is in your stack.
+        Looking up whether your agents can already use this plugin.
       </p>
     {{ detail.side_panel_close() }}
   {{ detail.side_close() }}
@@ -1275,17 +1275,17 @@
       panel.classList.add(installed ? 'detail-side__panel--ok' : 'detail-side__panel--warn');
     }
     chip.innerHTML = `<span class="detail-status detail-status--${installed ? 'ok' : 'warn'}">`
-      + (installed ? 'In your stack' : 'Not in your stack') + '</span>';
+      + (installed ? 'Agents can use this' : 'Not added yet') + '</span>';
     note.textContent = installed
       ? 'Run /update-agnes-plugins in Claude Code to pick up the latest version.'
-      : 'Add it to your stack to use it in Claude Code.';
+      : 'Add it to your agents to use it in Claude Code.';
   }
 
   function renderInstallState(installed) {
     installBtn.hidden = installed;
     statusPill.hidden = !installed;
     statusPill.classList.remove('is-system');
-    statusPill.textContent = '✓ In your stack';
+    statusPill.textContent = '✓ Agents can use this';
     statusPill.removeAttribute('title');
     removeBtn.hidden = !installed;
     renderRailStack(installed);
@@ -1362,7 +1362,7 @@
     removeBtn.hidden = true;
     installBtn.disabled = true;
     installBtn.title = 'This submission is not approved yet — install is disabled until checks pass.';
-    installBtn.textContent = '+ Add to my stack (unavailable while under review)';
+    installBtn.textContent = '+ Add to my agents (unavailable while under review)';
     installBtn.style.background = 'var(--ds-surface-sunken)';
     installBtn.style.color = 'var(--ds-text-muted)';
     installBtn.style.cursor = 'not-allowed';
@@ -1386,7 +1386,7 @@
   // and only when the user hasn't permanently dismissed it. The dismiss
   // flag lives in localStorage so a returning user who already understands
   // the two-step model isn't pestered. Re-shown to nontechnical users
-  // who hit "+ Add to my stack" for the first time on a new browser/laptop.
+  // who hit "+ Add to my agents" for the first time on a new browser/laptop.
   const HINT_DISMISS_KEY = 'mp.stack-hint.dismissed.v1';
   const hintEl = document.getElementById('stack-hint');
   function showHint() {
@@ -1417,8 +1417,8 @@
   function setHintTitle(kind) {
     if (!hintTitle) return;
     hintTitle.textContent = kind === 'removed'
-      ? '✓ Removed from your stack'
-      : '✓ Added to your stack';
+      ? '✓ Removed from your agents'
+      : '✓ Added to your agents';
   }
 
   installBtn.addEventListener('click', async () => {

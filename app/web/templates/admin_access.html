@@ -2343,8 +2343,8 @@
       By group <span class="ax-by__n" data-by-n="group"></span>
     </button>
     <button type="button" role="tab" id="ax-tab-bundle" class="tab-strip__item"
-            data-by="bundle" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
-      By bundle <span class="ax-by__n" data-by-n="bundle"></span>
+            data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
+      By resource <span class="ax-by__n" data-by-n="resource"></span>
     </button>
     <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item"
             data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1">
@@ -2513,14 +2513,13 @@
             <span class="dsec-act">
               <span class="ax-tip">
                 <span class="ax-tip__btn" tabindex="0" role="img"
-                      aria-label="What Available and Required mean"
+                      aria-label="What Automatic and Optional mean"
                       aria-describedby="ax-tierkey-body">i</span>
                 <span class="ax-tip__body" id="ax-tierkey-body" role="tooltip">
                   The grant already gave access — everyone in this group can query it
-                  now. This only decides the copy: <b>Required</b> is permanent and
-                  always downloaded; <b>Available</b> leaves the person one choice,
-                  keep a local copy or not. Admins can always reach everything regardless
-                  of grants.
+                  now. This only decides the copy: <b>Automatic</b> keeps one on every
+                  pull and only an admin changes that; <b>Optional</b> leaves the person
+                  the choice. Admins can always reach everything regardless of grants.
                 </span>
               </span>
             </span>
@@ -2622,6 +2621,16 @@
   //: link restores the whole view rather than just the lens — see `syncUrl()`.
   //: This has to be declared before any of them reads it (`const` is in the
   //: temporal dead zone until its own line).
+  /* The lens the URL asks for, or "" for anything this page does not know.
+     `bundle` was the old name for the resource lens — a word that named no
+     entity in the system and had to be inferred from the shape of the rows.
+     It stays readable here, and only here, because it is in shared links and
+     bookmarks: everything the page WRITES is the new name. */
+  function _normalizeBy(raw) {
+    const v = raw === "bundle" ? "resource" : raw;
+    return ["resource", "person", "group"].includes(v) ? v : "";
+  }
+
   const _q0 = new URLSearchParams(window.location.search);
   //: The list's kind filter — "" is every kind.
   let listKind = _q0.get("kind") || "";
@@ -2632,7 +2641,7 @@
      A user id names a person, and the person lens is where a person is
      shown, so it implies the lens. */
   let viewMode = _q0.get("lens") === "simulate" ? "person"
-    : (["bundle", "person"].includes(_q0.get("by")) ? _q0.get("by") : (_q0.get("user") ? "person" : "group"));
+    : (_normalizeBy(_q0.get("by")) || (_q0.get("user") ? "person" : "group"));
   let users = [];        // Simulate's picker only — never the member search
 
   const el = (id) => document.getElementById(id);
@@ -2901,8 +2910,8 @@
      `tests/test_access_vocabulary.py` pins this to a single definition. */
   const tierControl = (tier, granted) => `
     <span class="fbar-seg ax-tier" ${granted ? "" : 'aria-disabled="true"'} role="group" aria-label="Access tier">
-      <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>
-      <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">Required</button>
+      <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">{{ words.tier_optional }}</button>
+      <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">{{ words.tier_automatic }}</button>
     </span>`;
 
   //: Which kinds actually carry the Required/Available tier.
@@ -2928,9 +2937,9 @@
       ? tierControl(tier, true)
       : `<span class="fbar-seg ax-tier" aria-disabled="true" role="group"
               aria-label="Access tier — not applicable to this kind"
-              data-tip="This kind has no Available/Required choice — there is no local copy to keep.">
-           <button type="button" class="fbar-seg__btn is-active" disabled>Available</button>
-           <button type="button" class="fbar-seg__btn" disabled>Required</button>
+              data-tip="This kind has no Automatic/Optional choice — there is no local copy to keep.">
+           <button type="button" class="fbar-seg__btn is-active" disabled>{{ words.tier_optional }}</button>
+           <button type="button" class="fbar-seg__btn" disabled>{{ words.tier_automatic }}</button>
          </span>`;
     return `<span class="ax-ctl">${tierPart}
       <button type="button" class="ax-revoke" data-revoke>Revoke</button>
@@ -4152,7 +4161,7 @@
     const before = selectedGroup;
     syncQuery();
     if (viewMode === "person") return;
-    if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
+    if (viewMode === "resource") { renderBundles(); bindFind(); return; }
     renderGroups();
     if (selectedGroup !== before) await renderMembers();
     bindFind();
@@ -4247,13 +4256,13 @@
      now says what THIS lens searches. */
   const FIND_PLACEHOLDER = {
     group: "Search groups, what they hold, or people in them…",
-    bundle: "Search bundles by name, id or block…",
-    person: "Search groups, bundles or people…",
+    resource: "Search resources by name, id or block…",
+    person: "Search groups, resources or people…",
   };
   const LEDE = {
     group: "Every group you can write a grant against, and what each one can reach.",
-    bundle: "One thing at a time — a data package, a memory domain, a plugin, an agent — "
-          + "and which groups can reach it. The mirror of By group.",
+    resource: "One thing at a time — a data package, a memory domain, a plugin, an agent — "
+            + "and which groups can reach it. The mirror of By group.",
   };
   function setLede(mode) {
     const l = el("ax-lede");
@@ -4315,7 +4324,7 @@
        "Marketplace plugins 5" produced "2 of 24 bundles", and "Agents 3"
        produced "12 of 24". Each lens now counts the thing it lists. */
     const counts = new Map();
-    if (viewMode === "bundle") {
+    if (viewMode === "resource") {
       // Bundles of that kind, counted exactly as `bundleTotal()` counts.
       for (const t of (overview.resources || [])) {
         if (!BUNDLE_LEAD.has(t.type_key)) continue;
@@ -4433,7 +4442,7 @@
   function paintCount(shown, total) {
     const countEl = el("ax-count");
     if (!countEl) return;
-    const noun = viewMode === "bundle" ? "bundle" : "group";
+    const noun = viewMode === "resource" ? "resource" : "group";
     const plural = (n) => `${n} ${n === 1 ? noun : noun + "s"}`;
     countEl.textContent = shown < total
       ? `${shown} of ${plural(total)}`
@@ -4474,7 +4483,7 @@
   });
 
   function paintTabCounts() {
-    const NOUN = { group: "groups", bundle: "bundles", person: "people" };
+    const NOUN = { group: "groups", resource: "resources", person: "people" };
     const set = (k, n) => {
       const el2 = document.querySelector(`[data-by-n="${k}"]`);
       if (!el2) return;
@@ -4488,7 +4497,7 @@
        distinct grant rows of every type — so the badge said 9 over a list of
        23, and neither number explained the other. Same source as the list and
        its "N of M" count now. */
-    set("bundle", bundleTotal());
+    set("resource", bundleTotal());
     /* This computed a number and then threw it away — `? null : null` —
        so the badge rendered as an empty box beside "By group 5" and "By
        bundle 24", which reads as a count still loading. It is the number of
@@ -4505,7 +4514,7 @@
     paintKindFilter();
     if (viewMode === "person") { showPane("person"); return; }
     syncQuery();
-    if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
+    if (viewMode === "resource") { renderBundles(); bindFind(); return; }
     renderGroups();
     await renderMembers();
     bindFind();
@@ -4551,7 +4560,7 @@
   }
 
   function repaintView() {
-    if (viewMode === "bundle") { renderBundles(); return; }
+    if (viewMode === "resource") { renderBundles(); return; }
     renderResources();
     renderGroups();
   }
@@ -4615,7 +4624,7 @@
         ${listKind
           ? `Only ${esc(String(kindName || listKind).toLowerCase())} were searched —
              <button type="button" class="ax-linkbtn" data-chip-clear>search every kind</button>.`
-          : "Every bundle on the instance was searched."}</div>`;
+          : "Every resource on the instance was searched."}</div>`;
       paintCount(0, bundleTotal());
       return;
     }
@@ -5018,7 +5027,7 @@
 
     const byBtn = e.target.closest("[data-by]");
     if (byBtn) {
-      const next = ["bundle", "person"].includes(byBtn.dataset.by) ? byBtn.dataset.by : "group";
+      const next = _normalizeBy(byBtn.dataset.by) || "group";
       if (next !== viewMode) {
         viewMode = next;
         // The view rides the URL, so a link can hand someone the direction
@@ -5776,10 +5785,10 @@
     const bands = preview.sections.map((sec) => {
       const rows = (sec.items || []).map((it) => {
         const state = it.requirement === "required"
-          ? `<span class="ax-chip ok" title="Required — permanent and always downloaded; only an admin changes this">Required by your admin</span>`
+          ? `<span class="ax-chip ok" title="{{ words.tier_automatic_help }}">Automatic — set by you</span>`
           : it.in_stack
             ? `<span class="ax-chip ok" title="${it.materialized ? "In their Library, and downloaded on their next pull" : "In their Library"}">In their Library</span>`
-            : `<span class="ax-chip info" title="Available — granted, and they have not kept a local copy">Available, no local copy yet</span>`;
+            : `<span class="ax-chip info" title="{{ words.tier_optional_help }}">Optional — no local copy yet</span>`;
         const href = previewHref(sec.kind, it);
         const name = href ? `<a href="${esc(href)}">${esc(it.name)}</a>` : esc(it.name);
         return `<li class="ax-preview__row"><span class="ax-preview__name">${name}</span>${state}</li>`;
@@ -6052,7 +6061,7 @@
   window.addEventListener("popstate", async () => {
     const params = new URLSearchParams(window.location.search);
     const by = params.get("lens") === "simulate" ? "person"
-      : (["bundle", "person"].includes(params.get("by")) ? params.get("by") : "group");
+      : (_normalizeBy(params.get("by")) || "group");
     viewMode = by;
     groupFilter = params.get("q") || "";
     listKind = params.get("kind") || "";

@@ -371,7 +371,7 @@
         '<div class="ag-empty">' +
           '<span class="ag-ava">' + AVA_SVG + '</span>' +
           '<h3>No agents yet</h3>' +
-          '<p>Build your first agent — pick what it knows from your stack, what it can do from your plugins, and where it runs.</p>' +
+          '<p>Build your first agent — pick what it knows from what you have, what it can do from your plugins, and where it runs.</p>' +
           '<button type="button" class="cc-btn cc-btn--primary" data-ag-new>+ Build an agent</button>' +
         '</div>';
       return;
@@ -717,7 +717,7 @@
       '<div class="ag-row-body">' +
         '<div class="ag-row-name">' + esc(p.name) +
           '<span class="ag-kind ag-kind--' + esc(type) + '">' + esc(TYPE_LABEL[type] || type) + '</span>' +
-          (mode === 'pick' && p.installed ? '<span class="ag-instack">In your stack</span>' : '') +
+          (mode === 'pick' && p.installed ? '<span class="ag-instack">Agents can use this</span>' : '') +
           (p.category ? '<span class="ag-row-meta">' + esc(p.category) + '</span>' : '') + '</div>' +
         '<div class="ag-row-desc">' + esc(p.description || '') + '</div>' +
       '</div>' +
@@ -781,7 +781,7 @@
     },
     capabilities: {
       title: 'Add a plugin or skill',
-      sub: 'Any plugin or skill available to you — not only what is in your stack.',
+      sub: 'Any plugin or skill available to you — not only the ones your agents already use.',
       search: 'Search plugins & skills…',
       foot: 'Browse the full set in the <a href="/catalog?kind=plugins">Catalog</a>.'
     }

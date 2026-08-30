@@ -2273,7 +2273,7 @@
       {% if library_stack_toggle %}
       <button type="button" class="fbar-toggle" id="lib-stack-toggle"
               data-facet-value="in_stack" aria-pressed="false"
-              title="Only what's in your stack — the set your default agent can use">
+              title="Only what your default agent can already use">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 4.9-9 4.9-9-4.9L12 2Z"></path><path d="m3 11.9 9 4.9 9-4.9"></path><path d="m3 16.9 9 4.9 9-4.9"></path></svg>
         Agents use it<span class="fbar-toggle__n" data-stack-count>{{ library_in_stack_count }}</span>
       </button>
@@ -3327,10 +3327,10 @@
         // the caller has. `textContent` of the pill's rest state is exactly
         // what the row shows.
         const rowLabel = (stackEl.querySelector('.lib-stackpill__rest') || stackEl).textContent.trim()
-          || 'In stack';
+          || 'Agents can use this';
         tip(rowLabel, stackEl.dataset.tip || stackEl.title || (locked
-          ? 'In your stack — only an admin can remove it'
-          : 'In your stack'));
+          ? 'Your agents use this — only an admin can remove it'
+          : 'Your agents use this'));
         status.innerHTML = (locked ? LOCK_SVG : CARD_CHECK_SVG) + '<span></span>';
         status.querySelector('span').textContent = rowLabel;
         foot.appendChild(status);
@@ -3339,7 +3339,7 @@
         // explain an absence nobody expected (the table slot is simply
         // empty, and the card mirrors it). Every other slotless kind keeps
         // the explicit status.
-        tip('Not addable', 'This item cannot be added to your stack');
+        tip('Not addable', 'This item cannot be added to your agents');
         status.innerHTML = '<span>Not addable</span>';
         foot.appendChild(status);
       }

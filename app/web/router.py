@@ -19,6 +19,7 @@ import duckdb
 import jinja2
 
 from app.auth.access import is_user_admin, require_admin
+from app.web import vocabulary
 from app.web.studio import STUDIO_DOMAINS, get_domain as get_studio_domain
 from app.auth.dependencies import get_current_user, get_optional_user, _get_db
 from app.instance_config import (
@@ -359,6 +360,7 @@ from app.web.admin_nav import (  # noqa: E402
     resolve_section_tabs,
 )
 
+vocabulary.install(templates.env)
 templates.env.globals["admin_nav_sections"] = ADMIN_NAV_SECTIONS
 templates.env.globals["admin_nav_docs"] = ADMIN_NAV_DOCS
 templates.env.globals["admin_nav_home"] = ADMIN_NAV_HOME
@@ -2111,19 +2113,16 @@ _GRANTED_STACK_TOOLTIP = (
 #: what the server does and left the reader to infer what they get. Named
 #: once, because this column has already collected four spellings of one
 #: state and every extra literal is how a fifth arrives.
-_AGENT_ADD = "Add to my agents"
-_AGENT_REMOVE = "Remove"
+_AGENT_ADD = vocabulary.ADD
+_AGENT_REMOVE = vocabulary.REMOVE
 # The resting states drop the possessive the ACTION keeps ("Add to my
 # agents"): the action is a sentence about you, the state is a fact about the
 # row, and repeating "your agents" on every line both clipped the 142px cell
 # and said nothing the lede above the list has not already said.
-_AGENT_HAS = "Agents can use this"
-_AGENT_CAN_QUERY = "Agents can query this"
-_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
-_AGENT_HAS_TOOLTIP = (
-    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
-    "sees what that scope allows."
-)
+_AGENT_HAS = vocabulary.HAS
+_AGENT_CAN_QUERY = vocabulary.CAN_QUERY
+_AGENT_ADD_TOOLTIP = vocabulary.ADD_TOOLTIP
+_AGENT_HAS_TOOLTIP = vocabulary.HAS_TOOLTIP
 
 
 def _library_row_base(
@@ -3175,9 +3174,6 @@ async def library_page(
                 # (`curated_install` / `curated_uninstall`). The Library's toggle
                 # is kind-agnostic — it POSTs/DELETEs whatever the row names.
                 row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
-                # Same verb as a store entity, and for the same reason.
-                row["stack_action"] = "Install"
-                row["stack_undo"] = "Uninstall"
                 # Droppable unless an admin pinned it globally (`is_system`) or
                 # required-tier-granted it to one of the caller's groups. Those
                 # are precisely the two cases `curated_uninstall` answers 409

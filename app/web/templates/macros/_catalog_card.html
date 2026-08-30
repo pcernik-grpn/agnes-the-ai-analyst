@@ -194,10 +194,10 @@
               data-remove-url="{{ a.remove_url }}"
               {% if a.rt %}data-rt="{{ a.rt }}" data-rid="{{ a.rid }}"{% endif %}>
         {% if a.state == 'in' %}
-          <span class="cc-btn-instack"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> {{ 'Downloaded' if is_dl else 'In stack' }}</span>
+          <span class="cc-btn-instack"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> {{ 'Downloaded' if is_dl else words.has }}</span>
           <span class="cc-btn-remove"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> {{ 'Remove local copy' if is_dl else 'Remove' }}</span>
         {% else %}
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> {{ 'Download locally' if is_dl else 'Add to stack' }}
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> {{ words.keep_local if is_dl else words.add }}
         {% endif %}
       </button>
     {% else %}

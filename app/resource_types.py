@@ -889,7 +889,7 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         key=ResourceType.DATA_PACKAGE,
         family=ResourceFamily.KNOWLEDGE,
         display_name="Data packages",
-        description="An admin-curated bundle of data tables.",
+        description="An admin-curated set of data tables.",
         id_format="<package_id>",
         list_blocks=_data_package_blocks,
     ),

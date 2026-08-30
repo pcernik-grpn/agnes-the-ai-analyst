@@ -17,6 +17,8 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
+from app.web import vocabulary
+
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "app" / "web" / "templates"
 STATIC = ROOT / "app" / "web" / "static"
@@ -35,6 +37,9 @@ def _render_card(**entry):
     # siblings (`macros/_trustmark.html`), so a standalone loader cannot render
     # it, and stubbing those imports would be testing a copy.
     env = Environment(loader=FileSystemLoader(str(TEMPLATES)), autoescape=True)
+    # The macro reads the shared words (app/web/vocabulary). Same one-call
+    # completion the stack-card macro tests use — still no FastAPI here.
+    vocabulary.install(env)
     tpl = env.from_string('{% from "macros/_stack_card.html" import card %}{{ card(entry) }}')
     base = {"id": "pkg1", "name": "Sales", "description": "d", "drilldown_url": "/x"}
     base.update(entry)
@@ -52,8 +57,13 @@ def test_downloaded_package_says_downloaded():
 
 
 def test_not_downloaded_package_offers_the_download():
+    """"Download locally" named the mechanism (`agnes pull` fetching parquets);
+    the vocabulary pass replaced it with the outcome. Both projections now say
+    the same thing here, which is fine — this card's job was always to
+    distinguish the local-copy question from the access one, and that is
+    exactly what the phrase says."""
     html = _render_card(in_stack=False, in_stack_is_local=True)
-    assert "Download locally" in html
+    assert vocabulary.KEEP_LOCAL in html
     assert "Add to stack" not in html
 
 
@@ -66,11 +76,11 @@ def test_projections_without_the_flag_keep_the_old_wording():
     """The flag is opt-in so a consumer that never re-pointed `in_stack` — it
     still means stack membership there — is untouched by this change."""
     html = _render_card(in_stack=True)
-    assert "In stack" in html
+    assert vocabulary.HAS in html
     assert "Downloaded" not in html
 
     html = _render_card(in_stack=False)
-    assert "Add to stack" in html
+    assert vocabulary.ADD in html
     assert "Download locally" not in html
 
 

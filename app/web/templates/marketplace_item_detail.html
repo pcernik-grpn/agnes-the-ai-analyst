@@ -706,7 +706,7 @@
   <div class="helper" id="hero-helper" hidden></div>
   <div class="stack-hint" id="stack-hint" hidden>
     <div class="head">
-      <span class="title" id="stack-hint-title">✓ Added to your stack</span>
+      <span class="title" id="stack-hint-title">✓ Added to your agents</span>
       <button class="dismiss" id="stack-hint-dismiss" type="button">Don’t show again</button>
     </div>
     <div>Run in Claude Code:</div>
@@ -1433,17 +1433,17 @@
     const t = document.getElementById('stack-hint-title');
     if (!t) return;
     t.textContent = kind === 'removed'
-      ? '✓ Removed from your stack'
-      : '✓ Added to your stack';
+      ? '✓ Removed from your agents'
+      : '✓ Added to your agents';
   }
   function renderInstallActionsHtml(installed) {
     if (installed) {
       return `
-        <span class="status-pill" id="status-pill">✓ In your stack</span>
+        <span class="status-pill" id="status-pill">✓ Agents can use this</span>
         <button class="btn-remove" id="remove-btn" type="button">✕ Remove from stack</button>
       `;
     }
-    return `<button class="btn primary" id="install-btn" type="button">+ Add to my stack</button>`;
+    return `<button class="btn primary" id="install-btn" type="button">+ Add to my agents</button>`;
   }
   // The rail's Availability block — the reader's own state, in the same
   // position and the same tinted callout every other detail page uses for it.
@@ -1461,10 +1461,10 @@
       panel.classList.add(installed ? 'detail-side__panel--ok' : 'detail-side__panel--warn');
     }
     chip.innerHTML = `<span class="detail-status detail-status--${installed ? 'ok' : 'warn'}">`
-      + (installed ? 'In your stack' : 'Not in your stack') + '</span>';
+      + (installed ? 'Agents can use this' : 'Not added yet') + '</span>';
     note.textContent = installed
       ? 'Run /update-agnes-plugins in Claude Code to pick up the latest version.'
-      : 'Add it to your stack to use it in Claude Code.';
+      : 'Add it to your agents to use it in Claude Code.';
     block.hidden = false;
   }
   // Wires whichever of {install-btn, remove-btn} is currently in the
@@ -1518,7 +1518,7 @@
     const helperEl = document.getElementById('hero-helper');
     helperEl.innerHTML = `
       This ${esc(kind === 'skill' ? 'skill' : 'agent')} is part of <strong>${esc(parentLabel)}</strong>.<br>
-      Add the bundle to your stack to use it.`;
+      Add the plugin to your agents to use it.`;
     helperEl.hidden = false;
   } else {
     // v32+ quarantine: when the entity is non-approved (only owner +
@@ -1539,7 +1539,7 @@
       actions.innerHTML = `<button class="btn primary" type="button" disabled
         title="This submission is not approved yet — install is disabled until checks pass."
         style="background:var(--ds-surface-sunken);color:var(--ds-text-muted);cursor:not-allowed;border:1px solid var(--ds-border);">
-          + Add to my stack (unavailable while ${stateLabel})
+          + Add to my agents (unavailable while ${stateLabel})
         </button>`;
     } else {
       // Two-element installed state — inline status label BEFORE the
