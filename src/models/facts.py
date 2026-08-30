@@ -105,6 +105,7 @@ class Claim(Base):
         sa.Index("idx_claims_fact_id", "fact_id"),
         sa.Index("idx_claims_edge_id", "edge_id"),
         sa.Index("idx_claims_corpus_file_id", "corpus_file_id"),
+        sa.Index("idx_claims_corpus_audience", "corpus_id", "audience"),
         # Functional unique index — Postgres cannot express COALESCE in a
         # plain UNIQUE table constraint (spec §3); backs §7.2's union-mode
         # ingest idempotency.
@@ -129,6 +130,10 @@ class Claim(Base):
     quote: Mapped[str] = mapped_column(Text, nullable=False)
     quote_hash: Mapped[str] = mapped_column(String, nullable=False)
     document_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # NULL = untagged (unrestricted within its collection; under
+    # acl_sync.guarantee_mode=must_not, admin-only in a tiered corpus) —
+    # see facts_pg's visibility contract and migration 0086.
+    audience: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
     )
