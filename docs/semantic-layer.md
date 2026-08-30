@@ -426,6 +426,33 @@ GET /api/semantic-models/retail.yaml
 
 The bytes you get back are the bytes that were stored.
 
+## Reaching an agent: CLAUDE.md injection
+
+An agent should learn a semantic model exists without being told to go
+look — so every RBAC-filtered-readable ``status='valid'`` model gets a
+one-line summary (slug, description, the author's own truncated
+``ai_context.instructions``) injected into the agent's own ``CLAUDE.md``, on
+every surface that spawns one:
+
+- The workspace/chat sandbox's rendered CLAUDE.md (``src/claude_md.py::
+  _semantic_layer_models``, via ``config/claude_md_template.txt``'s
+  "## Semantic layer" section) — the default surface, always on.
+- A named agent profile's persona prompt (``app/chat/agent_profile.py::
+  _semantic_layer_section``) — condensed to the same minimal shape (no full
+  metric/glossary dump), since a persona *replaces* the workspace CLAUDE.md
+  rather than extending it. Covers web chat with a persona, Slack, `agnes
+  chat`, and the one-shot agent API — every surface a named `agents` row can
+  spawn from. This closed a real asymmetry (P1-3 of the post-#1707
+  remediation): before it existed, a named agent got zero semantic context
+  while a plain sandbox session always had it.
+
+Not covered: a user's own local Claude Code session connected to Agnes only
+as an MCP source (no Agnes-rendered CLAUDE.md exists there at all — that
+project's CLAUDE.md is the user's own, unrelated to this instance). Such a
+session can still reach the same information live via the
+`get_semantic_context`/`semantic_model_search` MCP tools or the `agnes
+semantic-model` CLI; it just never gets it injected ambiently.
+
 ## Query validation
 
 Before running a SQL statement, check it against the semantic layer: does it

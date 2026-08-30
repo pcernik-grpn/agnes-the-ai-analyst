@@ -1096,6 +1096,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **A named agent profile now gets the same semantic-layer context a plain
+  sandbox session always has.** `src/claude_md.py` injects a summary of
+  every readable model (slug, description, the author's own `ai_context
+  .instructions`) into the sandbox's CLAUDE.md, but `app/chat/agent_profile
+  .py`'s `DATA_ACCESS_RAILS` — appended to a persona instead, since a
+  persona replaces the workspace CLAUDE.md — had no equivalent, so a named
+  agent (web chat with a persona, Slack, `agnes chat`, the one-shot agent
+  API) got zero semantic context. `build_profile` now accepts the caller's
+  `user_email` and appends the same condensed, RBAC-filtered summary via a
+  new `_semantic_layer_section`; omitted (the default) it behaves exactly
+  as before. Documented in `docs/semantic-layer.md` → "Reaching an agent:
+  CLAUDE.md injection".
 - **The semantic-layer column-metadata prune no longer collides across two
   sources of the same kind, on Postgres.** `_prune_columns`
   (`src/semantic/projection.py`) scoped only on `(table_id, source)`, so two
