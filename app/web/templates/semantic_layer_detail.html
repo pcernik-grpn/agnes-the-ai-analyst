@@ -64,15 +64,18 @@
 }
 
 /* A8 (issue #1707): removable filter chip shown above the table when `q` is
-   active. Tabs drop `q` on click (carrying it across was rejected — see the
-   router docstring), so the chip is what makes the active filter visible and
-   its loss on tab-switch explicit. Same shape/tokens as the library page's
+   active — makes the active filter visible and gives it a single removable
+   affordance (replaces the redundant `Clear` button/search box combo this
+   page used to render alongside it). Product decision (#1707 A8): tabs
+   deliberately drop `q` on click; the chip only shows the active filter,
+   it does not survive a tab switch. Same shape/tokens as the library page's
    `.fbar-chip` (filter_toolbar.css) — a pill chip with a round "x" — kept
    page-local rather than pulling in that stylesheet for one chip. */
 .slb-filter-chip {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    max-width: 22rem;
     height: 28px;
     padding: 0 5px 0 11px;
     margin: 0 0 var(--space-4);
@@ -83,11 +86,18 @@
     border: 1px solid color-mix(in srgb, var(--ds-primary) 30%, transparent);
     border-radius: var(--ds-radius-pill);
 }
-.slb-filter-chip__label { font-weight: 500; color: var(--ds-text-secondary); }
-.slb-filter-chip__value { font-weight: 600; }
+.slb-filter-chip__label { flex: none; font-weight: 500; color: var(--ds-text-secondary); }
+.slb-filter-chip__value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+}
 .slb-filter-chip__x {
     display: inline-grid;
     place-items: center;
+    flex: none;
     width: 17px;
     height: 17px;
     border: none;
@@ -160,14 +170,15 @@
     <input type="hidden" name="tab" value="{{ active_tab }}">
     <input type="search" name="q" value="{{ q }}" placeholder="Filter {{ active_tab }}&hellip;" aria-label="Filter {{ active_tab }}">
     <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
-    {% if q %}<a class="btn btn-ghost btn-sm" href="/semantic-layer/{{ slug }}?tab={{ active_tab }}">Clear</a>{% endif %}
 </form>
 
 {% if q %}
-{# A8 (issue #1707): the tabs above drop `q` on click (see the router
-   docstring — carrying it across tabs was explicitly rejected), so this
-   chip is what makes the active filter visible above the table and its
-   loss on tab-switch explicit. The "x" links to the same tab WITHOUT `q`. #}
+{# A8 (issue #1707): a removable chip showing the active filter above the
+   table. Product decision (#1707 A8): tabs deliberately drop `q` on click;
+   the chip only shows the active filter, it does not survive a tab switch.
+   The "x" links to the same tab WITHOUT `q` — this is now the page's only
+   removable-filter control; the redundant `Clear` link/button that used to
+   sit next to the search box was removed in favor of it. #}
 <div class="slb-filter-chip" data-testid="slb-filter-chip">
     <span class="slb-filter-chip__label">filter:</span>
     <span class="slb-filter-chip__value">{{ q }}</span>

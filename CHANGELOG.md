@@ -1054,16 +1054,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
-- **Semantic layer browse: an active `q` filter is now visible across a tab
-  switch (#1707, A8).** `/semantic-layer/{slug}` tabs are plain links
-  (`?tab={t}`, no `q`), so arriving at `?tab=metrics&q=Orders` and clicking
-  any tab silently dropped the filter with no indication it had ever applied.
+- **Semantic layer browse: the active `q` filter is now visible and has one
+  removable control, not three partial ones (#1707, A8).** `/semantic-layer
+  /{slug}` tabs are plain links (`?tab={t}`, no `q`), so arriving at
+  `?tab=metrics&q=Orders` and clicking any tab silently dropped the filter
+  with no indication it had ever applied — and the page still had no single
+  place that stated "a filter is active" (a search box showing the value, a
+  `Clear` link, and the tabs disagreeing about whether it survives a click).
   Carrying `q` across tabs was rejected as the fix — a filter scoped to one
-  tab's fields rarely still means the same thing on another — so tabs keep
-  dropping it as before. Instead, a removable filter chip (`filter: Orders
-  ×`) now renders above the table whenever `q` is active, making the filter
-  visible and its loss on tab-switch explicit; the chip's `×` links to the
-  same tab without `q`.
+  tab's fields rarely still means the same thing on another — so tabs still
+  drop it exactly as before. Instead, a removable filter chip (`filter:
+  Orders ×`) now renders above the table whenever `q` is active, making the
+  active filter visible; its `×` links to the same tab without `q` and
+  replaces the redundant `Clear` link that used to sit next to the search
+  box (now the page's only removable-filter control). The chip does not
+  survive a tab switch — that loss is still silent by design.
 - **Semantic layer browse: the constraint Severity tooltip is now a fast
   `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
   ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
