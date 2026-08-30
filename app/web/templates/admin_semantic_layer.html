@@ -1168,7 +1168,12 @@ function hlRender(body) {
   hlSection(container, "Sources that synced but imported nothing", emptySources, (li, s) => {
     const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
     li.appendChild(hlEl("strong", null, s.name || s.source_id));
-    li.appendChild(document.createTextNode(" — check this source's scope/config"));
+    // A17: naming what was scanned is the actionable half of this finding —
+    // "0 models" alone cannot say whether the upstream is empty or whether
+    // the role/scope simply cannot see it. Absent (`null`, or a server too
+    // old to send it) adds nothing rather than an empty parenthesis.
+    const scanned = typeof s.scan_scope === "string" && s.scan_scope ? ` (scanned ${s.scan_scope})` : "";
+    li.appendChild(document.createTextNode(`${scanned} — check this source's scope/config`));
     const badge = hlMutedBadge(muted);
     if (badge) li.appendChild(badge);
   });

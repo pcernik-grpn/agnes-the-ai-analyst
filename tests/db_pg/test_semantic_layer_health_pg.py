@@ -180,6 +180,51 @@ class TestOwnedModelCount:
         assert by_id["src-b"]["owned_model_count"] == 1
 
 
+
+class TestScanScope:
+    """Finding A17 on #1707: a source owning zero models may be pointed at an
+    empty upstream, or at one whose contents its role/scope cannot see. The
+    report says which was scanned so the two are distinguishable."""
+
+    def test_each_source_reports_what_it_scanned(self, pg_state):
+        from src.repositories import semantic_source_repo
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        semantic_source_repo().create(
+            id="src-git",
+            kind="git",
+            name="Docs repo",
+            adapter="native",
+            config={"repo_url": "https://example.com/acme/semantics.git", "ref": "main"},
+        )
+        _source("src-upload", name="Pasted")
+
+        by_id = {s["source_id"]: s for s in compute_semantic_layer_health()["sources"]}
+        assert by_id["src-git"]["scan_scope"] == "https://example.com/acme/semantics.git @ main"
+        assert by_id["src-upload"]["scan_scope"] == "uploaded documents (0)"
+
+    def test_it_rides_beside_the_owned_model_count(self, pg_state):
+        """An addition to the count, never a replacement: "synced ok, owns 0,
+        scanned X" is the sentence that makes A17 diagnosable."""
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _source("src-empty", name="Empty", status="ok")
+
+        row = {s["source_id"]: s for s in compute_semantic_layer_health()["sources"]}["src-empty"]
+        assert row["last_sync_status"] == "ok"
+        assert row["owned_model_count"] == 0
+        assert row["scan_scope"] == "uploaded documents (0)"
+
+    def test_a_source_with_no_derivable_scope_reports_null(self, pg_state):
+        from src.repositories import semantic_source_repo
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        semantic_source_repo().create(id="src-bare", kind="connection", name="Bare", adapter="native", config={})
+
+        by_id = {s["source_id"]: s for s in compute_semantic_layer_health()["sources"]}
+        assert by_id["src-bare"]["scan_scope"] is None
+
+
 class TestOrphanedModels:
     def test_a_model_whose_source_was_deleted_is_flagged(self, pg_state):
         from src.semantic.coverage import compute_semantic_layer_health
@@ -543,6 +588,7 @@ class TestTheEndpointOnPostgres:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert all("owned_model_count" in s for s in body["sources"])
+        assert all("scan_scope" in s for s in body["sources"])
         for key in (
             "sources",
             "orphaned_models",

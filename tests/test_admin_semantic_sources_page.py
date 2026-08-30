@@ -89,3 +89,46 @@ class TestOwnedModelCountColumn:
         renderer = body.split("function fmtOwnedModels")[1].split("\nfunction ")[0]
         assert 'typeof n !== "number"' in renderer
         assert "ss-models-unknown" in renderer
+
+
+class TestScanScopeBesideTheSyncResult:
+    """Finding A17 on #1707: "ok · 0 models" cannot separate "there is nothing
+    upstream" from "the role I connect as cannot see it". The page renders
+    client-side, so what is pinned here is the shell it renders FROM — the
+    renderer, the field it reads, and the fact that an absent scope stays
+    silent."""
+
+    def _body(self, seeded_app) -> str:
+        return seeded_app["client"].get(
+            "/admin/semantic-sources", headers=_auth(seeded_app["admin_token"])
+        ).text
+
+    def test_the_row_renders_the_api_field(self, seeded_app):
+        assert "scan_scope" in self._body(seeded_app)
+
+    def test_it_is_rendered_in_the_last_sync_cell(self, seeded_app):
+        """"Scanned X" belongs next to the result of the scan, not in a column
+        of its own — it is context for the sync line, not a fourth status."""
+        assert "${fmtLastSync(s)}${fmtScanScope(s)}" in self._body(seeded_app)
+
+    def test_it_is_labelled_so_the_string_is_not_bare(self, seeded_app):
+        renderer = self._body(seeded_app).split("function fmtScanScope")[1].split("\nfunction ")[0]
+        assert "scanned ${esc(s.scan_scope)}" in renderer
+
+    def test_an_absent_scope_renders_nothing_rather_than_an_empty_claim(self, seeded_app):
+        renderer = self._body(seeded_app).split("function fmtScanScope")[1].split("\nfunction ")[0]
+        assert 'typeof s.scan_scope !== "string"' in renderer
+        assert 'return "";' in renderer
+
+    def test_the_scope_is_escaped_before_it_reaches_innerHTML(self, seeded_app):
+        """The string is composed from admin-supplied config (a repo URL, a
+        database name) and the row is built with innerHTML."""
+        renderer = self._body(seeded_app).split("function fmtScanScope")[1].split("\nfunction ")[0]
+        assert "${s.scan_scope}" not in renderer
+
+    def test_it_is_informational_not_a_status_accent(self, seeded_app):
+        """A scope is neither good nor bad news — it must not borrow the
+        success/warn/danger vocabulary."""
+        scope_css = [line for line in self._body(seeded_app).splitlines() if ".ss-scope" in line]
+        assert scope_css, "the scope style must be in the page's head_extra"
+        assert not any("accent" in line for line in scope_css)

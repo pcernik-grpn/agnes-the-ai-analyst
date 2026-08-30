@@ -450,17 +450,38 @@ def _owned_models_cell(row: dict) -> str:
     return f"{count} model" + ("" if count == 1 else "s")
 
 
+def _scan_scope_cell(row: dict) -> str:
+    """What the source's sync actually looked at, for the end of the row.
+
+    The model count says whether anything came back; it cannot say whether
+    the scan could see anything in the first place — a Snowflake source whose
+    role holds no grant on an existing semantic view syncs `ok` and owns 0
+    models, exactly like one pointed at an empty database (finding A17 on
+    #1707). Naming the database/schema/role, project, catalog or repository
+    is what makes that checkable. Absent (or a server too old to send it)
+    prints nothing rather than an empty claim.
+    """
+    scope = row.get("scan_scope")
+    if not isinstance(scope, str) or not scope:
+        return ""
+    return f"  scanned {scope}"
+
+
 @source_app.command("list")
 def list_sources(
     enabled_only: bool = typer.Option(False, "--enabled-only", help="Only show enabled sources"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
     """List registered semantic sources, each with the number of semantic
-    models it owns.
+    models it owns and what it scans.
 
     "Synced ok" only means the fetch worked; a source scoped at an upstream
-    with nothing in it stays green forever while importing nothing. The
-    model count is what tells the two apart (#1707).
+    with nothing in it stays green forever while importing nothing, and the
+    model count is what tells the two apart (#1707). The scope goes one step
+    further: a count of 0 still cannot separate "there is nothing upstream"
+    from "the role/scope I connect with cannot see it", so the row also names
+    the database/schema/role (or project, catalog, repository) that was
+    scanned.
     """
     params = {"enabled_only": enabled_only} if enabled_only else None
     resp = api_get(_SOURCES_PATH, params=params)
@@ -478,7 +499,7 @@ def list_sources(
         owned = _owned_models_cell(r)
         typer.echo(
             f"{r.get('id', ''):<16}  {r.get('kind', ''):<10}  {r.get('name', ''):<24}  "
-            f"{state:<9}  {owned:<10}  {last}"
+            f"{state:<9}  {owned:<10}  {last}{_scan_scope_cell(r)}"
         )
         # A source that synced and imported nothing is the finding this
         # column exists for; one that has never run yet owning nothing is
@@ -885,7 +906,13 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
     if empty_synced:
         typer.echo(f"Sources that synced but imported nothing ({len(empty_synced)}):")
         for s in empty_synced:
-            typer.echo(f"  {s.get('name') or s['source_id']} — check this source's scope/config")
+            # The scope is the actionable half: "scanned ESHOP_DEMO.RAW as
+            # ESHOP_DEMO_ROLE" points straight at the grant to check, where
+            # "check this source's config" alone leaves the reader guessing
+            # (finding A17 on #1707).
+            scanned = _scan_scope_cell(s).strip()
+            detail = f" ({scanned})" if scanned else ""
+            typer.echo(f"  {s.get('name') or s['source_id']}{detail} — check this source's scope/config")
         typer.echo("")
 
     orphaned = body.get("orphaned_models") or []

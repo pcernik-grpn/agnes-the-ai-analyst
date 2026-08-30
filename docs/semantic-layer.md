@@ -118,6 +118,34 @@ report (page + CLI). Never with error styling — the fetch worked, so nothing
 failed — and never for a source that has not synced at all: owning nothing
 before the first run is "has not run", not "imported nothing".
 
+### What did the sync actually look at?
+
+A count of zero still leaves two very different explanations open: the
+upstream really is empty, or its contents are invisible to the credentials
+Agnes syncs with. Both read `ok · 0 models`. The second was observed live — a
+Snowflake semantic view existed and the role the adapter connects as held no
+privilege on it, so `SHOW SEMANTIC VIEWS` returned nothing — and it is a
+misconfiguration an admin has to fix, not a state to accept.
+
+The same four surfaces therefore also carry **`scan_scope`**: one line naming
+what the source scans, derived from its own config at read time
+(`src/semantic/scan_scope.py`), never stored — the scope is a property of the
+row, not of a run. Per adapter:
+
+| Source | `scan_scope` |
+|---|---|
+| Snowflake semantic views | `ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE` — database, schema (or `ESHOP_DEMO (whole database)` when unscoped, plus `matching '<pattern>'` when a `like` narrows it) and the role that decides what is visible |
+| Keboola Metastore | `Keboola project 4321 (Demo Project)` — the project the pinned connection is bound to |
+| Databricks UC metric views | `Unity Catalog catalogs main, sales on <workspace host>` |
+| git | `https://example.com/acme/semantics.git @ main` — repository + ref (`default branch` when unset) |
+| upload / native | `uploaded documents (3)` |
+
+`null` means no scope could be derived (an adapter with no resolver, or a
+config too incomplete to name one) and every surface simply omits it — a new
+adapter is additive here too. The string carries coordinates only: no token,
+no credential env-var name, and any URL it echoes has its `user:pass@`
+userinfo stripped first.
+
 The count is derived at read time, never stored: it counts `semantic_models`
 rows stamped with the exact `(source, source_ref)` provenance this source's
 imports write under (`src/semantic/ownership.py`). "Owns" means that and
@@ -479,11 +507,13 @@ Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
 stale, or internally inconsistent" — a different question, in one response:
 
 - **`sources`** — every `semantic_sources` row's last sync outcome, verbatim,
-  plus `owned_model_count` (see above): a source can sync `ok` and import
-  nothing, and the status alone cannot say so. A dedicated **"Sources that
-  synced but imported nothing"** section lists exactly those, so a
-  silently-empty source is a finding rather than a number the reader has to
-  notice — reported without error styling, because nothing failed.
+  plus `owned_model_count` and `scan_scope` (see above): a source can sync
+  `ok` and import nothing, and the status alone cannot say so — nor can the
+  count say whether the upstream was empty or merely invisible. A dedicated
+  **"Sources that synced but imported nothing"** section lists exactly those,
+  naming what each one scanned, so a silently-empty source is an actionable
+  finding rather than a number the reader has to notice — reported without
+  error styling, because nothing failed.
 - **`orphaned_models`** — non-`manual` models whose `source_ref` names no live
   source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
   not cascade to the models it fed, so a project can vanish and leave its

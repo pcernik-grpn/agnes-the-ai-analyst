@@ -148,3 +148,38 @@ class TestSourcesThatSyncedButImportedNothing:
         """`null` means "cannot say", not "owns nothing"."""
         result = self._run([self._source("murky", status="ok", owned=None)])
         assert "synced but imported nothing" not in result.output
+
+
+class TestTheScanScopeOnTheEmptySourceFinding:
+    """Finding A17 on #1707: the finding says a source imported nothing; the
+    scope says where it looked, which is the half the admin can act on."""
+
+    @staticmethod
+    def _source(source_id: str, *, scope: str | None) -> dict:
+        return {
+            "source_id": source_id,
+            "name": source_id.title(),
+            "last_sync_status": "ok",
+            "last_sync_at": None,
+            "last_sync_error": None,
+            "owned_model_count": 0,
+            "scan_scope": scope,
+        }
+
+    def _run(self, sources: list[dict]):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, _health_body(sources=sources))):
+            return runner.invoke(app, ["semantic-model", "health"])
+
+    def test_the_finding_names_what_was_scanned(self):
+        result = self._run([self._source("warehouse", scope="ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE")])
+        assert result.exit_code == 0
+        assert "scanned ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE" in result.output
+
+    def test_it_keeps_the_forward_hint(self):
+        result = self._run([self._source("warehouse", scope="ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE")])
+        assert "check this source's scope/config" in result.output
+
+    def test_a_source_with_no_derivable_scope_still_reports_the_finding(self):
+        result = self._run([self._source("warehouse", scope=None)])
+        assert "Sources that synced but imported nothing (1):" in result.output
+        assert "scanned" not in result.output
