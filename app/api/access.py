@@ -1246,6 +1246,64 @@ class EffectiveAccessItem(BaseModel):
     resource_type: str
     resource_id: str
     via_groups: List[dict]  # [{group_id, group_name}]
+    #: Human name for `resource_id`, resolved through the SAME
+    #: `ResourceTypeSpec.list_blocks()` projection `/api/admin/access-overview`
+    #: uses, so the two surfaces cannot disagree about what a thing is called.
+    #: Falls back to the id when a grant no longer resolves — a dangling grant
+    #: is a real state and must render as itself rather than vanish.
+    name: Optional[str] = None
+    #: Where a reader can open the thing, when the type has a page for it.
+    href: Optional[str] = None
+    #: True when the id could not be resolved to a live resource at all.
+    unresolved: bool = False
+
+
+def _resource_display_index(types_needed: set) -> dict:
+    """`(resource_type, resource_id)` -> `{"name", "href"}` for the types asked for.
+
+    Both effective-access surfaces — `/me/profile` and `/admin/users/{id}` —
+    rendered raw primary keys: `DATA PACKAGE pkg_03ab1c829864`, `MEMORY DOMAIN
+    md_24992ef123b2`, `CHAT chat`. These are the two screens a member opens to
+    answer "what do I have" and an admin opens to answer "why can she see
+    that", and neither answered it.
+
+    The names were always one call away: `/api/admin/access-overview`, on the
+    neighbouring page, resolves every one through each type's `list_blocks()`
+    projection. This reuses that projection rather than adding a second source
+    of truth, so a rename lands on both surfaces at once.
+
+    Only the types actually granted are projected — `list_blocks()` reads the
+    whole table for its type, and an instance grants a handful of the sixteen
+    registered types.
+    """
+    from app.resource_types import RESOURCE_TYPES, ResourceType
+
+    index: dict = {}
+    for raw in types_needed:
+        try:
+            spec = RESOURCE_TYPES.get(ResourceType(raw))
+        except ValueError:
+            continue  # a grant naming a type this build does not register
+        if spec is None:
+            continue
+        try:
+            blocks = spec.list_blocks()
+        except Exception:  # noqa: BLE001
+            # One unreadable projection must not blank the whole page; those
+            # rows fall back to their ids.
+            logger.exception("effective-access: list_blocks failed for %s", raw)
+            continue
+        for block in blocks or []:
+            for item in (block.get("items") or []):
+                rid = item.get("resource_id")
+                if not rid:
+                    continue
+                slug = item.get("slug")
+                index[(raw, str(rid))] = {
+                    "name": item.get("name") or str(rid),
+                    "href": f"/catalog/p/{slug}" if raw == "data_package" and slug else None,
+                }
+    return index
 
 
 class TablePolicyDiagnosis(BaseModel):
@@ -1482,16 +1540,33 @@ async def user_effective_access(
     by_gid = {m["group_id"]: m["name"] for m in membership_rows}
     grants_rows = resource_grants_repo().list_for_groups(list(by_gid.keys()))
 
+    # Resolve display names once for the types actually granted, then sort by
+    # NAME rather than id — an id sort is alphabetical over opaque keys, which
+    # is no order at all to a reader.
+    display = _resource_display_index({gr["resource_type"] for gr in grants_rows})
+
     grouped: dict[tuple[str, str], EffectiveAccessItem] = {}
-    for gr in sorted(grants_rows, key=lambda r: (r["resource_type"], r["resource_id"], by_gid.get(r["group_id"], ""))):
+    for gr in sorted(
+        grants_rows,
+        key=lambda r: (
+            r["resource_type"],
+            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name")
+            or r["resource_id"],
+            by_gid.get(r["group_id"], ""),
+        ),
+    ):
         rt, rid, gid = gr["resource_type"], gr["resource_id"], gr["group_id"]
         gname = by_gid.get(gid, gid)
         key = (rt, rid)
         if key not in grouped:
+            shown = display.get(key)
             grouped[key] = EffectiveAccessItem(
                 resource_type=rt,
                 resource_id=rid,
                 via_groups=[],
+                name=(shown or {}).get("name") or rid,
+                href=(shown or {}).get("href"),
+                unresolved=shown is None,
             )
         grouped[key].via_groups.append({"group_id": gid, "group_name": gname})
 

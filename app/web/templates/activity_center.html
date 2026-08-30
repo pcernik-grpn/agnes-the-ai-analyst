@@ -517,6 +517,18 @@
       return;
     }
 
+    // Resolve each row into a sentence before drawing. The maps are fetched
+    // once per page and cached; if either fetch fails the rows still render,
+    // just with ids where a name would have been.
+    const maps = await _loadNameMaps();
+    for (const r of filtered) {
+      try {
+        r._what = describeChange(r, maps);
+      } catch (_) {
+        r._what = null;  // a row must never fail to render over its own label
+      }
+    }
+
     const frag = document.createDocumentFragment();
     filtered.forEach(r => frag.appendChild(renderRow(r)));
     tbody.appendChild(frag);
@@ -526,6 +538,90 @@
     rowCount.textContent = tbody.children.length + ' rows shown' + (nextCursor ? ' (more available)' : '');
   }
 
+
+  /* ── What actually changed ───────────────────────────────────────────────
+     The API returns `params` on every row — `{"group_id": …, "resource_type":
+     "data_package", "resource_id": "pkg_…"}` for a grant, `{"name": "Data
+     team"}` for a group, `{"user_email": …}` for a membership — and the table
+     rendered only `r.resource`, which for a grant is `grant:<uuid>`. That uuid
+     belongs to the grant ROW, so after a revoke it resolves to nothing, ever:
+     "what did we un-share from whom last week" was unanswerable at any number
+     of clicks, from anywhere in the product.
+
+     So: build the sentence from `params`, and resolve the ids in it through
+     the same two projections the Access page uses. Both are fetched once and
+     cached for the page; a failure to resolve degrades to the id rather than
+     blanking the row. */
+  const _nameCache = { groups: null, resources: null };
+
+  async function _loadNameMaps() {
+    if (_nameCache.groups && _nameCache.resources) return _nameCache;
+    const groups = new Map();
+    const resources = new Map();
+    try {
+      const gr = await fetch('/api/admin/groups', { credentials: 'include' });
+      if (gr.ok) for (const g of await gr.json()) groups.set(g.id, g.name);
+    } catch (_) { /* ids stay ids */ }
+    try {
+      const rr = await fetch('/api/admin/access-overview', { credentials: 'include' });
+      if (rr.ok) {
+        const ov = await rr.json();
+        for (const t of (ov.resources || [])) {
+          for (const b of (t.blocks || [])) {
+            for (const it of (b.items || [])) {
+              resources.set(t.type_key + ':' + it.resource_id, it.name || it.resource_id);
+            }
+          }
+        }
+      }
+    } catch (_) { /* ids stay ids */ }
+    _nameCache.groups = groups;
+    _nameCache.resources = resources;
+    return _nameCache;
+  }
+
+  function _kindWord(t) {
+    return String(t || '').replace(/_/g, ' ');
+  }
+
+  /* One sentence for the row, or null to fall back to `r.resource`. */
+  function describeChange(r, maps) {
+    const a = String(r.action || '');
+    // `params` arrives JSON-ENCODED, not as an object — the detail panel
+    // gets away with it because `prettyJson` parses defensively. Reading it
+    // as an object here silently produced `{}` for every row, so every
+    // sentence fell back to the id it was meant to replace: a failure that
+    // logs nothing and looks exactly like "no rule matched".
+    let p = r.params;
+    if (typeof p === 'string') {
+      try { p = JSON.parse(p); } catch (_) { p = {}; }
+    }
+    if (!p || typeof p !== 'object') p = {};
+    const grp = (id) => escapeHtml((maps.groups.get(id) || id || '').toString());
+    const res = (t, id) =>
+      escapeHtml((maps.resources.get(t + ':' + id) || id || '').toString());
+
+    if (a.startsWith('resource_grant.')) {
+      const verb = a.endsWith('.deleted') ? 'stopped sharing' : 'shared';
+      if (!p.resource_type && !p.group_id) return null;
+      const what = `<b>${res(p.resource_type, p.resource_id)}</b>`;
+      const kind = _kindWord(p.resource_type);
+      const who = p.group_id ? ` with <b>${grp(p.group_id)}</b>` : '';
+      return `${verb} the ${escapeHtml(kind)} ${what}${who}`;
+    }
+    if (a === 'user_group.created') return `created the group <b>${escapeHtml(p.name || '')}</b>`;
+    if (a === 'user_group.deleted') return `deleted the group <b>${grp(p.group_id || r.resource)}</b>`;
+    if (a.startsWith('user_group.member_add')) return `added <b>${escapeHtml(p.user_email || p.user_id || '')}</b> to a group`;
+    if (a.startsWith('user_group.member_remove')) return `removed <b>${escapeHtml(p.user_email || p.user_id || '')}</b> from a group`;
+    if (a.startsWith('data_package.add_table')) return `added the table <b>${escapeHtml(p.table_name || p.table_id || '')}</b> to a data package`;
+    if (a.startsWith('data_package.remove_table')) return `removed the table <b>${escapeHtml(p.table_name || p.table_id || '')}</b> from a data package`;
+    if (a.startsWith('register_table') || a === 'table.registered') return `registered the table <b>${escapeHtml(p.table_name || p.table_id || '')}</b>`;
+    if (a.startsWith('unregister_table')) return `unregistered the table <b>${escapeHtml(p.table_name || p.table_id || '')}</b>`;
+    if (a === 'source_connection.update' && Array.isArray(p.fields)) {
+      return `changed ${escapeHtml(p.fields.join(', '))} on a data source`;
+    }
+    return null;
+  }
   function renderRow(r) {
     const tr = document.createElement('tr');
     tr.dataset.rowJson = JSON.stringify(r);
@@ -558,7 +654,7 @@
     tr.appendChild(td('', '<span class="obs-source-pill is-' + src + '">' + escapeHtml(src) + '</span>'));
 
     tr.appendChild(td('obs-action-cell', escapeHtml(r.action || '')));
-    tr.appendChild(td('', escapeHtml(r.resource || '—')));
+    tr.appendChild(td('obs-what-cell', r._what || escapeHtml(r.resource || '—')));
     tr.appendChild(td('obs-dur-cell', r.duration_ms != null ? escapeHtml(r.duration_ms + ' ms') : '—'));
 
     const result = r.result || '';
