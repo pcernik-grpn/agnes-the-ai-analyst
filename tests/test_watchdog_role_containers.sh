@@ -84,6 +84,12 @@ if [ "${1:-}" = "compose" ]; then
                 empty)
                     :
                     ;;
+                extraction)
+                    printf 'app agnes-app-1\n'
+                    printf 'scheduler agnes-scheduler-1\n'
+                    printf 'extraction-worker agnes-extraction-worker-1\n'
+                    printf 'redis agnes-redis-1\n'
+                    ;;
                 *)
                     printf 'app agnes-app-1\n'
                     printf 'scheduler agnes-scheduler-1\n'
@@ -324,6 +330,34 @@ grep -qF "docker logs agnes-app-1 --since" "$transcript" \
 log_file | grep -qF "CRASH[agnes-app-1]: 1x 'terminate called'" \
     || fail "E: the fallback-discovered container's alert must be named"
 echo "OK: E — fallback path still finds and scans agnes-app-1 when compose ps yields nothing"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario F: extraction-lane topology (customer-instance module opt-in) —
+# `extraction-worker` is a role container (it runs the app image with
+# AGNES_ROLE=worker) so it is scanned and named; redis coordination is
+# declared via the .env AGNES_COORDINATION_BACKEND override rather than any
+# instance*.yaml (the module writes the env form so it never touches the
+# applier-owned instance.yaml), and the coordination signature must fire
+# off that declaration alone. The redis sidecar itself stays filtered out.
+# =====================================================================
+run_scenario F
+printf 'AGNES_COORDINATION_BACKEND=redis\n' > "$tmp/.env"
+printf 'CoordinationUnavailable\n%.0s' {1..5} > "$fake_logs_dir/agnes-extraction-worker-1.log"
+
+TRANSCRIPT="$transcript" FAKE_LOGS_DIR="$fake_logs_dir" \
+    FAKE_TOPOLOGY=extraction \
+    AGNES_WATCHDOG_COMPOSE_DIR="$tmp" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed"
+
+grep -qF "docker logs agnes-extraction-worker-1 --since" "$transcript" \
+    || fail "F: extraction-worker must be scanned (role container)"
+grep -qF "docker logs agnes-redis-1" "$transcript" \
+    && fail "F: redis is not a role container and must never be docker-logs'd"
+log_file | grep -qF "COORDINATION[agnes-extraction-worker-1]: 5x 'CoordinationUnavailable'" \
+    || fail "F: env-declared redis (AGNES_COORDINATION_BACKEND in .env) must gate the coordination signature ON"
+echo "OK: F — extraction-worker scanned+named; .env AGNES_COORDINATION_BACKEND=redis arms the coordination signature"
 rm -rf "$tmp"
 
 echo "OK"
