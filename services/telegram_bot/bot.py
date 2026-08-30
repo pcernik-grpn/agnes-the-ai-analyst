@@ -81,6 +81,119 @@ def _audit_user_id(username: str) -> str:
         return email
 
 
+async def _cmd_start(chat_id: int) -> None:
+    username = get_username_by_chat_id(chat_id)
+    if username:
+        await send_message(
+            chat_id,
+            f"You are already linked as *{username}*.\nUse /help to see available commands.",
+        )
+        return
+
+    code = create_verification_code(chat_id)
+    await send_message(
+        chat_id,
+        f"Welcome to {_bot_instance_name} Notifications!\n\n"
+        f"Your verification code: *{code}*\n\n"
+        f"Enter this code on your dashboard at {_bot_server_hostname}\n"
+        f"Code expires in 10 minutes.",
+    )
+    logger.info(f"Sent verification code to chat_id {chat_id}")
+
+
+async def _cmd_whoami(chat_id: int) -> None:
+    username = get_username_by_chat_id(chat_id)
+    if username:
+        # Username is derived from email
+        if _bot_domain_suffix:
+            email = f"{username}@{_bot_domain_suffix}"
+        else:
+            email = username
+        await send_message(
+            chat_id,
+            f"*{username}*\n{email}",
+        )
+    else:
+        await send_message(
+            chat_id,
+            "No linked account. Use /start to link.",
+            parse_mode="",
+        )
+
+
+async def _cmd_status(chat_id: int) -> None:
+    username = get_username_by_chat_id(chat_id)
+    if not username:
+        await send_message(
+            chat_id,
+            "Link your account first using /start and the dashboard.",
+            parse_mode="",
+        )
+        return
+
+    status_text = get_notification_status(username)
+    buttons = get_script_buttons(username)
+    if buttons:
+        await send_message_with_buttons(chat_id, status_text, buttons)
+    else:
+        await send_message(chat_id, status_text)
+
+
+async def _cmd_test(chat_id: int) -> None:
+    username = get_username_by_chat_id(chat_id)
+    if not username:
+        await send_message(
+            chat_id,
+            "Link your account first using /start and the dashboard.",
+            parse_mode="",
+        )
+        return
+
+    await send_message(chat_id, "Generating test report...", parse_mode="")
+    try:
+        image_path, caption = generate_test_report(username)
+        await send_photo(chat_id, image_path, caption)
+        # Cleanup temp file
+        os.unlink(image_path)
+        logger.info(f"Sent test report to {username}")
+    except Exception:
+        logger.exception(f"Failed to generate test report for {username}")
+        await send_message(chat_id, "Failed to generate report. Check server logs.", parse_mode="")
+
+
+async def _cmd_help(chat_id: int) -> None:
+    await send_message(
+        chat_id,
+        f"*{_bot_instance_name} Bot*\n\n"
+        "/start - Link your Telegram account\n"
+        "/whoami - Show your username and chat ID\n"
+        "/status - List your notification scripts\n"
+        "/test - Send a demo report\n"
+        "/help - Show this help",
+    )
+
+
+#: The command -> handler registry `handle_message` actually routes
+#: through — a plain if/elif chain used to hand-duplicate these five
+#: strings, which is exactly the kind of registry-vs-reality drift the
+#: non-HTTP audit-posture ratchet (`src.audit_posture.BOT_COMMAND_POSTURE`)
+#: is designed to catch elsewhere. Deriving `TELEGRAM_COMMANDS` FROM this
+#: dict (rather than listing the strings twice) means a new command added
+#: here is automatically picked up by both the dispatcher and the ratchet.
+TELEGRAM_COMMAND_HANDLERS = {
+    "/start": _cmd_start,
+    "/whoami": _cmd_whoami,
+    "/status": _cmd_status,
+    "/test": _cmd_test,
+    "/help": _cmd_help,
+}
+
+#: Every text command this bot recognizes — used by
+#: `tests/test_audit_nonhttp_posture.py` to ratchet
+#: `src.audit_posture.BOT_COMMAND_POSTURE` against reality.
+TELEGRAM_COMMANDS: frozenset[str] = frozenset(TELEGRAM_COMMAND_HANDLERS)
+
+
 async def handle_message(message: dict) -> None:
     """Handle an incoming Telegram message."""
     chat_id = message.get("chat", {}).get("id")
@@ -102,99 +215,15 @@ async def handle_message(message: dict) -> None:
             client_kind="telegram",
         )
 
-    if text == "/start":
-        username = get_username_by_chat_id(chat_id)
-        if username:
-            await send_message(
-                chat_id,
-                f"You are already linked as *{username}*.\nUse /help to see available commands.",
-            )
-            return
-
-        code = create_verification_code(chat_id)
-        await send_message(
-            chat_id,
-            f"Welcome to {_bot_instance_name} Notifications!\n\n"
-            f"Your verification code: *{code}*\n\n"
-            f"Enter this code on your dashboard at {_bot_server_hostname}\n"
-            f"Code expires in 10 minutes.",
-        )
-        logger.info(f"Sent verification code to chat_id {chat_id}")
-
-    elif text == "/whoami":
-        username = get_username_by_chat_id(chat_id)
-        if username:
-            # Username is derived from email
-            if _bot_domain_suffix:
-                email = f"{username}@{_bot_domain_suffix}"
-            else:
-                email = username
-            await send_message(
-                chat_id,
-                f"*{username}*\n{email}",
-            )
-        else:
-            await send_message(
-                chat_id,
-                "No linked account. Use /start to link.",
-                parse_mode="",
-            )
-
-    elif text == "/status":
-        username = get_username_by_chat_id(chat_id)
-        if not username:
-            await send_message(
-                chat_id,
-                "Link your account first using /start and the dashboard.",
-                parse_mode="",
-            )
-            return
-
-        status_text = get_notification_status(username)
-        buttons = get_script_buttons(username)
-        if buttons:
-            await send_message_with_buttons(chat_id, status_text, buttons)
-        else:
-            await send_message(chat_id, status_text)
-
-    elif text == "/test":
-        username = get_username_by_chat_id(chat_id)
-        if not username:
-            await send_message(
-                chat_id,
-                "Link your account first using /start and the dashboard.",
-                parse_mode="",
-            )
-            return
-
-        await send_message(chat_id, "Generating test report...", parse_mode="")
-        try:
-            image_path, caption = generate_test_report(username)
-            await send_photo(chat_id, image_path, caption)
-            # Cleanup temp file
-            os.unlink(image_path)
-            logger.info(f"Sent test report to {username}")
-        except Exception:
-            logger.exception(f"Failed to generate test report for {username}")
-            await send_message(chat_id, "Failed to generate report. Check server logs.", parse_mode="")
-
-    elif text == "/help":
-        await send_message(
-            chat_id,
-            f"*{_bot_instance_name} Bot*\n\n"
-            "/start - Link your Telegram account\n"
-            "/whoami - Show your username and chat ID\n"
-            "/status - List your notification scripts\n"
-            "/test - Send a demo report\n"
-            "/help - Show this help",
-        )
-
-    else:
+    handler = TELEGRAM_COMMAND_HANDLERS.get(text)
+    if handler is None:
         await send_message(
             chat_id,
             "Unknown command. Type /help for available commands.",
             parse_mode="",
         )
+        return
+    await handler(chat_id)
 
 
 async def handle_callback_query(callback_query: dict) -> None:
@@ -227,7 +256,9 @@ async def handle_callback_query(callback_query: dict) -> None:
     # button press runs a script as an arbitrary OS user via `sudo -u`
     # (services/telegram_bot/runner.py). Highest-value audit row in this
     # task: who triggered it, which script, which OS user, and whether the
-    # subprocess actually succeeded.
+    # subprocess actually succeeded. This is the real action
+    # `src.audit_posture.BOT_COMMAND_POSTURE["telegram:callback:run_script"]`
+    # declares — must never be exempt.
     log_safe(
         user_id=_audit_user_id(username),
         action="telegram.script_run",
