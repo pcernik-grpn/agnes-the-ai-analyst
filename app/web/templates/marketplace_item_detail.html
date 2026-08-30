@@ -569,6 +569,16 @@
     color: var(--text-secondary); font-size: 13px; font-style: italic;
     text-align: center; padding: 32px 16px;
   }
+
+  /* CLS fix (this page only — the plugin detail page's server shell is
+     already tall enough and measures 0.026, so it's left alone): measured
+     layout shift 0.468, sources DIV.detail-cols + FOOTER.site-footer — the
+     server renders a short shell, the detail XHR lands, .detail-cols grows
+     and shoves the footer down through the viewport. CLS only scores
+     elements visible in the viewport before or after they move, so
+     reserving enough height up front to push the footer below the first
+     viewport keeps that growth off-screen and out of the score. */
+  .item-detail .detail-cols { min-height: 100vh; }
 </style>
 {% endblock %}
 
