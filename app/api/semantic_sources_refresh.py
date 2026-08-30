@@ -31,6 +31,17 @@ instance:
   would orphan every existing metric and write a duplicate beside it.
 * ``reconcile_after_import()`` runs after each successful import and performs
   the post-sync legacy-row cleanup those endpoints used to do inline.
+* ``src.semantic.adapters.unconfigured_reason()`` is asked of every source
+  before its import: a source whose adapter reports that its CONNECTOR is not
+  configured on this instance at all is skipped (``skipped_not_configured``)
+  rather than imported into that connector's own "not configured" failure on
+  every run, forever. The row is left exactly as the admin shaped it —
+  skipping is reversible the moment the configuration returns, deleting the
+  row is not — with the reason recorded on it so /admin/semantic-sources and
+  the health report show why it stopped syncing. Per-adapter opt-in: today
+  ``databricks_metric_views`` and ``snowflake_semantic`` answer, both because
+  they are auto-registered and can outlive the connection they read; an
+  adapter that stays silent is always "ready" and its failures stay failures.
 * ``claim_source_for_import()`` and ``duplicate_upstream_reason()`` carry over
   the two guards those triggers had built in: a migrated Keboola source is
   skipped (``skipped_running``) while the login-triggered sync that writes the
@@ -61,7 +72,10 @@ never aborts the sweep over the rest. ``import_source`` already records
 ``last_sync_at`` / ``last_sync_status`` / ``last_sync_error`` on the source
 row itself (success or failure) — this module does not write that state a
 second time, it only aggregates the per-run HTTP response, plus the
-in-memory last-completed summary the admin page's status strip reads.
+in-memory last-completed summary the admin page's status strip reads. That
+per-row state is also what ``get_sync_status_summary()`` falls back to when
+the in-memory summary is empty, so a freshly restarted process reports the
+sources' real history instead of claiming nothing ever synced.
 """
 
 from __future__ import annotations
@@ -77,6 +91,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.auth.access import require_admin
 from src.audit_helpers import log_safe
 from src.repositories import semantic_source_repo
+from src.semantic.adapters import unconfigured_reason
 from src.semantic.legacy_migration import (
     claim_source_for_import,
     duplicate_upstream_reason,
@@ -107,11 +122,122 @@ _refresh_state: dict[str, Any] = {
 
 def get_last_refresh_summary() -> dict[str, Any]:
     """Read accessor for the admin UI — the last completed sweep's summary,
-    without reaching into the module-private `_refresh_state` dict."""
+    without reaching into the module-private `_refresh_state` dict.
+
+    In-memory only, by the design above: empty means "no sweep in THIS
+    process", never "nothing has ever synced". Callers rendering a claim
+    about history want `get_sync_status_summary()` instead.
+    """
     return {
         "last_completed_at": _refresh_state.get("last_completed_at"),
         "last_status": _refresh_state.get("last_status"),
         "last_result": _refresh_state.get("last_result"),
+    }
+
+
+#: `last_sync_status` values that mean the source was actually IMPORTED
+#: from — the only ones the fallback may speak for. `record_sync` also
+#: stamps `last_sync_at` for a `'skipped'` row (the duplicate-upstream skip
+#: below), which never ran an import: counting one would let a source that
+#: has never been read set the "last source sync" time, i.e. the same
+#: over-claim this fallback exists to remove.
+_ATTEMPTED_SYNC_STATUSES = frozenset({"ok", "error"})
+
+
+def _as_iso(value: Any) -> str | None:
+    """One comparable, renderable form for a `last_sync_at` off either
+    backend — DuckDB hands back a naive datetime, Postgres a tz-aware one,
+    and a raw string is tolerated.
+
+    Normalized to second precision HERE, before the max() below, so what is
+    compared is exactly what is rendered: microseconds are noise in a status
+    strip, and trimming after the comparison could print a stamp that was
+    never the one selected. Within one backend the format stays uniform, so
+    max() over these still sorts chronologically.
+    """
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return value.strip() or None
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    return None
+
+
+def _no_fallback(*, unavailable: bool = False) -> dict[str, Any]:
+    return {"last_sync_at": None, "synced_count": 0, "source_count": 0, "unavailable": unavailable}
+
+
+def _last_source_sync() -> dict[str, Any]:
+    """The durable fallback: `max(last_sync_at)` across the `semantic_sources`
+    rows that have actually been imported from, how many those are, and how
+    many are registered in total.
+
+    Read-time derivation over state each row already carries — no new table,
+    no schema change, and `list_all()` exists on both halves of the pair, so
+    a DuckDB instance answers this exactly as a Postgres one does.
+
+    A read that fails reports `unavailable`, NOT an empty result: rendering
+    "never synced" because the sources could not be read would be a claim
+    about history made from a failure to read it — the very shape of bug this
+    function exists to fix. Either way it degrades rather than 500-ing the
+    page it decorates.
+    """
+    try:
+        sources = semantic_source_repo().list_all()
+    except Exception as exc:  # noqa: BLE001 - a status strip must not break the page
+        logger.warning("semantic sources refresh: could not read the sources' last sync: %s", exc)
+        return _no_fallback(unavailable=True)
+    stamps = [
+        iso
+        for iso in (
+            _as_iso(source.get("last_sync_at"))
+            for source in sources
+            if (source.get("last_sync_status") or "") in _ATTEMPTED_SYNC_STATUSES
+        )
+        if iso
+    ]
+    return {
+        "last_sync_at": max(stamps) if stamps else None,
+        "synced_count": len(stamps),
+        "source_count": len(sources),
+        "unavailable": False,
+    }
+
+
+def get_sync_status_summary() -> dict[str, Any]:
+    """What the /admin/semantic-layer status strip renders — the sweep view
+    when there is one, a truthful fallback when there is not.
+
+    `_refresh_state` is deliberately in-memory, so EVERY redeploy empties it.
+    The strip used to read that emptiness as "Never synced yet." — a claim
+    about history made from a fact about this process — while
+    /admin/semantic-sources listed the same sources synced hours earlier.
+
+    Four states, and the label moves with the meaning:
+
+    * a sweep ran in this process — render it, it is the richer view
+      (counts, per-source results), whether it succeeded or failed;
+    * no sweep here, but sources have been imported from — report THAT, and
+      say what it is: the last sync of any source, not a sweep;
+    * no sweep here and the sources cannot be read — say the status is
+      unavailable, never that nothing synced;
+    * none of the above — nothing has ever synced, and only there is the old
+      sentence true.
+    """
+    summary = get_last_refresh_summary()
+    # Only when there is no sweep to show: the richer in-memory view always
+    # wins, and this way the common path costs no query.
+    fallback = _last_source_sync() if summary["last_status"] is None else _no_fallback()
+    return {
+        **summary,
+        "fallback_last_sync_at": fallback["last_sync_at"],
+        # How many sources that time speaks for, out of how many exist — "2"
+        # alone reads as the total when it is a subset.
+        "fallback_synced_count": fallback["synced_count"],
+        "fallback_source_count": fallback["source_count"],
+        "fallback_unavailable": fallback["unavailable"],
     }
 
 
@@ -134,6 +260,7 @@ def _run_sweep() -> dict[str, Any]:
     synced = 0
     failed = 0
     skipped_disabled = 0
+    skipped_not_configured = 0
     skipped_running = 0
     skipped_duplicate_project = 0
     results: list[dict[str, Any]] = []
@@ -163,6 +290,48 @@ def _run_sweep() -> dict[str, Any]:
                         "hint": "Another writer of this source's rows is in flight; the next sweep picks it up.",
                     }
                 )
+                continue
+
+            # The connector this source reads is no longer configured on
+            # this instance. Asked of the ADAPTER
+            # (`src/semantic/adapters`), so the sweep stays generic: a
+            # git/upload source has no connector and never answers, a
+            # connector adapter opts in with one method.
+            #
+            # Skipped, not failed and NOT deleted. Importing it would raise
+            # the connector's own "not configured" on every single run,
+            # forever — which is precisely the state the connector's
+            # create-time gate exists to prevent but cannot, since it returns
+            # an existing row's id before checking. The row keeps everything
+            # an admin gave it: a rotated credential or a removed connection
+            # is an outage, not consent to throw the source away.
+            #
+            # INSIDE the claim, exactly like the duplicate-project skip below
+            # and for the same reason: this branch WRITES to the row
+            # (`record_sync`), and the claim is what serializes that against
+            # the other writer of this source's rows. Inert today — no
+            # adapter that has a competing writer implements the hook — but
+            # the next one that does (Keboola, whose login-triggered sync
+            # writes the same rows) would silently inherit the clobber.
+            unconfigured = unconfigured_reason(source)
+            if unconfigured:
+                skipped_not_configured += 1
+                results.append(
+                    {"id": source_id, "name": name, "status": "skipped_not_configured", "error": unconfigured}
+                )
+                # info, not warning: this is a deliberate admin state that
+                # would otherwise log at warning level on every tick,
+                # forever — the noise half of the very bug this skip fixes.
+                logger.info(
+                    "semantic sources refresh: source %s skipped, its connector is not configured: %s",
+                    source_id,
+                    unconfigured,
+                )
+                # Recorded on the row for the same reason the
+                # duplicate-project skip is: without it the row would keep
+                # rendering the red "failed" from the last sweep that still
+                # tried, and nothing would ever say why it stopped trying.
+                repo.record_sync(source_id, status="skipped", error=unconfigured)
                 continue
 
             # One upstream, one importer per sweep — two sources resolving to
@@ -210,6 +379,7 @@ def _run_sweep() -> dict[str, Any]:
         "synced": synced,
         "failed": failed,
         "skipped_disabled": skipped_disabled,
+        "skipped_not_configured": skipped_not_configured,
         "skipped_running": skipped_running,
         "skipped_duplicate_project": skipped_duplicate_project,
         "migrated": migrated,
@@ -260,11 +430,12 @@ async def run_semantic_sources_refresh(
 
     logger.info(
         "semantic sources refresh: run_id=%s synced=%s failed=%s skipped_disabled=%s "
-        "skipped_running=%s skipped_duplicate_project=%s migrated=%s",
+        "skipped_not_configured=%s skipped_running=%s skipped_duplicate_project=%s migrated=%s",
         run_id,
         result["synced"],
         result["failed"],
         result["skipped_disabled"],
+        result["skipped_not_configured"],
         result["skipped_running"],
         result["skipped_duplicate_project"],
         len(result["migrated"]),
@@ -281,6 +452,7 @@ async def run_semantic_sources_refresh(
             "synced": result["synced"],
             "failed": result["failed"],
             "skipped_disabled": result["skipped_disabled"],
+            "skipped_not_configured": result["skipped_not_configured"],
             "skipped_running": result["skipped_running"],
             "skipped_duplicate_project": result["skipped_duplicate_project"],
             "migrated": len(result["migrated"]),

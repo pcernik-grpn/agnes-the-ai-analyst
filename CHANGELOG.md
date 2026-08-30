@@ -1068,6 +1068,98 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **`/admin/semantic-layer` claimed "Never synced yet." on instances whose
+  sources had synced that morning (#1707).** The status strip read the
+  whole-sweep summary, which is deliberately in-memory ("since this process
+  started") — so every redeploy emptied it and turned a fact about the
+  process into a false claim about history. The strip now falls back to what
+  the `semantic_sources` rows already carry durably, and labels it as the
+  different claim it is: "Last source sync <time> across N of M sources — no
+  sweep since this instance restarted". A sweep that ran in this process still
+  wins, succeeded or failed (it is the richer view); a source that was only
+  *skipped* is excluded, since nothing was ever imported from it; sources that
+  cannot be read report "Sync status unavailable." rather than a history claim
+  made from a failed read; and "Never synced yet." survives for the one case
+  where it is true — nothing, anywhere, has ever synced. Derived at read time
+  from `max(last_sync_at)` through the existing repository factory, so no new
+  table and no schema change, and a DuckDB instance reports it exactly as a
+  Postgres one does.
+- **A source card on `/admin/data-sources` no longer reports the state the page
+  was born in.** The per-source pipeline strip (tables → sync → semantic →
+  feeds) was baked into the page's HTML at render time, but everything that
+  changes it happens on that same page over `fetch` — the Add-tables wizard,
+  package creation and sharing, token saves, chat-tools toggles, unbinding a
+  project. So an admin who registered two dozen tables kept reading "Add the
+  first tables → / Never synced / 0 packages" until they hard-reloaded: the
+  setup was done and the app said nothing had happened. Each of those handlers
+  now re-reads the strip from a new read-only, admin-gated
+  `GET /api/admin/source-pipelines` (the same fold the template inlines — no
+  new data, no new authority) and repaints the affected card in place, so an
+  expanded card and the scroll position survive the update; the handlers that
+  also change what the card's own row says — a stored token, a cleared project
+  binding, chat tools, a queued SharePoint extraction, a connection created or
+  deleted — redraw the card list from that same fresh read.
+- **A Databricks or Snowflake semantic source no longer fails forever once the
+  connector is deconfigured (#1707).** Both connectors refuse to CREATE their
+  semantic source row when the warehouse is not configured — exactly so
+  nothing carries a source that fails on every run for a warehouse it does not
+  have — but an existing row short-circuits before that check, so a connector
+  deconfigured AFTER registration (credentials rotated out, connection
+  removed) landed in that state from the other direction: every scheduled
+  sweep imported the row, the adapter raised "… is not configured", and the
+  source accrued a fresh error and a fresh warning, every run, indefinitely.
+  Both rows are auto-registered — the Databricks one by the sweep's own
+  migration, the Snowflake one by the /admin/data-sources wizard's opt-in — so
+  neither needed an admin to set up the state that then broke. The sweep now
+  asks each source's adapter whether its connector is configured at all and
+  skips the ones that are not — counted as `skipped_not_configured` in the
+  `POST /api/admin/run-semantic-sources-refresh` response, the sweep's log
+  line and its audit row, and recorded on the source itself as
+  `last_sync_status='skipped'` with the reason, so `/admin/semantic-sources`
+  shows a muted "skipped" with the explanation instead of a red failure
+  nothing is trying to reach any more. The reason names both places a
+  connector can be configured (a registered connection under Admin → Data
+  sources, or the legacy `data_source.*` config), rather than sending a
+  wizard-configured admin off to edit a file that was never their source of
+  truth. The row is never deleted: a rotated credential is an outage, not
+  consent to discard a source an admin named, scoped and enabled — it resumes
+  syncing on the first sweep after the configuration returns. A manual sync of
+  such a source still fails loudly, since that one was explicitly asked for.
+  The check is a new optional adapter method (`unconfigured_reason`), so any
+  connector-backed adapter opts in with one function and git/upload sources
+  need no opinion.
+- **The semantic-layer health report no longer says "No sync failures,
+  disconnected models, or invalid documents" for an instance whose only source
+  is permanently skipped (#1707).** Both renderers — the `/admin/semantic-layer`
+  Health tab and `agnes admin semantic health` — filtered `sources` on
+  "failed" and "synced but owns nothing" alone, so a source the sweep skips
+  (its connector deconfigured, or another source already importing the same
+  upstream project) appeared in no section at all and still counted as
+  all-clear. Both now list them under **"Sources that are not syncing
+  (skipped)"** with the reason recorded on each row, without failure styling
+  (nothing failed — the sweep declined to try), and a skipped source
+  suppresses the all-clear headline.
+- **A Keboola table that is empty upstream no longer reports as a failed
+  sync — and a lost sliced export no longer reports as a clean one.** A
+  sliced export of a table with no rows comes back as a manifest with zero
+  entries. The Storage API client's two sliced download paths treated that
+  as an unconditional error, so a table that is simply empty (a form-fields
+  table with no attachments, say) stayed permanently red and looked exactly
+  like a broken extraction; the legacy client's own third consumer had the
+  opposite failure, reporting any entries-less manifest as a clean 0-row
+  export. All three now share one decision. Empty and successful: the export
+  carries the table's declared columns (a header-only CSV / a zero-row
+  parquet, honouring a `columns` projection when one was requested), so the
+  sync succeeds with 0 rows and the downstream view still resolves its
+  columns — either because upstream's `rowsCount` is 0, or because the
+  export carried a row filter (`whereFilters` / `changedSince` /
+  `changedUntil` / `limit`), which may legitimately match nothing on a table
+  that has rows. Otherwise an error: `rowsCount > 0` on an unfiltered export
+  now says plainly that upstream claims N rows while the export returned no
+  slices. **Contract change on the legacy client:** when `rowsCount` cannot
+  be read at all — no table id to ask about, the detail call failed, the
+  field is absent — that path now fails where it used to report 0 rows
+  successfully. Unknown must never present itself as empty.
 - **Semantic layer browse: the constraint Severity tooltip is now a fast
   `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
   ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
@@ -1137,6 +1229,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   Added page-level test coverage for the detach toolbar (PG-only, since
   `sync_mode='detached'` is a Postgres-only column), which is what let both
   issues ship unguarded.
+- **/admin/data-sources: the master token is now named at the point of
+  entry, and "Token not set" no longer links to a page that cannot set it
+  (#1707, A12/A13).** The "+ Add source" wizard's semantic-layer token field
+  said only "project owner" — Agnes's own phrasing, not Keboola's, so an
+  admin searching their Keboola project for "project owner token" found
+  nothing. The field now carries a hint naming Keboola's own term, the
+  project **master** token. The connection card's matching hint moved off a
+  native `title=` (600ms+ show delay, invisible on touch) onto the shared
+  `[data-tip]` fast-tooltip, paired with `aria-label` per the design-system
+  convention (`aria-label` prefixed with the visible "Semantic-layer token"
+  label, per WCAG 2.5.3, not replaced by the tip). Separately, a **stored**
+  source with no token set rendered "Token not set" as a link to
+  `/admin/semantic-layer`, which renders fine but has no token field — the
+  token is set on the card itself; that cell now calls the same
+  `toggleMasterToken` action already reachable from the card's Actions menu
+  instead of navigating to a page that cannot help. A source with a token
+  set, and a **derived** card (no stored connection, so no such widget to
+  call), both keep the health-page link unchanged.
 - **Testing a non-Keboola data connection no longer fails with a Keboola error.**
   `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
   /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and
