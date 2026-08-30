@@ -34,7 +34,16 @@ jobs:
       - name: Regenerate .test_durations
         # || true so a flaky/broken test on main doesn't block the duration
         # update — pytest-split writes .test_durations even on partial failure.
-        run: pytest tests/ --store-durations -n auto -q --tb=no || true
+        #
+        # `connectors/` is included because ci.yml's shards run it: the
+        # connector packages keep their tests beside the code, so regenerating
+        # from `tests/` alone left their ~170 entries frozen at whatever run
+        # first recorded them. pytest-split MERGES rather than replaces, so the
+        # stale entries survived and kept mis-balancing the shards instead of
+        # disappearing loudly. The same numbers now also decide the local
+        # `--lane fast` cut (see the root conftest.py), which is a second reason
+        # they should describe the suite CI actually runs.
+        run: pytest tests/ connectors/ --store-durations -n auto -q --tb=no || true
         env:
           TESTING: "1"
 
