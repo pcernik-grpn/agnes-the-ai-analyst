@@ -392,7 +392,7 @@ def get_current_user(
         return _stash_user(request, user)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail=_AUTH_DETAIL_BY_REASON.get(reason, "Invalid or expired token"),
+        detail=auth_detail_for_reason(reason),
     )
 
 

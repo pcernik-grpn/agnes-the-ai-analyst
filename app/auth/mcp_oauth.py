@@ -201,9 +201,15 @@ def _access_token_from_pat(token: str) -> AccessToken | None:
 
     Everything else the resolver enforces still applies unchanged — revoked /
     expired / unknown / hash-mismatched PATs, deactivated accounts, and the
-    ``credential_surface`` narrowing. An agent PAT is refused here the same
-    way it is on SSE: ``resolve_token_to_user`` is called without a
-    ``Request``, so its surface allowlist can never match (fail closed).
+    ``credential_surface`` narrowing.
+
+    An agent PAT (``typ="agent_pat"``) is refused by the ``typ`` check below,
+    which is the ACTIVE gate: it fires first, so such a token never reaches
+    ``resolve_token_to_user`` from here at all. The resolver's own surface
+    allowlist (``_AGENT_PAT_ALLOWED_PREFIXES``, which cannot match because
+    this call passes no ``Request``) is a latent second line that would catch
+    it if the ``typ`` gate below were ever widened — depth, not the reason it
+    is refused today.
 
     Exceptions are NOT swallowed: a resolver that raises means Agnes is
     broken, and the caller gets a 500 from the ASGI stack rather than a 401
@@ -213,6 +219,10 @@ def _access_token_from_pat(token: str) -> AccessToken | None:
     from app.auth.jwt import verify_token
 
     payload = verify_token(token)
+    # THE gate. Widening this set is a security decision, not a cleanup: it is
+    # what keeps agent PATs, session JWTs and OAuth access tokens off this
+    # transport (see the docstring). tests/test_mcp_transport_auth_parity.py
+    # ratchets each of those refusals.
     if not payload or payload.get("typ") != "pat":
         return None
 

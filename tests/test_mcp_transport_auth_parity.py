@@ -39,25 +39,49 @@ MCP_MOUNT = "/api/mcp/http"
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 
-def _mint_pat(user_id: str = "analyst1", email: str = "analyst@test.com") -> tuple[str, str]:
+def _mint_pat(
+    user_id: str = "analyst1",
+    email: str = "analyst@test.com",
+    *,
+    typ: str = "pat",
+    scope: str | None = None,
+    agent_id: str | None = None,
+    expires_at: datetime | None = None,
+) -> tuple[str, str]:
     """Create a real, live PAT for ``user_id``; return ``(jwt, token_id)``.
 
     The stored ``token_hash`` must be sha256 of the JWT or
     ``resolve_token_to_user`` rejects it as ``pat_mismatch`` long before the
     code under test runs.
+
+    The keyword-only knobs mint the *variants* the fail-closed ratchets below
+    need (agent PAT, scoped PAT, already-expired row). Defaults are the plain,
+    fully-valid PAT every other test wants.
     """
     from app.auth.jwt import create_access_token
     from src.repositories import access_token_repo
 
     tid = str(uuid.uuid4())
-    pat = create_access_token(user_id=user_id, email=email, token_id=tid, typ="pat")
+    claims: dict = {}
+    if scope is not None:
+        claims["scope"] = scope
+    if agent_id is not None:
+        claims["agent_id"] = agent_id
+    pat = create_access_token(
+        user_id=user_id,
+        email=email,
+        token_id=tid,
+        typ=typ,
+        extra_claims=claims or None,
+    )
     access_token_repo().create(
         id=tid,
         user_id=user_id,
         name="mcp-transport-test",
         token_hash=hashlib.sha256(pat.encode()).hexdigest(),
         prefix=tid.replace("-", "")[:8],
-        expires_at=datetime.now(UTC) + timedelta(days=90),
+        expires_at=expires_at if expires_at is not None else datetime.now(UTC) + timedelta(days=90),
+        agent_id=agent_id,
     )
     return pat, tid
 
@@ -225,6 +249,86 @@ class TestCredentialMatrixPerTransport:
         assert status == 401
         assert body["reason"] == "invalid_token"
         assert _verify_on_streamable("not-a-real-jwt") is None
+
+    def test_agent_pat_is_refused_on_the_streamable_transport(self, seeded_app):
+        """The ratchet that matters most: an agent PAT must never reach the
+        remote-connector surface.
+
+        Two assertions, deliberately. The OUTCOME (refused) holds today via
+        two independent layers, so asserting it alone would stay green even if
+        the ``typ`` gate were widened to admit ``agent_pat`` — the resolver's
+        surface allowlist would still catch it, and the ratchet would be
+        asleep. So the MECHANISM is pinned too: the active gate refuses on
+        ``typ`` before the resolver is ever consulted. Widening that gate
+        fails this test on the second assertion even while the first still
+        passes, which is precisely when a reviewer needs to be told.
+        """
+        agent_pat, _ = _mint_pat(typ="agent_pat", agent_id="agent-1")
+
+        from app.auth import pat_resolver
+
+        with patch.object(
+            pat_resolver,
+            "resolve_token_to_user",
+            wraps=pat_resolver.resolve_token_to_user,
+        ) as resolver:
+            assert _verify_on_streamable(agent_pat) is None, "an agent PAT must not authenticate the connector"
+            assert not resolver.called, (
+                "the typ gate must refuse an agent PAT before resolution — "
+                "if this fires, the gate was widened and only the resolver's "
+                "surface allowlist (a latent second line) is still refusing"
+            )
+
+        # SSE refuses it too, and names why (the allowlist, where it IS the
+        # active gate because that transport resolves every credential).
+        status, body = _sse_response(agent_pat)
+        assert status == 401
+        assert body["reason"] == "agent_pat_wrong_surface"
+
+    def test_expired_pat_is_refused_on_the_streamable_transport(self, seeded_app):
+        """Expiry lives on the token ROW, so a PAT whose JWT still verifies is
+        refused by the resolver the fallback delegates to."""
+        expired, _ = _mint_pat(expires_at=datetime.now(UTC) - timedelta(days=1))
+        assert _verify_on_streamable(expired) is None
+
+        status, body = _sse_response(expired)
+        assert status == 401
+        assert body["reason"] == "pat_expired"
+
+    def test_deactivated_users_pat_is_refused_on_the_streamable_transport(self, seeded_app):
+        """Deactivating an account must close the connector surface too."""
+        from src.repositories import users_repo
+
+        pat, _ = _mint_pat()
+        users_repo().update(id="analyst1", active=False)
+
+        assert _verify_on_streamable(pat) is None
+
+        status, body = _sse_response(pat)
+        assert status == 401
+        assert body["reason"] == "deactivated"
+
+    @pytest.mark.parametrize(
+        ("scope", "expected_reason"),
+        [
+            ("data-app:my-app", "pat_scope_forbidden"),  # runtime service token
+            ("data-app-git:my-app", "pat_scope_forbidden"),  # clone credential
+        ],
+    )
+    def test_data_app_scoped_pat_is_refused_on_the_streamable_transport(self, seeded_app, scope, expected_reason):
+        """A data-app credential is confined to the data-app surface.
+
+        It is ``typ="pat"``, so unlike the cases above it passes the gate and
+        is refused by the resolver's own scope enforcement — the fallback
+        delegating there rather than reimplementing a check is exactly what
+        makes that hold.
+        """
+        scoped, _ = _mint_pat(scope=scope)
+        assert _verify_on_streamable(scoped) is None
+
+        status, body = _sse_response(scoped)
+        assert status == 401
+        assert body["reason"] == expected_reason
 
     def test_streamable_widening_is_scoped_to_pat_typed_credentials(self, seeded_app):
         """A browser session JWT is deliberately NOT a streamable credential.
