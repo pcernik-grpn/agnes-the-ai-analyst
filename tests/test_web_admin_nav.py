@@ -845,15 +845,24 @@ class TestRailCollapsePreference:
         assert 'id="nav-chats"' in lib_text
         assert "js/components/chat_row_menu.js" in lib_text
 
-    def test_the_onboarding_row_is_not_on_admin_pages(self, seeded_app, monkeypatch) -> None:
+    def test_the_analyst_onboarding_row_is_not_on_admin_pages(self, seeded_app, monkeypatch) -> None:
         """It measures the ANALYST's journey, and it is the only element in the
         rail with a coloured progress arc — so on an admin page it pulled the eye
         hardest of anything on screen while measuring something that has nothing to
         do with the work. Its anatomy is unchanged where it does render (a `.rail-i`
         whose icon is a progress ring, fixed size in both collapse states, so the
-        row's height never differs); this is a scoping change, not a redesign."""
+        row's height never differs); this is a scoping change, not a redesign.
+
+        The exclusion is of that JOURNEY, not of the slot: the admin's own
+        setup chain now uses it, and the reason above is exactly why that is
+        the right way round — on an admin page the chain measures the work in
+        front of you. It is stood down here so this test keeps checking the
+        scoping rule it was written for."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(seeded_app)
+        import app.web.router as _router
+
+        monkeypatch.setitem(_router.templates.env.globals, "admin_setup_rail", lambda: None)
         c = seeded_app["client"]
         text = c.get("/admin/users", headers=self._auth(seeded_app["admin_token"])).text
         assert "rail-getstarted" not in text

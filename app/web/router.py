@@ -1739,8 +1739,8 @@ def _data_package_entry_dict(
     (subscribe = keep a local copy), not stack membership.
     """
     description = entry.description or (
-        f"Bundle of {table_count} table{'s' if table_count != 1 else ''}. "
-        f"Download locally so `agnes pull` syncs the data to your workspace."
+        f"{table_count} table{'s' if table_count != 1 else ''}. "
+        f"Keep a local copy so `agnes pull` syncs the data to your workspace."
     )
     out = {
         "id": entry.id,

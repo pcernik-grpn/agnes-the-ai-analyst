@@ -77,6 +77,15 @@ TIER_OPTIONAL = "Optional"
 TIER_AUTOMATIC_HELP = "A local copy is always kept, and only an admin changes that."
 TIER_OPTIONAL_HELP = "Reachable now; keep a local copy if you want one."
 
+#: The ADMIN's version of the same two sentences, leading with the API's own
+#: word. An admin writes this tier through `agnes admin grant` and reads it
+#: back in a payload as `requirement: "required"`, so the surface that sets it
+#: is the one place the wire word has to stay visible — otherwise the UI and
+#: the CLI become two vocabularies with no bridge between them. A member never
+#: sees it: for them the word names nothing they can act on.
+TIER_AUTOMATIC_ADMIN_HELP = f"required — {TIER_AUTOMATIC_HELP[0].lower()}{TIER_AUTOMATIC_HELP[1:]}"
+TIER_OPTIONAL_ADMIN_HELP = f"available — {TIER_OPTIONAL_HELP[0].lower()}{TIER_OPTIONAL_HELP[1:]}"
+
 #: The API enum is NOT renamed, for the same reason `agnes stack` is not: a
 #: wire value is an interface with its own compatibility promise. Only the
 #: words a person reads move.
@@ -107,6 +116,8 @@ WORDS = {
     "tier_optional": TIER_OPTIONAL,
     "tier_automatic_help": TIER_AUTOMATIC_HELP,
     "tier_optional_help": TIER_OPTIONAL_HELP,
+    "tier_automatic_admin_help": TIER_AUTOMATIC_ADMIN_HELP,
+    "tier_optional_admin_help": TIER_OPTIONAL_ADMIN_HELP,
     "drop_local": DROP_LOCAL,
     "resource_lens": RESOURCE_LENS,
 }
