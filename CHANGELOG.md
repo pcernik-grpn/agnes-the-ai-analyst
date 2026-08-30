@@ -1069,6 +1069,57 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   also change what the card's own row says — a stored token, a cleared project
   binding, chat tools, a queued SharePoint extraction, a connection created or
   deleted — redraw the card list from that same fresh read.
+- **A Keboola table that is empty upstream no longer reports as a failed
+  sync — and a lost sliced export no longer reports as a clean one.** A
+  sliced export of a table with no rows comes back as a manifest with zero
+  entries. The Storage API client's two sliced download paths treated that
+  as an unconditional error, so a table that is simply empty (a form-fields
+  table with no attachments, say) stayed permanently red and looked exactly
+  like a broken extraction; the legacy client's own third consumer had the
+  opposite failure, reporting any entries-less manifest as a clean 0-row
+  export. All three now share one decision. Empty and successful: the export
+  carries the table's declared columns (a header-only CSV / a zero-row
+  parquet, honouring a `columns` projection when one was requested), so the
+  sync succeeds with 0 rows and the downstream view still resolves its
+  columns — either because upstream's `rowsCount` is 0, or because the
+  export carried a row filter (`whereFilters` / `changedSince` /
+  `changedUntil` / `limit`), which may legitimately match nothing on a table
+  that has rows. Otherwise an error: `rowsCount > 0` on an unfiltered export
+  now says plainly that upstream claims N rows while the export returned no
+  slices. **Contract change on the legacy client:** when `rowsCount` cannot
+  be read at all — no table id to ask about, the detail call failed, the
+  field is absent — that path now fails where it used to report 0 rows
+  successfully. Unknown must never present itself as empty.
+- **Semantic layer browse: the constraint Severity tooltip is now a fast
+  `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
+  ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
+  severity badge carried a 257-character explanation in `title=` — a
+  600ms+ OS-controlled show delay, no styling, and prone to clipping in a
+  scrollable ancestor. Both now use the shared `[data-tip]` mechanism, paired
+  with `aria-label` carrying the same text (never `title` alongside it, and
+  never `role="note"` on a `<th>` — that would override its implicit
+  `columnheader` role), with a single-sentence summary that also corrects the
+  original wording: an error-severity violation is a *missing filter in the
+  query*, not a *missing rule* on the constraint, and — soft-enforce — it
+  only flips `validate-query`'s verdict, it never blocks anything. The fuller
+  nuance (only `required_filter` is statically checkable today, so any other
+  type is advisory regardless of severity) moved to a short note under the
+  table/panel instead.
+- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
+  admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+  knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+  their table in `<div class="data-table-wrap">`, but no CSS rule ever
+  backed the class — so a wide table dragged the whole page into horizontal
+  scroll in a narrow window instead of just itself. Fixing the overflow
+  naively would have broken sticky table headers on all ten pages —
+  `overflow-x: auto` makes the wrap a nearer scrolling ancestor than the
+  viewport, and with no height cap the header would silently stop sticking
+  at all instead of visibly failing — so sticky is now consciously disabled
+  for any thead inside `.data-table-wrap` rather than left in that
+  ambiguous, silently-broken state. Also replaced seven admin pages' inline
+  `style="text-align:right"` on a header (semantic sources, marketplaces,
+  mcp_sources, mcp_source_detail, knowledge_digests, initial_workspace,
+  access) with the existing `.num` class.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
@@ -1096,6 +1147,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   denies too — but on an SDK with no `PreToolUse` hook support at all nothing
   can be registered and tool calls run ungated (logged loudly). The `kai-agent`
   provider is unaffected; its engine raises its own approvals.
+- **Semantic-layer detail page: the detach toolbar's "Export detached
+  version" link 404'd, and its two buttons rendered as unstyled text
+  (#1707).** The link pointed at the HTML detail route
+  (`/semantic-layer/{slug}.yaml`), which the `{slug}` path parameter catches
+  literally and 404s on; it now points at the route that actually serves the
+  document, `GET /api/semantic-models/{slug}.yaml`. The Re-attach/Detach
+  buttons used a `.btn--sm` class that has no rule in any app stylesheet,
+  so they had no borders or button chrome; they now use the same
+  `btn-secondary`/`btn-primary` + `btn-sm` classes as the rest of the page.
+  Added page-level test coverage for the detach toolbar (PG-only, since
+  `sync_mode='detached'` is a Postgres-only column), which is what let both
+  issues ship unguarded.
 - **Testing a non-Keboola data connection no longer fails with a Keboola error.**
   `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
   /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and
