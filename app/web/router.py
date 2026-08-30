@@ -4197,7 +4197,6 @@ def _glossary_terms_count() -> int:
 async def semantic_layer_list(
     request: Request,
     tab: str = Query("models"),
-    q: str = Query(""),
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -4372,7 +4371,6 @@ async def semantic_layer_list(
         models=models,
         active_tab=active_tab,
         tabs=tabs,
-        q=q,
         metric_categories=metric_categories,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
