@@ -379,6 +379,16 @@ class TestBackwardCompatibility:
                 assert flag.options, f"{flag.name}: a select switch must declare options"
                 assert flag.default in flag.options, f"{flag.name}: select default {flag.default!r} not in options"
                 continue
+            if flag.kind == "int":
+                # First `int` occupant: `acl_max_stale_hours`. The generic
+                # `_feature_flags_inventory` loop (kind != "bool") already
+                # renders it via `value_label`/`str(switch_value(...))` —
+                # no bespoke render path needed, unlike `select`. Guard
+                # against `bool` sneaking in here: `bool` is an `int`
+                # subclass in Python, so `type(...) is int` (not
+                # `isinstance`) is the correct check.
+                assert type(flag.default) is int, f"{flag.name}: int switch default {flag.default!r} is not an int"
+                continue
             assert isinstance(flag.default, bool), (
                 f"{flag.name}: the boolean panel path renders this default as a switch; a "
                 "non-bool default needs its own render path first (the `experience` select "
