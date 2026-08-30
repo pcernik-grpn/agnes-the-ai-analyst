@@ -409,24 +409,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **One word per thing, across the surfaces where two had drifted (TCRD-208).** `/profile` stops calling admin elevation "god-mode" (now *full admin access*) and stops calling its confirmation a "consent gate" — "consent" already means OAuth provider consent everywhere else in Agnes, so one word was carrying two mechanisms a user meets in the same session. The connection pill on `/me/connections` states a state and nothing else (*Expired*, beside *Connected* and *Not connected*) — the remedy still lives in the detail line, where someone is actually reading. `/admin/semantic-layer` names its drift columns *in Agnes / in source* rather than *stored / upstream*, and no longer points readers at a *Master token (semantic layer)* row that was renamed to *Semantic-layer token*. `/admin/linked-apps` writes `ID` beside `URL` rather than `Id`. The login page's apostrophes are typographic, like the rest of the repo. `tests/test_product_vocabulary.py` pins each decision, because the design-system contract tests police colour and spacing but nothing policed language — which is why sixteen design reviews each re-found a naming collision independently.
 
-- **The release-cut moves out of feature PRs and into one daily cut PR.**
-  The old rule — whichever PR happened to land last with content under
-  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
-  section — raced two PRs against the same version number and produced a
-  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
-  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
-  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
-  the new `.github/workflows/daily-cut.yml` (minor bump by default,
-  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
-  labeled `release-cut` that a human reviews and merges — the workflow
-  never merges or tags anything itself. The cut arithmetic is pure
-  functions in `scripts/release_cut.py` (unit-tested in
-  `tests/test_release_cut.py`, including a guard against the known
-  3-way-merge duplicate-heading failure class), reused for the emergency
-  manual path when Actions dispatch isn't available. See
-  `docs/RELEASING.md` for the full ritual and the train-driver operating
-  rule.
-
 - **SharePoint source card: humanized rejection rows, a source-type-aware Actions menu, and one-click scope management** (TCRD-240/241 live-use follow-up). The "Last run" drawer no longer shows a bare rejection row like `6a8e0bc93c07c56a — verbatim_gate_failed` — the doc_id resolves (server-side, via `corpus_file_sources`) to the corpus file's name and collection, the raw sha16 is demoted to a tooltip, duplicate `(doc_id, reason)` rows collapse into one with a "N×" count badge, and known reason slugs (`verbatim_gate_failed`, `unresolved_doc_id`, `ambiguous_cross_collection_doc_id`) get a plain-language subline; an unknown slug still shows verbatim, never hidden. The "Identity matching" row is rephrased as a sharing-state sentence ("all scope collections have a group" / "N collections have no group — only admins see them"). The Actions menu is now source-type-aware: a SharePoint connection gets its own verb set (Manage scopes…, Test connection, Update certificate…, Delete source) instead of the meaningless-for-SharePoint Keboola items (Add tables, Rotate storage token, Semantic-layer token, chat tools, Make default project); its own "Test connection" checks the certificate + a live Graph tree call instead of Keboola's token-verify endpoint. A new "Manage scopes" button sits directly on the collapsed card next to Actions, and the expanded card lists each confirmed scope as a clickable row — both open the connect wizard bound to that connection (never a duplicate), landing on the scope step or, for a specific scope row, the share step with that row highlighted (a stored scope carries no site/drive id to drive the tree browser to). The wizard's own "Continue an existing connection" picker pre-selects the sole option when only one connection exists.
 
 - **Every admin sidebar row in the Content, Instance and Activity sections carries a one-line gloss.** "Store lint" told a first-time admin nothing; "Advisory quality findings on skills" tells them enough to open it or skip it. The copy is each page's own lede, cut to one line — it existed already, one click too late. Only the vertical disclosure rows get one: the tab strips (People · Data · Access) tried captions and dropped them, on the reasoning that a label needing a gloss should be relabelled and four captions doubled a horizontal strip's height — that call still holds there, because "Sources" and "Tables" carry their own meaning while "Store lint" cannot be renamed into self-explanation. Height stays bounded because the column expands one section at a time; glosses are clamped to two lines and the copy is written to fit.
@@ -4000,6 +3982,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the original bug (which only overwrote it with corrupt bytes). Healthy
   sibling parts of the same table, and the same table on a later rebuild once
   the source part is repaired, are unaffected. (#1364)
+
+### Internal
+
+- **The release-cut moves out of feature PRs and into one daily cut PR.**
+  The old rule — whichever PR happened to land last with content under
+  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
+  section — raced two PRs against the same version number and produced a
+  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
+  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
+  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
+  the new `.github/workflows/daily-cut.yml` (minor bump by default,
+  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
+  labeled `release-cut` that a human reviews and merges — the workflow
+  never merges or tags anything itself. The cut arithmetic is pure
+  functions in `scripts/release_cut.py` (unit-tested in
+  `tests/test_release_cut.py`, including a guard against the known
+  3-way-merge duplicate-heading failure class), reused for the emergency
+  manual path when Actions dispatch isn't available. See
+  `docs/RELEASING.md` for the full ritual and the train-driver operating
+  rule.
 
 ## [0.88.0] - 2026-08-25
 
