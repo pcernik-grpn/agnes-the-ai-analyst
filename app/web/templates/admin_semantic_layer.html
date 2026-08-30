@@ -149,6 +149,17 @@
         Last run {{ rs.last_completed_at }} — OK.
       {% elif rs.last_status == 'error' %}
         Last run ({{ rs.last_completed_at }}) failed: {{ rs.last_result }}
+      {% elif rs.fallback_last_sync_at %}
+        {# No sweep in this process — a redeploy empties that state — so this
+           reports what the source rows durably carry. Different claim,
+           different sentence: the last sync of any source, not a sweep, and
+           not an assertion that it succeeded. "N of M" because N alone reads
+           as the total. #}
+        Last source sync {{ rs.fallback_last_sync_at }} across {{ rs.fallback_synced_count }} of {{ rs.fallback_source_count }} source{{ '' if rs.fallback_source_count == 1 else 's' }} — no sweep since this instance restarted.
+      {% elif rs.fallback_unavailable %}
+        {# The sources could not be read. Not "never synced" — that would be
+           the same bug again: a claim about history from a failure to read. #}
+        Sync status unavailable.
       {% else %}
         Never synced yet.
       {% endif %}

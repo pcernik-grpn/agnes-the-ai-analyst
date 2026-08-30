@@ -408,6 +408,86 @@ class TestSweepSummary:
         assert summary["last_completed_at"]
         assert summary["last_result"]["synced"] == 1
 
+    def test_the_in_memory_accessor_never_answers_for_the_sources(self, seeded_app):
+        """A10: the two accessors have to stay distinct. This one is
+        in-memory by design ("no sweep in THIS process"); the composed one
+        below is what may speak about history. A source synced before the
+        (simulated) restart must not make this one claim a sweep ran."""
+        from app.api.semantic_sources_refresh import get_last_refresh_summary
+        from src.repositories import semantic_source_repo
+
+        c = seeded_app["client"]
+        source_id = _create_source(
+            c, seeded_app["admin_token"], kind="upload", name="Bundle A", config={"documents": [DOC]}
+        )
+        semantic_source_repo().record_sync(source_id, status="ok", error=None)
+
+        assert get_last_refresh_summary()["last_status"] is None
+
+    def test_the_composed_summary_falls_back_to_the_sources_last_sync(self, seeded_app):
+        """And the composed one does exactly what the strip needs: with no
+        sweep in this process it reports the sources' own last sync, counted,
+        so the caller can label it as the different claim it is."""
+        from app.api.semantic_sources_refresh import get_sync_status_summary
+        from src.repositories import semantic_source_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first = _create_source(c, token, kind="upload", name="Bundle A", config={"documents": [DOC]})
+        _create_source(c, token, kind="upload", name="Bundle B", config={"documents": [DOC]})
+        semantic_source_repo().record_sync(first, status="error", error="boom")
+
+        summary = get_sync_status_summary()
+        assert summary["last_status"] is None
+        # A failed sync is still a sync — the fallback is "last sync of any
+        # kind", which is precisely why the strip must not label it "OK".
+        assert summary["fallback_last_sync_at"]
+        # One of two: the count the time speaks for, and the registered total.
+        assert summary["fallback_synced_count"] == 1
+        assert summary["fallback_source_count"] == 2
+        assert summary["fallback_unavailable"] is False
+
+        # Once a sweep runs in this process, the richer view takes over and
+        # the fallback stops being computed at all.
+        c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+        after = get_sync_status_summary()
+        assert after["last_status"] == "ok"
+        assert after["fallback_last_sync_at"] is None
+        assert after["fallback_synced_count"] == 0
+
+    def test_a_skipped_source_is_not_counted_as_synced(self, seeded_app):
+        """`record_sync(status='skipped')` stamps `last_sync_at` on a source
+        the sweep never imported from (the duplicate-upstream skip). Counting
+        it would let a never-read source define the "last source sync"."""
+        from app.api.semantic_sources_refresh import get_sync_status_summary
+        from src.repositories import semantic_source_repo
+
+        c = seeded_app["client"]
+        source_id = _create_source(
+            c, seeded_app["admin_token"], kind="upload", name="Bundle A", config={"documents": [DOC]}
+        )
+        semantic_source_repo().record_sync(source_id, status="skipped", error="two sources, one upstream")
+
+        summary = get_sync_status_summary()
+        assert summary["fallback_last_sync_at"] is None
+        assert summary["fallback_synced_count"] == 0
+        # The row still exists — it is just not something to speak for.
+        assert summary["fallback_source_count"] == 1
+
+    def test_a_failed_read_is_reported_as_unavailable_not_as_never(self, seeded_app, monkeypatch):
+        """The distinction the strip needs: "I could not look" is not "nothing
+        ever happened"."""
+        import app.api.semantic_sources_refresh as sweep_module
+
+        def _boom():
+            raise RuntimeError("app-state unreachable")
+
+        monkeypatch.setattr(sweep_module, "semantic_source_repo", _boom)
+
+        summary = sweep_module.get_sync_status_summary()
+        assert summary["fallback_unavailable"] is True
+        assert summary["fallback_last_sync_at"] is None
+
 
 #: A workspace that resolves — what ``resolve_databricks_settings()`` returns
 #: on a CONFIGURED instance. Enough shape for the sweep's pre-flight check;
