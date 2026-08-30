@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +56,26 @@ MAX_MESSAGE_CHARS = 4000
 
 
 class BuilderMessage(BaseModel):
-    """One turn of the transcript, as the page replays it."""
+    """One turn of the transcript, as the page replays it.
+
+    ``text`` is TRUNCATED rather than rejected. It used to carry
+    ``max_length``, which is right for a field the author types and wrong for
+    one the page replays: a single reply over the cap made every later turn in
+    that conversation 422 — a conversation with no way out, and the page had
+    no idea why. The author's own message is still capped where it is typed
+    (``MAX_MESSAGE_CHARS`` on each builder's request model); this cap only
+    bounds what the transcript costs to resend.
+    """
 
     role: str = Field(max_length=16)
-    text: str = Field(default="", max_length=MAX_MESSAGE_CHARS)
+    text: str = Field(default="")
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _clip(cls, v: Any) -> Any:
+        if isinstance(v, str) and len(v) > MAX_MESSAGE_CHARS:
+            return v[:MAX_MESSAGE_CHARS]
+        return v
 
 
 # ---------------------------------------------------------------------------

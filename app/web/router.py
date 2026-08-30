@@ -3854,14 +3854,27 @@ async def skills_page(
     "submit" CTA, the ``?from=skills`` detail back-link and the tour anchors.
     ``?type=skill|plugin|agent`` deep-links past the picker."""
     from src.store_categories import STORE_CATEGORIES
+    from src.store_naming import sanitize_username
 
     from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
 
+    # The name an author types is not the name their item answers to — the
+    # store appends `-by-<owner>`. /store/new has always shown that; the
+    # builder replaced that page without carrying it over, so the preview
+    # promised a handle the save then changed.
+    try:
+        owner_username = sanitize_username(user.get("email") or "")
+    except ValueError:
+        owner_username = ""
     _guardrails_enabled = get_guardrails_enabled()
     ctx = _build_context(
         request,
         user=user,
         store_categories=list(STORE_CATEGORIES),
+        owner_username=owner_username,
+        # The floors Check and Save actually enforce, so the form can state
+        # them instead of letting the author discover them in a refusal.
+        guardrail=_guardrail_thresholds(),
         guardrails_enabled=_guardrails_enabled,
         guardrails_llm_ready=_guardrails_enabled and get_guardrails_llm_provider_ready(),
     )

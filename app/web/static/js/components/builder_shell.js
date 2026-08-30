@@ -161,12 +161,19 @@
       }).join('') + '</div>';
     }
     var off = o.busy ? ' disabled' : '';
+    /* `readOnly` is the "you cannot send, but this is still your text" state:
+       a DISABLED textarea is not selectable in Chrome, so a message restored
+       into one after a failure is visible and impossible to copy back out.
+       Send is disabled either way. */
+    var ro = o.readOnly && !o.busy;
     return (
       '<div class="ag-comp"><div class="ag-comp-in">' + chips +
         '<div class="ag-comp-box">' +
           '<textarea rows="1" data-ag-comp="' + esc(o.kind) + '" ' +
-            'placeholder="' + esc(o.placeholder) + '"' + off + '>' + esc(o.value || '') + '</textarea>' +
-          '<button type="button" class="ag-send" data-ag-send="' + esc(o.kind) + '"' + off + '>' +
+            'placeholder="' + esc(o.placeholder) + '"' + off + (ro ? ' readonly' : '') + '>' +
+            esc(o.value || '') + '</textarea>' +
+          '<button type="button" class="ag-send" data-ag-send="' + esc(o.kind) + '"' +
+            (off || (ro ? ' disabled' : '')) + '>' +
             'Send <span aria-hidden="true">→</span></button>' +
         '</div>' +
       '</div></div>'
@@ -195,13 +202,17 @@
      "+ Add" menu already answered was the least useful card in the most
      valuable slot. Optional, so the agent builder is unaffected. */
   function head(o) {
+    /* `titleHtml` REPLACES the heading block, rather than filling the <h2> —
+       /skills hangs a menu off its title, and the <h2> clips its own overflow
+       to ellipsise a long name, which swallowed the popup. A host that wants
+       a control there owns the whole block; pages that pass only `title` get
+       the plain heading. */
+    var titleBlock = o.titleHtml || '<h2 id="' + esc(o.titleId) + '">' + esc(o.title) + '</h2>';
     return (
       '<div class="ag-build-head">' +
         '<button type="button" class="ag-back" data-ag-back>← ' + esc(o.backLabel) + '</button>' +
         (o.badge ? '<div class="ag-build-badge">' + o.badge + '</div>' : '') +
-        '<div style="min-width:0;flex:1">' +
-          '<h2 id="' + esc(o.titleId) + '">' + esc(o.title) + '</h2>' +
-        '</div>' +
+        '<div style="min-width:0;flex:1">' + titleBlock + '</div>' +
         '<div class="ag-build-actions" id="' + esc(o.actionsId) + '">' + (o.actions || '') + '</div>' +
       '</div>'
     );
@@ -215,8 +226,17 @@
       '<div class="ag-work">' +
         '<div class="ag-pane">' + (o.left || '') + '</div>' +
         '<div class="ag-pane ag-pane--cfg">' +
-          '<div class="ag-cfg-head"><h3>' + esc(o.cfgTitle) + '</h3>' +
-            '<p>' + esc(o.cfgSub) + '</p></div>' +
+          /* `cfgAside` is a second line under the title — for the one thing a
+             builder has to say ABOUT the configuration rather than in it:
+             how much of it is still open. It rode inside the body as a boxed
+             card, which made the first thing in the column a status widget
+             instead of the first field. Optional and pre-built; a pane that
+             passes none renders exactly as before. */
+          '<div class="ag-cfg-head">' +
+            '<div class="ag-cfg-head-main"><h3>' + esc(o.cfgTitle) + '</h3>' +
+              '<p>' + esc(o.cfgSub) + '</p></div>' +
+            (o.cfgAside || '') +
+          '</div>' +
           '<div class="ag-cfg-body" id="' + esc(o.cfgBodyId) + '">' + (o.cfg || '') + '</div>' +
         '</div>' +
       '</div>'

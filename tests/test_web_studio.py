@@ -198,15 +198,16 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     assert "var TYPE_ORDER = ['skill', 'plugin', 'agent'];" in body
     for kind in ("skill", "plugin", "agent"):
         assert f"key: '{kind}'," in body
-    # Type is NOT a step. It used to be section 1 — a card with a tick where
-    # every other section has a number, spending the top of the panel
-    # re-asking what "+ Add → Build a skill" already answered. It is identity,
-    # so it rides in the header beside the title, with Change one click away;
-    # the sections are the configuration, numbered 1..3 with no gap.
-    assert "typeBadgeHtml" in body, "the type is no longer shown beside the title"
-    assert "sk-typechip" in body
-    assert "data-sk-change" in body
-    assert ">Change<" in body
+    # Type is NOT a step, and no longer a header badge either. It was section
+    # 1 (a card with a tick where every other section has a number), then a
+    # pill beside the title with "Change" next to it. Both restated the answer
+    # the Library entry already carried, and the Change was inert: it set
+    # `typeOpen`, which only the picker read — and the picker only renders
+    # when NO type is set. The type is chosen once, in the picker; the header
+    # carries the title, and the sections are the configuration, 1..3.
+    assert "typeBadgeHtml" not in body, "the type badge is back in the builder header"
+    assert "data-sk-change" not in body, "a Change hook is back with nothing to open"
+    assert "typeOpen" not in body, "the dead re-open flag is back"
     for n in ("1", "2", "3"):
         assert f"no: {n}," in body, f"step {n} is not numbered in the shell sections"
     assert "no: 4," not in body, "the sections should end at 3 now that Type is not one"
@@ -370,10 +371,16 @@ def test_skills_page_arms_new_skill_spotlight(seeded_app):
     assert "spotlight" in body and "new-skill" in body
     assert "js/tour.js" in body  # lazy dynamic import of the engine
     assert "launchTour('skill-builder')" in body
-    # The guard must accept the type step in EITHER state. It briefly required
-    # the name field, which is only in the DOM once a type is chosen — on a
-    # cold arrival (step 1 expanded) the coach-mark had no anchor at all.
-    assert "'[data-sk-type],[data-sk-change]'" in body
+    # The anchor covers BOTH arrivals: the type cards on a cold visit, the
+    # Identity section once a type is chosen — a `?type=` deep link, or a
+    # resumed draft, neither of which renders the picker. Anchoring on the
+    # cards alone silently skipped the tour for everyone with a draft.
+    assert '\'[data-sk-type], [data-sec="identity"]\'' in body
+    # And the one-shot param is stripped BEFORE any early return, or an
+    # arrival with no anchor re-arms it on every later visit.
+    strip = body.index("params.delete('spotlight')")
+    guard = body.index("document.querySelector('[data-sk-type], [data-sec=\"identity\"]')")
+    assert strip < guard, "the spotlight param outlives an arrival that cannot show the tour"
     # One-shot: the param is stripped so a reload doesn't re-pop the coach-mark.
     assert "history.replaceState" in body
     assert "maybeSpotlightNew()" in body
@@ -391,15 +398,19 @@ def test_skill_builder_tour_anchors_on_the_type_step():
     Anchor history is the point of this guard: it was the "+ New skill" card,
     then the name field, and the name field broke when type became step 1
     (that field is not in the DOM until a type is picked, so the coach-mark
-    pointed at nothing). The type step is present in both its states, so the
-    selector must cover the expanded cards AND the collapsed Change button.
+    pointed at nothing). The cards are the only state now — the collapsed
+    collapsed "Change" form was retired with the header's type badge, whose
+    click set a flag nothing read — and anchoring on the picker alone then
+    skipped the tour for every arrival that already had a type. Both states
+    are covered.
     Single-step tours render in the popover's solo form (no dots / no "explore
     on my own"), so guard the branch that produces it too."""
     from pathlib import Path
 
     js = Path("app/web/static/js/tour.js").read_text()
     assert "'skill-builder':" in js
-    assert "'[data-sk-type], [data-sk-change]'" in js
+    assert '\'[data-sk-type], [data-sec="identity"]\'' in js
+    assert "[data-sk-change]" not in js  # retired anchor — the button it named is gone
     assert "[data-sk-new]" not in js  # retired anchor
     assert '[data-sk-field="name"]' not in js  # retired anchor — breaks on cold arrival
     assert "page: '/skills'" in js

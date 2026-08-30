@@ -98,7 +98,6 @@
   .sk-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin: 2px 0 0; padding-bottom: 24px; }
   .sk-head h1 { font-size: 24px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
   .sk-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 0; max-width: 64ch; }
-  .sk-wip { font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ds-warn-ink); background: var(--ds-warn-bg); border: 1px solid var(--ds-warn-line); border-radius: var(--ds-radius-pill); padding: 2px 9px; }
 
   .sk-types { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 14px 0 0; }
   .sk-type { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; padding: 18px; text-align: left; font: inherit; color: inherit; cursor: pointer; display: flex; flex-direction: column; gap: 10px; transition: border-color var(--ds-motion-fast) var(--ds-ease-standard), box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
@@ -137,6 +136,38 @@
 
   /* Discard — the only destructive control here, so it is deliberately the
      lowest-emphasis thing in the action row until you hover it. */
+  /* Why the primary action is dark. Sits in the action row, so the answer is
+     where the question is. */
+  /* The title is a control: it names what you are building and opens the
+     switch. Reads as a heading until you point at it. */
+  .sk-titlewrap { position: relative; display: inline-flex; max-width: 100%; }
+  /* Mirrors .ag-build-head h2, minus the overflow clip — the ellipsis moved
+     to the button so the menu can escape the heading. */
+  .sk-titleh2 { font-size: 19px; margin: 0; min-width: 0; }
+  .sk-titlebtn { display: inline-flex; align-items: center; gap: 6px; border: none; background: none; padding: 2px 6px 2px 0;
+                 font: inherit; font-size: inherit; font-weight: inherit; color: inherit; cursor: pointer; border-radius: 8px;
+                 max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sk-titlebtn:hover { color: var(--ds-primary); }
+  .sk-titlechev { color: var(--ds-text-muted); display: inline-flex; flex-shrink: 0; }
+  .sk-titlebtn:hover .sk-titlechev { color: var(--ds-primary); }
+  .sk-typemenu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; width: 340px; max-width: 80vw;
+                 background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 12px;
+                 box-shadow: var(--ds-shadow-lg); padding: 6px; text-align: left; }
+  .sk-typemenu-head { margin: 6px 10px 4px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+                      text-transform: uppercase; color: var(--ds-text-muted); }
+  .sk-typemenu-foot { margin: 4px 10px 6px; font-size: 11.5px; color: var(--ds-text-muted); }
+  .sk-typemenu-item { display: flex; gap: 10px; width: 100%; text-align: left; border: none; background: none;
+                      padding: 8px 10px; border-radius: 9px; cursor: pointer; font: inherit; color: var(--ds-text-primary); }
+  .sk-typemenu-item:hover { background: var(--ds-surface-sunken); }
+  .sk-typemenu-item.is-current { background: var(--ds-surface-sunken); }
+  .sk-typemenu-ico { flex-shrink: 0; color: var(--ds-text-secondary); }
+  .sk-typemenu-ico svg { width: 18px; height: 18px; display: block; }
+  .sk-typemenu-name { display: block; font-size: 13.5px; font-weight: 600; }
+  .sk-typemenu-what { display: block; font-size: 11.5px; line-height: 1.45; color: var(--ds-text-muted);
+                      overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .sk-req { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ds-text-secondary); }
+  .sk-opt { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ds-text-muted); }
+  .sk-gate { font-size: 12px; color: var(--ds-text-muted); align-self: center; }
   .sk-draft-discard { border: none; background: none; color: var(--ds-text-muted); cursor: pointer; font: inherit; font-size: 13px; font-weight: 600; padding: 5px 10px; border-radius: 8px; }
   .sk-draft-discard:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
 
@@ -419,7 +450,7 @@
   <a class="sk-back" href="/library">← Library</a>
   <div class="sk-head">
     <div>
-      <h1>Builder <span class="sk-wip">WIP</span></h1>
+      <h1>Builder</h1>
       <p class="lede">Author a skill, a plugin, or an agent template. Keep it as a draft while you work, then save it to your Library — privately, or published for everyone here.</p>
     </div>
   </div>
@@ -458,6 +489,10 @@
 
   var CATEGORIES = JSON.parse(document.getElementById('sk-categories').textContent || '[]');
   var USER_ID = "{{ session.user.id }}";
+  // What the store appends to every name, and the floors it enforces.
+  var OWNER_SUFFIX = "{{ owner_username or '' }}";
+  var MIN_DESC_CHARS = {{ guardrail.min_description_chars if guardrail else 60 }};
+  var MIN_BODY_CHARS = {{ guardrail.min_body_chars if guardrail else 200 }};
   // True when an LLM guardrail is active on this instance — doSave() runs a
   // blocking pre-check and gates the real publish on the verdict.
   var GUARDRAILS_ENABLED = {{ 'true' if guardrails_enabled else 'false' }};
@@ -580,9 +615,12 @@
     }
   };
   var TYPE_ORDER = ['skill', 'plugin', 'agent'];
+  var typeMenuOpen = false;   // the title's type switch
+  var CHEVRON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" width="16" height="16"><path d="M5 8.5l7 7 7-7" ' +
+    'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
   var type = null;        // null → step 1 expanded, nothing below it yet
-  var typeOpen = false;   // step 1 re-opened via Change while a type is set
   var draft = null;       // the in-progress item in the builder
   /* Which configuration sections are folded away. Content is what an author
      is here to write, so it opens; Identity opens because it gates saving.
@@ -598,12 +636,47 @@
   var builderTab = 'create';
   var convs = { skill: [], plugin: [], agent: [] };
   var convBusy = false, convErr = null, convDraft = '', convChips = [];
+  /* The transcript is replayed to the server on EVERY turn, and the endpoint
+     caps each item. One reply over the cap therefore made every later turn
+     422 forever — a conversation that could not be left. The cap is enforced
+     here, where the text is stored, not only where it is typed. */
+  var convPatchNote = null;   // what the last reply wrote, and what it left alone
+  var convTrimmed = false;    // the transcript has passed what the model can see
+  var MAX_MSG_CHARS = 4000;
+  /* Mirrors MAX_HISTORY in app/api/builder_core.py. The server prompt keeps
+     only the last N turns; the page kept and sent all of them, so the two
+     transcripts diverged silently. */
+  var MAX_HISTORY = 40;
+  /* Has the author said anything in THIS type's transcript? The opening turn
+     is the builder talking to itself, so it does not count. */
+  function authorHasSpoken() {
+    return conv().some(function (m) { return m.role === 'user'; });
+  }
+  /* Starters are for a blank page. Two ways it stops being one: the author
+     speaks, or they arrive back on work already in the panel — the transcript
+     is memory-only, so a reload makes a resumed draft look like a first
+     visit to anything that asks the conversation instead of the form. */
+  function startersApply() { return !authorHasSpoken() && isBlank(); }
+  /* Greeting someone back to a half-written draft with "tell me what this
+     should do" reads as amnesia — the answer is on the screen beside it. */
+  function resumedMessage(c) {
+    return 'Picking up your ' + c.label.toLowerCase() + ' draft — it is on the right. ' +
+      'Tell me what to change, or keep editing it by hand.';
+  }
+  /* Latched when a turn comes back saying this instance has no model. The
+     builder used to open by failing and then keep inviting: a greeting, a red
+     error under it, and three cheerful chips that all failed the same way. */
+  var llmUnavailable = false;
+  function clipMsg(t) { t = t || ''; return t.length > MAX_MSG_CHARS ? t.slice(0, MAX_MSG_CHARS) : t; }
+  /* A turn with no deadline leaves "Thinking…" and a disabled composer with
+     no way out but a reload — which used to lose the transcript with it. */
+  var TURN_TIMEOUT_MS = 60000;
   /* What the last turn reported. `engine` is which one answered — a scripted
      stand-in runs whenever AGNES_BUILDER_STUB (or TESTING) is set, and a
      degraded mode that looks identical to the real one is a lie the page
      would otherwise tell. `slots` is the interview's state, computed
      server-side so the two cannot disagree about what is still missing. */
-  var convEngine = null, convSlots = { skill: null, plugin: null, agent: null };
+  var convEngine = null;
   var openedFor = {};   // types whose opening turn has already been fired
   function conv() { return convs[type] || []; }
 
@@ -698,20 +771,31 @@
            !(draft.body || '').trim() && !draft.category && !bundle &&
            !componentIds().length;
   }
+  /* Returns what actually happened, because the button above it used to
+     toast "Draft saved in this browser." unconditionally — including while a
+     review had it locked, and on an emptied form where this DELETES the
+     stored draft. */
   function persist() {
-    if (!type || !draft) return;
+    if (!type || !draft) return 'skipped';
     // After a successful save the review banner is shown and the entity exists
     // in the DB. Any further edit in the still-visible form must not re-create
     // a localStorage draft, or the next visit will offer to "resume" a skill
     // that is already published (and a re-save would fail on a name conflict).
-    if (reviewInProgress) return;
+    if (reviewInProgress) return 'skipped';
     // Emptying the last field is a way of throwing work away too — leaving the
     // old slot behind would resurrect the removed content on the next visit,
     // which is exactly what someone who just hit Remove did not ask for.
-    if (isBlank()) { if (drafts[type]) discardDraft(type); return; }
+    if (isBlank()) { if (drafts[type]) discardDraft(type); return 'cleared'; }
     drafts[type] = JSON.parse(JSON.stringify(draft));
     drafts[type].saved_at = new Date().toISOString();
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify(drafts)); } catch (e) { /* quota / private mode — soft-fail */ }
+    try {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(drafts));
+    } catch (e) {
+      // Quota, or a browser that refuses storage. Still soft-fail — but the
+      // caller can now say so instead of promising a save that did not land.
+      return 'failed';
+    }
+    return 'saved';
   }
   function discardDraft(k) {
     delete drafts[k];
@@ -782,7 +866,11 @@
     // something called that" — the field arguing with itself. The specific
     // refusal is the better sentence, so the affirmative one stands down.
     if (problems.some(function (p) { return p.field === 'name'; })) return { ok: true, msg: '' };
-    return { ok: true, msg: 'Looks good.' };
+    /* "Looks good." read as a verdict on the NAME, availability included —
+       and the markdown dry-run never returns field issues, so a duplicate
+       passed this and then 409'd at save on the field it had just approved.
+       It says what it actually checked. */
+    return { ok: true, msg: 'Shape looks right — availability is checked when you save.' };
   }
   // Gate for Save to Library: a valid name plus this type's content.
   function canPublish() {
@@ -790,7 +878,7 @@
     if (cfg().source === 'bundle') {
       return pluginSource() === 'upload' ? !!bundle : componentIds().length > 0;
     }
-    return (draft.body || '').trim().length > 0;
+    return (draft.body || '').trim().length >= MIN_BODY_CHARS;
   }
   // Check needs the same inputs as Save — both send the real payload.
   function canCheck() { return canPublish(); }
@@ -875,23 +963,10 @@
     }).join('');
   }
 
+  /* The picker. Only ever rendered with no type chosen (see render()), so
+     there is no collapsed form: the three cards. */
   function typeSectionHtml() {
-    // Collapsed: a compact row naming the choice, with Change to reopen.
-    if (type && !typeOpen) {
-      var c = cfg();
-      return '<div class="sk-sec sk-sec--done">' +
-        '<div class="sk-sec-head">' +
-          '<span class="sk-sec-no sk-sec-no--done" aria-hidden="true">✓</span>' +
-          '<div class="sk-sec-grow sk-sec-collapsed">' +
-            '<span class="sk-ava sk-ava--' + type + '">' + ICONS[type] + '</span>' +
-            '<span class="sk-sec-collapsed-txt"><h3>Type</h3>' +
-            '<p class="sk-sec-sub">' + esc(c.label) + ' — ' + esc(c.takes.toLowerCase()) + '</p></span>' +
-          '</div>' +
-          '<button type="button" class="sk-sec-change" data-sk-change>Change</button>' +
-        '</div>' +
-      '</div>';
-    }
-    // Expanded: the three cards. The "keeps your work" promise is stated
+    // The three cards. The "keeps your work" promise is stated
     // BEFORE the click, not after — that is the whole point of saying it.
     var switchNote = (type && !isBlank())
       ? '<p class="sk-hint sk-types-note">Picking another type keeps your ' + esc(cfg().label.toLowerCase()) +
@@ -1073,10 +1148,11 @@
       }
       panel += fileInputHtml(MD_ACCEPT);
     } else {
-      panel = '<label class="sk-field"><span>' + esc(c.bodyLabel) + ' <em>— ' + esc(c.bodyNote) + '</em></span>' +
+      panel = '<label class="sk-field"><span>' + esc(c.bodyLabel) + REQ + ' <em>— ' + esc(c.bodyNote) + '</em></span>' +
+        '<span class="sk-hint" id="sk-body-count">' + bodyCountHtml() + '</span>' +
           '<textarea rows="14" class="mono" data-sk-field="body" placeholder="' + esc(c.bodyPlaceholder) + '">' + esc(draft.body) + '</textarea></label>' +
         (src ? '<p class="sk-hint">From <strong>' + esc(src.name) + '</strong>. Editing here does not touch the file on your computer.</p>' : '') +
-        '<div class="sk-note">Write at least a couple of paragraphs (the store needs ~200+ characters): explain what it does, when to use it, and what inputs it expects. ' +
+        '<div class="sk-note">Write at least a couple of paragraphs: explain what it does, when to use it, and what inputs it expects. Under ' + MIN_BODY_CHARS + ' characters is refused at save. ' +
         'A YAML frontmatter block (<code>name</code>, <code>description</code>) is added for you if you don’t write one.</div>' +
         fileInputHtml(MD_ACCEPT);
     }
@@ -1085,13 +1161,46 @@
     return '<div class="sk-sec-body" id="sk-drop">' + modeSwitchHtml() + panel + fieldErrHtml('body') + '</div>';
   }
 
+  /* The handle the item will actually answer to. The store appends the
+     owner's username on save, so a preview of the typed name alone was a
+     promise the save broke. */
+  /* The description floor is a real refusal at save time (the store's content
+     guardrail), and the form never mentioned it — while the body's floor was
+     stated as a hard requirement it is not. Both are said the same way now,
+     against the instance's own configured numbers. */
+  function bodyCountHtml() {
+    var n = (draft.body || '').trim().length;
+    if (!n) return 'Needs at least ' + MIN_BODY_CHARS + ' characters — shorter than this is refused at save.';
+    if (n < MIN_BODY_CHARS) return n + ' of at least ' + MIN_BODY_CHARS + ' characters — shorter than this is refused at save.';
+    return n + ' characters.';
+  }
+  function descCountHtml() {
+    var n = (draft.description || '').trim().length;
+    if (!n) return 'Needs about ' + MIN_DESC_CHARS + ' characters — one sentence that says when to reach for it.';
+    if (n < MIN_DESC_CHARS) return n + ' of about ' + MIN_DESC_CHARS + ' characters — shorter than this gets refused at save.';
+    return n + ' characters.';
+  }
+
+  /* One mark for each, in the label row. Category defaults to "— none —" and
+     saves fine without a choice; Name and the content do not. */
+  var REQ = ' <span class="sk-req" title="Required to save">required</span>';
+  var OPT = ' <span class="sk-opt">optional</span>';
+
+  function invocationName() {
+    var n = (draft.name || '').trim();
+    if (!n) return '';
+    return OWNER_SUFFIX ? n + '-by-' + OWNER_SUFFIX : n;
+  }
+
   function previewHtml() {
+    // The verdict lives in the configuration pane for every type now.
+
     var c = cfg();
     var rows =
       '<div class="sk-pv-row"><span class="sk-pv-k">Type</span><span class="sk-pv-v">' + esc(c.label) + '</span></div>' +
       (type === 'agent'
         ? '<div class="sk-pv-row"><span class="sk-pv-k">Kind</span><span class="sk-pv-v">Library resource</span></div>'
-        : '<div class="sk-pv-row"><span class="sk-pv-k">Invoked as</span><span class="sk-pv-v"><code id="sk-pv-inv">' + (esc(draft.name) || '—') + '</code></span></div>') +
+        : '<div class="sk-pv-row"><span class="sk-pv-k">Invoked as</span><span class="sk-pv-v"><code id="sk-pv-inv">' + (esc(invocationName()) || '—') + '</code></span></div>') +
       '<div class="sk-pv-row"><span class="sk-pv-k">' + (c.source !== 'bundle' ? 'Content' : (pluginSource() === 'library' ? 'Contents' : 'Bundle')) + '</span><span class="sk-pv-v" id="sk-pv-stats">' + bodyStats() + '</span></div>' +
       // Provenance, once there is any. Which file a body came from is the first
       // thing an author checks when two drafts start to look alike.
@@ -1117,7 +1226,6 @@
           '<div class="sk-pv-meta">' + rows + '</div>' +
         '</div>' +
       '</div>' +
-      checkHtml() +
     '</div>';
   }
 
@@ -1203,9 +1311,9 @@
     view.innerHTML =
       BuilderShell.head({
         backLabel: 'Library',
+        titleHtml: titleMenuHtml(c),
         title: draft.name || c.newTitle,
         titleId: 'sk-build-title',
-        badge: typeBadgeHtml(c),
         actionsId: 'sk-build-actions',
         actions: headActionsHtml(),
       }) +
@@ -1222,7 +1330,8 @@
         cfgTitle: 'Configuration',
         cfgSub: 'everything this ' + c.label.toLowerCase() + ' is, editable by hand',
         cfgBodyId: 'sk-steps',
-        cfg: progressHostHtml() + stepsHtml(c, ns),
+        cfgAside: progressHostHtml(),
+        cfg: checkHostHtml() + stepsHtml(c, ns),
       }) +
       // Modal host. Always in the DOM so opening the picker never has to wait
       // for a re-render, and empty whenever it is closed.
@@ -1281,23 +1390,43 @@
        open slot, which a hardcoded paragraph could not be. `convOpening`
        survives as the pre-flight line: what the pane says while that turn is
        still in the air, so the pane is never blank. */
+    /* The pane used to go BLANK during the opening round-trip: `rows` was
+       empty while busy, so the one paragraph written to orient a newcomer was
+       painted for a frame and replaced by "Getting started…". On the model
+       path that is several seconds of a first impression with nothing to
+       read. The line stays until a real reply replaces it. */
     var rows = conv().length
       ? conv()
-      : (convBusy ? [] : [{ role: 'assistant', text: openingMessage(c) }]);
+      : (llmUnavailable ? [] : [{ role: 'assistant', text: isBlank() ? openingMessage(c) : resumedMessage(c) }]);
     return engineNoticeHtml() +
+      (convTrimmed ? '<p class="sk-patch-note">Earlier turns have scrolled out of what the assistant can see.</p>' : '') +
       BuilderShell.conversation({
         id: 'sk-conv',
         rows: rows,
         busy: convBusy,
         busyText: conv().length ? 'Thinking…' : 'Getting started…',
-        err: convErr,
+        // The standing banner already says it, once.
+        err: llmUnavailable ? null : convErr,
       }) +
+      (convPatchNote && !convBusy ? '<p class="sk-patch-note">' + esc(convPatchNote) + '</p>' : '') +
       BuilderShell.composer({
         kind: 'create',
         value: convDraft,
-        placeholder: c.convPlaceholder,
+        placeholder: llmUnavailable
+          ? 'No AI is configured here — fill the panel on the right by hand.'
+          : c.convPlaceholder,
+        // A composer that cannot reach a model cannot send — but it must
+        // stay READABLE: `disabled` is unselectable in Chrome, which made a
+        // restored message impossible to copy back out.
         busy: convBusy,
-        chips: convBusy ? [] : (convChips.length ? convChips : c.convStarters),
+        readOnly: llmUnavailable,
+        /* Starters belong to the empty state — before the author has said
+           anything. Keying on "no chips from the last turn" put them back
+           mid-conversation, so a nearly-finished skill could be offered
+           "How to check a pipeline is healthy" — one click from a brand-new
+           brief landing in a draft with work in it. Keying on the OPENING
+           turn alone was the same mistake one step smaller. */
+        chips: (convBusy || llmUnavailable) ? [] : (convChips.length ? convChips : (startersApply() ? c.convStarters : [])),
       });
   }
 
@@ -1310,6 +1439,11 @@
      one every turn would be noise, but leaving the scripted one unnamed is
      how someone spends an afternoon judging a string-slicer. */
   function engineNoticeHtml() {
+    if (llmUnavailable) {
+      return '<div class="ag-note ag-note--warn">No AI credential is configured on this instance, so the ' +
+        'builder cannot draft anything. The panel on the right is hand-editable and Save works normally — ' +
+        'or ask an admin to set a model up.</div>';
+    }
     // Kept as a named function because three call sites read better for it;
     // the notice itself is the shell's (BuilderShell.engineNotice), so all
     // four builders say the same thing in the same words.
@@ -1322,6 +1456,87 @@
   /* A stable host, so a landed turn can repaint the progress line alone —
      re-rendering the whole panel for it would rebuild the form under whatever
      field has focus. */
+  /* What a turn changed, in the author's vocabulary. The reply's own prose is
+     the model's account of itself; this is the page's. */
+  var FIELD_WORDS = { name: 'the name', description: 'the description', category: 'the category', body: 'the instructions' };
+  function fieldWords(keys) {
+    var words = keys.map(function (k) { return FIELD_WORDS[k] || k; });
+    if (words.length < 2) return words[0] || '';
+    return words.slice(0, -1).join(', ') + ' and ' + words[words.length - 1];
+  }
+  function patchNote(applied, kept) {
+    if (!applied.length && !kept.length) return 'Nothing changed in the panel.';
+    var parts = [];
+    if (applied.length) parts.push('Wrote ' + fieldWords(applied) + '.');
+    if (kept.length) parts.push('Left ' + fieldWords(kept) + ' as you had ' + (kept.length > 1 ? 'them' : 'it') + '.');
+    return parts.join(' ');
+  }
+  /* Reuses the shared shell's field flash, so "the assistant just wrote here"
+     looks the same on both builders. */
+  function flashFields(keys) {
+    keys.forEach(function (k) {
+      var el = document.querySelector('[data-sk-field="' + k + '"]');
+      if (!el) return;
+      el.classList.remove('ag-touched');
+      void el.offsetWidth;            // restart the animation on a repeat write
+      el.classList.add('ag-touched');
+    });
+  }
+
+  /* The interview's slots, as the PANEL can evaluate them.
+     The server's own slot answer only ever arrived on a turn, so the
+     line above a hand-editable form reported the state of a conversation
+     nobody was having: type the whole thing by hand and it still said "0 of 5
+     · still to settle: …", and with no turn at all it rendered nothing.
+     These mirror `_SLOTS` in app/api/entity_builder.py, thresholds included
+     (they are the store's own guardrail floors, not arbitrary), and
+     tests/test_builder_progress_mirror.py fails if the two drift apart. */
+  var SLOT_RULES = {
+    skill: [
+      { key: 'purpose',  label: 'what it does', any: [['body', 200], ['description', 40]] },
+      { key: 'trigger',  label: 'the trigger',  any: [['description', 60]] },
+      { key: 'steps',    label: 'the steps',    any: [['body', 200]] },
+      { key: 'name',     label: 'a name',       any: [['name', 1]] },
+      { key: 'category', label: 'a category',   any: [['category', 1]] }
+    ],
+    agent: [
+      { key: 'role',        label: 'the role',      any: [['body', 200], ['description', 40]] },
+      { key: 'description', label: 'what it is for', any: [['description', 60]] },
+      { key: 'behaviour',   label: 'how it works',  any: [['body', 200]] },
+      { key: 'name',        label: 'a name',        any: [['name', 1]] },
+      { key: 'category',    label: 'a category',    any: [['category', 1]] }
+    ],
+    plugin: [
+      { key: 'what',     label: 'what it carries', any: [['description', 60]] },
+      { key: 'name',     label: 'a name',          any: [['name', 1]] },
+      { key: 'category', label: 'a category',      any: [['category', 1]] }
+    ]
+  };
+  function localSlots() {
+    return (SLOT_RULES[type] || []).map(function (rule) {
+      var known = rule.any.some(function (pair) {
+        return ((draft && draft[pair[0]]) || '').trim().length >= pair[1];
+      });
+      return { key: rule.key, label: rule.label, known: known };
+    });
+  }
+
+  /* The Check verdict, in the configuration pane.
+     `checkHtml()` was reachable only through `previewHtml()`, which the left
+     pane renders only when a live preview is impossible — i.e. plugins. So on
+     a skill or an agent template the toast said "3 notes in the panel" and
+     there was no panel: the call was made, paid for, and thrown away. It
+     belongs beside the fields it is talking about anyway. */
+  function checkHostHtml() { return '<div id="sk-check-host">' + checkPanelHtml() + '</div>'; }
+  function checkPanelHtml() { return checkHtml(); }
+  /* 3. A verdict that is no longer true must leave the screen. `check = null`
+     happens in five places (body edit, name edit, source switch, file
+     removal, type switch) and none of them repainted this host — so a green
+     "✓ No findings" sat over a body that had just been gutted. */
+  function syncCheck() {
+    var host = document.getElementById('sk-check-host');
+    if (host) host.innerHTML = checkPanelHtml();
+  }
   function progressHostHtml() { return '<div id="sk-prog-host">' + progressHtml() + '</div>'; }
   function syncProgress() {
     var host = document.getElementById('sk-prog-host');
@@ -1329,16 +1544,47 @@
   }
 
   function progressHtml() {
-    var slots = convSlots[type];
-    if (!slots || !slots.length) return '';
+    var slots = localSlots();
+    if (!slots.length) return '';
     var known = slots.filter(function (s) { return s.known; }).length;
     var open = slots.filter(function (s) { return !s.known; });
-    return '<div class="ag-prog">' +
+    /* "nothing missing" is answerable only by the thing that actually gates
+       the button. A plugin settles all three slots on name + description +
+       category while Save stays disabled for want of contents — the panel
+       insisting the work was done over a dead primary action. */
+    /* ONE line. It used to be two — a count, then every open slot spelled
+       out — sitting under a title and a subtitle, four stacked lines of
+       chrome above the first field. What an author wants from it is how far
+       along they are and what to do next; the rest is a tooltip. */
+    var tail;
+    if (!canPublish()) tail = 'next: ' + esc(open.length ? open[0].label : (publishBlocker() || 'finish this item'));
+    else if (open.length) tail = 'ready to save · optional: ' + esc(open[0].label);
+    else tail = 'ready to save';
+    var full = open.length ? 'Still open: ' + open.map(function (s) { return s.label; }).join(', ') : 'Nothing left to settle.';
+    return '<div class="ag-prog" title="' + esc(full) + '">' +
       '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
-      '<span class="ag-prog-t">' + (open.length
-        ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
-        : 'nothing missing — ready to save') + '</span>' +
+      '<span class="ag-prog-t">' + tail + '</span>' +
     '</div>';
+  }
+
+  /* What Save to Library is waiting for, in the author's words and from the
+     same predicates `canPublish()` uses — so a disabled button and this line
+     can never name different things. */
+  function publishBlocker() {
+    var want = [];
+    if (!nameState().ok) want.push('a name');
+    if (cfg().source === 'bundle') {
+      if (pluginSource() === 'upload' ? !bundle : !componentIds().length) {
+        want.push(pluginSource() === 'upload' ? 'a .zip to upload' : 'at least one item from your Library');
+      }
+    } else {
+      var n = (draft.body || '').trim().length;
+      var what = type === 'agent' ? 'the role definition' : 'the instructions';
+      if (!n) want.push(what);
+      else if (n < MIN_BODY_CHARS) want.push(MIN_BODY_CHARS + ' characters of ' + what + ' (you have ' + n + ')');
+    }
+    if (!want.length) return '';
+    return want.length > 1 ? want.slice(0, -1).join(', ') + ' and ' + want[want.length - 1] : want[0];
   }
 
   /* Re-render ONLY the left pane. A full render() would rebuild the form and
@@ -1374,13 +1620,31 @@
     if (!type || !draft || convBusy) return;
     var opening = !text && !conv().length;
     if (!text && !opening) return;
+    /* Refuse over-long input HERE, with the author's text still in the box.
+       Sending it earned a pydantic 422 whose `detail` is an array — so the
+       page rendered "the assistant could not answer" for what is really
+       "that paste is too big", and cleared the composer on the way. */
+    if (text && text.length > MAX_MSG_CHARS) {
+      convErr = 'That message is ' + text.length + ' characters and the limit is ' + MAX_MSG_CHARS +
+        '. Shorten it, or paste the long part straight into the instructions on the right.';
+      convDraft = text;
+      renderLeftPane();
+      return;
+    }
     if (!opening) convs[type] = conv().concat([{ role: 'user', text: text }]);
-    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    convBusy = true; convErr = null; convDraft = ''; convChips = []; convPatchNote = null;
+    /* The panel as it stood when this turn was dispatched. A field the author
+       edits while it is in flight belongs to them, not to the reply. */
+    var sentDraft = JSON.parse(JSON.stringify(draft));
+    var ctl = window.AbortController ? new window.AbortController() : null;
+    var timedOut = false;
+    var timer = setTimeout(function () { timedOut = true; if (ctl) ctl.abort(); }, TURN_TIMEOUT_MS);
     renderLeftPane();
     fetch('/api/store/entities/builder/turn', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
+      signal: ctl ? ctl.signal : undefined,
       body: JSON.stringify({
         type: type,
         message: text || '',
@@ -1395,29 +1659,88 @@
       return r.json().catch(function () { return {}; }).then(function (body) {
         if (!r.ok) {
           var d = (body && body.detail) || {};
+          if (d.kind === 'builder_llm_unavailable') llmUnavailable = true;
+          /* 422 arrives as an ARRAY of field errors, so `hint`/`kind` are both
+             undefined and the old fallback blamed the assistant for what is a
+             size problem in the request. */
+          if (r.status === 422 || Array.isArray(d)) {
+            throw new Error('This conversation carries more text than one turn can send. ' +
+              'Shorten your last message, or start a fresh conversation — the panel on the right keeps your work.');
+          }
           throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
         }
         return body;
       });
     }).then(function (body) {
-      convs[type] = conv().concat([{ role: 'assistant', text: body.reply || '' }]);
-      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      convs[type] = conv().concat([{ role: 'assistant', text: clipMsg(body.reply || '') }]);
+      // Keep the page's transcript and the model's the same length.
+      if (convs[type].length > MAX_HISTORY) {
+        convs[type] = convs[type].slice(-MAX_HISTORY);
+        convTrimmed = true;
+      }
+      /* The OPENING turn keeps the page's curated starters. The author has
+         said nothing yet, so a model suggestion here can only be an invented
+         scenario ("Generate a monthly budget variance report") — a chip that
+         commits them to a skill they never mentioned. The starters are three
+         KINDS of thing to build, which is what an empty panel needs. From the
+         first real turn on, the model's chips are grounded in what the author
+         actually said and win as before.
+         (Leaving convChips empty is what re-selects convStarters — see the
+         `chips:` line in leftPaneHtml.) */
+      /* An opening turn's suggestions are invented — the author has said
+         nothing for them to be grounded in — so they never enter the state at
+         all. The render site's `authorHasSpoken()` is the second half of the
+         same rule; this is the half that survives a model which, unlike the
+         stub, actually returns some. */
+      convChips = (!opening && body.suggestions && body.suggestions.length) ? body.suggestions : [];
       convEngine = body.engine || null;
-      convSlots[type] = body.slots || null;
-      syncProgress();
+      /* Applying a patch used to be `draft[k] = patch[k]` for every key, then
+         a wholesale rebuild of the panel — so a reply landing while someone
+         typed took their caret and, if it touched that field, their text.
+         There is no undo here, and `persist()` wrote the loss straight to
+         localStorage. A field the author is IN, or has changed since this
+         turn was sent, is left alone and named in the note instead. */
       var patch = body.patch || {};
-      var keys = Object.keys(patch);
-      if (keys.length) {
-        keys.forEach(function (k) { draft[k] = patch[k]; });
+      var applied = [], kept = [];
+      Object.keys(patch).forEach(function (k) {
+        var el = document.querySelector('[data-sk-field="' + k + '"]');
+        var mine = (el && document.activeElement === el) || (draft[k] || '') !== (sentDraft[k] || '');
+        if (mine) { kept.push(k); return; }
+        draft[k] = patch[k];
+        applied.push(k);
+      });
+      /* The opening turn is the builder introducing itself — it was never
+         going to write a field, so "Nothing changed in the panel." under it
+         is noise on a screen the author has not acted on yet. The receipt
+         exists to answer "what did that do to my work", and there is no
+         work yet. */
+      convPatchNote = opening ? null : patchNote(applied, kept);
+      /* AFTER the patch, always — it used to run before the merge, so the
+         aside still listed "a name" as unsettled directly beneath a receipt
+         saying the name had just been written. */
+      syncProgress();
+      if (applied.length) {
         persist();
         // The form is the source of truth and stays hand-editable; re-render
         // it so the fields show what the turn wrote.
         renderConfigPane();
+        syncHeadActions();
+        flashFields(applied);
       }
     }).catch(function (err) {
       console.error('skills: builder turn failed', err);
-      convErr = err.message;
+      convErr = timedOut
+        ? 'That turn took longer than ' + Math.round(TURN_TIMEOUT_MS / 1000) + ' seconds and was given up on. Try again.'
+        : err.message;
+      /* Hand the message back. It was cleared from the composer optimistically
+         and, on a failure, existed nowhere the author could retrieve it. */
+      if (text) {
+        convDraft = text;
+        var rows = conv();
+        if (rows.length && rows[rows.length - 1].role === 'user') convs[type] = rows.slice(0, -1);
+      }
     }).finally(function () {
+      clearTimeout(timer);
       convBusy = false;
       renderLeftPane();
     });
@@ -1425,10 +1748,32 @@
 
   /* Re-render ONLY the configuration. Keeps the conversation pane — and any
      half-typed message in its composer — untouched. */
+  /* Repainting `#sk-steps` wholesale destroys the node the author is typing
+     in — so skipping their FIELD in the patch merge only saved the text, and
+     the caret went anyway: `document.activeElement` was null the instant a
+     turn landed, and the next keystroke went nowhere. The focused field and
+     its selection are carried across the swap. */
+  function withCaret(fn) {
+    var el = document.activeElement;
+    var f = el && el.getAttribute && el.getAttribute('data-sk-field');
+    var start = null, end = null;
+    if (f) {
+      try { start = el.selectionStart; end = el.selectionEnd; } catch (e) { /* select has none */ }
+    }
+    fn();
+    if (!f) return;
+    var back = document.querySelector('[data-sk-field="' + f + '"]');
+    if (!back) return;
+    back.focus();
+    if (start !== null) {
+      try { back.setSelectionRange(start, end); } catch (e) { /* not a text input */ }
+    }
+  }
+
   function renderConfigPane() {
     var body = document.getElementById('sk-steps');
     if (!body) { render(); return; }
-    body.innerHTML = progressHostHtml() + stepsHtml(cfg(), nameState());
+    withCaret(function () { body.innerHTML = checkHostHtml() + stepsHtml(cfg(), nameState()); });
     syncProblems();
     if (window.dsDropdownInit) body.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
   }
@@ -1436,6 +1781,49 @@
   /* The header verbs. Split out of render() for the same reason /agents did
      it: they change on their own (a draft appearing, a check finishing) and
      repainting just this row must not rebuild the form under the caret. */
+  /* Repaint just the action row. `headActionsHtml()` was only ever called
+     from a full render(), so the disabled state — and now the line saying
+     WHY — was whatever it had been at first paint: type a name and the
+     instructions and Save stayed grey until something else rebuilt the page.
+     Repainting this row alone never touches the form under the caret. */
+  function syncHeadActions() {
+    var host = document.getElementById('sk-build-actions');
+    if (host) host.innerHTML = headActionsHtml();
+  }
+
+  /* The title IS the type switch. Each type keeps its own parked draft and
+     switching never destroys one, but with the old header badge gone there
+     was no way in at all — and a second verb beside "back" competed with it.
+     One control: what you are building, and the way to build something else.
+
+     The label follows the draft (the entity's name once it has one), because
+     that is what the heading is for; the MENU is always the three types. */
+  function titleMenuHtml(c) {
+    var label = (draft && (draft.name || '').trim()) || c.newTitle;
+    var items = TYPE_ORDER.map(function (k) {
+      var t = TYPES[k];
+      return '<button type="button" role="menuitem" class="sk-typemenu-item' + (k === type ? ' is-current' : '') + '" ' +
+        'data-sk-type="' + esc(k) + '"' + (k === type ? ' aria-current="true"' : '') + '>' +
+        '<span class="sk-typemenu-ico">' + ICONS[k] + '</span>' +
+        '<span><span class="sk-typemenu-name">' + esc(t.label) + '</span>' +
+        '<span class="sk-typemenu-what">' + esc(t.what) + '</span></span></button>';
+    }).join('');
+    return '<span class="sk-titlewrap">' +
+        '<h2 id="sk-build-title" class="sk-titleh2">' +
+        '<button type="button" class="sk-titlebtn" data-sk-typemenu aria-haspopup="menu" ' +
+          'aria-expanded="' + (typeMenuOpen ? 'true' : 'false') + '" ' +
+          'title="Change what you are building">' +
+          esc(label) + '<span class="sk-titlechev" aria-hidden="true">' + CHEVRON_SVG + '</span>' +
+        '</button></h2>' +
+        (typeMenuOpen
+          ? '<div class="sk-typemenu" role="menu">' +
+              '<p class="sk-typemenu-head">Build something else</p>' + items +
+              '<p class="sk-typemenu-foot">Your ' + esc(c.label.toLowerCase()) + ' draft is kept — switch back any time.</p>' +
+            '</div>'
+          : '') +
+      '</span>';
+  }
+
   function headActionsHtml() {
     var c = cfg();
     // No status line lives in this row. Receipts go to the toast and the save
@@ -1444,26 +1832,30 @@
     // Discard replaced the ✕ that used to sit on each row of the picker's
     // draft list; with the list gone this is the only way to throw work away,
     // so it has to exist somewhere.
+    /* Both actions used to render `disabled` from first paint with nothing
+       saying why — no title, no adjacent line — so the author's first move was
+       to guess. The reason comes from `publishBlocker()`, which reads the same
+       predicates that disable them, so the button and the explanation cannot
+       drift into naming different things. */
+    var blocked = reviewInProgress
+      ? 'This item is with the reviewer.'
+      : (canPublish() ? '' : 'Add ' + publishBlocker() + ' first.');
+    var attrs = blocked ? ' disabled title="' + esc(blocked) + '" aria-label="' + esc(c.checkLabel + ' — ' + blocked) + '"' : '';
     return (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
           '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
-          '<button type="button" class="cc-btn" id="sk-check" ' + (canCheck() && !reviewInProgress ? '' : 'disabled') + '>' + esc(c.checkLabel) + '</button>' +
-      '<button type="button" class="cc-btn cc-btn--primary" id="sk-save" ' + (canPublish() && !reviewInProgress ? '' : 'disabled') + '>Save to Library</button>';
+          '<button type="button" class="cc-btn" id="sk-check"' + attrs + '>' + esc(c.checkLabel) + '</button>' +
+      '<button type="button" class="cc-btn cc-btn--primary" id="sk-save"' +
+        (blocked ? ' disabled title="' + esc(blocked) + '" aria-label="Save to Library — ' + esc(blocked) + '"' : '') +
+        '>Save to Library</button>';
   }
 
   /* The configuration itself — the numbered sections, on the shell's own
      section component so they read identically to the agent builder's. */
-  /* What is being made, for the header. The type used to be section 1 of the
-     panel: a card with a ✓ where every other section has a number, spending
-     the most valuable slot in the column re-asking what "+ Add → Build a
-     skill" had already answered. It is identity, not configuration, so it
-     sits beside the title now and the sections start at Identity. Change is
-     still one click, and switching still parks the outgoing draft. */
-  function typeBadgeHtml(c) {
-    return '<span class="sk-typechip sk-typechip--' + type + '">' +
-        '<span class="sk-typechip-ico">' + ICONS[type] + '</span>' + esc(c.label) +
-      '</span>' +
-      '<button type="button" class="sk-typechip-change" data-sk-change>Change</button>';
-  }
+  /* The type is no longer restated in the header. The pill said what the
+     Library entry the author came through had already said, and the Change
+     beside it was the only way to reach the picker mid-draft — a detour
+     nobody took, occupying the line above the thing they came to write. The
+     picker is still how a type gets chosen; it is just chosen once. */
 
   function stepsHtml(c, ns) {
     // Section 1 — Identity. Same fields for every type, so switching type
@@ -1478,13 +1870,14 @@
         sub: 'When someone should reach for it — and, last, what to call it.',
         summary: draft.name || 'Unnamed',
         body:
-              '<label class="sk-field"><span>' + esc(c.descLabel) + ' <em>' + esc(c.descNote) + '</em></span>' +
-                '<textarea rows="2" data-sk-field="description" placeholder="' + esc(c.descPlaceholder) + '">' + esc(draft.description) + '</textarea></label>' +
+              '<label class="sk-field"><span>' + esc(c.descLabel) + REQ + ' <em>' + esc(c.descNote) + '</em></span>' +
+                '<textarea rows="2" data-sk-field="description" placeholder="' + esc(c.descPlaceholder) + '">' + esc(draft.description) + '</textarea>' +
+                  '<span class="sk-hint">' + descCountHtml() + '</span></label>' +
               fieldErrHtml('description') +
-              '<label class="sk-field"><span>Category</span>' +
+              '<label class="sk-field"><span>Category' + OPT + '</span>' +
                 '<div class="sk-selectwrap"><select id="sk-category" data-sk-field="category" class="ds-dropdown-native">' + catOptions() + '</select>' + catDropdownHtml() + '</div></label>' +
           fieldErrHtml('category') +
-              '<label class="sk-field"><span>Name <em>— lowercase-hyphenated handle</em></span>' +
+              '<label class="sk-field"><span>Name' + REQ + ' <em>— lowercase-hyphenated handle</em></span>' +
                 '<input type="text" data-sk-field="name" value="' + esc(draft.name) + '" placeholder="' + esc(c.namePlaceholder) + '" maxlength="64" autocomplete="off" spellcheck="false"></label>' +
               '<p class="sk-hint' + (ns.err ? ' err' : '') + '" id="sk-name-hint">' + esc(ns.msg) + '</p>' +
               fieldErrHtml('name'),
@@ -1520,7 +1913,7 @@
                 '</label>' +
               '</div>',
       }) +
-      '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above.</div>';
+      '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above, and you can edit or archive it from there afterwards.</div>';
   }
 
   /* Everything render() has to do once the markup is in the DOM. */
@@ -1574,7 +1967,7 @@
     if ((el = document.getElementById('sk-pv-name'))) el.textContent = draft.name || ('your-' + type);
     if ((el = document.getElementById('sk-pv-cat'))) el.textContent = draft.category || c.label;
     if ((el = document.getElementById('sk-pv-desc'))) el.textContent = draft.description || c.descPreview;
-    if ((el = document.getElementById('sk-pv-inv'))) el.textContent = draft.name || '—';
+    if ((el = document.getElementById('sk-pv-inv'))) el.textContent = invocationName() || '—';
     if ((el = document.getElementById('sk-pv-stats'))) el.textContent = bodyStats();
     if ((el = document.getElementById('sk-pv-access'))) el.textContent = draft.access === 'everyone' ? 'Everyone' : 'Private';
     if ((el = document.getElementById('sk-pv-status'))) el.textContent = canPublish() ? 'Ready to save' : 'Draft';
@@ -1597,7 +1990,7 @@
      any) is loaded. Nothing is ever overwritten across types, which is what
      lets the expanded step promise "you can switch back" honestly. */
   function chooseType(k) {
-    if (type === k) { typeOpen = false; render(); return; }
+    typeMenuOpen = false;
     persist();                       // park the outgoing draft under its type
     var previous = type ? cfg().label : null;
     var incoming = drafts[k] || null;
@@ -1621,7 +2014,6 @@
     bundle = null;   // a File can't be persisted — plugin drafts resume without one
     check = null;
     problems = [];   // last type's verdict says nothing about this one
-    typeOpen = false;
     reviewInProgress = false; _reviewBannerHtml = null;
     // render() must run first — it replaces view.innerHTML, so anything written
     // into the builder's own DOM before it (the #sk-alerts host) is wiped out.
@@ -1629,7 +2021,7 @@
     // The builder speaks first. Once per type per page load: a re-render or a
     // switch back must not re-open a conversation that is already going, and a
     // resumed draft with work in it does not want to be greeted from scratch.
-    if (!openedFor[k] && !conv().length) {
+    if (!openedFor[k] && !conv().length && isBlank()) {
       openedFor[k] = true;
       sendBuilderTurn('');
     }
@@ -1756,6 +2148,9 @@
     dropProblem('bundle');
     persist();
     renderPickerRows();
+    syncCheck();               // ...and the stale verdict leaves the screen with it
+    syncHeadActions();
+    syncProgress();
   }
 
   /* ── Server calls ── */
@@ -2250,7 +2645,11 @@
 
     // Markdown path (skill / agent): LLM pre-check gate + async review banner.
     function showReviewPanel(created, chosenAccess) {
-      discardDraft(type);
+      /* The draft used to be discarded HERE — before any verdict existed. A
+         blocked review then left the author with the DOM of one open tab as
+         the only copy of their work, and a reload took it. It is discarded
+         when a verdict says the entity survived (see `settle`), never on the
+         strength of the row merely having been written. */
       var isPrivate = chosenAccess !== 'everyone';
       // Set BEFORE render() — render() reads reviewInProgress to decide whether
       // the Save / Check buttons are disabled.
@@ -2271,6 +2670,32 @@
         view.appendChild(banner);
       }
 
+      /* One place decides what a verdict does to the author's work and to the
+         form, so a new verdict kind cannot forget one of the two. */
+      function settle(state) {
+        var kind = state.kind;
+        /* FILED covers every terminal state where the entity now lives
+           server-side: approved, published, or parked in the admin queue.
+           Only the transient polling state keeps the draft. Treating
+           `pending` as one bucket left an author who saved to everyone on an
+           instance with no automated review holding a localStorage draft of
+           an item already submitted — reload dropped them back into it, and
+           saving again hit the duplicate-name refusal. */
+        if (kind === 'ok' || state.filed) {
+          discardDraft(type);          // it lives in the Library now
+          syncHeadActions();           // ...so "Discard draft" goes with it
+          return;
+        }
+        if (kind === 'err') {
+          /* Blocked. The row exists, but the author is not finished: give the
+             form back and KEEP the draft. Saving again posts a new entity, so
+             the name has to change — which the banner says, rather than
+             sending them to a delete the server refuses. */
+          reviewInProgress = false;
+          render();
+        }
+      }
+
       function updateBanner(state) {
         // Re-query the live node: render() may have detached the original element.
         var node = document.getElementById('sk-review-banner-wrap') || banner;
@@ -2286,14 +2711,17 @@
               '<a class="cc-btn cc-btn--primary" href="/library?new=' + encodeURIComponent(created.id) + '">Open in Library →</a>' +
             '</div>';
         } else if (state.kind === 'err') {
-          // The entity was already written to the DB (showReviewPanel is only
-          // called after a successful commitSave). Re-saving with the same name
-          // would hit a 409 conflict. Keep buttons locked and direct the user to
-          // Library where they can delete the rejected entry before retrying.
+          /* It used to send the author to Library to "delete & retry" — a
+             route the server refuses: DELETE on an entity with an adverse
+             verdict is 403 `quarantined_owner_cannot_delete`, and the detail
+             page renders Delete disabled. Editing and re-saving IS allowed,
+             so that is what is offered; `settle('err')` has already unlocked
+             the form behind this banner. */
           inFlight = false;
           actionsHtml =
             '<div class="sk-review-actions">' +
-              '<a class="cc-btn cc-btn--primary" href="/library">Open Library to delete &amp; retry →</a>' +
+              '<button type="button" class="cc-btn cc-btn--primary" data-sk-revise>Back to editing</button>' +
+              '<a class="cc-btn" href="/library?new=' + encodeURIComponent(created.id) + '">See it in Library</a>' +
             '</div>';
         }
         _reviewBannerHtml =
@@ -2306,10 +2734,19 @@
             '</div>' +
           '</div>';
         node.innerHTML = _reviewBannerHtml;
+        settle(state);
       }
 
       if (isPrivate) {
-        updateBanner({ kind: 'ok', title: 'Saved to your private Library.', hint: 'Only you can see and install this skill.' });
+        /* Not "nobody else sees it": administrators see non-approved rows in
+           normal browse, and with guardrails on a private save still creates a
+           submission carrying the full content into the admin review queue.
+           The promise is narrowed to one the system keeps. */
+        updateBanner({
+          kind: 'ok',
+          title: 'Saved to your private Library.',
+          hint: 'Only you can install it. This instance\u2019s administrators can see it.',
+        });
         return;
       }
 
@@ -2319,6 +2756,7 @@
       }
       if (!GUARDRAILS_LLM_READY) {
         updateBanner({
+          filed: true,
           kind: 'pending',
           title: 'Saved — waiting for admin review.',
           hint: 'No LLM provider is configured, so the skill sits in the admin queue. An admin can approve it manually or configure an API key.',
@@ -2359,18 +2797,15 @@
           inFlight = false;
           // Entity is in DB — keep reviewInProgress=true so buttons stay locked.
           // Show a Library link so the user can track the outcome there.
-          _reviewBannerHtml =
-            '<div class="sk-review-banner pending">' +
-              '<div class="sk-review-banner-icon">⋯</div>' +
-              '<div class="sk-review-banner-body">' +
-                '<div class="sk-review-banner-title">Still under review.</div>' +
-                '<div class="sk-review-banner-hint">This is taking longer than usual. Track the outcome in the Library or contact your admin.</div>' +
-                '<div class="sk-review-actions">' +
-                  '<a class="cc-btn cc-btn--primary" href="/library">Open Library →</a>' +
-                '</div>' +
-              '</div>' +
-            '</div>';
-          banner.innerHTML = _reviewBannerHtml;
+          /* Through updateBanner, so this state settles like the others —
+             it used to write the markup by hand and skip the settlement,
+             leaving a local draft of a row already in the queue. */
+          updateBanner({
+            filed: true,
+            kind: 'pending',
+            title: 'Still under review.',
+            hint: 'This is taking longer than usual. Track the outcome in the Library or contact your admin.',
+          });
         }
       }
       pollTimer = setInterval(poll, 4000);
@@ -2454,7 +2889,9 @@
       sessionStorage.setItem('agnes.flash.toast', JSON.stringify({
         kind: 'success',
         msg: access === 'everyone'
-          ? '“' + name + '” saved — publishing to everyone once the automated review passes.'
+          ? '“' + name + '” saved — ' + (GUARDRAILS_LLM_READY
+              ? 'publishing to everyone once the automated review passes.'
+              : 'waiting for an admin to review it. No automated review runs on this instance.')
           : '“' + name + '” saved to your Library.',
         timeout: 7000
       }));
@@ -2589,7 +3026,7 @@
 
   /* ── Events — all delegated, since the page is re-rendered wholesale ── */
   document.addEventListener('click', function (e) {
-    var t = e.target.closest('[data-sk-type],[data-sk-change],[data-sk-mode],[data-sk-browse],' +
+    var t = e.target.closest('[data-sk-type],[data-sk-typemenu],[data-sk-revise],[data-sk-mode],[data-sk-browse],' +
                              '[data-sk-removefile],[data-sk-jump],[data-sk-dismiss],' +
                              '[data-sk-psrc],[data-sk-openpick],[data-sk-pick],[data-sk-unpick],' +
                              '[data-ag-pick-close],' +
@@ -2645,7 +3082,20 @@
       } else { render(); }
     }
     else if (t.hasAttribute('data-sk-type')) { chooseType(t.getAttribute('data-sk-type')); }
-    else if (t.hasAttribute('data-sk-change')) { typeOpen = true; render(); }
+    else if (t.hasAttribute('data-sk-typemenu')) {
+      persist();          // park what is on screen before offering the switch
+      typeMenuOpen = !typeMenuOpen;
+      render();
+    }
+    else if (t.hasAttribute('data-sk-revise')) {
+      /* The form is already unlocked by settle('err'); this just gets the
+         banner out of the way so the author can see what they wrote. */
+      var wrap = document.getElementById('sk-review-banner-wrap');
+      if (wrap) wrap.remove();
+      _reviewBannerHtml = null;
+      var first = document.querySelector('[data-sk-field="description"]');
+      if (first) first.focus();
+    }
     else if (t.hasAttribute('data-sk-dismiss')) { clearProblems(); }
     else if (t.hasAttribute('data-sk-jump')) { jumpTo(t.getAttribute('data-sk-jump')); }
     else if (t.hasAttribute('data-sk-mode')) {
@@ -2704,13 +3154,29 @@
     }
     else if (t.id === 'sk-check') { doCheck(); }
     else if (t.id === 'sk-save') { doSave(); }
-    else if (t.id === 'sk-draft') { persist(); render(); toast('Draft saved in this browser.', 'success'); }
+    else if (t.id === 'sk-draft') {
+      var outcome = persist();
+      render();
+      // Say what happened. The three outcomes used to read as one success.
+      if (outcome === 'saved') toast('Draft saved in this browser.', 'success');
+      else if (outcome === 'cleared') toast('Nothing to save — the empty draft was cleared.', 'info');
+      else if (outcome === 'failed') toast('This browser refused to store the draft. Copy your work somewhere safe.', 'error', 8000);
+      else toast('Not saved — this item is with the reviewer.', 'info');
+    }
     else if (t.id === 'sk-discard') {
       // Destructive and unrecoverable — the draft exists nowhere but this
       // browser, so it gets a confirm rather than an undo we cannot offer.
       if (!window.confirm('Discard this ' + cfg().label.toLowerCase() + ' draft? It is only saved in this browser and cannot be recovered.')) return;
       discardDraft(type);
       draft = makeDraft(); bundle = null; check = null; problems = [];
+      /* Clear the review state with it. Discarding after a save left
+         `reviewInProgress` true and the success banner pinned over an empty
+         form whose Save and Check were both disabled — a builder only a
+         reload could revive. */
+      reviewInProgress = false;
+      _reviewBannerHtml = null;
+      var wrap = document.getElementById('sk-review-banner-wrap');
+      if (wrap) wrap.remove();
       render();
       toast('Draft discarded.');
     }
@@ -2755,6 +3221,8 @@
       // This branch patches the one preview node by hand rather than
       // re-rendering on every keystroke — but a dropped Check row lives in the
       // panel, which only `syncPreview` redraws.
+      syncProgress();
+      syncHeadActions();
       if (staleRow) { syncPreview(); return; }
       var el = document.getElementById('sk-pv-cat');
       if (el) el.textContent = draft.category || cfg().label;
@@ -2762,14 +3230,40 @@
     }
     if (f === 'body') {
       check = null;   // editing the body invalidates a prior check result
+      syncCheck();
       // The card no longer shows verbatim what the file contained, and saying
       // so is cheaper than letting the author assume it does.
       if (draft.source_file) draft.source_file.edited = true;
     }
     dropProblem(f);   // the field is being answered — stop faulting it
+    if (f === 'name' && check) { check = null; syncCheck(); }
     persist();
     syncPreview();
+    syncProgress();     // the line reports the FORM, so typing has to move it
+    syncHeadActions();  // ...and so does what Save is waiting for
+    if (f === 'description') {
+      var hint = document.querySelector('[data-sk-field="description"]');
+      hint = hint && hint.parentNode && hint.parentNode.querySelector('.sk-hint');
+      if (hint) hint.textContent = descCountHtml();
+    }
+    if (f === 'body') {
+      var bc = document.getElementById('sk-body-count');
+      if (bc) bc.textContent = bodyCountHtml();
+    }
   }
+  /* An open menu closes on anything that is not itself — the same rule the
+     rest of the app's menus follow, and the reason it is on document. */
+  document.addEventListener('click', function (e) {
+    if (!typeMenuOpen) return;
+    var inside = e.target.closest && e.target.closest('.sk-titlewrap');
+    if (inside) return;
+    typeMenuOpen = false;
+    render();
+  }, true);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && typeMenuOpen) { typeMenuOpen = false; render(); }
+  });
+
   document.addEventListener('input', handleFieldInput);
 
   /* Enter sends, Shift+Enter opens a line — the convention every chat box on
@@ -2834,15 +3328,19 @@
   function maybeSpotlightNew() {
     var params = new URLSearchParams(window.location.search);
     if (params.get('spotlight') !== 'new-skill') return;
-    // The tour anchors on the type step, which is always rendered — expanded
-    // when unanswered, collapsed (with Change) when the caller deep-linked a
-    // type. Bail only if neither is present.
-    if (!document.querySelector('[data-sk-type],[data-sk-change]')) return;
+    /* Strip FIRST. The param is one-shot, and returning before this left it
+       in the URL — so a visitor with a draft (no picker on screen) re-armed
+       the coach-mark on every later visit and never saw it once. */
     params.delete('spotlight');
     var qs = params.toString();
     try {
       history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
     } catch (e) { /* history unavailable — non-fatal */ }
+    /* Anchor on whatever this arrival actually shows: the type cards on a
+       cold visit, the Identity section once a type is chosen (a deep link, or
+       a resumed draft). The old fallback was the header's Change button,
+       which is gone — and was inert long before that. */
+    if (!document.querySelector('[data-sk-type], [data-sec="identity"]')) return;
     import("{{ static_url('js/tour.js') }}")
       .then(function (mod) { mod.launchTour('skill-builder'); })
       .catch(function () { /* coach-mark is additive — never block the page */ });

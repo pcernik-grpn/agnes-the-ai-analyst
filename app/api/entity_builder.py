@@ -33,7 +33,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from app.api.builder_core import (
     ENGINE_MODEL,
@@ -82,12 +82,30 @@ class EntityDraft(BaseModel):
 
     Untrusted, and used only to build the prompt — nothing here is written
     anywhere, and the fields that come back are re-validated on the way out.
+
+    Every field TRUNCATES rather than rejecting, for the same reason
+    ``BuilderMessage.text`` does: this is replayed context, not authored
+    input. A body long enough to exceed the cap is legal everywhere else in
+    the product — the markdown upload takes 512 KB and the store's own
+    ``skill_md`` is unbounded — so rejecting it here meant an author could
+    write something the builder then refused to discuss, with a 422 whose
+    text blamed their last message. The prompt only ever shows a truncated
+    panel anyway (see ``panel_prompt_section``).
     """
 
-    name: str = Field(default="", max_length=MAX_NAME_CHARS)
-    description: str = Field(default="", max_length=4000)
-    category: str = Field(default="", max_length=120)
-    body: str = Field(default="", max_length=MAX_BODY_CHARS)
+    name: str = Field(default="")
+    description: str = Field(default="")
+    category: str = Field(default="")
+    body: str = Field(default="")
+
+    @field_validator("name", "description", "category", "body", mode="before")
+    @classmethod
+    def _clip(cls, v: Any, info: ValidationInfo) -> Any:
+        caps = {"name": MAX_NAME_CHARS, "description": 4000, "category": 120, "body": MAX_BODY_CHARS}
+        cap = caps.get(info.field_name or "", MAX_BODY_CHARS)
+        if isinstance(v, str) and len(v) > cap:
+            return v[:cap]
+        return v
 
 
 class EntityTurnRequest(BaseModel):
