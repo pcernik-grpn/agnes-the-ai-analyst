@@ -1122,6 +1122,13 @@ Tables in `table_registry` can be pinned to a specific connection via `connectio
 `GET …/{connection_id}/tables` lists the project's buckets with nested tables (admin-UI
 discovery helper for the /admin/data-sources add-project wizard, #755).
 
+`POST …/{connection_id}/test` branches on the row's `source_type`: `keboola` verifies
+the storage token against the stack, `snowflake` opens a session against the account
+and reads one row of metadata, and every other type answers
+`{"ok": false, "status": "unsupported", "detail": "connection test is not implemented
+for <type> yet"}`. Failure is HTTP 200 with `ok: false` throughout; only an unknown
+connection is a status code (404).
+
 - /api/admin/source-connections
 - /api/admin/source-connections/{connection_id}
 - /api/admin/source-connections/{connection_id}/secret
@@ -1298,7 +1305,7 @@ ontology (the producer's YAML) into the draft, reporting the leftovers the
 translator could not place structurally (mirrors the allowlisted
 `/api/admin/metrics/import`). `POST …/save` validates the frozen draft against
 the vendored Ossie schema and materializes it into a semantic model through
-the same path `agnes admin semantic-model import` uses. `POST /dry-run` runs
+the same path `agnes admin semantic import` uses. `POST /dry-run` runs
 the draft's current types over one selected document through the server-side
 LLM and returns proposed facts/edges plus a **not-captured** block; it is a
 typed `501` when no LLM provider is configured. Admin-only authoring with no
@@ -1391,7 +1398,9 @@ publishes metrics but none bind to a registered table). Datasets with no
 registered table are reported as a plain count, never as pending work — a
 semantic layer routinely describes more of a project than an instance registers.
 
-CLI: `agnes admin semantic-layer coverage [--json]`. MCP:
+CLI: `agnes admin semantic keboola-import [--json] [--limit N]` (renamed from
+`agnes admin semantic-layer coverage`, which called itself coverage while
+answering a third question — see the two neighbours below). MCP:
 `admin_semantic_layer_coverage`.
 
 ### `/api/admin/semantic-coverage` — source-agnostic semantic-layer coverage
@@ -1408,7 +1417,7 @@ ANY valid model's dataset resolves to it, whether that dataset is bound via
 a Keboola tableId or a plain `dataset.source`/`.name` match against
 `table_registry.id`/`.name`.
 
-CLI: `agnes semantic-model coverage tables [--limit N] [--json]`. MCP:
+CLI: `agnes admin semantic coverage tables [--limit N] [--json]`. MCP:
 `admin_semantic_coverage`.
 
 ### `/api/admin/semantic-auto-draft-sweep` — auto-draft uncovered tables
@@ -1417,8 +1426,7 @@ CLI: `agnes semantic-model coverage tables [--limit N] [--json]`. MCP:
 
 `POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every
 55 minutes) drafts a semantic model for up to a handful of uncovered tables
-(`tables_without_semantic_coverage`, filtered on `table_registry.
-semantic_draft_pending_at IS NULL`) per tick via a headless
+(`tables_without_semantic_coverage`) per tick via a headless
 `semantic-model-builder` chat session, authenticated as the non-admin
 `semantic-drafter@system.local` system identity so every draft lands in the
 `authoring_suggestions` moderation queue exactly like a human-submitted
@@ -1426,19 +1434,32 @@ proposal — never applied directly. Each selected table's
 `semantic_draft_pending_at` is stamped before its session is invoked (not
 after), so a table can never be double-picked by an overlapping tick; the
 flag clears when an admin resolves the resulting suggestion, approve or
-reject alike. A session hitting the chat manager's concurrency cap is
-counted and skipped, never a 500 — and its stamp is cleared again on the
-way out, since the cap is enforced before the session starts, so no
-suggestion would ever exist to clear it and the table would otherwise be
-excluded from every future sweep permanently. Any OTHER failure from a
-table's session is handled the same way and for the same reason (counted
-in `errored`): the table is un-stamped, logged, and the sweep continues to
-the next table rather than letting one transient error 500 the whole tick
-and abandon the rest of the batch.
+reject alike.
 
-Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
-"errored", "remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
-same class as the `/api/admin/run-*` jobs below.
+A table is a candidate again once its stamp is **older than 7 days**
+(`_SWEEP_STAMP_RETRY_AFTER_S`), and never-stamped tables are drafted ahead
+of stale-stamped ones. So a session that ran but filed nothing keeps its
+stamp and retries about once a week instead of on the very next tick — a
+handful of repeatedly-declined tables can no longer hold the whole batch
+and starve everything behind them. A session whose wait hits the per-table
+timeout also keeps its stamp (counted in `timed_out`, not `no_apply_call`):
+the sandbox keeps working on that turn after the sweep stops waiting, so the
+suggestion may still arrive, and un-stamping would re-draft the same table
+on every following tick.
+
+A session hitting the chat manager's concurrency cap is counted and
+skipped, never a 500 — and its stamp *is* cleared again on the way out,
+since the cap is enforced before the session starts, so that session
+provably never ran and cannot file anything later. Any OTHER failure from a
+table's session is handled the same way (counted in `errored`): the table is
+un-stamped, logged, and the sweep continues to the next table rather than
+letting one transient error 500 the whole tick and abandon the rest of the
+batch.
+
+Returns `{"triggered", "applied", "no_apply_call", "timed_out",
+"skipped_cap", "errored", "remaining"}`. No CLI/MCP surface —
+scheduler/admin maintenance trigger, same class as the `/api/admin/run-*`
+jobs below.
 
 Postgres app-state only (A3 PG-first ratchet — the dedup column is a
 Postgres-only addition, no DuckDB migration step exists for it): on a
@@ -1483,7 +1504,7 @@ on Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on
 an instance still running the frozen DuckDB app-state backend they answer
 `501` with `error: "requires_postgres_backend"`.
 
-CLI: `agnes semantic-model coverage [--source <id>] [--json]`,
+CLI: `agnes admin semantic coverage [--source <id>] [--json]`,
 `… coverage tag <type> <resource-id> <source-id>`, `… coverage untag <tag-id>`.
 MCP: `semantic_model_coverage`, `semantic_model_coverage_tag`,
 `semantic_model_coverage_untag`.
@@ -1513,7 +1534,7 @@ FIRST, before any other check runs, so a DuckDB-backed instance answers a
 clean `501 requires_postgres_backend` for the whole report rather than one
 silently missing the one field F4.3 exists to keep visible.
 
-CLI: `agnes semantic-model health [--json]`. MCP: `semantic_layer_health`.
+CLI: `agnes admin semantic health [--json]`. MCP: `semantic_layer_health`.
 
 ### `/api/admin/semantic-layer/mutes` — silencing a check, on the record
 
@@ -1556,8 +1577,8 @@ on Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on a
 instance still running the frozen DuckDB app-state backend they answer `501`
 with `error: "requires_postgres_backend"`.
 
-CLI: `agnes semantic-model mute <scope> [--reason …] [--expires <ISO8601>]`,
-`agnes semantic-model unmute <mute-id>`, `agnes semantic-model mutes
+CLI: `agnes admin semantic mute <scope> [--reason …] [--expires <ISO8601>]`,
+`agnes admin semantic unmute <mute-id>`, `agnes admin semantic mutes
 [--include-expired] [--json]`. MCP: `mute_semantic_check`,
 `unmute_semantic_check`, `semantic_mutes_list`. UI:
 `/admin/semantic-layer?tab=mute`.
@@ -1597,8 +1618,9 @@ instance still running the frozen DuckDB app-state backend they answer `501`
 with `error: "requires_postgres_backend"`.
 
 CLI: `agnes semantic-model feedback submit "<question>" [--sql …] [--metric …]
-[--comment …]`, `… feedback list [--status open] [--json]`,
-`… feedback resolve <id> [--note …]`. MCP: `flag_semantic_issue` (the tool a
+[--comment …]` (any signed-in caller), `agnes admin semantic feedback list
+[--status open] [--json]` and `agnes admin semantic feedback resolve <id>
+[--note …]` (admin — the queue follows the endpoint's authority). MCP: `flag_semantic_issue` (the tool a
 chat agent offers to call when it cannot support its own answer),
 `semantic_feedback_list`, `semantic_feedback_resolve`. UI:
 `/admin/semantic-layer?tab=feedback`.
@@ -1653,7 +1675,7 @@ staleness preview (`source_changed_since_detach`, `detached_at`) instead of
 acting, and it is `409 source_gone` when the source no longer has the slug
 at all. Both are Postgres-only (the DuckDB app-state ladder is frozen) and
 answer `501 requires_postgres_backend` on a DuckDB-backed instance. CLI:
-`agnes admin semantic-model detach|reattach <id>`.
+`agnes admin semantic detach|reattach <id>`.
 
 `GET /api/semantic-models/{slug}.yaml` (export) and `GET
 /api/semantic-models/search` are any-authenticated-user, gated instead on
@@ -1662,10 +1684,12 @@ rides the same visibility as the package(s) it belongs to; admins always
 see everything. A model with no linked package is admin-only until an
 admin links it.
 
-CLI: `agnes admin semantic-model list/show/import/export/validate` (the
-last runs entirely offline — no server, no token) and `agnes admin
-semantic-source add/list/sync`. MCP: `semantic_model_search`,
-`semantic_model_get`.
+CLI: `agnes semantic-model search <term>` and `agnes semantic-model
+show|export <slug>` are the any-user reads against these two public
+endpoints; `agnes semantic-model validate <file>` schema-checks a document
+entirely offline (no server, no token, no admin). The admin corpus is
+`agnes admin semantic list/show/import/delete` and `agnes admin semantic
+source add/list/sync/rm`. MCP: `semantic_model_search`, `semantic_model_get`.
 
 `POST /api/admin/semantic-models/{slug}/packages` (body `{"package_id":
 ...}`) and `DELETE .../packages/{package_id}` link/unlink a model to/from a
@@ -1674,7 +1698,7 @@ Both 404 if the model slug or the package id doesn't exist, are idempotent
 on a repeat call, and return the model's current `package_ids`. Not gated
 by the ownership rule (the junction is outside the document a re-sync would
 rewrite), so a source-owned model can be linked the same as a hand-authored
-one. CLI: `agnes admin semantic-model link-package/unlink-package`.
+one. CLI: `agnes admin semantic link-package/unlink-package`.
 
 `POST /api/semantic-models/apply` is the one non-admin-reachable write
 surface (chat-first authoring): any authenticated caller submits an Ossie
@@ -1698,12 +1722,13 @@ search/export) via the pure `src.semantic_validation.validate_query` engine:
 an `error`-severity constraint violation sets `valid: false`; a rule that
 cannot be checked statically degrades to `post_execution_checks`, never a
 guessed violation; a used metric whose only expressions target another
-engine sets `locally_executable: false`. With zero accessible valid models
+engine sets `locally_executable: false` and is named in
+`not_executable_metrics`. With zero accessible valid models
 the response is `{"available": false, "error": "no_semantic_model", ...}`
 rather than a misleading all-clear. CLI: `agnes semantic-model
 validate-query "<SQL>" [--expect JSON] [--target-engine duckdb] [--json]`
-(distinct from `agnes admin semantic-model validate`, which schema-checks a
-document, not a query). MCP: `validate_semantic_query`.
+(distinct from its sibling `agnes semantic-model validate`, which
+schema-checks a document, not a query). MCP: `validate_semantic_query`.
 
 `GET /api/semantic-models/context` and `GET /api/semantic-models/schema` are
 the agent read-parity tools. `context` uses the same RBAC tier as
@@ -1750,15 +1775,14 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-blocked-purge
 - /api/admin/run-bq-metadata-refresh
 - /api/admin/run-corporate-memory
-- /api/admin/run-databricks-semantic-layer-refresh
 - /api/admin/run-jira-consistency-check
 - /api/admin/run-jira-sla-poll
-- /api/admin/run-keboola-semantic-layer-refresh
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
+- /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
@@ -2189,13 +2213,19 @@ analogue) drive the in-chat split-pane preview iframe on top of this grant.
 ### `/api/glossary` — Keboola-imported business-term glossary (user-facing)
 
 Read/search over `glossary_terms`, populated by the Keboola semantic-layer
-importer (`keboola-semantic-layer-refresh` job) — see
+importer (on the `semantic-sources-refresh` sweep) — see
 `docs/superpowers/specs/2026-07-17-keboola-glossary-import-design.md`.
 Relevance-ranked search uses DuckDB FTS BM25 with an ILIKE fallback.
 
 - /api/glossary
 - /api/glossary/search
 - /api/glossary/{glossary_id}
+
+CLI: `agnes glossary search <term> [--limit N] [--json]` and `agnes glossary
+show <id> [--json]`. MCP: `glossary_search` — search is the agent-facing path;
+`/api/glossary` (the unfiltered list) and `/api/glossary/{id}` have no MCP
+analogue by design, an agent looking a term up is searching rather than
+paginating a table.
 
 ### `/api/health` — Health checks
 

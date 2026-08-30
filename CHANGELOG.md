@@ -10,6 +10,64 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **`agnes semantic-model search <term>` — the non-admin way to find a semantic
+  model.** `GET /api/semantic-models/search` is public and RBAC-filtered, and
+  had an MCP tool and a web page but no CLI: the only listing was `agnes admin
+  semantic-model list`, which an analyst cannot run. Follows the command-UX
+  standard (positional term, `--limit`, `--json`, a "nothing matched" line that
+  names the next step). Its siblings landed with it: **`agnes semantic-model
+  show <slug>`** (provenance, status, content hash — resolved through the same
+  public search response, no new endpoint), **`agnes admin semantic delete
+  <id|slug>`** and **`agnes admin semantic source rm <id>`**, both wrapping
+  `DELETE` endpoints that existed with no CLI at all. `delete` refuses a
+  source-owned model and names `detach` as the way through; `source rm` says
+  out loud that the models it imported are kept.
+- **Detect semantic bindings orphaned by a table delete or rename (Block 5 of #1707).** Unregistering (or renaming) a table left no cascade for `metric_definitions` rows bound to it by name or `column_metadata` rows profiled against its id — detection only, nothing is auto-deleted. `src/semantic/orphans.py` finds both classes through the existing `table_registry`/`metric`/`column_metadata` repo factories (backend-agnostic, no Postgres gate), and a new `orphaned_table_bindings` health check surfaces the findings in `GET /api/admin/semantic-layer/health`, `agnes semantic-model health`, the `semantic_layer_health` MCP tool, and the admin Semantic Layer page's Health tab. `DELETE /api/admin/source-connections/{id}` now also returns an informational `X-Agnes-Semantic-References` header counting the semantic sources/models tied to the deleted connection — never blocking the delete.
+- **The semantic layer now reaches the agent that is about to ignore it.** An
+  instance could hold a fully populated semantic layer and still be queried as
+  if it had none, because nothing on the consumption path mentioned it.
+  - **`POST /api/query` validates against the semantic layer on its own.**
+    After a statement succeeds, the caller's readable `status='valid'` models
+    are checked (same `_can_read_model` RBAC tier as the rest of the read
+    surface) and the response carries a new optional `semantic_validation`
+    field — but only when there is something to say: an error-severity
+    constraint violation, or a used metric with no expression for the engine
+    that actually ran the statement. Enforcement is **soft**: rows are
+    untouched, the status stays `200`, and a failure of the check itself is
+    logged and the field omitted rather than costing the caller their result.
+    A clean query, a caller who can read no model, and an instance with no
+    semantic layer all return `null`, so the field appearing means something.
+    `agnes query` prints each warning to stderr as `[semantic] …` (stdout
+    stays machine-parseable), and the MCP `query` tool passes it through.
+    The advisory names only the metrics that actually failed, states in the
+    payload and in every warning line that object detection is a best-effort
+    text match on declared names rather than SQL parsing (a column sharing a
+    metric's name matches too), and forwards `post_execution_checks` as
+    information — rules that cannot be checked before running are surfaced,
+    never evaluated. On both MCP transports the advisory is shortened, then
+    dropped, before the rows are, so an advisory can never push a deliverable
+    result over the tool output cap (which raises rather than truncating).
+  - **`validate-query` says WHICH metric is not executable.** `POST
+    /api/semantic-models/validate-query` and its CLI/MCP wrappers carry a new
+    `not_executable_metrics` list next to the `locally_executable` bool. The
+    bool alone forced a consumer that wanted to warn about it to name every
+    metric the statement touched, turning one unusable metric into an
+    accusation against all of them. `agnes semantic-model validate-query`
+    prints the names instead of "one or more used metrics".
+  - **MCP clients are steered to the layer before they write SQL.** The
+    server-level instructions both MCP transports advertise now say to read a
+    business term's declared definition first (`glossary_search`, then
+    `get_semantic_context`) and to call `validate_semantic_query` before
+    running SQL over modeled data; the `catalog` and `query` tool descriptions
+    carry the same cross-reference. The two transports previously held
+    byte-identical hand-copies of that prose and now read one shared constant.
+  - **A model author's `ai_context.instructions` reaches the workspace
+    prompt.** The one field a document declares *for the agent* reached no
+    agent surface at all; each model's bullet in the rendered `CLAUDE.md`
+    "Semantic layer" section now carries it (truncated to ~300 chars). That
+    section also names `agnes glossary search` and `agnes semantic-model
+    apply`, which it taught around but never mentioned.
+- **Registered semantic sources (git/upload/connection) now refresh on a schedule, not just on manual sync.** `POST /api/admin/run-semantic-sources-refresh` sweeps every `semantic_sources` row through the shared import pipeline on a `SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL` cadence (default 6 h, scheduler entry `semantic-sources-refresh`); one failing source never aborts the sweep over the rest. `enabled: false` now excludes a source from both this scheduled sweep and manual sync — `POST /api/admin/semantic-sources/{id}/sync` (and `agnes admin semantic-source sync`) on a disabled source answers `409 source_disabled` with a hint to re-enable it instead of silently syncing anyway. This is Block 3 step 2 of #1707; steps 3-4 (migrating the legacy Keboola/Databricks refreshes onto this sweep and retiring them) landed in the same release — see Changed.
 - **Document extraction now actually enqueues (TCRD-226) — the runtime PR #1692 built had nothing to create a job.** `POST /api/admin/sharepoint/connections/{id}/extract` lets an admin trigger the existing `corpus-extraction` job kind on demand — 404s on an unknown connection before any work, refuses cleanly with a typed `409` when `extraction.enabled` is off or no producer is configured (never a job that fails 30 minutes later in a worker), and `409 extraction_already_running` when a run for that connection is already queued. A new `POST /api/admin/sharepoint/extraction/run-due` scheduler sweep (registered only when the new `extraction.schedule` config is set — off by default) applies that single instance-wide cadence independently to each connection's own last-run stamp, same shape as the existing `agents:run-due` sweep. The producer subprocess also gets a credential to call back into Agnes's own API for the first time — `AGNES_API_URL` always, and `AGNES_API_TOKEN` (the scheduler's own shared-secret token) when one is configured — a deliberate, explicitly-documented over-grant (that token is Admin-group god-mode, far more than the producer needs) reused because it's the only credential class a headless subprocess can already present; never on argv, never logged. The SharePoint source card surfaces the in-Agnes schedule's last/next run and a "Run extraction now" action, separate from the external producer's own static crawl-cadence label.
 - **Full audit-log coverage for state-changing requests** (audit-full-coverage plan). A typed audit action catalog (`src/audit_events.py`) is now the single source of truth for every `action` string an audit writer can emit, and every `audit_log` row is auto-filled with per-request context (`client_ip`, `correlation_id`, `client_kind`, caller identity) so callers no longer thread it through by hand. Every mutating route declares its audit posture in `src/audit_posture.py` (`tests/test_audit_route_posture.py` ratchets it), and `AuditFallbackMiddleware` writes a generic `http.request` row for any authenticated mutating request whose handler wrote none — the shrinking `"fallback"` list is the map of what's left to close.
 - **Auth, agent, and background-job surfaces now write audit rows.** PAT enumeration (`GET /auth/tokens*`, `token.list`) and Keboola project-import (`keboola.projects_import`) close out the auth remainder. Agent invocation (`agent.invoke`), multi-turn agent-API session lifecycle (`agent.session.*`), webhook registration/removal (`agent.webhook.*`), every worker job dispatch (`job.run`), and the previously silent scheduled refresh jobs (BigQuery metadata cache, Keboola/Databricks semantic-layer sync, marketplace store lint audit) are now audited too.
@@ -370,6 +428,59 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
 ### Changed
+- **The semantic layer is two CLI groups instead of five.** `agnes
+  semantic-model`, `agnes admin semantic-model`, `agnes admin semantic-source`,
+  `agnes admin semantic-layer` and `agnes admin data-semantics` all read as
+  "the semantic layer" and were divided by which endpoint family they happened
+  to call — not by anything a reader could predict. They collapse into
+  **`agnes semantic-model`** (anything any signed-in caller may do) and
+  **`agnes admin semantic`** (anything that needs an admin), with the
+  documents, their `source` sub-group, and the health reports as three nouns
+  under the latter.
+  - `export` and `validate` moved OUT of the admin tier to `agnes
+    semantic-model export|validate`. Neither was ever an admin operation:
+    `export` reads the public, resource-gated endpoint, and `validate`
+    schema-checks a local file with no server and no token at all. Both helps
+    now say, prominently, that `validate` (a document) is not `validate-query`
+    (a SQL statement).
+  - `coverage`, `health`, `mute`, `mutes`, `unmute` and the queue half of
+    `feedback` (`feedback list` / `feedback resolve` → `agnes admin semantic
+    feedback list|resolve`) moved the other way, to `agnes admin semantic …`:
+    every endpoint behind them is `require_admin`, so sitting in the any-user
+    group advertised authority the caller did not have. `feedback submit`
+    stays in `agnes semantic-model` — filing "that answer looked wrong" is
+    open to anyone signed in, and belongs beside the analysis that produced
+    the bad number.
+  - `agnes admin semantic-layer coverage` is now **`agnes admin semantic
+    keboola-import`**. Three commands called themselves coverage while
+    answering three different questions; this one predicts what a live Keboola
+    project *would* import, which is neither of the other two. All three helps
+    now name their question and their endpoint.
+  - The health report's `orphaned_table_bindings` section (Block 5 of #1707)
+    is carried across with the command. `health` hardcodes one rendering block
+    per report key, so a key with no block is swallowed in silence — the
+    section is pinned by tests against the new path, and the deprecated alias
+    inherits it by delegating rather than by carrying a second copy.
+  - **Every old invocation still works this release**, as a hidden alias that
+    prints one line on stderr naming its new path and then delegates to the
+    same function the new path runs — so a script keeps working, `--help`
+    stops teaching two names for one thing, and an alias cannot drift from
+    what it replaces. The notice goes to stderr so `… --json | jq` is
+    unaffected. The aliases will be removed in a later release.
+- **The stdio MCP server is internal, not an end-user surface — the bare
+  `agnes mcp` invocation is no longer advertised.** Wiring it into a client by
+  hand was an experiment. It stays fully functional — the hosted chat sandbox
+  spawns one per session and `agnes global enable` registers it with Claude
+  Code — but `agnes mcp --help` now leads with what a user can actually do
+  here, the explicit spelling `agnes mcp serve` is hidden, and the tool set is
+  pinned by an exact-set test so it does not grow. An external MCP client
+  should use the server's HTTP transports, which carry the full RBAC-filtered
+  foundation tool set. Only the SERVER is unadvertised: the group itself stays
+  visible in `agnes --help`, because `agnes mcp connect` / `disconnect` /
+  `my-secret …` are supported user commands — and a missing per-user
+  credential is answered by the server with `agnes mcp my-secret set
+  <source-id>` by name, a remedy that hiding the group would have hidden.
+- **BREAKING: the two per-connector semantic-layer refreshes are gone; one scheduled sweep now covers every source.** `POST /api/admin/run-keboola-semantic-layer-refresh` and `POST /api/admin/run-databricks-semantic-layer-refresh`, and their scheduler entries (`SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL`, `SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL`), are removed — a caller gets 404/405 and an env var set for either is ignored. `POST /api/admin/run-semantic-sources-refresh` (`SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL`, default 6 h) is the only scheduled semantic refresh, and the /admin/semantic-layer "Sync now" button posts to it. **The connectors' sync logic did not move** — the same adapters compose the same documents and the same central projector writes them; only the trigger did. Nothing for an operator to do: every sweep first auto-registers the `semantic_sources` rows those triggers implied (one per Keboola connection holding a master token — or the legacy `KEBOOLA_STACK_URL`/`KEBOOLA_STORAGE_TOKEN` pair when none does — plus the Databricks workspace when one is configured), idempotently and never overwriting a row an admin renamed, re-scoped or disabled. **Existing rows are unaffected, which is the point:** a migrated Keboola source carries a provenance override (`config.provenance`) so its models, metrics, glossary terms and column descriptions keep the exact `source='keboola_metastore'` / `source_ref=<connection id>` pair they already have, plus `config.safe_prune` — the full-wipe guard that keeps an upstream answering with nothing usable from deleting a whole metric registry (the auto-registered Databricks source carries that same guard now: its adapter skips a metric view whose definition it cannot read, so a transient warehouse fault is a successful sync returning nothing). Adding a master token to a wizard-connected Keboola project hands its semantic sync over to that connection's own source under the SAME provenance instead of stopping it — the connection-backed row is created first and only then does the legacy-credentials row step down, so the project's metrics keep syncing under the `source_ref` they already have. Old and new paths are pinned to identical output by a golden regression over the same fixture upstream (`tests/test_semantic_legacy_refresh_migration.py`). Two things stayed on the Keboola side: the login-triggered background sync (Keboola OAuth provisioning) and `GET /api/admin/semantic-layer/coverage`; that sync and the sweep now share ONE single-flight guard, so a login landing mid-sweep skips instead of racing a second upsert+prune pass over the same rows (the sweep reports the source as `skipped_running`). The sweep also keeps the legacy loop's "one upstream project, one importer per run" rule: two connections pointing at the same Keboola project no longer import it twice under two refs — the second is reported `skipped_duplicate_project` and recorded on its source row (`last_sync_status='skipped'`). Because `config.provenance` is what selects whose rows a prune reaches, it is Agnes-managed: `POST`/`PUT /api/admin/semantic-sources` now refuse a config carrying it (`400 provenance_not_settable`), and a stored override must match its source's adapter and its own connection. Sequenced this way on purpose — running the generic sweep beside the legacy refreshes would have written the same upstream twice under two provenance labels. The audit trail moved with the trigger: the sweep writes one `run_semantic_sources_refresh` row per run whose counters mirror its response body exactly, while `run_keboola_semantic_layer_refresh` and `run_databricks_semantic_layer_refresh` have no live writer left — their catalog entries stay registered so the rows an existing instance already wrote keep resolving to a known action instead of going dark in the Activity Center. (#1707 Block 3 steps 3-4.)
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
   The old rule — whichever PR happened to land last with content under
   `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
@@ -947,6 +1058,56 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   denies too — but on an SDK with no `PreToolUse` hook support at all nothing
   can be registered and tool calls run ungated (logged loudly). The `kai-agent`
   provider is unaffected; its engine raises its own approvals.
+- **Testing a non-Keboola data connection no longer fails with a Keboola error.**
+  `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
+  /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and
+  called the Keboola token-verify endpoint for every connection, whatever its
+  source type — so testing a Snowflake connection reported a problem with a field
+  that source type has no concept of, for a connection that may be perfectly
+  healthy. A `snowflake` connection is now actually probed: a session against the
+  account it names, through the same credential resolution and remote-attach host
+  allowlist the extract build uses, reporting `<account>/<database>` on success.
+  Every other type (`databricks`, `bigquery`, …) gets an honest
+  `{"ok": false, "status": "unsupported", "detail": "connection test is not
+  implemented for <type> yet"}` instead of a misleading failure. The Snowflake
+  probe is bounded at 45 seconds and reports a timeout as its own answer —
+  neither the DuckDB Snowflake extension nor the ADBC driver takes a connect
+  deadline, so an unreachable account previously held the admin request open
+  until the socket gave up.
+- **Unregistering a table that belongs to a data package no longer fails with a
+  server error.** `DELETE /api/admin/registry/{id}` (`agnes admin
+  unregister-table`) hit the DuckDB foreign key from `data_package_tables` and
+  answered a raw 500, leaving the table registered; on Postgres, where that
+  column carries no foreign key, the same call succeeded but left the package
+  still "containing" a table that no longer existed. The table's package
+  memberships — and its per-table `resource_grants`, which Postgres already
+  cascaded away and DuckDB did not — are now removed with the registry row on
+  both backends, so a re-registered id can never inherit a deleted table's
+  grants. The same cleanup now covers the two other doors into that delete:
+  `DELETE /api/collections/{id}` (which drops a file collection's derived
+  tables) and the internal-table eviction that runs at startup. How many
+  memberships and grants went with the table is recorded in the
+  `unregister_table` audit row (`package_memberships_removed` /
+  `grants_revoked`).
+- **The semantic auto-draft sweep no longer strands a table it drafted nothing
+  for — nor re-drafts a slow one every tick.** Each selected table is stamped
+  `semantic_draft_pending_at` before its headless drafting session runs, and
+  that stamp is cleared when an admin resolves the suggestion the session
+  filed. A session that ran cleanly but filed no suggestion left the stamp set
+  with nothing that could ever clear it, so the table was silently excluded
+  from every later sweep tick — permanently, without an admin clearing the flag
+  by hand. A table is now a candidate again once its stamp is **older than 7
+  days**, and never-stamped tables are drafted ahead of stale-stamped ones —
+  rather than the stamp being cleared on the way out of the tick, which would
+  have put the same declined tables at the head of the very next batch and
+  starved everything behind them. `POST
+  /api/admin/semantic-auto-draft-sweep` gains a `timed_out` counter alongside
+  `no_apply_call`: a session whose wait hits the per-table timeout keeps its
+  stamp, because the sandbox keeps working on that turn after the sweep stops
+  waiting — un-stamping it made the sweep re-draft the same table on every
+  following tick and file a duplicate pending suggestion each time. A session
+  refused by the chat concurrency cap is still un-stamped immediately, since
+  that one provably never started.
 - **Local dev: `/library` took minutes to load, because `LOCAL_DEV_MODE`
   silently switched on the profiling debug toolbar.** `LOCAL_DEV_MODE=1`
   implied `DEBUG=1`, mounting the FastAPI debug toolbar, whose per-request
@@ -1544,6 +1705,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   indication why.
 
 ### Removed
+- **`agnes admin data-semantics generate` is gone, with no alias.** It
+  scaffolded a pre-Ossie "data-semantics pack" (`<slug>/tables/*.yml`,
+  `metrics/*.yml`, `_brief.md`) into a workspace directory that nothing reads:
+  the semantic layer has been the Ossie document in `semantic_models` since,
+  and an agent's read path is `agnes semantic-model context` / the semantic
+  cache `agnes pull` renders. Removed rather than aliased — an alias would
+  keep teaching a path that leads nowhere. Its engine
+  (`src/data_semantics_scaffold.py`) loses its CLI entry point but stays a
+  live dependency: `src/semantic/cache_render.py` imports `_dump_yaml` /
+  `humanize` from it and runs on the `agnes pull` path. Only the
+  scaffold-specific generation half is a deletion candidate, and only once
+  those shared helpers move to a module of their own.
 - **The Knowledge Layer hero's leftovers.** Retiring it from the chat landing left the parts behind: `macros/_knowledge_layer.html` was still imported by `chat.html` and still defined the whole banner, and ~230 lines of `.klb-*` CSS in `style-custom.css` (plus a dead `.klb-hub-label--lead` block in `chat.css` styling a class no template emitted, and a `.klb-cta` paper-theme override) were still shipped to every page — so the framing could come back through a one-line call. All of it is deleted. The two things inside it that were still doing work survive with names that describe them: the near-white knowledge-surface gradient is now `.cbn--bar`'s own rule (its only consumer, and the fill `.cld-door--lead` deliberately imitates), and the trust caption "Secure. Private. Always in sync." is inlined into `chat.html` as `.cld-trust-claim` — it was a macro only so the hero and this line could share one caption, and its title half was dead code every caller opted out of. `tests/test_web_chat_empty_state.py` now guards the whole `klb` prefix out of the rendered page rather than the four class names someone thought to list.
 - **Two stale pointers into the retired hero.** `setup_advanced.html` sent readers to `/home § "connect your tools"` for Google Workspace setup — a section that page has never had since the orientation pages were consolidated; it now names the two surfaces that actually do the job (add the plugin from your Library, authorize it under My connections). `tour.js`'s "Connect my AI tools" button justified its destination by pointing at a CTA that no longer exists; the destination was and is right, so only the reason changed.
 - **The old page's Keboola-specific "orphaned rows" count, "also connected

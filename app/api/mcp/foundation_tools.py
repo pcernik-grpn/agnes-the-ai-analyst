@@ -28,7 +28,7 @@ from pydantic import Field
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
 
 
 def _raise_for_status_with_detail(r: httpx.Response) -> None:
@@ -76,6 +76,23 @@ def _split_marketplace_id(item_id: str) -> tuple[str, str, str]:
     return "flea", item_id.removeprefix("flea-"), ""
 
 
+# Server-level steering, shown to an MCP client BEFORE it calls anything —
+# the one place to say "look the term up before you compute it". Shared by
+# both transports (SSE `app/api/mcp_http.py`, Streamable-HTTP
+# `app/api/mcp_streamable.py`); they carried byte-identical hand-copies, which
+# is how the 18-of-24 tool drift this module exists to prevent got started.
+# Token-budget sensitive: every client pays for this string on every session.
+SERVER_INSTRUCTIONS = (
+    "Agnes is a self-hosted AI harness for the organization's data, skills, and memory. "
+    "Use `catalog` first to discover available tables, then `schema` to "
+    "understand columns, `describe` for sample rows, and `query` to run SQL. "
+    "For a business term or metric, read its declared definition first — `glossary_search`, "
+    "then `get_semantic_context` — rather than inferring it from table or column names, "
+    "and call `validate_semantic_query` before running SQL that touches modeled data. "
+    "Run `server_info` to check connectivity at the start of a session."
+)
+
+
 FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "server_info",
     "catalog",
@@ -88,7 +105,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # Open semantic-layer contract (Task 12) — read-only search + get over
     # canonical Ossie semantic models. Triple-surface with
     # GET /api/semantic-models/search + GET /api/semantic-models/{slug}.yaml
-    # + `agnes admin semantic-model list/export`.
+    # + `agnes admin semantic list` / `agnes semantic-model export`.
     "semantic_model_search",
     "semantic_model_get",
     # Query-validation engine wiring (wave 3) — validate SQL against the
@@ -160,17 +177,17 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "admin_register_table",
     # Why imported metrics are missing — coverage of each Keboola project's
     # semantic layer against the table registry. Triple-surface with
-    # /api/admin/semantic-layer/coverage + `agnes admin semantic-layer coverage`.
+    # /api/admin/semantic-layer/coverage + `agnes admin semantic keboola-import`.
     "admin_semantic_layer_coverage",
     # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
     # registered tables with NO valid semantic model at all, regardless of
     # which source wrote it. Triple-surface with
-    # /api/admin/semantic-coverage + `agnes semantic-model coverage tables`.
+    # /api/admin/semantic-coverage + `agnes admin semantic coverage tables`.
     "admin_semantic_coverage",
     # Cross-domain, cross-SOURCE completeness (F4.1) — what each connected
     # source lacks in semantics/metrics/glossary/skill/agent/knowledge base.
     # Triple-surface with /api/admin/semantic-model/coverage* + `agnes
-    # semantic-model coverage[ tag| untag]`. The tag/untag pair is NOT
+    # admin semantic coverage[ tag| untag]`. The tag/untag pair is NOT
     # read_only and is deliberately NOT MCP-exempt: CONTRIBUTING.md's only
     # standing exemptions are credential-provisioning writes and
     # security-posture diagnostics, and "low-frequency admin action" is
@@ -406,7 +423,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def catalog() -> dict:
-        """List all tables available to you (RBAC-filtered).
+        """List all tables available to you (RBAC-filtered). Table and column names are not definitions — for what a business term or metric MEANS here, call ``glossary_search`` / ``get_semantic_context`` before writing SQL.
 
         Returns a dict with a ``tables`` list.  Each entry has:
         - ``id``         — use this in schema / describe / query calls
@@ -645,7 +662,9 @@ def register_foundation_tools(
         ``used_metrics``, ``matched_relationships``, ``violations``,
         ``post_execution_checks`` (rules that cannot be checked before
         running — never treated as a violation), ``sql_dialects``,
-        ``mixed_dialect_warning``, ``locally_executable``, ``summary``, plus
+        ``mixed_dialect_warning``, ``locally_executable`` +
+        ``not_executable_metrics`` (which used metrics made it false — name
+        those, not every metric you used), ``summary``, plus
         the ``matched_expected_objects``/``missing_expected_objects``/
         ``unexpected_detected_objects`` trio when ``expected`` was passed.
         When you have no accessible ``status='valid'`` semantic model, this
@@ -1047,7 +1066,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def query(sql: str, limit: int = 1000) -> dict:
-        """Execute a SQL query against Agnes data.
+        """Execute a SQL query against Agnes data. Check SQL that touches modeled data with ``validate_semantic_query`` first; the response may also carry a ``semantic_validation`` field — advisory warnings about the statement, never a block.
 
         For local and materialized tables the query runs against the server-side
         DuckDB view.  For remote (BigQuery) tables it passes through to BigQuery.
@@ -1058,12 +1077,20 @@ def register_foundation_tools(
             limit: Maximum rows to return (default 1000).
 
         Returns ``{"columns": [...], "rows": [[...], ...], "truncated": bool,
-        "row_scope": {"policied_tables": [...], "note": str} | None}``.
+        "row_scope": {"policied_tables": [...], "note": str} | None,
+        "semantic_validation": {...} | None}``.
         ``row_scope`` is present when a table this query touched has an
         access policy applied — the result is YOUR scoped slice, not the
         whole table. When present, state that qualification in your answer;
         never present an aggregate over the result as an organisation-wide
         figure.
+
+        ``semantic_validation`` is present only when the semantic layer has
+        something to say about the statement — an error-severity constraint
+        violation, or a used metric with no expression for the engine that
+        ran it. Enforcement is SOFT: the rows are unaffected and the status
+        is still 200. Its ``warnings`` list is the human-readable form; say
+        the qualification out loud rather than reporting the number alone.
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(
@@ -1073,7 +1100,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             _raise_for_status_with_detail(r)
-            return ensure_output_size(r.json(), "query")
+            return ensure_query_output_size(r.json())
 
     @tool(read_only=True)
     async def skills() -> dict:
@@ -1886,7 +1913,7 @@ def register_foundation_tools(
         semantic layer usually describes more than an instance registers.
 
         Mirrors ``GET /api/admin/semantic-layer/coverage`` and
-        ``agnes admin semantic-layer coverage``.
+        ``agnes admin semantic keboola-import``.
 
         Requires an admin PAT.
         """
@@ -1911,7 +1938,7 @@ def register_foundation_tools(
         table appear in ANY valid model's datasets at all.
 
         Returns ``{"tables": [...]}`` — full table_registry rows. Mirrors
-        ``GET /api/admin/semantic-coverage`` and `agnes semantic-model
+        ``GET /api/admin/semantic-coverage`` and `agnes admin semantic
         coverage tables`.
 
         Requires an admin PAT.
@@ -1950,7 +1977,7 @@ def register_foundation_tools(
                 no connection.
 
         Mirrors ``GET /api/admin/semantic-model/coverage`` and
-        ``agnes semantic-model coverage``.
+        ``agnes admin semantic coverage``.
 
         Requires an admin PAT and the Postgres app-state backend (a DuckDB
         instance answers ``501 requires_postgres_backend``).
@@ -1981,7 +2008,7 @@ def register_foundation_tools(
             source_id: The ``source_connections.id`` the resource is about.
 
         Mirrors ``POST /api/admin/semantic-model/coverage/tags`` and
-        ``agnes semantic-model coverage tag``.
+        ``agnes admin semantic coverage tag``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2008,7 +2035,7 @@ def register_foundation_tools(
                 ``semantic_model_coverage``'s ``domains.<domain>.raw``.
 
         Mirrors ``DELETE /api/admin/semantic-model/coverage/tags/{tag_id}``
-        and ``agnes semantic-model coverage untag``.
+        and ``agnes admin semantic coverage untag``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2036,7 +2063,7 @@ def register_foundation_tools(
                 longer silence anything, but the record of who chose it stands.
 
         Mirrors ``GET /api/admin/semantic-layer/mutes`` and
-        ``agnes semantic-model mutes``.
+        ``agnes admin semantic mutes``.
 
         Requires an admin PAT and the Postgres app-state backend (a DuckDB
         instance answers ``501 requires_postgres_backend``).
@@ -2077,7 +2104,7 @@ def register_foundation_tools(
                 unmutes it". Must be in the future.
 
         Mirrors ``POST /api/admin/semantic-layer/mutes`` and
-        ``agnes semantic-model mute``.
+        ``agnes admin semantic mute``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2100,7 +2127,7 @@ def register_foundation_tools(
             mute_id: The mute's id, from ``semantic_mutes_list``.
 
         Mirrors ``DELETE /api/admin/semantic-layer/mutes/{mute_id}`` and
-        ``agnes semantic-model unmute``.
+        ``agnes admin semantic unmute``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2118,16 +2145,18 @@ def register_foundation_tools(
         """Is the semantic layer trustworthy right now (admin only)?
 
         Sync failures, models whose source was deleted or renamed away from
-        under them, documents that failed schema validation, three static
-        document-quality checks (a metric with no description, one name
-        defined twice with a different formula, a cross-dataset metric with
-        no declared relationship between the datasets it touches),
-        ``semantic_model_coverage``'s missing/partial counts rolled up into
-        one pair of numbers, and every currently active mute — so a finding
-        already silenced by an admin does not get reported as news twice.
+        under them, metric bindings and profiled columns that outlived the
+        table they were bound to, documents that failed schema validation,
+        three static document-quality checks (a metric with no description,
+        one name defined twice with a different formula, a cross-dataset
+        metric with no declared relationship between the datasets it
+        touches), ``semantic_model_coverage``'s missing/partial counts rolled
+        up into one pair of numbers, and every currently active mute — so a
+        finding already silenced by an admin does not get reported as news
+        twice.
 
-        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes
-        semantic-model health``.
+        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes admin
+        semantic health``.
 
         Requires an admin PAT and the Postgres app-state backend (a DuckDB
         instance answers ``501 requires_postgres_backend`` — the mute overlay
@@ -2200,7 +2229,7 @@ def register_foundation_tools(
                 ``resolved``. Omit for every report.
 
         Mirrors ``GET /api/admin/semantic-feedback`` and
-        ``agnes semantic-model feedback list``.
+        ``agnes admin semantic feedback list``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """
@@ -2232,7 +2261,7 @@ def register_foundation_tools(
                 the next reader of the same question can see the answer.
 
         Mirrors ``POST /api/admin/semantic-feedback/{id}/resolve`` and
-        ``agnes semantic-model feedback resolve``.
+        ``agnes admin semantic feedback resolve``.
 
         Requires an admin PAT and the Postgres app-state backend.
         """

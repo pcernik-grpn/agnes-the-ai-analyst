@@ -81,9 +81,19 @@ def _model(
     )
 
 
-def _metric(metric_id: str, *, name: str, sql: str, description: str | None = None) -> None:
+def _metric(
+    metric_id: str,
+    *,
+    name: str,
+    sql: str,
+    description: str | None = None,
+    table_name: str | None = None,
+    tables: list[str] | None = None,
+) -> None:
     from src.repositories import metric_repo
 
+    # Registry-fed source: hand-authored sources are deliberately excluded
+    # from the orphan finder, so seed the provenance it actually inspects.
     metric_repo().create(
         id=metric_id,
         name=name,
@@ -91,7 +101,22 @@ def _metric(metric_id: str, *, name: str, sql: str, description: str | None = No
         category="revenue",
         sql=sql,
         description=description,
+        table_name=table_name,
+        tables=tables,
+        source="keboola_metastore",
     )
+
+
+def _table(table_id: str, *, name: str) -> None:
+    from src.repositories import table_registry_repo
+
+    table_registry_repo().register(id=table_id, name=name, source_type="local", query_mode="local")
+
+
+def _column(table_id: str, column_name: str) -> None:
+    from src.repositories import column_metadata_repo
+
+    column_metadata_repo().save(table_id=table_id, column_name=column_name, basetype="STRING")
 
 
 class TestSyncStatus:
@@ -187,6 +212,51 @@ class TestOrphanedModels:
 
         health = compute_semantic_layer_health()
         assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]
+
+
+class TestOrphanedTableBindings:
+    """Block 5 of #1707 — a delete (or a rename with no cascade) left a
+    metric or a profiled column bound to a table that no longer exists."""
+
+    def test_a_clean_instance_reports_no_orphans(self, pg_state):
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        health = compute_semantic_layer_health()
+        assert health["orphaned_table_bindings"] == []
+
+    def test_a_metric_bound_to_a_deleted_table_is_flagged(self, pg_state):
+        from src.repositories import table_registry_repo
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _table("orders", name="orders")
+        _metric("met1", name="revenue", sql="SELECT SUM(amount) FROM orders", table_name="orders")
+        table_registry_repo().unregister("orders")
+
+        health = compute_semantic_layer_health()
+        assert health["orphaned_table_bindings"] == [
+            {"binding": "metric", "metric_id": "met1", "name": "revenue", "missing_tables": ["orders"]}
+        ]
+
+    def test_a_metric_bound_to_a_live_table_is_not_flagged(self, pg_state):
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _table("orders", name="orders")
+        _metric("met1", name="revenue", sql="SELECT SUM(amount) FROM orders", table_name="orders")
+
+        health = compute_semantic_layer_health()
+        assert health["orphaned_table_bindings"] == []
+
+    def test_columns_for_a_deleted_table_are_flagged_with_a_count(self, pg_state):
+        from src.repositories import table_registry_repo
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _table("orders", name="orders")
+        _column("orders", "id")
+        _column("orders", "total")
+        table_registry_repo().unregister("orders")
+
+        health = compute_semantic_layer_health()
+        assert health["orphaned_table_bindings"] == [{"binding": "column", "table_id": "orders", "column_count": 2}]
 
 
 class TestInvalidModels:
@@ -428,6 +498,7 @@ class TestTheEndpointOnPostgres:
         for key in (
             "sources",
             "orphaned_models",
+            "orphaned_table_bindings",
             "invalid_models",
             "metrics_missing_description",
             "duplicate_metric_names",

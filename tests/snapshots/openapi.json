@@ -8490,6 +8490,18 @@
             "title": "Rows",
             "type": "array"
           },
+          "semantic_validation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semantic Validation"
+          },
           "truncated": {
             "default": false,
             "title": "Truncated",
@@ -26577,7 +26589,7 @@
     },
     "/api/admin/registry/{table_id}": {
       "delete": {
-        "description": "Unregister a table from the system.\n\nFor BQ rows, schedules a background rebuild so the dropped row's\nmaster view is removed from analytics.duckdb (rather than hanging\naround until the next scheduled sync).\n\nFor materialized rows, also removes the canonical parquet at\n`${DATA_DIR}/extracts/<source_type>/data/<id>.parquet` and clears\nthe matching `sync_state` row. Without these two cleanups, the\nmanifest endpoint kept advertising the dropped table to `agnes pull`\n(sync_state-driven) and the orchestrator's next rebuild could\nresurrect a master view from the leftover parquet (E2E sub-agent\nfinding 2026-05-01).",
+        "description": "Unregister a table from the system.\n\nFor BQ rows, schedules a background rebuild so the dropped row's\nmaster view is removed from analytics.duckdb (rather than hanging\naround until the next scheduled sync).\n\nFor materialized rows, also removes the canonical parquet at\n`${DATA_DIR}/extracts/<source_type>/data/<id>.parquet` and clears\nthe matching `sync_state` row. Without these two cleanups, the\nmanifest endpoint kept advertising the dropped table to `agnes pull`\n(sync_state-driven) and the orchestrator's next rebuild could\nresurrect a master view from the leftover parquet (E2E sub-agent\nfinding 2026-05-01).\n\nThe table's `data_package_tables` memberships and `resource_grants`\nrows go with it \u2014 cleared inside `TableRegistryRepository.unregister`\non both backends, since a DELETE that leaves them behind means\nsomething different on DuckDB (a foreign-key violation surfacing as a\nraw 500) than on Postgres (an orphan junction row). See that repo\nmethod's docstring.\n\nHow many of each went with it is recorded in the audit row\n(`package_memberships_removed` / `grants_revoked`, both always present\neven at zero \u2014 same shape as the plugin-disable precedent in\n`app/api/marketplaces.py`). Revoking grants is an access-control\nchange, and without the counts the audit log cannot answer \"who lost\naccess to what\" for the event that caused it.",
         "operationId": "unregister_table_api_admin_registry__table_id__delete",
         "parameters": [
           {
@@ -27346,57 +27358,6 @@
         ]
       }
     },
-    "/api/admin/run-databricks-semantic-layer-refresh": {
-      "post": {
-        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto the semantic layer. See connectors/databricks/semantic_ossie.py for\nthe composition logic and connectors/databricks/semantic_layer.py for\nconnection resolution + the legacy-provenance cutover.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 when the upstream is unreachable, answers\n5xx, or the sync fails for any other reason.",
-        "operationId": "run_databricks_semantic_layer_refresh_api_admin_run_databricks_semantic_layer_refresh_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Run Databricks Semantic Layer Refresh"
-      }
-    },
     "/api/admin/run-jira-consistency-check": {
       "post": {
         "description": "Validate Jira parquet against the Jira API and backfill small gaps.\n\nCompares three sources: Jira API (ground truth), raw JSON, and\nparquet. Auto-fixes small webhook-loss gaps (\u226410 issues); larger\ngaps are reported and require manual review.\n\nCadence: every 30 min by default (SCHEDULER_JIRA_CONSISTENCY_INTERVAL).\nDefault ``max_age_days=30`` keeps the routine cost bounded; an\noperator triggering a deeper validation passes a larger value.",
@@ -27523,57 +27484,6 @@
         "tags": [
           "admin"
         ]
-      }
-    },
-    "/api/admin/run-keboola-semantic-layer-refresh": {
-      "post": {
-        "description": "Sync the configured Keboola project's semantic layer into\nmetric_definitions. See connectors/keboola/semantic_layer.py for the\nmapping/prune logic.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 no Keboola credentials configured, or a token the\nStorage/Metastore API refuses (4xx). 502 only when the upstream is\nunreachable or answers 5xx.",
-        "operationId": "run_keboola_semantic_layer_refresh_api_admin_run_keboola_semantic_layer_refresh_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Run Keboola Semantic Layer Refresh"
       }
     },
     "/api/admin/run-knowledge-digests": {
@@ -27846,6 +27756,57 @@
         ]
       }
     },
+    "/api/admin/run-semantic-sources-refresh": {
+      "post": {
+        "description": "Sync every enabled ``semantic_sources`` row through the shared\ngit/upload/connection import pipeline. Disabled sources are skipped and\ncounted, never synced \u2014 manually or on this schedule. See the module\ndocstring for scope versus the legacy Keboola/Databricks endpoints.\n\n409 if a sweep is already in flight.",
+        "operationId": "run_semantic_sources_refresh_api_admin_run_semantic_sources_refresh_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Semantic Sources Refresh"
+      }
+    },
     "/api/admin/run-session-collector": {
       "post": {
         "description": "Trigger the session-collector job from the scheduler.\n\nWalks /home/*/user/sessions/*.jsonl and copies new files into\n/data/user_sessions/<user>/. Idempotent \u2014 already-collected files\nare skipped.",
@@ -27967,7 +27928,7 @@
     },
     "/api/admin/semantic-auto-draft-sweep": {
       "post": {
-        "description": "Draft a semantic model for tables with zero semantic-layer coverage.\n\nScheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)\n\u2014 admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``\nuncovered, not-already-pending tables (``tables_without_semantic_\ncoverage``, filtered on ``semantic_draft_pending_at IS NULL``), runs a\nheadless ``semantic-model-builder`` chat session (``app.chat.headless.\nrun_one_shot``) authenticated as the non-admin ``semantic-drafter``\nsystem identity (``app.auth.system_users``) \u2014 so every draft it\nproduces lands in the ``authoring_suggestions`` moderation queue\nexactly like a human-submitted proposal, never applied directly.\n\nDedup: each selected table's ``semantic_draft_pending_at`` is stamped\nBEFORE its session is invoked, not after \u2014 a concurrent or overlapping\nsweep tick can then never pick up the same table twice. The flag\nclears when an admin resolves the resulting suggestion, approve or\nreject alike (``app/api/authoring_suggestions.py``).\n\nA session hitting the chat manager's per-user concurrency cap\n(``ConcurrencyCapHit``) is counted and skipped, never raised as a\n500 \u2014 and its dedup flag is cleared again on the way out, so the\ntable stays eligible for a later tick. That un-stamping matters: the\ncap is enforced inside ``ChatManager.create_session``, before the\nprompt is ever sent, so a capped table's session never started and no\nsuggestion will ever exist to clear the flag on resolution. Left set,\nthe flag would exclude the table from every future sweep permanently.\n\nANY other failure from a table's session is treated the same way and\nfor the same reason (counted in ``errored``): the table is un-stamped,\nlogged, and the sweep moves on to the next one rather than letting one\ntransient broker/LLM/spawn error 500 the whole tick and abandon the\nrest of the batch. Un-stamping on an error the session may have\nsurvived can at worst cost a duplicate draft \u2014 one extra queued\nsuggestion an admin rejects \u2014 whereas leaving it stamped costs the\ntable its eligibility forever, silently. The bounded, visible failure\nis the right one to choose.\n\nReturns ``{\"triggered\": N, \"applied\": A, \"no_apply_call\": X,\n\"skipped_cap\": M, \"errored\": E, \"remaining\": R}`` \u2014 ``applied`` counts a table whose\nsession produced a NEW ``authoring_suggestions`` row before this\ncall's wait ended, detected by diffing the semantic-drafter's pending\nsuggestion count immediately before and after each session (sessions\nrun strictly in order, one at a time, so the diff cannot be confused\nby another table's suggestion); ``no_apply_call`` is everything else\nthe session actually ran for. ``remaining`` is how many eligible\ntables were left over after this tick's batch.\n\nA3 PG-first ratchet: the dedup flag this sweep relies on\n(``table_registry.mark_semantic_draft_pending`` /\n``clear_semantic_draft_pending``) is a Postgres-only capability \u2014 the\nDuckDB app-state ladder is frozen at v124 and never gained the backing\ncolumn. On a DuckDB-backend instance this raises\n:class:`~src.repositories.RequiresPostgresBackend`, translated by the\napp-wide handler in ``app/main.py`` into a clean ``501`` naming the\nfeature, before any real work (no chat session, no table scan) runs.",
+        "description": "Draft a semantic model for tables with zero semantic-layer coverage.\n\nScheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)\n\u2014 admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``\nuncovered, eligible tables (``tables_without_semantic_coverage`` narrowed\nand ordered by :func:`_sweep_candidates`), runs a headless\n``semantic-model-builder`` chat session (``app.chat.headless.\nrun_one_shot``) authenticated as the non-admin ``semantic-drafter``\nsystem identity (``app.auth.system_users``) \u2014 so every draft it\nproduces lands in the ``authoring_suggestions`` moderation queue\nexactly like a human-submitted proposal, never applied directly.\n\nDedup: each selected table's ``semantic_draft_pending_at`` is stamped\nBEFORE its session is invoked, not after \u2014 a concurrent or overlapping\nsweep tick can then never pick up the same table twice. The flag\nclears when an admin resolves the resulting suggestion, approve or\nreject alike (``app/api/authoring_suggestions.py``).\n\nRe-eligibility is by stamp AGE, not by clearing the stamp on the way\nout of a tick that filed nothing: a stamp older than\n``_SWEEP_STAMP_RETRY_AFTER_S`` (7 days) makes the table a candidate\nagain, and never-stamped tables sort ahead of stale-stamped ones. That\nis what keeps two things true at once \u2014 a slow session's table is not\nre-drafted while its sandbox is still working on the turn, and a table\nthe drafter keeps declining does not sit at the head of every batch\nforever. See the constant's own comment for the two bugs an immediate\nclear caused.\n\nA session hitting the chat manager's per-user concurrency cap\n(``ConcurrencyCapHit``) is counted and skipped, never raised as a\n500 \u2014 and its dedup flag IS cleared again on the way out, so the\ntable is eligible on the very next tick rather than in a week. That\nun-stamping is safe here and nowhere else: the cap is enforced inside\n``ChatManager.create_session``, before the prompt is ever sent, so a\ncapped table's session provably never started and cannot file anything\nin the background.\n\nANY other failure from a table's session is treated the same way\n(counted in ``errored``): the table is un-stamped, logged, and the\nsweep moves on rather than letting one transient broker/LLM/spawn\nerror 500 the whole tick and abandon the rest of the batch. Un-stamping\non an error the session may have survived can at worst cost a duplicate\ndraft \u2014 one extra queued suggestion an admin rejects \u2014 and unlike the\ntimeout case it is not the routine outcome, so paying for a fast retry\nis the right trade.\n\nReturns ``{\"triggered\": N, \"applied\": A, \"no_apply_call\": X,\n\"timed_out\": T, \"skipped_cap\": M, \"errored\": E, \"remaining\": R}``.\n``applied`` counts a table whose session produced a NEW\n``authoring_suggestions`` row before this call's wait ended, detected\nby diffing the semantic-drafter's pending suggestion count immediately\nbefore and after each session (sessions run strictly in order, one at a\ntime, so the diff cannot be confused by another table's suggestion).\n``timed_out`` counts a session whose wait hit ``_SWEEP_SESSION_TIMEOUT_S``\nwith nothing filed yet \u2014 ``run_one_shot`` reports that by RETURNING\n``timed_out=True`` rather than raising, and the sandbox keeps\nprocessing the turn after it returns, so the table keeps its stamp and\na suggestion may still arrive. ``no_apply_call`` is a session that\ngenuinely finished and chose to file nothing; it keeps its stamp too\nand comes back via the TTL. ``remaining`` is how many eligible tables\nwere left over after this tick's batch.\n\nA3 PG-first ratchet: the dedup flag this sweep relies on\n(``table_registry.mark_semantic_draft_pending`` /\n``clear_semantic_draft_pending``) is a Postgres-only capability \u2014 the\nDuckDB app-state ladder is frozen at v124 and never gained the backing\ncolumn. On a DuckDB-backend instance this raises\n:class:`~src.repositories.RequiresPostgresBackend`, translated by the\napp-wide handler in ``app/main.py`` into a clean ``501`` naming the\nfeature, before any real work (no chat session, no table scan) runs.",
         "operationId": "semantic_auto_draft_sweep_api_admin_semantic_auto_draft_sweep_post",
         "parameters": [
           {
@@ -31546,7 +31507,7 @@
     },
     "/api/admin/source-connections/{connection_id}": {
       "delete": {
-        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.",
+        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.\n\nSuccess carries an ``X-Agnes-Semantic-References`` header \u2014 the number\nof semantic sources/models tied to this connection (Block 5 of #1707).\nA header, not a body field: the response is ``204 No Content`` (pinned\nby ``test_delete_returns_204``), and this is informational only \u2014 it\nnever blocks the delete, unlike the pinned-tables 409 above.",
         "operationId": "delete_connection_api_admin_source_connections__connection_id__delete",
         "parameters": [
           {
@@ -32062,7 +32023,7 @@
     },
     "/api/admin/source-connections/{connection_id}/test": {
       "post": {
-        "description": "Verify connectivity for the connection.\n\nResolves the stack URL and token from the connection row (token_env \u2192\nenvironment lookup, or vault secret), then calls\n``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.\n\nReturns ``{ok: true, project_name: \"\u2026\"}`` on success or\n``{ok: false, error: \"\u2026\"}`` on failure.\n\nIt used to probe ``/v2/storage?exclude=components``, which measured\nverified live (2026-08-10): that endpoint is the unauthenticated stack\nindex \u2014 it answers **200 with no token at all** and carries no ``owner``\nblock. So \"Test\" reported OK for any token, including a garbage one, and\nthe ``project_name`` it returned was always the empty string. Verifying\nthe token is the only probe that answers the question the button asks,\nand it is what makes the project identity below readable at all.",
+        "description": "Verify connectivity for the connection \u2014 per source type.\n\n- ``keboola``: resolves the stack URL and token from the row (token_env\n  \u2192 environment lookup, or vault secret) and calls\n  ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.\n- ``snowflake``: opens a session against the account and reads one row\n  of metadata (:func:`_test_snowflake_connection`).\n- anything else: ``{ok: false, status: \"unsupported\", detail: \"\u2026\"}``\n  naming the type. This branch exists because the handler used to be\n  Keboola-shaped for EVERY row \u2014 it demanded a ``stack_url`` a Snowflake\n  or Databricks connection does not have, so \"Test\" on one of those\n  failed with a message about a field that source type has no concept\n  of, for a connection that may be perfectly healthy. An honest \"not\n  implemented for this type yet\" is a better answer than a confident\n  wrong one.\n\nReturns ``{ok: true, project_name: \"\u2026\"}`` on success or\n``{ok: false, error: \"\u2026\"}`` on failure. Failure is HTTP 200 throughout \u2014\nonly an unknown connection is a status code (404) \u2014 so the unsupported\nanswer keeps that convention rather than minting a new one for its own\ncallers to special-case.\n\nThe Keboola probe used to be ``/v2/storage?exclude=components``, which\nmeasured verified live (2026-08-10): that endpoint is the\nunauthenticated stack index \u2014 it answers **200 with no token at all**\nand carries no ``owner`` block. So \"Test\" reported OK for any token,\nincluding a garbage one, and the ``project_name`` it returned was always\nthe empty string. Verifying the token is the only probe that answers the\nquestion the button asks, and it is what makes the project identity\nbelow readable at all.",
         "operationId": "test_connection_api_admin_source_connections__connection_id__test_post",
         "parameters": [
           {

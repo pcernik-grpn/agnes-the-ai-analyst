@@ -472,6 +472,15 @@ CATALOG: dict[str, AuditEvent] = {
     "run_bq_metadata_refresh": AuditEvent(
         "run_bq_metadata_refresh", "system", "The scheduled BigQuery metadata-cache refresh ran."
     ),
+    "run_semantic_sources_refresh": AuditEvent(
+        "run_semantic_sources_refresh", "system", "The scheduled semantic-sources refresh sweep ran."
+    ),
+    # No live writer since #1707 Block 3 step 4 retired the two per-connector
+    # refresh triggers in favour of `run_semantic_sources_refresh` above. Kept
+    # per this module's append-only contract: rows written under these names
+    # before the migration are still in every existing instance's audit_log,
+    # and removing the key would turn them into unknown actions on the read
+    # side.
     "run_keboola_semantic_layer_refresh": AuditEvent(
         "run_keboola_semantic_layer_refresh", "system", "The scheduled Keboola semantic-layer refresh ran."
     ),

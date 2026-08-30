@@ -236,6 +236,27 @@ def test_column_metadata_save_accepts_source_ref(ctx):
         assert "source_ref" not in listed["region"]
 
 
+def test_column_metadata_list_all_spans_every_table(ctx):
+    """``list_all`` (Block 5 of #1707, orphaned-column detection) is not
+    scoped to one ``table_id`` like ``list_for_table`` — it has to see rows
+    for a table_id that no longer exists in ``table_registry`` at all, which
+    cannot be looked up by the very id that is missing."""
+    repo = ctx.column_metadata()
+    repo.save(table_id="orders", column_name="id", basetype="STRING")
+    repo.save(table_id="customers", column_name="email", basetype="STRING")
+
+    rows = repo.list_all()
+    assert {(r["table_id"], r["column_name"]) for r in rows} == {
+        ("orders", "id"),
+        ("customers", "email"),
+    }
+
+
+def test_column_metadata_list_all_empty_is_empty_list(ctx):
+    repo = ctx.column_metadata()
+    assert repo.list_all() == []
+
+
 # ---------------------------------------------------------------------------
 # usage — emit_server_event (PG port)
 # ---------------------------------------------------------------------------

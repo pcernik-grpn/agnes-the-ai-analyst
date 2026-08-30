@@ -68,6 +68,98 @@ router = APIRouter(tags=["semantic-models"])
 _SWEEP_BATCH_SIZE = 3
 _SWEEP_SESSION_TIMEOUT_S = 60
 
+# How stale a ``semantic_draft_pending_at`` stamp has to be before the sweep
+# treats the table as a candidate again. Seven days, and it is the ONLY thing
+# that re-opens a table whose session ran but filed nothing an admin can
+# resolve.
+#
+# The alternative — clearing the stamp on the way out of such a tick — was
+# wrong twice over. (1) ``run_one_shot`` reports a wait timeout by RETURNING
+# ``timed_out=True``, not by raising, and the sandbox keeps processing the
+# turn after it returns (``app/chat/headless.py``): every session slower than
+# ``_SWEEP_SESSION_TIMEOUT_S`` therefore looked like "filed nothing", got
+# un-stamped, and then filed in the background — so the table was re-drafted
+# on every following tick, one duplicate pending suggestion each. (2) An
+# immediate clear also makes the table eligible again on the very next tick,
+# and with ``list_all()``'s stable order a handful of tables the drafter keeps
+# declining occupy the whole batch forever, starving everything behind them.
+#
+# Seven days is a scheduler-relative number, not a magic one: the sweep fires
+# every 55 minutes, so it is ~180 skipped ticks — long enough that a declined
+# table costs about one retry a week rather than one an hour, short enough
+# that a table the drafter declined because of a transient gap (a missing
+# profile, an empty catalog, a model having a bad day) is not shelved for a
+# quarter. Fresh, never-stamped tables always take the batch ahead of
+# stale-stamped ones, so this retry stream can never starve a new table.
+_SWEEP_STAMP_RETRY_AFTER_S = 7 * 24 * 60 * 60
+
+# Sort sentinel for a never-stamped candidate — see ``_stamp_sort_key``.
+_SWEEP_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _stamp_as_utc(stamp: Any) -> datetime:
+    """Coerce a ``semantic_draft_pending_at`` value to an aware UTC datetime.
+
+    Postgres hands back an aware datetime for its ``timestamptz`` column;
+    the naive and ISO-string branches are defensive (a driver that decodes
+    differently must not crash the sweep), and a naive value is read as UTC
+    because that is what the writer stored.
+    """
+    if isinstance(stamp, str):
+        stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        return stamp.replace(tzinfo=UTC)
+    return stamp.astimezone(UTC)
+
+
+def _stamp_sort_key(stamp: Any) -> tuple[int, datetime]:
+    """Ordering key for one candidate: never-stamped first, then oldest
+    stamp first.
+
+    A single ``(group, when)`` tuple rather than two passes, so ``sorted``'s
+    stability preserves ``list_all()``'s own order inside the unstamped
+    group. Both slots always hold the same types, so the tuples are always
+    comparable (a ``None`` in slot 2 would raise on the first comparison
+    against a datetime).
+    """
+    if stamp is None:
+        return (0, _SWEEP_EPOCH)
+    return (1, _stamp_as_utc(stamp))
+
+
+def _sweep_candidates(tables: list[dict], *, now: datetime | None = None) -> list[dict]:
+    """Filter + order one tick's candidate tables.
+
+    Eligible: no ``semantic_draft_pending_at`` stamp at all, or one older
+    than :data:`_SWEEP_STAMP_RETRY_AFTER_S`. Ordered never-stamped first
+    (see :func:`_stamp_sort_key`), so a backlog of repeatedly-declined
+    tables reclaiming their eligibility can never take the batch away from
+    a table that has not been tried once.
+
+    A stamp that cannot be read at all (unparseable string, odd type) is
+    treated as "stamped and fresh" — the table is skipped this tick. Erring
+    toward skipping is the safe direction: the opposite would draft a table
+    whose session may still be running.
+    """
+    now = now or datetime.now(UTC)
+    eligible: list[dict] = []
+    for table in tables:
+        stamp = table.get("semantic_draft_pending_at")
+        if not stamp:
+            eligible.append(table)
+            continue
+        try:
+            age = (now - _stamp_as_utc(stamp)).total_seconds()
+        except (TypeError, ValueError, AttributeError):
+            logger.warning(
+                "semantic auto-draft sweep: unreadable semantic_draft_pending_at on table %s — skipping this tick",
+                table.get("id"),
+            )
+            continue
+        if age >= _SWEEP_STAMP_RETRY_AFTER_S:
+            eligible.append(table)
+    return sorted(eligible, key=lambda t: _stamp_sort_key(t.get("semantic_draft_pending_at")))
+
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -122,6 +214,37 @@ class SemanticSourceUpdate(BaseModel):
 
 
 _VALID_KINDS = ("git", "upload", "connection")
+
+
+def _assert_no_provenance_override(config: dict | None) -> None:
+    """Refuse an admin-supplied ``config.provenance``.
+
+    ``provenance`` names the ``(source, source_ref)`` pair a source's models,
+    metrics, glossary terms and column descriptions are written AND PRUNED
+    under (see ``src/semantic/transports.py``). It exists for exactly one
+    writer — the auto-migration of the retired per-connector semantic
+    refreshes, which writes its rows through the repository, never through
+    this API — so accepting it here would let an admin-authored source claim
+    a migrated connection's prune scope and have the next sweep delete that
+    connection's rows.
+
+    Refused outright rather than validated: one enforcement story, and no
+    second place the field can enter the system. (``resolve_provenance``
+    still validates every stored override on read — this is the outer wall,
+    not the only one.)
+    """
+    if config and "provenance" in config:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "provenance_not_settable",
+                "hint": (
+                    "config.provenance is managed by Agnes (it is how a source migrated off a retired "
+                    "connector refresh keeps owning the rows it already wrote) and cannot be set through "
+                    "this API. Remove it and register the source normally."
+                ),
+            },
+        )
 
 
 def _assert_known_adapter(name: str) -> None:
@@ -403,9 +526,9 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
 
     Scheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)
     — admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``
-    uncovered, not-already-pending tables (``tables_without_semantic_
-    coverage``, filtered on ``semantic_draft_pending_at IS NULL``), runs a
-    headless ``semantic-model-builder`` chat session (``app.chat.headless.
+    uncovered, eligible tables (``tables_without_semantic_coverage`` narrowed
+    and ordered by :func:`_sweep_candidates`), runs a headless
+    ``semantic-model-builder`` chat session (``app.chat.headless.
     run_one_shot``) authenticated as the non-admin ``semantic-drafter``
     system identity (``app.auth.system_users``) — so every draft it
     produces lands in the ``authoring_suggestions`` moderation queue
@@ -417,34 +540,49 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     clears when an admin resolves the resulting suggestion, approve or
     reject alike (``app/api/authoring_suggestions.py``).
 
+    Re-eligibility is by stamp AGE, not by clearing the stamp on the way
+    out of a tick that filed nothing: a stamp older than
+    ``_SWEEP_STAMP_RETRY_AFTER_S`` (7 days) makes the table a candidate
+    again, and never-stamped tables sort ahead of stale-stamped ones. That
+    is what keeps two things true at once — a slow session's table is not
+    re-drafted while its sandbox is still working on the turn, and a table
+    the drafter keeps declining does not sit at the head of every batch
+    forever. See the constant's own comment for the two bugs an immediate
+    clear caused.
+
     A session hitting the chat manager's per-user concurrency cap
     (``ConcurrencyCapHit``) is counted and skipped, never raised as a
-    500 — and its dedup flag is cleared again on the way out, so the
-    table stays eligible for a later tick. That un-stamping matters: the
-    cap is enforced inside ``ChatManager.create_session``, before the
-    prompt is ever sent, so a capped table's session never started and no
-    suggestion will ever exist to clear the flag on resolution. Left set,
-    the flag would exclude the table from every future sweep permanently.
+    500 — and its dedup flag IS cleared again on the way out, so the
+    table is eligible on the very next tick rather than in a week. That
+    un-stamping is safe here and nowhere else: the cap is enforced inside
+    ``ChatManager.create_session``, before the prompt is ever sent, so a
+    capped table's session provably never started and cannot file anything
+    in the background.
 
-    ANY other failure from a table's session is treated the same way and
-    for the same reason (counted in ``errored``): the table is un-stamped,
-    logged, and the sweep moves on to the next one rather than letting one
-    transient broker/LLM/spawn error 500 the whole tick and abandon the
-    rest of the batch. Un-stamping on an error the session may have
-    survived can at worst cost a duplicate draft — one extra queued
-    suggestion an admin rejects — whereas leaving it stamped costs the
-    table its eligibility forever, silently. The bounded, visible failure
-    is the right one to choose.
+    ANY other failure from a table's session is treated the same way
+    (counted in ``errored``): the table is un-stamped, logged, and the
+    sweep moves on rather than letting one transient broker/LLM/spawn
+    error 500 the whole tick and abandon the rest of the batch. Un-stamping
+    on an error the session may have survived can at worst cost a duplicate
+    draft — one extra queued suggestion an admin rejects — and unlike the
+    timeout case it is not the routine outcome, so paying for a fast retry
+    is the right trade.
 
     Returns ``{"triggered": N, "applied": A, "no_apply_call": X,
-    "skipped_cap": M, "errored": E, "remaining": R}`` — ``applied`` counts a table whose
-    session produced a NEW ``authoring_suggestions`` row before this
-    call's wait ended, detected by diffing the semantic-drafter's pending
-    suggestion count immediately before and after each session (sessions
-    run strictly in order, one at a time, so the diff cannot be confused
-    by another table's suggestion); ``no_apply_call`` is everything else
-    the session actually ran for. ``remaining`` is how many eligible
-    tables were left over after this tick's batch.
+    "timed_out": T, "skipped_cap": M, "errored": E, "remaining": R}``.
+    ``applied`` counts a table whose session produced a NEW
+    ``authoring_suggestions`` row before this call's wait ended, detected
+    by diffing the semantic-drafter's pending suggestion count immediately
+    before and after each session (sessions run strictly in order, one at a
+    time, so the diff cannot be confused by another table's suggestion).
+    ``timed_out`` counts a session whose wait hit ``_SWEEP_SESSION_TIMEOUT_S``
+    with nothing filed yet — ``run_one_shot`` reports that by RETURNING
+    ``timed_out=True`` rather than raising, and the sandbox keeps
+    processing the turn after it returns, so the table keeps its stamp and
+    a suggestion may still arrive. ``no_apply_call`` is a session that
+    genuinely finished and chose to file nothing; it keeps its stamp too
+    and comes back via the TTL. ``remaining`` is how many eligible tables
+    were left over after this tick's batch.
 
     A3 PG-first ratchet: the dedup flag this sweep relies on
     (``table_registry.mark_semantic_draft_pending`` /
@@ -465,7 +603,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     from src.semantic_autodraft import build_trigger_prompt
     from src.semantic_coverage import tables_without_semantic_coverage
 
-    candidates = [t for t in tables_without_semantic_coverage() if not t.get("semantic_draft_pending_at")]
+    candidates = _sweep_candidates(tables_without_semantic_coverage())
 
     manager = get_current_chat_manager()
     if manager is None:
@@ -475,6 +613,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
             "triggered": 0,
             "applied": 0,
             "no_apply_call": 0,
+            "timed_out": 0,
             "skipped_cap": 0,
             "errored": 0,
             "remaining": len(candidates),
@@ -509,6 +648,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     triggered = 0
     applied = 0
     no_apply_call = 0
+    timed_out = 0
     skipped_cap = 0
     errored = 0
 
@@ -516,7 +656,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
         registry.mark_semantic_draft_pending(table["id"])
         before = _pending_count()
         try:
-            await run_one_shot(
+            outcome = await run_one_shot(
                 manager,
                 user_email=SEMANTIC_DRAFTER_USER_EMAIL,
                 agent_id=None,
@@ -558,14 +698,45 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
             continue
         triggered += 1
         if _pending_count() > before:
+            # Filing happens mid-turn, so this is checked before the timeout
+            # branch: a session can land its suggestion and STILL have its
+            # wait time out afterwards. Either way an admin resolution is
+            # now what clears the stamp.
             applied += 1
+        elif (outcome or {}).get("timed_out"):
+            # NOT a failure and NOT "filed nothing": `run_one_shot` returns
+            # `timed_out=True` without raising, and the sandbox keeps
+            # processing the turn after it returns
+            # (`app/chat/headless.py`). Un-stamping here — which is what
+            # the old code did, by discarding this return and falling into
+            # the branch below — let the background session file its
+            # suggestion AFTER the table was made eligible again, so the
+            # next tick drafted it a second time, and the one after that a
+            # third. The stamp stays; if a suggestion does arrive, its
+            # resolution clears it, and if none ever does, the stamp ages
+            # past `_SWEEP_STAMP_RETRY_AFTER_S` and the table comes back.
+            logger.info(
+                "semantic auto-draft sweep: session for table %s is still running past %ss — "
+                "keeping its pending flag so a later tick cannot double-draft it",
+                table["id"],
+                _SWEEP_SESSION_TIMEOUT_S,
+            )
+            timed_out += 1
         else:
+            # The session ran to completion and chose not to submit a
+            # suggestion. The stamp stays here too: an immediate clear made
+            # the table eligible on the very next tick, and a few tables the
+            # drafter keeps declining then hold the whole batch forever
+            # (`list_all()` order is stable), so nothing behind them is ever
+            # reached. `_SWEEP_STAMP_RETRY_AFTER_S` is what brings it back,
+            # behind any table that has never been tried.
             no_apply_call += 1
 
     result = {
         "triggered": triggered,
         "applied": applied,
         "no_apply_call": no_apply_call,
+        "timed_out": timed_out,
         "skipped_cap": skipped_cap,
         "errored": errored,
         "remaining": remaining,
@@ -889,6 +1060,7 @@ async def create_semantic_source(body: SemanticSourceCreate, user: dict = Depend
             detail=f"unknown kind {body.kind!r} (expected one of {', '.join(_VALID_KINDS)})",
         )
     _assert_known_adapter(body.adapter)
+    _assert_no_provenance_override(body.config)
     from uuid import uuid4
 
     source_id = f"ss_{uuid4().hex[:12]}"
@@ -920,6 +1092,7 @@ async def update_semantic_source(source_id: str, body: SemanticSourceUpdate, use
         return repo.get(source_id)
     if fields.get("adapter") is not None:
         _assert_known_adapter(fields["adapter"])
+    _assert_no_provenance_override(fields.get("config"))
     return repo.update(source_id, **fields)
 
 
@@ -931,8 +1104,25 @@ async def delete_semantic_source(source_id: str, user: dict = Depends(require_ad
 
 @router.post("/api/admin/semantic-sources/{source_id}/sync")
 async def sync_semantic_source(source_id: str, user: dict = Depends(require_admin)):
-    if semantic_source_repo().get(source_id) is None:
+    row = semantic_source_repo().get(source_id)
+    if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
+    # `enabled=False` excludes a source from BOTH the scheduled sweep
+    # (app/api/semantic_sources_refresh.py) and this manual escape hatch —
+    # an admin who disabled a source expects nothing to touch it until they
+    # flip it back on.
+    if row.get("enabled") is False:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "source_disabled",
+                "hint": (
+                    f"Semantic source '{source_id}' is disabled and excluded from sync. "
+                    f"Re-enable it first: PUT /api/admin/semantic-sources/{source_id} "
+                    '{"enabled": true}'
+                ),
+            },
+        )
 
     from dataclasses import asdict
 
@@ -1077,6 +1267,116 @@ def _accessible_valid_rows(user: dict, conn: duckdb.DuckDBPyConnection) -> list[
             continue
         rows.append(row)
     return rows
+
+
+# Object detection is best-effort text matching over declared names, not SQL
+# parsing (``src/semantic_validation.py``'s own LIMITATIONS). Said out loud in
+# the payload and in every warning line: a column that shares a metric's name
+# matches too, so an unqualified warning would present a heuristic hit as a
+# confirmed violation.
+_DETECTION_NOTE = "best-effort text match"
+_DETECTION_NOTE_LONG = (
+    "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
+    "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
+)
+
+
+def semantic_validation_for_query(
+    sql: str,
+    user: dict,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    target_engine: str = "duckdb",
+) -> dict[str, Any] | None:
+    """The soft-enforce advisory for ``sql``, or ``None`` when the semantic
+    layer has nothing to say about it.
+
+    Called from the ``POST /api/query`` success path so a caller who never
+    asks for validation still hears about a violated constraint. Enforcement
+    is SOFT by product decision: this returns an advisory that rides an
+    otherwise untouched 200 — it never blocks, never changes a status code,
+    and never alters a row.
+
+    "Something to say" is deliberately narrow, because a field that appears
+    on every query is a field agents learn to ignore:
+
+    * an **error**-severity constraint violation (a warning-severity one is
+      carried along once the advisory exists, but never triggers it on its
+      own), or
+    * a used metric that is not executable on ``target_engine`` — the number
+      the caller just computed is not the declared metric.
+
+    RBAC is the same tier as every other read here (``_can_read_model`` via
+    ``_accessible_valid_documents``): a model the caller cannot read cannot
+    warn them. The cheap existence check runs FIRST — an instance with no
+    valid model at all returns on one ``COUNT(*)``, before a single row's
+    document is loaded or a single per-model grant is resolved. That is the
+    common case, and it is on the latency path of every query on the
+    instance.
+    """
+    # `count_valid()` is the whole reason this is affordable: the question is
+    # "is there a semantic layer at all?", and `list_all()` would answer it by
+    # dragging `document` + `document_json` for every row. It over-counts
+    # rather than under-counts (see the repo docstring) — an over-count costs
+    # the load below, an under-count would silently switch the advisory off.
+    if semantic_model_repo().count_valid() == 0:
+        return None
+    documents = _accessible_valid_documents(user, conn)
+    if not documents:
+        return None
+
+    result = validate_query(sql, documents, target_engine=target_engine)
+    violations = result.get("violations") or []
+    blocking = [v for v in violations if v.get("severity") == "error"]
+    locally_executable = bool(result.get("locally_executable", True))
+    if not blocking and locally_executable:
+        return None
+
+    warnings: list[str] = []
+    for violation in blocking:
+        metrics = ", ".join(str(m) for m in (violation.get("metrics") or [])) or "this query"
+        warnings.append(
+            f"constraint '{violation.get('name')}' on {metrics} ({_DETECTION_NOTE}): {violation.get('reason')}"
+        )
+    if not locally_executable:
+        # Name the metrics that are actually unexecutable, never every metric
+        # the statement mentioned: `revenue` composing fine is not something
+        # to warn about because `margin` next to it does not. The fallback
+        # keeps the sentence honest if the validator ever reports the flag
+        # without the names.
+        offenders = result.get("not_executable_metrics") or result.get("used_metrics") or []
+        used = ", ".join(str(m) for m in offenders) or "a used metric"
+        warnings.append(
+            f"{used} ({_DETECTION_NOTE}): no expression declared for {target_engine} — this result is not the "
+            "declared metric, check `agnes semantic-model context metric` before reporting it"
+        )
+    return {
+        "valid": result.get("valid", True),
+        "warnings": warnings,
+        # How the objects above were detected. Named in the payload AND in
+        # every warning line, because the CLI prints only the warnings: a
+        # column that happens to share a metric's name matches too, and
+        # without this a heuristic hit reads as a confirmed violation.
+        "detection": _DETECTION_NOTE_LONG,
+        # The raw engine output for the two findings above, so a UI can render
+        # more than the prose line. `violations` carries EVERY violation once
+        # the advisory exists (see the docstring) — hiding the advisory-
+        # severity ones next to a blocking one would misreport the total.
+        "violations": violations,
+        # Rules that cannot be checked before running (issue #1707 decision 7:
+        # allowed, not validated, surfaced as information). Forwarded, NEVER
+        # evaluated — this caller has the rows but evaluating a business rule
+        # over them is a different feature with a different failure mode, and
+        # a guessed verdict is exactly what the validator refuses to produce.
+        # They never raise the advisory on their own either (see the trigger
+        # above); they only ride one that already exists.
+        "post_execution_checks": result.get("post_execution_checks") or [],
+        "locally_executable": locally_executable,
+        "not_executable_metrics": result.get("not_executable_metrics") or [],
+        "used_metrics": result.get("used_metrics") or [],
+        "used_datasets": result.get("used_datasets") or [],
+        "summary": result.get("summary", ""),
+    }
 
 
 @router.post("/api/semantic-models/validate-query")

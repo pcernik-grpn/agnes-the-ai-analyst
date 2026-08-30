@@ -244,7 +244,7 @@ def _native_semantic_status(
     if not linked:
         return _domain_result(
             STATUS_MISSING,
-            "no semantic source is linked to this connection — register one with `agnes admin semantic-source add`",
+            "no semantic source is linked to this connection — register one with `agnes admin semantic source add`",
             raw=raw,
         )
 
@@ -571,6 +571,46 @@ def _orphaned_models(models: list[dict[str, Any]], known_source_ids: set) -> lis
     return orphans
 
 
+def _orphaned_table_bindings() -> list[dict[str, Any]]:
+    """Metric bindings and profiled columns still pointing at a
+    ``table_registry`` row that a delete (or a rename that landed under a
+    new id/name) left behind, with no cascade (Block 5 of #1707).
+
+    Same shape as :func:`_orphaned_models`: a flat list of findings under
+    one health-report key, computed fresh every call, never filtered by the
+    mute overlay here (muting happens client-side, matching a finding's
+    scope against the active mute list — see ``admin_semantic_layer.html``'s
+    ``hlIsMuted``). Delegates the actual detection to
+    ``src/semantic/orphans.py``, which is backend-agnostic (none of
+    ``table_registry_repo``/``metric_repo``/``column_metadata_repo`` is
+    Postgres-gated) — this health check just flattens its two-list shape
+    into the one-list-per-check shape every other finding here uses, tagging
+    each entry with which half of the module produced it.
+    """
+    from src.semantic.orphans import find_orphaned_table_bindings
+
+    result = find_orphaned_table_bindings()
+    findings: list[dict[str, Any]] = []
+    for metric in result["orphaned_metrics"]:
+        findings.append(
+            {
+                "binding": "metric",
+                "metric_id": metric["metric_id"],
+                "name": metric.get("name"),
+                "missing_tables": metric["missing_tables"],
+            }
+        )
+    for column in result["orphaned_columns"]:
+        findings.append(
+            {
+                "binding": "column",
+                "table_id": column["table_id"],
+                "column_count": column["column_count"],
+            }
+        )
+    return findings
+
+
 def _invalid_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {"model_id": m["id"], "slug": m.get("slug"), "validation_errors": m.get("validation_errors")}
@@ -700,11 +740,13 @@ def compute_semantic_layer_health() -> dict[str, Any]:
 
     Cross-domain coverage (:func:`compute_cross_domain_coverage`) answers
     "what exists"; this answers "is what exists broken, stale, or internally
-    inconsistent" — sync failures, models that lost their source, documents
-    that failed validation, and three cheap static quality checks over the
-    documents themselves (no description, the same name defined twice, a
-    cross-dataset metric with no declared relationship). All of it feeds one
-    admin screen, one CLI command, one MCP tool.
+    inconsistent" — sync failures, models that lost their source, metric
+    bindings and profiled columns that outlived the table they were bound to
+    (Block 5 of #1707, ``src/semantic/orphans.py``), documents that failed
+    validation, and three cheap static quality checks over the documents
+    themselves (no description, the same name defined twice, a cross-dataset
+    metric with no declared relationship). All of it feeds one admin screen,
+    one CLI command, one MCP tool.
 
     **Postgres-only**: the mute overlay (F4.3) reads ``semantic_health_
     mutes``, which has no DuckDB implementation. Resolved FIRST, before any
@@ -731,6 +773,7 @@ def compute_semantic_layer_health() -> dict[str, Any]:
     return {
         "sources": _sync_status(sources),
         "orphaned_models": _orphaned_models(models, known_source_ids),
+        "orphaned_table_bindings": _orphaned_table_bindings(),
         "invalid_models": _invalid_models(models),
         "metrics_missing_description": _metrics_missing_description(metrics),
         "duplicate_metric_names": _duplicate_metric_names(metrics),

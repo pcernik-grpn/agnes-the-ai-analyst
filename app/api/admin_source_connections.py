@@ -50,13 +50,25 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        registrations — resend with
                                                        ``?confirm_connection_change=true`` to apply (RBAC
                                                        review second round, 2026-08-26; see
-                                                       ``_guard_default_repoint``).
+                                                       ``_guard_default_repoint``). Success (204) carries an
+                                                       ``X-Agnes-Semantic-References`` header — informational
+                                                       only, never blocks the delete (Block 5 of #1707).
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
                                                        kind=master is keboola-only and validated
                                                        live via a verify_token preflight
   DELETE /api/admin/source-connections/{id}/secret  — clear vault secret (?kind=storage|master)
-  POST   /api/admin/source-connections/{id}/test    — verify connectivity; timeout 10s
+  POST   /api/admin/source-connections/{id}/test    — verify connectivity, per source type:
+                                                       ``keboola`` verifies the storage token against
+                                                       ``{stack_url}/v2/storage/tokens/verify`` (10s);
+                                                       ``snowflake`` opens a session against the account
+                                                       and reads one row of metadata
+                                                       (``_test_snowflake_connection``, bounded by
+                                                       ``_SNOWFLAKE_PROBE_TIMEOUT_S``); every other type
+                                                       answers ``{ok: false, status: "unsupported"}``
+                                                       naming the type. Failure is HTTP 200 with
+                                                       ``ok: false`` throughout — only an unknown
+                                                       connection is a status code (404).
   GET    /api/admin/source-connections/{id}/tables  — list buckets/tables for the "add data
                                                        source" wizard; keboola only, REST-only
                                                        admin-UI helper (see _EXEMPT classification
@@ -75,7 +87,7 @@ from uuid import uuid4
 
 import httpx
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -112,6 +124,16 @@ router = APIRouter(prefix="/api/admin/source-connections", tags=["admin"])
 # stalled download turns into the endpoint's 502-with-retry-hint instead of an
 # admin request that never returns.
 CHAT_TOOLS_INTROSPECT_TIMEOUT_S = 300.0
+
+# Ceiling on the Snowflake connectivity probe behind `POST .../{id}/test`.
+# The Keboola branch of the same endpoint has always been 10s-bounded (its
+# `httpx.AsyncClient(timeout=10)`); the Snowflake branch had no bound at all,
+# because neither the DuckDB Snowflake extension nor the ADBC driver takes a
+# connect deadline — an unreachable account held the admin request open until
+# the OS gave up on the socket. Larger than the Keboola figure on purpose: a
+# cold container has to INSTALL and LOAD a community extension before it can
+# dial at all (`discovery._default_attach_fn`), which the HTTP probe does not.
+_SNOWFLAKE_PROBE_TIMEOUT_S = 45.0
 
 # The exact keyword surface of the repos' `upsert`s. A rollback replays rows it
 # read with `get`/`list_for_source`, and those carry `created_at`/`updated_at`
@@ -1044,9 +1066,40 @@ def _resync_derived_chat_tools(connection_id: str) -> None:
         )
 
 
+def _semantic_reference_count(connection_id: str) -> int:
+    """Semantic sources linked to this connection, plus the models fed by
+    them — informational only (Block 5 of #1707's non-destructive-warning
+    leg for the connection-delete surface; see ``src/semantic/orphans.py``
+    for the analogous, also non-blocking, table-delete check).
+
+    A model is credited to the connection two ways, mirroring
+    ``src/semantic/coverage.py``'s own graph: through a linked
+    ``semantic_sources`` row (``config.connection_id == connection_id``,
+    the path every native adapter — Snowflake, Databricks, uploads/git —
+    takes), or directly (``model.source_ref == connection_id``), which is
+    what the Keboola metastore sync stamps
+    (``source='keboola_metastore'``) since it never creates a
+    ``semantic_sources`` row at all.
+    """
+    from src.repositories import semantic_model_repo, semantic_source_repo
+
+    linked_source_ids = {
+        s["id"]
+        for s in semantic_source_repo().list_all()
+        if (s.get("config") or {}).get("connection_id") == connection_id
+    }
+    model_count = sum(
+        1
+        for m in semantic_model_repo().list_all()
+        if m.get("source_ref") in linked_source_ids or m.get("source_ref") == connection_id
+    )
+    return len(linked_source_ids) + model_count
+
+
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
+    response: Response,
     confirm_connection_change: bool = False,
     _user: dict = Depends(require_admin),
 ):
@@ -1056,6 +1109,12 @@ async def delete_connection(
     (``connection_change_affects_registrations`` — second RBAC review round,
     2026-08-26; ``?confirm_connection_change=true`` to apply). See
     :func:`_guard_default_repoint`.
+
+    Success carries an ``X-Agnes-Semantic-References`` header — the number
+    of semantic sources/models tied to this connection (Block 5 of #1707).
+    A header, not a body field: the response is ``204 No Content`` (pinned
+    by ``test_delete_returns_204``), and this is informational only — it
+    never blocks the delete, unlike the pinned-tables 409 above.
     """
     repo = source_connections_repo()
     row = repo.get(connection_id)
@@ -1109,6 +1168,15 @@ async def delete_connection(
         connection_secrets_repo().delete(master_secret_key(connection_id))
     except Exception:
         logger.debug("no master vault secret for connection %s (expected)", connection_id)
+    # Informational only (Block 5 of #1707) — a broken read here must not
+    # turn an otherwise-successful delete into a 500; the row is already
+    # gone by this point, and there is nothing left to retry.
+    try:
+        response.headers["X-Agnes-Semantic-References"] = str(_semantic_reference_count(connection_id))
+    except Exception:
+        logger.warning(
+            "could not compute semantic-reference count for deleted connection %s", connection_id, exc_info=True
+        )
 
 
 async def _store_connection_secret(connection_id: str, row: Dict[str, Any], value: str, kind: str) -> None:
@@ -1881,37 +1949,156 @@ async def disable_chat_tools(
     _remove_chat_tools(connection_id)
 
 
+async def _test_snowflake_connection(connection_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Connectivity check for a ``source_type='snowflake'`` row.
+
+    Opens a session against the account this connection names and reads one
+    row of metadata (``connectors.snowflake.discovery.probe_connection``) —
+    the connector's own credential resolution, attach URL and
+    host-allowlist gate, no new credential path. Blocking DuckDB + ADBC
+    driver work, so it runs off the event loop exactly as the table picker
+    does — and bounded by ``_SNOWFLAKE_PROBE_TIMEOUT_S``, since neither the
+    DuckDB extension nor the ADBC driver takes a connect deadline of its own.
+
+    Three failure classes, kept apart on purpose:
+
+    - :class:`~connectors.snowflake.discovery.RemoteAttachHostNotAllowed` —
+      an operator misconfiguration whose message already names the env var
+      to fix, so it passes through verbatim. This used to be a bare
+      ``except ValueError``, which also swallowed the rejected-identifier
+      and unparseable-key ``ValueError``s from the same call path and
+      echoed their raw library text to the admin unclassified.
+    - a wait timeout — reported as its own sentence, because "we gave up
+      waiting" and "the account said no" point the operator at completely
+      different things.
+    - everything else — classified to one sentence, full driver text to the
+      log only.
+
+    Same answer shape as the Keboola branch (``{ok, project_name}`` /
+    ``{ok, error}``). ``project_name`` carries ``<account>/<database>``:
+    a green check that does not say WHICH account answered cannot rule out
+    the one failure worth ruling out.
+    """
+    from connectors.snowflake import discovery
+    from connectors.snowflake.discovery import RemoteAttachHostNotAllowed
+
+    try:
+        probe = await asyncio.wait_for(
+            run_in_threadpool(discovery.probe_connection, row),
+            timeout=_SNOWFLAKE_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # The worker thread is abandoned, not killed — the driver keeps
+        # dialling until its own socket gives up, and its result is
+        # discarded. Bounding the WAIT is the part that matters: it is what
+        # stops one unreachable account from holding an admin request (and
+        # a worker) open indefinitely, and it is all that can be bounded
+        # from here, since the DuckDB/ADBC call takes no deadline.
+        # `:g` so a whole-number ceiling reads "45s", not "45.0s" — the
+        # constant is a float because `asyncio.wait_for` takes one.
+        logger.warning(
+            "connection test for %s (snowflake): timed out after %gs",
+            connection_id,
+            _SNOWFLAKE_PROBE_TIMEOUT_S,
+        )
+        return {
+            "ok": False,
+            "error": (
+                f"connection test timed out after {_SNOWFLAKE_PROBE_TIMEOUT_S:g}s — the account did not "
+                "answer. Check the account identifier, the warehouse state and network reachability, "
+                "then try again."
+            ),
+        }
+    except RemoteAttachHostNotAllowed as exc:
+        # Raised before any session is opened, so nothing went out; the
+        # message names the allowlist env var, so it is worth showing as-is.
+        logger.info("connection test for %s (snowflake): refused — %s", connection_id, exc)
+        return {"ok": False, "error": str(exc)[:300]}
+    except Exception as exc:  # noqa: BLE001 — reported, never raised
+        # The full driver text (SQLSTATE, Snowflake error code, request id)
+        # is what an operator needs and goes to the log; the caller gets the
+        # classified one-sentence version, same split the browse endpoint
+        # makes (`app/api/admin_source_discovery.py`). Plain `ValueError`s
+        # land here too, deliberately — see the docstring.
+        from app.api.admin_source_discovery import _classify_snowflake_error
+
+        logger.warning("connection test for %s (snowflake): failed — %s", connection_id, exc)
+        return {"ok": False, "error": _classify_snowflake_error(exc)}
+
+    if probe is None:
+        logger.info("connection test for %s (snowflake): not configured", connection_id)
+        return {
+            "ok": False,
+            "error": (
+                "no credential available for this connection (vault empty, no allowlisted "
+                "secret-ref env var) — store one via PUT .../secret, or complete "
+                "config.account/user/database/warehouse"
+            ),
+        }
+
+    logger.info("connection test for %s (snowflake): ok", connection_id)
+    return {"ok": True, "project_name": f"{probe['account']}/{probe['database']}"}
+
+
 @router.post("/{connection_id}/test")
 async def test_connection(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
-    """Verify connectivity for the connection.
+    """Verify connectivity for the connection — per source type.
 
-    Resolves the stack URL and token from the connection row (token_env →
-    environment lookup, or vault secret), then calls
-    ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.
+    - ``keboola``: resolves the stack URL and token from the row (token_env
+      → environment lookup, or vault secret) and calls
+      ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.
+    - ``snowflake``: opens a session against the account and reads one row
+      of metadata (:func:`_test_snowflake_connection`).
+    - anything else: ``{ok: false, status: "unsupported", detail: "…"}``
+      naming the type. This branch exists because the handler used to be
+      Keboola-shaped for EVERY row — it demanded a ``stack_url`` a Snowflake
+      or Databricks connection does not have, so "Test" on one of those
+      failed with a message about a field that source type has no concept
+      of, for a connection that may be perfectly healthy. An honest "not
+      implemented for this type yet" is a better answer than a confident
+      wrong one.
 
     Returns ``{ok: true, project_name: "…"}`` on success or
-    ``{ok: false, error: "…"}`` on failure.
+    ``{ok: false, error: "…"}`` on failure. Failure is HTTP 200 throughout —
+    only an unknown connection is a status code (404) — so the unsupported
+    answer keeps that convention rather than minting a new one for its own
+    callers to special-case.
 
-    It used to probe ``/v2/storage?exclude=components``, which measured
-    verified live (2026-08-10): that endpoint is the unauthenticated stack
-    index — it answers **200 with no token at all** and carries no ``owner``
-    block. So "Test" reported OK for any token, including a garbage one, and
-    the ``project_name`` it returned was always the empty string. Verifying
-    the token is the only probe that answers the question the button asks,
-    and it is what makes the project identity below readable at all.
+    The Keboola probe used to be ``/v2/storage?exclude=components``, which
+    measured verified live (2026-08-10): that endpoint is the
+    unauthenticated stack index — it answers **200 with no token at all**
+    and carries no ``owner`` block. So "Test" reported OK for any token,
+    including a garbage one, and the ``project_name`` it returned was always
+    the empty string. Verifying the token is the only probe that answers the
+    question the button asks, and it is what makes the project identity
+    below readable at all.
     """
     row = source_connections_repo().get(connection_id)
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
 
+    # Audit before the source-type fork so every probe — Keboola, Snowflake,
+    # or an unsupported type — leaves the same one trail entry.
     log_safe(
         user_id=_user.get("id"),
         action="source_connection.test",
         resource=f"source_connection:{connection_id}",
     )
+
+    source_type = (row.get("source_type") or "").strip().lower()
+    if source_type == "snowflake":
+        return await _test_snowflake_connection(connection_id, row)
+    if source_type != "keboola":
+        named = source_type or "unknown"
+        logger.info("connection test for %s: unsupported source_type %s", connection_id, named)
+        return {
+            "ok": False,
+            "status": "unsupported",
+            "detail": f"connection test is not implemented for {named} yet",
+        }
 
     config = row.get("config") or {}
     try:

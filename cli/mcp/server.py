@@ -1,28 +1,33 @@
-"""Agnes MCP server.
+"""Agnes stdio MCP server — INTERNAL tool channel, not an end-user surface.
 
-Runs as an stdio subprocess started by Claude Desktop.  All tools have
-full network access to the Agnes server — unlike the Bash tool sandbox,
-which blocks outbound HTTP.
+Runs as an stdio subprocess (``agnes mcp``). Two callers start it, and both
+do the wiring themselves:
 
-Usage:
-    agnes mcp                   # starts the MCP server (stdio transport)
+  * the hosted chat sandbox, once per session
+    (``app/chat/runner.py::_agnes_mcp_servers``);
+  * ``agnes global enable``, which registers it as a user-scope MCP server in
+    Claude Code (``cli/commands/global_scope.py``).
 
-Claude Desktop wires this via .claude/settings.json:
-    {
-      "mcpServers": {
-        "agnes": {
-          "command": "/path/to/agnes",
-          "args": ["mcp"],
-          "type": "stdio"
-        }
-      }
-    }
+#1707 Block 6 retired it as a *documented* path: setting it up by hand was an
+experiment, and the supported way for an external MCP client to reach Agnes
+is the server's own HTTP transports (``app/api/mcp_http.py`` /
+``mcp_streamable.py``, whose tools are defined once in
+``app/api/mcp/foundation_tools.py``). The SERVER invocation is therefore
+unadvertised — its explicit spelling ``agnes mcp serve`` is registered
+``hidden=True`` and the group's help leads with the connection commands —
+while staying fully functional. The ``agnes mcp`` GROUP itself stays visible:
+``connect``/``disconnect``/``my-secret`` are supported user commands.
 
-The setup.py inside the Cowork bundle detects the agnes binary path at
-install time and writes the mcpServers block with the correct absolute path.
+**Its tool set is deliberately closed.** New tools — semantic-layer tools in
+particular — go to the HTTP foundation surface only; the exact set here is
+pinned by ``tests/test_mcp_tool_parity.py::STDIO_TOOL_NAMES``, so adding one
+is a conscious edit, not a drift. What lives here is what genuinely needs a
+local process: filesystem-touching (``pull``, ``query_local``,
+``chat_upload_file``) and the in-chat data-app authoring/preview loop.
 
-Credentials are read from ~/.config/agnes/config.yaml (server URL) and
-~/.config/agnes/token.json (PAT) — the same files written by setup.py.
+All tools have full network access to the Agnes server — unlike the Bash
+tool sandbox, which blocks outbound HTTP. Credentials are read from
+~/.config/agnes/config.yaml (server URL) and ~/.config/agnes/token.json (PAT).
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from cli.config import get_server_url, get_token
 from cli.query_hints import missing_table, remote_table_hint
 from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
 from src.duckdb_conn import _open_duckdb
-from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
 from src.remote_engines import strip_one_trailing_semicolon
 
 mcp = FastMCP(
@@ -357,11 +362,20 @@ def query(sql: str, limit: int = 1000) -> dict:
         limit: Maximum rows to return (default 1000).
 
     Returns ``{"columns": [...], "rows": [[...], ...], "truncated": bool,
-    "row_scope": {"policied_tables": [...], "note": str} | None}``.
+    "row_scope": {"policied_tables": [...], "note": str} | None,
+    "semantic_validation": {...} | None}``.
     ``row_scope`` is present when a table this query touched has an access
     policy applied — the result is YOUR scoped slice, not the whole table.
     When present, state that qualification in your answer; never present an
     aggregate over the result as an organisation-wide figure.
+
+    ``semantic_validation`` is present only when the server's semantic layer
+    has something to say about the statement — an error-severity constraint
+    violation, or a used metric with no expression for the engine that ran
+    it. Enforcement is SOFT: the rows are unaffected. Its ``warnings`` list
+    is the human-readable form; say the qualification out loud rather than
+    reporting the number alone. Check a statement up front with
+    ``agnes semantic-model validate-query "<SQL>"``.
 
     Tips:
     - Always run ``catalog()`` first to know what tables exist.
@@ -374,7 +388,11 @@ def query(sql: str, limit: int = 1000) -> dict:
         result = api_post_json("/api/query", {"sql": sql, "limit": limit})
     except V2ClientError as exc:
         raise ValueError(_mcp_error("query", exc)) from exc
-    return ensure_output_size(result, "query")
+    # Advisory-aware cap: `semantic_validation` is shortened, then dropped,
+    # before the rows are — an advisory must never fail a query that would
+    # otherwise have returned. Same helper the HTTP foundation tool uses, so
+    # a borderline result behaves identically on both transports.
+    return ensure_query_output_size(result)
 
 
 @tool(read_only=True)

@@ -76,18 +76,81 @@ A source is where documents come from. Three kinds:
 | `connection` | connector-specific | The adapter fetches from a configured data-source connection |
 
 ```bash
-agnes admin semantic-source add --kind git \
+agnes admin semantic source add --kind git \
   --name "Finance models" \
   --repo-url https://example.com/semantics.git \
   --ref main --glob 'semantic/**/*.yaml'
 
-agnes admin semantic-source sync <source-id>
+agnes admin semantic source sync <source-id>
 ```
 
 A sync that cannot fetch **fails loudly and imports nothing**. This matters more
 than it sounds: an empty document list legitimately means "upstream deleted
 everything", which prunes. A failed clone must never be able to present itself
 as an empty source, so the error is recorded on the source row and re-raised.
+
+### Scheduled refresh
+
+Every registered source — regardless of kind — is also synced automatically by
+`POST /api/admin/run-semantic-sources-refresh`, on a cadence set by
+`SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL` (default 6 h). One failing
+source never stops the sweep over the rest; each source's own
+`last_sync_at`/`last_sync_status`/`last_sync_error` (surfaced on `GET
+/api/admin/semantic-sources` and in Health, below) still reflects only its own
+outcome.
+
+`enabled: false` (`--disabled` on `add`, or `PUT .../sources/{id}` with
+`enabled: false`) excludes a source from **both** this scheduled sweep and the
+manual `agnes admin semantic-source sync <id>` / `POST .../sources/{id}/sync`
+— a disabled source's manual sync now answers `409 source_disabled` instead of
+running. Re-enable it (`enabled: true`) to bring it back into rotation for
+both paths.
+
+This is the path for `git`/`upload`/`connection` sources alike, and since
+#1707 Block 3 it is the ONLY scheduled semantic refresh. The Keboola and
+Databricks connectors used to run their own, longer-standing ones (`POST
+/api/admin/run-keboola-semantic-layer-refresh` /
+`.../run-databricks-semantic-layer-refresh`); both endpoints and both
+scheduler entries are gone.
+
+Their sync logic is not: the same adapters compose the same documents and the
+same central projector writes them. Only the trigger moved, and an operator
+has nothing to do — every sweep first registers the sources those triggers
+implied (`src/semantic/legacy_migration.py`):
+
+| Legacy trigger | Auto-registered as | Provenance of the rows it writes |
+|---|---|---|
+| Keboola Metastore refresh | one `connection` source per Keboola connection holding a master token (`keboola_<connection id>`), or one for the legacy `KEBOOLA_STACK_URL`/`KEBOOLA_STORAGE_TOKEN` pair when no connection has one | unchanged: `source='keboola_metastore'`, `source_ref=<connection id>` — carried by a `config.provenance` override |
+| Databricks metric-view refresh | the workspace, when one is configured (`databricks_default`) | unchanged: `source='ossie_connection'`, `source_ref='databricks_default'` |
+
+The provenance override is why an upgrade is a no-op for what is *stored*:
+every semantic model, metric, glossary term and column description is owned
+by its `(source, source_ref)` pair, and re-importing the same upstream under
+a new label would orphan every existing row and write a duplicate beside it.
+A migrated Keboola source also carries `config.safe_prune: true`, the
+full-wipe guard that sync has always used — an upstream answering with
+nothing usable must not delete an installation's whole metric registry.
+
+Registration is idempotent and never a get-or-*replace*: a source an admin
+renamed, re-scoped or disabled stays exactly as they left it.
+
+**`config.provenance` is Agnes-managed and not admin-writable.** It names the
+`(source, source_ref)` pair a source's rows are written *and pruned* under, so
+a source allowed to claim an arbitrary one could delete another connection's
+models, metrics, glossary terms and column descriptions. `POST`/`PUT
+/api/admin/semantic-sources` refuse a config carrying it (`400
+provenance_not_settable`), and a stored override is validated on every sync:
+the label must be a migrated legacy one, the source must run that label's
+adapter, and the `source_ref` must be the source's own connection (or, for the
+legacy env-credential row, the pair that path has ever stamped).
+
+Two things the sweep skips rather than syncs, both carried over from guards
+the retired triggers had built in:
+
+| Skip | When | Where it shows |
+|---|---|---|
+| `skipped_running` | a Keboola source whose rows the login-triggered sync (`run_semantic_layer_refresh_background`) is writing right now — the two share one single-flight guard, so they can never overlap | the sweep's response only; the row keeps its last real sync state and the next sweep picks it up |
+| `skipped_duplicate_project` | a second source resolving to the SAME upstream Keboola project as one already imported this sweep (two connections may point at one project) — importing both would write one project's rows under two refs that then delete each other's | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
 
 ## Adapters — adding a source format
 
@@ -123,6 +186,23 @@ which is a lie the moment one does.
 An adapter name that nothing is registered under is refused at registration
 (`400`, naming the adapters that do exist) rather than at the first sync.
 
+### `keboola_metastore`
+
+A `connection`-kind source whose config carries only scope — never
+credentials. Either `connection_id` (a registered Keboola connection; its
+master (owner) Storage token is read from that connection's own vault slot)
+or `legacy_credentials: true` (the `KEBOOLA_STACK_URL` /
+`KEBOOLA_STORAGE_TOKEN` pair). Registering one by hand is rarely needed: the
+scheduled sweep registers one per master-token connection automatically (see
+*Scheduled refresh* above).
+
+Before each fetch the adapter runs the two preflight checks this sync has
+always run — the token must be a master token (the Metastore rejects anything
+else with an opaque error) and it must open the project its connection is
+bound to. Either failing records the error on the source row and imports
+nothing, rather than filing another project's semantic layer under this
+connection's provenance.
+
 ### `snowflake_semantic`
 
 Register it as a `connection`-kind source; the config carries only scope, never
@@ -130,7 +210,7 @@ credentials — those resolve from the instance's Snowflake connection like ever
 other Snowflake code path:
 
 ```bash
-agnes admin semantic-source add --kind connection --name "Snowflake semantic views" \
+agnes admin semantic source add --kind connection --name "Snowflake semantic views" \
     --adapter snowflake_semantic
 ```
 
@@ -177,17 +257,17 @@ place a workspace token is stored. Register it the same way as the Snowflake
 adapter:
 
 ```bash
-agnes admin semantic-source add --kind connection --name "Databricks semantics" \
+agnes admin semantic source add --kind connection --name "Databricks semantics" \
     --adapter databricks_metric_views
 ```
 
-The scheduled refresh (`POST /api/admin/run-databricks-semantic-layer-refresh`,
+The scheduled refresh (`POST /api/admin/run-semantic-sources-refresh`,
 see [`DATA_SOURCES.md`](DATA_SOURCES.md#semantic-layer-sync-unity-catalog-metric-views))
-registers this source automatically under a fixed id (`databricks_default`) if
-it does not already exist — manual registration through the CLI, or the
-connect wizard's "Also sync semantic views" opt-in, is only needed to pin a
-specific `connection_id` or a second, differently-scoped source (e.g. a
-narrower `config.catalogs`).
+registers this source automatically under a fixed id (`databricks_default`)
+if a workspace is configured and it does not already exist — manual
+registration through the CLI, or the connect wizard's "Also sync semantic
+views" opt-in, is only needed to pin a specific `connection_id` or a second,
+differently-scoped source (e.g. a narrower `config.catalogs`).
 
 Optional scope keys in `config`: `catalogs` (a list; or the single `catalog`,
 defaulting to the connection's own catalog / `semantic_layer_catalogs`) and
@@ -227,15 +307,25 @@ Every projected row is stamped with the model's `source` and `source_ref`, and a
 sync prunes only within its own `(source, source_ref)`. Two sources can never
 delete each other's rows.
 
-One documented exception: `column_metadata` has no `source_ref` column, so column
-descriptions prune at `(table_id, source)` granularity. Two sources sharing a
-`source` value *and* describing the same physical table can prune each other's
-column descriptions. Metrics and glossary terms are unaffected.
+One documented exception: column descriptions prune at `(table_id, source)`
+granularity, so two writers sharing a `source` value *and* describing the same
+physical table prune each other's column descriptions. Metrics and glossary terms
+are unaffected.
+
+This is not hypothetical, and it does not need an exotic setup: `source` is the
+source *kind*, not the source. Two registered semantic sources of the same kind
+(both `ossie_git`) or two Keboola connections (both `keboola_metastore`) already
+share one `source` value, so whichever syncs last wins for any table both
+describe. `column_metadata.source_ref` exists on Postgres and the projector
+records it; the prune does not read it yet, because the frozen DuckDB app-state
+schema has no such column and cannot gain one — closing the gap means accepting
+a per-backend difference in what a sync deletes, which is a decision, not a
+detail.
 
 ## Export
 
 ```bash
-agnes admin semantic-model export retail > retail.yaml
+agnes semantic-model export retail > retail.yaml
 ```
 
 Or over HTTP, gated on a grant for a Data Package the model is linked to (or a
@@ -275,6 +365,32 @@ accessible valid models the response is `{"available": false, "error":
 all-clear — do not read a missing `available` (or `available: true`) as
 "no semantic layer configured".
 
+Validation also happens **without being asked**. `POST /api/query` runs the
+same check over the caller's readable models after a statement succeeds and
+attaches `semantic_validation` to the response — but only when there is
+something to say: an `error`-severity constraint violation, or a used metric
+with no expression for the engine that actually ran the statement (DuckDB,
+BigQuery, or a Databricks warehouse). A clean query, a caller who can read no
+model, and an instance with no semantic layer all return `null`, so the field
+appearing means something. Enforcement is **soft** by design — the rows are
+untouched, the status stays `200`, and a failure of the check itself is
+swallowed (logged, field omitted) rather than costing the caller their
+result. `agnes query` prints each warning to stderr as `[semantic] …`, and the
+MCP `query` tools (both transports) pass the field through — shortening, then
+dropping, the advisory rather than letting it push a deliverable result over
+the tool output cap, which raises rather than truncating. An advisory must
+never fail a query.
+
+Read it as a prompt to check, not as proof. Object detection is a
+best-effort text match on declared names, not SQL parsing, so a column or
+alias that happens to share a metric's name matches too; the payload says so
+in `detection` and every warning line repeats it. Only the metrics that are
+actually unexecutable are named (`not_executable_metrics`), never every
+metric the statement mentioned. `post_execution_checks` — rules that cannot
+be checked before running — ride along as **information**: this caller has
+the rows but deliberately does not evaluate a business rule over them, and
+they never raise the advisory on their own.
+
 Constraints have no slot in core Ossie, so they ride `custom_extensions`
 under the Agnes vendor name, and the key naming the rule kind is
 `constraint_type` — the same key the Keboola adapter composes, the projector
@@ -289,7 +405,7 @@ custom_extensions:
        "rule": "region = 'EU'", "severity": "error", "metrics": ["revenue"]}]}
 ```
 
-Not to be confused with `agnes admin semantic-model validate <file>` below,
+Not to be confused with `agnes semantic-model validate <file>` below,
 which schema-checks a *document*, offline, before it is ever stored.
 
 ## Coverage: what each source still lacks
@@ -332,6 +448,12 @@ stale, or internally inconsistent" — a different question, in one response:
   source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
   not cascade to the models it fed, so a project can vanish and leave its
   models silently pointing at nothing.
+- **`orphaned_table_bindings`** — the same shape of gap, one hop over: a
+  `metric_definitions` row bound by name (`table_name`/`tables[]`) or a
+  `column_metadata` row bound by id (`table_id`) to a `table_registry` row
+  that no longer exists — unregistering (or renaming) a table has no cascade
+  either. Detection only (`src/semantic/orphans.py`); nothing here deletes
+  the dangling metric/column rows, and a table delete is never blocked on it.
 - **`invalid_models`** — documents with `status='invalid'`, and why.
 - **Three static, document-only quality checks**, none of which touch live
   data: `metrics_missing_description` (a formula with no business decision
@@ -384,7 +506,7 @@ somebody unmutes it. Expired mutes drop out of the default list but stay
 readable with `?include_expired=true` / `--include-expired` — the silence ends
 at the expiry, the record of who chose it does not.
 
-Muting is admin-only on every surface (UI, `agnes semantic-model
+Muting is admin-only on every surface (UI, `agnes admin semantic
 mute/unmute/mutes`, MCP `mute_semantic_check` / `unmute_semantic_check` /
 `semantic_mutes_list`, REST), and both mutations are audit-logged.
 `semantic_health_mutes` is **Postgres-only** (see `docs/migrations.md` →
@@ -410,7 +532,8 @@ Four surfaces file the same report, on purpose:
   user agrees: reporting silently on someone's behalf and waiting for the user
   to remember are both wrong. (The matching workspace-prompt sentence ships
   with the agent-grounding rules.)
-- **CLI** — `agnes semantic-model feedback submit/list/resolve`.
+- **CLI** — `agnes semantic-model feedback submit` for anyone signed in;
+  `agnes admin semantic feedback list/resolve` for the queue.
 - **REST** — the endpoints above; the only surface that also accepts
   `model_content_hash`, which pins the report to the document version that
   produced the answer.
@@ -424,32 +547,94 @@ report was filed.
 
 ## Commands
 
+Two groups, split by who may run them — not by which endpoint family they
+happen to call.
+
+**`agnes semantic-model` — anyone signed in.** RBAC is per model (a Data
+Package grant or a direct model grant), so these show exactly what the caller
+can already read.
+
 ```bash
-agnes admin semantic-model list [--json] [--limit N]
-agnes admin semantic-model show <slug>
-agnes admin semantic-model import <file>
-agnes admin semantic-model export <slug>
-agnes admin semantic-model validate <file>   # offline: no server, no token
+agnes semantic-model search <term> [--limit N] [--json]   # find models you can read
+agnes semantic-model show <slug> [--json]                 # provenance, status, content hash
+agnes semantic-model export <slug> [-o FILE]              # the document, byte for byte
 
-agnes admin semantic-source add ... | list | sync <id>
+agnes semantic-model validate <file>          # offline: no server, no token
+agnes semantic-model validate-query "<SQL>"   # see "Query validation" above
+agnes semantic-model apply <file> [--description ...] [--expect-hash <hash>]
 
-agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
-
-agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
-agnes semantic-model coverage tag <type> <resource-id> <source-id>
-agnes semantic-model coverage untag <tag-id>
-agnes semantic-model coverage tables [--limit N] [--json]   # source-agnostic: tables with NO model at all
-
-agnes semantic-model health [--json]   # admin, see "Health" above
-
-agnes semantic-model mute <scope> [--reason "..."] [--expires <ISO8601>]  # admin
-agnes semantic-model unmute <mute-id>                                    # admin
-agnes semantic-model mutes [--include-expired] [--json]                  # admin
+agnes semantic-model context dataset|metric|relationship [--id ...] [--model ...]
+agnes semantic-model schema dataset metric relationship
 
 agnes semantic-model feedback submit "<question>" [--sql ...] [--metric ...] [--comment ...]
-agnes semantic-model feedback list [--status open] [--json]   # admin
-agnes semantic-model feedback resolve <id> [--note "..."]     # admin
 ```
 
 `validate` deliberately needs neither a server nor a token — someone fixing a
-document should not need an instance to check their work.
+document should not need an instance to check their work. It is **not**
+`validate-query`: `validate` checks whether a *document file* is well-formed;
+`validate-query` checks whether a *SQL statement* obeys the models you can
+read, and needs a server.
+
+`apply` is the write path for everyone: an admin's document goes live, anyone
+else's is queued for admin moderation (the command labels which happened).
+
+**`agnes admin semantic` — admin only.** Everything that changes what the
+layer is, or reports on how healthy it is.
+
+```bash
+agnes admin semantic list [<term>] [--limit N] [--json]   # every model, any status
+agnes admin semantic show <id|slug> [--json]
+agnes admin semantic import <file>
+agnes admin semantic delete <id|slug> [--yes]
+agnes admin semantic detach|reattach <id|slug> [--yes]
+agnes admin semantic link-package|unlink-package <slug> <package-id>
+
+agnes admin semantic source add --kind git|upload|connection --name "..." [...]
+agnes admin semantic source list [--enabled-only] [--json]
+agnes admin semantic source sync <id>
+agnes admin semantic source rm <id> [--yes]     # unregisters the source; keeps its models
+
+agnes admin semantic coverage [--source <id>] [--json]   # PER SOURCE × domain grid
+agnes admin semantic coverage tag <type> <resource-id> <source-id>
+agnes admin semantic coverage untag <tag-id>
+agnes admin semantic coverage tables [--limit N] [--json]  # PER TABLE: no model at all
+agnes admin semantic keboola-import [--json] [--limit N]   # PER KEBOOLA PROJECT: what would import
+
+agnes admin semantic health [--json]
+agnes admin semantic mute <scope> [--reason "..."] [--expires <ISO8601>]
+agnes admin semantic unmute <mute-id>
+agnes admin semantic mutes [--include-expired] [--json]
+
+agnes admin semantic feedback list [--status open] [--json]
+agnes admin semantic feedback resolve <id> [--note "..."]
+```
+
+The three reports are three different questions, which is why
+`keboola-import` no longer calls itself coverage:
+
+| Command | Question | Endpoint |
+|---|---|---|
+| `coverage` | Per SOURCE: which of six domains is still empty? | `/api/admin/semantic-model/coverage` |
+| `coverage tables` | Per TABLE: which registered tables no valid model describes | `/api/admin/semantic-coverage` |
+| `keboola-import` | Per KEBOOLA PROJECT: how much of its published layer *would* import | `/api/admin/semantic-layer/coverage` |
+
+Business terms projected out of a document are read through the glossary
+surface: `agnes glossary search <term>` / `agnes glossary show <id>`.
+
+### Renamed in this release
+
+Five groups that all read as "the semantic layer" became the two above. Every
+old spelling still runs for one release as a hidden alias that prints its new
+path on stderr, then delegates:
+
+| Old | New |
+|---|---|
+| `agnes admin semantic-model <cmd>` | `agnes admin semantic <cmd>` |
+| `agnes admin semantic-model export\|validate` | `agnes semantic-model export\|validate` |
+| `agnes admin semantic-source <cmd>` | `agnes admin semantic source <cmd>` |
+| `agnes admin semantic-layer coverage` | `agnes admin semantic keboola-import` |
+| `agnes semantic-model coverage\|health\|mute\|mutes\|unmute` | `agnes admin semantic <same>` |
+| `agnes semantic-model feedback list\|resolve` | `agnes admin semantic feedback list\|resolve` |
+
+`agnes admin data-semantics` was removed outright with no alias — it scaffolded
+a pre-Ossie workspace pack that nothing reads.

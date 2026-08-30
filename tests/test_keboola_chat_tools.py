@@ -1038,7 +1038,16 @@ class TestDeletingTheConnectionStaysRetryable(TestChatToolsEndpoint):
         src = (pathlib.Path(__file__).resolve().parents[1] / "app" / "api" / "admin_source_connections.py").read_text(
             encoding="utf-8"
         )
-        block = src[src.index("def delete_connection") :][:3000]
+        # Slice to the end of the function (next top-level def), not an arbitrary
+        # character window — sl/b5-orphan-detection grew the function past the old
+        # 3000-char cap and the invariant under test (teardown before delete) is
+        # about ordering, not about function length.
+        block = src[src.index("def delete_connection") :]
+        nxt = block.find("\nasync def ", 1)
+        if nxt == -1:
+            nxt = block.find("\ndef ", 1)
+        if nxt != -1:
+            block = block[:nxt]
         assert block.index("_remove_chat_tools(connection_id)") < block.index("repo.delete(connection_id)")
 
 

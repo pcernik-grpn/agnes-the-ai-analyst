@@ -1,9 +1,13 @@
-"""CLI tests for `agnes semantic-model coverage tables` — the source-agnostic
+"""CLI tests for `agnes admin semantic coverage tables` — the source-agnostic
 semantic-layer coverage check (semantic-phase5, wave 1, Task 1).
 
-Renamed from the bare `agnes semantic-model coverage` to `coverage tables`
-when F4.1's cross-domain, per-source report claimed the bare form — see
-`cli/commands/semantic_model.py`."""
+Renamed twice, both times because a name claimed more than it answered: from
+the bare `agnes semantic-model coverage` to `coverage tables` when F4.1's
+cross-domain per-source report claimed the bare form, then out of the
+any-user group entirely (#1707 Block 6) — every coverage endpoint is
+`require_admin`, so advertising them to non-admins promised authority the
+caller did not have. The old path survives as a hidden alias, covered in
+`tests/test_cli_semantic_consolidation.py`."""
 
 from __future__ import annotations
 
@@ -34,16 +38,16 @@ def _resp(status_code=200, json_data=None, text=""):
 
 
 def test_no_uncovered_tables():
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, {"tables": []})):
-        result = runner.invoke(app, ["semantic-model", "coverage", "tables"])
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, {"tables": []})):
+        result = runner.invoke(app, ["admin", "semantic", "coverage", "tables"])
     assert result.exit_code == 0
     assert "semantic-layer coverage" in result.output
 
 
 def test_lists_uncovered_tables():
     body = {"tables": [{"id": "lonely", "name": "lonely"}, {"id": "orphan", "name": "Orphan Table"}]}
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, body)):
-        result = runner.invoke(app, ["semantic-model", "coverage", "tables"])
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+        result = runner.invoke(app, ["admin", "semantic", "coverage", "tables"])
     assert result.exit_code == 0
     assert "lonely" in result.output
     assert "orphan" in result.output
@@ -51,8 +55,8 @@ def test_lists_uncovered_tables():
 
 def test_limit_truncates_and_says_so():
     body = {"tables": [{"id": f"t{i}", "name": f"t{i}"} for i in range(5)]}
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, body)):
-        result = runner.invoke(app, ["semantic-model", "coverage", "tables", "--limit", "2"])
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+        result = runner.invoke(app, ["admin", "semantic", "coverage", "tables", "--limit", "2"])
     assert result.exit_code == 0
     assert "t0" in result.output
     assert "t1" in result.output
@@ -62,17 +66,17 @@ def test_limit_truncates_and_says_so():
 
 def test_json_output():
     body = {"tables": [{"id": "lonely", "name": "lonely"}]}
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, body)):
-        result = runner.invoke(app, ["semantic-model", "coverage", "tables", "--json"])
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
+        result = runner.invoke(app, ["admin", "semantic", "coverage", "tables", "--json"])
     assert result.exit_code == 0
     assert json.loads(result.output) == body
 
 
 def test_admin_only_error_surfaces():
     with patch(
-        "cli.commands.semantic_model.api_get",
+        "cli.commands.admin_semantic.api_get",
         return_value=_resp(403, {"detail": "Admin access required"}, text="Forbidden"),
     ):
-        result = runner.invoke(app, ["semantic-model", "coverage", "tables"])
+        result = runner.invoke(app, ["admin", "semantic", "coverage", "tables"])
     assert result.exit_code == 1
     assert "Admin access required" in result.output

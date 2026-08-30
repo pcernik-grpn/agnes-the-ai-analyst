@@ -19,6 +19,12 @@ Idempotently converges five user-scope artifacts:
 | SessionStart hook | `~/.claude/settings.json` | a detached `agnes update --quiet` keeps data + plugins fresh from any repo (skip with `--no-hook`) |
 | Config flag | `global_scope` in the CLI config | `agnes update` re-converges the layer on every run |
 
+> The stdio server (`agnes mcp`) is internal wiring: `agnes global enable`
+> registers it for you, and the hosted chat sandbox spawns its own. It is not
+> a supported end-user command — do not add it to a client by hand. A machine
+> without the CLI should use the remote HTTP transport below, which carries the
+> full server-side tool set.
+
 Check with `agnes global status` (add `--json` for scripting); remove with
 `agnes global disable` — it reverts exactly what enable wrote and never
 touches your other marketplaces, MCP servers, or hooks.
