@@ -5286,6 +5286,9 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         # Marketplaces, and verification's own switch), so the page was a
         # landing spot for links you can reach directly.
         "can_store_moderation": get_store_moderation_enabled(),
+        # Publishing external apps — off by default, and its page 404s when it
+        # is off, so the row goes with it.
+        "can_data_apps": _data_apps_nav_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -6729,18 +6732,10 @@ async def admin_linked_apps_builder(
     request: Request,
     user: dict = Depends(require_admin),
 ) -> RedirectResponse:
-    """Gone — publishing linked apps is a section of the MCP-source builder.
-
-    It was always downstream of that builder and could never stand alone: step
-    one asked which MCP source to read apps from and dead-ended with "not
-    registered yet? register one first, then come back", and when exactly one
-    source existed it picked that one by elimination and printed "✓ Using" for
-    a choice the admin never made. Folding it in removes the round trip, the
-    guess, and an entry point that could not complete on an instance with data
-    apps switched off. The path stays so bookmarks and the old admin links
-    still land somewhere useful.
-    """
-    return RedirectResponse("/admin/mcp-sources/new", status_code=302)
+    """The old "new linked app" path. There is no separate create step any
+    more — publishing apps is picking a connected server and reading its list
+    — so this lands on the page that does it."""
+    return RedirectResponse("/admin/linked-apps", status_code=302)
 
 
 @router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
@@ -9028,16 +9023,44 @@ async def admin_marketplaces_page(
     return templates.TemplateResponse(request, "admin_marketplaces.html", ctx)
 
 
-@router.get("/admin/linked-apps")
+@router.get("/admin/linked-apps", response_class=HTMLResponse)
 async def admin_linked_apps_page(
     request: Request,
     user: dict = Depends(require_admin),
-) -> RedirectResponse:
-    """Gone, for the same reason as ``/admin/linked-apps/new`` above: the
-    wizard's three steps (pick a source → materialize its lister → select and
-    grant the apps) are now the last section of the builder that registers the
-    source, reached in the flow that created it."""
-    return RedirectResponse("/admin/mcp-sources/new", status_code=302)
+    source: str | None = None,
+):
+    """Publish apps from a tool server that is already connected.
+
+    The other half of the MCP builder's apps section, and a different errand:
+    there you are connecting a server and its apps are the obvious next move;
+    here the server was connected weeks ago and today's job starts from the
+    app list. Routing that through the connection form would ask an admin to
+    re-answer questions they answered once.
+
+    It is the same panel in both places (``linked_apps_panel.js``), so "what
+    does reading the list write" cannot have two answers. What the retired
+    wizard did wrong is not repeated: the source is CHOSEN from a list rather
+    than detected by elimination, and the empty state hands off to the builder
+    instead of saying "register one first, then come back".
+
+    ``?source=`` preselects a server — how the builder's "publish these
+    elsewhere" link and a return trip from connecting one land on the right
+    row instead of an empty picker.
+    """
+    if not _data_apps_nav_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "data_apps_disabled",
+                "message": (
+                    "Linked apps are switched off on this instance. Turn on data_apps.enabled "
+                    "in server config, then come back."
+                ),
+            },
+        )
+    ctx = _build_context(request, user=user)
+    ctx["prefer_source_id"] = source
+    return templates.TemplateResponse(request, "admin_linked_apps.html", ctx)
 
 
 @router.get("/admin/contribute-skill", response_class=HTMLResponse)

@@ -2386,11 +2386,16 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
               <span>Connect a source<small>Warehouse, BigQuery, Databricks, files</small></span>
             </a>
-            {# "Link an external app" used to sit here. It never stood on its
-               own — every path through it began by picking an MCP source it
-               could not create — so it is now the last section of the builder
-               that registers that source, and this menu offers one door
-               instead of two that led to the same room. #}
+            {# Two doors to the same room ON PURPOSE, because they are two
+               errands: publishing apps while you connect the server that lists
+               them is the MCP builder's last section, and publishing from a
+               server connected weeks ago starts here. Both drive one panel. #}
+            {% if data_apps_enabled() %}
+            <a class="lib-new__item" href="/admin/linked-apps" role="menuitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
+              <span>Publish external apps<small>Apps a connected server lists, catalogued here</small></span>
+            </a>
+            {% endif %}{# data apps off → the flow cannot complete, so it is not offered #}
             {% endif %}
             <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>

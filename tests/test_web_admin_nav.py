@@ -430,9 +430,7 @@ class TestAdminNavActiveSection:
         # Content (key "library"), not Instance: an MCP source is a source of
         # things analysts reach, like a marketplace — not instance plumbing.
         assert resolve_active_section_key("/admin/mcp-sources") == "library"
-        # "/admin/linked-apps" is deliberately absent: publishing external apps
-        # is a section of the MCP-source builder, so the path is a redirect and
-        # no row claims it.
+        assert resolve_active_section_key("/admin/linked-apps") == "library"
         assert resolve_active_section_key("/admin/store/lint") == "library"
         assert resolve_active_section_key("/admin/news") == "library"
         assert resolve_active_section_key("/admin/server-config") == "instance"

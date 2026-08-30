@@ -357,16 +357,24 @@ def test_detail_linked_hides_deploy_shows_override_form(web_env):
     assert "https://example.com/apps/sales" in resp.text
 
 
-def test_admin_linked_apps_wizard_redirects_to_the_mcp_builder(web_env):
-    """The wizard's three steps — pick a source, materialize its lister,
-    select and grant the apps — are now the last section of the builder that
-    registers the source. Its first step could only ever point at a source it
-    had no way to create, so the flow is one page, and the old path lands on
-    it."""
+def test_admin_linked_apps_page_renders_for_an_admin(web_env):
+    """Publishing apps from an already-connected server is its own errand, and
+    its own page: the MCP builder covers the server being connected NOW, this
+    covers the one connected weeks ago. Both render the same panel."""
     c = web_env["client"]
-    resp = c.get("/admin/linked-apps", headers=_auth(web_env["admin_pat"]), follow_redirects=False)
+    resp = c.get("/admin/linked-apps", headers=_auth(web_env["admin_pat"]))
+    assert resp.status_code == 200, resp.text
+    assert 'id="la-view"' in resp.text
+    assert "linked_apps_panel.js" in resp.text, "the page does not load the shared panel"
+
+
+def test_the_old_new_linked_app_path_lands_on_that_page(web_env):
+    """There is no separate create step any more — publishing apps IS picking a
+    connected server and reading its list."""
+    c = web_env["client"]
+    resp = c.get("/admin/linked-apps/new", headers=_auth(web_env["admin_pat"]), follow_redirects=False)
     assert resp.status_code == 302
-    assert resp.headers["location"] == "/admin/mcp-sources/new"
+    assert resp.headers["location"] == "/admin/linked-apps"
 
 
 def test_admin_linked_apps_wizard_forbidden_for_non_admin(web_env):
@@ -412,10 +420,11 @@ def test_app_publishing_calls_real_access_endpoints():
     """Group/grant calls must hit the mounted /api/admin router — /api/access/*
     does not exist and 404s silently in the UI (Devin Review on #1116).
 
-    Follows the code: the wizard that used to make these calls is gone, and
-    the MCP-source builder inherited them along with the section.
+    Follows the code: both surfaces that publish apps — the MCP builder's
+    section and /admin/linked-apps — drive one panel, and the panel is where
+    the calls live.
     """
-    src = open("app/web/static/js/components/mcp_builder.js").read()
+    src = open("app/web/static/js/components/linked_apps_panel.js").read()
     assert "/api/admin/grants" in src
     assert "/api/access/" not in src
     # It is the ONE caller that designates its tool as the data-app lister —

@@ -1,0 +1,48 @@
+{% extends "base_index.html" %}
+{# Publish apps a connected tool server lists, in the builder shell.
+
+   The MCP builder offers the same thing while a server is being connected —
+   this is the same panel for a server that already is. The page owns nothing
+   but the mount; linked_apps_page.js owns the sections and every request, and
+   linked_apps_panel.js owns the part both surfaces share. #}
+
+{% block title %}Publish apps — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{% block head_extra %}
+{# The builder workspace: two panes, the shell header, the full-bleed
+   breakout, the section cards, the picker modal. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{# `.cc-btn` — the shell's markup uses it for the primary action and it is
+   defined here, not in builder.css (same reason admin_mcp_builder.html loads
+   it). #}
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
+{% endblock %}
+
+{% block page_head %}
+{# Deliberately empty — `body.ag-building` collapses this band, and the shell
+   header carries the title and the actions. #}
+{% endblock %}
+
+{% block page_surface %}
+<div id="la-view" class="ag-builder-mount"></div>
+{% endblock %}
+
+{% block scripts %}
+{# Not deferred: the page mounts on boot, so BuilderShell has to exist first. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script src="{{ static_url('js/components/linked_apps_panel.js') }}"></script>
+<script src="{{ static_url('js/components/linked_apps_page.js') }}"></script>
+<script>
+  (function () {
+    'use strict';
+    var mount = document.getElementById('la-view');
+    if (!mount || !window.AgnesLinkedApps) return;
+    window.AgnesLinkedApps.open({
+      mount: mount,
+      {# `?source=` — a return trip from connecting a server lands on its row
+         rather than an empty picker. #}
+      preferSourceId: {{ (prefer_source_id | tojson) if prefer_source_id else 'null' }},
+    });
+  })();
+</script>
+{% endblock %}

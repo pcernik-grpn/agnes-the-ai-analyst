@@ -38,6 +38,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 JS = ROOT / "app" / "web" / "static" / "js" / "components"
 SHELL = JS / "builder_shell.js"
+#: The MCP builder renders its apps section through this, so the harness has
+#: to load it for the same reason the page does.
+APPS_PANEL = JS / "linked_apps_panel.js"
 MCP = JS / "mcp_builder.js"
 LINKED = JS / "linked_apps_builder.js"
 
@@ -157,7 +160,7 @@ def _load(*paths: Path) -> str:
 def test_a_failed_grant_does_not_make_the_retry_register_a_second_source():
     script = (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
@@ -215,7 +218,7 @@ window.AgnesMcpBuilder.open({ mount });
 def test_an_already_granted_group_does_not_fail_the_mcp_save():
     script = (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
@@ -265,7 +268,7 @@ def _apps_script(grant_responses: str, tail: str) -> str:
     """
     return (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   // A lister tool, which is what makes the apps section appear at all.
@@ -300,7 +303,7 @@ window.AgnesMcpBuilder.open({ mount, dataAppsEnabled: true });
   for (let i = 0; i < 14; i++) await flush();
   // Registered — and still here, because there are apps to catalogue.
   const hrefAfterRegister = window.location.href;
-  fire('click', { 'data-mcp-apps': '1' });
+  fire('click', { 'data-la-read': '1' });
   for (let i = 0; i < 14; i++) await flush();
 """
         + tail
@@ -336,7 +339,7 @@ def test_an_instance_with_data_apps_off_is_never_offered_the_section():
     materialize mode. Off means the section does not exist."""
     script = (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   'POST /api/admin/mcp-sources/preview-introspect': { status: 200, body: { tools: [
@@ -366,11 +369,17 @@ window.AgnesMcpBuilder.open({ mount, dataAppsEnabled: false });
     )
 
 
-def test_reading_the_app_list_does_not_install_a_nightly_job_by_itself():
-    """Fetching used to switch a SHARED tool to materialize mode *and* install
-    a `daily 03:00` schedule, as a side effect of looking. The mode is
-    required — the projection reads a table the run writes — the schedule is
-    not, so it is the admin's choice and defaults to off."""
+def test_reading_the_app_list_sends_what_the_registry_requires():
+    """The mode is what makes the read possible — the projection reads a table
+    the run writes — and `tool_registry.upsert` refuses `materialize` without
+    a schedule string, so both go.
+
+    What was removed is the UI's claim ABOUT that schedule. Nothing in the
+    scheduler reads a `tool_registry` row, so the `daily 03:00` the old wizard
+    wrote never fired; a "keep this list current" switch would have promised a
+    refresh the product does not perform. The panel says the catalogue is a
+    snapshot instead, which is true.
+    """
     script = _apps_script(
         "",
         r"""
@@ -382,8 +391,13 @@ def test_reading_the_app_list_does_not_install_a_nightly_job_by_itself():
     )
     res = _node(script)
     assert res["bodies"], "the lister tool was never put into materialize mode"
-    assert res["bodies"][0] == {"mode": "materialize"}, (
-        f"browsing installed a schedule nobody asked for: {res['bodies'][0]}"
+    assert res["bodies"][0] == {"mode": "materialize", "schedule": "daily 03:00"}, (
+        f"the registry would refuse this: {res['bodies'][0]}"
+    )
+    panel = (JS / "linked_apps_panel.js").read_text(encoding="utf-8")
+    assert "data-la-refresh" not in panel, (
+        "the refresh switch is back — nothing refreshes these tools, so it promises what "
+        "the product does not do"
     )
 
 
@@ -466,7 +480,7 @@ def _mcp_script(responses_js: str, drive_js: str) -> str:
     """Open the MCP builder, introspect two tools, then run `drive_js`."""
     return (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + "installFetch("
         + responses_js
         + """);
@@ -741,7 +755,7 @@ def _edit_script(tail: str) -> str:
     """
     return (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   'GET /api/admin/groups': { status: 200, body: [

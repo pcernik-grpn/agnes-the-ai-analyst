@@ -822,7 +822,7 @@
         readOnly: llmUnavailable,
         placeholder: llmUnavailable
           ? 'No AI is configured here — fill the form on the right by hand.'
-          : 'Describe the package you need…',
+          : ((st && st.mode === 'edit') ? 'Tell me what should change…' : 'Describe the package you need…'),
         /* Starters belong to the empty state. Keying on "no chips from the
            last turn" put them back mid-conversation, so a nearly-finished
            package could be offered a fresh-start brief — one click from

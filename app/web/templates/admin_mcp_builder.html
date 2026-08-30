@@ -32,6 +32,9 @@
 {# Not deferred: the builder mounts on boot, so BuilderShell has to exist
    before the script below runs. #}
 <script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+{# The apps section is the same panel /admin/linked-apps renders, so the two
+   cannot disagree about what reading a list writes. #}
+<script src="{{ static_url('js/components/linked_apps_panel.js') }}"></script>
 <script src="{{ static_url('js/components/mcp_builder.js') }}"></script>
 <script>
   (function () {
