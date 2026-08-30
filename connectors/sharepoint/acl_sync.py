@@ -362,7 +362,14 @@ async def _run_acl_sync_async(payload: dict) -> dict:
 async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     """Sync one connection's mirrored scopes; persists the last-run block,
     audits the run-level actions, and applies must_not staleness suspension.
-    See :func:`run_acl_sync` for the full contract."""
+    See :func:`run_acl_sync` for the full contract.
+
+    TODO(acl-sync): this and ``_sweep_connection`` both read-modify-write the
+    same ``source_connections.config`` blob with no lock — a nightly sync and
+    the weekly sweep landing together on one connection can silently drop
+    each other's just-written bookkeeping keys (never grants — those live in
+    ``resource_grants``). Self-healing on the loser's next run; fix is a
+    key-scoped ``config_patch`` merge helper on the repo pair."""
     connection_id = connection["id"]
     scopes = _mirrored_scopes(connection)
     t0 = time.monotonic()
