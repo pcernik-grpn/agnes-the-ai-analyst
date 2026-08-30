@@ -3838,8 +3838,10 @@ async def catalog_semantics(
         metric_categories=metric_categories,
         metric_count=len(metrics),
         glossary_count=glossary_count,
-        # The door to /semantic-layer. Both pages are titled "Semantic layer"
-        # and this is the reachable one, so without the link a document with
+        # The door to Semantic models (/semantic-layer). Both pages were once
+        # titled "Semantic layer" (this one is now "Metrics & glossary", see
+        # tests/test_semantic_page_names_contract.py) and this is the more
+        # reachable one, so without the link a document with
         # datasets and relationships but no metrics rendered as "there is no
         # semantic layer here". Same gate /library's Definitions footer uses —
         # a readable document, never this page's own metric/glossary counts.
@@ -7528,7 +7530,7 @@ def _source_inventory(user: dict | None = None) -> dict:
     different table and the client would otherwise need four more round-trips
     per card. The strip is what makes a source card answer "is this project
     healthy AND is anyone getting its data", which previously took four pages
-    (Data sources, Tables, Sync, Semantic layer) to assemble by hand.
+    (Data sources, Tables, Sync, Semantic layer health) to assemble by hand.
 
     Per-connector by construction rather than a fixed four: the semantic cell
     is Keboola-only (the Metastore is a Keboola API) and the cost cell is
@@ -8375,7 +8377,7 @@ async def admin_semantic_layer_page(
     connected sources, so a scope the picker offers is always a scope something
     is actually scored on.
     """
-    from app.api.semantic_sources_refresh import get_last_refresh_summary
+    from app.api.semantic_sources_refresh import get_sync_status_summary
     from app.resource_types import RESOURCE_TYPES, ResourceType
     from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
@@ -8454,7 +8456,10 @@ async def admin_semantic_layer_page(
     # The whole-sweep status the strip renders, and what its "Sync now"
     # button triggers: since #1707 Block 3 step 4 there is ONE scheduled
     # semantic refresh over every registered source, not a per-connector one.
-    ctx["semantic_refresh_summary"] = get_last_refresh_summary()
+    # Composed, not raw: the sweep summary is in-memory and therefore empty
+    # after every redeploy, so this carries a durable fallback derived from
+    # the sources' own `last_sync_at` for the strip to label as what it is.
+    ctx["semantic_refresh_summary"] = get_sync_status_summary()
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
 
 

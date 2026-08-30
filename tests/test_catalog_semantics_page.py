@@ -280,8 +280,8 @@ class TestCatalogSemanticsLinkFromCatalog:
         """The Definitions block in the Library is the way in.
 
         This asked /catalog for a rendered link, which the classic template's
-        Semantic layer card supplied. The unified Catalog offers only what the
-        caller does not already have, and the semantic layer is not one of
+        (now retired) Semantic layer card supplied. The unified Catalog offers
+        only what the caller does not already have, and the semantic layer is not one of
         those — the rail's own IA note names the Library's Definitions block as
         the door instead.
 
@@ -300,8 +300,8 @@ class TestCatalogSemanticsLinkFromCatalog:
 
 class TestCatalogSemanticsWayOut:
     """The page is link-only — reached from the Library's Definitions block,
-    the Catalog's Semantic layer card, a chat citation or global search — and
-    is a nav destination in neither chrome. Without a back link the browser's
+    a chat citation or global search (the classic Catalog's card is retired,
+    see the class above) — and is a nav destination in neither chrome. Without a back link the browser's
     Back button was the only way out, and under the rail no nav item lit up
     either, so the chrome read as "nowhere"."""
 
@@ -601,7 +601,9 @@ _DOOR = 'href="/semantic-layer"'
 class TestCatalogSemanticsDoorToTheDocument:
     """This page renders the FLAT projection (`metric_definitions` +
     `glossary_terms`); the stored Ossie document itself is browsed at
-    `/semantic-layer`. Both are titled "Semantic layer", and this is the more
+    `/semantic-layer`. Both were once titled "Semantic layer" (this page is
+    now "Metrics & glossary", that one "Semantic models" — see
+    tests/test_semantic_page_names_contract.py), and this is the more
     reachable of the two, so a model with datasets and relationships but no
     metrics rendered "No metrics registered yet" here with nothing pointing at
     the document — the page read as "there is no semantic layer" while there

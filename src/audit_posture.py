@@ -549,3 +549,16 @@ POSTURE: dict[str, str] = {
     "POST /me/profile/refetch-groups": "exempt:debug_dry_run_no_write",
     "POST /slack/bind": "slack.bind",
 }
+
+# Forward declaration for the #1802 wave-2 read-posture ratchet, which lives
+# on `integration` (READ_POSTURE + tests/test_audit_read_posture.py) and has
+# not reached this branch yet. Deliberately NOT named READ_POSTURE: a second
+# module-level binding of that name would silently shadow integration's real
+# ~400-row dict if a merge resolution keeps both sides (last binding wins).
+# Nothing on this base reads this dict. On the merge, union these rows into
+# integration's READ_POSTURE and delete this block.
+PENDING_READ_POSTURE: dict[str, str] = {
+    # Same fold the /admin/data-sources template inlines at render time, for
+    # the page's own repaint — no data content, secrets, or other users' data.
+    "GET /api/admin/source-pipelines": "exempt:ui_support",
+}
