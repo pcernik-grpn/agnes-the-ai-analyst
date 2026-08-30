@@ -109,27 +109,64 @@ class TestMasterTokenCardTooltip:
     use the shared `[data-tip]` fast-tooltip mechanism instead: `data-tip` and
     `aria-label` carrying the same text, never `title` alongside it."""
 
+    @staticmethod
+    def _extract_function(tpl: str, signature: str) -> str:
+        """Brace-matched extraction — a naive index-slice to the next known
+        function name would false-fire on an unrelated `title=` introduced
+        anywhere in between by a later, unrelated edit."""
+        start = tpl.index(signature)
+        depth = 0
+        started = False
+        for i in range(start, len(tpl)):
+            ch = tpl[i]
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return tpl[start : i + 1]
+        raise AssertionError(f"unbalanced braces extracting {signature!r}")
+
     def _fact_fn(self, seeded_app) -> str:
         c = seeded_app["client"]
         body = c.get(
             "/admin/data-sources",
             headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
         ).text
-        start = body.index("function _masterTokenFactHtml(row) {")
-        return body[start : body.index("function _connector(type)", start)]
+        return self._extract_function(body, "function _masterTokenFactHtml(row) {")
 
     def test_uses_data_tip_and_aria_label_not_title(self, seeded_app):
         fn = self._fact_fn(seeded_app)
         assert "data-tip=" in fn
         assert "aria-label=" in fn
         assert "title=" not in fn
-        # Same sentence on both attributes — one source of truth for the tip.
         tip = fn.split('data-tip="', 1)[1].split('"', 1)[0]
         label = fn.split('aria-label="', 1)[1].split('"', 1)[0]
-        assert tip == label
+        # The accessible name must PREFIX the visible label with the tip,
+        # never replace it outright (WCAG 2.5.3 Label in Name) — the
+        # library.html:83 precedent this was modeled on does the same.
+        assert label.startswith("Semantic-layer token")
+        assert label.endswith(tip)
         assert "master" in tip.lower()
         assert len(tip) < 160
 
+    def test_a_derived_card_has_no_master_token_widget(self, seeded_app):
+        """`_masterTokenFactHtml` is never called for a derived row (no
+        stored connection to hold the secret in) — proving this here is what
+        makes the pipeline-strip fallback to the plain link, rather than
+        `toggleMasterToken`, for a derived card the only safe choice."""
+        c = seeded_app["client"]
+        body = c.get(
+            "/admin/data-sources",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        ).text
+        card = self._extract_function(body, "function _connectionCardHtml(row) {")
+        derived_branch = card[: card.index("const c = _connector(row.source_type);")]
+        assert "_masterTokenFactHtml" not in derived_branch
+
+
+class TestDataSourcesPageVaultBanner:
     def test_banner_shown_when_vault_key_unset(self, seeded_app, monkeypatch):
         monkeypatch.delenv("AGNES_VAULT_KEY", raising=False)
         _reset_ephemeral_key_for_tests()
@@ -673,13 +710,19 @@ class TestSourcePipelineStrip:
 
 
 class TestSemanticLayerCellNoTokenAction:
-    """A13 (#1707): "Token not set" used to link to /admin/semantic-layer,
-    which cannot set a token (and 501s on a DuckDB app-state backend). The
-    actual fix — Actions → Semantic-layer token — lives on the same card, so
-    the not-set cell must call `toggleMasterToken` directly instead of
-    navigating away. Once a token IS set, the cell keeps linking to the
-    health page, executed for real via `node` against a seeded
-    `SOURCE_PIPELINES` fixture (same pattern as `TestSharePointSourceCardRendering`)."""
+    """A13 (#1707): "Token not set" used to link to /admin/semantic-layer —
+    the page renders fine, but has no token field; the token is set on the
+    card itself. The actual fix — Actions → Semantic-layer token — lives on
+    the same card, so a STORED connection's not-set cell must call
+    `toggleMasterToken` directly instead of navigating to a page that cannot
+    help. Once a token IS set, the cell keeps linking to the health page —
+    and so does a DERIVED card's cell regardless of token state, since a
+    derived row (no stored connection) carries no `toggleMasterToken` widget
+    at all (`_masterTokenFactHtml` is never rendered for it — see
+    `TestMasterTokenCardTooltip.test_a_derived_card_has_no_master_token_widget`);
+    calling it there would dereference a DOM element that does not exist.
+    Executed for real via `node` against a seeded `SOURCE_PIPELINES` fixture
+    (same pattern as `TestSharePointSourceCardRendering`)."""
 
     @staticmethod
     def _extract_function(tpl: str, signature: str) -> str:
@@ -697,7 +740,7 @@ class TestSemanticLayerCellNoTokenAction:
                     return tpl[start : i + 1]
         raise AssertionError(f"unbalanced braces extracting {signature!r}")
 
-    def _run(self, *, token_set: bool) -> str:
+    def _run(self, *, token_set: bool, derived: bool = False) -> str:
         import json
         import subprocess
         import tempfile
@@ -713,13 +756,14 @@ class TestSemanticLayerCellNoTokenAction:
             "semantic": {"token": token_set, "metrics": 2 if token_set else 0, "terms": 3 if token_set else 0},
             "feeds": {"packages": 1, "people": 3},
         }
+        row = {"id": "kbc-conn-1", "source_type": "keboola", "derived": derived}
         script = f"""
 function _esc(s) {{ return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }}
 const SOURCE_PIPELINES = {{ "kbc-conn-1": {json.dumps(pipeline)} }};
 
 {fn}
 
-console.log(_pipelineStripHtml({{ id: "kbc-conn-1", source_type: "keboola" }}));
+console.log(_pipelineStripHtml({json.dumps(row)}));
 """
         with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
             f.write(script)
@@ -743,6 +787,17 @@ console.log(_pipelineStripHtml({{ id: "kbc-conn-1", source_type: "keboola" }}));
         html = self._run(token_set=True)
         assert 'href="/admin/semantic-layer"' in html
         assert "toggleMasterToken" not in html
+
+    def test_derived_no_token_cell_keeps_the_base_link_not_toggle_master_token(self):
+        """The blocking regression this guards: a derived card has no
+        `ds-master-row-*` element for `toggleMasterToken` to find, so wiring
+        it there would `TypeError` on click (`row.classList` on `null`) the
+        moment the pipeline strip renders for the common case of an
+        instance-credentialed Keboola source with no managed connection yet."""
+        html = self._run(token_set=False, derived=True)
+        assert "Token not set" in html
+        assert "toggleMasterToken" not in html
+        assert 'href="/admin/semantic-layer"' in html
 
 
 class TestSourcesIsEveryConnector:

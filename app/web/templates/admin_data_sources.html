@@ -1791,7 +1791,7 @@ function _masterTokenFactHtml(row) {
   const hasMaster = row.has_master_secret === true;
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" role="note" data-tip="Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary." aria-label="Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary.">Semantic-layer token</span>
+    <span class="ds-src__fact-k" role="note" data-tip="Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary." aria-label="Semantic-layer token. Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary.">Semantic-layer token</span>
     <span class="ds-src__fact-v"><span class="ds-badge ${hasMaster ? "badge-vault" : "badge-unset"}">${hasMaster ? "set" : "not set"}</span></span>
     <span class="ds-src__fact-a">
       <button type="button" class="btn btn-secondary" onclick="toggleMasterToken('${id}')">${hasMaster ? "Rotate" : "Set token"}</button>
@@ -1986,12 +1986,15 @@ function _pipelineStripHtml(row) {
         ? `✓ ${sem.metrics} metric${sem.metrics === 1 ? "" : "s"} · ${sem.terms} term${sem.terms === 1 ? "" : "s"}`
         : "Nothing imported yet";
     const semTone = !sem.token ? "is-warn" : (sem.metrics || sem.terms) ? "is-ok" : "is-warn";
-    // "Token not set" cannot be fixed on /admin/semantic-layer — that page
-    // has no token field, and 501s outright on a DuckDB app-state backend.
-    // The actual fix (Actions → Semantic-layer token) lives two elements
-    // away on this same card, so the cell calls it directly instead of
-    // navigating to a page that cannot help.
-    if (!sem.token) {
+    // "Token not set" cannot be fixed on /admin/semantic-layer — the page
+    // renders fine, it just has no token field; the token is set on this
+    // same card (Actions → Semantic-layer token), so a STORED connection's
+    // cell calls that action directly instead of navigating to a page that
+    // cannot help. A derived card (no stored connection — see `row.derived`
+    // above) carries no such widget at all — `_masterTokenFactHtml` is never
+    // rendered for it — so it keeps the base link; there is nothing on the
+    // card itself to point at instead.
+    if (!sem.token && !row.derived) {
       cells.push(`
         <button type="button" class="ds-pipe__cell" onclick="toggleMasterToken('${row.id}')">
           <span class="ds-pipe__k">Semantic layer</span>
