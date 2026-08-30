@@ -595,6 +595,52 @@ Three things about it are deliberate:
   feature"), so on the frozen DuckDB app-state backend these routes answer
   `501 requires_postgres_backend`.
 
+## Auto-draft sweep: how coverage gaps get filled without a human starting it
+
+Coverage (above) only *reports* a table with zero semantic-layer coverage; a
+scheduled sweep (`POST /api/admin/semantic-auto-draft-sweep`,
+`services/scheduler/__main__.py` fires it every 55 minutes; an admin can also
+trigger it on demand) is what actually tries to close the gap, unattended.
+
+Each tick takes up to three uncovered, eligible tables and runs a headless
+`semantic-model-builder` chat session per table
+(`app.chat.headless.run_one_shot`), authenticated as the non-admin
+**`semantic-drafter`** system identity (`app.auth.system_users`) — never an
+admin, and never the caller who happened to trigger the tick. That identity
+is what makes the rest of the design safe: every draft the session produces
+lands in the `authoring_suggestions` moderation queue exactly like a
+human-submitted proposal, **never applied directly**, no matter what the
+session's own trigger prompt tells it to do (`src/semantic_autodraft.py`'s
+`build_trigger_prompt` explicitly instructs the agent to call
+`apply_semantic_model` itself, unattended — safe only because the caller's
+own authority caps the outcome at "queued for review", not "live").
+
+Dedup uses a `table_registry.semantic_draft_pending_at` stamp (**Postgres-only**
+— see `docs/migrations.md` → "Adding a PG-only feature"; the sweep answers a
+clean `501 requires_postgres_backend` on a DuckDB-backend instance before any
+table scan or chat session runs), set BEFORE a table's session is invoked so
+two overlapping ticks can never draft the same table twice. The stamp clears
+the moment an admin resolves the resulting suggestion, approve or reject
+alike — a rejected draft is eligible again immediately, on the theory that a
+human just told the system something concrete about that table. Absent a
+resolution, a stamp only goes stale after **7 days**, which is what actually
+gives a table another try when its session filed nothing: a session that
+merely timed out (60s, `_SWEEP_SESSION_TIMEOUT_S`) or genuinely finished
+without calling `apply_semantic_model` both keep their stamp rather than
+being retried on the very next tick, so a handful of tables the drafter keeps
+declining can never occupy every batch forever. Never-stamped tables always
+sort ahead of stale-stamped ones, so this retry stream can't starve a table
+that has not been tried once.
+
+The session is told it is fine — preferred, even — to submit a minimal,
+explicitly-flagged-for-review model rather than invent structure the data
+does not support, and to survey with `agnes schema`/`agnes describe` before
+drafting anything. It is also pinned to a specific dataset-identity contract
+(`dataset.source` must be the Agnes table id verbatim, never the upstream
+native identifier) — without it, a drafted document would resolve to nothing
+for both coverage credit and dedup-flag clearing, silently excluding the
+table from every later sweep.
+
 ## Health: is the layer trustworthy right now
 
 Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
