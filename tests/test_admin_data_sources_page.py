@@ -1018,6 +1018,8 @@ const toasts = [];
 function showToast(msg, ok) {{ toasts.push([msg, ok]); }}
 let loadCalls = 0;
 async function loadConnections() {{ loadCalls++; }}
+let refreshCalls = 0;
+async function refreshSourcePipelines() {{ refreshCalls++; return true; }}
 let sentRequest = null;
 global.fetch = async (url, opts) => {{
   sentRequest = {{ url, opts }};
@@ -1035,6 +1037,7 @@ global.fetch = async (url, opts) => {{
     url: sentRequest ? sentRequest.url : null,
     toasts,
     loadCalls,
+    refreshCalls,
     derivedSourcesLength: DERIVED_SOURCES.length,
   }}));
 }})();
@@ -1119,6 +1122,10 @@ global.fetch = async (url, opts) => {{
         }
         assert result["toasts"] == [["Keboola imported as a managed connection.", True]]
         assert result["loadCalls"] == 1
+        # The new connection has no entry in the strip snapshot this page was
+        # rendered from, so its card would draw with no pipeline strip at all
+        # until a reload.
+        assert result["refreshCalls"] == 1
         # The stale derived entry is dropped before the reload.
         assert result["derivedSourcesLength"] == 0
 
@@ -2932,3 +2939,416 @@ def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
         "identifier the server suggested"
     )
     assert "_registerErrorText(" in html, "guard has nothing to check — helper is gone"
+
+
+class TestSourcePipelinesEndpoint:
+    """`GET /api/admin/source-pipelines` — the pipeline strip as data.
+
+    The page inlines the same dict at render time (`SOURCE_PIPELINES`), so
+    every card froze at whatever was true when the HTML was built: an admin
+    who registered tables through the wizard kept reading "Add the first
+    tables →" until they hard-reloaded. This endpoint is what the page
+    re-reads after each mutation — read-only, admin-gated exactly like the
+    page it serves.
+    """
+
+    def _get(self, seeded_app, token):
+        return seeded_app["client"].get(
+            "/api/admin/source-pipelines",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    def test_admin_gets_the_strip_dict(self, seeded_app):
+        import uuid
+
+        from src.repositories import source_connections_repo
+
+        conn_id = f"pipeapi-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name=f"Pipe API {conn_id[-4:]}",
+            source_type="keboola",
+            config={"stack_url": "https://connection.example.com"},
+        )
+        try:
+            resp = self._get(seeded_app, seeded_app["admin_token"])
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert conn_id in body
+            assert set(body[conn_id]) == {"tables", "sync", "semantic", "feeds"}
+            assert body[conn_id]["tables"]["count"] == 0
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_it_serves_the_same_dict_the_template_inlines(self, seeded_app):
+        """No new data — it is `_source_pipelines()`, the page's own context."""
+        from app.web.router import _source_pipelines
+
+        resp = self._get(seeded_app, seeded_app["admin_token"])
+        assert resp.status_code == 200
+        assert set(resp.json()) == set(_source_pipelines())
+
+    def test_a_registration_after_page_render_is_visible_without_a_reload(self, seeded_app):
+        """The A14 regression, end to end: register a table AFTER the page
+        HTML was built, and the endpoint must already know about it."""
+        import uuid
+
+        from src.repositories import source_connections_repo, table_registry_repo
+
+        conn_id = f"pipefresh-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name=f"Pipe Fresh {conn_id[-4:]}",
+            source_type="keboola",
+            config={"stack_url": "https://connection.example.com"},
+        )
+        c = seeded_app["client"]
+        auth = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+        page = c.get("/admin/data-sources", headers=auth).text
+        assert f'"{conn_id}"' in page  # the stale snapshot the page froze
+
+        tid = f"pipefresh-{uuid.uuid4().hex[:6]}"
+        table_registry_repo().register(
+            id=tid,
+            name=f"pipe_fresh_{tid[-6:]}",
+            source_type="keboola",
+            bucket="in.c-test",
+            source_table="pipe_fresh",
+            query_mode="local",
+            connection_id=conn_id,
+        )
+        try:
+            body = self._get(seeded_app, seeded_app["admin_token"]).json()
+            assert body[conn_id]["tables"]["count"] == 1
+        finally:
+            table_registry_repo().unregister(tid)
+            source_connections_repo().delete(conn_id)
+
+    def test_non_admin_is_refused(self, seeded_app):
+        assert self._get(seeded_app, seeded_app["analyst_token"]).status_code == 403
+
+    def test_unauthenticated_is_refused(self, seeded_app):
+        resp = seeded_app["client"].get("/api/admin/source-pipelines")
+        assert resp.status_code in (401, 403)
+
+
+class TestSourceCardRefreshWiring:
+    """Every mutating action on /admin/data-sources re-reads the strip.
+
+    `SOURCE_PIPELINES` is baked into the page at render time, so a card kept
+    reporting "Add the first tables → / Never synced / 0 packages" after the
+    wizard had registered two dozen tables (A14). The fix is one function —
+    `refreshSourcePipelines()` — called from every handler that changes what
+    a strip says; a full page reload is the fallback, never the mechanism,
+    because it throws away expanded cards and scroll position.
+    """
+
+    # Handler → what it changes about a strip.
+    HANDLERS = {
+        "registerSelected": "registers tables (inline browse + Keboola wizard step 2)",
+        "_registerBqRows": "registers BigQuery rows from wizard step 2",
+        "_registerSfRows": "registers Snowflake rows from wizard step 2",
+        "closeWizard": "the wizard registered/bundled/shared, and is now closing",
+        "_createPackagesAndContinue": "creates data packages / attaches tables",
+        "_shareAndFinish": "grants packages to groups (the feeds cell)",
+        "saveRotatedToken": "stores a storage token",
+        "saveMasterToken": "stores the semantic-layer master token",
+        "removeMasterToken": "clears the semantic-layer master token",
+        "saveSpCertificate": "stores a SharePoint certificate",
+        "toggleChatTools": "enables/disables the connection's chat tools",
+        "grantChatTools": "grants the derived MCP tools to a group",
+        "unbindProject": "clears the connection's project binding",
+        "deleteConn": "removes a source (and re-attributes unlinked tables)",
+        "setDefaultConn": "moves the default flag between connections",
+        "runSpExtraction": "queues a SharePoint extraction run",
+        "importKeboolaConnection": "turns the derived card into a real connection",
+        "closeSpWizard": "the SharePoint wizard connected/scoped/shared",
+    }
+
+    @staticmethod
+    def _js_function_body(page: str, name: str) -> str:
+        """The source of one top-level JS function, up to the next one."""
+        import re
+
+        start = re.search(rf"^(?:async )?function {re.escape(name)}\(", page, re.MULTILINE)
+        assert start, f"{name}() is gone from the template — update this guard"
+        rest = page[start.end() :]
+        nxt = re.search(r"^(?:async )?function ", rest, re.MULTILINE)
+        return rest[: nxt.start()] if nxt else rest
+
+    def _page(self, seeded_app) -> str:
+        return (
+            seeded_app["client"]
+            .get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            )
+            .text
+        )
+
+    def test_the_refresh_function_reads_the_endpoint(self, seeded_app):
+        body = self._js_function_body(self._page(seeded_app), "refreshSourcePipelines")
+        assert "/api/admin/source-pipelines" in body
+
+    def test_the_refresh_repaints_instead_of_reloading(self, seeded_app):
+        """A reload loses expanded cards and scroll position — the strip is
+        repainted in place from the fresh dict instead."""
+        page = self._page(seeded_app)
+        body = self._js_function_body(page, "refreshSourcePipelines")
+        assert "window.location.reload" not in body
+        assert "_repaintSourceCards" in body
+        repaint = self._js_function_body(page, "_repaintSourceCards")
+        assert "_pipelineStripHtml" in repaint
+        assert "_sourceHealth" in repaint
+
+    def test_every_mutation_handler_calls_the_refresh(self, seeded_app):
+        page = self._page(seeded_app)
+        missing = [
+            f"{name} ({why})"
+            for name, why in self.HANDLERS.items()
+            if "refreshSourcePipelines(" not in self._js_function_body(page, name)
+        ]
+        assert not missing, (
+            "these handlers mutate what a source card reports but never re-read "
+            "the strip, so the card keeps showing the pre-mutation state until a "
+            "hard reload:\n" + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_the_refresh_is_one_function_not_copy_paste(self, seeded_app):
+        """One reader, many callers — nobody re-implements the fetch."""
+        page = self._page(seeded_app)
+        assert page.count('fetch("/api/admin/source-pipelines"') == 1
+
+    # The strip is not the whole card. These handlers also change something
+    # the card BODY or head draws from the connection ROW (`config`, secret
+    # presence, chat-tools state, or the row's very existence), and the strip
+    # endpoint does not carry rows — so they re-read the list too.
+    REDRAWERS = {
+        "importKeboolaConnection": "the derived card becomes a real connection row",
+        "saveSpCertificate": "secret presence + certificate metadata on the row",
+        "setDefaultConn": "the `default` tag in the card head",
+        "saveRotatedToken": "secret presence badge",
+        "saveMasterToken": "secret presence badge",
+        "removeMasterToken": "secret presence badge",
+        "unbindProject": "`config.project_id` — the subtitle and the Unbind row",
+        "toggleChatTools": "`has_chat_tools` + `chat_tools_source_id`",
+        "runSpExtraction": "the dispatch stamps `config.extraction.last_run_at`",
+        "closeSpWizard": "`config.scopes` — the identity line and scope list",
+        "closeWizard": "a connection created in step 1 has no card at all yet",
+    }
+
+    def test_handlers_that_change_the_row_also_redraw_the_card_list(self, seeded_app):
+        page = self._page(seeded_app)
+        missing = [
+            f"{name} ({why})"
+            for name, why in self.REDRAWERS.items()
+            if "loadConnections(" not in self._js_function_body(page, name)
+        ]
+        assert not missing, (
+            "these handlers change what the card's ROW says, which the strip "
+            "endpoint does not carry — refreshing the strip alone leaves the "
+            "card body stale until a hard reload:\n" + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_delete_redraws_from_the_cached_list_on_purpose(self, seeded_app):
+        """The one deliberate exception to the rule above: the deleted row is
+        dropped from `_connections` locally, so re-fetching the list to learn
+        the same thing would be a round-trip for nothing."""
+        body = self._js_function_body(self._page(seeded_app), "deleteConn")
+        assert "renderConnList()" in body
+        assert "loadConnections(" not in body
+
+
+class TestRefreshSourcePipelinesBehavior:
+    """`refreshSourcePipelines()` executed for real via `node` — the strip
+    HTML it writes back into an already-drawn card, from the endpoint's
+    payload, without a reload.
+
+    String-matching the wiring (above) proves every handler CALLS it; this
+    proves what it does when it runs: the fresh dict wins, the new strip is
+    written into the card that is already on screen, and a failed read
+    leaves the stale one alone rather than blanking the card.
+    """
+
+    _extract_function = staticmethod(TestImportKeboolaConnectionBehavior._extract_function)
+
+    # Minimal DOM shim — this repo carries no jsdom, and what matters here is
+    # WHAT gets written WHERE, not HTML parsing.
+    _DOM_SHIM = """
+class El {
+  constructor(cls) {
+    this.className = cls; this.textContent = ""; this.removed = false;
+    this.inserted = []; this.written = null; this.kids = {};
+  }
+  set outerHTML(v) { this.written = v; }
+  get outerHTML() { return this.written; }
+  querySelector(sel) { return this.kids[sel] || null; }
+  insertAdjacentHTML(pos, html) { this.inserted.push([pos, html]); }
+  remove() { this.removed = true; }
+}
+"""
+
+    def _run(self, *, fresh: dict, ok: bool = True, break_repaint: bool = False, concurrent: int = 1) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _relAge(minutes) {",
+                "function _sharepointPipelineStripHtml(row) {",
+                "function _pipelineStripHtml(row) {",
+                "function _sharepointHealth(fs) {",
+                "function _sourceHealth(row) {",
+                "async function refreshSourcePipelines() {",
+                "function _repaintSourceCards() {",
+            )
+        )
+        break_repaint_js = "true" if break_repaint else "false"
+        script = f"""
+{self._DOM_SHIM}
+{fns}
+
+// The page as the admin left it: one card, drawn from a snapshot in which
+// nothing was registered and nothing was shared.
+let SOURCE_PIPELINES = {{
+  "c1": {{"tables": {{"count": 0, "unlinked": 0}}, "sync": {{}},
+          "semantic": {{"token": false, "metrics": 0, "terms": 0}},
+          "feeds": {{"packages": 0, "groups": 0, "people": 0}}}}
+}};
+let _connections = [{{"id": "c1", "source_type": "keboola", "config": {{}}}}];
+// Declared beside the function in the template, so it is not part of what
+// `_extract_function` lifts out.
+let _pipelineRefreshInFlight = null;
+
+const card = new El("ds-src");
+const head = new El("ds-src__head");
+const strip = new El("ds-pipe");
+const chip = new El("ds-src__health is-warn");
+chip.textContent = "No tables yet";
+const acts = new El("ds-src__acts");
+const bodyEl = new El("ds-src__body");
+bodyEl.hidden = false;  // the admin has this card expanded
+card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip}};
+head.kids = {{".ds-src__health": chip, ".ds-src__acts": acts}};
+const breakRepaint = {break_repaint_js};
+global.document = {{
+  getElementById: (id) => {{
+    if (breakRepaint) throw new Error("DOM is gone");
+    return id === "ds-conn-c1" ? card : null;
+  }},
+}};
+
+let fetched = null;
+let fetchCount = 0;
+global.fetch = async (url, opts) => {{
+  fetched = {{ url, opts }};
+  fetchCount++;
+  await new Promise((res) => setTimeout(res, 5));
+  return {{ ok: {str(ok).lower()}, status: {200 if ok else 500},
+            json: async () => ({json.dumps(fresh)}) }};
+}};
+
+(async () => {{
+  const results = await Promise.all(
+    Array.from({{ length: {concurrent} }}, () => refreshSourcePipelines()),
+  );
+  const returned = results[0];
+  console.log(JSON.stringify({{
+    returned,
+    results,
+    fetchCount,
+    inFlightCleared: _pipelineRefreshInFlight === null,
+    fetchedUrl: fetched && fetched.url,
+    credentials: fetched && fetched.opts && fetched.opts.credentials,
+    stripWritten: strip.written,
+    stripRemoved: strip.removed,
+    stripsInserted: head.inserted,
+    chipText: chip.textContent,
+    chipClass: chip.className,
+    chipRemoved: chip.removed,
+    bodyHidden: bodyEl.hidden,
+  }}));
+}})();
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    _FRESH = {
+        "c1": {
+            "tables": {"count": 3, "unlinked": 0, "basis": "connection"},
+            "sync": {"last_sync": "2026-08-30T10:00:00+00:00", "age_minutes": 5, "errors": 0},
+            "semantic": {"token": True, "metrics": 2, "terms": 1},
+            "feeds": {"packages": 1, "groups": 1, "people": 4},
+        }
+    }
+
+    def test_it_reads_the_endpoint_as_the_signed_in_admin(self):
+        out = self._run(fresh=self._FRESH)
+        assert out["fetchedUrl"] == "/api/admin/source-pipelines"
+        assert out["credentials"] == "include"
+        assert out["returned"] is True
+
+    def test_the_card_on_screen_gets_the_fresh_strip(self):
+        out = self._run(fresh=self._FRESH)
+        written = out["stripWritten"]
+        assert written, "the drawn card's strip was never rewritten"
+        assert "3 registered" in written
+        assert "Add the first tables" not in written
+        assert "1 package → 4 people" in written
+        assert "Never synced" not in written
+        # Rewritten in place — not inserted a second time, not removed.
+        assert out["stripsInserted"] == []
+        assert out["stripRemoved"] is False
+
+    def test_the_status_word_follows_the_strip(self):
+        out = self._run(fresh=self._FRESH)
+        assert out["chipText"] == "Healthy"
+        assert "is-ok" in out["chipClass"]
+        assert out["chipRemoved"] is False
+
+    def test_an_expanded_card_stays_expanded(self):
+        """The reason this repaints instead of reloading: an admin mid-task
+        keeps their open card (and their scroll position)."""
+        assert self._run(fresh=self._FRESH)["bodyHidden"] is False
+
+    def test_a_failed_read_keeps_the_stale_strip_rather_than_blanking_it(self):
+        out = self._run(fresh=self._FRESH, ok=False)
+        assert out["returned"] is False
+        assert out["stripWritten"] is None
+        assert out["stripRemoved"] is False
+        assert out["chipText"] == "No tables yet"
+
+    def test_a_throwing_repaint_is_a_failed_refresh_not_an_escaping_error(self):
+        """Two callers await this from inside a `finally` block. An exception
+        escaping the repaint would replace whatever error that block was
+        already unwinding — so the repaint lives inside the same `try` as the
+        read, and a broken DOM is simply `false`."""
+        out = self._run(fresh=self._FRESH, break_repaint=True)
+        assert out["returned"] is False
+        assert out["inFlightCleared"] is True
+
+    def test_concurrent_callers_share_one_read(self):
+        """A wizard exit reaches this from several places within a tick. Two
+        overlapping reads resolve last-response-wins, and the loser can be the
+        older snapshot — the exact staleness this function removes."""
+        out = self._run(fresh=self._FRESH, concurrent=3)
+        assert out["fetchCount"] == 1
+        assert out["results"] == [True, True, True]
+        # And the marker is cleared, so the NEXT mutation still gets a fresh read.
+        assert out["inFlightCleared"] is True

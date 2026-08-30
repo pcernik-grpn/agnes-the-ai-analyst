@@ -535,7 +535,19 @@ def materialize_query(
                 file_info = stats["file_info"]
                 if file_info.get("isSliced"):
                     slice_dir = Path(tmpdir) / "slices"
-                    slice_paths = storage_client.download_file_slices(file_info, slice_dir)
+                    # `table_id` + `export_filter` let the client tell an
+                    # empty export (entries-less manifest → one synthetic
+                    # zero-row slice carrying the declared columns) apart from
+                    # a lost one, which stays an error. The filter matters:
+                    # rowsCount is a whole-table count and cannot arbitrate a
+                    # row-filtered export that legitimately matched nothing —
+                    # the same scenario the zero-row warning below names.
+                    slice_paths = storage_client.download_file_slices(
+                        file_info,
+                        slice_dir,
+                        table_id=full_table_id,
+                        export_filter=export_filter,
+                    )
                     if not slice_paths:
                         raise RuntimeError(f"sliced parquet export for {full_table_id} yielded no slices")
                     quoted = ", ".join("'" + str(p).replace("'", "''") + "'" for p in slice_paths)

@@ -56,6 +56,12 @@
     border-radius: var(--radius-sm);
     padding: 2px 6px;
 }
+
+.slb-severity-note {
+    margin: var(--space-2) 0 0;
+    font-size: 12px;
+    color: var(--ds-text-secondary);
+}
 </style>
 {% endblock %}
 
@@ -169,7 +175,7 @@
     {% if constraints %}
     <table class="data-table">
         <thead>
-            <tr><th>Name</th><th>Type</th><th>Rule</th><th title="warning: recorded for reference, never blocks a query. error: blocks validate-query, but only when Type is statically checkable (currently just required_filter) and the rule is missing from the query — any other Type is advisory only regardless of severity.">Severity</th><th>Metrics</th></tr>
+            <tr><th>Name</th><th>Type</th><th>Rule</th><th data-tip="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft." aria-label="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft.">Severity</th><th>Metrics</th></tr>
         </thead>
         <tbody>
             {% for c in constraints %}
@@ -187,6 +193,7 @@
             {% endfor %}
         </tbody>
     </table>
+    <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
     {% else %}
     <div class="empty-state"><p class="empty-state__description">No constraints{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
     {% endif %}
