@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import re
 
+import pytest
+
 from src.db import get_system_db
 
 _SLUG = "retail"
@@ -854,20 +856,49 @@ class TestObjectDetailScaffold:
         assert r.status_code == 200, r.text
         assert _side_row(r.text, "Source ref") is None
 
-    def test_admin_gets_the_manage_cluster_with_all_three_doors(self, seeded_app):
+    def test_native_model_has_no_source_row(self, seeded_app):
+        """The hero badge already says Native; a rail row repeating it teaches
+        the reader that the rail restates the header."""
+        _seed_model()
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert ">Native<" in r.text  # the header still states it
+        assert _side_row(r.text, "Source") is None
+
+    def test_detached_model_says_so_in_the_rail(self, seeded_app, monkeypatch):
+        """A model an admin took off sync is the case this row exists for. The
+        `sync_mode` column is Postgres-only (A3 ratchet), so the detached row is
+        injected here rather than seeded — what is under test is that the
+        template renders the state, which is where it was missing."""
+        import app.web.router as web_router
+
+        _seed_model()
+        real = web_router._readable_model_by_slug
+
+        def _detached(slug, user, conn):
+            row = real(slug, user, conn)
+            return None if row is None else {**row, "sync_mode": "detached"}
+
+        monkeypatch.setattr(web_router, "_readable_model_by_slug", _detached)
+        r = self._object(seeded_app, seeded_app["admin_token"])
+        assert r.status_code == 200, r.text
+        sync = _side_row(r.text, "Sync") or ""
+        assert "Detached" in sync
+        assert "Synced" not in sync
+
+    def test_admin_gets_the_manage_cluster_with_one_door(self, seeded_app):
+        """`manage()`'s contract: instance-scoped work goes behind ONE
+        `admin_href`, and `actions` are reserved for actions on the object
+        itself — which this read-only page has none of."""
         _seed_model()
         r = self._object(seeded_app, seeded_app["admin_token"])
         assert r.status_code == 200, r.text
         block = self._MANAGE.search(r.text)
         assert block, "admin is missing the manage cluster"
         manage = block.group(0)
-        for label, href in (
-            ("Semantic sources", "/admin/semantic-sources"),
-            ("Semantic models", "/semantic-layer"),
-            ("Semantic layer health", "/admin/semantic-layer"),
-        ):
-            assert f'href="{href}"' in manage, href
-            assert f">{label}" in manage, label
+        assert 'href="/admin/semantic-layer"' in manage
+        assert "Semantic layer health" in manage
+        assert "detail-manage__body" not in manage, "the cluster grew an action list again"
 
     def test_non_admin_gets_no_manage_cluster(self, seeded_app):
         row = _seed_model()
@@ -875,8 +906,49 @@ class TestObjectDetailScaffold:
         r = self._object(seeded_app, seeded_app["analyst_token"])
         assert r.status_code == 200, r.text
         assert not self._MANAGE.search(r.text), "non-admin was offered admin management links"
-        assert "/admin/semantic-sources" not in r.text
         assert "/admin/semantic-layer" not in r.text
+
+
+class TestObjectDetailLegacyTheme:
+    """The scaffold's gating rule: the rail and the redesign-only header
+    affordances do not exist on a non-paper instance, so anything they carry
+    must still reach the legacy page through an ungated slot. The object type
+    is the one such fact here — the header this page replaced printed it
+    ungated as part of "<model> · <type>"."""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_theme(self, monkeypatch):
+        monkeypatch.setenv("AGNES_INSTANCE_THEME", "blue")
+
+    def test_legacy_header_still_names_the_object_type(self, seeded_app):
+        _seed_model()
+        r = seeded_app["client"].get(
+            f"/semantic-layer/{_SLUG}/constraint:region_filter_required",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert "detail-cols" not in body, "the rail must not render on the legacy path"
+        # The type, in the hero's ungated meta line...
+        meta = re.search(r'<div class="detail-hero__meta">(.*?)</div>', body, re.DOTALL)
+        assert meta, "legacy hero has no meta line"
+        assert "Constraint" in meta.group(1)
+        # ...and the model name, still in the ungated back link.
+        assert f'class="detail-back" href="/semantic-layer/{_SLUG}?tab=constraints"' in body
+        assert _SLUG in body
+
+    def test_legacy_dataset_source_heading_is_not_reworded(self, seeded_app):
+        """ "Source table" disambiguates the heading from the rail's provenance
+        row; with no rail there is no collision, so the legacy heading keeps
+        the word it has always had."""
+        _seed_model()
+        r = seeded_app["client"].get(
+            f"/semantic-layer/{_SLUG}/dataset:orders",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert "Source table" not in r.text
+        assert re.search(r'<h2 class="detail-section__title">.*?Source</h2>', r.text, re.DOTALL)
 
 
 class TestLibraryEntryPoint:

@@ -116,15 +116,26 @@
 </div>
 {% endset %}
 
+{# `type_label` is redesign-gated inside the hero, and the header this page
+   replaced printed the type ungated ("<model> · Constraint"). So the type also
+   rides the UNGATED `meta` slot on the legacy path — the same split
+   catalog_table_detail.html makes for the facts its editorial header moves to
+   the rail. The model name needs no such fallback: `detail-back` renders it
+   ungated one line above, on both paths. #}
+{% set _meta = [] %}
+{% if not detail.redesign %}
+  {% set _ = _meta.append({'icon': 'info', 'text': object_type_label}) %}
+{% endif %}
+
 {# A semantic object is Data — the same teal and cylinder glyph as the tables
    it describes; only the type badge (Dataset / Metric / …) tells them apart.
    Back goes to the model's own tab for this object type, which is where the
    reader clicked through from. #}
 {% call detail.hero(
      kind='data', name=object_name,
-     type_label=object_type_label,
+     type_label=object_type_label, meta=_meta,
      description=obj.description or None,
-     back_href='/semantic-layer/' ~ slug ~ '?tab=' ~ back_tab,
+     back_href='/semantic-layer/' ~ (slug | urlencode) ~ '?tab=' ~ back_tab,
      back_label=model_name,
      body_slot=_badges|trim) %}
 {% endcall %}
@@ -154,16 +165,18 @@
         </tbody>
     </table>
     {% else %}
-    <p class="empty-state__description">No fields declared.</p>
+    {{ detail.empty('No fields declared.', icon='table') }}
     {% endif %}
 {{ detail.section_close() }}
 {% if obj.source %}
 {# "Source table", not "Source": the rail's provenance block already answers
    "where did this DOCUMENT come from", and one page cannot spell two different
-   questions the same way. This one is the physical object the dataset binds
-   to. It stays a main-column section rather than moving to the rail, because
-   the rail is redesign-only and a legacy instance would lose the fact. #}
-{{ detail.section_open('Source table', icon='db') }}
+   questions the same way. The rewording is redesign-gated because the
+   collision is: on the legacy path there is no rail, so the heading keeps the
+   word it has always had (THE GATING RULE in macros/_detail.html). It stays a
+   main-column section either way — in the rail a legacy instance would lose
+   the fact entirely. #}
+{{ detail.section_open('Source table' if detail.redesign else 'Source', icon='db') }}
     <p>{{ obj.source }}</p>
 {{ detail.section_close() }}
 {% endif %}
@@ -177,7 +190,7 @@
     <pre class="slb-expr">{{ e.expression }}</pre>
     {% endfor %}
     {% else %}
-    <p class="empty-state__description">No expression declared.</p>
+    {{ detail.empty('No expression declared.', icon='code') }}
     {% endif %}
     {# The way back to the flat registry: the same metric's row there carries
        the SQL Agnes composed from this expression, its synonyms and its
@@ -265,7 +278,10 @@
    emits the row with `| safe`. #}
 {% set _model_link %}<a href="/semantic-layer/{{ slug | urlencode }}">{{ model_name }}</a>{% endset %}
 {{ detail.side_open('') }}
-  {% set _rows = [{'key': 'Source', 'val': source_label},
+  {# Source only when a source actually owns the document: for a native model
+     the hero badge two lines up already says "Native", and `side_rows` drops a
+     row whose value is empty rather than printing the same word twice. #}
+  {% set _rows = [{'key': 'Source', 'val': source_label if is_imported else None},
                   {'key': 'Source ref', 'val': source_ref}] %}
   {% set _ = _rows.append({'key': 'Model', 'html': True, 'val': _model_link | trim}) %}
   {% if sync_mode == 'detached' %}
@@ -284,14 +300,18 @@
 {# ── Managing it ───────────────────────────────────────────────────────
    N6 (#1707). LAST in the rail, admin-only — the same visibility condition
    the model page puts on Detach. An admin who reaches a stale object here had
-   no way on to the pages that own it and was retyping URLs; these are the
-   three, under their current names (#1844): where the document comes from,
-   whether the layer is healthy, and the model list itself. Nothing here edits
-   the object — this page stays read-only. #}
+   nothing to click and was retyping admin URLs.
+
+   ONE door, no action list. Managing a semantic model is instance-scoped work
+   (a source's schedule, the layer's health), and `manage()`'s contract puts
+   instance-scoped work behind `admin_href` alone — an `actions` entry means an
+   action ON the thing the reader is standing on, which this page, being
+   read-only, has none of. Semantic layer health is that door: it reports on
+   this model and links onward to Semantic sources, and the rail's Model row
+   above already leads back to the model itself. #}
 {% if user.is_admin %}
 {{ detail.manage(
-     [{'label': 'Semantic sources', 'href': '/admin/semantic-sources'},
-      {'label': 'Semantic models', 'href': '/semantic-layer'}],
+     [],
      admin_href='/admin/semantic-layer',
      admin_label='Semantic layer health',
      title='Manage this model') }}
