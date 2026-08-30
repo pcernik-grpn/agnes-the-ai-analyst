@@ -30,6 +30,15 @@ subtly wrong:
 - ``LICENSE`` (a literal, no wildcard) matches only the root-level file named
   exactly ``LICENSE``.
 
+One divergence from `paths-ignore` is deliberate, not a gap: ``git diff
+--name-only`` collapses a rename to its DESTINATION path only (``git mv
+app/main.py docs/main.py`` reports just ``docs/main.py``), which would
+misclassify that commit as docs-only even though `paths-ignore` — which
+looks at GitHub's added/removed/modified file lists, where a rename appears
+as both a removal and an addition — would have built it. This script always
+passes ``--no-renames`` to `git diff` so a rename is reported as its old AND
+new path, closing that gap.
+
 Usage::
 
     python3 scripts/ci/docs_only_change.py <before_sha> <head_sha>
@@ -47,11 +56,20 @@ Stdlib only, on purpose — no venv required to run it in CI.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ZERO_SHA = "0" * 40
+
+# A well-formed git SHA (abbreviated or full), the all-zeros sentinel git
+# uses for a branch-create `before`, or an empty string (`workflow_dispatch`
+# has no `before` at all). Anything else is rejected before it ever reaches
+# a `git` subprocess argument — GitHub computes these values today, but
+# validating input before it lands in a subprocess argv is cheap hygiene
+# regardless of who currently controls it.
+_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$|^0+$|^$")
 
 # Mirrors the removed `paths-ignore:` list exactly (see module docstring for
 # the depth semantics of each entry).
@@ -90,13 +108,27 @@ def decide(repo_dir: Path, before_sha: str, head_sha: str) -> tuple[bool, str]:
     ``build`` is ``True`` whenever the workflow should run the image build —
     the safe default whenever the diff can't be established with confidence.
     """
-    if not before_sha or before_sha == ZERO_SHA:
+    if not _SHA_PATTERN.match(before_sha):
+        return True, f"before_sha {before_sha!r} does not look like a git SHA"
+    if not _SHA_PATTERN.match(head_sha):
+        return True, f"head_sha {head_sha!r} does not look like a git SHA"
+
+    if not before_sha or set(before_sha) == {"0"}:
         return True, "before_sha is empty or all zeros (branch-create / zero-diff push)"
 
     if not _sha_is_known(repo_dir, before_sha):
         return True, f"before_sha {before_sha} is unknown to local git (force-push edge)"
 
-    diff = _run_git(repo_dir, "diff", "--name-only", before_sha, head_sha)
+    # `--no-renames`: plain `--name-only` collapses a rename to its
+    # DESTINATION path only, which would misclassify `git mv app/main.py
+    # docs/main.py` as docs-only (see module docstring). `--no-renames`
+    # reports both the old and new path instead, matching what GitHub's own
+    # `paths-ignore` sees (its added/removed/modified file lists). The
+    # trailing `--` terminates the revision list so neither SHA can be
+    # misread as a pathspec — putting `--` *before* the SHAs instead would
+    # do the opposite (git would treat them as literal path arguments and
+    # silently return an empty diff), confirmed by probe.
+    diff = _run_git(repo_dir, "diff", "--no-renames", "--name-only", before_sha, head_sha, "--")
     if diff.returncode != 0:
         return True, f"git diff {before_sha}..{head_sha} failed: {diff.stderr.strip()}"
 

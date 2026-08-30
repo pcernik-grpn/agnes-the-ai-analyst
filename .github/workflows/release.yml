@@ -57,17 +57,32 @@ jobs:
   # `scripts/ci/docs_only_change.py` — rather than bash-in-YAML.
   decide:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       build: ${{ steps.decide.outputs.build }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # This gate only needs commit history + paths, never blob content —
+          # `filter: blob:none` keeps the "cheap gate" claim true against a
+          # repo whose `.git` directory is otherwise hundreds of MB.
+          filter: blob:none
 
       - name: Decide whether this push needs an image build
         id: decide
+        # SHAs travel through `env:` rather than being interpolated directly
+        # into the `run:` script — cheap hygiene per the security playbook
+        # (untrusted-looking template expressions belong in env vars, not
+        # inline in shell), even though both values are GitHub-computed and
+        # not attacker-controlled today. The script itself re-validates each
+        # against a strict SHA-shaped regex before it ever reaches `git`.
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          output=$(python3 scripts/ci/docs_only_change.py "${{ github.event.before }}" "${{ github.sha }}")
+          output=$(python3 scripts/ci/docs_only_change.py "$BEFORE_SHA" "$HEAD_SHA")
           echo "$output" | head -1 >> "$GITHUB_OUTPUT"
           echo "$output" | tail -1
 
@@ -106,10 +121,22 @@ jobs:
     # makes every autopilot PR look broken. Skipping the dev-image build for
     # these branches keeps them visually clean without touching main, real
     # dev branches, or the merge gate.
+    #
+    # `always() && ... != 'false'` (not `== 'true'`) is deliberate: without
+    # an explicit status function, `needs: decide` defaults to implicit
+    # `success()`, so an infra blip in `decide` (e.g. a flaky checkout) would
+    # SKIP `build-and-push` on `main` — and even on `workflow_dispatch`,
+    # despite the comment above claiming that trigger is never gated by
+    # `decide`, since a failed/skipped dependency skips its dependents
+    # regardless of the `event_name` branch of the condition. `always()`
+    # makes this job's own `if:` the only thing that decides whether it
+    # runs, and comparing against `!= 'false'` fails OPEN on a missing/empty
+    # output (a `decide` failure never sets its output at all) exactly like
+    # every other uncertain case in `scripts/ci/docs_only_change.py`.
     if: |
-      !endsWith(github.ref, '-autopilot') && (
+      always() && !endsWith(github.ref, '-autopilot') && (
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'push' && needs.decide.outputs.build == 'true')
+        (github.event_name == 'push' && needs.decide.outputs.build != 'false')
       )
     runs-on: ubuntu-latest
     outputs:

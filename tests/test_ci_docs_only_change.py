@@ -126,6 +126,40 @@ def test_license_only_change_skips_build(repo: Path) -> None:
     assert build is False
 
 
+def test_rename_into_docs_dir_still_builds(repo: Path) -> None:
+    """`git diff --name-only` alone collapses a rename to its DESTINATION
+    path only — `git mv app/main.py docs/main.py` would report just
+    `docs/main.py`, misclassifying the commit as docs-only. GitHub's own
+    `paths-ignore` looks at the added/removed/modified file lists, where a
+    rename shows up as both a removal and an addition, so it would have
+    built this commit. `--no-renames` is what keeps `decide` in step with
+    that: it must report `app/main.py` too."""
+    before = _commit(repo, {"app/main.py": "print('hi')\n"}, "init")
+    (repo / "docs").mkdir(parents=True, exist_ok=True)
+    _git(repo, "mv", "app/main.py", "docs/main.py")
+    _git(repo, "commit", "-q", "-m", "rename into docs")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    build, reason = decide(repo, before, head)
+
+    assert build is True
+    assert "app/main.py" in reason
+
+
+def test_malformed_before_sha_always_builds(repo: Path) -> None:
+    head = _commit(repo, {"app/main.py": "print('hi')\n"}, "init")
+    build, reason = decide(repo, "--upload-pack=evil", head)
+    assert build is True
+    assert "does not look like a git SHA" in reason
+
+
+def test_malformed_head_sha_always_builds(repo: Path) -> None:
+    before = _commit(repo, {"app/main.py": "print('hi')\n"}, "init")
+    build, reason = decide(repo, before, "not-a-sha!!")
+    assert build is True
+    assert "does not look like a git SHA" in reason
+
+
 def test_mixed_docs_and_code_change_builds(repo: Path) -> None:
     before = _commit(repo, {"app/main.py": "print('hi')\n"}, "init")
     head = _commit(
