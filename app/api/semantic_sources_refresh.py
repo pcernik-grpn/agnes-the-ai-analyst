@@ -32,13 +32,16 @@ instance:
 * ``reconcile_after_import()`` runs after each successful import and performs
   the post-sync legacy-row cleanup those endpoints used to do inline.
 * ``src.semantic.adapters.unconfigured_reason()`` is asked of every source
-  before its import: a source whose CONNECTOR is no longer configured on this
-  instance (credentials rotated out, connection removed) is skipped
-  (``skipped_not_configured``) rather than imported into its connector's own
-  "not configured" failure on every run, forever. The row is left exactly as
-  the admin shaped it — skipping is reversible the moment the configuration
-  returns, deleting the row is not — with the reason recorded on it so
-  /admin/semantic-sources shows why it stopped syncing.
+  before its import: a source whose adapter reports that its CONNECTOR is not
+  configured on this instance at all is skipped (``skipped_not_configured``)
+  rather than imported into that connector's own "not configured" failure on
+  every run, forever. The row is left exactly as the admin shaped it —
+  skipping is reversible the moment the configuration returns, deleting the
+  row is not — with the reason recorded on it so /admin/semantic-sources and
+  the health report show why it stopped syncing. Per-adapter opt-in: today
+  ``databricks_metric_views`` and ``snowflake_semantic`` answer, both because
+  they are auto-registered and can outlive the connection they read; an
+  adapter that stays silent is always "ready" and its failures stay failures.
 * ``claim_source_for_import()`` and ``duplicate_upstream_reason()`` carry over
   the two guards those triggers had built in: a migrated Keboola source is
   skipped (``skipped_running``) while the login-triggered sync that writes the
@@ -159,37 +162,6 @@ def _run_sweep() -> dict[str, Any]:
             results.append({"id": source_id, "name": name, "status": "skipped_disabled"})
             continue
 
-        # The connector this source reads is no longer configured on this
-        # instance. Asked of the ADAPTER (`src/semantic/adapters`), so the
-        # sweep stays generic: a git/upload source has no connector and never
-        # answers, a connector adapter opts in with one method.
-        #
-        # Skipped, not failed and NOT deleted. Importing it would raise the
-        # connector's own "not configured" on every single run, forever —
-        # which is precisely the state the connector's create-time gate
-        # exists to prevent but cannot, since it returns an existing row's id
-        # before checking. The row keeps everything an admin gave it: a
-        # rotated credential or a removed connection is an outage, not
-        # consent to throw the source away.
-        unconfigured = unconfigured_reason(source)
-        if unconfigured:
-            skipped_not_configured += 1
-            results.append({"id": source_id, "name": name, "status": "skipped_not_configured", "error": unconfigured})
-            # info, not warning: this is a deliberate admin state that would
-            # otherwise log at warning level on every tick, forever — the
-            # noise half of the very bug this skip fixes.
-            logger.info(
-                "semantic sources refresh: source %s skipped, its connector is not configured: %s",
-                source_id,
-                unconfigured,
-            )
-            # Recorded on the row for the same reason the duplicate-project
-            # skip is: without it the row would keep rendering the red
-            # "failed" from the last sweep that still tried, and nothing
-            # would ever say why it stopped trying.
-            repo.record_sync(source_id, status="skipped", error=unconfigured)
-            continue
-
         # Single-flight against the OTHER writer of this source's rows (the
         # Keboola login-triggered sync). Held for the whole import, released
         # however it ends.
@@ -204,6 +176,48 @@ def _run_sweep() -> dict[str, Any]:
                         "hint": "Another writer of this source's rows is in flight; the next sweep picks it up.",
                     }
                 )
+                continue
+
+            # The connector this source reads is no longer configured on
+            # this instance. Asked of the ADAPTER
+            # (`src/semantic/adapters`), so the sweep stays generic: a
+            # git/upload source has no connector and never answers, a
+            # connector adapter opts in with one method.
+            #
+            # Skipped, not failed and NOT deleted. Importing it would raise
+            # the connector's own "not configured" on every single run,
+            # forever — which is precisely the state the connector's
+            # create-time gate exists to prevent but cannot, since it returns
+            # an existing row's id before checking. The row keeps everything
+            # an admin gave it: a rotated credential or a removed connection
+            # is an outage, not consent to throw the source away.
+            #
+            # INSIDE the claim, exactly like the duplicate-project skip below
+            # and for the same reason: this branch WRITES to the row
+            # (`record_sync`), and the claim is what serializes that against
+            # the other writer of this source's rows. Inert today — no
+            # adapter that has a competing writer implements the hook — but
+            # the next one that does (Keboola, whose login-triggered sync
+            # writes the same rows) would silently inherit the clobber.
+            unconfigured = unconfigured_reason(source)
+            if unconfigured:
+                skipped_not_configured += 1
+                results.append(
+                    {"id": source_id, "name": name, "status": "skipped_not_configured", "error": unconfigured}
+                )
+                # info, not warning: this is a deliberate admin state that
+                # would otherwise log at warning level on every tick,
+                # forever — the noise half of the very bug this skip fixes.
+                logger.info(
+                    "semantic sources refresh: source %s skipped, its connector is not configured: %s",
+                    source_id,
+                    unconfigured,
+                )
+                # Recorded on the row for the same reason the
+                # duplicate-project skip is: without it the row would keep
+                # rendering the red "failed" from the last sweep that still
+                # tried, and nothing would ever say why it stopped trying.
+                repo.record_sync(source_id, status="skipped", error=unconfigured)
                 continue
 
             # One upstream, one importer per sweep — two sources resolving to

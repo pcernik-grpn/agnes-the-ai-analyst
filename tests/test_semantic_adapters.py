@@ -107,3 +107,58 @@ class TestUnconfiguredReason:
             lambda *a, **k: {"host": "example.cloud.databricks.com", "warehouse_id": "w1", "token": "t"},
         )
         assert unconfigured_reason({"adapter": "databricks_metric_views", "config": {}}) is None
+
+    def test_the_snowflake_adapter_reports_an_unconfigured_account(self, monkeypatch):
+        """The same shape as Databricks, and not hypothetical: the
+        /admin/data-sources wizard auto-registers a `snowflake_semantic`
+        source on connect, so deconfiguring Snowflake leaves exactly the same
+        source-outlives-its-connector row behind."""
+        from src.semantic.adapters import unconfigured_reason
+
+        monkeypatch.setattr(
+            "connectors.snowflake.settings.resolve_snowflake_settings",
+            lambda *a, **k: None,
+        )
+        reason = unconfigured_reason({"adapter": "snowflake_semantic", "config": {}})
+        assert reason is not None
+        assert "not configured" in reason.lower()
+
+    def test_the_snowflake_adapter_is_ready_when_the_account_resolves(self, monkeypatch):
+        from src.semantic.adapters import unconfigured_reason
+
+        monkeypatch.setattr(
+            "connectors.snowflake.settings.resolve_snowflake_settings",
+            lambda *a, **k: {"account": "acct", "user": "u", "database": "db"},
+        )
+        assert unconfigured_reason({"adapter": "snowflake_semantic", "config": {}}) is None
+
+    @pytest.mark.parametrize(
+        "adapter,resolver,legacy_config",
+        [
+            (
+                "databricks_metric_views",
+                "connectors.databricks.semantic_layer.resolve_databricks_settings",
+                "data_source.databricks",
+            ),
+            (
+                "snowflake_semantic",
+                "connectors.snowflake.settings.resolve_snowflake_settings",
+                "data_source.snowflake",
+            ),
+        ],
+    )
+    def test_the_reason_names_both_places_a_connector_is_configured(
+        self, monkeypatch, adapter, resolver, legacy_config
+    ):
+        """Both resolvers are ROW-FIRST: the `source_connections` row the
+        /admin/data-sources wizard writes, with the `data_source.*` yaml as
+        the legacy fallback. A reason naming only the yaml sends an admin who
+        configured the connector through the wizard off to edit a file that
+        was never the source of truth for them.
+        """
+        from src.semantic.adapters import unconfigured_reason
+
+        monkeypatch.setattr(resolver, lambda *a, **k: None)
+        reason = unconfigured_reason({"adapter": adapter, "config": {}}) or ""
+        assert "Admin → Data sources" in reason
+        assert legacy_config in reason

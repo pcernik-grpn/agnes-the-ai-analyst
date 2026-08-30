@@ -610,6 +610,37 @@ class TestASourceWhoseConnectorIsGone:
         assert body["synced"] == 1
         assert body["skipped_not_configured"] == 0
 
+    def test_a_snowflake_source_gets_the_same_treatment(self, seeded_app, monkeypatch, no_import):
+        """Not a Databricks quirk: the /admin/data-sources wizard registers a
+        `snowflake_semantic` source on connect (`_connectSemanticSource`), so
+        deconfiguring Snowflake leaves the identical row-outlived-its-
+        connector state. Skipped, kept, no error accrued."""
+        monkeypatch.setattr(
+            "connectors.snowflake.settings.resolve_snowflake_settings",
+            lambda *a, **k: None,
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        source_id = _create_source(
+            c,
+            token,
+            kind="connection",
+            name="Snowflake semantics",
+            adapter="snowflake_semantic",
+            config={"connection_id": "conn-sf"},
+        )
+
+        body = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token)).json()
+        assert no_import == []
+        assert body["skipped_not_configured"] == 1
+        assert body["failed"] == 0
+        assert {s["id"]: s["status"] for s in body["sources"]}[source_id] == "skipped_not_configured"
+
+        row = c.get(f"/api/admin/semantic-sources/{source_id}", headers=_auth(token))
+        assert row.status_code == 200, "the row must survive its connector going away"
+        assert row.json()["last_sync_status"] == "skipped"
+        assert "not configured" in (row.json()["last_sync_error"] or "").lower()
+
     def test_the_counter_rides_the_audit_row(self, seeded_app, unconfigured, no_import):
         """The audit params mirror the response counters — a new counter that
         is not there leaves the audit row describing a sweep that never

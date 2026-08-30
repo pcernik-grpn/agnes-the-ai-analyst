@@ -279,6 +279,12 @@ class DatabricksMetricViewAdapter:
         forever. The sweep asks this first and skips the row instead; the row
         itself is untouched, because an existing row is one an admin shaped
         and an outage is not consent to delete it.
+
+        Deliberately the same zero-argument ``resolve_databricks_settings()``
+        call :meth:`extract` makes — row-first, legacy yaml second — so this
+        answers "yes" exactly when that one would raise, and the reason names
+        BOTH places the connector can be configured rather than sending a
+        wizard-configured admin off to edit instance.yaml.
         """
         # Imported at call time for the same reason `extract` does it below.
         from connectors.databricks.semantic_layer import resolve_databricks_settings
@@ -286,9 +292,9 @@ class DatabricksMetricViewAdapter:
         if resolve_databricks_settings():
             return None
         return (
-            "Databricks is not configured on this instance (data_source.databricks.host + "
-            "warehouse_id, and the DATABRICKS_TOKEN env var / vault secret); skipping this "
-            "source until it is configured again"
+            "Databricks is not configured on this instance (a registered Databricks connection — "
+            "Admin → Data sources — or the legacy data_source.databricks.* config, plus its "
+            "DATABRICKS_TOKEN env or vault secret); skipping this source until it is configured again"
         )
 
     def extract(self, config: Dict[str, Any]) -> List[str]:

@@ -487,3 +487,38 @@ class TestTheHealthTabReportsSilentlyEmptySources:
         section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
         assert "danger" not in section
         assert "error" not in section
+
+
+class TestTheHealthTabReportsSkippedSources:
+    """The page twin of the CLI section: `hlRender` filtered `sources` on
+    `error` and `ok`+0 only, so a source the sweep permanently SKIPS (its
+    connector deconfigured) produced no section AND left the headline reading
+    "No sync failures, disconnected models, or invalid documents."
+
+    Client-rendered, so what is pinned is the shell it renders FROM.
+    """
+
+    def _body(self, seeded_app) -> str:
+        return (
+            seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
+        )
+
+    def test_the_report_has_its_own_section(self, seeded_app):
+        assert "Sources that are not syncing (skipped)" in self._body(seeded_app)
+
+    def test_the_section_selects_skipped_rows(self, seeded_app):
+        predicate = self._body(seeded_app).split("const skippedSources")[1].split(";")[0]
+        assert 'last_sync_status === "skipped"' in predicate
+
+    def test_the_finding_suppresses_the_nothing_is_wrong_headline(self, seeded_app):
+        nothing_wrong = self._body(seeded_app).split("const nothingWrong")[1].split(";")[0]
+        assert "skippedSources" in nothing_wrong
+
+    def test_it_is_not_rendered_with_error_styling(self, seeded_app):
+        """Nothing failed — the sweep declined to try — so it must not borrow
+        the failure vocabulary (design system: no danger accent for an
+        attention state)."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that are not syncing (skipped)"')[1].split("});")[0]
+        assert "danger" not in section
+        assert "error" not in section.replace("last_sync_error", "")
