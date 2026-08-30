@@ -3110,7 +3110,11 @@ def register_foundation_tools(
         # itself via a same-origin re-fetch of the grant endpoint.
         return {"render": "data_app_preview", "slug": slug, "url": url}
 
-    @tool(read_only=False, idempotent=True)
+    # Read-only, and honestly so — see the note on the stdio twin in
+    # cli/mcp/server.py: both tools return a render directive and make no
+    # server call, and a client that confirms non-read-only calls would put
+    # an approval card in front of every preview refresh.
+    @tool(read_only=True, idempotent=True)
     async def agnes_data_app_refresh(slug: str) -> dict:
         """Force-reload the in-chat preview pane for a hosted data app.
 
@@ -3126,7 +3130,7 @@ def register_foundation_tools(
         """
         return {"render": "data_app_preview_refresh", "slug": slug}
 
-    @tool(read_only=False, destructive=True)
+    @tool(read_only=True, idempotent=True)
     async def agnes_data_app_close(slug: str) -> dict:
         """Tear down the in-chat preview pane for a hosted data app.
 

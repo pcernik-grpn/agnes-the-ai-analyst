@@ -29,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 import uuid
 import time
 from pathlib import Path
@@ -135,15 +136,17 @@ _WEDGE_DRAIN_SECONDS = 5.0
 # ── MCP tool approval routing ────────────────────────────────────────────
 #
 # The CLI namespaces every MCP tool as ``mcp__<server>__<tool>``. Whether a
-# call needs the user's confirmation is decided from the tool's OWN
-# behaviour annotation (``readOnlyHint``, set at the ``@tool(read_only=…)``
-# decoration in ``cli/mcp/server.py`` via ``src/mcp_tooling.py``), never
-# from its name: a name-shaped rule silently stops covering the next
-# mutating tool somebody adds. Anything not positively known to be
-# read-only — a tool added after this runner was built, a per-caller
-# passthrough tool (registered dynamically, carries no annotation at all),
-# or a tool from a workspace-configured MCP server — counts as mutating and
-# takes the approval round-trip.
+# call needs the user's confirmation follows each tool's OWN behaviour
+# annotation (``readOnlyHint``, set at the ``@tool(read_only=…)``
+# decoration in ``cli/mcp/server.py`` via ``src/mcp_tooling.py``) — but at
+# tool time the runner cannot read annotations (they live in the MCP
+# server it does not import), so the rule it actually evaluates is the
+# name allowlist below, a COPY of those annotations pinned to them by a
+# test. The direction of the default is what makes that safe: anything not
+# positively listed — a tool added after this runner was built, a
+# per-caller passthrough tool (registered dynamically, carries no
+# annotation at all), or a tool from a workspace-configured MCP server —
+# counts as mutating and takes the approval round-trip.
 _MCP_TOOL_PREFIX = "mcp__"
 
 #: PreToolUse matcher covering every MCP tool from every connected server.
@@ -174,7 +177,9 @@ _AGNES_MCP_SERVER_NAME = "agnes"
 #: costs a needless card, never an unasked mutation.
 _READ_ONLY_AGNES_MCP_TOOLS = frozenset(
     {
+        "agnes_data_app_close",
         "agnes_data_app_credentials",
+        "agnes_data_app_refresh",
         "catalog",
         "collection_file_read",
         "collection_get",
@@ -242,10 +247,13 @@ class ApprovalGate:
     in-process, so it CAN block the call while a human answers.
 
     MCP tools take the same round-trip, routed from their own behaviour
-    ANNOTATIONS rather than the file hook: ``readOnlyHint=True`` runs
-    unasked, everything else — including a tool nobody has classified —
-    asks (see ``_check_mcp_tool``). The file hook is not consulted for them;
-    the bundled one allows every non-Bash tool anyway.
+    annotations rather than from a per-tool policy rule: a tool the
+    file hook does not ``deny`` runs unasked when it is known read-only,
+    and asks otherwise — including a tool nobody has classified (see
+    ``_check_mcp_tool``). The file hook still runs FIRST for them, because
+    a ``deny`` in it is an operator policy decision and outranks any
+    annotation; its ``allow`` means nothing here (the bundled hook allows
+    every non-Bash tool by default).
 
     ``allow_session`` remembers the exact approved COMMAND (for an MCP tool,
     the tool plus its arguments) and auto-allows later asks for that
@@ -354,28 +362,66 @@ class ApprovalGate:
         return any(not fut.done() for fut in self._pending.values())
 
     async def check(self, input_data: dict, tool_use_id, context) -> dict:
-        """SDK PreToolUse callback body. Returns hookSpecificOutput."""
+        """SDK PreToolUse callback body. Returns hookSpecificOutput.
+
+        A guard wrapper, because a raise inside the gate is a BYPASS: the
+        exception surfaces at the SDK's hook boundary, which treats a hook
+        that errored as having no opinion and runs the tool — the gate's own
+        bug would silently restore exactly the unasked execution it exists to
+        remove. So an internal error denies whatever the gate is responsible
+        for gating (an ask-flagged command, a mutating MCP tool) and says so,
+        while a known read-only MCP tool still runs: a broken gate must not
+        take `catalog` down with it.
+        """
         tool_name = str(input_data.get("tool_name") or "")
-        tool_input = input_data.get("tool_input") or {}
-        if tool_name.startswith(_MCP_TOOL_PREFIX):
-            # MCP tools carry their own verdict in their annotations; the
-            # workspace file hook has no opinion on them (the bundled one
-            # allows every non-Bash tool) and running it per call would put
-            # a subprocess in front of every `catalog`.
-            return await self._check_mcp_tool(tool_name, tool_input)
-        if tool_name != "Bash":
+        try:
+            return await self._check(tool_name, input_data.get("tool_input") or {})
+        except asyncio.CancelledError:
+            # Turn cancellation, not a gate failure — must stay cancellation
+            # or the SDK never learns the call was abandoned.
+            raise
+        except Exception as exc:  # noqa: BLE001 — fail closed, never open
+            print(
+                f"approval gate: internal error on {tool_name!r}: {exc!r}\n{traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if _mcp_tool_is_read_only(tool_name):
+                return {}
+            return _hook_output(
+                "deny",
+                "The approval gate failed internally, so this call could not be confirmed "
+                f"and was refused: {exc}. Tell the user the gate is broken (the sandbox log "
+                "has the traceback) rather than retrying.",
+            )
+
+    async def _check(self, tool_name: str, tool_input: dict) -> dict:
+        """Unguarded body of :meth:`check` — see it for the fail-closed wrap."""
+        is_mcp = tool_name.startswith(_MCP_TOOL_PREFIX)
+        if not is_mcp and tool_name != "Bash":
             # Same reach the gate has always had. The bundled workspace hook
             # returns `allow` for every non-Bash tool, so nothing is lost,
             # and gating every Read/Grep/Edit through a per-call file-hook
             # subprocess would add real latency (scope note on #1145). The
-            # MCP matcher above is why this branch is now reachable at all.
+            # MCP matcher is why this branch is now reachable at all.
             return {}
         payload = {"tool_name": tool_name, "tool_input": tool_input}
+        # The file hook runs for MCP tools too — including the read-only ones.
+        # It is the operator's policy surface, and a `deny` it returns has to
+        # be ENFORCED: routing MCP calls straight to the annotation check
+        # downgraded an operator deny to an approval card the user could click
+        # past (review finding). The cost is one subprocess per MCP call,
+        # accepted for the same reason it is accepted per Bash call. Only
+        # `deny` is honoured here: the bundled hook answers `allow` for every
+        # non-Bash tool, so reading `allow` as a decision would switch the
+        # whole MCP gate off as shipped.
         verdict = await asyncio.to_thread(self.run_file_hook, payload)
         decision = (verdict or {}).get("permissionDecision")
         reason = (verdict or {}).get("permissionDecisionReason", "")
         if decision == "deny":
             return _hook_output("deny", reason or "Denied by workspace policy.")
+        if is_mcp:
+            return await self._check_mcp_tool(tool_name, tool_input)
         if decision != "ask":
             return {}
         command = str(tool_input.get("command", ""))
@@ -396,7 +442,8 @@ class ApprovalGate:
         )
 
     async def _check_mcp_tool(self, tool_name: str, tool_input: dict) -> dict:
-        """Approval verdict for one ``mcp__<server>__<tool>`` call.
+        """Approval verdict for one ``mcp__<server>__<tool>`` call, AFTER the
+        file hook has had its say (a hook ``deny`` never reaches here).
 
         Read-only by its own annotation → no opinion, the call proceeds.
         Anything else — including a tool nobody has classified — takes the
