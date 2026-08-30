@@ -9416,6 +9416,20 @@
       },
       "SetScopeRequest": {
         "properties": {
+          "audience_class": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audience Class"
+          },
           "items": {
             "default": [],
             "items": {
