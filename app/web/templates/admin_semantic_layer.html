@@ -149,6 +149,17 @@
         Last run {{ rs.last_completed_at }} — OK.
       {% elif rs.last_status == 'error' %}
         Last run ({{ rs.last_completed_at }}) failed: {{ rs.last_result }}
+      {% elif rs.fallback_last_sync_at %}
+        {# No sweep in this process — a redeploy empties that state — so this
+           reports what the source rows durably carry. Different claim,
+           different sentence: the last sync of any source, not a sweep, and
+           not an assertion that it succeeded. "N of M" because N alone reads
+           as the total. #}
+        Last source sync {{ rs.fallback_last_sync_at }} across {{ rs.fallback_synced_count }} of {{ rs.fallback_source_count }} source{{ '' if rs.fallback_source_count == 1 else 's' }} — no sweep since this instance restarted.
+      {% elif rs.fallback_unavailable %}
+        {# The sources could not be read. Not "never synced" — that would be
+           the same bug again: a claim about history from a failure to read. #}
+        Sync status unavailable.
       {% else %}
         Never synced yet.
       {% endif %}
@@ -421,7 +432,12 @@ document.getElementById("sl-refresh-btn").addEventListener("click", async () => 
       showToast(
         `Synced ${body.synced ?? 0} source(s)` +
           (failed ? `, ${failed} failed` : "") +
-          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : ""),
+          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : "") +
+          // Called out beside "disabled" because it is the other STANDING
+          // skip: a source whose connector is no longer configured syncs
+          // nothing on every run until an admin acts, and a bare
+          // "Synced 0 source(s)" would not say so.
+          (body.skipped_not_configured ? `, ${body.skipped_not_configured} not configured` : ""),
         failed === 0,
       );
       setTimeout(() => window.location.reload(), 1200);
@@ -1120,6 +1136,16 @@ function hlRender(body) {
   const emptySources = (body.sources || []).filter(
     (s) => s.last_sync_status === "ok" && typeof s.owned_model_count === "number" && s.owned_model_count === 0
   );
+  // A source the SWEEP DECLINED to sync — its connector is no longer
+  // configured on this instance, or another source already imported the same
+  // upstream this run. Neither failed, so neither belongs under "Sync
+  // failures"; but neither is importing anything either, and without a
+  // section of its own an instance whose only source is permanently skipped
+  // read "No sync failures, disconnected models, or invalid documents."
+  // One section for both producers, each row carrying its OWN recorded
+  // reason: a `skipped` row has no machine-readable kind, so a heading named
+  // after one of the two would mislabel the other.
+  const skippedSources = (body.sources || []).filter((s) => s.last_sync_status === "skipped");
   const orphaned = body.orphaned_models || [];
   const tableBindings = body.orphaned_table_bindings || [];
   const invalid = body.invalid_models || [];
@@ -1131,6 +1157,7 @@ function hlRender(body) {
   const nothingWrong =
     !failedSources.length &&
     !emptySources.length &&
+    !skippedSources.length &&
     !orphaned.length &&
     !tableBindings.length &&
     !invalid.length &&
@@ -1174,6 +1201,18 @@ function hlRender(body) {
     // old to send it) adds nothing rather than an empty parenthesis.
     const scanned = typeof s.scan_scope === "string" && s.scan_scope ? ` (scanned ${s.scan_scope})` : "";
     li.appendChild(document.createTextNode(`${scanned} — check this source's scope/config`));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  // Same posture as the section above: neutral text, no failure vocabulary.
+  // The reason is whatever the sweep recorded on the row, so an admin reads
+  // "Databricks is not configured on this instance (…)" rather than a
+  // heading that guesses which skip this was.
+  hlSection(container, "Sources that are not syncing (skipped)", skippedSources, (li, s) => {
+    const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
+    li.appendChild(hlEl("strong", null, s.name || s.source_id));
+    li.appendChild(document.createTextNode(": " + (s.last_sync_error || "reason not recorded")));
     const badge = hlMutedBadge(muted);
     if (badge) li.appendChild(badge);
   });

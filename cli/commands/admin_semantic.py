@@ -915,6 +915,23 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
             typer.echo(f"  {s.get('name') or s['source_id']}{detail} — check this source's scope/config")
         typer.echo("")
 
+    # A source the SWEEP DECLINED to sync — today: its connector is no longer
+    # configured on this instance, or another source already imported the
+    # same upstream this run. Neither failed, so neither belongs in "Sync
+    # failures"; but neither is importing anything either, and without a
+    # section of its own an instance whose only source is permanently skipped
+    # read "No sync failures, disconnected models, or invalid documents."
+    #
+    # One section for both producers, each row carrying its OWN recorded
+    # reason: `last_sync_status='skipped'` carries no machine-readable kind,
+    # so a heading named after one of the two would mislabel the other.
+    skipped = [s for s in sources if s.get("last_sync_status") == "skipped"]
+    if skipped:
+        typer.echo(f"Sources that are not syncing (skipped) ({len(skipped)}):")
+        for s in skipped:
+            typer.echo(f"  {s.get('name') or s['source_id']}: {s.get('last_sync_error') or 'reason not recorded'}")
+        typer.echo("")
+
     orphaned = body.get("orphaned_models") or []
     if orphaned:
         typer.echo(f"Models whose source is gone ({len(orphaned)}):")
@@ -977,7 +994,17 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
     if mutes_list:
         typer.echo(f"Muted ({len(mutes_list)} of the above are silenced — see `agnes admin semantic mutes`)")
 
-    if not (failed or empty_synced or orphaned or table_bindings or invalid or missing_desc or dupes or missing_rel):
+    if not (
+        failed
+        or empty_synced
+        or skipped
+        or orphaned
+        or table_bindings
+        or invalid
+        or missing_desc
+        or dupes
+        or missing_rel
+    ):
         typer.echo("No sync failures, disconnected models, or invalid documents.")
 
 
