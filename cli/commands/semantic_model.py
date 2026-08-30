@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional
 
 import typer
 
@@ -181,7 +180,7 @@ def show(
 @semantic_model_app.command("export")
 def export_model(
     slug: str = typer.Argument(..., help="Model slug"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Write to this file instead of stdout"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Write to this file instead of stdout"),
 ):
     """Print one model's stored document, byte for byte.
 
@@ -249,8 +248,8 @@ def validate_document(
 @semantic_model_app.command("apply")
 def apply(
     path: str = typer.Argument(..., help="Path to a semantic-model document (YAML)"),
-    description: Optional[str] = typer.Option(None, "--description", help="Listing description for the model"),
-    expect_hash: Optional[str] = typer.Option(
+    description: str | None = typer.Option(None, "--description", help="Listing description for the model"),
+    expect_hash: str | None = typer.Option(
         None,
         "--expect-hash",
         help="For edits: the content_hash the edit was based on — a mismatch refuses instead of overwriting.",
@@ -304,7 +303,7 @@ def apply(
 @semantic_model_app.command("validate-query")
 def validate_query(
     sql: str = typer.Argument(..., help="SQL statement to validate"),
-    expect: Optional[str] = typer.Option(
+    expect: str | None = typer.Option(
         None,
         "--expect",
         help='JSON list of expected objects, e.g. \'[{"type":"metric","name":"mrr"}]\'',
@@ -348,6 +347,14 @@ def validate_query(
 
     status = "VALID" if body.get("valid") else "INVALID"
     typer.echo(f"{status} — {body.get('summary', '')}")
+    # The datasets/metrics named above (and in `--json`) are a best-effort
+    # text match, not SQL parsing -- printed unconditionally as its own line
+    # so it can never be missed the way a trailing clause in `summary` could
+    # be (issue #1707, finding A18). Falls back to the generic wording
+    # against an older server that doesn't send `detection` yet.
+    typer.echo(
+        body.get("detection") or "Note: detected datasets/metrics are a best-effort text match, not SQL parsing."
+    )
 
     if body.get("violations"):
         typer.echo("Violations:")
@@ -371,11 +378,11 @@ def validate_query(
         subject = offenders if offenders else "one or more used metrics"
         typer.echo(f"Warning: {subject} — not locally executable on the target engine.")
 
-    if "missing_expected_objects" in body and body["missing_expected_objects"]:
+    if body.get("missing_expected_objects"):
         typer.echo("Missing expected objects:")
         for obj in body["missing_expected_objects"]:
             typer.echo(f"  {obj.get('type')}: {obj.get('name')}")
-    if "unexpected_detected_objects" in body and body["unexpected_detected_objects"]:
+    if body.get("unexpected_detected_objects"):
         typer.echo("Unexpected detected objects:")
         for obj in body["unexpected_detected_objects"]:
             typer.echo(f"  {obj.get('type')}: {obj.get('name')}")
@@ -389,10 +396,10 @@ def validate_query(
 @semantic_model_app.command("context")
 def context(
     semantic_type: str = typer.Argument(..., help=f"One of: {', '.join(_SEMANTIC_TYPES)}"),
-    id: Optional[List[str]] = typer.Option(  # noqa: A002 - CLI flag name, not shadowing intentionally
+    id: list[str] | None = typer.Option(
         None, "--id", help="Specific object id/name — repeatable. Omit for every object of this type (compact)."
     ),
-    model: Optional[List[str]] = typer.Option(
+    model: list[str] | None = typer.Option(
         None,
         "--model",
         help="Restrict to this model id, slug, or name (the `[model]` label shown in output) — "
@@ -463,7 +470,7 @@ def context(
 
 @semantic_model_app.command("schema")
 def schema(
-    semantic_type: List[str] = typer.Argument(..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)}"),
+    semantic_type: list[str] = typer.Argument(..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)}"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
     """Show the vendored Apache Ossie JSON Schema for one or more object types.
@@ -516,10 +523,10 @@ def _fail_needs_postgres(resp, what: str) -> None:
 @feedback_app.command("submit")
 def feedback_submit(
     question: str = typer.Argument(..., help="The question whose answer looked wrong, as it was asked"),
-    sql: Optional[str] = typer.Option(None, "--sql", help="The SQL that produced the suspect answer, if there was one"),
-    metric: Optional[str] = typer.Option(None, "--metric", help="Metric id the answer relied on (e.g. revenue/mrr)"),
-    comment: Optional[str] = typer.Option(None, "--comment", help="What looks wrong about it"),
-    model_hash: Optional[str] = typer.Option(
+    sql: str | None = typer.Option(None, "--sql", help="The SQL that produced the suspect answer, if there was one"),
+    metric: str | None = typer.Option(None, "--metric", help="Metric id the answer relied on (e.g. revenue/mrr)"),
+    comment: str | None = typer.Option(None, "--comment", help="What looks wrong about it"),
+    model_hash: str | None = typer.Option(
         None,
         "--model-hash",
         help="content_hash of the semantic model that produced the answer — pins the report to a document "
@@ -609,7 +616,7 @@ semantic_model_app.add_typer(_coverage_alias_app, name="coverage", hidden=True)
 @_coverage_alias_app.callback(invoke_without_command=True)
 def _coverage_alias(
     ctx: typer.Context,
-    source: Optional[str] = typer.Option(
+    source: str | None = typer.Option(
         None, "--source", help="Only this source connection id (`__local__` for tables with no connection)"
     ),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),

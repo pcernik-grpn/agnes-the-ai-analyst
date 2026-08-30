@@ -55,6 +55,7 @@ from src.semantic.projection import project_document, prune_model
 from src.semantic.scan_scope import with_scan_scope
 from src.semantic_context import get_semantic_context as _get_semantic_context
 from src.semantic_context import get_semantic_schema as _get_semantic_schema
+from src.semantic_validation import DETECTION_NOTE_LONG as _DETECTION_NOTE_LONG
 from src.semantic_validation import validate_query
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ def _stamp_as_utc(stamp: Any) -> datetime:
     because that is what the writer stored.
     """
     if isinstance(stamp, str):
-        stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        stamp = datetime.fromisoformat(stamp)
     if stamp.tzinfo is None:
         return stamp.replace(tzinfo=UTC)
     return stamp.astimezone(UTC)
@@ -1330,12 +1331,10 @@ def _accessible_valid_rows(user: dict, conn: duckdb.DuckDBPyConnection) -> list[
 # parsing (``src/semantic_validation.py``'s own LIMITATIONS). Said out loud in
 # the payload and in every warning line: a column that shares a metric's name
 # matches too, so an unqualified warning would present a heuristic hit as a
-# confirmed violation.
+# confirmed violation. The long form (``_DETECTION_NOTE_LONG``) is imported
+# from ``src.semantic_validation`` -- one shared constant, not a copy -- so it
+# also travels with ``validate_query``'s own result dict (issue #1707, A18).
 _DETECTION_NOTE = "best-effort text match"
-_DETECTION_NOTE_LONG = (
-    "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
-    "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
-)
 
 
 def semantic_validation_for_query(
