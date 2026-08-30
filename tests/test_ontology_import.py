@@ -112,7 +112,7 @@ def test_no_customer_vocabulary_in_translator_source():
     own source, only flow through as data."""
     script_path = Path(__file__).parent.parent / "scripts" / "ontology" / "import_ontology.py"
     source = script_path.read_text()
-    for needle in ("engagement", "sponsor", "northwind", "kohlberg", "myers"):
+    for needle in ("engagement", "sponsor", "northwind", "litware", "fabrikam"):
         assert needle not in source.lower(), f"customer/ontology vocabulary {needle!r} leaked into the script"
 
 

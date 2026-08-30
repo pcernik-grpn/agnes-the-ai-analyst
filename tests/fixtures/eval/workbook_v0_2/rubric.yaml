@@ -1,5 +1,5 @@
 frozen: '2026-08-27'
-source: eval_scoring_workbook_v0.2.xlsx, Rubric sheet, owner Shan Wang
+source: eval_scoring_workbook_v0.2.xlsx, Rubric sheet, owner A. Rivera
 scale_note: 'Scale note: each dimension is scored 0/1/2, not 0-5. Weights below are the original 0-5 weights rescaled ×2.5 so the composite still tops out at 100 and every dimension''s maximum contribution (weight × 2) is unchanged from v0.1 — only the granularity within each dimension got coarser, not the relative importance of the dimensions.'
 composite_formula: composite = Correct×12.5 + Complete×10 + Precision×7.5 + Ground×7.5 + Disambig×5 + Action×5 + Consist×2.5   (each dimension scored 0/1/2, max 100)
 governance_gate: Governance gate FAIL overrides everything above → composite = 0 for that question, no exceptions.

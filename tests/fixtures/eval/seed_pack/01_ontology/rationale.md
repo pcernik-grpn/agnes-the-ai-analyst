@@ -7,7 +7,7 @@ producer repo's own `docs/ONTOLOGY.md`.
 
 ## Design rule
 
-The ontology is derived backwards from the evaluation prompts (Shan Wang's
+The ontology is derived backwards from the evaluation prompts (A. Rivera's
 scoring workbook v0.2), because those are the questions the system is graded
 on. The two graph-decider prompts are G1 (which sponsor drove the most
 engagements, plus a de-duplicated list of every industry touched -- an

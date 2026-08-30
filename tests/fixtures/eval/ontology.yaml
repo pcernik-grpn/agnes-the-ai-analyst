@@ -27,7 +27,7 @@ conventions:
     rule: >
       Every edge MUST carry evidence: a list of {doc_id, quote} where quote is
       VERBATIM from the source document — never paraphrased. (Paraphrase skews
-      and compounds errors down the relation chain — T. Fejfar, 2026-08-26.)
+      and compounds errors down the relation chain.)
       Nodes SHOULD carry evidence for any non-obvious attribute.
     shape: [{doc_id: string, quote: string}]
   entity_resolution: >
@@ -86,7 +86,7 @@ node_types:
     description: The kind of work. P1 filters on it ("sell-side IT due diligence"),
       R1 assembles a proposal of one type, A1 needs it to disambiguate.
     attrs:
-      name: {type: string, required: true}   # e.g. AI Value Backlog, IOP (Industrial Opportunity Partners) AI Assessment,
+      name: {type: string, required: true}   # e.g. AI Value Backlog, SIP (Summit Industrial Partners) AI Assessment,
                                              # Sell-side IT DD, Data Platform Build
 
   skill:

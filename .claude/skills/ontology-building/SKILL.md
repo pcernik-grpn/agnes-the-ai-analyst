@@ -75,8 +75,8 @@ review it exactly as you would review a proposal.
 
 Ask in this order.
 
-**Is it asked about on its own?** "Which engagements did Kohlberg sponsor?"
-means sponsor is a **type**. "How long did the Myers engagement run?" means
+**Is it asked about on its own?** "Which engagements did Litware sponsor?"
+means sponsor is a **type**. "How long did the Fabrikam engagement run?" means
 duration is an **attribute** of engagement — nobody asks "list all durations".
 
 **Does it connect two things?** If it only makes sense as *A relates to B*,
