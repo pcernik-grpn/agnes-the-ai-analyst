@@ -827,6 +827,68 @@ def test_q_escapes_like_metacharacters(pg_env, repo):
 
 
 # ---------------------------------------------------------------------------
+# P2 review finding: `q` has no repo-layer floor, so a 1-char query drives a
+# full-scan ILIKE — and `search()` runs with no statement timeout at all,
+# unlike `neighbors()`. Enforced at the REPOSITORY layer (not merely the
+# REST Pydantic model) so an MCP/CLI caller reaching `search()` directly
+# cannot bypass it either.
+# ---------------------------------------------------------------------------
+
+
+def test_q_below_minimum_length_is_refused(pg_env, repo):
+    """A 1-char `q` is refused outright rather than driving an unbounded
+    ILIKE scan — mirrors the `too many filters` ValueError contract (the
+    REST layer already translates a bare `ValueError` to a `422`)."""
+    _seed_full_fixture()
+    with pytest.raises(ValueError):
+        repo.search(_dict_user("alice"), type="organization", q="a")
+
+
+def test_q_blank_is_exempt_from_the_minimum_length(pg_env, repo):
+    """A blank/whitespace `q` still degrades to "no filter" (existing
+    contract, `test_q_empty_string_is_treated_as_absent`) rather than
+    tripping the new floor — the floor only applies to a caller-supplied,
+    non-blank, too-short query."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=fact_id, type="organization", natural_key="organization:solo-co2")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Solo Co 2.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="quinn", email="quinn@test.com", name="Quinn")
+    _make_group_with_grant(pg_env, group_name="group-q", collection_id=CORPUS_A, member_user_id="quinn")
+
+    result = repo.search(_dict_user("quinn"), type="organization", q="  ")
+    assert [s["id"] for s in result["subjects"]] == [fact_id]
+
+
+def test_search_applies_a_statement_timeout(pg_env, repo):
+    """`search()` must bound its query the same way `neighbors()` does — a
+    single ILIKE-driven candidate scan with no bound would let a caller
+    stall a connection out of the pool. The generic Postgres mechanism
+    (`SET LOCAL statement_timeout` genuinely cancelling a slow statement) is
+    proven once, directly, by `test_statement_timeout_mechanism_actually_
+    cancels` below; this test proves `search()` actually WIRES it, by
+    recording every statement issued on the connection it opens."""
+    from sqlalchemy import event
+
+    _seed_full_fixture()
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(repo._engine, "before_cursor_execute", _capture)
+    try:
+        repo.search(_dict_user("bystander"), type="organization")
+    finally:
+        event.remove(repo._engine, "before_cursor_execute", _capture)
+
+    assert any("SET LOCAL statement_timeout" in s for s in statements)
+
+
+# ---------------------------------------------------------------------------
 # S8 (read side) — corrections enforced at read time.
 # ---------------------------------------------------------------------------
 
