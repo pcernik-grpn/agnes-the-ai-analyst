@@ -1357,8 +1357,24 @@
     if (e.key === "Escape" && drawerOpen()) closeDrawers();
   });
 
-  renderShareRows();
-  renderRowSelection();
+  // Deferred to DOMContentLoaded on purpose. This inline block lives in the
+  // page's content, and `_app_scripts.html` — which loads
+  // static/js/kind_glyph.js, the source of `window.AgnesKindGlyph` — is
+  // included at the END of the body by base_ds.html. Calling straight through
+  // therefore threw `ReferenceError: AgnesKindGlyph is not defined` on the
+  // first row, and because `renderDelivery()` is invoked from INSIDE
+  // `renderShareRows()`, one missing glyph silently took out the Sharing
+  // list, the "Shared with N groups" fact, the delivery read-out and row
+  // selection — while the sidebar (server-rendered) kept saying "Shared with
+  // 3 groups". The page contradicted itself on one screen.
+  //
+  // It only reproduced on a package that IS shared: the throw is inside
+  // `SHARING.map`, so an unshared package rendered fine and the empty state's
+  // "Shared with nobody" was mistaken for the truth.
+  document.addEventListener("DOMContentLoaded", () => {
+    renderShareRows();
+    renderRowSelection();
+  });
 })();
 </script>
 {% endblock %}
