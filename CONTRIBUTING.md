@@ -31,17 +31,6 @@ reviewer a finding. The step-by-step loop (which guards to run for which diff,
 how to treat WARN findings, when to add a new check) is
 `.claude/skills/verify-agnes-change/SKILL.md`.
 
-**A PR that gets no CI is not reviewable, whatever it targets.** `ci.yml`'s
-`pull_request` trigger therefore carries no `branches:` filter — a PR into a
-stack base (`mf/semantic-layer-v0`, a `claude/*` branch, anything) runs the
-same suite as one into `main`. This is worth stating because the failure mode
-is silent: with a filter, GitHub fires no workflow at all and the PR shows a
-**green rollup that asserted nothing**, which reads exactly like a passing run.
-When you check a PR's status, confirm the check NAMES are present
-(`test-shard (1..8)`, `test-pg (1..4)`) — "no red" is not the same as "tested".
-Stack bases are also unprotected, so `gh pr merge --auto` on one merges
-immediately rather than waiting for anything.
-
 ## Sync-map
 
 Surfaces that must change together — and that CI does **not** fully guard. When
