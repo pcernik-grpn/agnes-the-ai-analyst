@@ -1199,6 +1199,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   Added page-level test coverage for the detach toolbar (PG-only, since
   `sync_mode='detached'` is a Postgres-only column), which is what let both
   issues ship unguarded.
+- **/admin/data-sources: the master token is now named at the point of
+  entry, and "Token not set" no longer links to a page that cannot set it
+  (#1707, A12/A13).** The "+ Add source" wizard's semantic-layer token field
+  said only "project owner" — Agnes's own phrasing, not Keboola's, so an
+  admin searching their Keboola project for "project owner token" found
+  nothing. The field now carries a hint naming Keboola's own term, the
+  project **master** token. The connection card's matching hint moved off a
+  native `title=` (600ms+ show delay, invisible on touch) onto the shared
+  `[data-tip]` fast-tooltip, paired with `aria-label` per the design-system
+  convention (`aria-label` prefixed with the visible "Semantic-layer token"
+  label, per WCAG 2.5.3, not replaced by the tip). Separately, a **stored**
+  source with no token set rendered "Token not set" as a link to
+  `/admin/semantic-layer`, which renders fine but has no token field — the
+  token is set on the card itself; that cell now calls the same
+  `toggleMasterToken` action already reachable from the card's Actions menu
+  instead of navigating to a page that cannot help. A source with a token
+  set, and a **derived** card (no stored connection, so no such widget to
+  call), both keep the health-page link unchanged.
 - **Testing a non-Keboola data connection no longer fails with a Keboola error.**
   `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
   /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and

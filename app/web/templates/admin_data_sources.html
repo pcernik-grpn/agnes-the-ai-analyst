@@ -1213,6 +1213,8 @@
           <div class="ds-field ds-wsl-opt__field" hidden>
             <label for="ds-new-master">Semantic-layer token <span class="optional">(project owner)</span></label>
             <input type="password" id="ds-new-master" placeholder="paste owner token" autocomplete="off">
+            <div class="field-hint">Keboola calls this the project's <strong>master</strong> token — search your
+               Keboola project for that term if "owner token" turns up nothing.</div>
           </div>
         </div>
         </div>
@@ -1789,7 +1791,7 @@ function _masterTokenFactHtml(row) {
   const hasMaster = row.has_master_secret === true;
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Keboola calls this the project MASTER (owner) token. Required only for the semantic layer — metrics and glossary.">Semantic-layer token</span>
+    <span class="ds-src__fact-k" role="note" data-tip="Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary." aria-label="Semantic-layer token. Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary.">Semantic-layer token</span>
     <span class="ds-src__fact-v"><span class="ds-badge ${hasMaster ? "badge-vault" : "badge-unset"}">${hasMaster ? "set" : "not set"}</span></span>
     <span class="ds-src__fact-a">
       <button type="button" class="btn btn-secondary" onclick="toggleMasterToken('${id}')">${hasMaster ? "Rotate" : "Set token"}</button>
@@ -1984,11 +1986,27 @@ function _pipelineStripHtml(row) {
         ? `✓ ${sem.metrics} metric${sem.metrics === 1 ? "" : "s"} · ${sem.terms} term${sem.terms === 1 ? "" : "s"}`
         : "Nothing imported yet";
     const semTone = !sem.token ? "is-warn" : (sem.metrics || sem.terms) ? "is-ok" : "is-warn";
-    cells.push(`
-      <a class="ds-pipe__cell" href="/admin/semantic-layer">
-        <span class="ds-pipe__k">Semantic layer</span>
-        <span class="ds-pipe__v ${semTone}">${semText}</span>
-      </a>`);
+    // "Token not set" cannot be fixed on /admin/semantic-layer — the page
+    // renders fine, it just has no token field; the token is set on this
+    // same card (Actions → Semantic-layer token), so a STORED connection's
+    // cell calls that action directly instead of navigating to a page that
+    // cannot help. A derived card (no stored connection — see `row.derived`
+    // above) carries no such widget at all — `_masterTokenFactHtml` is never
+    // rendered for it — so it keeps the base link; there is nothing on the
+    // card itself to point at instead.
+    if (!sem.token && !row.derived) {
+      cells.push(`
+        <button type="button" class="ds-pipe__cell" onclick="toggleMasterToken('${row.id}')">
+          <span class="ds-pipe__k">Semantic layer</span>
+          <span class="ds-pipe__v ${semTone}">${semText}</span>
+        </button>`);
+    } else {
+      cells.push(`
+        <a class="ds-pipe__cell" href="/admin/semantic-layer">
+          <span class="ds-pipe__k">Semantic layer</span>
+          <span class="ds-pipe__v ${semTone}">${semText}</span>
+        </a>`);
+    }
   }
 
   // Feeds — the end of the chain: who actually gets this source's data.
