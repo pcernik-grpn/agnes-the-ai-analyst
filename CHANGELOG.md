@@ -1156,6 +1156,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **The static `get_system_db()` guard now actually covers the named-agent
+  semantic-layer section.** `app/chat/agent_profile.py`'s
+  `_semantic_layer_section` opens a DuckDB connection but was missing from
+  `tests/test_backend_split_guard.py`'s allowlist, so
+  `test_no_new_get_system_db_callers` failed on any run of the full suite.
+  Also replaced the RBAC test's use of an admin user — which bypasses the
+  very access check the section relies on — with a dedicated case proving a
+  non-admin user with no grant on the model sees no semantic-layer section
+  at all.
 - **An Agnes PAT now authenticates BOTH HTTP MCP transports, and a refused MCP
   request says which check refused it (#1707).** Two findings in the same auth
   layer. (1) The two transports authenticated differently while the modules

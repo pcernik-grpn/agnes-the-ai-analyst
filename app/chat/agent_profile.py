@@ -168,8 +168,9 @@ def _semantic_layer_section(user_email: Optional[str]) -> str:
     Opens its own DuckDB connection when the active backend is DuckDB
     (Postgres reads need none) — the same ``conn = None if use_pg() else
     get_system_db()`` pattern ``app/main.py``'s workspace-prompt renderer
-    uses, since this module otherwise opens no connection of its own and
-    would need no ``get_system_db()`` grandfather entry.
+    uses. This module otherwise opens no connection of its own, so this
+    call is why it carries a ``get_system_db()`` grandfather entry in
+    ``tests/test_backend_split_guard.py``.
     """
     if not user_email:
         return ""
@@ -208,7 +209,7 @@ def _semantic_layer_section(user_email: Optional[str]) -> str:
         lines.append(
             "\nDiscover more: `agnes semantic-model context <type>` (or the "
             "MCP `get_semantic_context` tool). Always check a query against "
-            "it first with `agnes semantic-model validate-query \"<SQL>\"`.\n"
+            'it first with `agnes semantic-model validate-query "<SQL>"`.\n'
         )
         return "".join(lines)
     except Exception:
