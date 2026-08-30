@@ -47,6 +47,10 @@ _VALID_RESULT = {
     "mixed_dialect_warning": None,
     "locally_executable": True,
     "summary": "Query references 1 dataset(s) and 1 metric(s) from the semantic layer; no constraint violations detected.",
+    "detection": (
+        "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
+        "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
+    ),
 }
 
 
@@ -64,6 +68,25 @@ class TestValidateQuery:
             result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT 1", "--json"])
         assert result.exit_code == 0
         assert json.loads(result.stdout) == _VALID_RESULT
+
+    def test_non_json_output_carries_the_detection_caveat(self):
+        """Issue #1707 finding A18: the dataset/metric list printed above this
+        line is a best-effort text match, not a confirmed fact -- the human
+        (non-`--json`) output must say so unmissably, not bury it in
+        `summary` or omit it."""
+        with patch("cli.commands.semantic_model.api_post", return_value=_resp(200, _VALID_RESULT)):
+            result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT SUM(revenue) FROM orders"])
+        assert result.exit_code == 0
+        assert "best-effort text match" in result.output.lower()
+
+    def test_non_json_output_falls_back_when_server_omits_detection(self):
+        """An older server without the `detection` field must still get a
+        caveat -- never silently drop it just because the key is absent."""
+        body = {k: v for k, v in _VALID_RESULT.items() if k != "detection"}
+        with patch("cli.commands.semantic_model.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT SUM(revenue) FROM orders"])
+        assert result.exit_code == 0
+        assert "best-effort text match" in result.output.lower()
 
     def test_error_violation_prints_invalid_and_reason(self):
         body = {

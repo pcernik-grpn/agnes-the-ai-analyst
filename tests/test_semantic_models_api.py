@@ -844,6 +844,61 @@ class TestValidateQuery:
         )
         assert r.json()["available"] is False
 
+    def test_detection_disclosure_travels_with_a_heuristic_match(self, seeded_app):
+        """Issue #1707 finding A18: `used_datasets` is a best-effort text
+        match, not proof of a real touch -- a WHERE clause on a common column
+        name (``status``) matches a dataset that only declares that column,
+        never referenced by the query otherwise. The response must carry the
+        `detection` disclosure so this cannot be read as a confirmed fact.
+        """
+
+        from src.repositories import semantic_model_repo
+
+        document_json = {
+            "semantic_model": [
+                {
+                    "name": "status_match",
+                    "datasets": [
+                        {"name": "orders", "source": "db.public.orders", "fields": [{"name": "order_id"}]},
+                        # Never mentioned by name in the query below -- only
+                        # matches because it happens to declare a `status`
+                        # column, the same word the query filters on.
+                        {"name": "subscriptions", "source": "db.public.subscriptions", "fields": [{"name": "status"}]},
+                    ],
+                }
+            ]
+        }
+        semantic_model_repo().upsert(
+            id="manual/_/status_match",
+            slug="status_match",
+            name="status_match",
+            description=None,
+            document="# native fixture, not schema-authored",
+            document_json=document_json,
+            spec_version="0.2.0.dev0",
+            content_hash="hash-status_match",
+            source="manual",
+            source_ref=None,
+            status="valid",
+            validation_errors=None,
+            validated_at=None,
+        )
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/semantic-models/validate-query",
+            json={"sql": "SELECT * FROM orders WHERE status = 'active'"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["available"] is True
+        # The false positive actually happened -- otherwise this test proves
+        # nothing about the disclosure being needed.
+        assert "subscriptions" in body["used_datasets"]
+        assert "detection" in body
+        assert "best-effort text match" in body["detection"].lower()
+        assert "not by parsing" in body["detection"].lower() or "not sql parsing" in body["detection"].lower()
+
     def test_expected_objects_are_diffed_when_passed(self, seeded_app):
         _upsert_model_with_constraints()
         c = seeded_app["client"]
