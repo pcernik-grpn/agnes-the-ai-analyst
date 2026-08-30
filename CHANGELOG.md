@@ -12,6 +12,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- SharePoint ACL mirroring (all slices, behind `acl_mirroring.enabled`, default off): per-scope mirrored grants via a third source-segregated sync writer, broken-inheritance subtree exclusion sweep, per-scope audience classes with index-time claim variants, and a guarantee-mode switch (`must_not`/`should_not`) deciding the fail-closed posture.
+
 ### Changed
 
 ### Fixed
