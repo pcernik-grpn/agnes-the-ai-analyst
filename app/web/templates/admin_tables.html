@@ -6994,6 +6994,13 @@
           + '<button type="button" class="tbl-more__item" data-act="sync">Sync now</button>'
           + '<button type="button" class="tbl-more__item" data-act="assign">Add to a data package…</button>'
           + '<div class="tbl-more__sep"></div>'
+          // The answer to "why can't they see this table" already exists —
+          // `?resource=table:<id>` on the Access page renders it, naming the
+          // package that carries the table or saying it is in none. Nothing
+          // linked to it: `manageAccess` was defined and never called, so an
+          // admin debugging a complaint had no route to the one screen that
+          // explains it.
+          + '<button type="button" class="tbl-more__item" data-act="access">Who reaches this?</button>'
           + '<a class="tbl-more__item" href="/admin/sync">Sync history</a>';
         // Unregister stays gated on being in NO package: deleting a table a
         // package still lists would leave the package pointing at a row that
@@ -7043,6 +7050,7 @@
             if (item.dataset.act === 'edit' && t) { openEditModal(t); }
             else if (item.dataset.act === 'sync') { syncTable(item, id); }
             else if (item.dataset.act === 'assign') { openBulkAssignFromRow(id); }
+            else if (item.dataset.act === 'access') { manageAccess(id); }
             else if (item.dataset.act === 'delete') { deleteTable(id); }
             return;
         }

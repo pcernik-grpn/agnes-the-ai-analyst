@@ -965,6 +965,14 @@
   }
   /* ── + Add row ───────────────────────────────────────────────────────
      One way in, sitting at the foot of the list it adds to. */
+  /* The kind's caveat, inline on its run header. Clamped to one line: these
+     are registry sentences written for an API reader, and the tag's tooltip
+     carries the full text — this is the tell that a caveat EXISTS, not the
+     place to read it. */
+  .ax-kindcaveat {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: min(52ch, 100%); font-weight: 400;
+  }
   .ax-add {
     display: flex; align-items: baseline; gap: 8px; width: 100%;
     margin-top: 14px; padding: 10px 2px; text-align: left;
@@ -2925,7 +2933,15 @@
   const kindTag = (t) => {
     const k = kindToken(t);
     const glyph = window.AgnesKindGlyph ? window.AgnesKindGlyph.get(k) : "";
-    return `<span class="ax-r__kd ds-kindtag" data-kind="${esc(k)}">${glyph}<span>${esc(kindWord(t))}</span></span>`;
+    // `type_description` is the registry's own caveat for this kind — that a
+    // table grant does NOT give an analyst visibility, that an MCP source
+    // grant is ANDed with per-tool grants, that a memory-domain grant is
+    // additive. The API has shipped it since the type registry existed
+    // (app/api/access.py) and nothing rendered it, so the picker offered
+    // Tables beside Data packages looking identical and behaving nothing
+    // alike. At minimum it is the tag's tooltip, everywhere a tag appears.
+    const caveat = t.type_description ? ` title="${esc(t.type_description)}"` : "";
+    return `<span class="ax-r__kd ds-kindtag" data-kind="${esc(k)}"${caveat}>${glyph}<span>${esc(kindWord(t))}</span></span>`;
   };
 
   /* Who wrote this grant. Two writers, two shapes: the admin API records an
@@ -3314,7 +3330,14 @@
       corpus_file: (id) => `/library/d/${encodeURIComponent(id)}`,
       data_app: (id) => `/apps/${encodeURIComponent(id)}`,
       agent: (id) => `/agents?agent=${encodeURIComponent(id)}`,
-      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`,
+      // Carries the group out with it. The person lens already round-trips
+      // (`?from=simulate&user=`) so a package page opened from an audit says
+      // whose audit and offers the way back; the group lens did not, so the
+      // same page fell through to its hard-coded "← Packages" and rendered
+      // every group the package is shared with — you filtered to one group
+      // and it showed you all of them.
+      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`
+        + (selectedGroup ? `?from=access&group=${encodeURIComponent(selectedGroup)}` : ""),
       table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
     };
 
@@ -4665,6 +4688,7 @@
                <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
                <span class="fbar-group__title">${esc(r.t.type_display)}</span>
                <span class="fbar-group__n">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>
+               ${r.t.type_description ? `<span class="fbar-group__hint ax-kindcaveat">${esc(r.t.type_description)}</span>` : ""}
              </button>`
           : "";
         lastKind = r.t.type_key;

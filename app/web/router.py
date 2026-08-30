@@ -5616,6 +5616,40 @@ def _simulate_preview_ctx(request: Request) -> dict | None:
     }
 
 
+def _access_group_ctx(request: Request) -> dict | None:
+    """Which group the admin was reading, when they arrived from Access.
+
+    The sibling of :func:`_simulate_preview_ctx` for the *group* lens. That
+    one closes the loop for a person — "← Back to preview: Jane" plus a
+    "Re-check Jane →" return link — and the group lens had no equivalent, so
+    a package opened while filtered to one group fell through to the
+    hard-coded "← Packages" back link and rendered its Sharing block for
+    every group the package reaches. The admin had narrowed to one group and
+    the page showed them three.
+
+    Same contract as its sibling: resolved server-side to a name so the
+    banner can say "Finance" rather than echoing a uuid, and an unknown or
+    garbage id resolves to None so the page renders normally — the banner is
+    chrome, never a 500.
+    """
+    if request.query_params.get("from") != "access":
+        return None
+    gid = request.query_params.get("group") or ""
+    if not gid:
+        return None
+    try:
+        group = user_groups_repo().get(gid)
+    except Exception:  # noqa: BLE001
+        group = None
+    if not group:
+        return None
+    return {
+        "group_id": gid,
+        "name": group.get("name") or gid,
+        "back_href": f"/admin/access?group={gid}",
+    }
+
+
 @router.get("/admin/corporate-memory", response_class=HTMLResponse)
 async def corporate_memory_admin(
     request: Request,
@@ -7194,6 +7228,9 @@ async def admin_package_detail(
 
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
     preview_ctx = _simulate_preview_ctx(request)
+    # The group lens's equivalent. Both are chrome: at most one is set, and
+    # the template prefers the person banner when somehow both are.
+    group_ctx = _access_group_ctx(request)
 
     ctx = _build_context(
         request,
@@ -7207,6 +7244,7 @@ async def admin_package_detail(
         all_groups=all_groups,
         delivery=delivery,
         preview_ctx=preview_ctx,
+        group_ctx=group_ctx,
         newest_sync=newest_sync.isoformat() if newest_sync else None,
         newest_sync_age_minutes=(int((now - newest_sync).total_seconds() // 60) if newest_sync else None),
     )
