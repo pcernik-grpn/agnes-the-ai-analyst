@@ -20,6 +20,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`release.yml` runs once per push, not twice.** GitHub fired both a `create` and a `push` event for a brand-new branch's first commit; `paths-ignore` on `push` diffs the new ref against the default branch, so a zero-diff branch matched every ignore pattern and only the `create` run built an image — but on a non-zero-diff branch-create both events fired and `cancel-in-progress` killed one of them, leaving a cancelled run's job check-contexts stuck red on every fresh PR until someone manually reran it. The `create:` trigger and `paths-ignore` are gone; a new first job, `decide`, replicates the same docs-only skip in-workflow (backed by a tested `scripts/ci/docs_only_change.py`, not bash-in-YAML) so `build-and-push` renders as a neutral SKIPPED check on a docs-only push instead of a stuck red one.
+
 - **The daily cut PR opens even when the batch is large.** `daily-cut.yml` embedded every shipped bullet in the PR body; the 0.93.0 cut carried 214 of them (216 KB) and blew past GitHub's 65,536-character limit, so `gh pr create` failed *after* the branch was already computed, committed and pushed — which reads as a broken cut rather than a broken announcement. The list is now budgeted, trimmed at bullet boundaries and stopping once the budget is spent (never interleaving whichever later bullets still fit), with a line naming how many were omitted. The CHANGELOG diff on the PR remains the complete list.
 
 ## [0.93.0] - 2026-08-30
