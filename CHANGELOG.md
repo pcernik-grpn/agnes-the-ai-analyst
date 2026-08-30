@@ -1069,6 +1069,46 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   also change what the card's own row says — a stored token, a cleared project
   binding, chat tools, a queued SharePoint extraction, a connection created or
   deleted — redraw the card list from that same fresh read.
+- **A Databricks or Snowflake semantic source no longer fails forever once the
+  connector is deconfigured (#1707).** Both connectors refuse to CREATE their
+  semantic source row when the warehouse is not configured — exactly so
+  nothing carries a source that fails on every run for a warehouse it does not
+  have — but an existing row short-circuits before that check, so a connector
+  deconfigured AFTER registration (credentials rotated out, connection
+  removed) landed in that state from the other direction: every scheduled
+  sweep imported the row, the adapter raised "… is not configured", and the
+  source accrued a fresh error and a fresh warning, every run, indefinitely.
+  Both rows are auto-registered — the Databricks one by the sweep's own
+  migration, the Snowflake one by the /admin/data-sources wizard's opt-in — so
+  neither needed an admin to set up the state that then broke. The sweep now
+  asks each source's adapter whether its connector is configured at all and
+  skips the ones that are not — counted as `skipped_not_configured` in the
+  `POST /api/admin/run-semantic-sources-refresh` response, the sweep's log
+  line and its audit row, and recorded on the source itself as
+  `last_sync_status='skipped'` with the reason, so `/admin/semantic-sources`
+  shows a muted "skipped" with the explanation instead of a red failure
+  nothing is trying to reach any more. The reason names both places a
+  connector can be configured (a registered connection under Admin → Data
+  sources, or the legacy `data_source.*` config), rather than sending a
+  wizard-configured admin off to edit a file that was never their source of
+  truth. The row is never deleted: a rotated credential is an outage, not
+  consent to discard a source an admin named, scoped and enabled — it resumes
+  syncing on the first sweep after the configuration returns. A manual sync of
+  such a source still fails loudly, since that one was explicitly asked for.
+  The check is a new optional adapter method (`unconfigured_reason`), so any
+  connector-backed adapter opts in with one function and git/upload sources
+  need no opinion.
+- **The semantic-layer health report no longer says "No sync failures,
+  disconnected models, or invalid documents" for an instance whose only source
+  is permanently skipped (#1707).** Both renderers — the `/admin/semantic-layer`
+  Health tab and `agnes admin semantic health` — filtered `sources` on
+  "failed" and "synced but owns nothing" alone, so a source the sweep skips
+  (its connector deconfigured, or another source already importing the same
+  upstream project) appeared in no section at all and still counted as
+  all-clear. Both now list them under **"Sources that are not syncing
+  (skipped)"** with the reason recorded on each row, without failure styling
+  (nothing failed — the sweep declined to try), and a skipped source
+  suppresses the all-clear headline.
 - **A Keboola table that is empty upstream no longer reports as a failed
   sync — and a lost sliced export no longer reports as a clean one.** A
   sliced export of a table with no rows comes back as a manifest with zero
