@@ -1075,6 +1075,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   be read at all — no table id to ask about, the detail call failed, the
   field is absent — that path now fails where it used to report 0 rows
   successfully. Unknown must never present itself as empty.
+- **Semantic layer browse: the constraint Severity tooltip is now a fast
+  `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
+  ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
+  severity badge carried a 257-character explanation in `title=` — a
+  600ms+ OS-controlled show delay, no styling, and prone to clipping in a
+  scrollable ancestor. Both now use the shared `[data-tip]` mechanism, paired
+  with `aria-label` carrying the same text (never `title` alongside it, and
+  never `role="note"` on a `<th>` — that would override its implicit
+  `columnheader` role), with a single-sentence summary that also corrects the
+  original wording: an error-severity violation is a *missing filter in the
+  query*, not a *missing rule* on the constraint, and — soft-enforce — it
+  only flips `validate-query`'s verdict, it never blocks anything. The fuller
+  nuance (only `required_filter` is statically checkable today, so any other
+  type is advisory regardless of severity) moved to a short note under the
+  table/panel instead.
 - **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
   admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
   knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap

@@ -14,6 +14,7 @@ increment).
 from __future__ import annotations
 
 import json
+import re
 
 from src.db import get_system_db
 
@@ -296,6 +297,40 @@ class TestModelDetail:
             assert r.status_code == 200, tab
             assert needle in r.text, f"tab={tab} did not render {needle!r}"
 
+    def test_constraints_severity_header_uses_fast_tooltip_not_title(self, seeded_app):
+        """A7 (issue #1707): the 257-char severity explanation lived in a
+        native `title=` on `<th>Severity</th>` — a 600ms+ OS-controlled show
+        delay, no styling, and prone to clipping in a scrollable ancestor.
+        Converted to the shared `[data-tip]` fast-tooltip (components.css)
+        with `aria-label` carrying the same text (the repo convention —
+        `title` is never used alongside `data-tip`) and a short one-sentence
+        summary; the fuller nuance moved to a note under the table. No
+        `role="note"` on the `<th>` — that would override its implicit
+        `columnheader` role and break screen-reader table navigation."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}?tab=constraints", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        body = r.text
+        th_match = re.search(r"<th[^>]*>Severity</th>", body)
+        assert th_match, "Severity <th> not found"
+        th_tag = th_match.group(0)
+        assert "title=" not in th_tag
+        assert 'role="note"' not in th_tag, "role=note would override the <th>'s implicit columnheader role"
+        tip_match = re.search(r'data-tip="([^"]+)"', th_tag)
+        assert tip_match, "Severity <th> is missing data-tip"
+        tip_text = tip_match.group(1)
+        assert len(tip_text) < 160
+        # Soft-enforce: an error never blocks a query, only flips the
+        # validate-query verdict — the copy must not claim otherwise.
+        assert "enforcement is soft" in tip_text
+        aria_match = re.search(r'aria-label="([^"]+)"', th_tag)
+        assert aria_match, "Severity <th> is missing aria-label"
+        assert aria_match.group(1) == tip_text
+        # The fuller nuance (which constraint types are checkable today) now
+        # lives in a short note under the table, not squeezed into the tooltip.
+        assert "statically checkable today" in body
+
     def test_default_tab_is_datasets(self, seeded_app):
         _seed_model()
         c = seeded_app["client"]
@@ -573,6 +608,33 @@ class TestObjectDetail:
         assert r.status_code == 200
         assert "never on email" in r.text
         assert "orders.customer_id = customers.customer_id" in r.text
+
+    def test_constraint_object_severity_uses_fast_tooltip_not_title(self, seeded_app):
+        """A7 (issue #1707): same fix as the constraints tab header, applied to
+        the badge on the constraint object page — no `title=`, a `[data-tip]`
+        + `aria-label` pair (same text, the repo convention) and a short
+        one-sentence summary. No `role="note"` here either, for consistency
+        with the other `[data-tip]` sites in the repo, none of which use it."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        body = r.text
+        span_match = re.search(r'<span class="badge[^"]*"[^>]*>error</span>', body)
+        assert span_match, "severity badge not found"
+        span_tag = span_match.group(0)
+        assert "title=" not in span_tag
+        assert 'role="note"' not in span_tag
+        tip_match = re.search(r'data-tip="([^"]+)"', span_tag)
+        assert tip_match, "severity badge is missing data-tip"
+        tip_text = tip_match.group(1)
+        assert len(tip_text) < 160
+        assert "enforcement is soft" in tip_text
+        aria_match = re.search(r'aria-label="([^"]+)"', span_tag)
+        assert aria_match, "severity badge is missing aria-label"
+        assert aria_match.group(1) == tip_text
+        # The fuller nuance moved to a short note under the panel.
+        assert "statically checkable today" in body
 
     def test_object_name_with_a_slash_is_reachable(self, seeded_app):
         """Devin #1398: an object name/term carrying a `/` (a glossary phrase

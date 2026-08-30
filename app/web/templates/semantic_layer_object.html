@@ -90,6 +90,20 @@
 }
 .slb-rel-sides a { font-weight: 600; }
 .slb-rel-arrow { color: var(--ds-text-muted); }
+
+.slb-severity-note {
+    margin: var(--space-2) 0 0;
+    font-size: 12px;
+    color: var(--ds-text-secondary);
+}
+.slb-rule-code {
+    font-family: var(--ds-font-mono, monospace);
+    font-size: 12px;
+    background: var(--ds-surface-dim);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-sm);
+    padding: 2px 6px;
+}
 </style>
 {% endblock %}
 
@@ -182,9 +196,10 @@
 {% if object_type == 'constraint' %}
 <div class="slb-panel">
     <h2>Rule</h2>
-    <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}" title="warning: recorded for reference, never blocks a query. error: blocks validate-query, but only when the constraint type is statically checkable (currently just required_filter) and the rule is missing from the query — any other type is advisory only regardless of severity.">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
+    <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}" data-tip="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft." aria-label="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft.">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
     <pre class="slb-expr">{{ obj.rule or "" }}</pre>
     <p>Applies to metrics: {{ (obj.metrics or []) | join(', ') }}</p>
+    <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
 </div>
 {% endif %}
 
