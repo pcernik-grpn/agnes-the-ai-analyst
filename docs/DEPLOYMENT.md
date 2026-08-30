@@ -626,6 +626,18 @@ call their endpoint synchronously (full split in
 with `agnes admin jobs list` (`--status`/`--kind` to filter) or
 `agnes admin jobs show <job_id>` for one row.
 
+A third, opt-in lane — `extraction` (document extraction, off by default;
+see the `extraction:` block in `config/instance.yaml.example` and
+[`architecture.md`](architecture.md#background-jobs)) — is normally split
+into its own process via the `extraction-worker` Compose service
+(`docker-compose.yml`, profile `extraction-worker`, `AGNES_ROLE=worker`,
+`AGNES_WORKER_LANES=extraction`). Starting that service is itself a role
+split: flipping `extraction.enabled: true` and the Compose profile is not
+sufficient on its own — the three prerequisites above (Postgres app-state,
+explicit secrets, `coordination.backend: redis`) must already hold, or
+`validate_deployment` refuses to boot that container exactly like any other
+role-split process.
+
 ### Coordination backend
 
 `coordination.backend` (`instance.yaml`) / `AGNES_COORDINATION_BACKEND`

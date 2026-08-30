@@ -19,7 +19,7 @@ DuckLake backend) has no new requirements. Spec §3.2/§3.4/§3.7.
 
 import os
 
-from app.roles import is_all_in_one
+from app.roles import active_roles, is_all_in_one
 
 
 class DeploymentConfigError(RuntimeError):
@@ -80,6 +80,25 @@ def is_multi_process() -> bool:
     return (not is_all_in_one()) or _workers() > 1 or _coordination_backend() == "redis"
 
 
+def _multi_process_trigger_reasons() -> list[str]:
+    """Which of ``is_multi_process()``'s conditions actually fired, in
+    concrete terms — so the refusal below can name the real cause (e.g. a
+    compose service that set ``AGNES_ROLE=worker``) instead of leaving the
+    reader to resolve a generic "AGNES_ROLE split or UVICORN_WORKERS>1"
+    disjunction themselves. Order matches :func:`is_multi_process`.
+    """
+    reasons: list[str] = []
+    if not is_all_in_one():
+        roles = ",".join(sorted(r.value for r in active_roles()))
+        reasons.append(f"AGNES_ROLE={roles!r} is a role split")
+    workers = _workers()
+    if workers > 1:
+        reasons.append(f"UVICORN_WORKERS={workers} > 1")
+    if _coordination_backend() == "redis":
+        reasons.append("coordination.backend=redis")
+    return reasons
+
+
 def validate_deployment() -> None:
     if not is_multi_process():
         return
@@ -102,7 +121,9 @@ def validate_deployment() -> None:
                 "single-process only"
             )
     if problems:
+        reasons = "; ".join(_multi_process_trigger_reasons())
         raise DeploymentConfigError(
-            "Multi-process deployment (AGNES_ROLE split or UVICORN_WORKERS>1) "
-            "is not safely configured:\n  - " + "\n  - ".join(problems) + "\nSee docs/DEPLOYMENT.md#multi-process."
+            f"Multi-process deployment ({reasons}) is not safely configured:\n  - "
+            + "\n  - ".join(problems)
+            + "\nSee docs/DEPLOYMENT.md#multi-process."
         )

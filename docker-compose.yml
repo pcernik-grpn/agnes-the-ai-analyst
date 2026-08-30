@@ -205,8 +205,17 @@ services:
   # NOT vendor the producer (a separate project of the operator's, adopted per spec
   # §7.1). Off by default (`extraction.enabled: false`,
   # config/instance.yaml.example) AND behind its own compose profile — a
-  # deployment that wants it running does BOTH: flips the config block and
-  # starts this service with `--profile extraction-worker`.
+  # deployment that wants it running does ALL THREE, in order:
+  #   1. Satisfy the multi-process prerequisites FIRST. This service sets
+  #      AGNES_ROLE=worker below, which is a role split — the deployment as
+  #      a whole becomes "multi-process" the moment this container starts,
+  #      requiring Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET,
+  #      and `coordination.backend: redis` (instance.yaml). Without these,
+  #      `app/startup_guards.py::validate_deployment` refuses to boot — see
+  #      docs/DEPLOYMENT.md#multi-process.
+  #   2. Flip `extraction.enabled: true` with a configured producer
+  #      (config/instance.yaml.example's `extraction:` block).
+  #   3. Start this service with `--profile extraction-worker`.
   extraction-worker:
     build:
       context: .

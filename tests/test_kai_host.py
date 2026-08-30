@@ -1075,6 +1075,65 @@ def test_workspace_carries_the_agent_persona_skill_and_memories(seeded_app, kai_
     assert "Analyst prefers charts over tables." in memory
 
 
+def test_workspace_agent_persona_gets_fact_tool_guidance_when_the_switch_is_on(seeded_app, kai_env, monkeypatch):
+    """The default (no-persona) Workspace Prompt template carries a
+    `facts.enabled`-gated "Facts — entity and relationship questions"
+    section (`config/claude_md_template.txt`), but a persona REPLACES
+    `CLAUDE.md` wholesale — so without `agent_profile.FACTS_ACCESS_RAILS`
+    that guidance never reached a persona'd agent, and a who/what/
+    relationship question that `fact_search` would have answered directly
+    instead fell back to `agnes catalog` + SQL and reported no data, while
+    the empty default agent (unaltered rails) answered it correctly."""
+    import tarfile as _tarfile
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    credential = _mint_agent_session(
+        seeded_app,
+        {
+            "name": "Analyst Persona",
+            "slug": "analyst-persona-facts-on",
+            "system_prompt": "You are the revenue analyst.",
+        },
+    )
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200
+
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        claude_md = tar.extractfile("CLAUDE.md").read().decode("utf-8")
+
+    assert claude_md.count("fact_search") == 1
+    assert "fact_neighbors" in claude_md
+    assert "fact_claims" in claude_md
+    # Additive, not a replacement — the catalog guidance is still there too,
+    # and it comes first (steer to the more specific tool second).
+    assert "Data access (Agnes platform)" in claude_md
+    assert claude_md.index("Data access (Agnes platform)") < claude_md.index("fact_search")
+
+
+def test_workspace_agent_persona_gets_no_fact_tool_guidance_when_the_switch_is_off(seeded_app, kai_env, monkeypatch):
+    """An instance with `facts` off must not steer a persona'd agent toward
+    tools that would all 404."""
+    import tarfile as _tarfile
+
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    credential = _mint_agent_session(
+        seeded_app,
+        {
+            "name": "Analyst Persona",
+            "slug": "analyst-persona-facts-off",
+            "system_prompt": "You are the revenue analyst.",
+        },
+    )
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200
+
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        claude_md = tar.extractfile("CLAUDE.md").read().decode("utf-8")
+
+    assert "fact_search" not in claude_md
+    assert "Data access (Agnes platform)" in claude_md
+
+
 def test_workspace_agent_overlay_defaults_to_nothing(seeded_app, kai_env):
     """The seeded default agent (empty system_prompt, no memories) must leave
     the archive bit-for-bit identical to a no-agent session — the same
