@@ -119,10 +119,15 @@ class TestSharingReadOut:
             # A single grant is NAMED (a count of one says less than the name);
             # the tier is worded Automatic, with the API's own word in the
             # title attribute so the CLI/API vocabulary stays learnable.
+            # The GROUP is named; the tier is not. It is per-grant, so a single
+            # value beside a list of groups is false for some of them — see
+            # `test_the_tier_is_a_filter_and_appears_nowhere_in_the_table`. The
+            # wire word `required` still travels, on the row's `data-tier` set,
+            # translated to the label the filter menu offers.
             assert "Everyone" in row
-            assert "Automatic" in row
-            assert "required" in row
             assert "Not shared" not in row
+            assert 'data-tier="Automatic"' in row
+            assert "<span>Automatic</span>" not in row, "the tier is stated on the row again"
         finally:
             from src.repositories import data_packages_repo, table_registry_repo
 
@@ -240,20 +245,75 @@ class TestTheToolbarIsTheSharedOne:
         assert 'data-contents="Empty"' in row
         assert 'data-tier=""' in row
 
-    def test_access_is_a_filter_not_a_column(self, seeded_app):
-        """It was a column and was blank on every row that is unshared or
-        empty — nearly all of them on a young instance — while saying one
-        thing about a package that can be Automatic for one group and Optional
-        for another. The tier reads inside "Shared with", where it qualifies
-        the fact it belongs to, and survives in the Filter menu, where a
-        mostly-blank axis is exactly what you want."""
+    def test_the_tier_is_a_filter_and_appears_nowhere_in_the_table(self, seeded_app):
+        """The tier is PER-GRANT, and every attempt to show it on a package row
+        was the same lie in a different slot.
+
+        First a column, then a chip inside "Shared with": both printed
+        `any(required)` as though it described the row. It does not — a package
+        is routinely Automatic for one group and Optional for another, so any
+        single value shown beside a list of groups is false for some of them.
+        The per-group truth lives in the Edit drawer and on the package's own
+        page, which are the surfaces that can show it per group AND change it.
+
+        It survives as a filter because there the subject is the package, not
+        the groups: "is this automatic for anybody?" is a real question with
+        one true answer.
+        """
+        _mk_pkg("tier-col", "Tier Col Pkg")
         body = seeded_app["client"].get(
             "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
         ).text
-        head = body[body.index("<thead>") : body.index("</thead>")]
+        # Anchored on the PACKAGES table. The first `<thead>` on this page is
+        # whichever table renders first, and with no packages seeded that is
+        # Memory Domains — so a bare `body.index("<thead>")` asserted against
+        # the wrong table and passed for the wrong reason.
+        pkg_tbody = body.index('id="adp-pkg-rows"')
+        head = body[body.rindex("<thead>", 0, pkg_tbody) : body.index("</thead>", 0, pkg_tbody)]
         assert "Access" not in head, "Access is a column again"
         assert "Shared with" in head
+        # Not in any row either — the chip was the column's second life.
+        rows = body[pkg_tbody : body.index("</tbody>", pkg_tbody)]
+        assert "adp-chip--auto" not in rows, "the tier chip is back in the package rows"
+        for word in ("Automatic", "Optional"):
+            assert f"<span>{word}</span>" not in rows, f"{word} is stated on a row again"
         assert 'data-facet="tier"' in body, "…and it is no longer offered as a filter either"
+
+    def test_a_mixed_tier_package_carries_both_values(self, seeded_app):
+        """The case that took the tier out of the table, pinned.
+
+        A package granted `required` to one group and `available` to another is
+        BOTH, so `data-tier` is a pipe-joined set read with `multi: true` — it
+        matches either filter rather than being forced to one word. A single
+        value here would resurrect the bug in the filter after removing it from
+        the row.
+        """
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        pkg_id = _mk_pkg("mixed-tier", "Mixed Tier Pkg")
+        grants = resource_grants_repo()
+        groups = user_groups_repo()
+        everyone = groups.get_by_name("Everyone")
+        admin_g = groups.get_by_name("Admin")
+        a = grants.create(
+            group_id=everyone["id"], resource_type="data_package",
+            resource_id=pkg_id, requirement="available",
+        )
+        b = grants.create(
+            group_id=admin_g["id"], resource_type="data_package",
+            resource_id=pkg_id, requirement="required",
+        )
+        try:
+            body = seeded_app["client"].get(
+                "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+            ).text
+            row = _row_of(body, pkg_id)
+            m = re.search(r'data-tier="([^"]*)"', row)
+            assert m, "the row carries no data-tier"
+            assert set(m.group(1).split("|")) == {"Automatic", "Optional"}
+        finally:
+            grants.delete(a if isinstance(a, str) else a["id"])
+            grants.delete(b if isinstance(b, str) else b["id"])
 
 
 class TestUnpackagedTray:

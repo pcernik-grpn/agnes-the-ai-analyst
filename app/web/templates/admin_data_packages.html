@@ -93,12 +93,6 @@
   .adp-cat { font-size: 12px; color: var(--ds-text-muted); }
   .adp-cell--act { text-align: right; }
 
-  /* The sharing cell holds two facts that belong together — who can reach it,
-     and what it does in their workspace. They were two columns; the tier one
-     was blank on every unshared or empty row, and a package can be Automatic
-     for one group and Optional for another, which a column cannot say. */
-  .adp-shared { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
-
   /* Toolbars: one per list, each directly above the table it filters. The
      bar itself is `.fbar` (filter_toolbar.css) — nothing here restyles it,
      only the two page-local slots it leaves open. */
@@ -247,7 +241,7 @@
         {% for cat_key, cat_label, options in [
              ('shared', 'Sharing', ['Shared', 'Not shared']),
              ('contents', 'Contents', ['Has tables', 'Empty']),
-             ('tier', 'Access', ['Automatic', 'Optional']),
+             ('tier', 'Access for any group', ['Automatic', 'Optional']),
              ('cat', 'Category', _pkg_cats),
            ] %}
         {% if options %}
@@ -318,17 +312,22 @@
         {% for entry in package_cards %}
         {% set shares = pkg_sharing.get(entry.id, []) %}
         {% set n_tables = entry.table_count | default(0) %}
-        {% set is_auto = shares | selectattr('requirement', 'equalto', 'required') | list %}
         <tr class="adp-row" data-pkg-id="{{ entry.id }}"
             data-search="{{ (entry.name ~ ' ' ~ (entry.description or '') ~ ' ' ~ (entry.category or '')) | lower }}"
             data-name="{{ entry.name }}"
             data-shared="{{ 'Shared' if shares else 'Not shared' }}"
             data-contents="{{ 'Has tables' if n_tables else 'Empty' }}"
-            {# Empty rather than a third token: a package with no sharing has no
-               tier, and inventing a "None" value would put a filter in the menu
-               that means "unshared" — which the Sharing category already says,
-               better. #}
-            data-tier="{{ 'Automatic' if is_auto else ('Optional' if shares else '') }}"
+            {# A SET, pipe-joined, because a package can be Automatic for one
+               group and Optional for another — the fact that took the tier out
+               of the table above. Read with `multi: true`, so selecting
+               Automatic keeps every package that is automatic for SOMEBODY,
+               which is the only true reading of a per-grant value at package
+               scope. Empty when unshared: a third token would put a filter in
+               the menu meaning "unshared", which Sharing already says better. #}
+            data-tier="{{ shares | map(attribute='requirement') | unique | sort
+                          | map('replace', 'required', words.tier_automatic)
+                          | map('replace', 'available', words.tier_optional)
+                          | join('|') }}"
             data-cat="{{ entry.category or '' }}">
           <td>
             <a class="adp-row__name" href="{{ entry.drilldown_url }}">
@@ -355,24 +354,17 @@
             {% endif %}
           </td>
           <td>{% if entry.category %}<span class="adp-cat">{{ entry.category }}</span>{% else %}<span class="adp-none">&mdash;</span>{% endif %}</td>
-          <td>
-            <span class="adp-shared">
-              {{ share_readout(shares) }}
-              {# The tier rides here, and only when it says something: on an
-                 empty package it would promise a delivery that cannot happen,
-                 and on an unshared one there is nothing to qualify. #}
-              {% if shares and n_tables %}
-                {% if is_auto %}
-                <span class="adp-chip adp-chip--auto" title="{{ words.tier_automatic_admin_help }}">
-                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 19h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
-                  <span>{{ words.tier_automatic }}</span>
-                </span>
-                {% else %}
-                <span class="adp-chip" title="{{ words.tier_optional_admin_help }}"><span>{{ words.tier_optional }}</span></span>
-                {% endif %}
-              {% endif %}
-            </span>
-          </td>
+          {# Groups only. The TIER is per-grant — a package is routinely
+             Automatic for one group and Optional for another — so any single
+             value here is false for some of the groups named beside it. It
+             was a column, then a chip in this cell, and both were the same
+             collapse: `any(required)` printed as though it described the
+             whole row. The per-group truth is in the Edit drawer and on the
+             package's own page, which is where it can be shown per group and
+             changed. It survives as a FILTER, where the question is about the
+             package ("is this automatic for anybody?") rather than about a
+             row of groups. #}
+          <td>{{ share_readout(shares) }}</td>
           <td class="adp-cell--act">
             {# Edit in place — the same shared drawer the detail page opens, so
                a rename does not cost a navigation. #}
@@ -423,7 +415,7 @@
         {% for cat_key, cat_label, options in [
              ('shared', 'Sharing', ['Shared', 'Not shared']),
              ('contents', 'Contents', ['Has items', 'Empty']),
-             ('tier', 'Access', ['Automatic', 'Optional']),
+             ('tier', 'Access for any group', ['Automatic', 'Optional']),
            ] %}
         <div class="fbar-cat" data-cat="{{ cat_key }}">
           <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
@@ -473,13 +465,16 @@
         {% for entry in domain_cards %}
         {% set shares = dom_sharing.get(entry.id, []) %}
         {% set n_items = entry.items_count | default(0) %}
-        {% set is_auto = shares | selectattr('requirement', 'equalto', 'required') | list %}
         <tr class="adp-row" data-domain-id="{{ entry.id }}"
             data-search="{{ (entry.name ~ ' ' ~ (entry.description or '')) | lower }}"
             data-name="{{ entry.name }}"
             data-shared="{{ 'Shared' if shares else 'Not shared' }}"
             data-contents="{{ 'Has items' if n_items else 'Empty' }}"
-            data-tier="{{ 'Automatic' if is_auto else ('Optional' if shares else '') }}">
+            {# The set, as above. #}
+            data-tier="{{ shares | map(attribute='requirement') | unique | sort
+                          | map('replace', 'required', words.tier_automatic)
+                          | map('replace', 'available', words.tier_optional)
+                          | join('|') }}">
           <td>
             <a class="adp-row__name" href="{{ entry.drilldown_url }}">
               <span class="adp-row__glyph adp-row__glyph--memory" aria-hidden="true">
@@ -498,18 +493,9 @@
             <span class="adp-num">{{ n_items }}</span>
             {% endif %}
           </td>
-          <td>
-            <span class="adp-shared">
-              {{ share_readout(shares) }}
-              {% if shares and n_items %}
-                {% if is_auto %}
-                <span class="adp-chip adp-chip--auto" title="{{ words.tier_automatic_admin_help }}"><span>{{ words.tier_automatic }}</span></span>
-                {% else %}
-                <span class="adp-chip" title="{{ words.tier_optional_admin_help }}"><span>{{ words.tier_optional }}</span></span>
-                {% endif %}
-              {% endif %}
-            </span>
-          </td>
+          {# Groups only — see the package table above for why the tier is not
+             here. #}
+          <td>{{ share_readout(shares) }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -550,7 +536,9 @@
   var COMMON = [
     { key: 'shared', attr: 'data-shared', label: 'Sharing' },
     { key: 'contents', attr: 'data-contents', label: 'Contents' },
-    { key: 'tier', attr: 'data-tier', label: 'Access' },
+    // `multi` because the attribute is a SET: a package Automatic for one
+    // group and Optional for another carries both, and matches either filter.
+    { key: 'tier', attr: 'data-tier', label: 'Access for any group', multi: true },
   ];
   if (document.getElementById('adp-pkg-rows')) {
     window.FilterToolbar.init({
