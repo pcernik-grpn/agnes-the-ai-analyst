@@ -219,6 +219,24 @@ connector it reads:
 | `skipped_running` | a Keboola source whose rows the login-triggered sync (`run_semantic_layer_refresh_background`) is writing right now — the two share one single-flight guard, so they can never overlap | the sweep's response only; the row keeps its last real sync state and the next sweep picks it up |
 | `skipped_duplicate_project` | a second source resolving to the SAME upstream Keboola project as one already imported this sweep (two connections may point at one project) — importing both would write one project's rows under two refs that then delete each other's | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
 
+**`skipped_duplicate_project` is Keboola-specific, on purpose (P2-2 of the
+post-#1707 remediation).** `duplicate_upstream_reason()`
+(`src/semantic/legacy_migration.py`) only resolves upstream identity for the
+`keboola_metastore` adapter (`sweep_project_identity()`); a manually-added
+`connection`-kind source of a *different* adapter pointed at the same
+upstream project has no equivalent check. This was a deliberate scope
+decision, not an oversight: Databricks avoids the problem structurally (one
+workspace resolves to a singleton `databricks_default` source, so there is
+nothing to duplicate); `git`/`upload`/native sources have no "upstream
+project identity" the same way a warehouse connection does, so a generic
+identity resolver would have nothing to compare. The remaining risk is an
+admin manually registering two Snowflake (or future-adapter) connections at
+the same warehouse/database — a narrow operator-error window that requires
+deliberate misconfiguration, not something a scheduled sweep can trigger on
+its own — so it is accepted rather than built against. Revisit if a second
+adapter after Keboola turns out to have the same "one credential, many
+connections" shape that makes the duplicate real.
+
 ## Adapters — adding a source format
 
 An adapter turns one source's payload into Ossie documents and does nothing
@@ -389,6 +407,30 @@ source. A model created directly through the admin API stays editable.
 This is not bureaucracy. A scheduled sync prunes what upstream no longer has, so
 an edit made downstream would be reverted on the next run — silently, and at an
 unpredictable time.
+
+**"The document is the owner" has three intentional exceptions (P2-3 of the
+post-#1707 remediation).** Every connector-sourced writer (Keboola,
+Snowflake, Databricks, native/manual) converged onto `project_document` —
+metrics are a *projection* of a stored Ossie document, never written
+directly. Three older, independent writers remain outside that model and
+write straight to `metric_definitions`:
+
+- `POST /api/admin/metrics` (generic REST create/update)
+- `POST /api/admin/metrics/import` (ad-hoc YAML upload, its own parser)
+- `agnes admin metrics import docs/metrics/` (the CLI "starter pack",
+  direct repository write — see the "Business Metrics" section of the root
+  `CLAUDE.md`)
+
+These are accepted as permanent, intentional parallel paths, not a
+migration backlog — a decision, not an oversight. A metrics-catalog-as-code
+workflow (hand-authored YAML, or a REST call from an external tool) does
+not need a full semantic document's datasets/relationships/constraints
+machinery, and forcing one through that ceremony for a single ad-hoc metric
+adds ritual without a corresponding benefit. They stay held together, as
+they always have, purely by the `(source, source_ref)` convention every
+writer — old and new — respects for pruning. Revisit only if one of these
+three paths grows a real need for document-level features (relationships,
+constraints, glossary) it currently has no way to declare.
 
 ## Provenance and pruning
 
@@ -597,6 +639,19 @@ before any of the other, backend-agnostic checks run — so a DuckDB-backed
 instance answers one clean `501 requires_postgres_backend` for the whole
 report rather than a partial one that silently drops the one field muting
 exists to keep visible.
+
+**`orphaned_table_bindings` stays detection-only, forever, pending a real
+product decision (P3-2 of the post-#1707 remediation).** There is no
+"clean this up" action anywhere — no UI button, no CLI command, no API
+endpoint — so an admin who sees the finding today resolves it by hand
+(direct DB/API edits to the flagged `metric_definitions`/`column_metadata`
+rows). This is confirmed as the CURRENT state, not endorsed as the RIGHT
+one: whether semantic-layer hygiene should stay this hands-on, or whether
+it deserves at least a guided cleanup command (e.g. `agnes admin semantic
+health fix-orphan <id>` that deletes or re-points the specific flagged
+row), is a genuine open product question with no recommendation attached
+here — flag it in the next planning conversation rather than deciding it
+silently in a documentation pass.
 
 ## Muting: turning a check off is a signature
 
