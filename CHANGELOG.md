@@ -1060,38 +1060,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (`/semantic-layer/{slug}.yaml`), which the `{slug}` path parameter catches
   literally and 404s on; it now points at the route that actually serves the
   document, `GET /api/semantic-models/{slug}.yaml`. The Re-attach/Detach
-  buttons used a `.btn--sm` class that has no CSS rule anywhere in the repo,
+  buttons used a `.btn--sm` class that has no rule in any app stylesheet,
   so they had no borders or button chrome; they now use the same
   `btn-secondary`/`btn-primary` + `btn-sm` classes as the rest of the page.
   Added page-level test coverage for the detach toolbar (PG-only, since
   `sync_mode='detached'` is a Postgres-only column), which is what let both
   issues ship unguarded.
-  just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
-  mutating MCP tool the in-chat agent can call — deleting a data-app draft,
-  deploying one, `pull` — executed without the approve/deny round-trip its own
-  contract asks for. Approval now follows each tool's own behaviour annotation
-  (`readOnlyHint`) rather than its name, so it covers future tools by
-  construction: a read-only tool still runs unasked, and everything else —
-  including a tool the runner has no annotation for, such as a per-caller
-  passthrough tool or one from a workspace-configured MCP server — raises the
-  same approval card, showing the call's arguments. The one user-visible
-  change in the shipped tool set: `agnes_data_app_preview` now asks before it
-  runs (it mints a scoped preview grant); the two pure render directives
-  beside it, `agnes_data_app_refresh` and `agnes_data_app_close`, are now
-  correctly annotated read-only on both MCP surfaces and do not ask. The
-  workspace policy hook also runs for MCP calls now, so an operator `deny` on
-  an MCP tool is enforced instead of being downgraded to a card the user can
-  click past, and the same mutations reached through the CLI
-  (`agnes app create|deploy|stop|delete|draft …`) are `ask`-flagged in the
-  bundled sandbox hook so the Bash route raises the same card. "Allow for
-  session" remembers the exact tool + arguments approved, never the tool as a
-  family. Read-only built-in tools (`Read`/`Grep`/…) are unaffected.
-  Fail-closed, scoped honestly: on the `docker` provider, on an SDK whose hook
-  matcher cannot block safely, mutating MCP tools are DENIED with an actionable
-  message rather than silently allowed, and an internal error in the gate
-  denies too — but on an SDK with no `PreToolUse` hook support at all nothing
-  can be registered and tool calls run ungated (logged loudly). The `kai-agent`
-  provider is unaffected; its engine raises its own approvals.
 - **Testing a non-Keboola data connection no longer fails with a Keboola error.**
   `POST /api/admin/source-connections/{id}/test` (the "Test connection" action on
   /admin/data-sources, `agnes admin connection test`) validated a `stack_url` and

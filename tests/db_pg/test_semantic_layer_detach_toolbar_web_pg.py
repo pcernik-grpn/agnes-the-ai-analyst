@@ -144,3 +144,10 @@ class TestDetachToolbarPage:
         # `<button id="...">` tags are what must be admin-gated.
         assert 'id="slb-reattach-btn"' not in r.text
         assert 'id="slb-detach-btn"' not in r.text
+        # A1's failure mode was "the link 403s for exactly the users who can
+        # see the page" — so the export route must answer the SAME non-admin
+        # principal the page just answered, not only the admin.
+        export = s["client"].get(
+            "/api/semantic-models/invoices.yaml", headers=_auth(s["analyst_token"])
+        )
+        assert export.status_code == 200, export.text
