@@ -22,6 +22,8 @@ import pyarrow as pa
 import requests
 from kbcstorage.client import Client
 
+from connectors.keboola.storage_api import _coerce_rows_count, check_empty_sliced_manifest
+
 from dataclasses import dataclass, field
 
 
@@ -219,6 +221,21 @@ class KeboolaClient:
         except Exception as e:
             logger.error(f"Error getting metadata for {table_id}: {e}")
             raise
+
+    def _raw_rows_count(self, table_id: str) -> Optional[int]:
+        """Upstream `rowsCount` for `table_id`, or None when it cannot be read.
+
+        Deliberately NOT `get_table_metadata()["row_count"]`: that projection
+        defaults a MISSING count to 0, which is exactly the conflation the
+        empty-sliced-manifest decision exists to prevent — unknown would
+        arrive looking like an empty table. Reads the raw detail and lets
+        `_coerce_rows_count` classify it.
+        """
+        try:
+            return _coerce_rows_count(self.client.tables.detail(table_id).get("rowsCount"))
+        except Exception as e:
+            logger.warning(f"Could not read rowsCount for {table_id}: {e}")
+            return None
 
     def _resolve_keboola_type(self, col_meta_list: Any) -> str:
         """
@@ -635,6 +652,33 @@ class KeboolaClient:
                 column_names = table_metadata.get("columns", [])
                 if not column_names:
                     raise ValueError(f"No columns found in metadata for {table_id}")
+
+                if not slice_entries:
+                    # Third sliced-manifest consumer, same decision as the two
+                    # in storage_api.py — shared, not mirrored. Writing the
+                    # header-only CSV below unconditionally reported a lost
+                    # export (upstream rows > 0, zero slices) as a clean
+                    # `exported_rows: 0` sync.
+                    #
+                    # `export_table` only routes here when `where_filters` is
+                    # non-empty, so in production this is always a filtered
+                    # export and the shared rule keeps it a success; the
+                    # unfiltered branches guard the private entry point and
+                    # any future caller that drops the filter.
+                    # `rows_count` is not merely ignored on the filtered
+                    # path — it is never fetched, so "cannot arbitrate" costs
+                    # no API call and cannot creep back into the decision.
+                    check_empty_sliced_manifest(
+                        manifest,
+                        table_id=table_id,
+                        rows_count=None if where_filters else self._raw_rows_count(table_id),
+                        filtered=bool(where_filters),
+                    )
+                    # Known limitation, unchanged by this branch: under a
+                    # `columns` projection the header is synthesized from ALL
+                    # declared columns, here and on the non-empty path below
+                    # alike, so empty and non-empty exports stay consistent
+                    # with each other.
 
                 # Create CSV header line
                 header_line = ",".join(f'"{col}"' for col in column_names) + "\n"

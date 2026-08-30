@@ -1070,6 +1070,139 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   from `max(last_sync_at)` through the existing repository factory, so no new
   table and no schema change, and a DuckDB instance reports it exactly as a
   Postgres one does.
+- **A source card on `/admin/data-sources` no longer reports the state the page
+  was born in.** The per-source pipeline strip (tables → sync → semantic →
+  feeds) was baked into the page's HTML at render time, but everything that
+  changes it happens on that same page over `fetch` — the Add-tables wizard,
+  package creation and sharing, token saves, chat-tools toggles, unbinding a
+  project. So an admin who registered two dozen tables kept reading "Add the
+  first tables → / Never synced / 0 packages" until they hard-reloaded: the
+  setup was done and the app said nothing had happened. Each of those handlers
+  now re-reads the strip from a new read-only, admin-gated
+  `GET /api/admin/source-pipelines` (the same fold the template inlines — no
+  new data, no new authority) and repaints the affected card in place, so an
+  expanded card and the scroll position survive the update; the handlers that
+  also change what the card's own row says — a stored token, a cleared project
+  binding, chat tools, a queued SharePoint extraction, a connection created or
+  deleted — redraw the card list from that same fresh read.
+- **A Databricks or Snowflake semantic source no longer fails forever once the
+  connector is deconfigured (#1707).** Both connectors refuse to CREATE their
+  semantic source row when the warehouse is not configured — exactly so
+  nothing carries a source that fails on every run for a warehouse it does not
+  have — but an existing row short-circuits before that check, so a connector
+  deconfigured AFTER registration (credentials rotated out, connection
+  removed) landed in that state from the other direction: every scheduled
+  sweep imported the row, the adapter raised "… is not configured", and the
+  source accrued a fresh error and a fresh warning, every run, indefinitely.
+  Both rows are auto-registered — the Databricks one by the sweep's own
+  migration, the Snowflake one by the /admin/data-sources wizard's opt-in — so
+  neither needed an admin to set up the state that then broke. The sweep now
+  asks each source's adapter whether its connector is configured at all and
+  skips the ones that are not — counted as `skipped_not_configured` in the
+  `POST /api/admin/run-semantic-sources-refresh` response, the sweep's log
+  line and its audit row, and recorded on the source itself as
+  `last_sync_status='skipped'` with the reason, so `/admin/semantic-sources`
+  shows a muted "skipped" with the explanation instead of a red failure
+  nothing is trying to reach any more. The reason names both places a
+  connector can be configured (a registered connection under Admin → Data
+  sources, or the legacy `data_source.*` config), rather than sending a
+  wizard-configured admin off to edit a file that was never their source of
+  truth. The row is never deleted: a rotated credential is an outage, not
+  consent to discard a source an admin named, scoped and enabled — it resumes
+  syncing on the first sweep after the configuration returns. A manual sync of
+  such a source still fails loudly, since that one was explicitly asked for.
+  The check is a new optional adapter method (`unconfigured_reason`), so any
+  connector-backed adapter opts in with one function and git/upload sources
+  need no opinion.
+- **The semantic-layer health report no longer says "No sync failures,
+  disconnected models, or invalid documents" for an instance whose only source
+  is permanently skipped (#1707).** Both renderers — the `/admin/semantic-layer`
+  Health tab and `agnes admin semantic health` — filtered `sources` on
+  "failed" and "synced but owns nothing" alone, so a source the sweep skips
+  (its connector deconfigured, or another source already importing the same
+  upstream project) appeared in no section at all and still counted as
+  all-clear. Both now list them under **"Sources that are not syncing
+  (skipped)"** with the reason recorded on each row, without failure styling
+  (nothing failed — the sweep declined to try), and a skipped source
+  suppresses the all-clear headline.
+- **A Keboola table that is empty upstream no longer reports as a failed
+  sync — and a lost sliced export no longer reports as a clean one.** A
+  sliced export of a table with no rows comes back as a manifest with zero
+  entries. The Storage API client's two sliced download paths treated that
+  as an unconditional error, so a table that is simply empty (a form-fields
+  table with no attachments, say) stayed permanently red and looked exactly
+  like a broken extraction; the legacy client's own third consumer had the
+  opposite failure, reporting any entries-less manifest as a clean 0-row
+  export. All three now share one decision. Empty and successful: the export
+  carries the table's declared columns (a header-only CSV / a zero-row
+  parquet, honouring a `columns` projection when one was requested), so the
+  sync succeeds with 0 rows and the downstream view still resolves its
+  columns — either because upstream's `rowsCount` is 0, or because the
+  export carried a row filter (`whereFilters` / `changedSince` /
+  `changedUntil` / `limit`), which may legitimately match nothing on a table
+  that has rows. Otherwise an error: `rowsCount > 0` on an unfiltered export
+  now says plainly that upstream claims N rows while the export returned no
+  slices. **Contract change on the legacy client:** when `rowsCount` cannot
+  be read at all — no table id to ask about, the detail call failed, the
+  field is absent — that path now fails where it used to report 0 rows
+  successfully. Unknown must never present itself as empty.
+- **Semantic layer browse: the constraint Severity tooltip is now a fast
+  `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
+  ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
+  severity badge carried a 257-character explanation in `title=` — a
+  600ms+ OS-controlled show delay, no styling, and prone to clipping in a
+  scrollable ancestor. Both now use the shared `[data-tip]` mechanism, paired
+  with `aria-label` carrying the same text (never `title` alongside it, and
+  never `role="note"` on a `<th>` — that would override its implicit
+  `columnheader` role), with a single-sentence summary that also corrects the
+  original wording: an error-severity violation is a *missing filter in the
+  query*, not a *missing rule* on the constraint, and — soft-enforce — it
+  only flips `validate-query`'s verdict, it never blocks anything. The fuller
+  nuance (only `required_filter` is statically checkable today, so any other
+  type is advisory regardless of severity) moved to a short note under the
+  table/panel instead.
+- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
+  admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+  knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+  their table in `<div class="data-table-wrap">`, but no CSS rule ever
+  backed the class — so a wide table dragged the whole page into horizontal
+  scroll in a narrow window instead of just itself. Fixing the overflow
+  naively would have broken sticky table headers on all ten pages —
+  `overflow-x: auto` makes the wrap a nearer scrolling ancestor than the
+  viewport, and with no height cap the header would silently stop sticking
+  at all instead of visibly failing — so sticky is now consciously disabled
+  for any thead inside `.data-table-wrap` rather than left in that
+  ambiguous, silently-broken state. Also replaced seven admin pages' inline
+  `style="text-align:right"` on a header (semantic sources, marketplaces,
+  mcp_sources, mcp_source_detail, knowledge_digests, initial_workspace,
+  access) with the existing `.num` class.
+- **Security: the cloud-chat approval gate now covers mutating MCP tools, not
+  just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
+  mutating MCP tool the in-chat agent can call — deleting a data-app draft,
+  deploying one, `pull` — executed without the approve/deny round-trip its own
+  contract asks for. Approval now follows each tool's own behaviour annotation
+  (`readOnlyHint`) rather than its name, so it covers future tools by
+  construction: a read-only tool still runs unasked, and everything else —
+  including a tool the runner has no annotation for, such as a per-caller
+  passthrough tool or one from a workspace-configured MCP server — raises the
+  same approval card, showing the call's arguments. The one user-visible
+  change in the shipped tool set: `agnes_data_app_preview` now asks before it
+  runs (it mints a scoped preview grant); the two pure render directives
+  beside it, `agnes_data_app_refresh` and `agnes_data_app_close`, are now
+  correctly annotated read-only on both MCP surfaces and do not ask. The
+  workspace policy hook also runs for MCP calls now, so an operator `deny` on
+  an MCP tool is enforced instead of being downgraded to a card the user can
+  click past, and the same mutations reached through the CLI
+  (`agnes app create|deploy|stop|delete|draft …`) are `ask`-flagged in the
+  bundled sandbox hook so the Bash route raises the same card. "Allow for
+  session" remembers the exact tool + arguments approved, never the tool as a
+  family. Read-only built-in tools (`Read`/`Grep`/…) are unaffected.
+  Fail-closed, scoped honestly: on the `docker` provider, on an SDK whose hook
+  matcher cannot block safely, mutating MCP tools are DENIED with an actionable
+  message rather than silently allowed, and an internal error in the gate
+  denies too — but on an SDK with no `PreToolUse` hook support at all nothing
+  can be registered and tool calls run ungated (logged loudly). The `kai-agent`
+  provider is unaffected; its engine raises its own approvals.
 - **Semantic-layer detail page: the detach toolbar's "Export detached
   version" link 404'd, and its two buttons rendered as unstyled text
   (#1707).** The link pointed at the HTML detail route

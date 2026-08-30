@@ -8905,3 +8905,27 @@ async def run_reap_stuck_reviews(
         params={"grace_seconds": grace, "reaped": result.get("reaped", 0), "skipped": result.get("skipped", False)},
     )
     return {"ok": True, "details": result}
+
+
+@router.get("/source-pipelines")
+async def get_source_pipelines(
+    user: dict = Depends(require_admin),
+):
+    """The per-source pipeline strip — tables → sync → semantic → feeds.
+
+    Read-only, and deliberately no new data: it returns exactly the dict
+    ``/admin/data-sources`` inlines into its own HTML (``SOURCE_PIPELINES``),
+    from the same ``_source_pipelines()`` fold. The page needs it because
+    everything on it — the Add-tables wizard, package creation, token
+    saves — happens over fetch, so a strip baked at render time kept
+    reporting "Add the first tables → / Never synced / 0 packages" long
+    after the admin had registered two dozen tables. Same admin gate as the
+    page, so this exposes nothing the caller could not already read there.
+
+    ``user`` is threaded through for the one caller-scoped cell (a
+    SharePoint source's facts/edges counts); every other cell is
+    caller-independent.
+    """
+    from app.web.router import _source_pipelines
+
+    return _source_pipelines(user=user)
