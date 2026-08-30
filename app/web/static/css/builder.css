@@ -342,6 +342,13 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
    Muted and small: it is a receipt, not another thing said. */
 .sk-patch-note { font-size: 12px; color: var(--ds-text-muted); margin: 2px 22px 0; text-align: center; }
 
+/* "writes" marker on an MCP tool row — a warning tint, not the accent, so it
+   reads as a property of the tool rather than as decoration. */
+.mcp-writes { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg);
+  border: 1px solid var(--ds-accent-warn-line); border-radius: var(--ds-radius-pill);
+  padding: 1px 7px; margin-left: 7px; vertical-align: 1px; }
+
 /* Live preview — a real session with the agent, not a mock of one. */
 .ag-live-note { font-size: 12px; color: var(--ds-text-muted); text-align: center; padding: 0 22px 10px; }
 .ag-live-note a { color: var(--ds-primary); font-weight: 600; text-decoration: none; }

@@ -592,6 +592,17 @@
         '<textarea rows="2" data-ag-field="greeting" placeholder="Hi, I&#39;m …">' + esc(a.greeting) + '</textarea></label>' +
       '<label class="ag-field"><span>Name <em>— last, once you know what it is</em></span>' +
         '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
+      /* The slug is this agent's public address — how the agent API, the CLI
+         and any script reach it. It follows the name while the agent is a
+         draft and FREEZES the moment it is marked ready; the shared module
+         says so and adds that the builder "shows it nowhere". It does now. */
+      (a.slug
+        ? '<div class="ag-field"><span>Address <em>— how scripts and the CLI reach it</em></span>' +
+            '<div class="ag-bnd"><div class="ag-bnd-row"><span class="ag-bnd-k">' + esc(a.slug) + '</span>' +
+            '<span class="ag-bnd-v">' + (a.status === 'ready'
+              ? 'Fixed — marking ready froze it'
+              : 'Still follows the name, until you mark it ready') + '</span></div></div></div>'
+        : '') +
       '<div class="ag-note">Instructions replace the default analyst prompt. Agnes still appends its data-access rails (<code>agnes catalog</code> → <code>schema</code> → <code>query</code>), so you don’t need to restate them — write the persona and its task.</div>';
   }
 
@@ -847,12 +858,27 @@
   }
 
   function boundariesBody() {
+    var a = current() || {};
+    /* "Scoped to each user's permissions" was false, and false in the
+       direction that matters: scope resolves against the GRANTER's access,
+       defaulting to the owner, and the broker deliberately runs a turn under
+       the owner-derived principal "regardless of who mentioned the bot". An
+       owner who read the old line and then bound this agent to a Slack
+       channel had been told the opposite of what happens. Model and budget
+       read from the row instead of being asserted — both are settable
+       through the API and were displayed as unset whatever they held. */
     return '<div class="ag-bnd">' +
-        '<div class="ag-bnd-row"><span class="ag-bnd-k">Model</span><span class="ag-bnd-v">Workspace default</span></div>' +
-        '<div class="ag-bnd-row"><span class="ag-bnd-k">Data access</span><span class="ag-bnd-v">Scoped to each user’s permissions</span></div>' +
+        '<div class="ag-bnd-row"><span class="ag-bnd-k">Model</span><span class="ag-bnd-v">' +
+          esc(a.model || 'Workspace default') + '</span></div>' +
+        '<div class="ag-bnd-row"><span class="ag-bnd-k">Monthly tokens</span><span class="ag-bnd-v">' +
+          (a.token_budget_monthly ? esc(String(a.token_budget_monthly)) : 'No cap') + '</span></div>' +
+        '<div class="ag-bnd-row"><span class="ag-bnd-k">Data access</span>' +
+          '<span class="ag-bnd-v">Your access, narrowed to what you attach above</span></div>' +
         '<div class="ag-bnd-row"><span class="ag-bnd-k">Sensitive actions</span><span class="ag-bnd-v">Require confirmation</span></div>' +
       '</div>' +
-      '<div class="ag-note">Inherited from the workspace — you build within them. Ask an admin to change a boundary.</div>';
+      '<div class="ag-note">This agent runs on <strong>your</strong> permissions, never anyone else’s — including ' +
+      'when a teammate talks to it. It reaches only what you attached under Data &amp; resources, and it loses that ' +
+      'the moment you do.</div>';
   }
 
   /* ── Schedules — unattended runs on a cadence. CRUD rides the agent-schedules
@@ -1259,10 +1285,25 @@
      Existing: Save, the status toggle, and Delete. "← All agents" leaves
      without saving. Delete is the destructive one and stays furthest from
      Save, which is the button being aimed at. */
+  /* What Mark ready is waiting for, in the owner's words and from the same
+     inputs the gate reads — so a dark button and its explanation cannot name
+     different things. It used to be enabled always: a blank, roleless agent
+     could be published into every colleague's picker, and marking ready also
+     FREEZES the agent's public address for the API and the CLI. */
+  function readyBlocker(a) {
+    var want = [];
+    if (!(a.name || '').trim()) want.push('a name');
+    if (!(a.role || a.instructions || '').trim()) want.push('a role');
+    if (!want.length) return '';
+    return 'Needs ' + (want.length > 1 ? want.join(' and ') : want[0]) + ' before it can go in the agent picker.';
+  }
+
   function headActionsHtml(a) {
     var dirty = isDirty();
     var busy = saving ? ' disabled' : '';
-    var mark = '<button type="button" class="cc-btn cc-btn--primary" data-ag-status' + busy + '>' +
+    var blocked = a.status === 'ready' ? '' : readyBlocker(a);
+    var markOff = busy || (blocked ? ' disabled title="' + esc(blocked) + '"' : '');
+    var mark = '<button type="button" class="cc-btn cc-btn--primary" data-ag-status' + markOff + '>' +
       (a.status === 'ready' ? 'Back to draft' : 'Mark ready') + '</button>';
     if (isNewAgent) {
       return statusPill(a) +
@@ -1273,7 +1314,7 @@
       (dirty ? '<span class="ag-unsaved" title="Not saved yet">Unsaved changes</span>' : '') +
       // Same reason as the list card: the default agent has no delete.
       (a.is_default ? '' : '<button type="button" class="cc-btn ag-del-btn" data-ag-del="' + esc(a.id) + '">Delete</button>') +
-      '<button type="button" class="cc-btn" data-ag-status' + busy + '>' +
+      '<button type="button" class="cc-btn" data-ag-status' + markOff + '>' +
         (a.status === 'ready' ? 'Revert to draft' : 'Mark ready') + '</button>' +
       '<button type="button" class="cc-btn cc-btn--primary" data-ag-save' +
         (saving || !dirty ? ' disabled' : '') + '>' + (saving ? 'Saving…' : 'Save') + '</button>';

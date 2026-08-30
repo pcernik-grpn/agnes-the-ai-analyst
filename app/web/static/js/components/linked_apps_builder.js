@@ -120,15 +120,24 @@
 
   /* ── Fetch the catalogue ───────────────────────────────────────────── */
 
+  var scheduleErr = null;   // the nightly refresh could not be set up
+
   function fetchApps() {
     if (fetching || !picked.toolId) return;
-    fetching = true; fetchErr = null;
+    fetching = true; fetchErr = null; scheduleErr = null;
     render();
     // Idempotent: the tool has to be in materialize mode for the lister path
     // to write a table for the projection to read.
     send(TOOLS_API + '/' + encodeURIComponent(picked.toolId), 'PUT',
          { mode: 'materialize', schedule: 'daily 03:00' })
-      .catch(function () { /* already in the right mode — not fatal */ })
+      .catch(function (e) {
+        /* Usually "already in that mode", which IS the end state we wanted.
+           But every other refusal was swallowed with it, leaving the admin a
+           catalogue that will never refresh and nothing on screen saying so. */
+        if (!e || e.status !== 409) {
+          scheduleErr = (e && e.message) || 'the server refused';
+        }
+      })
       .then(function () {
         return send(SOURCES_API + '/' + encodeURIComponent(picked.sourceId) + '/materialize', 'POST',
                     { tool_id: picked.toolId, lister: true });
@@ -171,6 +180,15 @@
   function chosenApps() { return apps.filter(function (a) { return chosen[a.id]; }); }
 
   function canSave() { return fetched && chosenApps().length > 0 && grantGroups.length > 0; }
+  /* Three separate conditions gate Publish, and the button named none of
+     them — it rendered dark from first paint and the admin guessed. Derived
+     from `canSave()`'s own inputs so the two cannot disagree. */
+  function saveBlocker() {
+    if (fetched && chosenApps().length && grantGroups.length) return '';
+    if (!fetched) return 'Fetch the apps from the remote first.';
+    if (!chosenApps().length) return 'Choose at least one app to publish.';
+    return 'Choose at least one group to publish it to.';
+  }
 
   /* Save is one grant per (app × group), and the two things that matter are
      both about partial success.
@@ -358,12 +376,19 @@
       (fetching || !picked.toolId ? ' disabled' : '') + '>' +
       (fetching ? 'Fetching…' : (fetched ? 'Fetch again' : '+ Fetch apps')) + '</button>';
     if (fetchErr) fetchBtn += '<div class="ag-note ag-note--err">' + esc(fetchErr) + '</div>';
+    /* Not an error for the fetch — the apps are catalogued. It is an error for
+       every day after today, and it used to be swallowed entirely. */
+    if (scheduleErr) {
+      fetchBtn += '<div class="ag-note ag-note--warn">Catalogued, but the nightly refresh could not be ' +
+        'scheduled: ' + esc(scheduleErr) + '. The list will not stay current.</div>';
+    }
     if (!fetched) {
       return '<div class="ag-slot">' +
           '<p class="ag-slot-head">Nothing fetched yet.</p>' +
           '<p class="ag-slot-body">Agnes asks the server what apps exist and catalogues them. ' +
-          'This one DOES write — the catalogue is ingested. Nobody can see any of it until you ' +
-          'grant a group below.</p>' +
+          'This one DOES write, twice: the app list is stored, and the tool is switched to a ' +
+          'nightly refresh at 03:00 so the list stays current. Neither is undone by leaving. ' +
+          'Nobody can see any of it until you grant a group below.</p>' +
         '</div>' + fetchBtn;
     }
     if (!apps.length) {
@@ -477,10 +502,9 @@
     mount.innerHTML =
       window.BuilderShell.head({
         backLabel: 'Library', title: 'Link external apps', titleId: 'la-title',
-        badge: '<span class="sk-typechip sk-typechip--agent">Linked apps</span>',
         actionsId: 'la-actions',
         actions: '<button type="button" class="cc-btn cc-btn--primary" id="la-save"' +
-          (canSave() && !saving ? '' : ' disabled') + '>' +
+          (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Publishing…') + '"') + '>' +
           (saving ? 'Publishing…' : 'Publish to Library') + '</button>',
       }) +
       window.BuilderShell.workspace({

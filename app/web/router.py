@@ -2672,7 +2672,12 @@ async def library_page(
     except Exception as e:
         _lost("skills, plugins and agent templates", e)
 
-    for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
+    # Agent templates were missing from this tuple, so a published one appeared
+    # in no listing at all — while the error label three lines up, the type
+    # label map, and the builder's own "Open in Library" success action all
+    # said otherwise. The author followed their own success banner to a page
+    # that did not contain their work.
+    for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin"), ("agent", "Agent template")):
         try:
             _entities, _total = store_entities_repo().list(
                 type=_etype,
@@ -6722,6 +6727,22 @@ async def admin_linked_apps_builder(
     could not read, and the source and its lister tool are detected rather than
     chosen.
     """
+    # Data apps are OFF by default, and this builder cannot complete without
+    # them: the app list 404s `data_apps_disabled` at the last step — AFTER
+    # "+ Fetch apps" has already switched a shared MCP tool to materialize
+    # mode and installed a nightly job. The same predicate already hides the
+    # data-apps hub in the rail; it simply was never applied here.
+    if not _data_apps_nav_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "data_apps_disabled",
+                "message": (
+                    "Linked apps are switched off on this instance. Turn on data_apps.enabled "
+                    "in server config, then come back."
+                ),
+            },
+        )
     return templates.TemplateResponse(request, "admin_linked_apps_builder.html", _build_context(request, user=user))
 
 

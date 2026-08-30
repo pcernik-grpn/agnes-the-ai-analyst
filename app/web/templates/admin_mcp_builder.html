@@ -12,6 +12,11 @@
 {# The builder workspace: two panes, the shell header, the full-bleed
    breakout, the section cards, the picker modal. #}
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{# `.cc-btn` — the shell's markup uses it for the primary action, and it
+   is defined here, not in builder.css. Without this the main button on
+   this page renders as a bare browser button (admin_package_builder.html
+   has always loaded it for the same reason). #}
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 {% endblock %}
 
 {% block page_head %}

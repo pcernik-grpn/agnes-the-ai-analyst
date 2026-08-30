@@ -2389,10 +2389,12 @@
             {# An app is a view onto the data rather than something an agent
                calls, which is why it is added from this half. Opens the existing
                three-step admin ingest. #}
+            {% if data_apps_enabled() %}
             <a class="lib-new__item" href="/admin/linked-apps/new" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
               <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
             </a>
+            {% endif %}{# data apps off → the flow cannot complete, so it is not offered #}
             {% endif %}
             <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>

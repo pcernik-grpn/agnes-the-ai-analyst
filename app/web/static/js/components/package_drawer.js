@@ -240,11 +240,13 @@
     // an already-open form left the slug empty and the create silently
     // bounced on a required field.)
     els.name.addEventListener('input', function () {
+      syncSubmitGate();   // the gate answers to typing, not only to opening
       if (!st || st.slugTouched) return;
       els.slug.value = slugify(els.name.value);
     });
     els.slug.addEventListener('input', function () {
       if (st) st.slugTouched = true;
+      syncSubmitGate();
     });
     els.name.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); els.submit.click(); }
@@ -711,6 +713,31 @@
      keeps working untouched. */
   var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [], convEngine = null;
 
+  /* Has the author said anything in this transcript? The opening turn is the
+     builder talking to itself, so it does not count. */
+  function authorHasSpoken() {
+    return conv.some(function (m) { return m.role === 'user'; });
+  }
+  /* Create used to render enabled from the moment the drawer opened and refuse
+     on submit — "A name is required" AFTER the click. The gate is the same
+     predicate the submit handler checks, so the button and the refusal cannot
+     disagree, and it says what it wants while it is dark. */
+  function submitBlocker() {
+    if (!els || !els.name) return '';
+    var name = (els.name.value || '').trim();
+    if (!name) return 'Add a name first — the slug derives from it.';
+    if (!((els.slug.value || '').trim() || slugify(name))) {
+      return 'That name has no URL-safe characters — give the slug a value.';
+    }
+    return '';
+  }
+  function syncSubmitGate() {
+    if (!els || !els.submit) return;
+    var why = submitBlocker();
+    els.submit.disabled = !!why;
+    if (why) els.submit.setAttribute('title', why); else els.submit.removeAttribute('title');
+  }
+
   function enterBuilderLayout() {
     if (!els || els.root.classList.contains('is-builder-built')) return;
     els.root.classList.add('is-builder-built');
@@ -776,7 +803,11 @@
       BuilderShell.composer({
         kind: 'create', value: convDraft, busy: convBusy,
         placeholder: 'Describe the package you need…',
-        chips: convBusy ? [] : (convChips.length ? convChips : STARTERS),
+        /* Starters belong to the empty state. Keying on "no chips from the
+           last turn" put them back mid-conversation, so a nearly-finished
+           package could be offered a fresh-start brief — one click from
+           landing on top of real work. */
+        chips: convBusy ? [] : (convChips.length ? convChips : (authorHasSpoken() ? [] : STARTERS)),
       });
     var el = els.convHost.querySelector('#pdw-conv-scroll');
     if (el) el.scrollTop = el.scrollHeight;
@@ -826,11 +857,16 @@
   /* Merge a proposal into the form. Nothing is saved — Create still writes,
      and the admin sees the tables and the access matrix first. */
   function applyPatch(patch) {
-    if (typeof patch.name === 'string' && patch.name) {
+    /* A field the author is typing in belongs to them — the same rule /skills
+       applies to its whole panel. Writing over a focused input took their
+       caret and, for name and description, their words. */
+    function mine(el) { return document.activeElement === el; }
+    if (typeof patch.name === 'string' && patch.name && !mine(els.name)) {
       els.name.value = patch.name;
       if (!st.slugTouched) els.slug.value = slugify(patch.name);
+      syncSubmitGate();
     }
-    if (typeof patch.description === 'string') els.desc.value = patch.description;
+    if (typeof patch.description === 'string' && !mine(els.desc)) els.desc.value = patch.description;
     if (Array.isArray(patch.tables)) {
       patch.tables.forEach(function (id) { st.tablesSelected.add(id); });
       renderTables();
@@ -916,7 +952,7 @@
     els.access.open = false;
     els.groups.innerHTML = '';
     els.err.hidden = true;
-    els.submit.disabled = false;
+    syncSubmitGate();
     applyMode(mode);
 
     /* PAGE MODE. Given a `mount`, this stops being an overlay: the panel is
@@ -1303,6 +1339,23 @@
         var host = st && st.chipHost;
         var done = (st && st.onCreated) || function () {};
         if (host && host.addChip) host.addChip({ id: pkg.id, name: pkg.name });
+        /* Report a partial failure HERE, before closing, rather than trusting
+           three hosts to remember. One of them did; the other two discarded
+           both counts and redirected, so the admin ticked two groups, saw a
+           page change, and walked away believing they had granted access.
+           The drawer stays open on a partial failure — there is nothing to
+           celebrate and the numbers are the whole message. */
+        if (failures || tableFailures) {
+          var parts = [];
+          if (failures) parts.push(failures + ' group' + (failures > 1 ? 's were' : ' was') + ' not granted');
+          if (tableFailures) parts.push(tableFailures + ' table' + (tableFailures > 1 ? 's were' : ' was') + ' not added');
+          els.submit.textContent = st.mode === 'edit' ? 'Save changes' : 'Create package';
+          els.submit.disabled = false;
+          fail('“' + pkg.name + '” was created, but ' + parts.join(' and ') +
+               '. Fix that on the package’s page — creating it again would only make a duplicate.');
+          try { done(pkg, failures, tableFailures); } catch (_) { /* the caller's problem */ }
+          return;
+        }
         close();
         // The package exists by now, so a caller's own error must not be
         // reported as a failed create on a drawer that has already closed.

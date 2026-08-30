@@ -640,6 +640,7 @@
      caps each item. One reply over the cap therefore made every later turn
      422 forever — a conversation that could not be left. The cap is enforced
      here, where the text is stored, not only where it is typed. */
+  var justSaved = null;       // {id, label} — set once a save actually landed
   var convPatchNote = null;   // what the last reply wrote, and what it left alone
   var convTrimmed = false;    // the transcript has passed what the model can see
   var MAX_MSG_CHARS = 4000;
@@ -1841,6 +1842,13 @@
       ? 'This item is with the reviewer.'
       : (canPublish() ? '' : 'Add ' + publishBlocker() + ' first.');
     var attrs = blocked ? ' disabled title="' + esc(blocked) + '" aria-label="' + esc(c.checkLabel + ' — ' + blocked) + '"' : '';
+    /* After a save the panel still holds what was just published — editing it
+       writes nothing, and Save would only mint a duplicate name. Offer the one
+       move that makes sense instead. */
+    if (justSaved) {
+      return '<a class="cc-btn" href="/library?new=' + encodeURIComponent(justSaved.id) + '">Open in Library</a>' +
+        '<button type="button" class="cc-btn cc-btn--primary" id="sk-again">Build another ' + esc(justSaved.label) + '</button>';
+    }
     return (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
           '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
           '<button type="button" class="cc-btn" id="sk-check"' + attrs + '>' + esc(c.checkLabel) + '</button>' +
@@ -1991,6 +1999,7 @@
      lets the expanded step promise "you can switch back" honestly. */
   function chooseType(k) {
     typeMenuOpen = false;
+    justSaved = null;                // a new draft is not the thing just saved
     persist();                       // park the outgoing draft under its type
     var previous = type ? cfg().label : null;
     var incoming = drafts[k] || null;
@@ -2683,7 +2692,15 @@
            saving again hit the duplicate-name refusal. */
         if (kind === 'ok' || state.filed) {
           discardDraft(type);          // it lives in the Library now
-          syncHeadActions();           // ...so "Discard draft" goes with it
+          /* And the form comes back. `reviewInProgress` was set before the
+             branch and only ever cleared on a FAILING verdict, so a private
+             save — the default — left the whole panel on screen with Save and
+             Check dark, tooltipped "This item is with the reviewer" when
+             nothing was reviewed and nothing is queued. Same on the
+             guardrails-off path, which is what most instances ship. */
+          reviewInProgress = false;
+          justSaved = { id: created.id, label: cfg().label.toLowerCase() };
+          syncHeadActions();
           return;
         }
         if (kind === 'err') {
@@ -3162,6 +3179,16 @@
       else if (outcome === 'cleared') toast('Nothing to save — the empty draft was cleared.', 'info');
       else if (outcome === 'failed') toast('This browser refused to store the draft. Copy your work somewhere safe.', 'error', 8000);
       else toast('Not saved — this item is with the reviewer.', 'info');
+    }
+    else if (t.id === 'sk-again') {
+      // A clean slate of the same type: new draft, no transcript, no banner.
+      justSaved = null;
+      _reviewBannerHtml = null;
+      var wrap2 = document.getElementById('sk-review-banner-wrap');
+      if (wrap2) wrap2.remove();
+      convs[type] = [];
+      openedFor[type] = false;
+      chooseType(type);
     }
     else if (t.id === 'sk-discard') {
       // Destructive and unrecoverable — the draft exists nowhere but this

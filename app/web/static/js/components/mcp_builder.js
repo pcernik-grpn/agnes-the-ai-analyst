@@ -42,7 +42,55 @@
 
   var mount = null, draft = null, groups = null, groupsErr = false;
   var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [];
-  var convEngine = null, convSlots = null, opened = false;
+  var convEngine = null, opened = false;
+  var convPatchNote = null;    // what the last reply wrote, and what it left alone
+  var llmUnavailable = false;  // latched when a turn says this instance has no model
+
+  /* This builder held EVERYTHING in module scope: a pasted endpoint, the auth
+     env-var name, the introspected tool list and its curation, the group
+     picks. A reload or a stray Back discarded all of it with no warning —
+     /agents guards with beforeunload because its drafts are server rows,
+     /skills persists per type. This does what /skills does. */
+  var DRAFT_KEY = 'agnes_mcp_builder_draft_v1';
+  function persistDraft() {
+    if (!draft) return;
+    try {
+      var keep = JSON.parse(JSON.stringify(draft));
+      delete keep.secret_value;   // a credential does not belong in localStorage
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ draft: keep, conv: conv }));
+    } catch (e) { /* quota or private mode — soft-fail, same as /skills */ }
+  }
+  function restoreDraft() {
+    try {
+      var raw = window.localStorage.getItem(DRAFT_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      return parsed && parsed.draft ? parsed : null;
+    } catch (e) { return null; }
+  }
+  function discardDraft() {
+    try { window.localStorage.removeItem(DRAFT_KEY); } catch (e) { /* ignore */ }
+  }
+
+  /* What a turn changed, in the admin's vocabulary — the reply's prose is the
+     model's account of itself; this is the page's. */
+  var FIELD_WORDS = {
+    name: 'the name', url: 'the endpoint', command: 'the command', args: 'the arguments',
+    transport: 'the transport', auth_method: 'the auth method',
+    auth_secret_env: 'the credential variable', scope: 'the scope',
+  };
+  function fieldWords(keys) {
+    var w = keys.map(function (k) { return FIELD_WORDS[k] || k; });
+    if (w.length < 2) return w[0] || '';
+    return w.slice(0, -1).join(', ') + ' and ' + w[w.length - 1];
+  }
+  function patchNote(applied, kept) {
+    if (!applied.length && !kept.length) return 'Nothing changed in the configuration.';
+    var parts = [];
+    if (applied.length) parts.push('Wrote ' + fieldWords(applied) + '.');
+    if (kept.length) parts.push('Left ' + fieldWords(kept) + ' as you had ' + (kept.length > 1 ? 'them' : 'it') + '.');
+    return parts.join(' ');
+  }
   var collapsed = {};
   var checking = false, checkErr = null;
   var saving = false, saveErr = null;
@@ -107,14 +155,69 @@
     return p;
   }
 
+  /* A stable host, so a landed turn or a keystroke can repaint the progress
+     line alone — re-rendering the panel would rebuild the form under whatever
+     field has focus. */
+  function syncProgress() {
+    var host = document.getElementById('mcp-prog-host');
+    if (host) host.innerHTML = progressHtml();
+  }
+
+  /* The interview's slots, as the PANEL can evaluate them.
+     `convSlots` — the server's answer — arrived only on a turn, and the input
+     handler deliberately skips repainting to protect the caret, so filling the
+     form by hand left the line reading "0 of 4 · still to settle" beside a lit
+     Register source. These mirror `_SLOTS` in app/api/mcp_builder.py, including
+     `_endpoint_known` (transport decides which address counts) and
+     `_auth_settled` ("decided: none" is a real answer, so the draft carries
+     `auth_decided` rather than inferring it from a blank field).
+     tests/test_mcp_builder_progress_mirror.py fails if the two drift. */
+  function localSlots() {
+    var endpoint = draft.transport === 'stdio'
+      ? !!(draft.command || '').trim()
+      : !!(draft.url || '').trim();
+    var auth = !!draft.auth_decided &&
+      (draft.auth_method === 'bearer' ? !!(draft.auth_secret_env || '').trim() : true);
+    return [
+      { key: 'endpoint', label: 'where it lives', known: endpoint },
+      { key: 'auth', label: 'how it authenticates', known: auth },
+      { key: 'name', label: 'a name', known: !!(draft.name || '').trim() },
+      { key: 'tools', label: 'which tools to expose', known: !!draft.introspected },
+    ];
+  }
+
   /* ── The conversation ──────────────────────────────────────────────── */
+
+  /* Mirrors the caps the endpoint enforces (app/api/builder_core.py). The
+     transcript is replayed on every turn, so one over-long reply used to make
+     every later turn 422 — a conversation with no way out. */
+  var MAX_MSG_CHARS = 4000;
+  var MAX_HISTORY = 40;
+  var TURN_TIMEOUT_MS = 60000;
+  function clipMsg(t) { t = t || ''; return t.length > MAX_MSG_CHARS ? t.slice(0, MAX_MSG_CHARS) : t; }
 
   function sendTurn(text) {
     if (convBusy) return;
     var opening = !text && !conv.length;
     if (!text && !opening) return;
+    /* Refuse over-long input here, with the author's text still in the box —
+       sending it earns a pydantic 422 whose `detail` is an array, which the
+       page would render as "the assistant could not answer". */
+    if (text && text.length > MAX_MSG_CHARS) {
+      convErr = 'That message is ' + text.length + ' characters and the limit is ' + MAX_MSG_CHARS +
+        '. Shorten it, or put the long part in the configuration on the right.';
+      convDraft = text;
+      render();
+      return;
+    }
     if (!opening) conv = conv.concat([{ role: 'user', text: text }]);
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    /* The panel as it stood when this turn was dispatched: a field the author
+       edits while it is in flight belongs to them, not to the reply. */
+    var sentDraft = JSON.parse(JSON.stringify(draft));
+    var timedOut = false;
+    var ctl = window.AbortController ? new window.AbortController() : null;
+    var timer = setTimeout(function () { timedOut = true; if (ctl) ctl.abort(); }, TURN_TIMEOUT_MS);
     render();
     postJson(TURN_API, {
       message: text || '',
@@ -128,15 +231,42 @@
         tool_names: (draft.tools || []).map(function (t) { return t.name; }),
       },
     }).then(function (body) {
-      conv = conv.concat([{ role: 'assistant', text: body.reply || '' }]);
-      convChips = body.suggestions || [];
+      conv = conv.concat([{ role: 'assistant', text: clipMsg(body.reply || '') }]);
+      if (conv.length > MAX_HISTORY) conv = conv.slice(-MAX_HISTORY);
+      // An opening turn's suggestions are invented — the author has said
+      // nothing for them to be grounded in.
+      convChips = (!opening && body.suggestions && body.suggestions.length) ? body.suggestions : [];
       convEngine = body.engine || null;
-      convSlots = body.slots || null;
+      /* Applying a patch used to be a blind merge followed by a full repaint,
+         so a reply landing while the author typed took their caret and, if it
+         touched that field, their text. */
       var patch = body.patch || {};
-      Object.keys(patch).forEach(function (k) { draft[k] = patch[k]; });
+      var applied = [], kept = [];
+      Object.keys(patch).forEach(function (k) {
+        var el = document.querySelector('[data-mcp-field="' + k + '"]');
+        var mine = (el && document.activeElement === el) ||
+          JSON.stringify(draft[k] === undefined ? null : draft[k]) !==
+          JSON.stringify(sentDraft[k] === undefined ? null : sentDraft[k]);
+        if (mine) { kept.push(k); return; }
+        draft[k] = patch[k];
+        applied.push(k);
+      });
+      convPatchNote = opening ? null : patchNote(applied, kept);
+      persistDraft();
+      syncProgress();
     }).catch(function (e) {
-      convErr = e.message || 'The assistant could not answer.';
+      if (e && e.detail && e.detail.kind === 'builder_llm_unavailable') llmUnavailable = true;
+      convErr = timedOut
+        ? 'That turn took longer than ' + Math.round(TURN_TIMEOUT_MS / 1000) + ' seconds and was given up on. Try again.'
+        : (e.message || 'The assistant could not answer.');
+      // Hand the message back — it was cleared optimistically and, on a
+      // failure, existed nowhere the author could retrieve it.
+      if (text) {
+        convDraft = text;
+        if (conv.length && conv[conv.length - 1].role === 'user') conv = conv.slice(0, -1);
+      }
     }).then(function () {
+      clearTimeout(timer);
       convBusy = false;
       render();
     });
@@ -160,6 +290,9 @@
             // name + description, which was fine while nothing here was
             // written and wrong the moment Save started registering tools.
             input_schema: (t && typeof t.input_schema === 'object' && t.input_schema) || null,
+            // `readOnlyHint` as the server gave it: true, false, or absent.
+            // Absent stays absent — it is not a claim of safety.
+            read_only: (t && typeof t.read_only === 'boolean') ? t.read_only : null,
           };
         });
         draft.enabled = {};
@@ -167,8 +300,10 @@
         draft.introspected = true;
         // Nothing to call it yet? The host is the honest first guess, and the
         // admin is standing right here to correct it.
-        if (!draft.name.trim() && draft.url) {
-          draft.name = String(draft.url).replace(/^https?:\/\//, '').split('/')[0];
+        if (!nameOk(draft.name) && draft.url) {
+          // Through the identifier rule — the raw host ("mcp.example.com") is
+          // exactly the value the API refuses.
+          draft.name = toIdentifier(String(draft.url).replace(/^https?:\/\//, '').split('/')[0]);
         }
       })
       .catch(function (e) { checkErr = e.message || 'Could not reach the server.'; })
@@ -239,6 +374,12 @@
       mode: 'passthrough',
       description: tool.description || null,
       input_schema: tool.input_schema || null,
+      /* The server's own `readOnlyHint`, mapped onto `mutating`. Sending
+         nothing meant every tool registered as non-mutating and the
+         group-grant handed out write tools — the sibling registration path
+         has always honoured this. An UNANNOTATED tool counts as mutating:
+         "the server said nothing" is not "this is safe". */
+      mutating: tool.read_only !== true,
       enabled: true,
     }).catch(function (e) {
       if (e && e.status === 409) return null;  // already registered — the end state we wanted
@@ -287,6 +428,12 @@
         });
       })
       .then(function () {
+        /* Clear the draft on the same tick it commits, BEFORE the redirect.
+           Persisting without this meant the next "+ Add → Connect an MCP
+           source" resumed a source that was already registered — endpoint and
+           tool curation prefilled — and Save then attempted a duplicate
+           registration. A builder that keeps a draft owns discarding it. */
+        discardDraft();
         window.location.href = '/admin/mcp-sources/' + encodeURIComponent(savedId);
       })
       .catch(function (e) {
@@ -297,9 +444,48 @@
       });
   }
 
+  /* Mirrors `is_safe_identifier` in src/sql_safe.py — the source name becomes
+     a DuckDB identifier, so the API refuses anything else. The page did not
+     know that: the placeholder read "Acme CRM", the post-check auto-fill used
+     the URL host, and both are refused AFTER the click, in the sync engine's
+     vocabulary. tests/test_mcp_builder_name_rule.py keeps the two in step. */
+  var NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+  function nameOk(n) { return NAME_RE.test((n || '').trim()); }
+  /* Turn anything into a name the API will take: lowercase, non-alphanumerics
+     to underscores, digits pushed off the front. */
+  function toIdentifier(raw) {
+    var v = String(raw || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!v) return '';
+    if (/^[0-9]/.test(v)) v = 'mcp_' + v;
+    return v.slice(0, 64);
+  }
+
   function canSave() {
-    if (!draft.name.trim()) return false;
+    if (!nameOk(draft.name)) return false;
+    if (!draft.introspected) return false;   // a source with no tools exposes nothing
     return draft.transport === 'stdio' ? !!draft.command.trim() : !!draft.url.trim();
+  }
+  /* What Register source is waiting for, from the same predicates that
+     disable it — so the button and its explanation cannot name different
+     things. The button rendered `disabled` from first paint with nothing
+     saying why. */
+  function saveBlocker() {
+    if (!draft.name.trim()) return 'Add a name first — letters, digits and underscores.';
+    if (!nameOk(draft.name)) {
+      return 'The name becomes a database identifier: letters, digits and underscores only, ' +
+        'starting with a letter. Try "' + (toIdentifier(draft.name) || 'acme_crm') + '".';
+    }
+    if (draft.transport === 'stdio') {
+      if (!draft.command.trim()) return 'Add the command to run first.';
+    } else if (!draft.url.trim()) {
+      return 'Add the endpoint URL first.';
+    }
+    /* Registering before checking produced a source with no tools: enabled,
+       granted, and unable to answer anything. */
+    if (!draft.introspected) {
+      return 'Check the connection first — until Agnes has read the tool list there is nothing to register.';
+    }
+    return '';
   }
 
   /* ── Groups picker ─────────────────────────────────────────────────── */
@@ -424,7 +610,7 @@
           esc((draft.args || []).join('\n')) + '</textarea></label>'
       : field('Endpoint URL', 'url', 'https://mcp.example.com/sse');
     return segHtml('transport', TRANSPORTS, draft.transport) + addr +
-      field('Name', 'name', 'Acme CRM', 'what it is called in the source list');
+      field('Name', 'name', 'acme_crm', 'what it is called in the source list');
   }
 
   function authBody() {
@@ -470,9 +656,14 @@
     }
     var rows = draft.tools.map(function (t) {
       var on = draft.enabled[t.name] !== false;
+      // The whole safety decision used to rest on an admin eyeballing an
+      // unmarked list. Say which ones can change data upstream.
+      var writes = t.read_only !== true
+        ? ' <span class="mcp-writes" title="This tool can change data on the server. Unmarked tools count as writes.">writes</span>'
+        : '';
       return '<div class="ag-row">' +
         '<div class="ag-row-body">' +
-          '<div class="ag-row-name">' + esc(t.name) + '</div>' +
+          '<div class="ag-row-name">' + esc(t.name) + writes + '</div>' +
           (t.description ? '<div class="ag-row-desc">' + esc(t.description) + '</div>' : '') +
         '</div>' +
         '<button type="button" class="ag-tglbtn' + (on ? ' on' : '') + '" ' +
@@ -504,11 +695,12 @@
   }
 
   function progressHtml() {
-    if (!convSlots || !convSlots.length) return '';
-    var known = convSlots.filter(function (s) { return s.known; }).length;
-    var open = convSlots.filter(function (s) { return !s.known; });
+    var slots = localSlots();
+    if (!slots.length) return '';
+    var known = slots.filter(function (s) { return s.known; }).length;
+    var open = slots.filter(function (s) { return !s.known; });
     return '<div class="ag-prog">' +
-      '<span class="ag-prog-n">' + known + ' of ' + convSlots.length + '</span>' +
+      '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
       '<span class="ag-prog-t">' + (open.length
         ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
         : 'nothing missing — ready to save') + '</span>' +
@@ -517,8 +709,7 @@
 
   function panelHtml() {
     var sec = window.BuilderShell.section;
-    return '<div id="mcp-prog-host">' + progressHtml() + '</div>' +
-      (saveErr ? '<div class="ag-note ag-note--err">' + esc(saveErr) + '</div>' : '') +
+    return (saveErr ? '<div class="ag-note ag-note--err">' + esc(saveErr) + '</div>' : '') +
       sec({
         key: 'connection', no: 1, title: 'Connection', note: 'where it lives',
         collapsed: !!collapsed.connection,
@@ -536,7 +727,8 @@
       sec({
         key: 'tools', no: 3, title: 'Tools', note: 'what it exposes',
         collapsed: !!collapsed.tools,
-        sub: 'What the server actually offers, read from the server itself. Turn off anything agents should not call.',
+        sub: 'What the server actually offers, read from the server itself. Tools marked "writes" can change data ' +
+             'upstream — a tool the server does not vouch for counts as one. Turn off anything agents should not call.',
         summary: toolSummary(),
         body: toolsBody(),
       }) +
@@ -553,15 +745,30 @@
     var rows = conv.length ? conv : (convBusy ? [] : [{ role: 'assistant', text:
       'Connecting a tool server takes four things: where it lives, how it authenticates, ' +
       'which of its tools to expose, and who may call them. Tell me what you are connecting.' }]);
-    return window.BuilderShell.engineNotice(convEngine) +
+    /* With no model configured the page used to render a greeting, a red
+       error under it, and a live composer + chips — every one of which failed
+       identically. One standing notice instead. */
+    var notice = llmUnavailable
+      ? '<div class="ag-note ag-note--warn">No AI credential is configured on this instance, so the ' +
+        'assistant cannot draft anything. The configuration on the right is editable by hand and ' +
+        'Register source works normally — or ask an admin to set a model up.</div>'
+      : window.BuilderShell.engineNotice(convEngine);
+    return notice +
       window.BuilderShell.conversation({
-        id: 'mcp-conv', rows: rows, busy: convBusy,
-        busyText: conv.length ? 'Thinking…' : 'Getting started…', err: convErr,
+        id: 'mcp-conv', rows: llmUnavailable && !conv.length ? [] : rows, busy: convBusy,
+        busyText: conv.length ? 'Thinking…' : 'Getting started…',
+        err: llmUnavailable ? null : convErr,
       }) +
+      (convPatchNote && !convBusy ? '<p class="sk-patch-note">' + esc(convPatchNote) + '</p>' : '') +
       window.BuilderShell.composer({
         kind: 'create', value: convDraft, busy: convBusy,
-        placeholder: 'Tell me what you are connecting…',
-        chips: convBusy ? [] : convChips,
+        // readOnly, not disabled: a disabled textarea is unselectable in
+        // Chrome, so a restored message would be visible and uncopyable.
+        readOnly: llmUnavailable,
+        placeholder: llmUnavailable
+          ? 'No AI is configured here — fill the configuration on the right by hand.'
+          : 'Tell me what you are connecting…',
+        chips: convBusy || llmUnavailable ? [] : convChips,
       });
   }
 
@@ -570,16 +777,18 @@
     mount.innerHTML =
       window.BuilderShell.head({
         backLabel: 'Library', title: draft.name || 'New MCP source', titleId: 'mcp-title',
-        badge: '<span class="sk-typechip sk-typechip--plugin">MCP source</span>',
         actionsId: 'mcp-actions',
         actions: '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
-          (canSave() && !saving ? '' : ' disabled') + '>' +
+          (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Saving…') + '"') + '>' +
           (saving ? 'Saving…' : 'Register source') + '</button>',
       }) +
       window.BuilderShell.workspace({
         left: leftHtml(),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this source is, editable by hand',
+        // The shell grew `cfgAside` because a boxed status widget in the first
+        // slot of the column outweighed the fields it reports on.
+        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>',
         cfgBodyId: 'mcp-steps',
         cfg: panelHtml(),
       }) +
@@ -649,9 +858,17 @@
         draft[f] = f === 'args' ? el.value.split('\n').map(function (s) { return s.trim(); }).filter(Boolean)
                                 : el.value;
         // Typed values change what Save would do, not what the panel looks
-        // like — repainting here would take the caret with it.
+        // like — repainting here would take the caret with it. These two
+        // hosts are the exceptions: they report the form, so they have to
+        // answer to typing, and neither contains an input.
         var save = document.getElementById('mcp-save');
-        if (save) save.disabled = !(canSave() && !saving);
+        if (save) {
+          save.disabled = !(canSave() && !saving);
+          var why = saveBlocker();
+          if (why) save.setAttribute('title', why); else save.removeAttribute('title');
+        }
+        persistDraft();
+        syncProgress();
         return;
       }
       var comp = el.getAttribute && el.getAttribute('data-ag-comp');
@@ -675,10 +892,18 @@
   window.AgnesMcpBuilder = {
     open: function (opts) {
       mount = opts.mount;
-      draft = newDraft();
+      var saved = restoreDraft();
+      draft = saved ? Object.assign(newDraft(), saved.draft) : newDraft();
+      conv = (saved && Array.isArray(saved.conv)) ? saved.conv : [];
       wire();
       render();
-      if (!opened) { opened = true; sendTurn(''); }
+      /* Greet only a blank page. A resumed draft already answers "what are you
+         connecting", and the opening turn's own prompt says the author has not
+         said anything yet. */
+      if (!opened && !conv.length && !draft.name.trim() && !draft.url.trim() && !draft.command.trim()) {
+        opened = true;
+        sendTurn('');
+      }
     },
   };
 })(window);
