@@ -8,12 +8,18 @@ Bound on the internal compose network only; token-gated.
 from __future__ import annotations
 
 import functools
+import hmac
 import json
+import logging
 import os
 import socket
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException
+
+from services.apps_runner.audit_report import report_event
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="agnes-apps-runner", docs_url=None, redoc_url=None)
 
@@ -42,10 +48,37 @@ def _docker():
     return docker.from_env(timeout=timeout)
 
 
+# Defined here rather than imported: this sidecar is deliberately free of
+# `app.`/`src.` imports (it is the only process holding the Docker socket).
+# Must stay in lockstep with RUNNER_TOKEN_MIN_LENGTH in app/api/data_apps.py.
+RUNNER_TOKEN_MIN_LENGTH = 32
+
+
 def _check_token(x_runner_token: str | None) -> None:
-    expected = os.environ.get("APPS_RUNNER_TOKEN", "")
-    if not expected or x_runner_token != expected:
+    """Constant-time check of the shared control-plane secret.
+
+    Same contract (and same secret) as the control plane's own
+    ``_check_runner_token`` in ``app/api/data_apps.py``: a plain ``!=``
+    leaks the token a byte at a time under timing analysis, and a secret
+    below the length floor is treated as "auth disabled" rather than as a
+    weak secret. Fixing only one direction would leave the same key
+    guessable through the other door.
+    """
+    expected = os.environ.get("APPS_RUNNER_TOKEN", "").strip()
+    if not expected or len(expected) < RUNNER_TOKEN_MIN_LENGTH:
         raise HTTPException(status_code=401, detail="bad_runner_token")
+    if not x_runner_token or not hmac.compare_digest(x_runner_token, expected):
+        raise HTTPException(status_code=401, detail="bad_runner_token")
+
+
+def _safe_report(action: str, params: dict) -> None:
+    """Belt-and-braces on top of ``report_event``'s own internal swallow: a
+    container action (start/stop/resume) must never fail because reporting
+    it did, even if a future change to ``report_event`` reintroduces a raise."""
+    try:
+        report_event(action, params)
+    except Exception:
+        logger.warning("apps-runner: report_event raised for %r; container action unaffected", action, exc_info=True)
 
 
 def _container(name: str):
@@ -277,6 +310,7 @@ def up(slug: str, payload: dict = Body(...), x_runner_token: str | None = Header
         # cycle; surfacing the failure is the deliberate choice here.
         restart_policy={"Name": "on-failure", "MaximumRetryCount": 3},
     )
+    _safe_report("data_app.container_up", {"slug": slug})
     return {"status": "started"}
 
 
@@ -289,8 +323,10 @@ def stop(slug: str, payload: dict = Body(...), x_runner_token: str | None = Head
         return {"status": "absent"}
     if payload.get("mode") == "pause":
         c.pause()
+        _safe_report("data_app.container_stop", {"slug": slug, "mode": "pause"})
         return {"status": "paused"}
     c.remove(force=True)
+    _safe_report("data_app.container_stop", {"slug": slug, "mode": "removed"})
     return {"status": "removed"}
 
 
@@ -302,6 +338,7 @@ def resume(slug: str, x_runner_token: str | None = Header(default=None)):
     if c is None:
         raise HTTPException(status_code=404, detail="absent")
     c.unpause()
+    _safe_report("data_app.container_resume", {"slug": slug})
     return {"status": "running"}
 
 

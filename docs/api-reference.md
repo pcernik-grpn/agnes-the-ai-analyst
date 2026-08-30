@@ -1859,6 +1859,7 @@ by-slug surface but keep their grants for a lossless re-link.
 
 - /api/data-apps
 - /api/data-apps/reap-idle
+- /api/data-apps/runner-events
 - /api/data-apps/{slug}
 - /api/data-apps/{slug}/deploy
 - /api/data-apps/{slug}/drafts

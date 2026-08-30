@@ -404,3 +404,45 @@ def test_readiness_reports_docker_rows(api_client: TestClient, logged_in_admin, 
     assert body["provider"] == "docker"
     assert body["secrets"]["apps_runner_token"]["required"] is True
     assert "apps_runner_token" in body["missing"]
+
+
+# ---------------------------------------------------------------------------
+# admin_tail audit coverage (wave 2 — the WS gap the read-posture task flagged)
+# ---------------------------------------------------------------------------
+
+
+def test_admin_tail_view_writes_audit_row(api_client: TestClient, logged_in_admin):
+    """Watching another user's live chat log leaves a record.
+
+    The ticket issuance is audited separately, but that only proves permission
+    was granted — this row is the one a "who read whose conversation" question
+    is actually asking about.
+    """
+    from src.repositories import audit_repo
+
+    c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
+    ticket = api_client.post(f"/admin/chat/{c['id']}/tail-ticket").json()["ticket"]
+    with api_client.websocket_connect(f"/admin/chat/{c['id']}/tail?ticket={ticket}") as ws:
+        ws.receive_json()
+
+    rows, _ = audit_repo().query(action="chat.session.tail_view", limit=5)
+    assert rows, "streaming another user's chat log must be audited"
+    assert rows[0]["resource"] == f"chat_session:{c['id']}"
+    assert rows[0]["user_id"], "the watching admin must be attributed"
+
+
+def test_admin_tail_rejection_writes_denied_row(api_client: TestClient, logged_in_admin):
+    """A refused stream is recorded too — a failed attempt to read someone
+    else's conversation is exactly what an auditor wants to see."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from src.repositories import audit_repo
+
+    c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
+    with pytest.raises(WebSocketDisconnect):
+        with api_client.websocket_connect(f"/admin/chat/{c['id']}/tail?ticket=bogus") as ws:
+            ws.receive_json()
+
+    rows, _ = audit_repo().query(action="chat.session.tail_rejected", limit=5)
+    assert rows
+    assert rows[0]["result"] == "denied"

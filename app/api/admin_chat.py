@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
+from src.audit_helpers import log_safe
 from src.repositories import audit_repo
 from app.chat.readiness import (
     ENV_ANTHROPIC,
@@ -306,6 +307,14 @@ async def admin_tail(ws: WebSocket, chat_id: str, ticket: str = ""):
         await ws.close(code=4503, reason="coordination_unavailable")
         return
     if user_id is None:
+        log_safe(
+            user_id=None,
+            action="chat.session.tail_rejected",
+            resource=f"chat_session:{chat_id}",
+            params={"reason": "invalid_or_expired_ticket"},
+            result="denied",
+            client_kind="web",
+        )
         await ws.close(code=4401, reason="invalid_or_expired_ticket")
         return
     repo = getattr(ws.app.state, "chat_repo", None)
@@ -317,6 +326,18 @@ async def admin_tail(ws: WebSocket, chat_id: str, ticket: str = ""):
         await ws.close(code=4404)
         return
     await ws.accept()
+    # The admin is now streaming ANOTHER user's live chat log. The ticket
+    # issuance (a separate POST) records that permission was granted; only
+    # this row records that the content was actually watched, which is the
+    # event a "who read whose conversation" question is really asking about.
+    log_safe(
+        user_id=user_id,
+        action="chat.session.tail_view",
+        resource=f"chat_session:{chat_id}",
+        params={"subject_email": s.user_email},
+        result="success",
+        client_kind="web",
+    )
     chat_data_dir = getattr(ws.app.state, "chat_data_dir", None)
     if chat_data_dir is None:
         await ws.send_json({"type": "no_log", "reason": "chat_data_dir_not_configured"})
