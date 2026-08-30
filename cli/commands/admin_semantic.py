@@ -435,12 +435,33 @@ def add_source(
     typer.echo(f"Created semantic source id={body.get('id')} kind={kind}")
 
 
+def _owned_models_cell(row: dict) -> str:
+    """How many semantic models this source owns, for the table column.
+
+    ``last_sync_status`` answers "did the fetch work", never "did it bring
+    anything back" (#1707), so the count is what separates a healthy source
+    from one silently scoped at an empty upstream. A server too old to send
+    the field renders ``-`` rather than a confident ``0 models`` nobody
+    claimed.
+    """
+    count = row.get("owned_model_count")
+    if not isinstance(count, int):
+        return "-"
+    return f"{count} model" + ("" if count == 1 else "s")
+
+
 @source_app.command("list")
 def list_sources(
     enabled_only: bool = typer.Option(False, "--enabled-only", help="Only show enabled sources"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
-    """List registered semantic sources."""
+    """List registered semantic sources, each with the number of semantic
+    models it owns.
+
+    "Synced ok" only means the fetch worked; a source scoped at an upstream
+    with nothing in it stays green forever while importing nothing. The
+    model count is what tells the two apart (#1707).
+    """
     params = {"enabled_only": enabled_only} if enabled_only else None
     resp = api_get(_SOURCES_PATH, params=params)
     if resp.status_code != 200:
@@ -450,10 +471,28 @@ def list_sources(
         typer.echo(json.dumps(rows, indent=2, default=str))
         return
     typer.echo(f"Semantic sources: {len(rows)}")
+    silently_empty = []
     for r in rows:
         state = "enabled" if r.get("enabled") else "disabled"
         last = r.get("last_sync_status") or "never synced"
-        typer.echo(f"{r.get('id', ''):<16}  {r.get('kind', ''):<10}  {r.get('name', ''):<24}  {state:<9}  {last}")
+        owned = _owned_models_cell(r)
+        typer.echo(
+            f"{r.get('id', ''):<16}  {r.get('kind', ''):<10}  {r.get('name', ''):<24}  "
+            f"{state:<9}  {owned:<10}  {last}"
+        )
+        # A source that synced and imported nothing is the finding this
+        # column exists for; one that has never run yet owning nothing is
+        # simply not started, and flagging it would train the eye to skip
+        # the warning.
+        count = r.get("owned_model_count")
+        if r.get("last_sync_status") == "ok" and isinstance(count, int) and count == 0:
+            silently_empty.append(str(r.get("id") or ""))
+    if silently_empty:
+        typer.echo(
+            f"\n{len(silently_empty)} source(s) synced but own no models: {', '.join(silently_empty)}\n"
+            "  The fetch worked and brought nothing back — check the source's scope/config, "
+            "then: agnes admin semantic source sync <id>"
+        )
 
 
 @source_app.command("sync")
@@ -792,6 +831,18 @@ def keboola_import(
 # ---------------------------------------------------------------------------
 
 
+def _synced_but_imported_nothing(source: dict) -> bool:
+    """Did this source's last sync work and still bring back nothing? (#1707)
+
+    Three conditions, each load-bearing: it must have SYNCED (a never-synced
+    source has not imported nothing, it has not run), the count must be a
+    real integer (``null`` is "cannot say" — see ``src/semantic/ownership.py``
+    — and must never be reported as empty), and that integer must be zero.
+    """
+    count = source.get("owned_model_count")
+    return source.get("last_sync_status") == "ok" and isinstance(count, int) and count == 0
+
+
 @admin_semantic_app.command("health")
 def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
     """Is the semantic layer trustworthy right now (admin only)?
@@ -821,6 +872,20 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
         typer.echo(f"Sync failures ({len(failed)}):")
         for s in failed:
             typer.echo(f"  {s.get('name') or s['source_id']}: {s.get('last_sync_error') or 'unknown error'}")
+        typer.echo("")
+
+    # #1707: the fetch working is not the same as the fetch bringing anything
+    # back. Deliberately its own section rather than a line in "Sync
+    # failures": nothing failed here, so it must not read as a failure. Only
+    # a source that actually SYNCED counts — a never-synced one has not
+    # imported nothing, it has not run — and `owned_model_count: null`
+    # ("cannot say", see src/semantic/ownership.py) is never reported as
+    # empty.
+    empty_synced = [s for s in sources if _synced_but_imported_nothing(s)]
+    if empty_synced:
+        typer.echo(f"Sources that synced but imported nothing ({len(empty_synced)}):")
+        for s in empty_synced:
+            typer.echo(f"  {s.get('name') or s['source_id']} — check this source's scope/config")
         typer.echo("")
 
     orphaned = body.get("orphaned_models") or []
@@ -885,7 +950,7 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
     if mutes_list:
         typer.echo(f"Muted ({len(mutes_list)} of the above are silenced — see `agnes admin semantic mutes`)")
 
-    if not (failed or orphaned or table_bindings or invalid or missing_desc or dupes or missing_rel):
+    if not (failed or empty_synced or orphaned or table_bindings or invalid or missing_desc or dupes or missing_rel):
         typer.echo("No sync failures, disconnected models, or invalid documents.")
 
 

@@ -195,6 +195,15 @@ class SemanticModelsPgRepository:
             ).fetchone()
         return int(row[0]) if row else 0
 
+    def counts_by_provenance(self) -> Dict[tuple[str, Optional[str]], int]:
+        """Postgres twin of the DuckDB ``counts_by_provenance`` — same key,
+        same "absent, never zero" contract (see the sibling's docstring)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT source, source_ref, COUNT(*) FROM semantic_models GROUP BY source, source_ref")
+            ).all()
+        return {(r[0], r[1]): int(r[2]) for r in rows}
+
     def delete(self, model_id: str) -> bool:
         existed = self.get(model_id) is not None
         with self._engine.begin() as conn:

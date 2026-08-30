@@ -443,3 +443,47 @@ def test_the_data_sources_page_shows_both_mismatch_codes():
     ).read_text(encoding="utf-8")
     assert 'w.code === "master_token_project_mismatch"' in src
     assert 'w.code === "token_project_mismatch"' in src
+
+
+class TestTheHealthTabReportsSilentlyEmptySources:
+    """#1707: `hlRender` filtered `sources` on `last_sync_status === "error"`
+    alone, so a source that synced fine and imported nothing produced no
+    section AND still let the headline read "No sync failures, disconnected
+    models, or invalid documents."
+
+    The page renders client-side, so what is pinned here is the shell it
+    renders FROM — the section, the predicate, and the absence of error
+    styling on it.
+    """
+
+    def _body(self, seeded_app) -> str:
+        return (
+            seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
+        )
+
+    def test_the_report_has_its_own_section(self, seeded_app):
+        assert "Sources that synced but imported nothing" in self._body(seeded_app)
+
+    def test_the_section_reads_the_owned_model_count_field(self, seeded_app):
+        assert "owned_model_count" in self._body(seeded_app)
+
+    def test_the_finding_suppresses_the_nothing_is_wrong_headline(self, seeded_app):
+        """`nothingWrong` must account for it, or the page says everything is
+        fine while listing a finding right underneath."""
+        body = self._body(seeded_app)
+        nothing_wrong = body.split("const nothingWrong")[1].split(";")[0]
+        assert "emptySources" in nothing_wrong
+
+    def test_only_a_source_that_actually_synced_is_counted(self, seeded_app):
+        """A never-synced source has not imported nothing — it has not run."""
+        body = self._body(seeded_app)
+        predicate = body.split("const emptySources")[1].split(";")[0]
+        assert 'last_sync_status === "ok"' in predicate
+
+    def test_it_is_not_rendered_with_error_styling(self, seeded_app):
+        """Nothing failed; the fetch worked. It must not borrow the failure
+        vocabulary (design-system: no danger accent for an attention state)."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        assert "danger" not in section
+        assert "error" not in section

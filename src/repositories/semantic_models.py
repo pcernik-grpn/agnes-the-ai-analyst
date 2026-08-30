@@ -179,6 +179,32 @@ class SemanticModelsRepository:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def counts_by_provenance(self) -> Dict[tuple[str, Optional[str]], int]:
+        """How many rows each ``(source, source_ref)`` owns, in one query.
+
+        "Owns" means exactly one thing: the row is stamped with that
+        provenance. It is deliberately NOT "a sync of this source would
+        delete this many" — the prune is narrower than ownership on both
+        counts (Postgres excludes ``sync_mode='detached'`` rows, and a
+        ``safe_prune`` source skips the prune entirely when a run yields no
+        valid document), so equating the two would overstate what a sync can
+        reach. This is the read-time answer to "did this source import
+        anything", which no column on ``semantic_sources`` records (that
+        table is a frozen pre-A3 pair; see issue #1707).
+
+        Every row under the provenance counts, valid or invalid: an invalid
+        document is still something this source brought in, and whether it
+        parses is what ``invalid_models`` in the health report is for.
+
+        Grouped rather than one COUNT per source: the caller has a list of
+        sources and would otherwise issue N queries to render one page.
+        A scope with no rows is simply absent from the mapping.
+        """
+        rows = self.conn.execute(
+            "SELECT source, source_ref, COUNT(*) FROM semantic_models GROUP BY source, source_ref"
+        ).fetchall()
+        return {(r[0], r[1]): int(r[2]) for r in rows}
+
     def delete(self, model_id: str) -> bool:
         existed = self.get(model_id) is not None
         self.conn.execute("DELETE FROM data_package_semantic_models WHERE model_id = ?", [model_id])

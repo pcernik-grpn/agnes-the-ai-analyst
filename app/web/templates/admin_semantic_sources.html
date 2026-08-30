@@ -33,6 +33,21 @@
 
   .ss-adapter { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--ds-text-secondary); }
 
+  /* How many models this source OWNS. "Synced ok" only says the fetch
+     worked — a source scoped at an empty upstream stays green forever while
+     importing nothing (#1707), so the count needs its own marker.
+     `-empty` (amber) fires ONLY for a source that synced OK and still owns
+     nothing — the same rule the CLI and the docs state. A never-synced or
+     skipped source owning nothing has simply not run, so it stays neutral.
+     Amber is WARN (attention), never danger: nothing failed either way. */
+  .ss-models {
+    display: inline-block; padding: 2px 8px; border-radius: var(--ds-radius-pill, 999px);
+    font-size: 11px; font-weight: 600; white-space: nowrap;
+  }
+  .ss-models-neutral { background: var(--ds-surface-dim); color: var(--ds-text-secondary); }
+  .ss-models-empty { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .ss-models-unknown { color: var(--ds-text-muted); }
+
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap; }
 
   .ss-empty, .ss-loading {
@@ -105,6 +120,7 @@
           <th>Adapter</th>
           <th>Enabled</th>
           <th>Last sync</th>
+          <th>Models</th>
           <th style="text-align:right">Actions</th>
         </tr>
       </thead>
@@ -278,6 +294,29 @@ function fmtLastSync(s) {
   return esc(when);
 }
 
+function fmtOwnedModels(s) {
+  const n = s.owned_model_count;
+  if (typeof n !== "number") {
+    // `null` (this source's provenance could not be resolved) or a server too
+    // old to send the field at all — say nothing rather than assert a count
+    // nobody claimed. A confident "0 models" here would be a wrong number.
+    const why = s.owned_model_count === null
+      ? "Cannot determine — this source's provenance could not be resolved. See the server log."
+      : "Not reported by this server.";
+    return `<span class="ss-models-unknown" title="${esc(why)}">—</span>`;
+  }
+  const label = `${n} model${n === 1 ? "" : "s"}`;
+  // Amber ONLY for "synced fine and still owns nothing" — the finding. A
+  // source that has never run (or was skipped) owning nothing has not failed
+  // to import, it has not imported yet.
+  if (n === 0 && s.last_sync_status === "ok") {
+    const why = "Synced, but imported nothing — check this source's scope/config.";
+    return `<span class="ss-models ss-models-empty" title="${esc(why)}">${esc(label)}</span>`;
+  }
+  const title = n === 0 ? ' title="Nothing imported yet."' : "";
+  return `<span class="ss-models ss-models-neutral"${title}>${esc(label)}</span>`;
+}
+
 function renderSources() {
   const tbody = document.getElementById("ss-tbody");
   const loading = document.getElementById("ss-loading");
@@ -301,6 +340,7 @@ function renderSources() {
       <td><span class="ss-adapter">${esc(s.adapter || "native")}</span></td>
       <td><span class="ss-status-pill ${enabled ? "" : "ss-status-disabled"}">${enabled ? "Enabled" : "Disabled"}</span></td>
       <td>${fmtLastSync(s)}</td>
+      <td>${fmtOwnedModels(s)}</td>
       <td>
         <div class="row-actions">
           <button class="icon-btn" data-act="sync" data-id="${esc(s.id)}">Sync now</button>
