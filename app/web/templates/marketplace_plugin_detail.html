@@ -805,6 +805,7 @@
      name_id='hero-name', icon_id='hero-icon', type_label='Plugin',
      trust=(_trust_level if detail.redesign else None), trust_own=is_owner,
      menu=_menu|trim, body_slot=_hero_slot, panel=_hero_panel|trim,
+     cover_image_url=cover_image_url,
      back_href=_back, back_label=_back_label) %}
   {# Three-element install state — see renderInstallState() below. Only one of
      {installBtn} vs {statusPill + removeBtn} is visible at a time. #}
@@ -1238,7 +1239,7 @@
   // On a 404 (missing internal file or dead external mirror), drop the
   // overlay and revert to the glyph rather than a broken-image icon.
   const iconEl = document.getElementById('hero-icon');
-  if (iconEl && d.cover_photo_url) {
+  if (iconEl && d.cover_photo_url && !iconEl.querySelector('img')) {
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';

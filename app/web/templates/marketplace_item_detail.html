@@ -701,6 +701,7 @@
      name_id='hero-name', icon_id='hero-icon', type_label=kind|capitalize,
      trust=(_trust_level if detail.redesign else None), trust_own=is_owner,
      menu=_menu|trim, body_slot=_hero_slot, panel=_hero_panel|trim,
+     cover_image_url=cover_image_url,
      back_href=_back, back_label=_back_label) %}
   <div class="actions-row" id="hero-actions"></div>
   <div class="helper" id="hero-helper" hidden></div>
@@ -1306,7 +1307,7 @@
   // overlay the curator cover when present (widening the tile via `--cover`,
   // mirroring the detail.hero() macro), reverting to the glyph on a 404.
   const iconEl = document.getElementById('hero-icon');
-  if (iconEl && d.cover_photo_url) {
+  if (iconEl && d.cover_photo_url && !iconEl.querySelector('img')) {
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';

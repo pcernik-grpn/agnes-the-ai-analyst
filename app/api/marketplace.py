@@ -652,14 +652,9 @@ def _flea_to_item(
     viewer_id: Optional[str] = None,
     stats: Optional[Dict[str, Dict]] = None,
 ) -> MarketplaceItem:
-    photo_url = (
-        # ``?v=`` cache-busting fingerprint: flea entities have a monotonic
-        # ``version_no`` (schema v37) bumped on every re-upload, so the URL
-        # changes exactly when the underlying bytes change.
-        f"/api/store/entities/{entity['id']}/photo?v={entity.get('version_no', 1)}"
-        if entity.get("photo_path")
-        else None
-    )
+    from app.api.store import entity_cover_url
+
+    photo_url = entity_cover_url(entity)
     # v49 phase-3: invocation is the stored synthetic_name. The column is
     # NOT NULL (phase 1 migration + repo create/update/archive write
     # paths keep it in sync), so reading it directly is safe and a
@@ -1957,12 +1952,9 @@ async def flea_detail(
         entity_id,
     )
 
-    cover_url: Optional[str] = None
-    if entity.get("photo_path"):
-        # ``?v=`` cache-busting fingerprint via ``version_no`` — see
-        # ``app/api/store.py:get_entity_photo`` for the matching
-        # ``Cache-Control: immutable`` header.
-        cover_url = f"/api/store/entities/{entity_id}/photo?v={entity.get('version_no', 1)}"
+    from app.api.store import entity_cover_url
+
+    cover_url = entity_cover_url(entity)
 
     # Strip archive-rename suffix for human display; manifest_name keeps
     # the renamed-on-archive slug since that's what Claude Code resolves.

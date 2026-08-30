@@ -5876,6 +5876,14 @@ async def marketplace_flea_detail(
         and not entity_has_adverse_verdict(entity.get("id") or "")
     )
 
+    # Hero cover, server-side — same helper the page's own detail XHR
+    # (``flea_detail`` in app/api/marketplace.py) resolves its cover URL
+    # through, so the browser's preload scanner sees the LCP image in the
+    # initial HTML instead of waiting on that follow-up request.
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     # v104 trust strip. `entity_owner_label` resolves the byline the same way
     # the card does (display name → email → username) so the detail page never
     # shows a kebab-case username where the grid showed a real name.
@@ -5909,6 +5917,7 @@ async def marketplace_flea_detail(
         # Where the visitor came from, so the detail page's back link can point
         # home to the right surface (e.g. ?from=skills → the Skill builder).
         from_source=from_source,
+        cover_image_url=cover_image_url,
     )
 
     if entity["type"] == "plugin":
@@ -6049,6 +6058,11 @@ async def marketplace_flea_skill_detail(
     _enforce_visibility(entity, user, conn)
     is_owner = entity.get("owner_user_id") == user.get("id")
     is_admin = is_user_admin(user["id"], conn)
+
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     ctx = _build_context(
         request,
         user=user,
@@ -6060,6 +6074,7 @@ async def marketplace_flea_skill_detail(
         entity=entity,
         is_owner=is_owner,
         is_admin=is_admin,
+        cover_image_url=cover_image_url,
     )
     return templates.TemplateResponse(
         request,
@@ -6092,6 +6107,11 @@ async def marketplace_flea_agent_detail(
     _enforce_visibility(entity, user, conn)
     is_owner = entity.get("owner_user_id") == user.get("id")
     is_admin = is_user_admin(user["id"], conn)
+
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     ctx = _build_context(
         request,
         user=user,
@@ -6103,6 +6123,7 @@ async def marketplace_flea_agent_detail(
         entity=entity,
         is_owner=is_owner,
         is_admin=is_admin,
+        cover_image_url=cover_image_url,
     )
     return templates.TemplateResponse(
         request,

@@ -686,6 +686,22 @@ def _to_iso(value: Any) -> Optional[str]:
     return str(value)
 
 
+def entity_cover_url(entity: dict[str, Any]) -> str | None:
+    """Resolve a store entity's cover-photo URL, or ``None`` when it has none.
+
+    ``?v=<version_no>`` is the cache-busting fingerprint: ``version_no`` is a
+    monotonic counter (schema v37) bumped on every re-upload, so the URL
+    changes exactly when the underlying bytes change. Pairs with the
+    ``Cache-Control: public, max-age=2592000, immutable`` header served by
+    ``get_entity_photo`` below. Single source of truth for this scheme —
+    every caller that needs an entity's cover URL goes through here instead
+    of re-deriving it.
+    """
+    if not entity.get("photo_path"):
+        return None
+    return f"/api/store/entities/{entity['id']}/photo?v={entity.get('version_no', 1)}"
+
+
 def _resolve_owner_display(user_id: str) -> Optional[str]:
     # Backend-aware: owner rows live in the active backend (Postgres on a PG
     # instance), so resolve through the factory rather than a raw DuckDB conn.
@@ -777,15 +793,7 @@ def _entity_to_response(
     else:
         display = _resolve_owner_display(entity["owner_user_id"])
     is_author = bool(viewer_user_id) and viewer_user_id == entity.get("owner_user_id")
-    photo_url = (
-        # ``?v=`` cache-busting fingerprint via ``version_no`` (schema v37
-        # monotonic counter, bumps on every re-upload). Pairs with the
-        # ``Cache-Control: public, max-age=2592000, immutable`` header
-        # served by ``get_entity_photo``.
-        f"/api/store/entities/{entity['id']}/photo?v={entity.get('version_no', 1)}"
-        if entity.get("photo_path")
-        else None
-    )
+    photo_url = entity_cover_url(entity)
     return StoreEntityResponse(
         id=entity["id"],
         type=entity["type"],
