@@ -67,6 +67,31 @@ from app.resource_types import ResourceType
 # ---------------------------------------------------------------------------
 
 
+# ── Lifecycle-status gating ────────────────────────────────────────────────
+# The status picker makes two promises, and until v114 kept neither: `status`
+# drove a pill and a hero filter and nothing else, so a granted `draft`
+# package landed in the analyst's Library fully materialized and a
+# `coming-soon` one delivered parquets like any other row.
+#
+# Both promises are kept HERE rather than at each caller, because
+# `_fetch_entries` is the one chokepoint every analyst-facing read runs
+# through — `browse()`, `stack()`, the Principal (agent/co-session) path, and
+# therefore the pull manifest too, which `app/api/sync.py` builds out of
+# `resolver.stack`. Gating once is what makes the label true on every surface
+# at the same time; gating per caller is how they drifted apart before.
+#
+# `browse_admin()` deliberately opts out (`include_hidden=True`) — an admin
+# authors drafts and has to see them.
+
+#: "admin-only, hidden from analysts" — never reaches a non-admin surface.
+HIDDEN_STATUSES = frozenset({"draft"})
+
+#: "visible but not usable yet" — browsable, but never a local copy and never
+#: in the pull manifest. A different axis from HIDDEN_STATUSES: the entry is
+#: still returned by `browse()` so the card and its "Coming soon" pill render.
+UNDELIVERABLE_STATUSES = frozenset({"coming-soon"})
+
+
 @dataclass
 class ResourceEntry:
     """One row in the browse/stack response.
@@ -263,6 +288,10 @@ class StackResolver:
         if isinstance(user_id_or_principal, PRINCIPAL_TYPES):
             ids = user_id_or_principal.intersection.get(resource_type.value, frozenset())
             entries = self._fetch_entries(resource_type, set(ids), set(ids))
+            # A principal's intersection is derived from its owner's grants,
+            # so it inherits the same gate: an agent cannot reach a draft its
+            # owner cannot see, nor deliver one that is not usable yet.
+            entries = [e for e in entries if e.status not in UNDELIVERABLE_STATUSES]
             for e in entries:
                 e.in_stack = True
                 e.materialized = True
@@ -292,6 +321,10 @@ class StackResolver:
             # member is local, so the materialized flag below stays truthful.
             effective_ids = required_ids | materialized_ids
         entries = self._fetch_entries(resource_type, effective_ids, required_ids)
+        # `app/api/sync.py::_build_data_packages_section` builds the pull
+        # manifest from this method, so dropping the undeliverable statuses
+        # here is what stops a "coming soon" package shipping parquets.
+        entries = [e for e in entries if e.status not in UNDELIVERABLE_STATUSES]
         for e in entries:
             # In stack() every entry is by definition in_stack=True.
             e.in_stack = True
@@ -320,6 +353,11 @@ class StackResolver:
             # (in_stack=False) — the pre-redesign add-to-stack affordance.
             e.materialized = e.id in required_ids or e.id in subscribed_ids
             e.in_stack = True if auto else e.materialized
+            if e.status in UNDELIVERABLE_STATUSES:
+                # "Visible but not usable yet": the card renders with its
+                # Coming-soon pill, but there is no local copy to offer and
+                # stack() has already refused to put it in the manifest.
+                e.materialized = False
         return entries
 
     def browse_admin(self, user_id: str, resource_type: ResourceType) -> List[ResourceEntry]:
@@ -349,7 +387,9 @@ class StackResolver:
         groups = self._user_group_ids(user_id)
         required_ids, available_ids = self._grants(groups, resource_type)
         subscribed_ids = self._subscribed_ids(user_id, resource_type)
-        entries = self._fetch_entries(resource_type, all_ids, required_ids)
+        # Admins author drafts, so their own Browse is the one surface that
+        # must still show them (see HIDDEN_STATUSES).
+        entries = self._fetch_entries(resource_type, all_ids, required_ids, include_hidden=True)
         from app.instance_config import get_stack_auto_membership
 
         auto = get_stack_auto_membership()
@@ -464,7 +504,14 @@ class StackResolver:
         resource_type: ResourceType,
         ids: set,
         required_ids: set,
+        include_hidden: bool = False,
     ) -> List[ResourceEntry]:
+        """Rows for *ids*, gated by lifecycle status.
+
+        ``include_hidden`` is the admin escape hatch (see HIDDEN_STATUSES);
+        it defaults to False so a new caller fails CLOSED — a surface that
+        forgets to think about drafts hides them rather than leaking them.
+        """
         if not ids:
             return []
         # v51: status + category. Memory Domains have status but no category
@@ -482,6 +529,12 @@ class StackResolver:
             rows = [r for r in self._memory_domains_repo().list(limit=100000) if r["id"] in ids]
         else:
             raise ValueError(f"StackResolver does not support resource_type={resource_type!r}")
+
+        # Drop `draft` unless the caller is the admin surface. Applied to the
+        # raw rows, before any enrichment, so there is exactly one place a
+        # hidden status can escape from.
+        if not include_hidden:
+            rows = [r for r in rows if (r.get("status") or "prod") not in HIDDEN_STATUSES]
 
         from datetime import datetime, timedelta, timezone as _tz
         import json as _json
