@@ -7176,6 +7176,22 @@ async def admin_package_detail(
     except Exception as e:  # noqa: BLE001
         logger.warning("package detail: could not compute delivery state: %s", e)
 
+    # A lifecycle status can VETO everything the counts above just said. Since
+    # v114 `draft` really is hidden from analysts and `coming-soon` really is
+    # undeliverable (app/services/stack_resolver.py), so "3 people get this
+    # automatically" is true of the grants and false of the world. The page
+    # has to say which, or it re-tells the lie the gate was added to end.
+    from app.services.stack_resolver import HIDDEN_STATUSES, UNDELIVERABLE_STATUSES
+
+    _pkg_status = (pkg.get("status") or "prod").strip()
+    if _pkg_status in HIDDEN_STATUSES:
+        delivery["withheld"] = "hidden"
+    elif _pkg_status in UNDELIVERABLE_STATUSES:
+        delivery["withheld"] = "undeliverable"
+    else:
+        delivery["withheld"] = None
+    delivery["withheld_status"] = _pkg_status if delivery["withheld"] else None
+
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
     preview_ctx = _simulate_preview_ctx(request)
 

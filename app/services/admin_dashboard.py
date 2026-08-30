@@ -223,6 +223,7 @@ def _plural(n: int, one: str, many: str) -> str:
 def _area_data() -> dict:
     """Sources, registered tables, packages, and the tables that reach nobody."""
     from src.repositories import (
+        connection_secrets_repo,
         data_packages_repo,
         source_connections_repo,
         table_registry_repo,
@@ -234,8 +235,31 @@ def _area_data() -> dict:
     packaged: set[str] = set()
     for ids in member_ids.values():
         packaged.update(ids)
+    # A connection with neither a vault secret nor a `token_env` naming one
+    # cannot read a single table. Counting rows called that "connected" — the
+    # chain's first link was the only one with no integrity term, so a failed
+    # token validation still ticked the step and the wizard went on to say
+    # "already connected, no token to paste again".
+    #
+    # `has_secret` is derived exactly as app/api/admin_source_connections.py
+    # derives it for the source card, so the card and the checklist cannot
+    # disagree about whether a connection works. Failing to read the vault is
+    # treated as "cannot prove it works" rather than as healthy: this counter
+    # only ever suppresses a green tick, so erring toward the warning is safe.
+    connections = source_connections_repo().list()
+    secrets = connection_secrets_repo()
+
+    def _can_read(row: dict) -> bool:
+        if (row.get("token_env") or "").strip():
+            return True
+        try:
+            return bool(secrets.has(row["id"]))
+        except Exception:  # noqa: BLE001
+            return False
+
     return {
-        "sources": len(source_connections_repo().list()),
+        "sources": len(connections),
+        "sources_unhealthy": sum(1 for c in connections if not _can_read(c)),
         "tables": len(tables),
         "packages": len(packages_repo.list()),
         "packages_with_tables": sum(1 for ids in member_ids.values() if ids),
@@ -370,13 +394,19 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
     unpackaged = d.get("unpackaged", 0)
     uncovered = p.get("uncovered", 0)
     unshared = a.get("unshared", 0)
+    unhealthy_sources = d.get("sources_unhealthy", 0)
 
     steps = [
         _step(
             "connect",
             "Connect a source",
             area=data,
-            done=bool(d.get("sources")) or bool(d.get("tables")),
+            # `done` used to be `sources or tables` — a bare existence check,
+            # and the only link in the chain without an integrity term beside
+            # it. A connection whose token failed validation is a row, so the
+            # step went green while nothing could be read; a hand-registered
+            # table ticked it with no connection at all. Both now fail.
+            done=bool(d.get("sources")) and not d.get("sources_unhealthy"),
             detail=(
                 f"{d.get('sources', 0)} {_plural(d.get('sources', 0), 'source is', 'sources are')} connected."
                 if d.get("sources")
@@ -387,6 +417,22 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
                 "One connection can carry hundreds of tables, and you can add more sources later."
             ),
             facts=[{"n": d.get("sources", 0), "label": _plural(d.get("sources", 0), "source", "sources")}],
+            # The fourth integrity term, beside `unpackaged`, `uncovered` and
+            # `unshared`. Only speaks once a source exists: with none at all
+            # the step is "not started", which is not a fault to report.
+            health=(
+                {
+                    "level": "warn",
+                    "text": (
+                        f"{unhealthy_sources} "
+                        f"{_plural(unhealthy_sources, 'source has', 'sources have')} no credential — "
+                        f"{_plural(unhealthy_sources, 'it', 'they')} cannot read any table"
+                    ),
+                    "href": "/admin/data-sources",
+                }
+                if unhealthy_sources
+                else ({"level": "ok", "text": "Every source has a credential."} if d.get("sources") else None)
+            ),
             href="/admin/data-sources?add=1",
             cta="Connect a source",
             done_cta="Add another source",
@@ -535,7 +581,7 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
     # step whose completion an admin cannot tick by visiting a page — "did my
     # change actually reach anyone?" is the question the product could not
     # answer at all before.
-    chain_ok = all(s["done"] for s in steps) and not (unpackaged or uncovered or unshared)
+    chain_ok = all(s["done"] for s in steps) and not (unhealthy_sources or unpackaged or uncovered or unshared)
     reach = min(p.get("covered", 0), p.get("people", 0))
     steps.append(
         _step(
