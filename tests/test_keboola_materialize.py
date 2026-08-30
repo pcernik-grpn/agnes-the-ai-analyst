@@ -226,7 +226,7 @@ def test_materialize_query_parquet_sliced_merges_via_duckdb(tmp_path):
             "file_type": "parquet",
         }
 
-    def fake_download_slices(file_info, dest_dir, *, table_id=None):
+    def fake_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         s1, s2 = dest_dir / "slice-00000", dest_dir / "slice-00001"
@@ -403,7 +403,7 @@ def test_materialize_query_sliced_parquet_tempdir_cleaned_on_exception(tmp_path)
             "file_type": "parquet",
         }
 
-    def boom_download_slices(file_info, dest_dir, *, table_id=None):
+    def boom_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         # Capture the tempdir the extractor created (parent of dest_dir).
         captured_tmpdir["path"] = Path(dest_dir).parent
         # Simulate a real download writing partial state, then disk full.
@@ -463,7 +463,7 @@ def test_materialize_query_warns_on_survived_scratch_when_exception_raised(tmp_p
             "file_type": "parquet",
         }
 
-    def boom_download_slices(file_info, dest_dir, *, table_id=None):
+    def boom_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         raise OSError(28, "No space left on device")
 
     client = MagicMock()
@@ -896,7 +896,7 @@ def test_sliced_consolidation_bounds_writer_row_groups(tmp_path, small_row_group
             "file_type": "parquet",
         }
 
-    def fake_download_slices(file_info, dest_dir, *, table_id=None):
+    def fake_download_slices(file_info, dest_dir, *, table_id=None, export_filter=None):
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         paths = []

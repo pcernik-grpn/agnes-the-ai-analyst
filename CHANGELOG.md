@@ -1055,19 +1055,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 - **A Keboola table that is empty upstream no longer reports as a failed
-  sync.** A sliced export of a table with no rows comes back as a manifest
-  with zero entries, and both sliced download paths treated that as an
-  unconditional error — so a table that is simply empty (a form-fields table
-  with no attachments, say) stayed permanently red and looked exactly like a
-  broken extraction. The table detail's `rowsCount` now separates the two
-  states: `rowsCount == 0` writes an empty export carrying the table's
-  declared columns (a header-only CSV / a zero-row parquet), so the sync
-  succeeds with 0 rows and the downstream view still resolves its columns;
-  `rowsCount > 0` still fails, now saying plainly that upstream claims N rows
-  while the export returned no slices. When `rowsCount` cannot be read at all
-  — no table id to ask about, the detail call failed, the field is absent —
-  the pre-existing error stands: unknown must never present itself as
-  empty.
+  sync — and a lost sliced export no longer reports as a clean one.** A
+  sliced export of a table with no rows comes back as a manifest with zero
+  entries. The Storage API client's two sliced download paths treated that
+  as an unconditional error, so a table that is simply empty (a form-fields
+  table with no attachments, say) stayed permanently red and looked exactly
+  like a broken extraction; the legacy client's own third consumer had the
+  opposite failure, reporting any entries-less manifest as a clean 0-row
+  export. All three now share one decision. Empty and successful: the export
+  carries the table's declared columns (a header-only CSV / a zero-row
+  parquet, honouring a `columns` projection when one was requested), so the
+  sync succeeds with 0 rows and the downstream view still resolves its
+  columns — either because upstream's `rowsCount` is 0, or because the
+  export carried a row filter (`whereFilters` / `changedSince` /
+  `changedUntil` / `limit`), which may legitimately match nothing on a table
+  that has rows. Otherwise an error: `rowsCount > 0` on an unfiltered export
+  now says plainly that upstream claims N rows while the export returned no
+  slices. **Contract change on the legacy client:** when `rowsCount` cannot
+  be read at all — no table id to ask about, the detail call failed, the
+  field is absent — that path now fails where it used to report 0 rows
+  successfully. Unknown must never present itself as empty.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
