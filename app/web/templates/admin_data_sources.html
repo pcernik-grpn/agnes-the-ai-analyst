@@ -1986,7 +1986,7 @@ function _pipelineStripHtml(row) {
     const semTone = !sem.token ? "is-warn" : (sem.metrics || sem.terms) ? "is-ok" : "is-warn";
     cells.push(`
       <a class="ds-pipe__cell" href="/admin/semantic-layer">
-        <span class="ds-pipe__k">Semantic layer</span>
+        <span class="ds-pipe__k">Semantic layer health</span>
         <span class="ds-pipe__v ${semTone}">${semText}</span>
       </a>`);
   }

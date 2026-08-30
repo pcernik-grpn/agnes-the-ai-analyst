@@ -459,8 +459,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (`/catalog/semantics` — the flat projection), **Semantic layer health**
   (`/admin/semantic-layer`, also the admin-nav tab) and **Semantic sources**
   (`/admin/semantic-sources`, unchanged); every link label pointing at them —
-  on the Library's Definitions block, the two admin pages, and the browse
-  pages themselves — now says the target's name. URLs are unchanged, so
+  on the two admin pages, the data-source card's pipeline strip, and the
+  browse pages themselves — now says the target's name. URLs are unchanged, so
   existing links and bookmarks keep working. The health page's "browse" link
   also stopped disagreeing with its neighbour: it opened the metric/glossary
   projection while `/admin/semantic-sources` pointed at the documents — it

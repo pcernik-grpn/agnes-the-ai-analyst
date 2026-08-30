@@ -456,10 +456,9 @@
 
 {% block content %}
 {# ── Back link ───────────────────────────────────────────────────────────
-   This page is reached from a link (the Library's Definitions block, the
-   Catalog's Metrics &amp; glossary card, a chat citation, global search) but is not
-   itself a nav destination in either chrome — so without this the only way
-   out was the browser's Back button. `detail_back` resolves it per layout:
+   This page is reached from a link (the Library's Definitions block, a chat
+   citation, global search) but is not itself a nav destination in either
+   chrome — so without this the only way out was the browser's Back button. `detail_back` resolves it per layout:
    topnav keeps /catalog (the entry it links from, and the nav item its own
    /catalog/* path highlights); rail has no key for this kind and falls
    through to /library, which is both the rail's one browse surface and the

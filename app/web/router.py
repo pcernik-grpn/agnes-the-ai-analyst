@@ -7383,7 +7383,7 @@ def _source_inventory(user: dict | None = None) -> dict:
     different table and the client would otherwise need four more round-trips
     per card. The strip is what makes a source card answer "is this project
     healthy AND is anyone getting its data", which previously took four pages
-    (Data sources, Tables, Sync, Semantic layer) to assemble by hand.
+    (Data sources, Tables, Sync, Semantic layer health) to assemble by hand.
 
     Per-connector by construction rather than a fixed four: the semantic cell
     is Keboola-only (the Metastore is a Keboola API) and the cost cell is
