@@ -451,6 +451,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
 ### Changed
+- **Each semantic-layer page has a name of its own (#1707).** Three of the four
+  rendered the identical title "Semantic layer", so a browser tab, a bookmark
+  or a history entry could not tell them apart, and a link's label routinely
+  disagreed with its target's name. They are now **Semantic models**
+  (`/semantic-layer` — the stored documents), **Metrics & glossary**
+  (`/catalog/semantics` — the flat projection), **Semantic layer health**
+  (`/admin/semantic-layer`, also the admin-nav tab) and **Semantic sources**
+  (`/admin/semantic-sources`, unchanged); every link label pointing at them —
+  on the two admin pages, the data-source card's pipeline strip, and the
+  browse pages themselves — now says the target's name. URLs are unchanged, so
+  existing links and bookmarks keep working. The health page's "browse" link
+  also stopped disagreeing with its neighbour: it opened the metric/glossary
+  projection while `/admin/semantic-sources` pointed at the documents — it
+  now points at **Semantic models**, which is what it reports on.
 - **The semantic layer is two CLI groups instead of five.** `agnes
   semantic-model`, `agnes admin semantic-model`, `agnes admin semantic-source`,
   `agnes admin semantic-layer` and `agnes admin data-semantics` all read as

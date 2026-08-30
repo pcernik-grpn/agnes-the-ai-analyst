@@ -1,6 +1,6 @@
 {% extends "base_page.html" %}
 
-{% block title %}{{ model_name }} — Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <style>
@@ -66,10 +66,10 @@
 {% endblock %}
 
 {% block page_prehead %}
-<a class="slb-back" href="/semantic-layer">&larr; Semantic layer</a>
+<a class="slb-back" href="/semantic-layer">&larr; Semantic models</a>
 {% endblock %}
 
-{% set page_hero_eyebrow = "Semantic layer" %}
+{% set page_hero_eyebrow = "Semantic models" %}
 {% set page_hero_title = model_name %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = model_description %}

@@ -1,5 +1,11 @@
 {% extends "base_admin_page.html" %}
-{% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# NAME: "Semantic layer health" — the question this page answers (is what
+   was imported complete and healthy), not the layer itself. Plain "Semantic
+   layer" was worn by three pages at once. The h1 stays the SECTION name
+   ("Data", below) per tests/test_web_admin_page_pattern.py; the page name
+   lives in the <title> and in the admin-nav tab (app/web/admin_nav.py).
+   Guarded by tests/test_semantic_page_names_contract.py. #}
+{% block title %}Semantic layer health — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {# Section-level and PLAIN, matching /admin/data-sources: the h1 names the
    section, the tab strip below names the lens (Sources · Tables · Packages ·
@@ -165,7 +171,12 @@
       {% endif %}
     </span>
     <span class="apg-strip__end">
-      <a href="/catalog/semantics">Browse the layer →</a>
+      {# This page reports on the stored DOCUMENTS, so its door opens the
+         documents — the same target /admin/semantic-sources links to. It
+         used to point at /catalog/semantics (the flat metric/glossary
+         projection) while its neighbour pointed here, so two adjacent admin
+         pages disagreed about where "the layer" was. #}
+      <a href="/semantic-layer">Semantic models →</a>
       <button type="button" class="btn btn-primary" id="sl-refresh-btn">Sync now</button>
     </span>
   </div>
@@ -180,7 +191,7 @@
     <span class="apg-strip__end"><a href="/admin/ontology">Ontology builder →</a></span>
   </div>
 
-  <div class="sl-lenses">{{ ds.tabs(items=lens_tabs, aria_label='Semantic layer lens') }}</div>
+  <div class="sl-lenses">{{ ds.tabs(items=lens_tabs, aria_label='Semantic layer health lens') }}</div>
 
   {% if active_tab == 'coverage' %}
   <section id="sl-coverage">

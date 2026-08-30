@@ -1997,13 +1997,13 @@ function _pipelineStripHtml(row) {
     if (!sem.token && !row.derived) {
       cells.push(`
         <button type="button" class="ds-pipe__cell" onclick="toggleMasterToken('${row.id}')">
-          <span class="ds-pipe__k">Semantic layer</span>
+          <span class="ds-pipe__k">Semantic layer health</span>
           <span class="ds-pipe__v ${semTone}">${semText}</span>
         </button>`);
     } else {
       cells.push(`
         <a class="ds-pipe__cell" href="/admin/semantic-layer">
-          <span class="ds-pipe__k">Semantic layer</span>
+          <span class="ds-pipe__k">Semantic layer health</span>
           <span class="ds-pipe__v ${semTone}">${semText}</span>
         </a>`);
     }
