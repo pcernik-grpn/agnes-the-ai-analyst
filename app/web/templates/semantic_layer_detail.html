@@ -206,7 +206,7 @@
             {% endfor %}
         </tbody>
     </table>
-    {% elif q %}
+    {% elif q.strip() and counts.datasets %}
     {{ state.panel('nothing_found', 'No datasets match “' ~ q ~ '”.') }}
     {% else %}
     {{ state.panel('empty', 'No datasets.') }}
@@ -233,7 +233,7 @@
             {% endfor %}
         </tbody>
     </table>
-    {% elif q %}
+    {% elif q.strip() and counts.metrics %}
     {{ state.panel('nothing_found', 'No metrics match “' ~ q ~ '”.') }}
     {% else %}
     {{ state.panel('empty', 'No metrics.') }}
@@ -262,7 +262,7 @@
         </tbody>
     </table>
     <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
-    {% elif q %}
+    {% elif q.strip() and counts.constraints %}
     {{ state.panel('nothing_found', 'No constraints match “' ~ q ~ '”.') }}
     {% else %}
     {{ state.panel('empty', 'No constraints.') }}
@@ -285,7 +285,7 @@
             {% endfor %}
         </tbody>
     </table>
-    {% elif q %}
+    {% elif q.strip() and counts.relationships %}
     {{ state.panel('nothing_found', 'No relationships match “' ~ q ~ '”.') }}
     {% else %}
     {{ state.panel('empty', 'No relationships.') }}
@@ -307,7 +307,7 @@
             {% endfor %}
         </tbody>
     </table>
-    {% elif q %}
+    {% elif q.strip() and counts.glossary %}
     {{ state.panel('nothing_found', 'No glossary terms match “' ~ q ~ '”.') }}
     {% else %}
     {{ state.panel('empty', 'No glossary terms.') }}

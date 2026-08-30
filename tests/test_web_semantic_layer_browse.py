@@ -17,6 +17,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from src.db import get_system_db
 
 _SLUG = "retail"
@@ -256,6 +258,29 @@ class TestModelList:
         r = c.get("/semantic-layer", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
         assert "retail" not in r.text
+
+    def test_empty_list_offers_a_creation_cta_only_to_an_admin(self, seeded_app):
+        """A3 follow-up (issue #1707): the empty-list panel's primary CTA must
+        be a path that can actually succeed (spec §3, "never a CTA that
+        can't succeed") — only an admin can act on "no semantic model
+        available" (import/register a source), so only an admin gets the
+        primary CTA; anyone else gets the neutral ask-an-admin copy and the
+        `Metrics & glossary` cross-link stays a plain body link either way,
+        never the CTA itself (it can just as easily be empty)."""
+        c = seeded_app["client"]
+        admin_r = c.get("/semantic-layer", headers=_auth(seeded_app["admin_token"]))
+        assert admin_r.status_code == 200
+        assert 'href="/admin/semantic-sources"' in admin_r.text
+        assert "Add a semantic source" in admin_r.text
+        assert 'href="/catalog/semantics"' in admin_r.text
+
+        # A non-admin with nothing readable sees the same empty panel, but
+        # the primary CTA (an admin-only action) is absent.
+        no_grant_r = c.get("/semantic-layer", headers=_auth(seeded_app["analyst_token"]))
+        assert no_grant_r.status_code == 200
+        assert 'href="/admin/semantic-sources"' not in no_grant_r.text
+        assert "Add a semantic source" not in no_grant_r.text
+        assert 'href="/catalog/semantics"' in no_grant_r.text
 
     def test_non_admin_with_a_direct_grant_sees_the_model(self, seeded_app):
         row = _seed_model()
@@ -574,29 +599,71 @@ class TestModelDetail:
         assert "alpha_ds" in r.text
         assert "beta_ds" not in r.text
 
-    def test_filtered_no_match_renders_nothing_found_not_empty(self, seeded_app):
-        """A3 (issue #1707): a `q` that matches nothing is a filter collapse,
-        not a genuinely empty collection — the exact distinction the shared
-        `state.panel` vocabulary exists to keep visible. Must render
-        `nothing_found`, never `empty`, with the filter value itself part of
-        the copy (the removable chip above the table also carries it)."""
+    @pytest.mark.parametrize("tab", ["datasets", "metrics", "constraints", "relationships", "glossary"])
+    def test_filtered_no_match_renders_nothing_found_not_empty(self, seeded_app, tab):
+        """A3 (issue #1707): a `q` that matches nothing IN A NON-EMPTY
+        collection is a filter collapse, not a genuinely empty collection —
+        the exact distinction the shared `state.panel` vocabulary exists to
+        keep visible. Must render `nothing_found`, never `empty`, with the
+        filter value itself part of the copy (the removable chip above the
+        table also carries it). `_seed_model()` carries one row of every
+        object type, so every tab's universe is non-empty here."""
         _seed_model()
         c = seeded_app["client"]
         r = c.get(
-            f"/semantic-layer/{_SLUG}?tab=datasets&q=no_such_dataset_at_all",
+            f"/semantic-layer/{_SLUG}?tab={tab}&q=no_such_thing_at_all",
             headers=_auth(seeded_app["admin_token"]),
         )
         assert r.status_code == 200
         assert 'data-state-kind="nothing_found"' in r.text
         assert 'data-state-kind="empty"' not in r.text
-        assert "no_such_dataset_at_all" in r.text
+        assert "no_such_thing_at_all" in r.text
 
-    def test_unfiltered_empty_collection_renders_empty_not_nothing_found(self, seeded_app):
+    @pytest.mark.parametrize("tab", ["datasets", "metrics", "constraints", "relationships", "glossary"])
+    def test_unfiltered_empty_collection_renders_empty_not_nothing_found(self, seeded_app, tab):
         """A3 (issue #1707): a tab with no `q` and zero rows is the collection
         itself being empty, never a filter collapse. Must render `empty`."""
-        _seed_document("blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": []}]})
+        _seed_document(
+            "blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": [], "relationships": []}]}
+        )
         c = seeded_app["client"]
-        r = c.get("/semantic-layer/blank?tab=datasets", headers=_auth(seeded_app["admin_token"]))
+        r = c.get(f"/semantic-layer/blank?tab={tab}", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-state-kind="empty"' in r.text
+        assert 'data-state-kind="nothing_found"' not in r.text
+
+    def test_empty_collection_with_a_nonblank_filter_still_renders_empty(self, seeded_app):
+        """A3 follow-up (issue #1707): NOTHING_FOUND is defined as zero matches
+        out of a NON-EMPTY universe. A `q` present against an ALREADY-empty
+        collection (zero datasets regardless of any filter) must still render
+        `empty`, not `nothing_found` — the filter isn't what's to blame here,
+        the collection is. Guards the `counts.<type>` half of the predicate."""
+        _seed_document(
+            "blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": [], "relationships": []}]}
+        )
+        c = seeded_app["client"]
+        r = c.get(
+            "/semantic-layer/blank?tab=datasets&q=anything",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert 'data-state-kind="empty"' in r.text
+        assert 'data-state-kind="nothing_found"' not in r.text
+
+    def test_whitespace_only_filter_on_empty_collection_still_renders_empty(self, seeded_app):
+        """A3 follow-up (issue #1707): the router only filters on `q.strip()`
+        (a whitespace-only `q` filters nothing), but the template used to
+        branch on the raw, unstripped `q` — so a whitespace `q` against an
+        empty collection rendered `nothing_found` naming a "filter" that
+        never actually ran. Guards the `q.strip()` half of the predicate."""
+        _seed_document(
+            "blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": [], "relationships": []}]}
+        )
+        c = seeded_app["client"]
+        r = c.get(
+            "/semantic-layer/blank?tab=datasets&q=%20%20%20",
+            headers=_auth(seeded_app["admin_token"]),
+        )
         assert r.status_code == 200
         assert 'data-state-kind="empty"' in r.text
         assert 'data-state-kind="nothing_found"' not in r.text

@@ -498,11 +498,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   panels) rendered every zero-row case with the same legacy `.empty-state`
   markup, collapsing exactly the distinction the shared `state.panel(kind,
   …)` vocabulary exists to keep visible: a dataset/metric/constraint/
-  relationship/glossary tab filtered by `q` down to zero rows now renders the
-  `nothing_found` panel (naming the filter), while a genuinely empty
-  collection — no model available, no fields declared, no expression
-  declared — renders `empty`. Markup only; no behavior change to what is
-  filtered or counted.
+  relationship/glossary tab with a non-blank `q` filtered down to zero rows
+  out of an otherwise non-empty collection now renders the `nothing_found`
+  panel (naming the filter), while a genuinely empty collection — zero rows
+  regardless of `q`, a blank/whitespace-only `q`, no model available, no
+  fields declared, no expression declared — renders `empty`. The
+  `/semantic-layer` empty panel's CTA also changed: it used to link
+  "Metrics & glossary", a related but equally-likely-empty page; the primary
+  CTA is now an admin-only "Add a semantic source" pointing at
+  `/admin/semantic-sources` (a path that can actually resolve the state), the
+  "Metrics & glossary" link demoted to plain body text, and a non-admin sees
+  no primary CTA at all, only the neutral ask-an-admin copy.
 - **Each semantic-layer page has a name of its own (#1707).** Three of the four
   rendered the identical title "Semantic layer", so a browser tab, a bookmark
   or a history entry could not tell them apart, and a link's label routinely
