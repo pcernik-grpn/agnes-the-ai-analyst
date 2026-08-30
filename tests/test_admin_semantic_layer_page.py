@@ -642,6 +642,7 @@ class TestTheHealthTabReportsSilentlyEmptySources:
         assert scoped_line, section
         assert all("innerHTML" not in line for line in section.splitlines())
 
+
 class TestTheHealthTabReportsSkippedSources:
     """The page twin of the CLI section: `hlRender` filtered `sources` on
     `error` and `ok`+0 only, so a source the sweep permanently SKIPS (its
