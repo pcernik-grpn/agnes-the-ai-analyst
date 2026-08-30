@@ -123,36 +123,75 @@ def get_last_refresh_summary() -> dict[str, Any]:
     }
 
 
+#: `last_sync_status` values that mean the source was actually IMPORTED
+#: from — the only ones the fallback may speak for. `record_sync` also
+#: stamps `last_sync_at` for a `'skipped'` row (the duplicate-upstream skip
+#: below), which never ran an import: counting one would let a source that
+#: has never been read set the "last source sync" time, i.e. the same
+#: over-claim this fallback exists to remove.
+_ATTEMPTED_SYNC_STATUSES = frozenset({"ok", "error"})
+
+
 def _as_iso(value: Any) -> str | None:
     """One comparable, renderable form for a `last_sync_at` off either
     backend — DuckDB hands back a naive datetime, Postgres a tz-aware one,
-    and a raw string is tolerated. Within one backend the format is uniform,
-    so max() over these sorts chronologically."""
+    and a raw string is tolerated.
+
+    Normalized to second precision HERE, before the max() below, so what is
+    compared is exactly what is rendered: microseconds are noise in a status
+    strip, and trimming after the comparison could print a stamp that was
+    never the one selected. Within one backend the format stays uniform, so
+    max() over these still sorts chronologically.
+    """
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return value.strip() or None
     if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+        return value.isoformat(timespec="seconds")
     return None
 
 
-def _last_source_sync() -> tuple[str | None, int]:
-    """The durable fallback: `max(last_sync_at)` across `semantic_sources`,
-    plus how many rows have ever synced at all.
+def _no_fallback(*, unavailable: bool = False) -> dict[str, Any]:
+    return {"last_sync_at": None, "synced_count": 0, "source_count": 0, "unavailable": unavailable}
+
+
+def _last_source_sync() -> dict[str, Any]:
+    """The durable fallback: `max(last_sync_at)` across the `semantic_sources`
+    rows that have actually been imported from, how many those are, and how
+    many are registered in total.
 
     Read-time derivation over state each row already carries — no new table,
     no schema change, and `list_all()` exists on both halves of the pair, so
-    a DuckDB instance answers this exactly as a Postgres one does. Degrades
-    to "nothing to report" rather than 500-ing the page it decorates.
+    a DuckDB instance answers this exactly as a Postgres one does.
+
+    A read that fails reports `unavailable`, NOT an empty result: rendering
+    "never synced" because the sources could not be read would be a claim
+    about history made from a failure to read it — the very shape of bug this
+    function exists to fix. Either way it degrades rather than 500-ing the
+    page it decorates.
     """
     try:
         sources = semantic_source_repo().list_all()
     except Exception as exc:  # noqa: BLE001 - a status strip must not break the page
         logger.warning("semantic sources refresh: could not read the sources' last sync: %s", exc)
-        return None, 0
-    stamps = [iso for iso in (_as_iso(source.get("last_sync_at")) for source in sources) if iso]
-    if not stamps:
-        return None, 0
-    return max(stamps), len(stamps)
+        return _no_fallback(unavailable=True)
+    stamps = [
+        iso
+        for iso in (
+            _as_iso(source.get("last_sync_at"))
+            for source in sources
+            if (source.get("last_sync_status") or "") in _ATTEMPTED_SYNC_STATUSES
+        )
+        if iso
+    ]
+    return {
+        "last_sync_at": max(stamps) if stamps else None,
+        "synced_count": len(stamps),
+        "source_count": len(sources),
+        "unavailable": False,
+    }
 
 
 def get_sync_status_summary() -> dict[str, Any]:
@@ -164,26 +203,29 @@ def get_sync_status_summary() -> dict[str, Any]:
     about history made from a fact about this process — while
     /admin/semantic-sources listed the same sources synced hours earlier.
 
-    Three states, and the label moves with the meaning:
+    Four states, and the label moves with the meaning:
 
     * a sweep ran in this process — render it, it is the richer view
-      (counts, per-source results);
-    * no sweep here, but sources carry a `last_sync_at` — report THAT, and
+      (counts, per-source results), whether it succeeded or failed;
+    * no sweep here, but sources have been imported from — report THAT, and
       say what it is: the last sync of any source, not a sweep;
-    * neither — nothing has ever synced, and only there is the old sentence
-      true.
+    * no sweep here and the sources cannot be read — say the status is
+      unavailable, never that nothing synced;
+    * none of the above — nothing has ever synced, and only there is the old
+      sentence true.
     """
     summary = get_last_refresh_summary()
-    fallback_at: str | None = None
-    fallback_count = 0
     # Only when there is no sweep to show: the richer in-memory view always
     # wins, and this way the common path costs no query.
-    if summary["last_status"] is None:
-        fallback_at, fallback_count = _last_source_sync()
+    fallback = _last_source_sync() if summary["last_status"] is None else _no_fallback()
     return {
         **summary,
-        "fallback_last_sync_at": fallback_at,
-        "fallback_source_count": fallback_count,
+        "fallback_last_sync_at": fallback["last_sync_at"],
+        # How many sources that time speaks for, out of how many exist — "2"
+        # alone reads as the total when it is a subset.
+        "fallback_synced_count": fallback["synced_count"],
+        "fallback_source_count": fallback["source_count"],
+        "fallback_unavailable": fallback["unavailable"],
     }
 
 

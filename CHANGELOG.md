@@ -1060,9 +1060,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   started") — so every redeploy emptied it and turned a fact about the
   process into a false claim about history. The strip now falls back to what
   the `semantic_sources` rows already carry durably, and labels it as the
-  different claim it is: "Last source sync <time> across N sources — no sweep
-  since this instance restarted". A sweep that ran in this process still wins
-  (it is the richer view), and "Never synced yet." survives for the one case
+  different claim it is: "Last source sync <time> across N of M sources — no
+  sweep since this instance restarted". A sweep that ran in this process still
+  wins, succeeded or failed (it is the richer view); a source that was only
+  *skipped* is excluded, since nothing was ever imported from it; sources that
+  cannot be read report "Sync status unavailable." rather than a history claim
+  made from a failed read; and "Never synced yet." survives for the one case
   where it is true — nothing, anywhere, has ever synced. Derived at read time
   from `max(last_sync_at)` through the existing repository factory, so no new
   table and no schema change, and a DuckDB instance reports it exactly as a
