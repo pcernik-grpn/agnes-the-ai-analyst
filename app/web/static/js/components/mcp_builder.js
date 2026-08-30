@@ -339,8 +339,19 @@
             read_only: (t && typeof t.read_only === 'boolean') ? t.read_only : null,
           };
         });
+        /* Read-only tools arrive ON; anything that can change data upstream
+           arrives OFF and has to be chosen.
+
+           Every tool used to arrive on, under a section that says "Turn off
+           anything agents should not call" — so the sentence described a
+           review nobody performs and the default did the opposite. The grant
+           below is source-wide, and on a real instance the realistic group is
+           Everyone, which made the fast path hand every user's agents every
+           destructive tool the server offers. An unannotated tool counts as a
+           write here for the same reason it registers as mutating: the server
+           saying nothing is not the server saying it is safe. */
         draft.enabled = {};
-        draft.tools.forEach(function (t) { draft.enabled[t.name] = true; });
+        draft.tools.forEach(function (t) { draft.enabled[t.name] = t.read_only === true; });
         draft.introspected = true;
         // Nothing to call it yet? The host is the honest first guess, and the
         // admin is standing right here to correct it.
@@ -528,6 +539,22 @@
         saving = false;
         render();
       });
+  }
+
+  /* What pressing the primary will actually do, on the primary.
+
+     It said "Register source" while the act was "register, and let every
+     agent these groups' members build call these tools" — the widest thing
+     the page does, named nowhere in the moment of doing it. The counts come
+     from the same two selections the button commits, so it cannot describe a
+     different registration than the one it performs. */
+  function registerLabel() {
+    var tools = enabledTools();
+    if (!draft.groups.length || !tools.length) return 'Register source';
+    var writes = tools.filter(function (t) { return t.read_only !== true; }).length;
+    var who = draft.groups.length === 1 ? draft.groups[0].name : draft.groups.length + ' groups';
+    return 'Register and give ' + who + ' ' + tools.length + ' tool' + (tools.length === 1 ? '' : 's') +
+      (writes ? ' (' + writes + ' can write)' : '');
   }
 
   function save() {
@@ -945,8 +972,11 @@
       sec({
         key: 'tools', no: 3, title: 'Tools', note: 'what it exposes',
         collapsed: !!collapsed.tools,
-        sub: 'What the server actually offers, read from the server itself. Tools marked "writes" can change data ' +
-             'upstream — a tool the server does not vouch for counts as one. Turn off anything agents should not call.',
+        sub: editing
+          ? 'What this source exposes. Tools marked "writes" can change data upstream — a tool the server ' +
+            'does not vouch for counts as one.'
+          : 'What the server actually offers, read from the server itself. Read-only tools are on; anything ' +
+            'that can change data upstream is off until you turn it on.',
         summary: toolSummary(),
         body: toolsBody(),
       }) +
@@ -1026,7 +1056,7 @@
             (saving ? ' disabled' : '') + '>' + (saving ? 'Sharing…' : 'Done') + '</button>'
           : '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
             (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Saving…') + '"') + '>' +
-            (saving ? 'Registering…' : 'Register source') + '</button>',
+            (saving ? 'Registering…' : esc(registerLabel())) + '</button>',
       }) +
       window.BuilderShell.workspace({
         left: leftHtml(),
