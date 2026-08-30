@@ -26,9 +26,23 @@ import time
 import uuid
 
 
+import pytest
+
 from tests.perf_policy import PERF_CEILING_FACTOR, check_perf
 
 from src.db import get_system_db
+
+# pytest.ini's global 60 s timeout is sized for ordinary tests; these two seed
+# 1000 users x 50 groups x 200 packages x 800 grants and 100 packages x 20
+# tables before they measure anything, and the SEEDING is what has repeatedly
+# blown the limit on a contended CI runner — not the thing under test. When it
+# fires, pytest-timeout reports "Timeout (>60.0s)", which reads as a
+# performance regression and sends the next reader to the wrong place; the
+# actual assertions are already flake-tolerant by design (see the module
+# docstring: `check_perf` warns at the target and only fails at a multiple of
+# it). Locally the whole file is under 8 s, so this ceiling is a hang detector,
+# not a budget.
+pytestmark = pytest.mark.timeout(300)
 
 
 # ---------------------------------------------------------------------------
