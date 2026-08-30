@@ -7226,6 +7226,15 @@ async def admin_package_detail(
         delivery["withheld"] = None
     delivery["withheld_status"] = _pkg_status if delivery["withheld"] else None
 
+    # A second veto, and the one the audit caught: the panel reported
+    # "N has not pulled since — shared, not yet delivered" while the manifest
+    # was empty, because the manifest is built from `sync_state`
+    # (app/api/sync.py) and no table in the package had ever synced. There
+    # was nothing to pull, so blaming the analyst for not pulling is exactly
+    # backwards. The real blocker rendered as a grey "never synced" fact in
+    # the sidebar while the loud strips were reserved for other states.
+    delivery["nothing_to_deliver"] = bool(member_ids) and newest_sync is None
+
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
     preview_ctx = _simulate_preview_ctx(request)
     # The group lens's equivalent. Both are chrome: at most one is set, and

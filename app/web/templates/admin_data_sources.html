@@ -991,7 +991,9 @@
       Set <code>AGNES_VAULT_KEY</code> on the server to add data sources here — storage tokens
       are stored in the encrypted server vault. Generate one with:
       <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code>
-      then add <code>AGNES_VAULT_KEY=&lt;value&gt;</code> to your <code>.env</code>.
+      then add <code>AGNES_VAULT_KEY=&lt;value&gt;</code> to your <code>.env</code>
+      and <strong>restart the server</strong> — the key is read at startup, so
+      nothing changes here until it is.
     </div>
   </div>
   {% endif %}
@@ -1352,6 +1354,15 @@
             <p>Upload documents (PDF, Markdown, CSV, …) into a <strong>Collection</strong> in the
                <a href="/library">Library</a> — {{ instance_brand or 'Agnes' }} ingests them per file and analysts search them with citations.
                A Collection is honest about being a snapshot: when the content changes, a person re-uploads.</p>
+            {# A CSV or spreadsheet is the exception, and the pane used to
+               bury it: `src/ingest/tabular.py` registers an uploaded tabular
+               file as a real queryable table, so an instance with no
+               warehouse behind it is NOT tableless — which is exactly the
+               conclusion an admin drew from the heading above. #}
+            <p><strong>A CSV or Excel file is also a table.</strong> Upload one to a Collection and
+               {{ instance_brand or 'Agnes' }} registers it as a queryable table you can bundle into a
+               data package and share, the same as a warehouse table — so an instance with no
+               warehouse behind it still has tables.</p>
             <p>If the file is an <em>export of a live system</em>, that system is the source — connect it
                (Keboola or BigQuery) and let a data package carry the tables, or the copy starts drifting
                the moment it lands. The trade-offs: <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/admin/collections-vs-data-packages.md" rel="noopener">Collections vs. data packages</a>.</p>
@@ -5491,7 +5502,21 @@ document.addEventListener("keydown", function (e) {
 // "already connected" shortcut, and racing it hid the strip on exactly the
 // entry path that needs it most.
 loadConnections().then(() => {
-  if (new URLSearchParams(window.location.search).has("add")) openWizard();
+  // Honour the same precondition as `#ds-add-btn`, which is `disabled` when
+  // no vault key is configured. This deep link is the Overview checklist's
+  // CTA, and it opened the wizard unconditionally — so an admin on an
+  // instance that cannot store a secret filled in the whole form behind a
+  // banner that had already told them it would fail, and the attempt left a
+  // credential-less connection row behind.
+  if (new URLSearchParams(window.location.search).has("add")) {
+    const addBtn = document.getElementById("ds-add-btn");
+    if (addBtn && addBtn.disabled) {
+      const strip = document.querySelector(".apg-strip--warn[role='alert']");
+      if (strip) strip.scrollIntoView({ block: "center", behavior: "smooth" });
+    } else {
+      openWizard();
+    }
+  }
 });
 </script>
 

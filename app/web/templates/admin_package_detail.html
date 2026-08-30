@@ -936,6 +936,15 @@
         lines.push(['none',
           `<b>${optCount}</b> group${optCount === 1 ? " can" : "s can"} add it themselves.`]);
       }
+    } else if (DELIVERY.nothing_to_deliver) {
+      // Nothing in this package has ever synced, so there is nothing on the
+      // server for anyone to pull. Reporting "not yet delivered" here blamed
+      // the analyst for the server's state; the fix the admin needs is on
+      // the source, not on the person.
+      lines.push(['stale',
+        `Nothing to deliver yet — <b>no table in this package has ever synced</b>. Grants are in place; the data is not.`]);
+      lines.push(['none',
+        `<a href="/admin/sync">Check the sync →</a>`]);
     } else if (DELIVERY.withheld) {
       // A lifecycle status overrides the grant arithmetic. `draft` is hidden
       // from analysts and `coming-soon` is undeliverable (both enforced in
