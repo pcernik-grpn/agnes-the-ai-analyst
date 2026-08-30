@@ -30,12 +30,15 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 removes the row, leaves any
                                                                 already-created collection
                                                                 alone.
-  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the flat
-                                                                ``{source_scope_id: collection_id}``
-                                                                mapping ``ship_to_agnes.py
-                                                                --corpus-map`` consumes. Per-scope
-                                                                ``anonymize`` is NOT in this shape
-                                                                (kept flat/backward-compatible) —
+  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the
+                                                                ``{"<site>"|"<site>/<folder path>":
+                                                                collection_id}`` mapping
+                                                                ``ship_to_agnes.py --corpus-map``
+                                                                consumes, in the producer
+                                                                resolver's own key shape. 409
+                                                                ``corpus_map_ambiguous`` rather
+                                                                than a best-guess map. Per-scope
+                                                                ``anonymize`` is NOT in this shape —
                                                                 a producer that needs it reads the
                                                                 sibling ``GET .../scopes`` endpoint
                                                                 instead (each row already carries
