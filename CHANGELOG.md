@@ -1054,6 +1054,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **Semantic layer browse: the constraint Severity tooltip is now a fast
+  `[data-tip]`, not a native `title=` (#1707, A7).** `/semantic-layer/{slug}
+  ?tab=constraints`'s `<th>Severity</th>` and the constraint object page's
+  severity badge carried a 257-character explanation in `title=` — a
+  600ms+ OS-controlled show delay, no styling, and prone to clipping in a
+  scrollable ancestor. Both now use the shared `[data-tip]` mechanism, paired
+  with `aria-label` carrying the same text (never `title` alongside it, and
+  never `role="note"` on a `<th>` — that would override its implicit
+  `columnheader` role), with a single-sentence summary that also corrects the
+  original wording: an error-severity violation is a *missing filter in the
+  query*, not a *missing rule* on the constraint, and — soft-enforce — it
+  only flips `validate-query`'s verdict, it never blocks anything. The fuller
+  nuance (only `required_filter` is statically checkable today, so any other
+  type is advisory regardless of severity) moved to a short note under the
+  table/panel instead.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
