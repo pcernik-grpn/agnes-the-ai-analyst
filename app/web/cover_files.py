@@ -17,10 +17,18 @@ Design constraints:
 - The width branch re-derives containment from ``lookup_path`` even though
   Starlette's own lookup already enforces it — defense-in-depth, matching
   the pattern in src/marketplace_asset_mirror.py's ``_write_body``.
+- The ``?w=`` branch only ever runs for GET/HEAD, and any lookup error
+  (permission, overlong filename) is left for ``super().get_response()`` to
+  map to its normal 401/404 — it must not silently turn into a 200 or a
+  raw 500 that a plain request to the same path wouldn't produce.
+- 304 parity for the variant path is done through the base class's own
+  public ``is_not_modified`` / ``NotModifiedResponse`` — the same technique
+  ``StaticFiles.file_response`` itself uses, not a private attribute reach.
 """
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 from typing import Final
@@ -28,7 +36,8 @@ from urllib.parse import parse_qs
 
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
-from starlette.staticfiles import StaticFiles
+from starlette.datastructures import Headers
+from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import Scope
 
 from src.images.variants import ALLOWED_WIDTHS, coerce_width, variant_path
@@ -57,21 +66,48 @@ class CoverFiles(StaticFiles):
         headers middleware, so only Cache-Control is set here.
         """
         width = _parse_width(scope.get("query_string", b""))
-        if width in ALLOWED_WIDTHS:
-            full_path, stat_result = await run_in_threadpool(self.lookup_path, path)
-            if stat_result is not None and stat.S_ISREG(stat_result.st_mode) and self.directory is not None:
-                try:
-                    Path(full_path).resolve().relative_to(Path(self.directory).resolve())
-                except ValueError:
-                    pass
-                else:
-                    variant = await run_in_threadpool(variant_path, Path(full_path), width)
-                    if variant is not None:
-                        response = FileResponse(variant, media_type="image/webp")
-                        response.headers["cache-control"] = COVER_CACHE_CONTROL
-                        return response
+        if width in ALLOWED_WIDTHS and scope["method"] in ("GET", "HEAD"):
+            variant_response = await self._variant_response(path, scope, width)
+            if variant_response is not None:
+                return variant_response
 
         response = await super().get_response(path, scope)
         if response.status_code in (200, 304):
             response.headers["cache-control"] = COVER_CACHE_CONTROL
+        return response
+
+    async def _variant_response(self, path: str, scope: Scope, width: int) -> Response | None:
+        """Serve the resized ``?w=`` variant for ``path``, or ``None`` to
+        fall back to the normal (unresized) handling in ``get_response``.
+
+        ``None`` covers both "no variant to serve" (unlisted width already
+        filtered by the caller, source narrower than ``width``, animated,
+        corrupt) and "the lookup itself failed" -- the latter is deliberately
+        left unhandled here so ``super().get_response()``'s own retry raises
+        the same 401/404 a plain request without ``?w=`` would get, instead
+        of this branch inventing a different status for it.
+        """
+        try:
+            full_path, stat_result = await run_in_threadpool(self.lookup_path, path)
+        except OSError:
+            # Covers PermissionError too (a subclass). Same error
+            # super().get_response()'s own retry below will hit and map to
+            # its normal 401/404 -- don't duplicate that mapping here.
+            return None
+        if stat_result is None or not stat.S_ISREG(stat_result.st_mode) or self.directory is None:
+            return None
+        try:
+            Path(full_path).resolve().relative_to(Path(self.directory).resolve())
+        except ValueError:
+            return None
+
+        variant = await run_in_threadpool(variant_path, Path(full_path), width)
+        if variant is None:
+            return None
+
+        variant_stat = await run_in_threadpool(os.stat, variant)
+        response: Response = FileResponse(variant, media_type="image/webp", stat_result=variant_stat)
+        if self.is_not_modified(response.headers, Headers(scope=scope)):
+            response = NotModifiedResponse(response.headers)
+        response.headers["cache-control"] = COVER_CACHE_CONTROL
         return response

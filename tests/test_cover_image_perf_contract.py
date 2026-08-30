@@ -37,11 +37,12 @@ from __future__ import annotations
 import io
 import os
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
 
-from src.images.variants import variant_path
+from src.images.variants import MAX_SOURCE_BYTES, variant_path
 
 
 def _auth(token: str) -> dict:
@@ -49,17 +50,20 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+@lru_cache(maxsize=1)
 def _noise_png() -> bytes:
     """A 1500x800 random-noise PNG — incompressible, lands at ~3-4 MB, under
     the 5 MiB source cap so the resize path (not the size guard) is exercised.
+
+    Cached so building it (encoding ~3-4 MB of incompressible noise) is paid
+    once per test run, by whichever test needs it first, rather than at
+    collection time -- a collection-only run (``pytest --collect-only``,
+    ``-k`` filtering everything else out) pays nothing.
     """
     im = Image.frombytes("RGB", (1500, 800), os.urandom(1500 * 800 * 3))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return buf.getvalue()
-
-
-_NOISE_PNG = _noise_png()
 
 
 def _flea_skill_zip() -> bytes:
@@ -101,6 +105,17 @@ def test_variant_path_uses_post_transpose_dimensions(tmp_path):
         assert out.width == 480
 
 
+def test_variant_path_rejects_oversized_source(tmp_path):
+    """The disk-fill / CPU guard actually gets exercised: a source over
+    ``MAX_SOURCE_BYTES`` must never produce a variant, regardless of its
+    (declared or actual) image dimensions -- the size check runs before any
+    decode is attempted."""
+    oversized = tmp_path / "oversized.bin"
+    oversized.write_bytes(os.urandom(MAX_SOURCE_BYTES + 1))
+
+    assert variant_path(oversized, 480) is None
+
+
 # --- /api/store/entities/{id}/photo?w= -------------------------------------
 
 
@@ -113,7 +128,7 @@ def test_store_entity_photo_variant(seeded_app):
         headers=headers,
         files=[
             ("file", ("skill.zip", _flea_skill_zip(), "application/zip")),
-            ("photo", ("cover.png", _NOISE_PNG, "image/png")),
+            ("photo", ("cover.png", _noise_png(), "image/png")),
         ],
         data={
             "type": "skill",
@@ -131,17 +146,17 @@ def test_store_entity_photo_variant(seeded_app):
 
     r3 = client.get(f"/api/store/entities/{entity_id}/photo?w=1", headers=headers)
     assert r3.status_code == 200
-    assert r3.content == _NOISE_PNG
+    assert r3.content == _noise_png()
 
     # A non-integer or empty width must never 4xx -- it just serves the
     # original, same as any other unlisted width.
     r4 = client.get(f"/api/store/entities/{entity_id}/photo?w=abc", headers=headers)
     assert r4.status_code == 200
-    assert r4.content == _NOISE_PNG
+    assert r4.content == _noise_png()
 
     r5 = client.get(f"/api/store/entities/{entity_id}/photo?w=", headers=headers)
     assert r5.status_code == 200
-    assert r5.content == _NOISE_PNG
+    assert r5.content == _noise_png()
 
 
 # --- /api/marketplace/curated/{mp}/{plugin}/asset/{path}?w= ----------------
@@ -158,7 +173,7 @@ def test_curated_asset_variant(seeded_app):
     data_dir = Path(seeded_app["env"]["data_dir"])
     repo_root = data_dir / "marketplaces" / "cover-variant-mp"
     repo_root.mkdir(parents=True, exist_ok=True)
-    (repo_root / "cover.png").write_bytes(_NOISE_PNG)
+    (repo_root / "cover.png").write_bytes(_noise_png())
 
     client = seeded_app["client"]
     headers = _auth(seeded_app["admin_token"])
@@ -183,7 +198,7 @@ def test_curated_mirrored_variant(seeded_app):
     data_dir = Path(seeded_app["env"]["data_dir"])
     cache_root = data_dir / "marketplace-cache" / "cover-variant-mirrored-mp" / "demo"
     cache_root.mkdir(parents=True, exist_ok=True)
-    (cache_root / "cover.png").write_bytes(_NOISE_PNG)
+    (cache_root / "cover.png").write_bytes(_noise_png())
 
     client = seeded_app["client"]
     headers = _auth(seeded_app["admin_token"])
@@ -198,7 +213,7 @@ def test_curated_mirrored_variant(seeded_app):
 
     r2 = client.get(f"{url}?w=1", headers=headers)
     assert r2.status_code == 200
-    assert r2.content == _NOISE_PNG
+    assert r2.content == _noise_png()
 
     new_variants = set(variant_dir.glob("*-w480.webp")) - before
     assert len(new_variants) == 1
@@ -264,6 +279,29 @@ def test_stack_card_cover_external_url_has_no_srcset():
     assert "?w=" not in html
     assert "srcset=" not in html
     assert 'src="https://example.com/cover.png"' in html
+
+
+def test_stack_card_cover_protocol_relative_url_has_no_srcset():
+    """d4: a protocol-relative ``//host/...`` cover URL is external too --
+    the browser resolves it against a foreign host, so it must not be
+    treated as one of our own ``?w=``-capable serving routes."""
+    from app.web.router import templates
+
+    tmpl = templates.env.from_string('{% from "macros/_stack_card.html" import card %}{{ card(entry) }}')
+    html = tmpl.render(
+        entry={
+            "id": "p1",
+            "name": "Sales bundle",
+            "icon": "📦",
+            "color": "#fce7f3",
+            "requirement": "available",
+            "in_stack": False,
+            "cover_image_url": "//cdn.example.com/cover.png",
+        }
+    )
+    assert "?w=" not in html
+    assert "srcset=" not in html
+    assert 'src="//cdn.example.com/cover.png"' in html
 
 
 def test_catalog_package_hero_has_no_srcset_and_eager_high_priority(seeded_app):

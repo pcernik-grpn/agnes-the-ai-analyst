@@ -163,6 +163,57 @@ def test_upload_cover_variant_traversal_still_blocked(seeded_app_fresh):
     assert resp.status_code == 404
 
 
+def test_upload_cover_variant_post_still_405s(seeded_app_fresh):
+    """A ``?w=`` query string doesn't loosen the GET/HEAD-only StaticFiles
+    contract -- POST to a cover URL still 405s, same as without ``?w=``."""
+    app_data = seeded_app_fresh
+    client = app_data["client"]
+    files = {"file": ("noise.png", io.BytesIO(_NOISE_PNG), "image/png")}
+    upload = client.post(
+        "/api/admin/uploads/cover-image",
+        files=files,
+        headers=_auth(app_data["admin_token"]),
+    )
+    assert upload.status_code == 200
+    cover_url = upload.json()["url"]
+
+    resp = client.post(f"{cover_url}?w=480")
+    assert resp.status_code == 405
+
+
+def test_upload_cover_variant_overlong_filename_404s_not_500s(seeded_app_fresh):
+    """An overlong filename with ``?w=480`` 404s the same way the plain URL
+    does, instead of the lookup's raw OSError leaking out as a 500."""
+    client = seeded_app_fresh["client"]
+    overlong_name = "a" * 300 + ".png"
+    resp = client.get(f"/uploads/covers/{overlong_name}?w=480")
+    assert resp.status_code == 404
+
+
+def test_upload_cover_variant_conditional_get_304s(seeded_app_fresh):
+    """c6: a conditional GET (If-None-Match) against a ``?w=`` variant URL
+    gets a 304, matching the base StaticFiles behavior for the original."""
+    app_data = seeded_app_fresh
+    client = app_data["client"]
+    files = {"file": ("noise.png", io.BytesIO(_NOISE_PNG), "image/png")}
+    upload = client.post(
+        "/api/admin/uploads/cover-image",
+        files=files,
+        headers=_auth(app_data["admin_token"]),
+    )
+    assert upload.status_code == 200
+    cover_url = upload.json()["url"]
+
+    first = client.get(f"{cover_url}?w=480")
+    assert first.status_code == 200
+    etag = first.headers.get("etag")
+    assert etag
+
+    second = client.get(f"{cover_url}?w=480", headers={"If-None-Match": etag})
+    assert second.status_code == 304
+    assert "immutable" in second.headers.get("cache-control", "").lower()
+
+
 def test_upload_cover_variant_never_upscales(seeded_app_fresh):
     """c4: a source narrower than the requested width serves the original."""
     app_data = seeded_app_fresh

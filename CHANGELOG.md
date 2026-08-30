@@ -23,7 +23,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 - The marketplace item page no longer jumps when its content arrives.
 - Grid cover cards now ship a responsive srcset, so phones download a 480-px WebP instead of the full upload; page heroes fetch the 480-px variant directly (their fixed tile size never benefits from a larger one).
-- Marketplace plugin and item pages now render the hero cover with the page instead of after a follow-up request, so it starts loading immediately.
+- Flea marketplace plugin and item pages now render the hero cover with the page instead of after a follow-up request, so it starts loading immediately. (The curated shell routes still hydrate the cover via their RBAC-carrying XHR, unchanged.)
 - Cover images on package, memory-domain, marketplace and store pages now declare their size, decode off the main thread and lazy-load below the fold; page heroes are fetched at high priority.
 - Uploaded cover images are now served with a 30-day immutable cache
   header, so browsers stop re-validating every cover on every page load.

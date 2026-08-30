@@ -8,7 +8,7 @@ import os
 import secrets
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Final, Optional
 from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
@@ -228,18 +228,23 @@ def _store_display_name(name: str | None) -> str:
 templates.env.filters["store_display_name"] = _store_display_name
 
 
+_EXTERNAL_URL_PREFIXES: Final = ("http://", "https://", "//", "data:")
+
+
 def has_cover_variant(url: str) -> bool:
     """True when ``url`` is one of our serving routes and can take a ``?w=`` variant.
 
     Our own cover-serving routes (the ``/uploads`` static mount, the two
     curated-marketplace asset routes, the store entity-photo route) are
-    always emitted as relative paths, never absolute URLs — so any
-    absolute ``http(s)://`` URL is by definition an external cover with no
-    variant to request. Templates use this to skip emitting
+    always emitted as relative paths, never absolute or protocol-relative
+    URLs — so an ``http(s)://`` URL, a protocol-relative ``//host/...`` URL
+    (the browser resolves that against the page's own scheme, still a
+    foreign host), or a ``data:`` URL is by definition an external cover
+    with no variant to request. Templates use this to skip emitting
     ``srcset``/``sizes`` for those (a duplicated URL under two width
     descriptors would be a lying srcset).
     """
-    return not url.lower().startswith(("http://", "https://"))
+    return not url.lower().startswith(_EXTERNAL_URL_PREFIXES)
 
 
 def cover_variant_url(url: str, width: int) -> str:

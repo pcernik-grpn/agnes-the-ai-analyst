@@ -1091,7 +1091,10 @@
   // parsing needed (and none safe: cover_photo_url is often already
   // relative).
   function isMirroredCoverUrl(url) {
-    return !/^https?:\/\//i.test(url);
+    // Absolute (http/https), protocol-relative (//host/...), or data: URLs
+    // are external -- no ?w= variant to request. Mirrors has_cover_variant
+    // in app/web/router.py.
+    return !/^((https?:)?\/\/|data:)/i.test(url);
   }
   function coverW(url, w) {
     if (!isMirroredCoverUrl(url)) return url;
@@ -1261,10 +1264,12 @@
     coverImg.fetchPriority = 'high';
     coverImg.width = 480;
     coverImg.height = 240;
-    // No srcset: the hero tile renders at 108x62 CSS px (detail-page.css
-    // .detail-hero__icon--cover), 324 device px even at DPR 3, so the 480
-    // variant is the honest fetch up to DPR 4.4 — a srcset here only
-    // invited a DPR-3 phone to grab the 960 for zero visible gain.
+    // No srcset: the governing default renders the hero tile at 132x74 CSS
+    // px (macros/_detail.html .detail-hero__icon--cover), 396 device px
+    // even at DPR 3, so the 480 variant is the honest fetch up to DPR 3.6
+    // on its own (the paper theme narrows the tile further, to 108x62,
+    // detail-page.css) — a srcset here only invited a DPR-3 phone to grab
+    // the 960 for zero visible gain.
     coverImg.src = coverW(d.cover_photo_url, 480);
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
