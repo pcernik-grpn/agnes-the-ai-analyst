@@ -147,3 +147,61 @@ class TestRemoveSecret:
             )
         assert result.exit_code != 0
         assert "not found" in result.output
+
+
+class TestAStructuredErrorDetail:
+    """A16 (#1707): the refusal path answers `detail` as an object.
+
+    `_fail` json-dumped anything that was not a string, so the sentence the
+    server now composes reached the terminal as a JSON blob with an escaped
+    em-dash — and dragged the raw `upstream` wire text back in front of the
+    user, which is the thing the fix moved out of the message.
+    """
+
+    DETAIL = {
+        "error": "storage_api_error",
+        "message": "Keboola connection.example.com does not recognise this master token.",
+        "upstream": 'GET https://connection.example.com/v2/storage/tokens/verify -> HTTP 401: {"code": "x"}',
+    }
+
+    def test_the_message_is_printed_and_the_upstream_text_is_not(self):
+        with patch(
+            "cli.commands.admin_connection.api_put",
+            return_value=_resp(400, {"detail": self.DETAIL}),
+        ):
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--kind", "master"],
+                input="tok\n",
+            )
+        assert result.exit_code != 0
+        assert "does not recognise this master token" in result.output
+        assert "upstream" not in result.output
+        assert "tokens/verify" not in result.output
+        # Not a JSON blob: no quoted keys, no escaped punctuation.
+        assert '"message"' not in result.output
+
+    def test_a_detail_without_a_message_falls_back_to_the_error_code(self):
+        with patch(
+            "cli.commands.admin_connection.api_put",
+            return_value=_resp(400, {"detail": {"error": "connection_change_affects_registrations"}}),
+        ):
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN"],
+                input="tok\n",
+            )
+        assert result.exit_code != 0
+        assert "connection_change_affects_registrations" in result.output
+
+    def test_a_plain_string_detail_is_unchanged(self):
+        with patch(
+            "cli.commands.admin_connection.api_delete",
+            return_value=_resp(404, {"detail": "connection_not_found"}),
+        ):
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--remove"],
+            )
+        assert result.exit_code != 0
+        assert "connection_not_found" in result.output

@@ -1109,6 +1109,38 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **A Keboola token the stack refuses now says so in a sentence (#1707).**
+  Saving a semantic-layer (master/owner) token that the stack does not
+  recognise toasted the raw upstream error — the internal
+  `/v2/storage/tokens/verify` URL, `HTTP 401` and Keboola's JSON body down to
+  its `exceptionId` — which is all true and none of it the answer. A Keboola
+  token only exists on the stack that issued it, so a token refused outright
+  is expired, revoked, or from another stack; the message now says exactly
+  that and names the stack this connection is configured for. Covers both
+  token slots on `PUT /api/admin/source-connections/{id}/secret` (worded per
+  slot — the master token is the project owner's, the storage token is not)
+  **and the Test button**, `POST /api/admin/source-connections/{id}/test`,
+  which returned the same raw body from the same card while its
+  project-mismatch branch beside it already knew better. Recognised by
+  Keboola's own `storage.tokenInvalid` code, so a proxy that relays the
+  refusal under a status of its own does not defeat it — and, conversely, a
+  bare `401` carrying a proxy's own HTML error page is **not** translated,
+  because that page says nothing about the token. A refusal now always
+  answers `400`, whatever status carried it: `502` would tell the admin
+  "Agnes is broken" while the sentence beside it says "your token is wrong",
+  and only one of those can be acted on. The raw upstream text is not lost —
+  on `PUT .../secret` it moves to `detail.upstream`, out of the message, for
+  logs and bug reports; the admin page, `agnes admin connection secret` and
+  the server-side reporting path all render `detail.message` and never
+  `upstream`. `POST /api/admin/source-connections`'s `token_seed_error`
+  (the "import as managed connection" seeding step) consequently reports the
+  human sentence instead of the upstream text. Only a flat refusal is
+  translated: an outage, a 5xx or a network failure still reports what it
+  said, because there the upstream text IS the diagnosis. Unchanged: the
+  preflight itself, which already refused to store the token or badge it
+  "SET", and the project-mismatch message, which stays its own distinct
+  sentence — a mismatch is a token the stack knows perfectly well that opens
+  a different project, and it needs a different fix.
 - **The semantic-layer soft-enforce advisory now reaches the hybrid query
   endpoint and the web chat UI.** `POST /api/query/hybrid` — the one query
   path that joins BigQuery and local data — never called
