@@ -618,6 +618,80 @@
        Unlike the conversation region above, nothing is lost by its absence: the
        checklist is also reachable from the account menu's "Start over
        onboarding" and from the chat dashboard's "Set up {brand}" door. #}
+    {# TWO journeys share this one slot, and which one belongs here is decided
+       by whose steps can currently succeed.
+
+       They have ZERO steps in common — the analyst one (ask a question,
+       explore your Library, put knowledge in your stack…) and the admin chain
+       (connect a source, choose tables, bundle, invite, share, verify) — and
+       an earlier pass rendered both, producing two "of 6" counters with
+       different numerators on one screen. That was fixed on /chat alone, by
+       SUPPRESSING the analyst row for an admin mid-chain. Everywhere else
+       `admin_setup` is undefined, so the fix did not apply and an admin
+       standing on /admin/access read "Continue setup — 1 of 6" counting
+       *analyst* steps: a checklist for a job that is not theirs, on the very
+       pages where they are doing the one that is.
+
+       So the row now switches instead of hiding. While the chain is
+       unfinished the rail shows the chain, because until a source is
+       connected and shared the analyst steps CANNOT succeed — asking a first
+       question has nothing to answer from. The moment it completes, the admin
+       is also a user, those steps become true, and the row goes back to the
+       analyst journey on its own.
+
+       The admin variant is fully SERVER-rendered — count, arc and steps — and
+       carries its own ids on purpose. The analyst row renders its count empty
+       and its arc at zero length because /api/chat/journey has not resolved
+       yet, and chat_onboarding.js fills them in; the chain needs no fetch, so
+       rendering it blank first would invent a flash that has no cause. The
+       distinct ids are what keep that script off it: every lookup there is
+       guarded (`if (count)`, `if (ringFill)`), so it finds nothing and leaves
+       this row alone rather than writing analyst numbers over admin ones. #}
+    {% set _setup_chain = admin_setup_rail() if session.user.is_admin and dev_preview != 'member' else None %}
+    {% if _setup_chain and not _setup_chain.complete %}
+    {% set _pct = (_setup_chain.done / _setup_chain.total * 94.248) if _setup_chain.total else 0 %}
+    <div class="rail-getstarted rail-setupchain" id="railSetupChain">
+        <button type="button" class="rail-i rail-getstarted-btn"
+                id="rail-setupchain-toggle"
+                aria-expanded="false"
+                aria-controls="rail-setupchain-panel"
+                aria-label="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete"
+                title="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete">
+            <span class="rail-getstarted-ring" aria-hidden="true">
+                <svg viewBox="0 0 36 36" class="rail-getstarted-ring-svg">
+                    <circle class="rail-getstarted-ring-track" cx="18" cy="18" r="15"></circle>
+                    {# Same 2πr the script computes (r=15). Written here rather
+                       than left at zero because the number is already known. #}
+                    <circle class="rail-getstarted-ring-fill" cx="18" cy="18" r="15"
+                            style="stroke-dasharray: {{ '%.2f'|format(_pct) }} 94.248"></circle>
+                </svg>
+            </span>
+            <span class="rail-getstarted-body">
+                <span class="rail-getstarted-title">{% if _setup_chain.done %}Continue setup{% else %}Set up {{ instance_brand_short or 'Agnes' }}{% endif %}</span>
+                <span class="rail-getstarted-sub">{{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete</span>
+            </span>
+        </button>
+        <div class="rail-getstarted-panel" id="rail-setupchain-panel"
+             role="region" aria-label="Set up {{ instance_brand_short or 'Agnes' }}">
+          <ul class="rail-setupchain-list">
+            {% for st in _setup_chain.steps %}
+            {# A step whose own check RAISED is neither done nor safe to call
+               undone, so it says so and stays clickable — the page behind it
+               is where the failure is visible. Rendering it as an ordinary
+               open step would report a healthy chain built on a broken read. #}
+            <li class="rail-setupchain-step{% if st.done %} is-done{% endif %}{% if st.failed %} is-failed{% endif %}">
+              <a href="{{ st.href }}">
+                <span class="rail-setupchain-mark" aria-hidden="true">{% if st.done %}&#10003;{% elif st.failed %}!{% else %}&#8594;{% endif %}</span>
+                <span class="rail-setupchain-label">{{ st.label }}</span>
+                {% if st.failed %}<span class="rail-setupchain-note">could not check</span>{% endif %}
+              </a>
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+    </div>
+    {% endif %}
+
     {% if can_chat and not _admin_page %}
     {# Onboarding row — the last thing in the bottom zone, under Admin and
        directly above the profile; that zone's position/order is unchanged
@@ -652,18 +726,11 @@
        /api/chat/journey resolves, so without the resolved brand reaching the
        script a rebranded instance would show its own name for one frame and
        then have "Agnes" written over it. See `brandShort()` there. #}
-    {# Hidden for an admin whose instance is not set up yet. This row and the
-       hero card on /chat are two different six-step "setup" journeys with
-       ZERO shared steps — the analyst one (ask a question, explore your
-       Library, put knowledge in your stack…) and the admin chain (connect a
-       source, choose tables, bundle, invite, share, verify). Rendering both
-       put two "of 6" counters with different numerators on one screen, and
-       the one the front door drove was the one that never mentions the
-       admin's actual job.
-       `admin_setup` is only defined on /chat and only for an admin, so a
-       non-admin — and every other page — is unaffected: the row renders
-       exactly as before. It comes back on its own once the chain completes. #}
-    {% if not (admin_setup and not admin_setup.complete) %}
+    {# The analyst row. `admin_setup` (defined only on /chat, only for an
+       admin) still stands it down there; on every other page the chain row
+       above has already taken the slot, so this renders for a member always,
+       and for an admin once their chain is done. #}
+    {% if not (admin_setup and not admin_setup.complete) and not (_setup_chain and not _setup_chain.complete) %}
     <div class="rail-getstarted" id="railGetStarted"
          data-brand-short="{{ instance_brand_short or 'Agnes' }}">
         <button type="button" class="rail-i rail-getstarted-btn"

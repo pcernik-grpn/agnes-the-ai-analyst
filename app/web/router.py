@@ -322,6 +322,33 @@ def _data_apps_nav_enabled() -> bool:
         return False
 
 
+def _admin_setup_rail() -> object:
+    """The admin's setup chain for the rail, or None.
+
+    Registered as a Jinja global for the same reason as `data_apps_enabled`
+    above: `_app_rail.html` is shared by both context builders, and the chain
+    now has to reach EVERY page rather than only `/chat`. Threading it through
+    every route would have meant touching each one and forgetting the next.
+
+    The admin gate is the TEMPLATE's (`session.user.is_admin and dev_preview
+    != 'member'`), not this function's: the rail already holds that fact, and
+    the same expression is what decides the Admin badge two rows down, so
+    reading it in one place keeps a member-preview from showing the chain
+    while the badge beside it says member. This returns instance state — the
+    chain is identical for every admin — and None when it cannot be resolved,
+    which leaves the analyst row rendering exactly as before rather than a
+    chain claiming zero progress.
+    """
+    try:
+        from app.services.admin_dashboard import resolve_setup_rail
+
+        return resolve_setup_rail()
+    except Exception:
+        logger.warning("rail: admin setup chain unavailable", exc_info=True)
+        return None
+
+
+templates.env.globals["admin_setup_rail"] = _admin_setup_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
 
 

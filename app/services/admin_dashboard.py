@@ -148,13 +148,74 @@ def resolve_needs_fixing(*, force: bool = False) -> list[ResolvedSignal]:
         return _cache_value
 
 
+#: The setup chain is INSTANCE state, not per-user — every admin sees the same
+#: six steps at the same progress — so one memo serves them all. It exists
+#: because the chain moved from one page (`/chat`) to the rail, which renders
+#: on every page: six areas of repo reads per request, on every request, is a
+#: sitewide latency regression that would later be blamed on templates.
+_SETUP_RAIL_TTL_SECONDS = 30
+_setup_rail_lock = threading.Lock()
+_setup_rail_value: Optional[dict] = None
+_setup_rail_at: float = 0.0
+
+
+def resolve_setup_rail(*, force: bool = False) -> Optional[dict]:
+    """The chain as the rail needs it, memoised for `_SETUP_RAIL_TTL_SECONDS`.
+
+    Returns ``{"done", "total", "complete", "steps": [{label, done, failed,
+    href}]}`` or None when the whole build raised — the rail then renders the
+    analyst card exactly as it did before, which is the honest fallback for
+    "we could not check" and never a chain claiming zero progress.
+
+    A step whose own area raised is carried through as ``failed`` rather than
+    dropped or counted done: the reader needs to see that the check itself is
+    broken, not a chain that looks healthy because a read failed.
+    """
+    global _setup_rail_value, _setup_rail_at
+    now = time.monotonic()
+    with _setup_rail_lock:
+        if not force and _setup_rail_value is not None and (now - _setup_rail_at) < _SETUP_RAIL_TTL_SECONDS:
+            return _setup_rail_value
+        try:
+            setup = (resolve_journey() or {}).get("setup") or {}
+            if not setup.get("total"):
+                _setup_rail_value, _setup_rail_at = None, time.monotonic()
+                return None
+            _setup_rail_value = {
+                "done": setup.get("done_count") or 0,
+                "total": setup["total"],
+                "complete": bool(setup.get("complete")),
+                "steps": [
+                    {
+                        # `done_cta` is the verb for a finished step ("Add
+                        # another source"); the rail lists what the chain IS,
+                        # so it always shows the step's own name.
+                        "label": st.get("cta") or st.get("key") or "",
+                        "done": bool(st.get("done")),
+                        "failed": bool(st.get("failed")),
+                        "href": st.get("href") or "/admin",
+                    }
+                    for st in (setup.get("steps") or [])
+                ],
+            }
+            _setup_rail_at = time.monotonic()
+            return _setup_rail_value
+        except Exception:
+            logger.exception("setup rail: chain resolution failed")
+            _setup_rail_value, _setup_rail_at = None, time.monotonic()
+            return None
+
+
 def invalidate_cache() -> None:
     """Drop the Zone-2 cache. Used by tests, which must not inherit a rollup
     computed against a previous fixture's data."""
-    global _cache_value, _cache_at
+    global _cache_value, _cache_at, _setup_rail_value, _setup_rail_at
     with _cache_lock:
         _cache_value = None
         _cache_at = 0.0
+    with _setup_rail_lock:
+        _setup_rail_value = None
+        _setup_rail_at = 0.0
 
 
 def signal_keys() -> list[str]:
