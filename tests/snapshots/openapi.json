@@ -58176,7 +58176,7 @@
     },
     "/catalog/semantics": {
       "get": {
-        "description": "Read-only browser for the semantic layer \u2014 business metrics\n(`metric_definitions`) and the glossary (`glossary_terms`) in one page\n(issue #853 + the Keboola glossary import, #920).\n\nAnalyst-facing tier: ``get_current_user``, no admin gate and no\nper-resource grant \u2014 matches the RBAC tier of the underlying\n``GET /api/metrics`` / ``GET /api/glossary*`` endpoints this page reuses,\nand mirrors /catalog's own gate.\n\nMetrics are RBAC-filtered the same way ``GET /api/metrics`` is (#953):\na metric whose ``table_name``/``tables`` reference a table outside the\ncaller's Data Package stack is omitted before grouping, so a category\nleft with zero visible metrics never renders its header either. Glossary\nis intentionally NOT gated this way (business vocabulary, not data).\n\nMetrics are server-rendered (grouped by category, same reading order as\n``agnes catalog --metrics``) \u2014 the scale is tens-to-low-hundreds so a\nclient-side substring filter over the rendered rows is enough; no new\nsearch endpoint. Glossary starts empty and is populated client-side via\nthe existing ``GET /api/glossary`` / ``GET /api/glossary/search``.",
+        "description": "Retired page \u2014 a 308 onto the model list's \"All metrics\" tab (#1707 N5).\n\nAgnes shipped two pages over one semantic layer: this flat\n``metric_definitions`` / ``glossary_terms`` projection, and\n``/semantic-layer``'s stored documents. The split was never a distinction\na reader could make BEFORE arriving \u2014 \"metrics\" lived here, \"the model\nthose metrics came from\" lived there, and each page's way to the other\nwas one line of prose. The projection is now two tabs of the model list\n(``?tab=all_metrics`` / ``?tab=all_glossary``), rendered from the same two\ntables this page read.\n\nA 308 rather than a deletion, and a 308 rather than a 302: the method and\nbody must not be rewritten, and every bookmark, chat citation, skill\nreference and #1850 back link keeps landing. The redirect PRESERVES the\nquery string, which is what makes the old deep links survive \u2014 they carry\nthe filter term as ``?q=<name>`` and the tab as a ``#metrics`` fragment,\nand a fragment never reaches the server. So the tab is supplied here (the\nmetrics one, which is where every `q`-carrying link meant to go) and the\ncaller's own ``tab`` wins when they named one. The stale fragment rides\nalong untouched \u2014 the browser re-appends it \u2014 and the destination page\nreads it only to correct ``#glossary`` onto the glossary tab.\n\nStill behind ``get_current_user``: the destination is authenticated, and\nan anonymous 308 into it would only move the login bounce one hop later.",
         "operationId": "catalog_semantics_catalog_semantics_get",
         "parameters": [
           {
@@ -60936,9 +60936,29 @@
     },
     "/semantic-layer": {
       "get": {
-        "description": "Level 1 \u2014 every semantic model the caller can read, with its object\ncounts, SQL dialect(s) and validation status.\n\nA ``status='invalid'`` row still lists (an invalid import must be\nvisible, not silent) and renders its stored ``validation_errors``\ninstead of object counts, since an invalid document's ``document_json``\nmay be stale or absent.",
+        "description": "Level 1 \u2014 the semantic layer's front door, in three tabs.\n\n**Models** (default) \u2014 every semantic model the caller can read, with its\nobject counts, SQL dialect(s) and validation status. A ``status='invalid'``\nrow still lists (an invalid import must be visible, not silent) and renders\nits stored ``validation_errors`` instead of object counts, since an invalid\ndocument's ``document_json`` may be stale or absent.\n\n**All metrics** / **All glossary** \u2014 the flat ``metric_definitions`` and\n``glossary_terms`` projections, folded in from ``/catalog/semantics``\n(#1707 N5, which is now a 308 onto this page). They are the SAME two\ntables that page read, filtered by the SAME row predicate, and they hold\nrows no model card can show.\n\n``q`` is the deep link's filter term, carried in the query string because\nthe fragment the old links used (``#metrics``) never reaches the server.\nIt is applied client-side over the rendered rows, exactly as it was on the\nflat page \u2014 the scale is tens-to-low-hundreds and there is no search\nendpoint to add.\n\nONE ``_can_read_model`` sweep serves all three tabs (the #1850 memo): the\nmodel cards, the per-metric \"Open in the model\" links and the browse gate\nare three answers off one list. The check resolves a model's Data Packages\nper row, so a second sweep doubles the page's cost for an answer it has.",
         "operationId": "semantic_layer_list_semantic_layer_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "tab",
+            "required": false,
+            "schema": {
+              "default": "models",
+              "title": "Tab",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Q",
+              "type": "string"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",

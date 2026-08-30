@@ -548,7 +548,7 @@ def projected_metric_id(source: str, source_ref: Optional[str], model: dict, met
     every one of those parts may itself contain a ``/`` (a metric name, a
     Keboola-style source_ref), so splitting a stored id apart is ambiguous.
     Recomputing it from the document is not: the UI deep link
-    (``/catalog/semantics`` → ``/semantic-layer/{slug}/metric:{name}``) asks
+    (the All-metrics tab → ``/semantic-layer/{slug}/metric:{name}``) asks
     this function for the id it would expect and matches on equality, which
     keeps the link tied to the writer rather than to a parse of its output.
     """
@@ -754,7 +754,7 @@ def project_document(
             # into a runnable `SELECT ... FROM ...` (or a JOIN). The legacy
             # composer stored this alongside the composed `sql` as
             # `metric_definitions.expression`; kept here so the "Expression"
-            # block in catalog_semantics.html still has something to render.
+            # block on the model list's All-metrics tab still has something to render.
             fragment = sql
             table_id = _agnes_payload(metric).get("dataset") or ""
             if locally_runnable:

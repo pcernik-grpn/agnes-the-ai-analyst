@@ -267,14 +267,16 @@ class TestModelList:
         can't succeed") — only an admin can act on "no semantic model
         available" (import/register a source), so only an admin gets the
         primary CTA; anyone else gets the neutral ask-an-admin copy and the
-        `Metrics & glossary` cross-link stays a plain body link either way,
-        never the CTA itself (it can just as easily be empty)."""
+        `All metrics` cross-link stays a plain body link either way, never
+        the CTA itself (it can just as easily be empty). Since the fold
+        (#1707 N5) that cross-link is a TAB of this same page rather than a
+        separate one, but its role in the empty state is unchanged."""
         c = seeded_app["client"]
         admin_r = c.get("/semantic-layer", headers=_auth(seeded_app["admin_token"]))
         assert admin_r.status_code == 200
         assert 'href="/admin/semantic-sources"' in admin_r.text
         assert "Add a semantic source" in admin_r.text
-        assert 'href="/catalog/semantics"' in admin_r.text
+        assert 'href="/semantic-layer?tab=all_metrics"' in admin_r.text
 
         # A non-admin with nothing readable sees the same empty panel, but
         # the primary CTA (an admin-only action) is absent.
@@ -282,7 +284,7 @@ class TestModelList:
         assert no_grant_r.status_code == 200
         assert 'href="/admin/semantic-sources"' not in no_grant_r.text
         assert "Add a semantic source" not in no_grant_r.text
-        assert 'href="/catalog/semantics"' in no_grant_r.text
+        assert 'href="/semantic-layer?tab=all_metrics"' in no_grant_r.text
 
     def test_non_admin_with_a_direct_grant_sees_the_model(self, seeded_app):
         row = _seed_model()
@@ -1050,11 +1052,12 @@ class TestLibraryEntryPoint:
     guards against: a route is not a shipped page until something links to
     it. `/semantic-layer` is not a rail row (design-system.md's rail is
     fixed rows; a new content surface reaches the caller through an existing
-    destination) — the Library page's "Definitions" footer, which already
-    opens `/catalog/semantics`, is where it hangs, for both admin and
-    non-admin (this is a read-tier page, not admin-only) — but only when the
-    caller can actually read a model, so the link never dead-ends on the
-    "No semantic model available" empty state (Devin #1398)."""
+    destination) — the Library's own "Semantic models" section is where it
+    hangs, for both admin and non-admin (this is a read-tier page, not
+    admin-only). Each readable model is a ROW linking to its own detail page
+    (#1707 N3), so a caller who can read none is offered no model link at all
+    and never dead-ends on the "No semantic model available" empty state
+    (Devin #1398)."""
 
     def test_semantic_layer_linked_from_library_for_non_admin_with_a_grant(self, seeded_app):
         row = _seed_model()
@@ -1062,7 +1065,7 @@ class TestLibraryEntryPoint:
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer"' in r.text
+        assert 'href="/semantic-layer/retail"' in r.text
 
     def test_no_link_for_a_non_admin_who_can_read_no_model(self, seeded_app):
         """Devin #1398: the footer link is gated on readability, so a caller
@@ -1071,41 +1074,45 @@ class TestLibraryEntryPoint:
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer"' not in r.text
+        assert 'href="/semantic-layer/retail"' not in r.text
 
-    def test_browse_link_gated_independently_of_the_footer_rendering(self, seeded_app):
-        """Devin #1398 (template): the browse link is gated on
-        `has_semantic_models` alone, not on whether the footer renders. A
-        caller with visible metrics but no readable model gets the footer (the
-        metric link) WITHOUT the /semantic-layer link — the earlier negative
-        test passed only because the seeded instance had zero metrics."""
-        _seed_metric()  # a visible metric forces the footer to render
+    def test_model_links_gated_independently_of_the_definitions_rendering(self, seeded_app):
+        """Devin #1398 (template): the two are gated separately. A caller with
+        visible metrics but no readable model gets the section and its
+        registry links WITHOUT any model row — the earlier negative test
+        passed only because the seeded instance had zero metrics."""
+        _seed_metric()  # a visible metric forces the section to render
         _seed_model()  # a model exists, but this analyst has no grant on it
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
-        assert "/catalog/semantics#metrics" in r.text  # the footer did render
-        assert 'href="/semantic-layer"' not in r.text  # but not the browse link
+        assert "/semantic-layer?tab=all_metrics" in r.text  # the section did render
+        assert 'href="/semantic-layer/retail"' not in r.text  # but no model row
 
     def test_semantic_layer_linked_from_library_for_admin(self, seeded_app):
         _seed_model()
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer"' in r.text
+        assert 'href="/semantic-layer/retail"' in r.text
 
 
 class TestRegistryBackLink:
     """The other half of the #1707 N4 deep link: a metric object page points
-    back at the same metric's row in the flat registry (`/catalog/semantics`),
-    which carries the SQL Agnes composed, the synonyms and the source badge
-    this page does not show.
+    back at the same metric's row in the flat registry, which carries the SQL
+    Agnes composed, the synonyms and the source badge this page does not show.
+
+    The registry is the model list's "All metrics" tab since the fold (#1707
+    N5), so the link carries its term in the QUERY STRING (`?tab=all_metrics&
+    q=<name>`) rather than the old `?q=<name>#metrics` — a fragment never
+    reaches the server and so could never have chosen the tab. The old shape
+    still lands, through the 308 on `/catalog/semantics`.
 
     Offered only when the metric actually projected — a metric whose only
     expression is in an unusable dialect, or one the projector skipped, has no
     registry row to return to."""
 
-    _BACK = 'href="/catalog/semantics?q=revenue#metrics"'
+    _BACK = 'href="/semantic-layer?tab=all_metrics&amp;q=revenue"'
 
     def _seed_projected_metric(self) -> None:
         from src.repositories import metric_repo
@@ -1135,7 +1142,7 @@ class TestRegistryBackLink:
         _seed_model()
         r = self._object(seeded_app)
         assert r.status_code == 200, r.text
-        assert "/catalog/semantics?q=" not in r.text
+        assert "?tab=all_metrics&amp;q=" not in r.text
 
     def test_no_back_link_when_the_registry_row_is_rbac_hidden(self, seeded_app):
         """`/catalog/semantics` drops a metric whose table is outside the
@@ -1166,14 +1173,14 @@ class TestRegistryBackLink:
             headers=_auth(seeded_app["analyst_token"]),
         )
         assert r.status_code == 200, r.text
-        assert "/catalog/semantics?q=" not in r.text
+        assert "?tab=all_metrics&amp;q=" not in r.text
 
     def test_non_metric_object_carries_no_registry_link(self, seeded_app):
         _seed_model()
         self._seed_projected_metric()
         r = self._object(seeded_app, f"/semantic-layer/{_SLUG}/dataset:orders")
         assert r.status_code == 200, r.text
-        assert "/catalog/semantics?q=" not in r.text
+        assert "?tab=all_metrics&amp;q=" not in r.text
 
 
 class TestEmptyStateVocabulary:
@@ -1192,3 +1199,182 @@ class TestEmptyStateVocabulary:
             if "empty-state" in text:
                 offenders[path.name] = text.count("empty-state")
         assert not offenders, f"legacy .empty-state markup still present: {offenders}"
+
+
+class TestFlatProjectionTabsFold:
+    """N5 (issue #1707): the flat projection folds into the model list.
+
+    ``/catalog/semantics`` and ``/semantic-layer`` were two pages over one
+    semantic layer, and the split was not a distinction a reader could make
+    in advance: "metrics" lived on one, "the model those metrics came from"
+    on the other, and each page's way to the other was a single prose link.
+    The flat registry is now two more TABS of the model list — **All
+    metrics** and **All glossary** — and the old URL is a 308 so every
+    bookmark, chat citation and skill reference still lands.
+
+    The tabs read the SAME ``metric_definitions`` / ``glossary_terms``
+    projections the flat page read, which is why this is a fold and not a
+    deletion: those tables carry metrics from every writer, including ones
+    with no Ossie document behind them, and those rows exist on no model
+    card.
+    """
+
+    def _get(self, seeded_app, path: str, token: str = "admin_token", **kw):
+        return seeded_app["client"].get(path, headers=_auth(seeded_app[token]), **kw)
+
+    # ── The redirect ──────────────────────────────────────────────────────
+    def test_the_old_url_is_a_permanent_redirect_to_the_metrics_tab(self, seeded_app):
+        r = self._get(seeded_app, "/catalog/semantics", follow_redirects=False)
+        assert r.status_code == 308, r.text
+        assert r.headers["location"] == "/semantic-layer?tab=all_metrics"
+
+    def test_the_redirect_carries_the_deep_links_filter_term(self, seeded_app):
+        """#1850's back links are ``?q=<name>#metrics``. The fragment never
+        reaches the server, so the TAB has to ride the query string and ``q``
+        has to survive — otherwise the reader lands on an unfiltered list."""
+        r = self._get(seeded_app, "/catalog/semantics?q=revenue", follow_redirects=False)
+        assert r.status_code == 308
+        location = r.headers["location"]
+        assert "tab=all_metrics" in location
+        assert "q=revenue" in location
+
+    def test_an_explicit_tab_on_the_old_url_is_not_overwritten(self, seeded_app):
+        r = self._get(seeded_app, "/catalog/semantics?tab=all_glossary", follow_redirects=False)
+        assert r.status_code == 308
+        assert r.headers["location"] == "/semantic-layer?tab=all_glossary"
+
+    def test_following_the_redirect_lands_on_a_rendered_page(self, seeded_app):
+        _seed_metric("arr")
+        r = self._get(seeded_app, "/catalog/semantics")
+        assert r.status_code == 200
+        assert "ARR" in r.text
+
+    # ── The tabs ──────────────────────────────────────────────────────────
+    def test_models_is_the_default_tab(self, seeded_app):
+        _seed_model()
+        body = self._get(seeded_app, "/semantic-layer").text
+        assert 'href="/semantic-layer/retail"' in body
+
+    def test_unknown_tab_falls_back_to_the_model_cards(self, seeded_app):
+        _seed_model()
+        body = self._get(seeded_app, "/semantic-layer?tab=nonsense").text
+        assert 'href="/semantic-layer/retail"' in body
+
+    def test_every_tab_offers_the_way_back_to_the_others(self, seeded_app):
+        for tab in ("models", "all_metrics", "all_glossary"):
+            body = self._get(seeded_app, f"/semantic-layer?tab={tab}").text
+            assert "All metrics" in body, tab
+            assert "All glossary" in body, tab
+
+    def test_all_metrics_tab_lists_a_metric_with_no_document_behind_it(self, seeded_app):
+        """The reason this could not be a deletion: ``metric_definitions``
+        holds rows from every writer, and a hand-authored one appears on no
+        model card."""
+        _seed_metric("arr")
+        body = self._get(seeded_app, "/semantic-layer?tab=all_metrics").text
+        assert "ARR" in body
+        assert 'id="metrics-list"' in body
+
+    def test_all_glossary_tab_renders_the_glossary_panel(self, seeded_app):
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        assert 'id="glossary-list"' in body
+
+    def test_the_metrics_tab_consumes_the_deep_links_q(self, seeded_app):
+        _seed_metric("arr")
+        body = self._get(seeded_app, "/semantic-layer?tab=all_metrics&q=arr").text
+        assert "URLSearchParams(window.location.search).get('q')" in body
+
+    # ── RBAC — the SAME row predicate, never a wider one ──────────────────
+    def test_the_metrics_tab_applies_the_flat_pages_own_row_filter(self, seeded_app):
+        """``_first_inaccessible_table`` (#953), unchanged: a metric bound to
+        a table outside the caller's Data Package stack is dropped before the
+        page groups anything."""
+        from src.repositories import metric_repo, table_registry_repo
+
+        table_registry_repo().register(
+            id="orders_tbl",
+            name="orders_tbl",
+            description="test table",
+            source_type="keboola",
+            query_mode="materialized",
+        )
+        metric_repo().create(
+            id="gated",
+            name="gated_metric",
+            display_name="Gated metric",
+            category="revenue",
+            sql="SELECT 1 FROM orders_tbl",
+            table_name="orders_tbl",
+        )
+        assert "Gated metric" not in self._get(seeded_app, "/semantic-layer?tab=all_metrics", "analyst_token").text
+        assert "Gated metric" in self._get(seeded_app, "/semantic-layer?tab=all_metrics").text
+
+    def test_the_readable_model_sweep_runs_once_on_the_metrics_tab(self, seeded_app):
+        """The memo from #1850: the model cards, the browse gate and the
+        per-metric document links are three answers off ONE
+        ``_can_read_model`` sweep, not three."""
+        import app.api.semantic_models as semantic_models
+
+        _seed_model()
+        _seed_document("finance", _document_json("finance"))
+
+        real = semantic_models._can_read_model
+        seen: list[str] = []
+
+        def counting(user, row, conn):
+            seen.append(str(row.get("slug")))
+            return real(user, row, conn)
+
+        semantic_models._can_read_model = counting
+        try:
+            self._get(seeded_app, "/semantic-layer?tab=all_metrics")
+        finally:
+            semantic_models._can_read_model = real
+        assert len(seen) == 2, f"expected one sweep over the two models, got {len(seen)}: {seen}"
+
+
+class TestLibrarySemanticSection:
+    """N3 (issue #1707): the semantic layer is a NAMED Library section.
+
+    It used to be a footer aside below an unbounded list — the last thing on
+    the page, after every row, which is where a reader stops looking. It is
+    now one of the Library's own sections, in a fixed slot of the section
+    order, carrying the caller's readable models as rows and the two flat
+    projections as links into their tabs.
+    """
+
+    def test_the_section_is_named_and_carries_its_models_as_rows(self, seeded_app):
+        row = _seed_model()
+        _grant_model(row["id"])
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+        assert 'data-lib-sec="semantic_model"' in body
+        assert "Semantic models" in body
+        assert 'href="/semantic-layer/retail"' in body
+
+    def test_the_footer_aside_is_gone(self, seeded_app):
+        _seed_metric()
+        _seed_model()
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert 'class="lib-defs"' not in body, "the Definitions aside was promoted to a section"
+
+    def test_the_section_links_at_the_folded_tabs_not_the_old_url(self, seeded_app):
+        _seed_metric()
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert "/semantic-layer?tab=all_metrics" in body
+        assert "/semantic-layer?tab=all_glossary" in body
+        assert "/catalog/semantics" not in body
+
+    def test_a_model_the_caller_cannot_read_is_not_a_row(self, seeded_app):
+        _seed_model()  # no grant for this analyst
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+        assert 'href="/semantic-layer/retail"' not in body
+
+    def test_the_section_still_appears_with_definitions_but_no_readable_model(self, seeded_app):
+        """A caller with visible metrics but no readable document still needs
+        the door — the flat projection is what they can reach."""
+        _seed_metric()
+        _seed_model()
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+        assert "Semantic models" in body
+        assert "/semantic-layer?tab=all_metrics" in body
+        assert 'href="/semantic-layer/retail"' not in body

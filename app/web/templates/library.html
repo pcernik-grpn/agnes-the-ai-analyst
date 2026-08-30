@@ -45,6 +45,27 @@
         >{{ sec.soon }}</span>{% endif %}
 </button>
 {% endmacro %}
+{# ── The two flat projections, on the Semantic models band ────────────────────
+   The organization's agreed vocabulary — every metric and glossary term — is
+   NOT inventory: nobody owns, shares, installs or drops a definition, so as a
+   row it would have to blank Owner, Sharing, Access and Actions at once, and
+   four special-cased columns is the table saying the object is not one of its
+   rows. The stored DOCUMENTS are rows (they have a source, a grant and a
+   detail page); their flat projection is a destination, so it rides the
+   section's band as two links into the tabs that hold it.
+
+   `data-defs-search` is read by the block's own script below: the page's
+   search box narrows the list, and when a query matches a metric or term the
+   band says so — the only one-step term lookup the rail chrome has (it renders
+   no global search box, by design). #}
+{% macro defs_links(defs) %}
+{% if defs %}
+<div class="lib-defs__links" id="lib-defs" data-defs-search="{{ defs.search }}">
+  <a class="lib-defs__link" href="/semantic-layer?tab=all_metrics">{{ defs.metric_count }} metric{{ '' if defs.metric_count == 1 else 's' }} &rarr;</a>
+  <a class="lib-defs__link" href="/semantic-layer?tab=all_glossary">{{ defs.glossary_count }} glossary term{{ '' if defs.glossary_count == 1 else 's' }} &rarr;</a>
+</div>
+{% endif %}
+{% endmacro %}
 {# ── More is coming ───────────────────────────────────────────────────────────
    A note beside the ITEM COUNT, not a banner above the list. Three homes so
    far, and each move was a correction of what the note was actually saying:
@@ -1490,72 +1511,60 @@
   .lib-empty h3 { margin: 0 0 6px; color: var(--ds-text-primary); font-size: 15px; }
   .lib-empty .cc-btn { margin-top: 12px; }
 
-  /* ── Definitions footer ────────────────────────────────────────────────
-     An adjacent destination under the inventory, not a band of it. Styled
-     unlike anything in the list on purpose: no card fill, no border box, just
-     a hairline above it and a roomy row — a place the page ENDS on rather
-     than a thing that could be mistaken for another kind you own. (It also
-     avoids the notice vocabulary, which says "read this, nothing
-     to do"; this block is somewhere to GO.) */
-  .lib-defs {
-    display: flex;
-    align-items: flex-start;
-    gap: 14px;
-    margin: 28px 0 8px;
-    padding: 20px 4px 4px;
-    border-top: 1px solid var(--ds-border);
-  }
-  .lib-defs__icon {
-    flex: none;
-    display: grid;
-    place-items: center;
-    width: 34px;
-    height: 34px;
-    border-radius: 9px;
-    color: var(--ds-kind-data);
-    background: var(--ds-kind-data-soft);
-  }
-  .lib-defs__icon svg { width: 19px; height: 19px; }
-  .lib-defs__body { flex: 1 1 auto; min-width: 0; }
-  .lib-defs__title {
-    margin: 0 0 3px;
-    font-size: 14px;
-    font-weight: 650;
-    color: var(--ds-text-primary);
-  }
-  .lib-defs__text {
-    margin: 0;
-    font-size: 13px;
-    line-height: 1.5;
-    color: var(--ds-text-secondary);
-    max-width: 62ch;
-  }
-  /* Shown only when the page's search box matches a term inside. This is what
-     keeps the block reachable BY CONTENT and not just by scrolling to it. */
-  .lib-defs__hit {
-    margin: 8px 0 0;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ds-primary);
-  }
+  /* ── Definitions, ON the Semantic models band ──────────────────────────
+     This was a footer aside under the whole inventory — i.e. after every row,
+     which is where a reader stops looking. It is now the trailing half of one
+     section's own band: the section holds the DOCUMENTS as rows, and these
+     two links open the flat metric/glossary projections those documents are
+     projected into (`/semantic-layer?tab=all_metrics|all_glossary`).
+
+     The band therefore becomes a flex row rather than a full-width button —
+     page-local, exactly as `.fbar-groupband`'s own note prescribes: the
+     component owns the layout of a group header, this is what THIS group puts
+     in it. The toggle keeps `flex: 1` so the click target still spans the
+     label; the links sit outside it, because an anchor may not nest in a
+     button. */
+  .lib-band--defs { display: flex; align-items: center; }
+  .lib-band--defs .fbar-grouptoggle { flex: 1 1 auto; min-width: 0; }
   .lib-defs__links {
     flex: none;
     display: flex;
-    flex-direction: column;
-    gap: 6px;
-    align-items: flex-end;
+    gap: 14px;
+    align-items: center;
+    padding: 0 16px 0 10px;
   }
   .lib-defs__link {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 600;
     color: var(--ds-primary);
     text-decoration: none;
     white-space: nowrap;
   }
   .lib-defs__link:hover { text-decoration: underline; }
+  /* Shown only when the page's search box matches a term inside. This is what
+     keeps the definitions reachable BY CONTENT and not just by scrolling to
+     them — the rail renders no global search box, by design, so this is the
+     one-step term lookup. */
+  .lib-defs__hit {
+    margin: 0;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ds-primary);
+  }
+  /* The section with no readable DOCUMENT behind it — metrics and glossary
+     terms the caller can open, and nothing to list. It keeps its band (the
+     links are the point) and says why the table is missing, rather than
+     vanishing and taking the definitions off the page with it. */
+  .lib-group--defsonly .lib-defs__note {
+    margin: 0;
+    padding: 12px 16px 14px;
+    font-size: 12.5px;
+    color: var(--ds-text-secondary);
+  }
   @media (max-width: 640px) {
-    .lib-defs { flex-wrap: wrap; }
-    .lib-defs__links { width: 100%; flex-direction: row; gap: 16px; align-items: flex-start; }
+    .lib-band--defs { flex-wrap: wrap; }
+    .lib-defs__links { width: 100%; padding: 0 16px 10px 42px; }
   }
 
   /* ── "More coming soon", beside the item count ──
@@ -2471,12 +2480,29 @@
      rows — inherits it, so one attribute colours the whole group. #}
   <div class="lib-list">
   {% for sec in library_sections %}
+  {% if not sec.rows %}
+  {# The Semantic models section with no readable DOCUMENT behind it — the only
+     section that can render empty, and it does so deliberately: its band's two
+     links are the caller's way into the metric and glossary registries, which
+     they CAN open, and dropping the section would take those off the page
+     entirely (the failure the footer aside had by construction). Rendered
+     WITHOUT `data-lib-sec`, because that attribute makes the filter engine
+     count the group's rows and hide it when there are none — true of a
+     filtered-out group, wrong for one that never had rows to filter. #}
+  <section class="fbar-group lib-group lib-group--defsonly"
+           style="--lib-kind: var(--ds-kind-{{ sec.kind }}); --lib-kind-soft: var(--ds-kind-{{ sec.kind }}-soft);">
+    <div class="fbar-groupband lib-band lib-band--defs">{{ group_toggle(sec) }}{{ defs_links(sec.defs) }}</div>
+    <p class="lib-defs__hit" id="lib-defs-hit" hidden></p>
+    <p class="lib-defs__note">No semantic model you can read yet — the definitions above are the flat registries, which stay open to you.</p>
+  </section>
+  {% else %}
   <section class="fbar-group lib-group" data-lib-sec="{{ sec.key }}"
            style="--lib-kind: var(--ds-kind-{{ sec.kind }}); --lib-kind-soft: var(--ds-kind-{{ sec.kind }}-soft);">
     {# The band is the block host of the shared component (`.fbar-groupband`),
        sticky at the top of its own section so the group you are reading stays
        named while its rows scroll. #}
-    <div class="fbar-groupband lib-band">{{ group_toggle(sec) }}</div>
+    <div class="fbar-groupband lib-band{% if sec.defs %} lib-band--defs{% endif %}">{{ group_toggle(sec) }}{{ defs_links(sec.defs) }}</div>
+    {% if sec.defs %}<p class="lib-defs__hit" id="lib-defs-hit" hidden></p>{% endif %}
     <div class="lib-tablewrap">
       <table class="data-table lib-table">
         {# The SAME colgroup in every group — that plus `table-layout: fixed` is
@@ -2555,6 +2581,7 @@
        above, so the table stays the single source of truth. #}
     <div class="fbar-grid" hidden></div>
   </section>
+  {% endif %}
   {% endfor %}
   </div>
 
@@ -2602,58 +2629,12 @@
   </div>
   {% endif %}
 
-  {# ── Definitions — an adjacent destination, NOT a row ──────────────────
-     The organization's agreed vocabulary closes the page rather than joining
-     the inventory above it. It is the one thing here nobody owns, shares,
-     installs, drops or edits, so as a table row it had to blank all four
-     columns at once (Owner / Sharing / Stack / Actions) — which is the list
-     telling you the object is not one of its rows. Below the list, outside
-     the frame, it can just say what it is and how big it is.
-
-     It renders in BOTH page states — a stocked library and an empty one — and
-     independently of any filter, because it is not part of what the filters
-     filter. `data-defs-search` is read by the block's own script below: the
-     page's search box narrows the list, and when a query matches a metric or
-     term the footer says so, which is the only one-step term lookup the rail
-     chrome has (it renders no global search box, by design).
-
-     Absent entirely when the instance has no semantic layer configured — a
-     block advertising "0 metrics · 0 terms" describes the setup, not the
-     content. #}
-  {% if definitions_footer %}
-  {% set _dm = definitions_footer.metric_count %}
-  {% set _dg = definitions_footer.glossary_count %}
-  <aside class="lib-defs" id="lib-defs" data-defs-search="{{ definitions_footer.search }}">
-    <span class="lib-defs__icon" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none"><path d="M12 6.5S10 4.8 6.5 4.8c-1 0-1.8.1-2.5.3v13c.7-.2 1.5-.3 2.5-.3C10 17.8 12 19.5 12 19.5s2-1.7 5.5-1.7c1 0 1.8.1 2.5.3v-13c-.7-.2-1.5-.3-2.5-.3C14 5.1 12 6.5 12 6.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 6.5v13" stroke="currentColor" stroke-width="1.6"/></svg>
-    </span>
-    <div class="lib-defs__body">
-      <p class="lib-defs__title">Definitions</p>
-      <p class="lib-defs__text">
-        The words and numbers your organization has agreed on — what counts as revenue,
-        what an active account is. Maintained by your admin; your agent answers with them.
-      </p>
-      {# Hidden until the search box matches one of the terms inside. #}
-      <p class="lib-defs__hit" id="lib-defs-hit" hidden></p>
-    </div>
-    <div class="lib-defs__links">
-      <a class="lib-defs__link" href="/catalog/semantics#metrics">{{ _dm }} metric{{ '' if _dm == 1 else 's' }} &rarr;</a>
-      <a class="lib-defs__link" href="/catalog/semantics#glossary">{{ _dg }} glossary term{{ '' if _dg == 1 else 's' }} &rarr;</a>
-      {# The stored Ossie document itself — datasets, relationships, AI
-         context, constraints — one layer below the flat metric/glossary
-         projection the two links above open. Shown only when the caller can
-         read at least one model (`has_semantic_models`, the router's
-         `_can_read_model` sweep): a caller with visible metrics but no
-         readable document would otherwise land on the browse page's empty
-         state. No count here (unlike the two above): an exact per-type count
-         is a heavier read than the mere existence check the link needs — see
-         docs/superpowers/specs/2026-08-14-semantic-layer-ui-and-agent-parity-design.md. #}
-      {% if definitions_footer.has_semantic_models %}
-      <a class="lib-defs__link" href="/semantic-layer">Browse the semantic layer &rarr;</a>
-      {% endif %}
-    </div>
-  </aside>
-  {% endif %}
+  {# The Definitions footer used to close this section — an aside under the
+     whole inventory, carrying the metric and glossary counts and a link into
+     the browse pages. It was promoted to a real section with a fixed slot in
+     the order (#1707 N3): the stored documents are its rows, and the two flat
+     projections are the links on its band. See `defs_links` at the top of
+     this file, and `_SECTION_ORDER` in app/web/router.py. #}
   {# The Data apps note used to close this section. It now rides the page head
      with the other page-level notes (see `page_head`) — one place for the
      asides, and one rendering for both states of the page (a stocked Library
@@ -3490,12 +3471,12 @@
   }
 
   // ── "That word is a definition" ───────────────────────────────────────
-  //    The Definitions footer is NOT a row, so the filter engine neither hides
-  //    nor reveals it — it is always there. What it does do is answer the
-  //    search: someone types `MRR` or `active account` looking for a thing
-  //    they half-remember, the list comes back empty, and the block at the
-  //    bottom is the one place that knows the word. Without this, the reader
-  //    concludes Agnes has never heard of it.
+  //    The definitions links live on the Semantic models BAND, not in a row,
+  //    so the filter engine neither hides nor reveals them — they are always
+  //    there. What they do is answer the search: someone types `MRR` or
+  //    `active account` looking for a thing they half-remember, the list comes
+  //    back empty, and this band is the one place that knows the word. Without
+  //    it, the reader concludes Agnes has never heard of it.
   //
   //    Matched against the block's `data-defs-search` — metric names, display
   //    names, synonyms and glossary terms, lowercased, names only. Substring
