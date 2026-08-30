@@ -163,7 +163,7 @@
       '        <p class="ds-drawer__hint" id="pdw-tables-reach" hidden></p>' +
       '      </div>' +
       '      <details class="ds-drawer__disclose" id="pdw-access">' +
-      '        <summary>Who gets it <span class="ds-drawer__opt">(optional)</span></summary>' +
+      '        <summary>Access <span class="ds-drawer__opt">— nobody until you add a group</span></summary>' +
       '        <p class="ds-drawer__hint" style="margin:8px 0 12px;">' +
       '          <strong>Optional</strong> shows the package in that group’s Library for members to add;' +
       '          <strong>Automatic</strong> puts it in their workspace on the next sync.' +
@@ -193,7 +193,7 @@
       '  <div class="ds-drawer__foot">' +
       '    <span class="ds-drawer__foot-gap"></span>' +
       '    <button type="button" class="btn btn-secondary" data-pdw-close>Cancel</button>' +
-      '    <button type="button" class="btn btn-primary" id="pdw-submit">Create package</button>' +
+      '    <button type="button" class="cc-btn cc-btn--primary" id="pdw-submit">Create package</button>' +
       '  </div>' +
       '</div>';
     document.body.appendChild(root);
@@ -766,7 +766,7 @@
     var work = document.createElement('div');
     work.innerHTML = BuilderShell.workspace({
       left: '<div class="pdw-conv" id="pdw-conv"></div>',
-      cfgTitle: 'Package',
+      cfgTitle: 'Configuration',
       cfgSub: 'what it carries and who gets it, editable by hand',
       cfgBodyId: 'pdw-cfg',
     });
@@ -798,6 +798,12 @@
       (llmUnavailable
         ? BuilderShell.noModelNotice('form on the right')
         : BuilderShell.engineNotice(convEngine)) +
+      /* What a data package IS. The sentence existed — in the drawer header,
+         which builder.css hides in builder mode, so the full-page builder
+         (the one the Library's "+ Add" reaches) explained least. */
+      '<p class="ag-cfg-blurb pdw-blurb">A data package is how governed tables reach an analyst. Tables are ' +
+      'registered on this instance but reach nobody on their own: a package bundles them, you grant the package ' +
+      'to a group, and its members pull those tables to their laptop. Nothing is written until you press Create.</p>' +
       BuilderShell.conversation({
         id: 'pdw-conv-scroll',
         // With no model the opening line promises drafting that cannot happen.

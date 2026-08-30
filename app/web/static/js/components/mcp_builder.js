@@ -767,15 +767,20 @@
         actionsId: 'mcp-actions',
         actions: '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
           (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Saving…') + '"') + '>' +
-          (saving ? 'Saving…' : 'Register source') + '</button>',
+          (saving ? 'Registering…' : 'Register source') + '</button>',
       }) +
       window.BuilderShell.workspace({
         left: leftHtml(),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this source is, editable by hand',
-        // The shell grew `cfgAside` because a boxed status widget in the first
-        // slot of the column outweighed the fields it reports on.
-        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>',
+        /* The durable definition. The only orientation was inside the
+           conversation — which disappears entirely on an instance with no
+           model, leaving a title, a warning, and no statement of what an MCP
+           source IS or what registering one does to this instance. */
+        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>' +
+          '<p class="ag-cfg-blurb">An MCP source is an outside tool server — a CRM, a ticket tracker, a docs ' +
+          'search — that Agnes dials on your behalf. Register one and the tools you approve become callable by ' +
+          'agents, and by analysts in Claude Code, for the groups you grant.</p>',
         cfgBodyId: 'mcp-steps',
         cfg: panelHtml(),
       }) +

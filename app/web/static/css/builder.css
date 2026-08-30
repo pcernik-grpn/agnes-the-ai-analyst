@@ -191,6 +191,13 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 /* One line, and it stays one: a long slot label ellipsises rather than
    wrapping the header into a third row. */
 .ag-prog-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* What the thing IS, under the configuration title. Durable, so it survives
+   the states where the conversation does not. */
+/* In the conversation pane the blurb leads the column, so it is left-aligned
+   and spaced like a paragraph rather than centred under a title. */
+.pdw-blurb { text-align: left; margin: 0 22px 12px; max-width: none; }
+.ag-cfg-blurb { margin: 6px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--ds-text-secondary);
+  max-width: 62ch; text-align: center; }
 .ag-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
 .ag-note--err { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
 .ag-note--warn { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); }

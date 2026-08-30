@@ -976,8 +976,31 @@
   }
 
   /* ── The builder shell ── */
+  /* What you are building, permanently on screen.
+     The type cards carry the only definitions in the product — and they render
+     only when NO type is chosen, so arriving from the Library's "+ Add" menu,
+     which always names one, deleted every explanation. Agent templates had a
+     callout and the other two did not, which is backwards: an agent template
+     is the type least likely to be chosen blind. */
+  var TYPE_BLURB = {
+    skill:
+      'This is a <strong>Skill</strong> — a step-by-step recipe an agent loads when it needs one: how to run a ' +
+      'report, how to shape a query, how your team does a thing. You write it as Markdown here; agents read it later.',
+    plugin:
+      'This is a <strong>Plugin</strong> — one install that hands someone several things at once. Its contents are ' +
+      'items already in your Library, or a .zip packaged elsewhere. A skill installs on its own; a plugin is for ' +
+      'handing over a set.',
+  };
+
   function agentCalloutHtml() {
-    if (type !== 'agent') return '';
+    if (type !== 'agent') {
+      var blurb = TYPE_BLURB[type];
+      if (!blurb) return '';
+      return '<div class="sk-callout">' +
+        '<span class="sk-ava sk-ava--' + type + '">' + ICONS[type] + '</span>' +
+        '<span class="sk-callout-body">' + blurb + '</span>' +
+      '</div>';
+    }
     return '<div class="sk-callout">' +
       '<span class="sk-ava sk-ava--agent">' + ICONS.agent + '</span>' +
       '<span class="sk-callout-body">This is an <strong>Agent Template</strong> — a shareable starting point that others build their own ' +
