@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **The Knowledge tab opens on what the graph knows (TCRD-250).** Node types with live, caller-scoped counts sit at the head of the tab, each one a way in — the counts come from `GET /api/facts/type-map`, so a type shows what *you* can reach and a type nobody can see is absent rather than zero. It follows the active tab through the Library's own `onApply` chain (the filter engine slices rows by `data-tab`; a non-row element has no such hook) and starts hidden, so it never flashes on Capabilities before the first apply. Renders nothing at all when the facts feature is off, the app-state backend is DuckDB, or the graph is empty — the Library must not fail because a decoration is unavailable.
 - **Maintained digests can be listed, not just fetched by id (TCRD-250).** `GET /api/knowledge/digests` returns the digests the caller can read — `{id, slug, title, status, status_reason, generated_at}`, sorted by slug, never the markdown. The content endpoint has been readable since K4 and `agnes pull` already writes every granted digest to `.claude/rules/ka_<slug>.md`, but nothing could enumerate them, so a web surface had no way to show a reader which digests exist without already knowing an id. Filtered by the SAME fail-closed predicate the sync manifest uses, so the browser list and the pulled files can never disagree about entitlement — there is a test asserting exactly that. A digest that has never generated is omitted, matching the manifest, since listing it would promise a page that 404s; staleness travels per row so a stale digest is visibly stale.
 - **The Library can be filtered by what documents are ABOUT (TCRD-250).** `GET /api/facts/facets` (plus `agnes facts facets` and the `fact_facets` MCP tool) returns each entity type's values with a document count — client, industry, service offering and document type by default. That vocabulary comes from the extraction pass, so it is maintained by ingestion rather than by somebody remembering to tag a file, which is what "filter by tags" should have meant here. Same visibility gate as `search()`, shared rather than restated, plus one extra conservatism: the document tally counts only documents in collections the caller can READ — a `revealed` subject's unreadable evidence is deliberately not tallied, since a revealed correction reveals the subject, not the geography of its evidence, and counting those files would report how many sit in a collection the caller cannot open. An alias with no recorded provenance stays admin-only-visible, so a facet shows the opaque id rather than leaking the natural key.
 - **The fact graph now says what is in it (TCRD-250).** `GET /api/facts/type-map` (plus `agnes facts type-map` and the `fact_type_map` MCP tool) returns every node type with a live count of the subjects the caller can actually see — the head of the Library's Knowledge tab, where each type is a way in, and an agent's way to learn which types exist before spending a `fact_search` call. Counts run through the SAME visibility gate as `search()` with no `type`, shared rather than restated: `_visible_facts_for_corpus_cte` gained an `all_collections` switch that changes only which facts are candidates, never the rule that decides visibility. A naive `GROUP BY type` would have been the fact graph's existence oracle in aggregate form — a reader counting subjects whose every claim sits in a collection they cannot read — so a type with no visible subjects is OMITTED rather than reported as `0`, leaving "nothing you can see" deliberately indistinguishable from "no such type".
@@ -239,6 +240,92 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   longer 500s the whole ingest.
 
 ### Changed
+- **The Library says what your agents get, not what the server does.** Every
+  control in the Access column named a mechanism — *Install*, *Add to stack*,
+  *In stack*, *Required by your admin*, *Granted to your group* — which told a
+  reader what happens internally and left them to infer what they get. Each now
+  names the outcome: **Add to my agents** (was Install / Add to stack), *Agents
+  can use this* (was Installed / In stack), and one state for governed data,
+  *Agents can query this*, replacing the pair of pills that promised two
+  different things about removal for what is a single, identical capability —
+  the tier survives in the tooltip, where it explains why rather than posing as
+  a different power. The two toolbar toggles follow (*Agents use it*, *Not added
+  yet*), so the page no longer says "stack" anywhere, and a permanent one-line
+  lede under the title states the rule the whole page turns on: your admin
+  decides what data you can reach, you choose what your agents can do with it.
+- **Every row in the Library's + Add menu says what it makes.** Four of the
+  eight — skill, plugin, agent template, upload — were a verb and nothing else,
+  so the menu told you the shape of the thing only where someone had happened to
+  write a sub-line. Each now carries the builder's own one-line description,
+  compressed, so the menu and the page it opens describe the same object the
+  same way. The menu widens 214px → 320px to fit them on one line each.
+- **The Library filter menu answers more than "who owns it".** It offered
+  Owner, Source, Access and a Tags category that is empty for every collection,
+  file, app and recipe (`file_corpora` has no tags column), so past a screenful
+  the only working narrowing was search. Three categories join it, each read off
+  data the rows already carry: **Added** (last 7 / 30 / 90 days, cumulative, so
+  the buckets nest instead of excluding each other), **Yours or shared**
+  (created by you · shared by you · shared with you) and **File format**. A
+  category with fewer than two distinct values still does not render, so the
+  menu grows only where the data does. A file whose text the extraction pass
+  could not read now says so on its own row — *Not indexed yet* / *Indexing* /
+  *Needs review* / *Not indexed*, and nothing at all when it is indexed, which
+  is the majority — instead of only being discoverable by opening its
+  collection.
+- **The Library is two tabs, and every row's button says what it does.**
+  `/library` was one flat list answering two different questions — *what does
+  this organization know* and *what can my agent do* — and a single control
+  label, "Add to stack", sat on rows whose click posted to four different
+  endpoints meaning four different things.
+  - **Knowledge / Capabilities tabs**, deep-linkable as `?tab=`. Knowledge
+    holds documents, governed data, memory, recipes and apps; Capabilities
+    holds skills, plugins and agent templates. A detail page's `?section=`
+    back link selects the tab that owns the section, so returning from an item
+    can no longer land on a page where that item is filtered out. The tabs are
+    the shared `FilterToolbar` segmented control reading `data-tab` off each
+    row, so switching tabs shares one code path with search, the facets and the
+    empty-section hiding.
+  - **Data apps are their own band** rather than a trailing block inside
+    Artefacts, whose hint had to call an app a file the caller had uploaded.
+  - **Per-kind action verbs.** `Install` / `Installed` for skills, plugins and
+    agent templates (they post to `/install` and were never stack members —
+    `/api/stack` accepts only `data_package` and `memory_domain`);
+    `Keep a local copy` / `Local copy` for governed data, because
+    `features.stack_auto_membership` has been default-on since Wave 0, so the
+    grant already *is* the membership and the only remaining choice is what
+    `agnes pull` downloads — the wording `StackResolver.browse()` already used
+    internally. A granted row now states its tier — `Required by your admin`,
+    `Granted to your group` — instead of claiming a membership the caller could
+    neither create nor drop, with the reason available only in a tooltip. The
+    grid card no longer overwrites the row's label with the stack vocabulary,
+    so table and card cannot drift.
+  - **`+ Add` follows the tab** — sources on Knowledge (data package, connect a
+    source, link an external app, upload), builders on Capabilities (skill,
+    plugin, agent template, MCP source). The blast-radius headings survive
+    inside each half. The menu is bounded to the room below its button, so its
+    last entries stay reachable.
+  - **One browsing block, sitting on the list.** Search, the filters, the view
+    switch, "+ Add", the item count and the active-filter chips are one job, so
+    they are one block directly above what they act on; the page header keeps
+    the title, the connect banner and the tabs. They used to be spread over
+    four bands — you pressed Filter in the page header and read what it did two
+    bands lower, past a promo panel, while the count sat in a third place. The
+    Library spent its first screen not listing anything. The group bands keep
+    the viewport top, which is the thing worth pinning on a long list; no header
+    pins, because one carrying all of that runs ~270px and leaves a band no room
+    to travel in. The shared floating dock (`.fbar-dock`) is untouched and still
+    `/chats`'s.
+  - **Status stopped looking like a control.** "Shared with you", "Required by
+    your admin" and "Granted to your group" all answer *why you have this* and
+    were drawn as pills in the same slot the row's buttons use, under a column
+    headed **Actions** — which is what "Required by your admin" is precisely
+    not. They read as text now; only a control keeps a box, and the trailing
+    column drops its misleading label (keeping an accessible name). Controls
+    themselves went quiet at rest: five 38px bordered boxes across the toolbar
+    gave nothing rank, so search is a field, Filter/stack/view are borderless
+    utilities that tint when on, and "+ Add" is the only filled control.
+  - **Bands open on arrival**, and an empty tab says so in its own words rather
+    than offering a "Clear filters" button for filters that are not applied.
 - **Authoring surfaces no longer open on a name field (TCRD-205).** The agent builder, the skill/plugin/agent-template builder and the data-package drawer each now open on what the thing is for — a role, a description, what the package carries — and ask what to call it last. The name was the least interesting decision on each form and the hardest to make first, and on the data package it was actively harmful: the slug derives from the name as you type, so a placeholder name immediately became a placeholder identifier. The derivation is unchanged and still correct; asked last, it finally has a real name to derive from. Nothing became more or less required — none of the three gated saving on a name (each already rendered `Unnamed`), so this is ordering only.
 - **One word per thing, across the surfaces where two had drifted (TCRD-208).** `/profile` stops calling admin elevation "god-mode" (now *full admin access*) and stops calling its confirmation a "consent gate" — "consent" already means OAuth provider consent everywhere else in Agnes, so one word was carrying two mechanisms a user meets in the same session. The connection pill on `/me/connections` states a state and nothing else (*Expired*, beside *Connected* and *Not connected*) — the remedy still lives in the detail line, where someone is actually reading. `/admin/semantic-layer` names its drift columns *in Agnes / in source* rather than *stored / upstream*, and no longer points readers at a *Master token (semantic layer)* row that was renamed to *Semantic-layer token*. `/admin/linked-apps` writes `ID` beside `URL` rather than `Id`. The login page's apostrophes are typographic, like the rest of the repo. `tests/test_product_vocabulary.py` pins each decision, because the design-system contract tests police colour and spacing but nothing policed language — which is why sixteen design reviews each re-found a naming collision independently.
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
