@@ -82,18 +82,20 @@ def test_the_line_reports_the_panel_not_the_last_reply(js_rules):
     assert markup.count("syncProgress()") >= 3, "syncProgress is not called from the field-input path"
 
 
-def test_the_transcript_caps_agree():
-    """The page keeps as much transcript as the prompt replays.
+def test_the_page_does_not_keep_its_own_transcript_caps():
+    """The caps moved to the shell — the page must not grow a second copy.
 
-    They were different: the prompt used the last MAX_HISTORY turns while the
-    page kept and uploaded all of them, so past that mark the model silently
-    stopped seeing the start of a conversation that was still on screen — read
-    by the author as the assistant forgetting, not as a limit.
+    They were different once: the prompt used the last MAX_HISTORY turns while
+    the page kept and uploaded all of them, so past that mark the model
+    silently stopped seeing the start of a conversation still on screen. Four
+    builders then held four copies of the fix, which is the drift this guard
+    exists to prevent. `tests/test_builder_shell_owns_the_turn.py` pins the
+    shell's values against the server's; this pins that the page defers.
     """
-    from app.api.builder_core import MAX_HISTORY, MAX_MESSAGE_CHARS
-
     markup = SKILLS.read_text(encoding="utf-8")
-    for name, value in (("MAX_HISTORY", MAX_HISTORY), ("MAX_MSG_CHARS", MAX_MESSAGE_CHARS)):
-        assert f"var {name} = {value};" in markup, (
-            f"the page's {name} no longer matches the server's ({value})"
+    for name in ("MAX_HISTORY", "MAX_MSG_CHARS", "TURN_TIMEOUT_MS"):
+        assert f"var {name} =" not in markup, (
+            f"skills.html declares its own {name} again — it will drift from the shell's"
         )
+    assert "BuilderShell.turn(" in markup, "the page takes its turn by hand again"
+    assert "BuilderShell.trimHistory(" in markup, "the page trims the transcript by hand again"

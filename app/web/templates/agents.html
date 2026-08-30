@@ -1136,6 +1136,8 @@
      `history` each turn). A reload therefore loses the conversation but never
      the agent: the configuration is what was persisted. */
   var conv = [];            // [{ role: 'user' | 'assistant', text }]
+  var convKept = [];        // fields the last reply left alone because they were the owner's
+  var llmUnavailable = false;  // latched once a turn says this instance has no model
   var convBusy = false;
   var convErr = null;
   var convDraft = '';       // survives re-renders triggered from the config panel
@@ -1191,21 +1193,47 @@
       '“something that looks up policies from the handbook.”\n\nWhat would you like it to do?';
   }
 
+  /* What the last reply left alone, in the owner's words — the page's own
+     account, beside the model's. */
+  var FIELD_WORDS = {
+    name: 'the name', role: 'the role', instructions: 'the instructions',
+    greeting: 'the greeting', tone: 'the tone',
+  };
+  function keptNote() {
+    if (!convKept.length) return '';
+    var w = convKept.map(function (k) { return FIELD_WORDS[k] || k; });
+    var list = w.length < 2 ? w[0] : w.slice(0, -1).join(', ') + ' and ' + w[w.length - 1];
+    return '<p class="sk-patch-note">Left ' + BuilderShell.esc(list) +
+      ' as you had ' + (w.length > 1 ? 'them' : 'it') + '.</p>';
+  }
+
   function convHtml() {
+    /* With no model configured the pane used to show a greeting, a red error
+       under it, and a live composer — all of which fail identically. */
+    if (llmUnavailable) {
+      return BuilderShell.noModelNotice('configuration on the right') +
+        BuilderShell.conversation({ id: 'ag-conv', rows: conv, busy: false, err: null });
+    }
     return BuilderShell.conversation({
       id: 'ag-conv',
       rows: [{ role: 'assistant', text: openingMessage() }].concat(conv),
       busy: convBusy,
       err: convErr,
-    });
+    }) + keptNote();
   }
 
   /* Chips are a create-tab affordance only, and never while a turn is in
      flight — a suggestion you cannot click is noise. */
   function composerHtml(kind, value, placeholder, busy) {
     return BuilderShell.composer({
-      kind: kind, value: value, placeholder: placeholder, busy: busy,
-      chips: (kind === 'create' && !convBusy) ? convChips : [],
+      kind: kind, value: value, busy: busy,
+      // readOnly, not disabled: a disabled textarea is unselectable in Chrome,
+      // so a restored message would be visible and impossible to copy out.
+      readOnly: kind === 'create' && llmUnavailable,
+      placeholder: (kind === 'create' && llmUnavailable)
+        ? 'No AI is configured here — fill the configuration on the right by hand.'
+        : placeholder,
+      chips: (kind === 'create' && !convBusy && !llmUnavailable) ? convChips : [],
     });
   }
 
@@ -1408,12 +1436,15 @@
     var a = current(); if (!a || convBusy) return;
     conv.push({ role: 'user', text: text });
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    /* What the panel held when this turn was dispatched. A field the owner
+       edits while it is in flight belongs to them, not to the reply. */
+    var sent = {};
+    EDITABLE.forEach(function (k) { sent[k] = a[k]; });
     renderConvPane();
-    fetch('/api/agents/' + encodeURIComponent(a.id) + '/builder/turn', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({
+    BuilderShell.turn({
+      url: '/api/agents/' + encodeURIComponent(a.id) + '/builder/turn',
+      message: text,
+      body: {
         message: text,
         history: conv.slice(0, -1),
         /* Editing is explicit now, so a turn must NOT write: it returns the
@@ -1432,17 +1463,10 @@
         plugin_candidates: (plugins || []).slice(0, 60).map(function (p) {
           return { id: String(p.id), name: String(p.name || ''), description: String(p.description || '').slice(0, 400) };
         })
-      })
-    }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (body) {
-        if (!r.ok) {
-          var d = (body && body.detail) || {};
-          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
-        }
-        return body;
-      });
+      },
     }).then(function (body) {
-      conv.push({ role: 'assistant', text: body.reply || '' });
+      conv.push({ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') });
+      conv = BuilderShell.trimHistory(conv);
       convEngine = body.engine || null;
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
       var patch = body.patch || {};
@@ -1454,18 +1478,36 @@
            agent does not have — is not lost, only moved: an unsaved patch
            grants nothing at all, and Save re-derives the enforced scope
            server-side and returns the row the panel then reflects. */
-        EDITABLE.forEach(function (k) {
-          if (Object.prototype.hasOwnProperty.call(patch, k)) a[k] = patch[k];
-        });
+        /* Skip what the owner owns: a field they are focused in, or one they
+           changed since this turn went out. Writing over it took their caret
+           and, for Instructions, their words. */
         touched = {};
-        Object.keys(patch).forEach(function (k) { touched[k] = true; });
+        var kept = [];
+        EDITABLE.forEach(function (k) {
+          if (!Object.prototype.hasOwnProperty.call(patch, k)) return;
+          var el = document.querySelector('[data-ag-field="' + k + '"]');
+          var mine = (el && document.activeElement === el) ||
+            JSON.stringify(a[k] === undefined ? null : a[k]) !==
+            JSON.stringify(sent[k] === undefined ? null : sent[k]);
+          if (mine) { kept.push(k); return; }
+          a[k] = patch[k];
+          touched[k] = true;
+        });
+        convKept = kept;
         touch();
         renderCfgPane();
         syncPreview();
       }
     }).catch(function (err) {
       console.error('agents: builder turn failed', err);
+      if (err.kind === 'llm_unavailable') llmUnavailable = true;
       convErr = err.message;
+      /* Hand the message back. It was cleared optimistically and, on a
+         failure, existed nowhere the owner could retrieve it. */
+      if (text) {
+        convDraft = text;
+        if (conv.length && conv[conv.length - 1].role === 'user') conv.pop();
+      }
     }).finally(function () {
       convBusy = false;
       renderConvPane();

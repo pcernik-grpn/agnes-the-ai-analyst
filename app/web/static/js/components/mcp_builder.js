@@ -191,48 +191,37 @@
   /* Mirrors the caps the endpoint enforces (app/api/builder_core.py). The
      transcript is replayed on every turn, so one over-long reply used to make
      every later turn 422 — a conversation with no way out. */
-  var MAX_MSG_CHARS = 4000;
-  var MAX_HISTORY = 40;
-  var TURN_TIMEOUT_MS = 60000;
-  function clipMsg(t) { t = t || ''; return t.length > MAX_MSG_CHARS ? t.slice(0, MAX_MSG_CHARS) : t; }
 
   function sendTurn(text) {
     if (convBusy) return;
     var opening = !text && !conv.length;
     if (!text && !opening) return;
-    /* Refuse over-long input here, with the author's text still in the box —
-       sending it earns a pydantic 422 whose `detail` is an array, which the
-       page would render as "the assistant could not answer". */
-    if (text && text.length > MAX_MSG_CHARS) {
-      convErr = 'That message is ' + text.length + ' characters and the limit is ' + MAX_MSG_CHARS +
-        '. Shorten it, or put the long part in the configuration on the right.';
-      convDraft = text;
-      render();
-      return;
-    }
     if (!opening) conv = conv.concat([{ role: 'user', text: text }]);
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
-    /* The panel as it stood when this turn was dispatched: a field the author
+    /* The panel as it stood when this turn was dispatched: a field the admin
        edits while it is in flight belongs to them, not to the reply. */
     var sentDraft = JSON.parse(JSON.stringify(draft));
-    var timedOut = false;
-    var ctl = window.AbortController ? new window.AbortController() : null;
-    var timer = setTimeout(function () { timedOut = true; if (ctl) ctl.abort(); }, TURN_TIMEOUT_MS);
     render();
-    postJson(TURN_API, {
+    /* Through the shell — one implementation of the caps, the deadline and
+       the typed failure, shared with every other builder. */
+    BuilderShell.turn({
+      url: TURN_API,
       message: text || '',
-      history: opening ? [] : conv.slice(0, -1),
-      draft: {
-        name: draft.name, transport: draft.transport, url: draft.url,
-        command: draft.command, args: draft.args,
-        auth_method: draft.auth_method, auth_secret_env: draft.auth_secret_env,
-        scope: draft.scope, auth_decided: !!draft.auth_decided,
-        introspected: !!draft.introspected,
-        tool_names: (draft.tools || []).map(function (t) { return t.name; }),
+      body: {
+        message: text || '',
+        history: opening ? [] : conv.slice(0, -1),
+        draft: {
+          name: draft.name, transport: draft.transport, url: draft.url,
+          command: draft.command, args: draft.args,
+          auth_method: draft.auth_method, auth_secret_env: draft.auth_secret_env,
+          scope: draft.scope, auth_decided: !!draft.auth_decided,
+          introspected: !!draft.introspected,
+          tool_names: (draft.tools || []).map(function (t) { return t.name; }),
+        },
       },
     }).then(function (body) {
-      conv = conv.concat([{ role: 'assistant', text: clipMsg(body.reply || '') }]);
-      if (conv.length > MAX_HISTORY) conv = conv.slice(-MAX_HISTORY);
+      conv = BuilderShell.trimHistory(
+        conv.concat([{ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') }]));
       // An opening turn's suggestions are invented — the author has said
       // nothing for them to be grounded in.
       convChips = (!opening && body.suggestions && body.suggestions.length) ? body.suggestions : [];
@@ -255,10 +244,8 @@
       persistDraft();
       syncProgress();
     }).catch(function (e) {
-      if (e && e.detail && e.detail.kind === 'builder_llm_unavailable') llmUnavailable = true;
-      convErr = timedOut
-        ? 'That turn took longer than ' + Math.round(TURN_TIMEOUT_MS / 1000) + ' seconds and was given up on. Try again.'
-        : (e.message || 'The assistant could not answer.');
+      if (e.kind === 'llm_unavailable') llmUnavailable = true;
+      convErr = e.message || 'The assistant could not answer.';
       // Hand the message back — it was cleared optimistically and, on a
       // failure, existed nowhere the author could retrieve it.
       if (text) {
@@ -266,7 +253,7 @@
         if (conv.length && conv[conv.length - 1].role === 'user') conv = conv.slice(0, -1);
       }
     }).then(function () {
-      clearTimeout(timer);
+      // The shell clears its own timer.
       convBusy = false;
       render();
     });

@@ -715,6 +715,8 @@
 
   /* Has the author said anything in this transcript? The opening turn is the
      builder talking to itself, so it does not count. */
+  var llmUnavailable = false;  // latched once a turn says this instance has no model
+
   function authorHasSpoken() {
     return conv.some(function (m) { return m.role === 'user'; });
   }
@@ -793,21 +795,27 @@
       // The engine, named. Every turn reports it and this builder used to
       // discard it — see BuilderShell.engineNotice for why that is worse than
       // not having the badge at all.
-      BuilderShell.engineNotice(convEngine) +
+      (llmUnavailable
+        ? BuilderShell.noModelNotice('form on the right')
+        : BuilderShell.engineNotice(convEngine)) +
       BuilderShell.conversation({
         id: 'pdw-conv-scroll',
-        rows: [{ role: 'assistant', text: OPENING }].concat(conv),
+        // With no model the opening line promises drafting that cannot happen.
+        rows: llmUnavailable ? conv : [{ role: 'assistant', text: OPENING }].concat(conv),
         busy: convBusy,
-        err: convErr,
+        err: llmUnavailable ? null : convErr,
       }) +
       BuilderShell.composer({
         kind: 'create', value: convDraft, busy: convBusy,
-        placeholder: 'Describe the package you need…',
+        readOnly: llmUnavailable,
+        placeholder: llmUnavailable
+          ? 'No AI is configured here — fill the form on the right by hand.'
+          : 'Describe the package you need…',
         /* Starters belong to the empty state. Keying on "no chips from the
            last turn" put them back mid-conversation, so a nearly-finished
            package could be offered a fresh-start brief — one click from
            landing on top of real work. */
-        chips: convBusy ? [] : (convChips.length ? convChips : (authorHasSpoken() ? [] : STARTERS)),
+        chips: (convBusy || llmUnavailable) ? [] : (convChips.length ? convChips : (authorHasSpoken() ? [] : STARTERS)),
       });
     var el = els.convHost.querySelector('#pdw-conv-scroll');
     if (el) el.scrollTop = el.scrollHeight;
@@ -824,9 +832,15 @@
     conv = conv.concat([{ role: 'user', text: text }]);
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
     renderConv();
-    api(PKG_API + '/builder/turn', {
-      method: 'POST',
-      body: JSON.stringify({
+    /* Through the shell: the message cap, the history trim, the 60s deadline
+       and the typed failure are the same ones every other builder gets. This
+       page had none of them — an over-long paste earned a validation error
+       rendered as "The assistant could not answer", and its own typed
+       failures were discarded by a reader that only understood strings. */
+    BuilderShell.turn({
+      url: PKG_API + '/builder/turn',
+      message: text,
+      body: {
         message: text,
         history: conv.slice(0, -1),
         draft: {
@@ -839,15 +853,23 @@
           // kept re-proposing ones the admin had already accepted.
           groups: chosenGrants().map(function (g) { return g.group_id; }),
         },
-      }),
+      },
     }).then(function (body) {
-      conv = conv.concat([{ role: 'assistant', text: body.reply || '' }]);
+      conv = conv.concat([{ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') }]);
+      conv = BuilderShell.trimHistory(conv);
       convEngine = body.engine || null;
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
       applyPatch(body.patch || {});
     }).catch(function (err) {
       console.error('package drawer: turn failed', err);
+      if (err.kind === 'llm_unavailable') llmUnavailable = true;
       convErr = (err && err.message) || 'The assistant could not answer.';
+      // Hand the message back — it was cleared optimistically and existed
+      // nowhere the admin could retrieve it.
+      if (text) {
+        convDraft = text;
+        if (conv.length && conv[conv.length - 1].role === 'user') conv = conv.slice(0, -1);
+      }
     }).finally(function () {
       convBusy = false;
       renderConv();

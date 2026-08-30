@@ -66,6 +66,12 @@ body.ag-building .idx > footer { display: none; }
 .ag-build-actions .ag-del-btn:hover,
 .ag-build-actions .ag-del-btn:focus-visible { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
 
+/* One alert region per builder, under the header and above the workspace.
+   Refusals used to land in three different places — one of them the bottom of
+   a scrolling form, while the button that caused it sat in the header. */
+.ag-alerts:empty { display: none; }
+.ag-alerts { margin: 0 28px 14px; }
+
 /* Numbered collapsible sections. */
 /* Sections ARE cards, restored after a flat pass (cc2247518) that put them on
    the panel separated only by hairlines. The argument for flattening was real —

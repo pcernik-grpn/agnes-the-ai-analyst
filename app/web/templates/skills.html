@@ -636,18 +636,9 @@
   var builderTab = 'create';
   var convs = { skill: [], plugin: [], agent: [] };
   var convBusy = false, convErr = null, convDraft = '', convChips = [];
-  /* The transcript is replayed to the server on EVERY turn, and the endpoint
-     caps each item. One reply over the cap therefore made every later turn
-     422 forever — a conversation that could not be left. The cap is enforced
-     here, where the text is stored, not only where it is typed. */
   var justSaved = null;       // {id, label} — set once a save actually landed
   var convPatchNote = null;   // what the last reply wrote, and what it left alone
   var convTrimmed = false;    // the transcript has passed what the model can see
-  var MAX_MSG_CHARS = 4000;
-  /* Mirrors MAX_HISTORY in app/api/builder_core.py. The server prompt keeps
-     only the last N turns; the page kept and sent all of them, so the two
-     transcripts diverged silently. */
-  var MAX_HISTORY = 40;
   /* Has the author said anything in THIS type's transcript? The opening turn
      is the builder talking to itself, so it does not count. */
   function authorHasSpoken() {
@@ -668,10 +659,6 @@
      builder used to open by failing and then keep inviting: a greeting, a red
      error under it, and three cheerful chips that all failed the same way. */
   var llmUnavailable = false;
-  function clipMsg(t) { t = t || ''; return t.length > MAX_MSG_CHARS ? t.slice(0, MAX_MSG_CHARS) : t; }
-  /* A turn with no deadline leaves "Thinking…" and a disabled composer with
-     no way out but a reload — which used to lose the transcript with it. */
-  var TURN_TIMEOUT_MS = 60000;
   /* What the last turn reported. `engine` is which one answered — a scripted
      stand-in runs whenever AGNES_BUILDER_STUB (or TESTING) is set, and a
      degraded mode that looks identical to the real one is a lie the page
@@ -1621,32 +1608,18 @@
     if (!type || !draft || convBusy) return;
     var opening = !text && !conv().length;
     if (!text && !opening) return;
-    /* Refuse over-long input HERE, with the author's text still in the box.
-       Sending it earned a pydantic 422 whose `detail` is an array — so the
-       page rendered "the assistant could not answer" for what is really
-       "that paste is too big", and cleared the composer on the way. */
-    if (text && text.length > MAX_MSG_CHARS) {
-      convErr = 'That message is ' + text.length + ' characters and the limit is ' + MAX_MSG_CHARS +
-        '. Shorten it, or paste the long part straight into the instructions on the right.';
-      convDraft = text;
-      renderLeftPane();
-      return;
-    }
     if (!opening) convs[type] = conv().concat([{ role: 'user', text: text }]);
     convBusy = true; convErr = null; convDraft = ''; convChips = []; convPatchNote = null;
     /* The panel as it stood when this turn was dispatched. A field the author
        edits while it is in flight belongs to them, not to the reply. */
     var sentDraft = JSON.parse(JSON.stringify(draft));
-    var ctl = window.AbortController ? new window.AbortController() : null;
-    var timedOut = false;
-    var timer = setTimeout(function () { timedOut = true; if (ctl) ctl.abort(); }, TURN_TIMEOUT_MS);
     renderLeftPane();
-    fetch('/api/store/entities/builder/turn', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      signal: ctl ? ctl.signal : undefined,
-      body: JSON.stringify({
+    /* Through the shell: the message cap, the history trim, the deadline and
+       the typed failure are one implementation now, not four. */
+    BuilderShell.turn({
+      url: '/api/store/entities/builder/turn',
+      message: text || '',
+      body: {
         type: type,
         message: text || '',
         history: opening ? [] : conv().slice(0, -1),
@@ -1655,30 +1628,12 @@
           name: draft.name || '', description: draft.description || '',
           category: draft.category || '', body: draft.body || '',
         },
-      }),
-    }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (body) {
-        if (!r.ok) {
-          var d = (body && body.detail) || {};
-          if (d.kind === 'builder_llm_unavailable') llmUnavailable = true;
-          /* 422 arrives as an ARRAY of field errors, so `hint`/`kind` are both
-             undefined and the old fallback blamed the assistant for what is a
-             size problem in the request. */
-          if (r.status === 422 || Array.isArray(d)) {
-            throw new Error('This conversation carries more text than one turn can send. ' +
-              'Shorten your last message, or start a fresh conversation — the panel on the right keeps your work.');
-          }
-          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
-        }
-        return body;
-      });
+      },
     }).then(function (body) {
-      convs[type] = conv().concat([{ role: 'assistant', text: clipMsg(body.reply || '') }]);
+      convs[type] = conv().concat([{ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') }]);
       // Keep the page's transcript and the model's the same length.
-      if (convs[type].length > MAX_HISTORY) {
-        convs[type] = convs[type].slice(-MAX_HISTORY);
-        convTrimmed = true;
-      }
+      var trimmed = BuilderShell.trimHistory(convs[type]);
+      if (trimmed.length !== convs[type].length) { convs[type] = trimmed; convTrimmed = true; }
       /* The OPENING turn keeps the page's curated starters. The author has
          said nothing yet, so a model suggestion here can only be an invented
          scenario ("Generate a monthly budget variance report") — a chip that
@@ -1730,9 +1685,8 @@
       }
     }).catch(function (err) {
       console.error('skills: builder turn failed', err);
-      convErr = timedOut
-        ? 'That turn took longer than ' + Math.round(TURN_TIMEOUT_MS / 1000) + ' seconds and was given up on. Try again.'
-        : err.message;
+      if (err.kind === 'llm_unavailable') llmUnavailable = true;
+      convErr = err.message;
       /* Hand the message back. It was cleared from the composer optimistically
          and, on a failure, existed nowhere the author could retrieve it. */
       if (text) {
@@ -1741,7 +1695,7 @@
         if (rows.length && rows[rows.length - 1].role === 'user') convs[type] = rows.slice(0, -1);
       }
     }).finally(function () {
-      clearTimeout(timer);
+      // The shell clears its own timer.
       convBusy = false;
       renderLeftPane();
     });
