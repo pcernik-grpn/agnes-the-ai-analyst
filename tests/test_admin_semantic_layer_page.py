@@ -429,6 +429,80 @@ class TestTheSyncStrip:
         assert "semantic sources sweep exploded: boom" in body
 
 
+class TestTheStripAfterARestart:
+    """A10 (#1707): `_refresh_state` is in-memory BY DESIGN — "since last
+    process restart" — so every redeploy empties it. The strip then read
+    "Never synced yet." while /admin/semantic-sources listed the very same
+    sources synced that morning, two of them with errors.
+
+    The decision not to add a table stands; the SENTENCE was the bug. With no
+    sweep in this process the strip falls back to what the source rows already
+    carry durably — `max(last_sync_at)` across them — and says what that is:
+    the last sync of ANY source, not a sweep. "Never synced yet." survives for
+    the one case where it is finally true.
+    """
+
+    def _body(self, seeded_app) -> str:
+        return seeded_app["client"].get("/admin/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
+
+    @staticmethod
+    def _synced(*ids: str) -> None:
+        from src.repositories import semantic_source_repo
+
+        repo = semantic_source_repo()
+        for source_id in ids:
+            repo.create(id=source_id, kind="upload", name=source_id, adapter="native", config={})
+            repo.record_sync(source_id, status="ok", error=None)
+
+    def test_a_sweep_in_this_process_still_wins(self, seeded_app):
+        """The in-memory view is the richer one (counts, per-source results),
+        so it is never displaced by the fallback — even with synced rows
+        sitting right there to derive one from."""
+        from app.api.semantic_sources_refresh import _record_completion
+
+        self._synced("src-a")
+        _record_completion("ok", {"synced": 1, "failed": 0})
+
+        body = self._body(seeded_app)
+        assert "Last run" in body
+        assert "Last source sync" not in body
+        assert "Never synced yet" not in body
+
+    def test_no_sweep_but_synced_sources_reports_the_sources_own_last_sync(self, seeded_app):
+        from src.repositories import semantic_source_repo
+
+        self._synced("src-a", "src-b")
+        # A third row that has never synced is not part of the claim.
+        semantic_source_repo().create(id="src-never", kind="upload", name="src-never", adapter="native", config={})
+
+        body = self._body(seeded_app)
+        assert "Never synced yet" not in body
+        assert "Last source sync" in body
+        assert "no sweep since this instance restarted" in body
+        assert "across 2 sources" in body
+
+        newest = max(s["last_sync_at"] for s in semantic_source_repo().list_all() if s["last_sync_at"])
+        assert newest.isoformat() in body
+
+    def test_the_count_is_singular_for_one_source(self, seeded_app):
+        self._synced("src-only")
+
+        body = self._body(seeded_app)
+        assert "across 1 source " in body
+        assert "across 1 sources" not in body
+
+    def test_sources_that_never_synced_still_read_never_synced_yet(self, seeded_app):
+        """The one state the old sentence was always true for: rows exist,
+        none of them has ever synced, no sweep has ever run."""
+        from src.repositories import semantic_source_repo
+
+        semantic_source_repo().create(id="src-never", kind="upload", name="src-never", adapter="native", config={})
+
+        body = self._body(seeded_app)
+        assert "Never synced yet" in body
+        assert "Last source sync" not in body
+
+
 def test_the_data_sources_page_shows_both_mismatch_codes():
     """Devin Review on #1248: the more serious warning was filtered out.
 

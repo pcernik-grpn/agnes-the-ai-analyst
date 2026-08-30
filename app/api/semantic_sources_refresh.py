@@ -61,7 +61,10 @@ never aborts the sweep over the rest. ``import_source`` already records
 ``last_sync_at`` / ``last_sync_status`` / ``last_sync_error`` on the source
 row itself (success or failure) — this module does not write that state a
 second time, it only aggregates the per-run HTTP response, plus the
-in-memory last-completed summary the admin page's status strip reads.
+in-memory last-completed summary the admin page's status strip reads. That
+per-row state is also what ``get_sync_status_summary()`` falls back to when
+the in-memory summary is empty, so a freshly restarted process reports the
+sources' real history instead of claiming nothing ever synced.
 """
 
 from __future__ import annotations
@@ -107,11 +110,80 @@ _refresh_state: dict[str, Any] = {
 
 def get_last_refresh_summary() -> dict[str, Any]:
     """Read accessor for the admin UI — the last completed sweep's summary,
-    without reaching into the module-private `_refresh_state` dict."""
+    without reaching into the module-private `_refresh_state` dict.
+
+    In-memory only, by the design above: empty means "no sweep in THIS
+    process", never "nothing has ever synced". Callers rendering a claim
+    about history want `get_sync_status_summary()` instead.
+    """
     return {
         "last_completed_at": _refresh_state.get("last_completed_at"),
         "last_status": _refresh_state.get("last_status"),
         "last_result": _refresh_state.get("last_result"),
+    }
+
+
+def _as_iso(value: Any) -> str | None:
+    """One comparable, renderable form for a `last_sync_at` off either
+    backend — DuckDB hands back a naive datetime, Postgres a tz-aware one,
+    and a raw string is tolerated. Within one backend the format is uniform,
+    so max() over these sorts chronologically."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _last_source_sync() -> tuple[str | None, int]:
+    """The durable fallback: `max(last_sync_at)` across `semantic_sources`,
+    plus how many rows have ever synced at all.
+
+    Read-time derivation over state each row already carries — no new table,
+    no schema change, and `list_all()` exists on both halves of the pair, so
+    a DuckDB instance answers this exactly as a Postgres one does. Degrades
+    to "nothing to report" rather than 500-ing the page it decorates.
+    """
+    try:
+        sources = semantic_source_repo().list_all()
+    except Exception as exc:  # noqa: BLE001 - a status strip must not break the page
+        logger.warning("semantic sources refresh: could not read the sources' last sync: %s", exc)
+        return None, 0
+    stamps = [iso for iso in (_as_iso(source.get("last_sync_at")) for source in sources) if iso]
+    if not stamps:
+        return None, 0
+    return max(stamps), len(stamps)
+
+
+def get_sync_status_summary() -> dict[str, Any]:
+    """What the /admin/semantic-layer status strip renders — the sweep view
+    when there is one, a truthful fallback when there is not.
+
+    `_refresh_state` is deliberately in-memory, so EVERY redeploy empties it.
+    The strip used to read that emptiness as "Never synced yet." — a claim
+    about history made from a fact about this process — while
+    /admin/semantic-sources listed the same sources synced hours earlier.
+
+    Three states, and the label moves with the meaning:
+
+    * a sweep ran in this process — render it, it is the richer view
+      (counts, per-source results);
+    * no sweep here, but sources carry a `last_sync_at` — report THAT, and
+      say what it is: the last sync of any source, not a sweep;
+    * neither — nothing has ever synced, and only there is the old sentence
+      true.
+    """
+    summary = get_last_refresh_summary()
+    fallback_at: str | None = None
+    fallback_count = 0
+    # Only when there is no sweep to show: the richer in-memory view always
+    # wins, and this way the common path costs no query.
+    if summary["last_status"] is None:
+        fallback_at, fallback_count = _last_source_sync()
+    return {
+        **summary,
+        "fallback_last_sync_at": fallback_at,
+        "fallback_source_count": fallback_count,
     }
 
 

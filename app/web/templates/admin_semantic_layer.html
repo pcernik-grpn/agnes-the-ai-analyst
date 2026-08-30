@@ -149,6 +149,12 @@
         Last run {{ rs.last_completed_at }} — OK.
       {% elif rs.last_status == 'error' %}
         Last run ({{ rs.last_completed_at }}) failed: {{ rs.last_result }}
+      {% elif rs.fallback_last_sync_at %}
+        {# No sweep in this process — a redeploy empties that state — so this
+           reports what the source rows durably carry. Different claim,
+           different sentence: the last sync of any source, not a sweep, and
+           not an assertion that it succeeded. #}
+        Last source sync {{ rs.fallback_last_sync_at }} across {{ rs.fallback_source_count }} source{{ '' if rs.fallback_source_count == 1 else 's' }} — no sweep since this instance restarted.
       {% else %}
         Never synced yet.
       {% endif %}
