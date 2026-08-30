@@ -16,6 +16,7 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import duckdb
 import pytest
 import requests
 
@@ -1233,3 +1234,227 @@ class TestDownloadDiskPreflight:
         assert dest.exists()
         assert dest.read_bytes() == b"PAR1data"
         fake_usage.assert_not_called()
+
+
+# ---- empty sliced exports --------------------------------------------------
+#
+# A sliced-export manifest with zero entries used to be an unconditional
+# StorageApiError, which made a table that is legitimately empty upstream
+# (a form-fields table with no attachments, say) permanently red and
+# indistinguishable from a broken extraction. The table detail's `rowsCount`
+# now separates the two states. Both sliced entry points — the CSV
+# `_download_sliced` and the parquet `download_file_slices` — must route
+# through the same decision, so the error branches are parametrized over
+# both call sites.
+
+
+def _empty_manifest_session(table_detail=None, *, detail_status=200):
+    """Session whose first GET returns an entries-less sliced manifest and
+    whose second (when ``table_detail`` is given) answers the
+    ``get_table_info`` lookup the empty-manifest branch makes."""
+    sess = MagicMock()
+    manifest_resp = MagicMock()
+    manifest_resp.json.return_value = {"entries": []}
+    manifest_resp.raise_for_status = MagicMock()
+    responses = [manifest_resp]
+    if table_detail is not None:
+        responses.append(_mock_response(detail_status, table_detail))
+    sess.get.side_effect = responses
+    return sess
+
+
+_SLICED_CSV_FILE_INFO = {
+    "url": "https://signed/manifest.json",
+    "name": "export.csv",
+    "isSliced": True,
+}
+_SLICED_PARQUET_FILE_INFO = {
+    "url": "https://signed/manifest.json",
+    "name": "export.parquet",
+    "isSliced": True,
+}
+
+
+def _run_csv_site(client, tmp_path, table_id):
+    """`download_file` → `_download_sliced` (the CSV entry point)."""
+    dest = tmp_path / "out.csv"
+    client.download_file(_SLICED_CSV_FILE_INFO, dest, table_id=table_id)
+    return dest
+
+
+def _run_parquet_site(client, tmp_path, table_id):
+    """`download_file_slices` (the parquet entry point)."""
+    paths = client.download_file_slices(
+        _SLICED_PARQUET_FILE_INFO,
+        tmp_path / "slices",
+        table_id=table_id,
+    )
+    assert len(paths) == 1, "empty export must still yield exactly one schema-bearing artifact"
+    return paths[0]
+
+
+_BOTH_SITES = pytest.mark.parametrize(
+    "run_site",
+    [_run_csv_site, _run_parquet_site],
+    ids=["csv_download_file", "parquet_download_file_slices"],
+)
+
+
+class TestEmptySlicedExport:
+    # -- branch 1: rowsCount == 0 → success, empty artifact with schema ------
+
+    def test_csv_site_zero_rows_writes_header_only_export(self, tmp_path):
+        """Storage API puts the CSV header in slice 0 and data in slices
+        0..n, so "header, no data rows" IS the empty table's export. DuckDB
+        must read it back as the declared columns with zero rows — that is
+        what makes the downstream master view resolve."""
+        sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id", "answer_text"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        dest = _run_csv_site(c, tmp_path, "in.c-forms.answers")
+
+        assert dest.read_text(encoding="utf-8") == "id,answer_text\n"
+        safe = str(dest).replace("'", "''")
+        res = duckdb.connect().execute(
+            f"SELECT * FROM read_csv('{safe}', all_varchar=true, max_line_size=67108864, quote='\"', escape='\"')"
+        )
+        assert [d[0] for d in res.description] == ["id", "answer_text"]
+        assert res.fetchall() == []
+
+    def test_parquet_site_zero_rows_writes_empty_parquet_with_declared_schema(self, tmp_path):
+        """The synthetic slice must be a real parquet carrying the declared
+        columns — the extractor merges it through
+        `read_parquet([...])`, and a view over a column-less file would not
+        resolve."""
+        sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id", "answer_text", "created_at"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        slice_path = _run_parquet_site(c, tmp_path, "in.c-forms.answers")
+
+        assert slice_path.exists()
+        safe = str(slice_path).replace("'", "''")
+        res = duckdb.connect().execute(f"SELECT * FROM read_parquet('{safe}')")
+        assert [d[0] for d in res.description] == ["id", "answer_text", "created_at"]
+        assert res.fetchall() == []
+
+    def test_parquet_site_zero_rows_survives_the_extractor_merge_copy(self, tmp_path):
+        """End of the chain the extractor actually walks: COPY over
+        `read_parquet([slice])` into the published parquet, then COUNT(*).
+        Columns survive, the count is 0 — so `_meta` records 0 rows rather
+        than the sync failing."""
+        sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id", "answer_text"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        slice_path = _run_parquet_site(c, tmp_path, "in.c-forms.answers")
+
+        merged = tmp_path / "merged.parquet"
+        conn = duckdb.connect()
+        conn.execute(f"COPY (SELECT * FROM read_parquet(['{slice_path}'])) TO '{merged}' (FORMAT PARQUET)")
+        res = conn.execute(f"SELECT * FROM read_parquet('{merged}')")
+        assert [d[0] for d in res.description] == ["id", "answer_text"]
+        assert conn.execute(f"SELECT COUNT(*) FROM read_parquet('{merged}')").fetchone()[0] == 0
+
+    @_BOTH_SITES
+    def test_zero_rows_upstream_is_not_an_error(self, tmp_path, run_site):
+        sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        artifact = run_site(c, tmp_path, "in.c-forms.answers")
+
+        assert artifact.exists()
+
+    @_BOTH_SITES
+    def test_zero_rows_string_rows_count_is_still_empty_not_unknown(self, tmp_path, run_site):
+        """Some stacks serialize `rowsCount` as a numeric string. `"0"` is
+        still zero — not "unavailable"."""
+        sess = _empty_manifest_session({"rowsCount": "0", "columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        assert run_site(c, tmp_path, "in.c-forms.answers").exists()
+
+    # -- branch 2: rowsCount > 0 → still an error, said plainly --------------
+
+    @_BOTH_SITES
+    def test_rows_upstream_but_no_slices_is_still_an_error(self, tmp_path, run_site):
+        sess = _empty_manifest_session({"rowsCount": 4200, "columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        with pytest.raises(StorageApiError, match=r"claims 4200 rows"):
+            run_site(c, tmp_path, "in.c-forms.answers")
+
+    @_BOTH_SITES
+    def test_rows_upstream_error_names_the_table_and_the_lost_slices(self, tmp_path, run_site):
+        sess = _empty_manifest_session({"rowsCount": 7, "columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        with pytest.raises(StorageApiError) as exc:
+            run_site(c, tmp_path, "in.c-forms.answers")
+
+        msg = str(exc.value)
+        assert "in.c-forms.answers" in msg
+        assert "no slices" in msg
+
+    # -- branch 3: rowsCount unavailable → error, exactly as before ----------
+
+    @_BOTH_SITES
+    def test_missing_rows_count_field_raises_as_before(self, tmp_path, run_site):
+        """Unknown must never present itself as empty."""
+        sess = _empty_manifest_session({"columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        with pytest.raises(StorageApiError, match="sliced manifest had no entries"):
+            run_site(c, tmp_path, "in.c-forms.answers")
+
+    @_BOTH_SITES
+    def test_no_table_id_to_ask_about_raises_as_before(self, tmp_path, run_site):
+        """Callers that cannot name the table (no `table_id` threaded
+        through) keep the pre-fix behaviour — and make no extra API call."""
+        sess = _empty_manifest_session()
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        with pytest.raises(StorageApiError, match="sliced manifest had no entries"):
+            run_site(c, tmp_path, None)
+
+        assert sess.get.call_count == 1, "no table detail lookup without a table_id"
+
+    @_BOTH_SITES
+    def test_table_detail_lookup_failure_raises_as_before(self, tmp_path, run_site):
+        """A 403 on the table detail leaves `rowsCount` unknown; the export
+        must not be reported as an empty success."""
+        sess = _empty_manifest_session({"error": "forbidden"}, detail_status=403)
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        with pytest.raises(StorageApiError, match="sliced manifest had no entries"):
+            run_site(c, tmp_path, "in.c-forms.answers")
+
+    @_BOTH_SITES
+    def test_non_numeric_rows_count_raises_as_before(self, tmp_path, run_site):
+        sess = _empty_manifest_session({"rowsCount": "unknown", "columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        with pytest.raises(StorageApiError, match="sliced manifest had no entries"):
+            run_site(c, tmp_path, "in.c-forms.answers")
+
+    # -- unchanged: a manifest WITH entries never asks for the table detail --
+
+    def test_non_empty_manifest_makes_no_table_detail_call(self, tmp_path):
+        sess = MagicMock()
+        manifest_resp = MagicMock()
+        manifest_resp.json.return_value = {"entries": [{"url": "https://signed/slice-0"}]}
+        manifest_resp.raise_for_status = MagicMock()
+        slice0 = MagicMock()
+        slice0.__enter__ = MagicMock(return_value=slice0)
+        slice0.__exit__ = MagicMock(return_value=False)
+        slice0.iter_content.return_value = [b"PAR1...slice0..."]
+        slice0.raise_for_status = MagicMock()
+        sess.get.side_effect = [manifest_resp, slice0]
+
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+        paths = c.download_file_slices(
+            _SLICED_PARQUET_FILE_INFO,
+            tmp_path / "slices",
+            table_id="in.c-forms.answers",
+        )
+
+        assert len(paths) == 1
+        assert sess.get.call_count == 2  # manifest + the slice, no table detail
