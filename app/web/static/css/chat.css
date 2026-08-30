@@ -1271,6 +1271,28 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   font-size: var(--text-xs);
   color: var(--ds-text-muted);
 }
+/* Semantic-layer soft-enforce advisory (P2-1) — the same amber vocabulary
+   `.callout-rec`/`.ag-note--warn` use elsewhere, scoped small here since this
+   sits inside an already-succeeded tool result, not a standalone callout. */
+.cloud-chat-tool-result-advisory {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--ds-radius-sm, 6px);
+  background: var(--ds-accent-warn-bg);
+  border-left: 3px solid var(--ds-accent-warn-line);
+  color: var(--ds-accent-warn-ink);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+.cloud-chat-tool-result-advisory .ds-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+}
 .cloud-chat-tool-result-preview > :first-child { margin-top: 0; }
 .cloud-chat-tool-result-preview > :last-child  { margin-bottom: 0; }
 .cloud-chat-tool-result.is-json pre {

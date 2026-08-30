@@ -433,7 +433,6 @@ def engine_probe(monkeypatch):
     def _spy(sql, user, conn, *, target_engine="duckdb"):
         seen["engine"] = target_engine
         seen["calls"] += 1
-        return None
 
     monkeypatch.setattr(sm_mod, "semantic_validation_for_query", _spy)
     return seen
@@ -709,3 +708,67 @@ class TestFailureLogging:
         assert records[0].levelno == logging.WARNING
         assert records[0].exc_info is None, "no per-query traceback"
         assert "validator exploded" in records[0].getMessage(), "the error itself must still be in the line"
+
+
+# ── POST /api/query/hybrid gets the same advisory (P2-1) ───────────────────
+
+
+def _hybrid_query(app, token: str, sql: str = "SELECT revenue FROM orders"):
+    return app["client"].post(
+        "/api/query/hybrid",
+        json={"sql": sql, "register_bq": {}},
+        headers=_auth(token),
+    )
+
+
+class TestHybridQueryResponseField:
+    """`POST /api/query/hybrid` (`app/api/query_hybrid.py`) used to skip the
+    semantic advisory entirely — the one query path that combines BigQuery
+    and local data said nothing about a violated constraint or a
+    not-locally-executable metric, unlike the plain `/api/query` endpoint.
+    Mirrors `TestQueryResponseField`'s cases against the hybrid endpoint."""
+
+    def test_warns_on_an_error_severity_constraint_violation(self, orders_app):
+        _seed_model()
+        r = _hybrid_query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 2, body
+        sv = body["semantic_validation"]
+        assert sv is not None, body
+        assert sv["valid"] is False
+        assert any("revenue_needs_tenant_filter" in w for w in sv["warnings"]), sv
+
+    def test_warns_when_a_used_metric_is_not_locally_executable(self, orders_app):
+        _seed_model(with_constraint=False)
+        r = _hybrid_query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        sv = r.json()["semantic_validation"]
+        assert sv is not None
+        assert sv["locally_executable"] is False
+
+    def test_omitted_when_the_query_is_clean(self, orders_app):
+        _seed_model(with_constraint=False, dialect="duckdb")
+        r = _hybrid_query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert r.json()["semantic_validation"] is None
+
+    def test_omitted_when_the_instance_has_no_semantic_model(self, orders_app):
+        r = _hybrid_query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert r.json()["semantic_validation"] is None
+
+    def test_a_validator_failure_never_breaks_the_hybrid_query(self, orders_app, monkeypatch):
+        import app.api.semantic_models as sm_mod
+
+        _seed_model()
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("validator exploded")
+
+        monkeypatch.setattr(sm_mod, "validate_query", _boom)
+        r = _hybrid_query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 2
+        assert body["semantic_validation"] is None
