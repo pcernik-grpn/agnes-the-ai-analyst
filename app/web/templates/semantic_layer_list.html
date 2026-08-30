@@ -1,4 +1,5 @@
 {% extends "base_page.html" %}
+{% import "macros/_state.html" as state %}
 
 {# NAME: "Semantic models", never "Semantic layer" — that name was worn by
    three of the four semantic surfaces at once (this page, /catalog/semantics
@@ -115,12 +116,11 @@
     {% endfor %}
 </div>
 {% else %}
-<div class="empty-state">
-    <h3 class="empty-state__title">No semantic model available</h3>
-    <p class="empty-state__description">
-        Ask an admin to import or author one, or to grant you access to an existing one
-        (<a href="/catalog/semantics">Metrics &amp; glossary</a> is a related, separate view).
-    </p>
-</div>
+{# No `q` on this page — every model the caller can read is listed, so a
+   zero-row result is the collection genuinely being empty, never a filter
+   collapse. `empty`, not `nothing_found`. #}
+{{ state.panel('empty', 'No semantic model available',
+               body='Ask an admin to import or author one, or to grant you access to an existing one.',
+               cta_label='Metrics & glossary (related view) →', cta_href='/catalog/semantics') }}
 {% endif %}
 {% endblock %}

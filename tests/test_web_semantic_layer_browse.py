@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 from src.db import get_system_db
 
@@ -573,6 +574,33 @@ class TestModelDetail:
         assert "alpha_ds" in r.text
         assert "beta_ds" not in r.text
 
+    def test_filtered_no_match_renders_nothing_found_not_empty(self, seeded_app):
+        """A3 (issue #1707): a `q` that matches nothing is a filter collapse,
+        not a genuinely empty collection — the exact distinction the shared
+        `state.panel` vocabulary exists to keep visible. Must render
+        `nothing_found`, never `empty`, with the filter value itself part of
+        the copy (the removable chip above the table also carries it)."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get(
+            f"/semantic-layer/{_SLUG}?tab=datasets&q=no_such_dataset_at_all",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert 'data-state-kind="nothing_found"' in r.text
+        assert 'data-state-kind="empty"' not in r.text
+        assert "no_such_dataset_at_all" in r.text
+
+    def test_unfiltered_empty_collection_renders_empty_not_nothing_found(self, seeded_app):
+        """A3 (issue #1707): a tab with no `q` and zero rows is the collection
+        itself being empty, never a filter collapse. Must render `empty`."""
+        _seed_document("blank", {"semantic_model": [{"name": "blank", "datasets": [], "metrics": []}]})
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer/blank?tab=datasets", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-state-kind="empty"' in r.text
+        assert 'data-state-kind="nothing_found"' not in r.text
+
 
 class TestObjectDetail:
     def test_dataset_object_renders_fields_table_and_all_five_ai_groups(self, seeded_app):
@@ -683,7 +711,9 @@ class TestObjectDetail:
         with the other `[data-tip]` sites in the repo, none of which use it."""
         _seed_model()
         c = seeded_app["client"]
-        r = c.get(f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"]))
+        r = c.get(
+            f"/semantic-layer/{_SLUG}/constraint:region_filter_required", headers=_auth(seeded_app["admin_token"])
+        )
         assert r.status_code == 200
         body = r.text
         span_match = re.search(r'<span class="badge[^"]*"[^>]*>error</span>', body)
@@ -902,3 +932,21 @@ class TestRegistryBackLink:
         r = self._object(seeded_app, f"/semantic-layer/{_SLUG}/dataset:orders")
         assert r.status_code == 200, r.text
         assert "/catalog/semantics?q=" not in r.text
+
+
+class TestEmptyStateVocabulary:
+    """A3 (issue #1707): the legacy `.empty-state`/`.empty-state__*` markup
+    across the three browse templates is retired in favor of the shared
+    `macros/_state.html` → `state.panel(kind, ...)` vocabulary, which alone
+    can tell a filter collapse (`nothing_found`) apart from a genuinely empty
+    collection (`empty`) — the distinction the legacy markup could not
+    express."""
+
+    def test_no_legacy_empty_state_class_in_semantic_layer_templates(self):
+        templates_dir = Path(__file__).resolve().parents[1] / "app" / "web" / "templates"
+        offenders = {}
+        for path in sorted(templates_dir.glob("semantic_layer_*.html")):
+            text = path.read_text(encoding="utf-8")
+            if "empty-state" in text:
+                offenders[path.name] = text.count("empty-state")
+        assert not offenders, f"legacy .empty-state markup still present: {offenders}"
