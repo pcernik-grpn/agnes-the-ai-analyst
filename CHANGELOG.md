@@ -14,6 +14,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **Publishing external apps is part of connecting the MCP source that lists them.** The linked-apps builder was never able to stand alone: its first step asked which MCP source to read apps from and dead-ended if none was registered ("register one first, then come back"), and when exactly one existed it picked that one by elimination and printed "✓ Using" for a choice the admin never made. It is now the last section of the MCP-source builder, shown only when the server actually exposes a lister tool and only where data apps are switched on — register the source and you stay on the page to read its app list and share it with the same groups you just granted. Reading the list no longer installs a nightly 03:00 job as a side effect of looking: the schedule is a toggle, off by default. `/admin/linked-apps` and `/admin/linked-apps/new` redirect to the builder, and the Library's "+ Add" menu offers one door instead of two that led to the same room.
+
 ### Fixed
 
 - **A failed builder turn names its cause.** All four builders collapsed every distinguishable failure into one 502 telling the author to try again — advice that can never work for a rejected credential, an unavailable model or a refused request. Each now gets its own `kind` (`builder_llm_credential_rejected`, `builder_llm_model_unavailable`, `builder_llm_rate_limited`, `builder_llm_unreachable`, `builder_llm_request_refused`), a hint that says whether retrying can help, and the provider's own error text (length-capped) so the cause is visible without shell access to the server. A 404 from the provider is typed as `LLMModelNotFoundError` instead of escaping as a bare SDK exception.

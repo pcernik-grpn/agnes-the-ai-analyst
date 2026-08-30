@@ -2386,15 +2386,11 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
               <span>Connect a source<small>Warehouse, BigQuery, Databricks, files</small></span>
             </a>
-            {# An app is a view onto the data rather than something an agent
-               calls, which is why it is added from this half. Opens the existing
-               three-step admin ingest. #}
-            {% if data_apps_enabled() %}
-            <a class="lib-new__item" href="/admin/linked-apps/new" role="menuitem">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
-              <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
-            </a>
-            {% endif %}{# data apps off → the flow cannot complete, so it is not offered #}
+            {# "Link an external app" used to sit here. It never stood on its
+               own — every path through it began by picking an MCP source it
+               could not create — so it is now the last section of the builder
+               that registers that source, and this menu offers one door
+               instead of two that led to the same room. #}
             {% endif %}
             <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>
@@ -2419,7 +2415,7 @@
                that reading wins later, this row moves and nothing else does. #}
             <a class="lib-new__item" href="/admin/mcp-sources/new" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v6M5.5 7.5l4 3M18.5 7.5l-4 3M12 21v-6" stroke-linecap="round"/><circle cx="12" cy="12" r="2.5"/></svg>
-              <span>Connect an MCP source<small>Tools an agent can call</small></span>
+              <span>Connect an MCP source<small>Tools an agent can call{% if data_apps_enabled() %}, and any apps it lists{% endif %}</small></span>
             </a>
             {% endif %}
             <div class="lib-new__sep"></div>

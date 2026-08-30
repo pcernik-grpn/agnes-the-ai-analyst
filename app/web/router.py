@@ -6707,43 +6707,23 @@ async def admin_hub(
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
 
 
-@router.get("/admin/linked-apps/new", response_class=HTMLResponse)
+@router.get("/admin/linked-apps/new")
 async def admin_linked_apps_builder(
     request: Request,
     user: dict = Depends(require_admin),
-):
-    """Publish externally-hosted apps into the Library, in the builder shell.
+) -> RedirectResponse:
+    """Gone — publishing linked apps is a section of the MCP-source builder.
 
-    /admin/linked-apps stays as the wizard for now; this is the path the
-    Library's "+ Add" reaches. What it fixes is the two things that made the
-    wizard an operator-hostile surface: step 1 asked which MCP source to read
-    apps from, with a dead end under it ("Not registered yet? Register one
-    first, then come back"), and step 2 asked for a projection map — which
-    response field is the app's name, which is its URL.
-
-    A projection map is an integration author's artifact. The adapter already
-    falls back to alias guesses (src/data_apps/keboola_adapter.py), so the
-    mapping is an escape hatch shown only when a row came back that the aliases
-    could not read, and the source and its lister tool are detected rather than
-    chosen.
+    It was always downstream of that builder and could never stand alone: step
+    one asked which MCP source to read apps from and dead-ended with "not
+    registered yet? register one first, then come back", and when exactly one
+    source existed it picked that one by elimination and printed "✓ Using" for
+    a choice the admin never made. Folding it in removes the round trip, the
+    guess, and an entry point that could not complete on an instance with data
+    apps switched off. The path stays so bookmarks and the old admin links
+    still land somewhere useful.
     """
-    # Data apps are OFF by default, and this builder cannot complete without
-    # them: the app list 404s `data_apps_disabled` at the last step — AFTER
-    # "+ Fetch apps" has already switched a shared MCP tool to materialize
-    # mode and installed a nightly job. The same predicate already hides the
-    # data-apps hub in the rail; it simply was never applied here.
-    if not _data_apps_nav_enabled():
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": "data_apps_disabled",
-                "message": (
-                    "Linked apps are switched off on this instance. Turn on data_apps.enabled "
-                    "in server config, then come back."
-                ),
-            },
-        )
-    return templates.TemplateResponse(request, "admin_linked_apps_builder.html", _build_context(request, user=user))
+    return RedirectResponse("/admin/mcp-sources/new", status_code=302)
 
 
 @router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
@@ -8983,18 +8963,16 @@ async def admin_marketplaces_page(
     return templates.TemplateResponse(request, "admin_marketplaces.html", ctx)
 
 
-@router.get("/admin/linked-apps", response_class=HTMLResponse)
+@router.get("/admin/linked-apps")
 async def admin_linked_apps_page(
     request: Request,
     user: dict = Depends(require_admin),
-):
-    """Guided admin flow for linking externally-hosted (Keboola) data apps:
-    pick an MCP source → materialize its data-app lister → select the ingested
-    apps and grant them to a group. Wires existing admin APIs (mcp-sources,
-    mcp-tools, materialize, data-apps ?kind=linked, access/grants) — no new
-    control-plane surface beyond the page itself."""
-    ctx = _build_context(request, user=user)
-    return templates.TemplateResponse(request, "admin_linked_apps.html", ctx)
+) -> RedirectResponse:
+    """Gone, for the same reason as ``/admin/linked-apps/new`` above: the
+    wizard's three steps (pick a source → materialize its lister → select and
+    grant the apps) are now the last section of the builder that registers the
+    source, reached in the flow that created it."""
+    return RedirectResponse("/admin/mcp-sources/new", status_code=302)
 
 
 @router.get("/admin/contribute-skill", response_class=HTMLResponse)

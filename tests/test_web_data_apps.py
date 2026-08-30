@@ -357,16 +357,16 @@ def test_detail_linked_hides_deploy_shows_override_form(web_env):
     assert "https://example.com/apps/sales" in resp.text
 
 
-def test_admin_linked_apps_wizard_renders_for_admin(web_env):
+def test_admin_linked_apps_wizard_redirects_to_the_mcp_builder(web_env):
+    """The wizard's three steps — pick a source, materialize its lister,
+    select and grant the apps — are now the last section of the builder that
+    registers the source. Its first step could only ever point at a source it
+    had no way to create, so the flow is one page, and the old path lands on
+    it."""
     c = web_env["client"]
-    resp = c.get("/admin/linked-apps", headers=_auth(web_env["admin_pat"]))
-    assert resp.status_code == 200
-    # Heading matches the sidebar row ("Linked apps"); the page used to open
-    # with the verb ("Link Keboola apps") while the nav named the noun.
-    assert "Linked apps" in resp.text
-    # the three wizard steps are present
-    assert 'id="wiz-step-1"' in resp.text
-    assert 'id="wiz-step-3"' in resp.text
+    resp = c.get("/admin/linked-apps", headers=_auth(web_env["admin_pat"]), follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "/admin/mcp-sources/new"
 
 
 def test_admin_linked_apps_wizard_forbidden_for_non_admin(web_env):
@@ -408,14 +408,16 @@ def test_detail_page_404s_soft_deleted_linked_app(web_env):
     assert resp.status_code == 404
 
 
-def test_linked_apps_wizard_calls_real_access_endpoints():
-    """The wizard's group/grant calls must hit the mounted /api/admin router —
-    /api/access/* does not exist and 404s silently in the UI (Devin Review on
-    #1116)."""
-    src = open("app/web/templates/admin_linked_apps.html").read()
-    assert "/api/admin/groups" in src
+def test_app_publishing_calls_real_access_endpoints():
+    """Group/grant calls must hit the mounted /api/admin router — /api/access/*
+    does not exist and 404s silently in the UI (Devin Review on #1116).
+
+    Follows the code: the wizard that used to make these calls is gone, and
+    the MCP-source builder inherited them along with the section.
+    """
+    src = open("app/web/static/js/components/mcp_builder.js").read()
     assert "/api/admin/grants" in src
     assert "/api/access/" not in src
-    # The wizard is the ONE caller that designates its tool as the data-app
-    # lister — without the flag the server never projects a targeted run.
+    # It is the ONE caller that designates its tool as the data-app lister —
+    # without the flag the server never projects a targeted run.
     assert "lister: true" in src

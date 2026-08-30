@@ -79,8 +79,8 @@ anyone to one without checking `/admin/server-config` first. Each is one flag
 - `/admin/prompts` — the agent and workspace prompt overrides.
 - `/admin/datasource-credentials` — instance secrets for data sources.
 - `/admin/mcp-sources` — external MCP servers offered to users, and
-  per-tool grants.
-- `/admin/linked-apps` — linked external applications.
+  per-tool grants. Registering one at `/admin/mcp-sources/new` is also where
+  externally-hosted apps a server lists get catalogued and granted.
 
 ### Activity
 

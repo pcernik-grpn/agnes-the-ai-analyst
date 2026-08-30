@@ -38,7 +38,13 @@
     'use strict';
     var mount = document.getElementById('mcp-builder-view');
     if (!mount || !window.AgnesMcpBuilder) return;
-    window.AgnesMcpBuilder.open({ mount: mount });
+    window.AgnesMcpBuilder.open({
+      mount: mount,
+      // Whether the "Apps this server lists" section can appear at all. A
+      // separate linked-apps builder existed on instances where data apps are
+      // switched off, and every path through it ended in `data_apps_disabled`.
+      dataAppsEnabled: {{ 'true' if data_apps_enabled() else 'false' }},
+    });
   })();
 </script>
 {% endblock %}

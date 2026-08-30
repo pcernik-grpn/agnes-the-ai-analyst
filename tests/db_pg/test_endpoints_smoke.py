@@ -1376,10 +1376,17 @@ class TestMcpBuilderSmoke:
         assert r.status_code == 200, r.text
         assert "mcp-builder-view" in r.text
 
-    def test_linked_apps_builder_page_renders_for_an_admin(self, seeded_app_both):
-        r = seeded_app_both["client"].get("/admin/linked-apps/new", headers=_admin_headers(seeded_app_both))
-        assert r.status_code == 200, r.text
-        assert "la-builder-view" in r.text
+    def test_the_linked_apps_builder_redirects_into_this_one(self, seeded_app_both):
+        """It was never a builder that could stand alone — its first step
+        asked for an MCP source it had no way to create — so publishing apps
+        is a section here, and the old path lands on it."""
+        r = seeded_app_both["client"].get(
+            "/admin/linked-apps/new",
+            headers=_admin_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == "/admin/mcp-sources/new"
 
     def test_the_opening_turn_reports_slots_and_engine(self, seeded_app_both):
         """An empty first message is the builder speaking first; it must come

@@ -1362,7 +1362,7 @@
         "type": "object"
       },
       "BuilderMessage": {
-        "description": "One turn of the transcript, as the page replays it.",
+        "description": "One turn of the transcript, as the page replays it.\n\n``text`` is TRUNCATED rather than rejected. It used to carry\n``max_length``, which is right for a field the author types and wrong for\none the page replays: a single reply over the cap made every later turn in\nthat conversation 422 \u2014 a conversation with no way out, and the page had\nno idea why. The author's own message is still capped where it is typed\n(``MAX_MESSAGE_CHARS`` on each builder's request model); this cap only\nbounds what the transcript costs to resend.",
         "properties": {
           "role": {
             "maxLength": 16,
@@ -1371,7 +1371,6 @@
           },
           "text": {
             "default": "",
-            "maxLength": 4000,
             "title": "Text",
             "type": "string"
           }
@@ -4111,29 +4110,25 @@
         "type": "object"
       },
       "EntityDraft": {
-        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.",
+        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.\n\nEvery field TRUNCATES rather than rejecting, for the same reason\n``BuilderMessage.text`` does: this is replayed context, not authored\ninput. A body long enough to exceed the cap is legal everywhere else in\nthe product \u2014 the markdown upload takes 512 KB and the store's own\n``skill_md`` is unbounded \u2014 so rejecting it here meant an author could\nwrite something the builder then refused to discuss, with a 422 whose\ntext blamed their last message. The prompt only ever shows a truncated\npanel anyway (see ``panel_prompt_section``).",
         "properties": {
           "body": {
             "default": "",
-            "maxLength": 40000,
             "title": "Body",
             "type": "string"
           },
           "category": {
             "default": "",
-            "maxLength": 120,
             "title": "Category",
             "type": "string"
           },
           "description": {
             "default": "",
-            "maxLength": 4000,
             "title": "Description",
             "type": "string"
           },
           "name": {
             "default": "",
-            "maxLength": 64,
             "title": "Name",
             "type": "string"
           }
@@ -12631,7 +12626,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.91.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -14156,7 +14151,7 @@
     },
     "/admin/linked-apps": {
       "get": {
-        "description": "Guided admin flow for linking externally-hosted (Keboola) data apps:\npick an MCP source \u2192 materialize its data-app lister \u2192 select the ingested\napps and grant them to a group. Wires existing admin APIs (mcp-sources,\nmcp-tools, materialize, data-apps ?kind=linked, access/grants) \u2014 no new\ncontrol-plane surface beyond the page itself.",
+        "description": "Gone, for the same reason as ``/admin/linked-apps/new`` above: the\nwizard's three steps (pick a source \u2192 materialize its lister \u2192 select and\ngrant the apps) are now the last section of the builder that registers the\nsource, reached in the flow that created it.",
         "operationId": "admin_linked_apps_page_admin_linked_apps_get",
         "parameters": [
           {
@@ -14179,10 +14174,8 @@
         "responses": {
           "200": {
             "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
+              "application/json": {
+                "schema": {}
               }
             },
             "description": "Successful Response"
@@ -14206,7 +14199,7 @@
     },
     "/admin/linked-apps/new": {
       "get": {
-        "description": "Publish externally-hosted apps into the Library, in the builder shell.\n\n/admin/linked-apps stays as the wizard for now; this is the path the\nLibrary's \"+ Add\" reaches. What it fixes is the two things that made the\nwizard an operator-hostile surface: step 1 asked which MCP source to read\napps from, with a dead end under it (\"Not registered yet? Register one\nfirst, then come back\"), and step 2 asked for a projection map \u2014 which\nresponse field is the app's name, which is its URL.\n\nA projection map is an integration author's artifact. The adapter already\nfalls back to alias guesses (src/data_apps/keboola_adapter.py), so the\nmapping is an escape hatch shown only when a row came back that the aliases\ncould not read, and the source and its lister tool are detected rather than\nchosen.",
+        "description": "Gone \u2014 publishing linked apps is a section of the MCP-source builder.\n\nIt was always downstream of that builder and could never stand alone: step\none asked which MCP source to read apps from and dead-ended with \"not\nregistered yet? register one first, then come back\", and when exactly one\nsource existed it picked that one by elimination and printed \"\u2713 Using\" for\na choice the admin never made. Folding it in removes the round trip, the\nguess, and an entry point that could not complete on an instance with data\napps switched off. The path stays so bookmarks and the old admin links\nstill land somewhere useful.",
         "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
         "parameters": [
           {
@@ -14229,10 +14222,8 @@
         "responses": {
           "200": {
             "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
+              "application/json": {
+                "schema": {}
               }
             },
             "description": "Successful Response"

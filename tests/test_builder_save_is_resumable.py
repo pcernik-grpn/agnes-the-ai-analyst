@@ -83,7 +83,13 @@ global.document = {
   body: el(),
 };
 const mount = el();
-global.window = { location: { href: '' }, document: global.document };
+// `window` IS the global object in a browser, so a module that does
+// `window.X = ...` and then reads a bare `X` works there. A shim that made
+// `window` a plain object broke exactly that, and every builder reads the
+// shell through a bare `BuilderShell` somewhere — so the shim aliases the
+// global instead of standing in for it.
+global.window = global;
+global.window.location = { href: '' };
 global.self = global.window;
 
 // A synthetic target: `closest` returns itself so the module's delegation
@@ -156,6 +162,9 @@ installFetch({
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   // The create succeeds and hands back an id. Keyed exactly, so the
   // builder's own opening turn (POST .../builder/turn) cannot consume it.
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search', description: 'find things', read_only: true }] },
+  },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-1' } }],
   // ...and the FIRST grant attempt fails. The retry's grant is unqueued, so
   // it answers 200 — the resumed save must then finish.
@@ -164,9 +173,13 @@ installFetch({
 window.AgnesMcpBuilder.open({ mount });
 (async () => {
   await flush();
-  // Type a name and a url, the two things canSave() needs.
+  // Type a name and a url, then check the connection — Register source is
+  // gated on a real introspection, because a source with no tools is a source
+  // that can answer nothing.
   fire('input', { 'data-mcp-field': 'name', value: 'CRM' });
   fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
   // Pick a group so there is a grant step at all. The picker has to be opened
   // first: `toggleGroup` resolves the id against the loaded group list, and
   // the picker is what loads it. Without this the group list stayed empty, the
@@ -205,6 +218,9 @@ def test_an_already_granted_group_does_not_fail_the_mcp_save():
         + r"""
 installFetch({
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search', description: 'find things', read_only: true }] },
+  },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-2' } }],
   // 409 = the group can already reach it, which is the end state Save wants.
   'POST /api/admin/mcp-sources/src-2/grants': {
@@ -216,6 +232,8 @@ window.AgnesMcpBuilder.open({ mount });
   await flush();
   fire('input', { 'data-mcp-field': 'name', value: 'CRM' });
   fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
   fire('click', { 'data-mcp-openpick': '1' });
   for (let i = 0; i < 8; i++) await flush();
   fire('click', { 'data-mcp-pick': 'g1' });
@@ -232,30 +250,31 @@ window.AgnesMcpBuilder.open({ mount });
     )
 
 
-# ── Linked apps: 409 is done, and one failure does not hide the rest ─────────
+# ── Publishing apps: 409 is done, and one failure does not hide the rest ────
 
 
-def _linked_script(grant_responses: str, tail: str) -> str:
-    """Drive the linked-apps builder as far as Save.
+def _apps_script(grant_responses: str, tail: str) -> str:
+    """Drive the MCP builder through registration and into the apps section.
 
-    The apps come from the fetch step (a Keboola MCP source + its lister tool),
-    so the harness answers those three reads before Save has anything to grant.
+    This used to be its own builder (`linked_apps_builder.js`) and its own
+    page. It could not stand alone — its first step asked which MCP source to
+    read apps from, and dead-ended if none was registered — so it is now the
+    last section of the builder that registers the source, and these are the
+    same two invariants against the folded code.
     """
     return (
         _HARNESS
-        + _load(SHELL, LINKED)
+        + _load(SHELL, MCP)
         + r"""
 installFetch({
-  'GET /api/admin/mcp-sources': { status: 200, body: [
-    { id: 's1', name: 'keboola', url: 'https://connection.example.com/mcp', enabled: true },
-  ] },
-  // One lister tool, so `loadTools` picks it without the admin choosing.
-  'GET /api/admin/mcp-tools?source_id=s1': { status: 200, body: [
-    { id: 't1', tool_id: 't1', source_id: 's1', name: 'list_data_apps', enabled: true },
-  ] },
+  // A lister tool, which is what makes the apps section appear at all.
+  'POST /api/admin/mcp-sources/preview-introspect': { status: 200, body: { tools: [
+    { name: 'list_data_apps', description: 'apps hosted upstream', read_only: true },
+  ] } },
   'GET /api/admin/groups': { status: 200, body: [
     { id: 'g1', name: 'Analysts' }, { id: 'g2', name: 'Finance' },
   ] },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 's1' } }],
   'GET /api/data-apps?kind=linked&source=s1': { status: 200, body: { apps: [
     { id: 'app-a', name: 'Churn' }, { id: 'app-b', name: 'Revenue' },
   ] } },
@@ -263,15 +282,25 @@ installFetch({
         + grant_responses
         + r"""
 });
-window.AgnesLinkedAppsBuilder.open({ mount });
+window.AgnesMcpBuilder.open({ mount, dataAppsEnabled: true });
 (async () => {
   await flush();
-  // Pick the source (which loads and auto-picks its one lister tool), then
-  // fetch the catalogue — every app comes back chosen by default.
-  fire('click', { 'data-la-source': 's1' });
+  fire('input', { 'data-mcp-field': 'name', value: 'keboola' });
+  fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
   for (let i = 0; i < 8; i++) await flush();
-  fire('click', { 'data-la-fetch': '1' });
-  for (let i = 0; i < 12; i++) await flush();
+  // Pick the group before registering: the same groups that get the source
+  // get its apps, which is the whole reason the section lives here.
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 14; i++) await flush();
+  // Registered — and still here, because there are apps to catalogue.
+  const hrefAfterRegister = window.location.href;
+  fire('click', { 'data-mcp-apps': '1' });
+  for (let i = 0; i < 14; i++) await flush();
 """
         + tail
         + r"""
@@ -280,23 +309,94 @@ window.AgnesLinkedAppsBuilder.open({ mount });
     )
 
 
-def test_linked_apps_treats_an_existing_grant_as_done():
-    """Every pair 409s — the apps are already granted to those groups. That is
-    the state the admin asked for, so Save must complete."""
-    script = _linked_script(
+def test_registering_a_source_that_lists_apps_stays_on_the_page():
+    """The fold is only worth anything if the builder does not navigate away
+    from the section it just revealed."""
+    script = _apps_script(
+        "",
+        r"""
+  process.stdout.write(JSON.stringify({
+    hrefAfterRegister,
+    href: window.location.href,
+    all: CALLS,
+    materialized: CALLS.filter((c) => c.indexOf('/materialize') >= 0).length,
+  }));
+""",
+    )
+    res = _node(script)
+    assert res["hrefAfterRegister"] == "", f"it redirected instead of showing the apps: {res['all']}"
+    assert res["materialized"] == 1, f"the lister was never materialized: {res['all']}"
+
+
+def test_an_instance_with_data_apps_off_is_never_offered_the_section():
+    """The retired builder's whole failure mode: it was reachable on an
+    instance where data apps are switched off, and every path through it ended
+    at `data_apps_disabled` — AFTER it had already switched a shared tool to
+    materialize mode. Off means the section does not exist."""
+    script = (
+        _HARNESS
+        + _load(SHELL, MCP)
+        + r"""
+installFetch({
+  'POST /api/admin/mcp-sources/preview-introspect': { status: 200, body: { tools: [
+    { name: 'list_data_apps', description: 'apps hosted upstream', read_only: true },
+  ] } },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 's9' } }],
+});
+window.AgnesMcpBuilder.open({ mount, dataAppsEnabled: false });
+(async () => {
+  await flush();
+  fire('input', { 'data-mcp-field': 'name', value: 'keboola' });
+  fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 14; i++) await flush();
+  process.stdout.write(JSON.stringify({ href: window.location.href, all: CALLS }));
+})();
+"""
+    )
+    res = _node(script)
+    assert res["href"] == "/admin/mcp-sources/s9", (
+        f"it waited for an apps section that cannot exist here: {res['all']}"
+    )
+    assert not [c for c in res["all"] if "/materialize" in c], (
+        f"it materialized a lister on an instance that cannot show apps: {res['all']}"
+    )
+
+
+def test_reading_the_app_list_does_not_install_a_nightly_job_by_itself():
+    """Fetching used to switch a SHARED tool to materialize mode *and* install
+    a `daily 03:00` schedule, as a side effect of looking. The mode is
+    required — the projection reads a table the run writes — the schedule is
+    not, so it is the admin's choice and defaults to off."""
+    script = _apps_script(
+        "",
+        r"""
+  process.stdout.write(JSON.stringify({
+    bodies: BODIES['PUT /api/admin/mcp-tools/s1__list_data_apps'] || [],
+    all: CALLS,
+  }));
+""",
+    )
+    res = _node(script)
+    assert res["bodies"], "the lister tool was never put into materialize mode"
+    assert res["bodies"][0] == {"mode": "materialize"}, (
+        f"browsing installed a schedule nobody asked for: {res['bodies'][0]}"
+    )
+
+
+def test_an_existing_app_grant_is_read_as_done():
+    """Every pair 409s — the apps are already granted to that group. That is
+    the state the admin asked for, so Done must complete."""
+    script = _apps_script(
         r"""  'POST /api/admin/grants': [
     { status: 409, body: { detail: 'Grant already exists for this group/resource_type/resource_id' } },
     { status: 409, body: { detail: 'Grant already exists for this group/resource_type/resource_id' } },
   ],""",
         r"""
-  // Open the picker before picking: `toggleGroup` resolves the id against the
-  // loaded group list, and the picker is what loads it.
-  fire('click', { 'data-la-openpick': '1' });
-  for (let i = 0; i < 8; i++) await flush();
-  fire('click', { 'data-la-pick': 'g1' });
-  for (let i = 0; i < 4; i++) await flush();
-  fire('click', { id: 'la-save' });
-  for (let i = 0; i < 12; i++) await flush();
+  fire('click', { id: 'mcp-done' });
+  for (let i = 0; i < 14; i++) await flush();
   process.stdout.write(JSON.stringify({
     href: window.location.href,
     grants: CALLS.filter((c) => c === 'POST /api/admin/grants').length,
@@ -305,16 +405,17 @@ def test_linked_apps_treats_an_existing_grant_as_done():
 """,
     )
     res = _node(script)
-    assert res["href"] == "/library?kind=data_app", (
+    assert res["grants"] == 2, f"both apps should have been granted: {res['all']}"
+    assert res["href"] == "/admin/mcp-sources/s1", (
         f"409s were read as failures: href={res['href']!r}, calls={res['all']}"
     )
 
 
-def test_linked_apps_retry_only_repeats_what_is_still_missing():
-    """One pair fails for real. The save must report which, keep the admin on
-    the page, and — on retry — reach the success path once the 409s from the
-    first attempt are counted as done."""
-    script = _linked_script(
+def test_a_failed_app_grant_is_named_and_keeps_the_admin_on_the_page():
+    """A grant that did not land is the difference between "shared" and
+    "invisible", and the admin is the only one who can retry it — so it is
+    reported here rather than carried silently through a redirect."""
+    script = _apps_script(
         r"""  'POST /api/admin/grants': [
     { status: 200, body: {} },
     { status: 500, body: { detail: 'boom' } },
@@ -322,17 +423,11 @@ def test_linked_apps_retry_only_repeats_what_is_still_missing():
     { status: 200, body: {} },
   ],""",
         r"""
-  // Open the picker before picking: `toggleGroup` resolves the id against the
-  // loaded group list, and the picker is what loads it.
-  fire('click', { 'data-la-openpick': '1' });
-  for (let i = 0; i < 8; i++) await flush();
-  fire('click', { 'data-la-pick': 'g1' });
-  for (let i = 0; i < 4; i++) await flush();
-  fire('click', { id: 'la-save' });
-  for (let i = 0; i < 12; i++) await flush();
+  fire('click', { id: 'mcp-done' });
+  for (let i = 0; i < 14; i++) await flush();
   const hrefAfterPartial = window.location.href;
-  fire('click', { id: 'la-save' });
-  for (let i = 0; i < 12; i++) await flush();
+  fire('click', { id: 'mcp-done' });
+  for (let i = 0; i < 14; i++) await flush();
   process.stdout.write(JSON.stringify({
     hrefAfterPartial,
     href: window.location.href,
@@ -342,10 +437,11 @@ def test_linked_apps_retry_only_repeats_what_is_still_missing():
 """,
     )
     res = _node(script)
-    assert res["hrefAfterPartial"] == "", "a partial failure navigated away, so the admin never saw which pairs failed"
-    assert res["href"] == "/library?kind=data_app", (
-        f"the retry could not finish: href={res['href']!r}, calls={res['all']}"
+    assert res["hrefAfterPartial"] == "", f"a partial failure navigated away: {res['all']}"
+    assert res["href"] == "/admin/mcp-sources/s1", (
+        f"the retry never finished: href={res['href']!r}, calls={res['all']}"
     )
+
 
 
 # ── MCP source: the tool toggles have to reach the registry ──────────────────

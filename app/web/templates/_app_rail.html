@@ -81,7 +81,6 @@
    /agents which do exactly the same job from a non-admin path. #}
 {% set _builder_page = _path.endswith('/new') and (
      _path.startswith('/admin/mcp-sources')
-     or _path.startswith('/admin/linked-apps')
      or _path.startswith('/admin/data-packages')) %}
 {% set _admin_page = (_path == '/admin' or _path.startswith('/admin/')) and not _builder_page %}
 <nav class="rail{% if _admin_page %} rail-icon-mode{% endif %}" aria-label="Primary"

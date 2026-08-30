@@ -133,9 +133,10 @@
   function api(url, opts) {
     return fetch(url, Object.assign({ credentials: 'same-origin' }, opts || {})).then(readJson);
   }
-  function postJson(url, body) {
+  function postJson(url, body, method) {
     return api(url, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      method: method || 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
   }
 
@@ -259,6 +260,152 @@
     });
   }
 
+  /* ── Apps this server lists ─────────────────────────────────────────
+     Linked apps used to be its own builder, and it was entirely downstream of
+     this one: its empty state said "connect a source first, then come back",
+     and its first step DETECTED the source rather than asking — falling back
+     to "if there is exactly one, use that", which rendered "✓ Using" for a
+     source it had picked by elimination. Folding it in removes the round
+     trip, the guess, and a second entry point that could not complete on an
+     instance with data apps switched off.
+
+     It appears only when the server actually exposes a lister tool, so a
+     source that lists no apps never sees the section. */
+  var APPS_API = '/api/data-apps';
+  var GRANTS_API = '/api/admin/grants';
+  var appsFetching = false, appsFetched = false, appsErr = null;
+  var apps = [], appChosen = {}, appsRefresh = false, appsSkipped = 0;
+
+  function listerTools() {
+    return (draft.tools || []).filter(function (t) {
+      // Turned off in the Tools section means no tool row is registered, so
+      // there is nothing to materialize and nothing to catalogue.
+      if (draft.enabled[t.name] === false) return false;
+      var n = String(t.name || '').toLowerCase();
+      return n.indexOf('data') >= 0 && n.indexOf('app') >= 0;
+    });
+  }
+  function hasLister() { return DATA_APPS_ENABLED && listerTools().length > 0; }
+  function chosenApps() { return apps.filter(function (a) { return appChosen[a.id]; }); }
+
+  /* Fetching needs the tool in materialize mode. That used to also install a
+     nightly 03:00 job on a SHARED tool, silently, just for looking — so the
+     schedule is now the admin's choice and defaults to off. */
+  function fetchApps() {
+    if (appsFetching || !savedId) return;
+    var lister = listerTools()[0];
+    if (!lister) return;
+    // The same id `registerTool` sent when it created the row — the builder
+    // supplies it rather than letting the server mint a uuid, so it is known
+    // here without a round trip.
+    var toolId = savedId + '__' + lister.name;
+    appsFetching = true; appsErr = null;
+    render();
+    var mode = { mode: 'materialize' };
+    if (appsRefresh) mode.schedule = 'daily 03:00';
+    postJson(TOOLS_API + '/' + encodeURIComponent(toolId), mode, 'PUT')
+      .catch(function (e) { if (!e || e.status !== 409) throw e; })
+      .then(function () {
+        return postJson(SOURCES_API + '/' + encodeURIComponent(savedId) + '/materialize',
+                        { tool_id: toolId, lister: true });
+      })
+      .then(function (res) {
+        appsSkipped = (res && res.linked_projection && res.linked_projection.skipped) || 0;
+        return api(APPS_API + '?kind=linked&source=' + encodeURIComponent(savedId));
+      })
+      .then(function (body) {
+        var rows = Array.isArray(body) ? body : (body && body.apps) || (body && body.items) || [];
+        apps = rows.map(function (a) {
+          return {
+            id: String(a.id), name: String(a.name || a.slug || a.id),
+            url: String(a.external_url || a.url || ''),
+            description: String(a.description || ''),
+          };
+        });
+        apps.forEach(function (a) { if (appChosen[a.id] === undefined) appChosen[a.id] = true; });
+        appsFetched = true;
+      })
+      .catch(function (e) {
+        appsErr = (e && e.message) === 'data_apps_disabled'
+          ? 'Data apps are switched off on this instance, so its apps cannot be catalogued.'
+          : ((e && e.message) || 'Could not read the app list.');
+      })
+      .then(function () { appsFetching = false; render(); });
+  }
+
+  /* One grant per (app × group), the same shape the retired builder used —
+     including treating a 409 as the end state it asked for. */
+  function publishApps() {
+    var calls = [];
+    chosenApps().forEach(function (a) {
+      draft.groups.forEach(function (g) {
+        calls.push(
+          postJson(GRANTS_API, { group_id: g.id, resource_type: 'data_app', resource_id: a.id })
+            .then(function () { return null; })
+            .catch(function (e) {
+              if (e && e.status === 409) return null;
+              return a.name + ' → ' + g.name + ': ' + ((e && e.message) || 'unknown error');
+            })
+        );
+      });
+    });
+    return Promise.all(calls).then(function (results) {
+      return results.filter(Boolean);
+    });
+  }
+
+  function appsBody() {
+    var fetchBtn = '<button type="button" class="ag-addrow" data-mcp-apps' +
+      (appsFetching || !savedId ? ' disabled' : '') + '>' +
+      (appsFetching ? 'Reading…' : (appsFetched ? 'Read again' : '+ Read the app list')) + '</button>';
+    /* Same toggle the tool rows use, rather than a checkbox this stylesheet
+       has never had a rule for. */
+    var refresh = '<div class="ag-row">' +
+        '<div class="ag-row-body">' +
+          '<div class="ag-row-name">Keep the list current</div>' +
+          '<div class="ag-row-desc">Agnes re-reads the server every night at 03:00. Off means this ' +
+            'catalogue is a snapshot of the moment you read it.</div>' +
+        '</div>' +
+        '<button type="button" class="ag-tglbtn' + (appsRefresh ? ' on' : '') + '" data-mcp-appsrefresh>' +
+          (appsRefresh ? '✓ On' : 'Off') + '</button>' +
+      '</div>';
+    if (appsErr) fetchBtn += '<div class="ag-note ag-note--err">' + esc(appsErr) + '</div>';
+    if (!savedId) {
+      return '<div class="ag-slot">' +
+          '<p class="ag-slot-head">Register the source first.</p>' +
+          '<p class="ag-slot-body">Reading the list needs the source to exist. Register it above and this ' +
+          'section carries on from here — you stay on this page.</p>' +
+        '</div>';
+    }
+    if (!appsFetched) {
+      return '<div class="ag-slot">' +
+          '<p class="ag-slot-head">This server lists apps.</p>' +
+          '<p class="ag-slot-body">Agnes can read the list and catalogue it here, so the apps show up in the ' +
+          'Library for the groups you grant. Reading it writes the catalogue; nothing is shared until you grant.</p>' +
+        '</div>' + refresh + fetchBtn;
+    }
+    if (!apps.length) {
+      return '<div class="ag-slot">' +
+          '<p class="ag-slot-head">The server listed no apps.</p>' +
+          '<p class="ag-slot-body">It answered, and the list was empty.</p>' +
+        '</div>' + refresh + fetchBtn;
+    }
+    var rows = apps.map(function (a) {
+      var on = appChosen[a.id] !== false;
+      return '<div class="ag-row">' +
+        '<div class="ag-row-body"><div class="ag-row-name">' + esc(a.name) + '</div>' +
+          (a.description ? '<div class="ag-row-desc">' + esc(a.description) + '</div>' : '') + '</div>' +
+        '<button type="button" class="ag-tglbtn' + (on ? ' on' : '') + '" data-mcp-app="' + esc(a.id) + '">' +
+          (on ? '✓ On' : 'Off') + '</button>' +
+      '</div>';
+    }).join('');
+    var skipped = appsSkipped
+      ? '<div class="ag-note ag-note--warn">' + appsSkipped + ' row' + (appsSkipped > 1 ? 's' : '') +
+        ' could not be read — the columns did not match what Agnes expects of an app.</div>'
+      : '';
+    return '<div class="ag-rows">' + rows + '</div>' + skipped + refresh + fetchBtn;
+  }
+
   /* ── Check connection ──────────────────────────────────────────────── */
 
   function checkConnection() {
@@ -316,6 +463,11 @@
      retry above unreachable even once the row was correct. */
 
   var savedId = null;
+  /* True once the row exists. The builder used to leave the page the instant
+     it did; it now stays when there are apps to catalogue, because that work
+     needs the registered source and used to be a second builder. */
+  var registered = false;
+  var DATA_APPS_ENABLED = false;
 
   /* 409 from the source-wide grant is not one thing.
      `no_tools_registered` means the source has no ENABLED tool row to grant,
@@ -421,6 +573,18 @@
            tool curation prefilled — and Save then attempted a duplicate
            registration. A builder that keeps a draft owns discarding it. */
         discardDraft();
+        registered = true;
+        if (hasLister()) {
+          // There is a second thing to do here and it needs the row that was
+          // just created. Staying is the whole point of folding the linked-apps
+          // builder in: no redirect, no "now go to the other page".
+          saving = false;
+          collapsed.apps = false;
+          render();
+          var host = mount.querySelector('[data-sec="apps"]');
+          if (host && host.scrollIntoView) host.scrollIntoView({ block: 'center' });
+          return;
+        }
         window.location.href = '/admin/mcp-sources/' + encodeURIComponent(savedId);
       })
       .catch(function (e) {
@@ -429,6 +593,28 @@
         saving = false;
         render();
       });
+  }
+
+  function done() {
+    if (saving) return;
+    var leave = function () {
+      window.location.href = '/admin/mcp-sources/' + encodeURIComponent(savedId);
+    };
+    if (!chosenApps().length) return leave();
+    saving = true; saveErr = null;
+    render();
+    publishApps().then(function (failures) {
+      if (failures.length) {
+        /* Named, on this page, instead of carried silently through a redirect:
+           a grant that did not land is the difference between "shared" and
+           "invisible", and the admin is the only one who can retry it. */
+        saveErr = 'The source is registered. These grants did not land: ' + failures.join('; ');
+        saving = false;
+        render();
+        return;
+      }
+      leave();
+    });
   }
 
   /* Mirrors `is_safe_identifier` in src/sql_safe.py — the source name becomes
@@ -682,6 +868,15 @@
   }
 
   function progressHtml() {
+    /* Once the row exists the slots are history: an admin looking at a
+       registered source does not need to be told what is "still to settle",
+       and the line would sit there naming fields that are now saved. */
+    if (registered) {
+      return '<div class="ag-prog">' +
+        '<span class="ag-prog-n">Registered</span>' +
+        '<span class="ag-prog-t">the source is live — finish below, then press Done</span>' +
+      '</div>';
+    }
     var slots = localSlots();
     if (!slots.length) return '';
     var known = slots.filter(function (s) { return s.known; }).length;
@@ -725,7 +920,21 @@
         sub: 'Granting a group means every agent its members build can call these tools.',
         summary: draft.groups.length ? draft.groups.length + ' group' + (draft.groups.length === 1 ? '' : 's') : 'nobody',
         body: accessBody(),
-      });
+      }) +
+      (hasLister() ? sec({
+        key: 'apps', no: 5, title: 'Apps this server lists', note: 'what it can publish',
+        collapsed: !!collapsed.apps,
+        sub: 'This server exposes a tool that lists apps hosted elsewhere. Agnes can catalogue them and ' +
+             'publish them into the Library for the groups you granted above.',
+        summary: appsSummary(),
+        body: appsBody(),
+      }) : '');
+  }
+
+  function appsSummary() {
+    if (!appsFetched) return 'not read yet';
+    if (!apps.length) return 'none listed';
+    return chosenApps().length + ' of ' + apps.length;
   }
 
   function leftHtml() {
@@ -765,9 +974,12 @@
       window.BuilderShell.head({
         backLabel: 'Library', title: draft.name || 'New MCP source', titleId: 'mcp-title',
         actionsId: 'mcp-actions',
-        actions: '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
-          (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Saving…') + '"') + '>' +
-          (saving ? 'Registering…' : 'Register source') + '</button>',
+        actions: registered
+          ? '<button type="button" class="cc-btn cc-btn--primary" id="mcp-done"' +
+            (saving ? ' disabled' : '') + '>' + (saving ? 'Sharing…' : 'Done') + '</button>'
+          : '<button type="button" class="cc-btn cc-btn--primary" id="mcp-save"' +
+            (canSave() && !saving ? '' : ' disabled title="' + esc(saveBlocker() || 'Saving…') + '"') + '>' +
+            (saving ? 'Registering…' : 'Register source') + '</button>',
       }) +
       window.BuilderShell.workspace({
         left: leftHtml(),
@@ -795,7 +1007,8 @@
     document.addEventListener('click', function (e) {
       var t = e.target.closest('[data-mcp-seg],[data-mcp-field],[data-mcp-check],[data-mcp-tool],' +
         '[data-mcp-openpick],[data-mcp-pick],[data-mcp-unpick],[data-ag-pick-close],' +
-        '[data-ag-toggle-sec],[data-ag-send],[data-ag-chip],[data-ag-back],#mcp-save');
+        '[data-ag-toggle-sec],[data-ag-send],[data-ag-chip],[data-ag-back],#mcp-save,#mcp-done,' +
+        '[data-mcp-apps],[data-mcp-app],[data-mcp-appsrefresh]');
       if (!t) {
         if (pickerOpen && e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) closePicker();
         return;
@@ -837,7 +1050,15 @@
       }
       else if (t.hasAttribute('data-ag-chip')) { sendTurn(t.getAttribute('data-ag-chip')); }
       else if (t.hasAttribute('data-ag-back')) { window.location.href = '/library'; }
+      else if (t.hasAttribute('data-mcp-apps')) { fetchApps(); }
+      else if (t.hasAttribute('data-mcp-app')) {
+        var aid = t.getAttribute('data-mcp-app');
+        appChosen[aid] = appChosen[aid] === false;
+        render();
+      }
+      else if (t.hasAttribute('data-mcp-appsrefresh')) { appsRefresh = !appsRefresh; render(); }
       else if (t.id === 'mcp-save') { save(); }
+      else if (t.id === 'mcp-done') { done(); }
     });
 
     document.addEventListener('input', function (e) {
@@ -884,6 +1105,7 @@
   window.AgnesMcpBuilder = {
     open: function (opts) {
       mount = opts.mount;
+      DATA_APPS_ENABLED = !!opts.dataAppsEnabled;
       var saved = restoreDraft();
       draft = saved ? Object.assign(newDraft(), saved.draft) : newDraft();
       conv = (saved && Array.isArray(saved.conv)) ? saved.conv : [];

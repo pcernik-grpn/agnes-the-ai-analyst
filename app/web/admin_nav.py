@@ -316,14 +316,12 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {
                 "label": "MCP sources",
                 "href": "/admin/mcp-sources",
-                "gloss": "MCP servers whose tools analysts can use",
+                # "Linked apps" used to be the row below this one. Publishing
+                # apps was always downstream of registering the source that
+                # lists them, so it is a section of that builder now and this
+                # row is where both live.
+                "gloss": "MCP servers whose tools — and apps — analysts can use",
                 "match": ["/admin/mcp-sources", "/admin/mcp-tools"],
-            },
-            {
-                "label": "Linked apps",
-                "href": "/admin/linked-apps",
-                "gloss": "Hosted elsewhere, granted from here",
-                "match": ["/admin/linked-apps"],
             },
             # Conditional — the hub is off by default (see the module
             # docstring). `match` stays the bare prefix: Submissions and Store
