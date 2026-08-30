@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **The Knowledge tab opens on what the graph knows (TCRD-250).** Node types with live, caller-scoped counts sit at the head of the tab, each one a way in — the counts come from `GET /api/facts/type-map`, so a type shows what *you* can reach and a type nobody can see is absent rather than zero. It follows the active tab through the Library's own `onApply` chain (the filter engine slices rows by `data-tab`; a non-row element has no such hook) and starts hidden, so it never flashes on Capabilities before the first apply. Renders nothing at all when the facts feature is off, the app-state backend is DuckDB, or the graph is empty — the Library must not fail because a decoration is unavailable.
 - **Maintained digests can be listed, not just fetched by id (TCRD-250).** `GET /api/knowledge/digests` returns the digests the caller can read — `{id, slug, title, status, status_reason, generated_at}`, sorted by slug, never the markdown. The content endpoint has been readable since K4 and `agnes pull` already writes every granted digest to `.claude/rules/ka_<slug>.md`, but nothing could enumerate them, so a web surface had no way to show a reader which digests exist without already knowing an id. Filtered by the SAME fail-closed predicate the sync manifest uses, so the browser list and the pulled files can never disagree about entitlement — there is a test asserting exactly that. A digest that has never generated is omitted, matching the manifest, since listing it would promise a page that 404s; staleness travels per row so a stale digest is visibly stale.
 - **The Library can be filtered by what documents are ABOUT (TCRD-250).** `GET /api/facts/facets` (plus `agnes facts facets` and the `fact_facets` MCP tool) returns each entity type's values with a document count — client, industry, service offering and document type by default. That vocabulary comes from the extraction pass, so it is maintained by ingestion rather than by somebody remembering to tag a file, which is what "filter by tags" should have meant here. Same visibility gate as `search()`, shared rather than restated, plus one extra conservatism: the document tally counts only documents in collections the caller can READ — a `revealed` subject's unreadable evidence is deliberately not tallied, since a revealed correction reveals the subject, not the geography of its evidence, and counting those files would report how many sit in a collection the caller cannot open. An alias with no recorded provenance stays admin-only-visible, so a facet shows the opaque id rather than leaking the natural key.
 - **The fact graph now says what is in it (TCRD-250).** `GET /api/facts/type-map` (plus `agnes facts type-map` and the `fact_type_map` MCP tool) returns every node type with a live count of the subjects the caller can actually see — the head of the Library's Knowledge tab, where each type is a way in, and an agent's way to learn which types exist before spending a `fact_search` call. Counts run through the SAME visibility gate as `search()` with no `type`, shared rather than restated: `_visible_facts_for_corpus_cte` gained an `all_collections` switch that changes only which facts are candidates, never the rule that decides visibility. A naive `GROUP BY type` would have been the fact graph's existence oracle in aggregate form — a reader counting subjects whose every claim sits in a collection they cannot read — so a type with no visible subjects is OMITTED rather than reported as `0`, leaving "nothing you can see" deliberately indistinguishable from "no such type".
@@ -239,6 +240,92 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   longer 500s the whole ingest.
 
 ### Changed
+- **The Library says what your agents get, not what the server does.** Every
+  control in the Access column named a mechanism — *Install*, *Add to stack*,
+  *In stack*, *Required by your admin*, *Granted to your group* — which told a
+  reader what happens internally and left them to infer what they get. Each now
+  names the outcome: **Add to my agents** (was Install / Add to stack), *Agents
+  can use this* (was Installed / In stack), and one state for governed data,
+  *Agents can query this*, replacing the pair of pills that promised two
+  different things about removal for what is a single, identical capability —
+  the tier survives in the tooltip, where it explains why rather than posing as
+  a different power. The two toolbar toggles follow (*Agents use it*, *Not added
+  yet*), so the page no longer says "stack" anywhere, and a permanent one-line
+  lede under the title states the rule the whole page turns on: your admin
+  decides what data you can reach, you choose what your agents can do with it.
+- **Every row in the Library's + Add menu says what it makes.** Four of the
+  eight — skill, plugin, agent template, upload — were a verb and nothing else,
+  so the menu told you the shape of the thing only where someone had happened to
+  write a sub-line. Each now carries the builder's own one-line description,
+  compressed, so the menu and the page it opens describe the same object the
+  same way. The menu widens 214px → 320px to fit them on one line each.
+- **The Library filter menu answers more than "who owns it".** It offered
+  Owner, Source, Access and a Tags category that is empty for every collection,
+  file, app and recipe (`file_corpora` has no tags column), so past a screenful
+  the only working narrowing was search. Three categories join it, each read off
+  data the rows already carry: **Added** (last 7 / 30 / 90 days, cumulative, so
+  the buckets nest instead of excluding each other), **Yours or shared**
+  (created by you · shared by you · shared with you) and **File format**. A
+  category with fewer than two distinct values still does not render, so the
+  menu grows only where the data does. A file whose text the extraction pass
+  could not read now says so on its own row — *Not indexed yet* / *Indexing* /
+  *Needs review* / *Not indexed*, and nothing at all when it is indexed, which
+  is the majority — instead of only being discoverable by opening its
+  collection.
+- **The Library is two tabs, and every row's button says what it does.**
+  `/library` was one flat list answering two different questions — *what does
+  this organization know* and *what can my agent do* — and a single control
+  label, "Add to stack", sat on rows whose click posted to four different
+  endpoints meaning four different things.
+  - **Knowledge / Capabilities tabs**, deep-linkable as `?tab=`. Knowledge
+    holds documents, governed data, memory, recipes and apps; Capabilities
+    holds skills, plugins and agent templates. A detail page's `?section=`
+    back link selects the tab that owns the section, so returning from an item
+    can no longer land on a page where that item is filtered out. The tabs are
+    the shared `FilterToolbar` segmented control reading `data-tab` off each
+    row, so switching tabs shares one code path with search, the facets and the
+    empty-section hiding.
+  - **Data apps are their own band** rather than a trailing block inside
+    Artefacts, whose hint had to call an app a file the caller had uploaded.
+  - **Per-kind action verbs.** `Install` / `Installed` for skills, plugins and
+    agent templates (they post to `/install` and were never stack members —
+    `/api/stack` accepts only `data_package` and `memory_domain`);
+    `Keep a local copy` / `Local copy` for governed data, because
+    `features.stack_auto_membership` has been default-on since Wave 0, so the
+    grant already *is* the membership and the only remaining choice is what
+    `agnes pull` downloads — the wording `StackResolver.browse()` already used
+    internally. A granted row now states its tier — `Required by your admin`,
+    `Granted to your group` — instead of claiming a membership the caller could
+    neither create nor drop, with the reason available only in a tooltip. The
+    grid card no longer overwrites the row's label with the stack vocabulary,
+    so table and card cannot drift.
+  - **`+ Add` follows the tab** — sources on Knowledge (data package, connect a
+    source, link an external app, upload), builders on Capabilities (skill,
+    plugin, agent template, MCP source). The blast-radius headings survive
+    inside each half. The menu is bounded to the room below its button, so its
+    last entries stay reachable.
+  - **One browsing block, sitting on the list.** Search, the filters, the view
+    switch, "+ Add", the item count and the active-filter chips are one job, so
+    they are one block directly above what they act on; the page header keeps
+    the title, the connect banner and the tabs. They used to be spread over
+    four bands — you pressed Filter in the page header and read what it did two
+    bands lower, past a promo panel, while the count sat in a third place. The
+    Library spent its first screen not listing anything. The group bands keep
+    the viewport top, which is the thing worth pinning on a long list; no header
+    pins, because one carrying all of that runs ~270px and leaves a band no room
+    to travel in. The shared floating dock (`.fbar-dock`) is untouched and still
+    `/chats`'s.
+  - **Status stopped looking like a control.** "Shared with you", "Required by
+    your admin" and "Granted to your group" all answer *why you have this* and
+    were drawn as pills in the same slot the row's buttons use, under a column
+    headed **Actions** — which is what "Required by your admin" is precisely
+    not. They read as text now; only a control keeps a box, and the trailing
+    column drops its misleading label (keeping an accessible name). Controls
+    themselves went quiet at rest: five 38px bordered boxes across the toolbar
+    gave nothing rank, so search is a field, Filter/stack/view are borderless
+    utilities that tint when on, and "+ Add" is the only filled control.
+  - **Bands open on arrival**, and an empty tab says so in its own words rather
+    than offering a "Clear filters" button for filters that are not applied.
 - **Authoring surfaces no longer open on a name field (TCRD-205).** The agent builder, the skill/plugin/agent-template builder and the data-package drawer each now open on what the thing is for — a role, a description, what the package carries — and ask what to call it last. The name was the least interesting decision on each form and the hardest to make first, and on the data package it was actively harmful: the slug derives from the name as you type, so a placeholder name immediately became a placeholder identifier. The derivation is unchanged and still correct; asked last, it finally has a real name to derive from. Nothing became more or less required — none of the three gated saving on a name (each already rendered `Unnamed`), so this is ordering only.
 - **One word per thing, across the surfaces where two had drifted (TCRD-208).** `/profile` stops calling admin elevation "god-mode" (now *full admin access*) and stops calling its confirmation a "consent gate" — "consent" already means OAuth provider consent everywhere else in Agnes, so one word was carrying two mechanisms a user meets in the same session. The connection pill on `/me/connections` states a state and nothing else (*Expired*, beside *Connected* and *Not connected*) — the remedy still lives in the detail line, where someone is actually reading. `/admin/semantic-layer` names its drift columns *in Agnes / in source* rather than *stored / upstream*, and no longer points readers at a *Master token (semantic layer)* row that was renamed to *Semantic-layer token*. `/admin/linked-apps` writes `ID` beside `URL` rather than `Id`. The login page's apostrophes are typographic, like the rest of the repo. `tests/test_product_vocabulary.py` pins each decision, because the design-system contract tests police colour and spacing but nothing policed language — which is why sixteen design reviews each re-found a naming collision independently.
 - **The release-cut moves out of feature PRs and into one daily cut PR.**
@@ -807,7 +894,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   with it is `DEBUG=1 LOCAL_DEV_MODE=1`, as `docs/development.md` already
   documented. Production never set `LOCAL_DEV_MODE`, so no deployed
   instance was affected.
-- **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote that is a substring of the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The run report now distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
+- **The fact-graph verbatim gate rejected legitimate quotes grounded in a document's own filename/path.** `POST /api/facts/ingest` accepted a claim's quote only as a substring of a chunk of the document's extracted text — but the extraction ontology legitimately grounds some claims (e.g. a `part_of` edge) in the document's own folder path + filename, which have no chunk to land in (a live proving run rejected 3 such quotes). The gate now also accepts a quote grounded in the document's own SERVER-STORED `filename`/`path` (`corpus_files`) — never a producer-supplied name/path read off the ingest wire, which would let a producer self-certify an invented quote. The identity match itself must be a WHOLE unit — a folder name, the filename with or without its extension, or a contiguous run of whole path components (e.g. `"folder/filename.ext"`) — equality, never a bare substring: a same-day review round caught that `quote in path` also admitted a bare `.pptx`, a stray `/`, or any short fragment, letting a fabricated attribute self-certify as a confidently-cited quote via the document's own name. The whole-unit decomposition applies to BOTH `filename` and `path` (a cross-PR combination finding: a zip-bundle member stores its archive-relative path IN `filename`, with `path` NULL, so decomposing only `path` silently left a member's own folder name unmatchable — an ordinary, separator-free `filename` is unaffected either way). The run report still distinguishes the two: `claims_accepted_via_identity` counts the subset of `claims_written` accepted via the filename/path only, so an operator can see how much evidence is filename- rather than content-grounded (weaker evidence still, per spec §8's own honesty note that the gate validates the quote, not the fact). This closes the root cause of a worse regression: the producer's prior workaround — prepending a `Source: <site>/<path>` header into the uploaded artifact's text — made the artifact's bytes change on every rename, which the collections upsert reads as a content change and purges the file's chunks and claims for what was really a no-op rename (see the `claims_purged` fix below for the other half of that incident). Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.2.
+- **A duplicate-file claim could silently lose its `document_date`, breaking the latest-value-wins succession rule.** When a SharePoint duplicate's doc_id resolution (TCRD-241) fell to the deterministic indexed-preferred override, the claim wrote its `document_date` looked up by the corpus_file that override picked — which, for a batch whose own `documents[]` entry resolved to a DIFFERENT (unwinning) copy, was never a key that batch itself had set, so the date silently wrote `NULL`. An undated claim loses to any dated one in the per-key latest-`document_date`-wins projection, so a stale value could win forever over the newer one this batch actually declared — precisely the recurring-SharePoint-duplicate case the succession rule exists for. `document_date` is now looked up by the batch's own declared `doc_id`, not the resolved `corpus_file_id`, so it survives the override regardless of which copy wins.
+- **`FactsPgRepository.search()`'s free-text `q` had no minimum length and no statement timeout.** A 1-character `q` drove a full ILIKE scan over every `fact_aliases` row with no useful selectivity, and — unlike `neighbors()` — the query ran with no bound at all, a pool-stall risk on a large alias table. `q` now requires at least `MIN_SEARCH_Q_LENGTH` (2) non-blank characters (a `ValueError`, translated to the existing `422` by the REST layer) — enforced in the repository itself, not only the REST Pydantic model, so an MCP or CLI caller reaching `search()` directly gets the same floor. The query now runs under the same bounded Postgres `statement_timeout` `neighbors()` already used.
 - **The fact-graph verbatim gate accepted a degenerate quote — a bare file-extension fragment (`.pdf`) or a lone path separator (`/`) — as long as it happened to occur literally somewhere in the document.** A plain substring test has no notion of "meaningful": any character sequence that occurs anywhere in the text (or, for a quote the content check misses, in the document's own filename/path — nearly every file whose quote is its own extension) satisfies it, so a claim citing punctuation noise wrote and rendered as verified evidence. `POST /api/facts/ingest` now requires a quote to be at least 2 characters and to START with a word character (letter, digit, or underscore) before either half of the gate is tried — closing both paths with one check, since a length-only floor cannot tell a fragment like `.pdf` apart from a genuinely short quote of the same length (a metric name, a ticker, a year). Deliberately checks only the quote's start, not its end: a quote citing a whole sentence routinely — and legitimately — ends in terminal punctuation ("Acme Corp is the client."). A rejected degenerate quote gets its own `quote_not_meaningful` reason in `claims_rejected`, distinct from `verbatim_gate_failed` (the quote WAS present; it just isn't evidence of anything), surfaced under the same "rejected quotes" badge as the rest of the verbatim gate on the `/admin/data-sources` SharePoint source card. Spec: `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md` §8.4.
 - **Removed a committed `data` symlink pointing into a contributor's home
 - **Removed two committed symlinks (`data`, `user`) pointing into a contributor's home
