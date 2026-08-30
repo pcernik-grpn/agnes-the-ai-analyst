@@ -1060,20 +1060,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `/v2/storage/tokens/verify` URL, `HTTP 401` and Keboola's JSON body down to
   its `exceptionId` — which is all true and none of it the answer. A Keboola
   token only exists on the stack that issued it, so a token refused outright
-  is nearly always from another stack; the message now names the stack this
-  connection is configured for and asks that question directly. Applies to
-  both token slots on `PUT /api/admin/source-connections/{id}/secret`, worded
-  per kind (the master token is the project owner's; the storage token is
-  not), and is recognised by Keboola's own `storage.tokenInvalid` code as well
-  as the 401, so a proxy that rewrites the status does not defeat it. The raw
-  upstream text is not lost — it moves to `detail.upstream`, out of the
-  message, for logs and bug reports. Only a flat refusal is translated: an
-  outage, a 5xx or a network failure still reports what it said, because
-  there the upstream text IS the diagnosis. Unchanged: the preflight itself,
-  which already refused to store the token or badge it "SET", and the
-  project-mismatch message, which stays its own distinct sentence — a
-  mismatch is a token the stack knows perfectly well that opens a different
-  project, and it needs a different fix.
+  is expired, revoked, or from another stack; the message now says exactly
+  that and names the stack this connection is configured for. Covers both
+  token slots on `PUT /api/admin/source-connections/{id}/secret` (worded per
+  slot — the master token is the project owner's, the storage token is not)
+  **and the Test button**, `POST /api/admin/source-connections/{id}/test`,
+  which returned the same raw body from the same card while its
+  project-mismatch branch beside it already knew better. Recognised by
+  Keboola's own `storage.tokenInvalid` code, so a proxy that relays the
+  refusal under a status of its own does not defeat it — and, conversely, a
+  bare `401` carrying a proxy's own HTML error page is **not** translated,
+  because that page says nothing about the token. A refusal now always
+  answers `400`, whatever status carried it: `502` would tell the admin
+  "Agnes is broken" while the sentence beside it says "your token is wrong",
+  and only one of those can be acted on. The raw upstream text is not lost —
+  on `PUT .../secret` it moves to `detail.upstream`, out of the message, for
+  logs and bug reports; the admin page, `agnes admin connection secret` and
+  the server-side reporting path all render `detail.message` and never
+  `upstream`. `POST /api/admin/source-connections`'s `token_seed_error`
+  (the "import as managed connection" seeding step) consequently reports the
+  human sentence instead of the upstream text. Only a flat refusal is
+  translated: an outage, a 5xx or a network failure still reports what it
+  said, because there the upstream text IS the diagnosis. Unchanged: the
+  preflight itself, which already refused to store the token or badge it
+  "SET", and the project-mismatch message, which stays its own distinct
+  sentence — a mismatch is a token the stack knows perfectly well that opens
+  a different project, and it needs a different fix.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,

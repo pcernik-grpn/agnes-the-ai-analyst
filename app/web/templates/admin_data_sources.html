@@ -4369,9 +4369,8 @@ async function connectAndValidate() {
           banner.innerHTML += ` Semantic layer enabled — metrics & glossary will sync.`;
         } else {
           const mb = await mResp.json().catch(() => ({}));
-          const md = mb.detail;
           banner.innerHTML += ` <span style="color:var(--ds-accent-warn-ink)">Semantic-layer token was refused (` +
-            _esc((md && typeof md === "object" ? (md.message || md.error) : md) || `HTTP ${mResp.status}`) +
+            _esc(detailMessage(mb, `HTTP ${mResp.status}`)) +
             `) — tables still work; set it later on this connection's card.</span>`;
         }
       } else {

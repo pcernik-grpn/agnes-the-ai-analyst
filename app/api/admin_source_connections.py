@@ -87,7 +87,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -706,77 +706,108 @@ def _reject_project_mismatch(row: Dict[str, Any], payload: Dict[str, Any], *, wh
         raise HTTPException(status_code=400, detail=message)
 
 
-#: Keboola's own error code for "no such token on this stack". Checked
-#: alongside the 401 rather than instead of it: the status is what every
-#: stack answers, the code is what survives a reverse proxy that relays the
-#: body under a status of its own.
+#: Keboola's own error code for "no such token on this stack" — the thing
+#: that identifies a refusal, since the 401 alone does not: an authenticating
+#: proxy in front of a stack answers 401 with its own page, which says
+#: nothing about the token.
 _TOKEN_REFUSED_CODE = "storage.tokenInvalid"
 
+#: The token slots this message is written for. A `what` outside this set is
+#: a programming error, not something to paper over with a default sentence —
+#: the wording is the whole point of the function.
+TokenKind = Literal["master token", "storage token", "connection's token"]
+
 #: Why a refused token is nearly always a token from somewhere else, phrased
-#: per kind — the master token is the project owner's and the one the
-#: semantic layer needs, so pointing at the wrong hint sends the admin
-#: looking for the wrong thing.
-_TOKEN_REFUSED_HINTS = {
+#: per slot — the master token is the project owner's and the one the
+#: semantic layer needs, so the wrong hint sends the admin looking for the
+#: wrong thing.
+_TOKEN_REFUSED_HINTS: Dict[str, str] = {
     "master token": "Master (owner) tokens are valid only on their own stack and project",
     "storage token": "A Keboola token is valid only on the stack and project it was created in",
+    "connection's token": "A Keboola token is valid only on the stack and project it was created in",
 }
 
 
-def _is_token_refused(exc: Exception) -> bool:
-    """True when the Storage API answered "I have never seen this token".
+def _reads_as_token_refusal(status: Optional[int], body: Any) -> bool:
+    """True when an upstream answer is Keboola saying "I have never seen this
+    token" — parsed body and status, so both the client's exception and a
+    raw ``httpx`` probe response can ask the same question.
 
-    Deliberately narrow. It is NOT a project mismatch — that is a token this
-    stack knows and accepts, which merely opens a different project — and it
-    is not an outage. Three different failures needing three different
-    fixes, so they must not collapse into one sentence.
+    Deliberately narrow, in two directions. It is NOT a project mismatch
+    (a token this stack knows and accepts, which merely opens a different
+    project) and NOT an outage: three failures, three fixes, so they must
+    not collapse into one sentence. And a bare 401 is not enough — Keboola's
+    own refusal always carries the code, so a 401 whose body is a proxy's
+    HTML gets no confident sentence about a token the proxy never saw. Only
+    when there is no body to inspect at all does the status decide.
     """
-    if getattr(exc, "status", None) == 401:
-        return True
-    body = getattr(exc, "body", None)
-    return isinstance(body, dict) and body.get("code") == _TOKEN_REFUSED_CODE
+    if isinstance(body, dict):
+        return body.get("code") == _TOKEN_REFUSED_CODE
+    if isinstance(body, str) and body.strip():
+        # Unparsed text. Keboola's shape relayed as a string still counts;
+        # a proxy's own error page does not.
+        return _TOKEN_REFUSED_CODE in body
+    return status == 401
 
 
-def token_refused_message(stack_url: str, *, what: str) -> str:
+def _is_token_refused(exc: Exception) -> bool:
+    """:func:`_reads_as_token_refusal` for a raised client error. Duck-typed
+    on ``.status``/``.body`` so it covers ``StorageApiError`` without the
+    transport module having to know about this one."""
+    return _reads_as_token_refusal(getattr(exc, "status", None), getattr(exc, "body", None))
+
+
+def token_refused_message(stack_url: str, *, what: TokenKind) -> str:
     """What to tell an admin whose token the stack refused.
 
-    The raw ``StorageApiError`` text used to be the whole toast: an internal
+    The raw upstream text used to be the whole toast: an internal
     ``/v2/storage/tokens/verify`` URL, ``HTTP 401`` and Keboola's JSON body
     down to its ``exceptionId``. All of it true, none of it the answer —
     which is that a Keboola token only exists on the stack that issued it,
-    so a token refused outright is nearly always from another stack. Naming
-    the stack this connection is configured for is what makes that
-    checkable.
+    so a token refused outright is expired, revoked, or from somewhere else.
+    Naming the stack this connection is configured for is what makes the
+    last one checkable.
+
+    Shared by the token-save preflight and the ``/test`` probe: the same
+    failure asked from the same card, so it must not have two answers.
     """
     host = _log_host(stack_url)
-    hint = _TOKEN_REFUSED_HINTS.get(what, _TOKEN_REFUSED_HINTS["storage token"])
-    return f"Keboola {host} does not recognise this {what}. {hint} — is this token from {host}?"
+    # Indexed, not `.get(...)`: a slot with no wording is a bug to raise, not
+    # to smooth over with another slot's sentence.
+    hint = _TOKEN_REFUSED_HINTS[what]
+    return (
+        f"Keboola {host} does not recognise this {what} — expired, revoked, or issued "
+        f"on another stack. {hint} — is this token from {host}?"
+    )
 
 
-def _preflight_error(exc: Exception, redacted: str, stack_url: str, *, what: str) -> HTTPException:
+def _preflight_error(exc: Exception, redacted: str, stack_url: str, *, what: TokenKind) -> HTTPException:
     """The HTTP error for a failed ``verify_token`` preflight.
 
-    A 4xx means the Storage API understood us and said no — the admin's to
-    fix, so it must not come back as 502: a Bad Gateway reads as "Agnes is
-    broken" and sends people hunting infrastructure instead of re-reading
-    the error.
+    A refusal is always 400, whatever status carried it. The status and the
+    message have to agree: 502 tells the admin "Agnes is broken" while the
+    sentence beside it says "your token is wrong", and only one of those can
+    be acted on. A proxy relaying Keboola's refusal under a 5xx is the case
+    that makes this concrete. Otherwise a 4xx is still the admin's to fix
+    (400) and anything else is a gateway failure (502).
 
-    A refusal additionally gets a translated ``detail.message``; every other
-    upstream failure keeps the raw passthrough, because there the upstream
-    text IS the diagnosis and inventing a sentence for it would only hide
-    it. The raw text is never lost either way — on the translated path it
-    moves to ``detail.upstream``, which the page's ``detailMessage()``
-    reader (and :func:`_detail_text`) deliberately do not show.
+    Only a refusal gets a translated ``detail.message``; every other upstream
+    failure keeps the raw passthrough, because there the upstream text IS the
+    diagnosis and inventing a sentence for it would only hide it. The raw
+    text is never lost either way — on the translated path it moves to
+    ``detail.upstream``, which the page's ``detailMessage()`` reader (and
+    :func:`_detail_text`) deliberately do not show.
     """
-    status = 400 if is_upstream_client_error(exc) else 502
     if _is_token_refused(exc):
         return HTTPException(
-            status_code=status,
+            status_code=400,
             detail={
                 "error": "storage_api_error",
                 "message": token_refused_message(stack_url, what=what),
                 "upstream": redacted,
             },
         )
+    status = 400 if is_upstream_client_error(exc) else 502
     return HTTPException(status_code=status, detail=f"storage_api_error: {redacted}")
 
 
@@ -1515,9 +1546,17 @@ async def set_connection_secret(
     API token, required by the semantic-layer sync (Metastore API rejects
     non-master tokens). 400 if the connection isn't ``source_type="keboola"``,
     if the token fails a live ``verify_token`` preflight (not a master token),
-    or if the Storage API refuses the token outright (4xx — an invalid or
-    expired token is the admin's to fix, not a gateway failure). 502 only when
-    the Storage API is unreachable or answers 5xx.
+    or if the Storage API refuses the token outright (an expired, revoked or
+    wrong-stack token is the admin's to fix, not a gateway failure). 502 only
+    when the Storage API is unreachable or answers 5xx for a reason that is
+    not a refusal.
+
+    ``detail`` is a plain string on every branch EXCEPT that refusal, which
+    answers the structured ``{error, message, upstream}`` shape: ``message``
+    is the sentence to show a human, ``upstream`` the raw wire text kept for
+    logs and bug reports and shown to nobody (``_detail_text`` server-side,
+    ``detailMessage()`` on the page, ``_fail`` in the CLI). Readers must
+    handle both shapes — see :func:`_preflight_error`.
 
     409 if AGNES_VAULT_KEY is not configured on the server — checked FIRST, so
     an instance that cannot store secrets says so instead of spending an
@@ -2268,6 +2307,16 @@ async def test_connection(
             _log_host(stack_url),
             resp.status_code,
         )
+        # The same refusal the token-save preflight translates, asked from the
+        # same card — so it gets the same sentence instead of the raw body.
+        # The mismatch branch above already refused to dump JSON here; this is
+        # the other half of that.
+        try:
+            probe_body: Any = resp.json()
+        except Exception:
+            probe_body = resp.text
+        if _reads_as_token_refusal(resp.status_code, probe_body):
+            return {"ok": False, "error": token_refused_message(stack_url, what="connection's token")}
         return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:
         # Scrub the resolved token before logging (replace, then cap, so a

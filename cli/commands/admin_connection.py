@@ -30,11 +30,20 @@ def _fail(resp) -> None:
     except Exception:
         body = {}
     detail = body.get("detail") if isinstance(body, dict) else None
-    msg = (
-        detail
-        if isinstance(detail, str)
-        else (json.dumps(detail) if detail is not None else (resp.text or f"HTTP {resp.status_code}"))
-    )
+    if isinstance(detail, str):
+        msg = detail
+    elif isinstance(detail, dict):
+        # A structured detail carries the human line in `message` and the raw
+        # upstream text in `upstream` (see `_preflight_error` server-side).
+        # Dumping the whole object put the wire text back in the reader's
+        # face — with the sentence buried in escaped JSON — which is the one
+        # thing the shape exists to avoid. Same reader as the admin page's
+        # `detailMessage()`.
+        msg = detail.get("message") or detail.get("error") or json.dumps(detail)
+    elif detail is not None:
+        msg = json.dumps(detail)
+    else:
+        msg = resp.text or f"HTTP {resp.status_code}"
     typer.echo(f"Error ({resp.status_code}): {msg}", err=True)
     raise typer.Exit(1)
 
