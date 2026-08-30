@@ -5570,14 +5570,42 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     background: var(--ds-surface-dim);
 }
 
-/* `.data-table-wrap` — the wrapper several admin pages already put around a
-   `.data-table` (semantic sources, users, sync, marketplaces, mcp_sources,
-   knowledge_digests, linked_apps, initial_workspace, data_apps) so a
+/* `.data-table-wrap` — the wrapper ten admin pages put around a `.data-table`
+   (semantic sources, users, sync, marketplaces, mcp_sources,
+   knowledge_digests, linked_apps, initial_workspace, data_apps, tables) so a
    wide/many-column table scrolls horizontally instead of taking the whole
    page with it. No CSS rule ever backed the class (#1707 A6), so the
-   overflow silently landed on the page instead of the table. */
+   overflow silently landed on the page instead of the table.
+   `admin_tables.html` is the odd one out: its wrap holds a JS-hydrated
+   layout host (`#adminTablesLayoutRows`), not a literal `<table
+   class="data-table">` markup — the hydrator injects one once
+   `/api/admin/registry` resolves. It still gets `overflow-x: auto` for
+   free from this same rule once that happens.
+
+   Decision (PR #1823 review): overflow-x: auto makes overflow-y compute to
+   auto too, which turns the wrap into a NEW scrolling ancestor closer than
+   the viewport — so `.data-table thead th`'s `position: sticky` (below)
+   would silently re-target that ancestor instead. The wrap is never given a
+   height cap, so it never actually scrolls vertically, meaning the header
+   would stop sticking at all instead of degrading gracefully, and the same
+   ancestor change is what triggers the well-known "rounded corners vanish
+   under a stuck thead" clipping bug the `.cloud-chat-table-wrap` recipe in
+   chat.css works around for its own tables. Rather than adopt that recipe's
+   border-transfer here too (all ten pages would need touching, and
+   `admin_tables.html`'s wrap would gain a border around its
+   `#adminTablesLayoutRows` "Loading tables…" placeholder even before a
+   real table exists inside it — a visual change out of scope for this
+   fix), sticky is disabled outright for any thead wrapped in
+   `.data-table-wrap`: an unambiguous "off" instead of a silently
+   non-functional "on". A bounded,
+   internally-scrolling table with real in-wrap sticky is a legitimate
+   follow-up for a page that wants it, not a rule that belongs on every
+   consumer of this class today. */
 .data-table-wrap {
     overflow-x: auto;
+}
+.data-table-wrap thead th {
+    position: static;
 }
 
 /* ─── Badges — accent vocabulary ──────────────────────────────────────

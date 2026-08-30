@@ -1054,14 +1054,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
-- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Nine
+- **`.data-table-wrap` now actually scrolls horizontally (#1707 A6).** Ten
   admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
-  knowledge_digests, linked_apps, initial_workspace, data_apps) wrap their
-  table in `<div class="data-table-wrap">`, but no CSS rule ever backed the
-  class — so a wide table dragged the whole page into horizontal scroll in a
-  narrow window instead of just itself. Also replaced the inline
-  `style="text-align:right"` on `/admin/semantic-sources`'s Actions header
-  with the existing `.num` class.
+  knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+  their table in `<div class="data-table-wrap">`, but no CSS rule ever
+  backed the class — so a wide table dragged the whole page into horizontal
+  scroll in a narrow window instead of just itself. Fixing the overflow
+  naively would have broken sticky table headers on all ten pages —
+  `overflow-x: auto` makes the wrap a nearer scrolling ancestor than the
+  viewport, and with no height cap the header would silently stop sticking
+  at all instead of visibly failing — so sticky is now consciously disabled
+  for any thead inside `.data-table-wrap` rather than left in that
+  ambiguous, silently-broken state. Also replaced seven admin pages' inline
+  `style="text-align:right"` on a header (semantic sources, marketplaces,
+  mcp_sources, mcp_source_detail, knowledge_digests, initial_workspace,
+  access) with the existing `.num` class.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
