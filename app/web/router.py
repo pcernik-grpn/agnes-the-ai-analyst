@@ -2754,9 +2754,17 @@ async def library_page(
                     visibility=visibility,
                     visibility_label=visibility_label,
                     meta_text=" · ".join(meta_bits),
-                    # Store visibility, not a group grant — the badge reports the
-                    # model rather than offering a grant nothing would read.
-                    share_type=None,
+                    # The author's OWN item, so the badge is a control. It used
+                    # to be inert here on the grounds that a grant on a store
+                    # entity was read by nothing — true then, false now: a
+                    # granted group can find, open and install a private item.
+                    # An entity already published to everyone has nothing left
+                    # to grant, so only a private one is shareable.
+                    share_type=(
+                        ResourceType.STORE_ENTITY.value
+                        if (s.get("visibility_status") or "") != "approved"
+                        else None
+                    ),
                     tags=[s["category"]] if s.get("category") else [],
                     owner_key=owner_key,
                 )
@@ -3170,13 +3178,22 @@ async def library_page(
     except Exception as e:
         _lost("plugins from your organization", e)
 
-    # Installed AGENTS. Skills and plugins are already covered by the store sweep
-    # above — whether installed or not — so listing them here again would double
-    # every row. Agents are not swept (they have their own surface at /agents),
-    # so an installed one is surfaced here, as it always has been.
+    # Installed AGENT TEMPLATES the sweep did not already list.
+    #
+    # The sweep covers approved entities and the caller's own, of all three
+    # types. This pass exists for the remainder: an entity the caller
+    # installed that the sweep will not show them — someone else's item that
+    # has since been archived, or one shared with them rather than published.
+    # It used to be "agents are never swept", and when they joined the sweep
+    # this loop started listing an installed one a second time. Skipping what
+    # is already on the page is the durable form of that rule: it stays right
+    # whichever types the sweep covers next.
+    _listed_ids = {row.get("id") for row in items}
     try:
         for inst in installed_store.values():
             if (inst.get("type") or "").lower() != "agent":
+                continue
+            if inst["id"] in _listed_ids:
                 continue
             _add_shared_row(
                 item_id=inst["id"],

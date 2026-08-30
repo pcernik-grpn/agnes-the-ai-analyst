@@ -276,6 +276,12 @@
   .sk-selectwrap select { padding-right: 32px; cursor: pointer; -webkit-appearance: none; appearance: none; }
   .sk-hint { font-size: 12px; color: var(--ds-text-muted); margin: 6px 0 0; }
   .sk-hint.err { color: var(--ds-accent-danger-ink); }
+  /* The chosen groups, under the "These groups" tier. */
+  .sk-access-groups { margin: 12px 0 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .sk-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid var(--ds-border);
+             border-radius: 999px; font-size: 12.5px; background: var(--ds-surface-sunken); }
+  .sk-chip-x { border: 0; background: none; cursor: pointer; color: var(--ds-text-muted); font-size: 12px; padding: 0; }
+  .sk-chip-x:hover { color: var(--ds-accent-danger-ink); }
   /* Guidance attached to a field. On the sunken surface these read as
      disabled chrome and get skipped; the blue info vocabulary + an ⓘ badge
      in the gutter files them as "something you want to know" instead. */
@@ -827,6 +833,9 @@
     // provenance of an uploaded one; unlike a plugin's .zip it survives a
     // reload, because the text itself is in the draft.
     return { name: '', description: '', category: '', body: '', access: 'private',
+             // Groups chosen under the "These groups" tier, denormalized
+             // ({id, name}) so a resumed draft renders its own chips.
+             share_groups: [],
              source_mode: 'write', source_file: null,
              // Plugin only. `plugin_source` is how the contents are being
              // given; `components` is the Library selection, denormalized
@@ -1922,22 +1931,61 @@
         key: 'access',
         collapsed: !!collapsed['access'], no: 3, title: 'Access',
         sub: 'Who can use this ' + c.label.toLowerCase() + ' once it is saved.',
-        summary: draft.access === 'everyone' ? 'Everyone' : 'Private',
-        body:
-              '<div class="sk-access" role="radiogroup" aria-label="Who can use this">' +
-                '<label class="sk-access-opt' + (draft.access === 'everyone' ? '' : ' is-on') + '">' +
-                  '<input type="radio" name="sk-access" value="private" ' + (draft.access === 'everyone' ? '' : 'checked') + '>' +
-                  '<span class="sk-access-body"><span class="sk-access-name">Private</span>' +
-                  '<span class="sk-access-hint">Only you. It lands in your Library and nobody else sees it.</span></span>' +
-                '</label>' +
-                '<label class="sk-access-opt' + (draft.access === 'everyone' ? ' is-on' : '') + '">' +
-                  '<input type="radio" name="sk-access" value="everyone" ' + (draft.access === 'everyone' ? 'checked' : '') + '>' +
-                  '<span class="sk-access-body"><span class="sk-access-name">Everyone in the organization</span>' +
-                  '<span class="sk-access-hint">Published to the Library after the automated review, then available to everyone here.</span></span>' +
-                '</label>' +
-              '</div>',
+        summary: accessSummary(),
+        body: accessBody(c),
       }) +
       '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above, and you can edit or archive it from there afterwards.</div>';
+  }
+
+  /* ── Access ──
+     Three tiers, not two. "Only me" and "everyone here" were the whole choice,
+     and the middle one — the common one — did not exist: a grant on a store
+     item was accepted and read by nothing, so sharing a skill with your own
+     team was impossible from any surface. Now a grant is access, and this is
+     where an author says so while they are still thinking about it. */
+  function accessTier() {
+    if (draft.access === 'everyone') return 'everyone';
+    return (draft.share_groups && draft.share_groups.length) ? 'groups' : 'private';
+  }
+
+  function accessSummary() {
+    var t = accessTier();
+    if (t === 'everyone') return 'Everyone';
+    if (t === 'groups') return draft.share_groups.length + ' group' + (draft.share_groups.length === 1 ? '' : 's');
+    return 'Only you';
+  }
+
+  function accessOpt(value, name, hint, on) {
+    return '<label class="sk-access-opt' + (on ? ' is-on' : '') + '">' +
+      '<input type="radio" name="sk-access" value="' + value + '"' + (on ? ' checked' : '') + '>' +
+      '<span class="sk-access-body"><span class="sk-access-name">' + esc(name) + '</span>' +
+      '<span class="sk-access-hint">' + hint + '</span></span></label>';
+  }
+
+  function accessBody(c) {
+    var t = accessTier();
+    var chips = (draft.share_groups || []).map(function (g) {
+      return '<span class="sk-chip">' + esc(g.name) +
+        '<button type="button" class="sk-chip-x" data-sk-ungroup="' + esc(g.id) + '" ' +
+        'aria-label="Remove ' + esc(g.name) + '">✕</button></span>';
+    }).join('');
+    var picker = t === 'groups'
+      ? '<div class="sk-access-groups">' +
+          (chips || '<p class="sk-hint">No groups yet — nobody but you can see it until you add one.</p>') +
+          '<button type="button" class="ag-addrow" data-sk-groups>+ Choose groups</button>' +
+          (shareErr ? '<div class="sk-hint err">' + esc(shareErr) + '</div>' : '') +
+        '</div>'
+      : '';
+    return '<div class="sk-access" role="radiogroup" aria-label="Who can use this">' +
+        accessOpt('private', 'Only me',
+          'It lands in your Library and nobody else sees it.', t === 'private') +
+        accessOpt('groups', 'These groups',
+          'Shared with the groups you pick — they can find it, open it and add it. Nobody else can.',
+          t === 'groups') +
+        accessOpt('everyone', 'Everyone in the organization',
+          'Published to the Library after the automated review, then available to everyone here.',
+          t === 'everyone') +
+      '</div>' + picker;
   }
 
   /* Everything render() has to do once the markup is in the DOM. */
@@ -2108,8 +2156,87 @@
     return rows.map(function (c) { return componentRowHtml(c, 'picker'); }).join('');
   }
 
+  /* The picker host serves two lists now: the plugin's contents, and the
+     groups an item is shared with. One at a time, keyed here. */
+  var pickerKind = 'components';
+  var shareTargets = null;        // [{id, name, everyone}] from /api/sharing/groups
+  var shareTargetsErr = false;
+  var shareQuery = '';
+  var shareErr = '';
+
+  function loadShareTargets() {
+    if (shareTargets !== null) return Promise.resolve();
+    return fetch('/api/sharing/groups', { credentials: 'same-origin' })
+      .then(readJson)
+      .then(function (rows) {
+        shareTargets = (rows || []).map(function (g) {
+          // The API's own field name — `is_everyone`, not `everyone`. Reading
+          // the wrong one silently kept "Everyone (workspace)" in the list,
+          // which is a second control for a decision the tier above makes.
+          return { id: String(g.id), name: String(g.name || g.id), everyone: !!g.is_everyone };
+        // "Everyone" is its own tier above; offering it here as a group would
+        // be two controls for one decision.
+        }).filter(function (g) { return !g.everyone; });
+        shareTargetsErr = false;
+      })
+      .catch(function () { shareTargets = null; shareTargetsErr = true; });
+  }
+
+  function shareMatches() {
+    var q = shareQuery.trim().toLowerCase();
+    var rows = shareTargets || [];
+    return q ? rows.filter(function (g) { return g.name.toLowerCase().indexOf(q) !== -1; }) : rows;
+  }
+
+  function groupPicked(id) {
+    return (draft.share_groups || []).some(function (g) { return g.id === id; });
+  }
+
+  function toggleGroup(id) {
+    if (groupPicked(id)) {
+      draft.share_groups = draft.share_groups.filter(function (g) { return g.id !== id; });
+    } else {
+      var found = (shareTargets || []).filter(function (g) { return g.id === id; })[0];
+      if (found) draft.share_groups = (draft.share_groups || []).concat([{ id: found.id, name: found.name }]);
+    }
+    persist();
+    renderPickerRows();
+  }
+
+  function shareRowsHtml() {
+    if (shareTargetsErr) return '<p class="sk-hint err">Could not load your groups.</p>';
+    if (shareTargets === null) return '<p class="sk-hint">Loading…</p>';
+    var rows = shareMatches();
+    if (!rows.length) {
+      return '<p class="sk-hint">' + (shareTargets.length
+        ? 'No group matches that.'
+        : 'You are not in any group yet, so there is nobody to share with. An admin adds people to groups.') + '</p>';
+    }
+    return rows.map(function (g) {
+      var on = groupPicked(g.id);
+      return '<div class="ag-row">' +
+        '<div class="ag-row-body"><div class="ag-row-name">' + esc(g.name) + '</div></div>' +
+        '<button type="button" class="ag-tglbtn' + (on ? ' on' : '') + '" data-sk-group="' + esc(g.id) + '">' +
+          (on ? '✓ Added' : 'Add') + '</button>' +
+      '</div>';
+    }).join('');
+  }
+
   function pickerHtml() {
     if (!pickerOpen) return '';
+    if (pickerKind === 'groups') {
+      return BuilderShell.picker({
+        key: 'groups',
+        title: 'Share with',
+        sub: 'Groups you are in. Anyone in one of them can find this, open it and add it — nobody else can.',
+        searchPlaceholder: 'Search groups…',
+        query: shareQuery,
+        shown: shareTargets === null ? 0 : shareMatches().length,
+        total: shareTargets === null ? 0 : shareTargets.length,
+        rows: shareRowsHtml(),
+        foot: 'Need a group that is not here? Only an admin can create one or add you to it.',
+      });
+    }
     return BuilderShell.picker({
       key: 'components',
       title: 'Add to this plugin',
@@ -2131,13 +2258,31 @@
   /* Rows + count only, so the search input keeps its focus and caret — the
      same reason the agents builder partial-renders its picker. */
   function renderPickerRows() {
+    if (pickerKind === 'groups') {
+      var gel = document.querySelector('[data-rows="groups"]');
+      if (gel) gel.innerHTML = shareRowsHtml();
+      var gcnt = document.querySelector('[data-count="groups"]');
+      if (gcnt && shareTargets !== null) gcnt.textContent = shareMatches().length + ' of ' + shareTargets.length;
+      return;
+    }
     var el = document.querySelector('[data-rows="components"]');
     if (el) el.innerHTML = pickerRowsHtml();
     var cnt = document.querySelector('[data-count="components"]');
     if (cnt && pool !== null) cnt.textContent = poolMatches().length + ' of ' + pool.length;
   }
 
+  function openGroupPicker() {
+    pickerKind = 'groups';
+    pickerOpen = true;
+    shareQuery = '';
+    renderPicker();
+    loadShareTargets().then(function () { if (pickerOpen) renderPickerRows(); });
+    var box = document.querySelector('[data-ag-search="groups"]');
+    if (box) box.focus();
+  }
+
   function openPicker() {
+    pickerKind = 'components';
     pickerOpen = true;
     poolQuery = '';
     renderPicker();
@@ -2697,9 +2842,21 @@
         ? postJson('/api/store/entities/from-components', componentsPayload({ access: access }))
         : postForm('/api/store/entities', bundleForm({ access: access })))
         .then(function (created) {
-          discardDraft(type);
-          flashToast(created, access, name);
-          window.location.href = '/library?new=' + encodeURIComponent(created.id);
+          return shareAfterSave(created.id).then(function (shareFailure) {
+            discardDraft(type);
+            if (shareFailure) {
+              // Saved, not shared — say which, and stay put so it can be
+              // retried rather than discovering it from an empty Library.
+              setProblems('Saved, but not shared', [
+                { text: 'The ' + cfg().label.toLowerCase() + ' was saved. Sharing it failed: ' + shareFailure },
+                { text: 'Open it from the Library and share it from there.' },
+              ], true);
+              render();
+              return;
+            }
+            flashToast(created, access, name);
+            window.location.href = '/library?new=' + encodeURIComponent(created.id);
+          });
         })
         .catch(fail);
       return;
@@ -2890,8 +3047,19 @@
       if (verdictToken) { body.precheck_verdict_token = verdictToken; }
       postJson('/api/store/entities/from-markdown', body)
         .then(function (created) {
-          showReviewPanel(created, access);
-          inFlight = false;
+          // Share before the panel: the panel is the end of this flow, and a
+          // sharing failure has to be visible on the same screen, not two
+          // states later.
+          return shareAfterSave(created.id).then(function (shareFailure) {
+            if (shareFailure) {
+              setProblems('Saved, but not shared', [
+                { text: 'The ' + cfg().label.toLowerCase() + ' was saved. Sharing it failed: ' + shareFailure },
+                { text: 'Open it from the Library and share it from there.' },
+              ], true);
+            }
+            showReviewPanel(created, access);
+            inFlight = false;
+          });
         })
         .catch(fail);
     }
@@ -2948,6 +3116,24 @@
         // outage doesn't silently block publishing.
         commitSave(null);
       });
+  }
+
+  /* The grants that make "These groups" mean anything.
+
+     Runs AFTER the row exists, because a grant needs something to point at.
+     A failure here is reported rather than swallowed: the difference between
+     "shared with Finance" and "shared with nobody" is invisible on the next
+     page, and the author is the only one who can retry it. */
+  function shareAfterSave(entityId) {
+    var ids = (draft.share_groups || []).map(function (g) { return g.id; });
+    if (!ids.length) return Promise.resolve(null);
+    return fetch('/api/sharing/store_entity/' + encodeURIComponent(entityId), {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ group_ids: ids }),
+    }).then(readJson).then(function () { return null; })
+      .catch(function (e) { return (e && e.message) || 'sharing failed'; });
   }
 
   /* Receipt handed over a redirect (app.js drains agnes.flash.toast on the next
@@ -3099,6 +3285,7 @@
     var t = e.target.closest('[data-sk-type],[data-sk-typemenu],[data-sk-revise],[data-sk-mode],[data-sk-browse],' +
                              '[data-sk-removefile],[data-sk-jump],[data-sk-dismiss],' +
                              '[data-sk-psrc],[data-sk-openpick],[data-sk-pick],[data-sk-unpick],' +
+                             '[data-sk-groups],[data-sk-group],[data-sk-ungroup],' +
                              '[data-ag-pick-close],' +
                              '[data-ag-back],[data-ag-toggle-sec],' +
                              '[data-ag-tab],[data-ag-send],[data-ag-chip],' +
@@ -3194,6 +3381,15 @@
       }
     }
     else if (t.hasAttribute('data-sk-openpick')) { openPicker(); }
+    else if (t.hasAttribute('data-sk-groups')) { openGroupPicker(); }
+    else if (t.hasAttribute('data-sk-group')) { toggleGroup(t.getAttribute('data-sk-group')); }
+    else if (t.hasAttribute('data-sk-ungroup')) {
+      draft.share_groups = (draft.share_groups || []).filter(function (g) {
+        return g.id !== t.getAttribute('data-sk-ungroup');
+      });
+      persist();
+      render();
+    }
     else if (t.hasAttribute('data-sk-pick')) { togglePick(t.getAttribute('data-sk-pick')); }
     else if (t.hasAttribute('data-sk-unpick')) {
       /* No confirm: the item itself is untouched — this only takes it out of
@@ -3265,9 +3461,17 @@
   document.addEventListener('change', function (e) {
     // Access radios live inside the re-rendered builder — read via delegation.
     if (draft && e.target.matches && e.target.matches('input[name="sk-access"]')) {
-      draft.access = e.target.value === 'everyone' ? 'everyone' : 'private';
+      var tier = e.target.value;
+      // Two fields, three tiers: `access` is what the store row is created
+      // with, `share_groups` is who it is granted to afterwards. "These
+      // groups" is a private item with grants — which is the whole point of
+      // making a grant mean something.
+      draft.access = tier === 'everyone' ? 'everyone' : 'private';
+      if (tier !== 'groups') draft.share_groups = [];
+      shareErr = '';
       persist();
       render();
+      if (tier === 'groups' && !(draft.share_groups || []).length) openGroupPicker();
       return;
     }
     if (e.target && e.target.id === 'sk-file-input') {
@@ -3279,6 +3483,11 @@
   function handleFieldInput(e) {
     if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'components') {
       poolQuery = e.target.value;
+      renderPickerRows();
+      return;
+    }
+    if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'groups') {
+      shareQuery = e.target.value;
       renderPickerRows();
       return;
     }

@@ -61,7 +61,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from app.auth.access import is_user_admin, require_admin, required_store_entity_ids
+from app.auth.access import (
+    granted_store_entity_ids,
+    is_user_admin,
+    require_admin,
+    required_store_entity_ids,
+)
 from app.auth.dependencies import _get_db, get_current_user
 from app.services.journey import mark_journey
 from app.instance_config import (
@@ -1534,12 +1539,16 @@ async def list_entities(
     # admins via the existing /admin path. Anyone else only sees approved.
     visibility_filter: Optional[List[str]]
     include_owner_id: Optional[str] = None
+    include_granted: List[str] = []
     is_admin = is_user_admin(user["id"], conn)
     is_self_owner = bool(owner and owner == user["id"])
     if is_admin or is_self_owner:
         visibility_filter = None
     else:
         visibility_filter = ["approved"]
+        # ...and so does a group the entity was granted to: an admin who
+        # shares a private skill with Finance expects Finance to find it.
+        include_granted = sorted(granted_store_entity_ids(user["id"], conn))
         # Owner sees their own non-approved entries in the listing too
         # so they spot what they uploaded that's still under review or
         # quarantined. The card template renders a status badge for
@@ -1575,6 +1584,7 @@ async def list_entities(
         owner_user_id=facet_owner,
         visibility_status=visibility_filter,
         include_owner_id=include_owner_id,
+        include_ids=include_granted,
         publisher_kind=publisher_kind,
         exclude_owner_user_id=exclude_owner_user_id,
         verification_state=verification_states,
@@ -1599,17 +1609,39 @@ async def list_entities(
     )
 
 
+def _is_granted(entity_id: str, user: dict, conn) -> bool:
+    """Whether one of the caller's groups has been granted this entity.
+
+    A ``store_entity`` grant used to be accepted and do nothing: the admin
+    UI wrote the row, the API returned 201, and the group still got 404 on
+    the item, could not see it in a listing, and was refused an install with
+    ``entity_not_approved``. The Required tier built on top of it was worse
+    than nothing — it installed, for every member, something none of them
+    could read.
+
+    So the grant is what it always looked like: private stops meaning "nobody
+    but me" and starts meaning "not everyone".
+    """
+    from app.auth.access import can_access
+    from app.resource_types import ResourceType
+
+    return can_access(user["id"], ResourceType.STORE_ENTITY.value, entity_id, conn)
+
+
 def _enforce_visibility(entity: dict, user: dict, conn) -> None:
     """Refuse asset reads on quarantined entities for non-owner non-admin.
 
     Returns 404 (not 403) so the existence of the entity is not leaked
-    via timing / status-code differences. Owner + admin always pass.
+    via timing / status-code differences. Owner + admin always pass, and so
+    does a group the entity was granted to (see :func:`_is_granted`).
     """
     if entity.get("visibility_status") == "approved":
         return
     if entity.get("owner_user_id") == user.get("id"):
         return
     if is_user_admin(user["id"], conn):
+        return
+    if _is_granted(str(entity.get("id") or ""), user, conn):
         return
     raise HTTPException(status_code=404, detail="entity_not_found")
 
@@ -4487,6 +4519,15 @@ async def install_entity(
         _status != "approved"
         and not is_own_unflagged_private(entity, user["id"])
         and not is_user_admin(user["id"], conn)
+        # A group the entity was granted to installs it like anyone else. The
+        # same review conditions still apply at the serve chokepoint, which
+        # re-evaluates them on every read — a grant widens who may install,
+        # never what a blocked bundle is allowed to do.
+        and not (
+            _status == "hidden"
+            and _is_granted(entity_id, user, conn)
+            and not _entity_review_blocked(entity_id)
+        )
     ):
         raise HTTPException(status_code=409, detail="entity_not_approved")
     installs = user_store_installs_repo()

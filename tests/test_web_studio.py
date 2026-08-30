@@ -211,10 +211,13 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     for n in ("1", "2", "3"):
         assert f"no: {n}," in body, f"step {n} is not numbered in the shell sections"
     assert "no: 4," not in body, "the sections should end at 3 now that Type is not one"
-    # Access is a required choice before saving: Private or the whole org.
+    # Access is a required choice before saving, and it has THREE tiers: only
+    # me, these groups, everyone here. The middle one is the common case and
+    # did not exist — a grant on a store item was accepted and read by
+    # nothing, so sharing a skill with your own team was impossible.
     assert 'name="sk-access"' in body
-    assert 'value="private"' in body
-    assert 'value="everyone"' in body
+    for tier in ("private", "groups", "everyone"):
+        assert f"accessOpt('{tier}'" in body, f"the {tier} tier is gone from the access section"
     assert "Who can use this" in body
     # One primary action. A draft is explicitly local, never a store write —
     # "Publish to marketplace" stays gone.

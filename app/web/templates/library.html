@@ -372,22 +372,22 @@
                   {{ _vis_icon }}{{ c.visibility_label }}{{ _chevron }}
                 </button>
                 {% else %}
-                {# Skills: an approved store entity is already readable by everyone
-                   here, so the badge explains that model instead of offering a
-                   group grant nothing would read. `--fixed` alongside `--editable`
-                   is the point: it opens a dialog (so it keeps the chevron, the
-                   pointer and the button metrics) but that dialog changes nothing,
-                   so it must not wear the blue that now means "changeable".
+                {# An APPROVED store entity is already readable by everyone here,
+                   so the badge explains that model rather than offering a grant
+                   with nothing left to widen. A private one is now genuinely
+                   shareable and takes the `c.shareable` branch above instead.
+                   `--fixed` alongside `--editable` is the point: it opens a
+                   dialog (so it keeps the chevron, the pointer and the button
+                   metrics) but that dialog changes nothing, so it must not wear
+                   the blue that now means "changeable".
 
-                   TODO — make this badge a real control for a PRIVATE store entity
-                   ("share my private skill"). Today an owner has no path from the
-                   Library (or anywhere else) to take their own skill/plugin from
-                   Private to Everyone: `access=private|everyone` is accept-only at
-                   CREATE (`POST /api/store/entities` and the `from-markdown`
-                   sibling) — `PUT /api/store/entities/{id}` edits name, description,
-                   category, title, tagline, bundle and photo, but not access. So the
-                   missing piece is an access-change endpoint, not a control here;
-                   this branch is only where the control would land once one exists.
+                   TODO — what is still missing is the ACCESS TIER, not the
+                   grant: an owner cannot take their own private skill to
+                   Everyone after the fact. `access=private|everyone` is
+                   accept-only at CREATE (`POST /api/store/entities` and the
+                   `from-markdown` sibling) — `PUT /api/store/entities/{id}`
+                   edits name, description, category, title, tagline, bundle and
+                   photo, but not access.
 
                    The design question that endpoint has to answer: private→everyone
                    makes the bundle readable by every authenticated user, so it must

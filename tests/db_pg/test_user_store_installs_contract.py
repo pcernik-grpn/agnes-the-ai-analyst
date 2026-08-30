@@ -191,6 +191,38 @@ def test_hidden_never_serves_to_a_third_party(repos):
     assert installs.list_for_user(OTHER) == []
 
 
+def test_a_granted_hidden_entity_serves_to_the_group(repos):
+    """The read side of a `store_entity` grant. It used to be accepted and mean
+    nothing — the row was written and this chokepoint served the group
+    nothing — so both engines now take the granted set and both must honour
+    it identically."""
+    installs, entities, _subs = repos
+    eid = _entity(entities, name="granted", visibility_status="hidden")
+    installs.install(OTHER, eid)
+    assert installs.list_for_user(OTHER) == [], "it served without the grant, so the next line proves nothing"
+    assert [r["id"] for r in installs.list_for_user(OTHER, [eid])] == [eid]
+
+
+def test_a_grant_does_not_override_a_rejection(repos):
+    """A grant widens who may be served; it never resurrects a bundle the
+    guardrails blocked. Hand-maintained in two dialects, so it is asserted in
+    both."""
+    installs, entities, subs = repos
+    eid = _entity(entities, name="granted-but-blocked", visibility_status="hidden")
+    _reject(subs, eid)
+    installs.install(OTHER, eid)
+    assert installs.list_for_user(OTHER, [eid]) == []
+
+
+def test_an_unrelated_grant_does_not_widen_anything(repos):
+    """The granted set is matched by id, not merely counted."""
+    installs, entities, _subs = repos
+    mine = _entity(entities, name="wanted", visibility_status="hidden")
+    other = _entity(entities, name="unrelated", visibility_status="hidden")
+    installs.install(OTHER, mine)
+    assert installs.list_for_user(OTHER, [other]) == []
+
+
 def test_rejected_hidden_never_serves_even_to_its_author(repos):
     """Quarantine writes the same status as Private, so the blocking verdict is
     the only separator. A bundle review rejected stays out."""
