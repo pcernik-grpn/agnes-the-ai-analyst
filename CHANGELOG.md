@@ -12,6 +12,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+## [0.93.0] - 2026-08-30
+
+### Added
+
 - **The Knowledge tab opens on what the graph knows (TCRD-250).** Node types with live, caller-scoped counts sit at the head of the tab, each one a way in — the counts come from `GET /api/facts/type-map`, so a type shows what *you* can reach and a type nobody can see is absent rather than zero. It follows the active tab through the Library's own `onApply` chain (the filter engine slices rows by `data-tab`; a non-row element has no such hook) and starts hidden, so it never flashes on Capabilities before the first apply. Renders nothing at all when the facts feature is off, the app-state backend is DuckDB, or the graph is empty — the Library must not fail because a decoration is unavailable.
 
 - **Read and WebSocket routes join the audit-posture ratchet.** Every `GET` route now declares either a cataloged action or an exempt reason drawn from a closed vocabulary (`health`, `self`, `ui_support`, `static`, `noise`), and the same applies to the WebSocket surface. This closes several previously-unaudited reads — admin cross-user lookups and connector browsing among them — without flooding `audit_log` with routine polling and self-service traffic.
