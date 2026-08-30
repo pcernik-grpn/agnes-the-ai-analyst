@@ -771,10 +771,63 @@ class TestCatalogSemanticsDeepLinkIntoTheDocument:
         )
         assert self._LINK not in self._body(seeded_app, "analyst_token")
 
-    def test_filter_prefills_from_the_q_query_parameter(self, seeded_app):
-        """The other half of the round trip: the object page links back with
-        `?q=<metric name>`, which this page's client-side filter reads on
-        load. Without the reader the back link lands on an unfiltered list."""
+    def test_the_readable_model_sweep_runs_once_per_request(self, seeded_app, monkeypatch):
+        """The deep-link map and the page header's browse-link gate are two
+        answers off ONE `_can_read_model` sweep.
+
+        The check resolves a model's Data Packages per row, so a second sweep
+        doubles this page's semantic-layer cost for an answer it already had —
+        invisible in output, which is why it is asserted on the call count."""
+        import app.api.semantic_models as semantic_models
+
+        self._seed_model(slug="retail")
+        self._seed_model(slug="finance")
+
+        real = semantic_models._can_read_model
+        seen: list[str] = []
+
+        def counting(user, row, conn):
+            seen.append(str(row.get("slug")))
+            return real(user, row, conn)
+
+        monkeypatch.setattr(semantic_models, "_can_read_model", counting)
+        self._body(seeded_app)
+        assert len(seen) == 2, f"expected one sweep over the two models, got {len(seen)} checks: {seen}"
+
+    def test_the_back_links_q_value_matches_what_this_page_filters_on(self, seeded_app):
+        """The round trip's data agreement, end to end.
+
+        The object page PRODUCES `?q=<term>`; this page's filter CONSUMES it
+        against each row's `data-ft` index (lowercased on both sides). Asserted
+        as one dataflow rather than by grepping for the JS: a `q` the index
+        does not contain lands the reader on an empty list, and neither half
+        can see that on its own."""
+        import re
+        from urllib.parse import unquote
+
+        self._seed_model()
+        _make_metric(
+            id="manual/_/retail/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category="retail",
+            source="manual",
+            source_ref=None,
+        )
+        c = seeded_app["client"]
+        headers = _auth(seeded_app["admin_token"])
+
+        obj = c.get("/semantic-layer/retail/metric:revenue", headers=headers)
+        assert obj.status_code == 200, obj.text
+        produced = re.search(r'href="/catalog/semantics\?q=([^"#]*)#metrics"', obj.text)
+        assert produced, "the metric object page emitted no registry back link"
+        term = unquote(produced.group(1)).lower()
+
         body = self._body(seeded_app)
-        assert "URLSearchParams" in body
-        assert "metricFilter.value" in body
+        rows = re.findall(r'data-ft="([^"]*)"', body)
+        assert any(term in row for row in rows), (
+            f"no metric row indexes {term!r} — the back link would land on an empty filter"
+        )
+        # ...and the consumer end is wired at all: without this read the term
+        # arrives in the URL and the list renders unfiltered.
+        assert "URLSearchParams(window.location.search).get('q')" in body
