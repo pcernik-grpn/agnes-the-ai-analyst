@@ -33,6 +33,14 @@ The two **preview** endpoints widen the read rule by one case — a grant on the
 ``corpus_file`` itself also grants them — because a file shared out of a folder
 has to be viewable by the person it was shared with, who holds no grant on the
 parent collection.
+
+For a SharePoint ACL-mirroring **tiered** collection (``src.audience_classes``),
+reachability above is unchanged, but document TEXT (raw bytes, the text
+preview, and this file's chunk-backed search snippets) is narrowed further by
+``_document_text_visible`` to callers holding the scope's top audience class
+(or an admin) — a fail-toward-redacted stand-in for per-audience document
+derivations (spec §4.4, §8.4, §9) until those exist. Non-tiered collections are
+unaffected.
 """
 
 from __future__ import annotations
@@ -377,6 +385,23 @@ async def search_collections(
         allowed = [c for c in allowed if c == corpus_id]
     k = max(1, min(k, 50))
     results = _search(allowed, q, k=k)
+
+    # Chunks must not leak what claims withhold (spec §9): a tiered
+    # collection's snippets are silently dropped for a caller below its top
+    # audience class — same rule as the raw/preview endpoints, no separate
+    # hint (the caller already knows the collection is searched; they just
+    # don't see this file's text). Memoized per corpus_id since a search
+    # commonly returns several chunks from the same collection/file.
+    visible_cache: dict[str, bool] = {}
+
+    def _chunk_text_visible(corpus_id: Optional[str]) -> bool:
+        if not corpus_id:
+            return True
+        if corpus_id not in visible_cache:
+            visible_cache[corpus_id] = _document_text_visible(user, corpus_id)
+        return visible_cache[corpus_id]
+
+    results = [r for r in results if _chunk_text_visible(r.get("corpus_id"))]
     payload: dict = {"results": results, "retrieval": retrieval_mode()}
     if not results:
         payload["searched_collections"] = len(allowed)
@@ -1592,6 +1617,31 @@ _PREVIEW_READ_MAX_BYTES = 512 * 1024
 _PREVIEW_MAX_CHARS = 20_000
 
 
+def _document_text_visible(caller: Any, collection_id: str) -> bool:
+    """Whether ``caller`` may read a TIERED collection's document TEXT — raw
+    bytes, the text preview, and chunk-backed search snippets — as opposed to
+    the collection's mere reachability, which this predicate never touches.
+
+    Fail-toward-redacted stand-in for the parent spec's O5 per-audience
+    *document* derivations (§4.4, §8.4): until N-variant document text
+    exists, a tiered scope's document text is visible only to the caller
+    holding its most-privileged (top) audience class — or an admin, matching
+    this module's existing god-mode idiom (``is_user_admin``) — never to a
+    caller holding a lower class or none. A non-tiered collection
+    (``top_class_for`` returns ``None``) is always visible: plain collections
+    are unaffected by this predicate, byte for byte.
+    """
+    from src.audience_classes import audience_classes_for_caller, top_class_for
+
+    top = top_class_for(collection_id)
+    if top is None:
+        return True
+    if isinstance(caller, dict) and is_user_admin(caller.get("id")):
+        return True
+    held = audience_classes_for_caller(caller, [collection_id]).get(collection_id, frozenset())
+    return top in held
+
+
 def _readable_file_or_404(collection_id: str, file_id: str, user: dict) -> dict:
     """The file's row, if this caller may read it — else 404.
 
@@ -1746,6 +1796,12 @@ async def preview_file(
         "reason": None,
     }
 
+    if not _document_text_visible(user, collection_id):
+        # Tiered collection, caller below the top audience class (or in
+        # none): the same "no text preview available" shape a not-yet-
+        # indexed file gets — no new error vocabulary, no 403 oracle.
+        return {**base, "kind": "none", "reason": _no_text_reason(row)}
+
     if ext in _PREVIEW_INLINE_MEDIA:
         # A present blob is still the normal case, and a *text-less* inline
         # medium with no bytes must keep 404ing — a broken <img> in the modal
@@ -1861,6 +1917,12 @@ async def raw_file(
     from fastapi.responses import FileResponse
 
     row = _readable_file_or_404(collection_id, file_id, user)
+    if not _document_text_visible(user, collection_id):
+        # Same 404 shape a non-readable file already returns — a caller
+        # below the collection's top audience class gets no signal that the
+        # file exists at all beyond what the (visible) collection listing
+        # already told them.
+        raise HTTPException(status_code=404, detail="file_not_found")
     ext = (row.get("file_type") or "").lower()
     media = _PREVIEW_INLINE_MEDIA.get(ext)
     if not media:
