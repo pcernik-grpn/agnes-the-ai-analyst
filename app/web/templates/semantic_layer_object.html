@@ -96,6 +96,10 @@
     font-size: 12px;
     color: var(--ds-text-secondary);
 }
+.slb-registry-link {
+    margin: var(--space-3) 0 0;
+    font-size: 12.5px;
+}
 .slb-rule-code {
     font-family: var(--ds-font-mono, monospace);
     font-size: 12px;
@@ -169,6 +173,12 @@
     {% endfor %}
     {% else %}
     <p class="empty-state__description">No expression declared.</p>
+    {% endif %}
+    {# The way back to the flat registry: the same metric's row there carries
+       the SQL Agnes composed from this expression, its synonyms and its
+       source badge. Rendered only when the metric actually projected. #}
+    {% if registry_href %}
+    <p class="slb-registry-link"><a href="{{ registry_href }}">Open in the metric registry &rarr;</a></p>
     {% endif %}
 </div>
 {% endif %}

@@ -821,3 +821,84 @@ class TestLibraryEntryPoint:
         r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         assert 'href="/semantic-layer"' in r.text
+
+
+class TestRegistryBackLink:
+    """The other half of the #1707 N4 deep link: a metric object page points
+    back at the same metric's row in the flat registry (`/catalog/semantics`),
+    which carries the SQL Agnes composed, the synonyms and the source badge
+    this page does not show.
+
+    Offered only when the metric actually projected — a metric whose only
+    expression is in an unusable dialect, or one the projector skipped, has no
+    registry row to return to."""
+
+    _BACK = 'href="/catalog/semantics?q=revenue#metrics"'
+
+    def _seed_projected_metric(self) -> None:
+        from src.repositories import metric_repo
+
+        # The id `src/semantic/projection.py::projected_metric_id` writes for
+        # the fixture document's `revenue` metric.
+        metric_repo().create(
+            id=f"manual/_/{_SLUG}/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category=_SLUG,
+            sql="SELECT SUM(amount) FROM orders",
+            source="manual",
+        )
+
+    def _object(self, seeded_app, path: str = f"/semantic-layer/{_SLUG}/metric:revenue"):
+        return seeded_app["client"].get(path, headers=_auth(seeded_app["admin_token"]))
+
+    def test_metric_object_page_links_back_to_its_registry_row(self, seeded_app):
+        _seed_model()
+        self._seed_projected_metric()
+        r = self._object(seeded_app)
+        assert r.status_code == 200, r.text
+        assert self._BACK in r.text
+
+    def test_no_back_link_when_the_metric_never_projected(self, seeded_app):
+        _seed_model()
+        r = self._object(seeded_app)
+        assert r.status_code == 200, r.text
+        assert "/catalog/semantics?q=" not in r.text
+
+    def test_no_back_link_when_the_registry_row_is_rbac_hidden(self, seeded_app):
+        """`/catalog/semantics` drops a metric whose table is outside the
+        caller's Data Package stack (#953), so an analyst who can read the
+        model but not the table would land on an empty filter."""
+        from src.repositories import metric_repo, table_registry_repo
+
+        row = _seed_model()
+        _grant_model(row["id"])
+        table_registry_repo().register(
+            id="orders_tbl",
+            name="orders_tbl",
+            description="test table",
+            source_type="keboola",
+            query_mode="materialized",
+        )
+        metric_repo().create(
+            id=f"manual/_/{_SLUG}/revenue",
+            name="revenue",
+            display_name="Revenue",
+            category=_SLUG,
+            sql="SELECT SUM(amount) FROM orders_tbl",
+            table_name="orders_tbl",
+            source="manual",
+        )
+        r = seeded_app["client"].get(
+            f"/semantic-layer/{_SLUG}/metric:revenue",
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert "/catalog/semantics?q=" not in r.text
+
+    def test_non_metric_object_carries_no_registry_link(self, seeded_app):
+        _seed_model()
+        self._seed_projected_metric()
+        r = self._object(seeded_app, f"/semantic-layer/{_SLUG}/dataset:orders")
+        assert r.status_code == 200, r.text
+        assert "/catalog/semantics?q=" not in r.text
