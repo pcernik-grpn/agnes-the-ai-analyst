@@ -126,6 +126,12 @@ live in `docs/RELEASING.md`.
 
 ## Tests before push
 
-Run `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q` before every push.
-Failures in code you touched: fix before pushing. Failures unrelated:
-confirm they reproduce on a clean branch, note in the PR body, do not block.
+Run `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`
+(~3 min) before every push, after `--lane impacted` for what the diff touches.
+CI runs the full suite on the push — running it locally too is what makes a
+merge cycle take hours. Failures in code you touched: fix before pushing.
+Failures unrelated: confirm they reproduce on a clean branch, note in the PR
+body, do not block.
+
+A **release-cut PR** is the exception: it is the artifact the tag is built from,
+so run the full suite on it once before merge.

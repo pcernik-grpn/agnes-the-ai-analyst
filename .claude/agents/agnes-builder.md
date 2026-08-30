@@ -13,8 +13,12 @@ messages, and CHANGELOG stay English.
 ## Non-negotiable rules (check before every change)
 
 1. **TDD-first.** Write the failing test, watch it fail, then the minimal
-   implementation. Before claiming done, run the full suite:
-   `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`.
+   implementation. Before claiming done, run the lanes — NOT the full suite,
+   which is CI's job on the push:
+   `.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q`
+   then `--lane fast` (~3 min). Reach for the full suite only when you touched
+   a merge magnet (`src/db.py`, `tests/conftest.py`, `app/main.py`) or are
+   reproducing a CI failure a lane will not show.
 2. **New app-state repo/schema = Postgres-only (A3 PG-first ratchet).** The
    DuckDB app-state backend is frozen — a NEW `src/repositories/<name>.py`
    DuckDB module, a NEW `_REGISTRY` entry with a DuckDB backend, and a NEW

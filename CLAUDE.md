@@ -168,9 +168,13 @@ uv pip install ".[dev,server]"
 # Run FastAPI locally
 uvicorn app.main:app --reload
 
-# Run tests (connectors/ too — every connector keeps its tests beside the
-# code, and CI runs both; `tests/` alone silently skips them)
-.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
+# Run tests. Locally you run a LANE, not the whole suite — the full ~24 000
+# tests are CI's job on every push (see CONTRIBUTING.md → "Test lanes").
+# `connectors/` is always included: every connector keeps its tests beside the
+# code and `tests/` alone silently skips them.
+.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q   # what your diff touches
+.venv/bin/pytest tests/ connectors/ --lane fast     --tb=short -n auto -q   # ~3 min, pre-push gate
+.venv/bin/pytest tests/ connectors/                 --tb=short -n auto -q   # ~12 min, rarely needed locally
 
 # Locally `-n auto` is capped at 6 workers (each is a ~430 MB process, and the
 # suite is I/O-bound past that). Raise or lower it for a one-off run:
@@ -469,7 +473,7 @@ Full recipe, deploy workflows, manual rollback runbook, weekly tag-housekeeping,
 
 - **Changelog discipline.** Every PR that changes user-visible behavior MUST add a bullet under `## [Unreleased]` in `CHANGELOG.md`, in the same PR — grouped Added/Changed/Fixed/Removed/Internal, `**BREAKING**` prefix for breaking changes. No follow-ups.
 - **Release-cut is a dedicated cut PR, never a feature PR.** A feature/fix PR only ever adds an `[Unreleased]` bullet — it never bumps `pyproject.toml`/`server.json` or renames `[Unreleased]`. `.github/workflows/daily-cut.yml` cuts once a day (minor bump; `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR labeled `release-cut` that a human reviews and merges — this is what killed the old CHANGELOG-rename race between competing feature PRs. After merge: `gh workflow run tag-release.yml -f tag=vX.Y.Z` (the cut PR's body carries the exact command) tags the merge commit and creates the GitHub Release.
-- **Run the full test suite before every push** — `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q` (this is what CI runs). `connectors/` is not optional: every connector keeps its tests beside the code, so `tests/` alone skips them and a connector regression passes a "full" local run and fails in CI. Failures in code you touched: fix before pushing. Failures unrelated to your diff: confirm with `git stash` they reproduce on a clean branch, note them in the PR body, don't block on them.
+- **Run the fast lane before every push, not the full suite** — `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q` (~3 min), after `--lane impacted` for the tests your diff actually touches. CI runs the full suite on the push; running it locally as well is the single biggest cost in the merge cycle and buys nothing CI is not about to compute. `connectors/` is not optional in any lane: every connector keeps its tests beside the code, so `tests/` alone skips them and a connector regression passes a "full" local run and fails in CI. Failures in code you touched: fix before pushing. Failures unrelated to your diff: confirm with `git stash` they reproduce on a clean branch, note them in the PR body, don't block on them. Full local runs are for merge-magnet changes (`src/db.py`, `tests/conftest.py`, `app/main.py`) and for reproducing a CI failure a lane will not show.
 - **Watch the post-merge `release.yml` run.** On `main` pushes a `smoke-test` job pulls the just-built `:stable` image and runs a docker-compose stack; if it fails, the `rollback-on-smoke-fail` job calls the reusable `rollback.yml` workflow which re-points `:stable` to the previous known-good build and opens a tracking issue labeled `bug`. Success signal after merge = `smoke-test` green + `rollback-on-smoke-fail` skipped. If the rollback fires, the merge shipped a broken image to GHCR — investigate the tracking issue before any further push (the issue body has the failing image, commit SHA, deprecated tag, and rollback target). Manual rollback / forced target / weekly tag-pruning operator commands are in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Specialized agents, skills & commands
