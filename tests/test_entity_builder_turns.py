@@ -185,6 +185,23 @@ class TestDegradingWithoutAModel:
         assert r.status_code == 502
         assert r.json()["detail"]["kind"] == "builder_turn_failed"
 
+    def test_a_rejected_credential_says_so_instead_of_try_again(self, client, monkeypatch):
+        """The page has to be able to tell an author "this needs an admin"
+        apart from "the network hiccuped" — the same 502 for both is what
+        made an instance-wide credential failure look like flakiness."""
+        from connectors.llm.exceptions import LLMAuthError
+
+        monkeypatch.setattr("app.api.entity_builder.stub_enabled", lambda: False)
+        monkeypatch.setattr(
+            "app.api.entity_builder._llm_turn",
+            lambda *a, **k: (_ for _ in ()).throw(LLMAuthError("permission denied")),
+        )
+        r = _turn(client)
+        assert r.status_code == 502
+        detail = r.json()["detail"]
+        assert detail["kind"] == "builder_llm_credential_rejected"
+        assert "permission denied" in detail["detail"], "the provider's own words reach the operator"
+
     def test_a_model_that_returns_only_prose_still_answers(self, client, monkeypatch):
         monkeypatch.setattr("app.api.entity_builder.stub_enabled", lambda: False)
         monkeypatch.setattr("app.api.entity_builder._llm_turn", lambda *a, **k: {"reply": "Tell me more."})

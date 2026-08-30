@@ -49,6 +49,7 @@ from app.api.builder_core import (
     panel_prompt_section,
     slots_prompt_section,
     stub_enabled,
+    turn_failure,
     turn_response,
 )
 from app.auth.dependencies import get_current_user
@@ -455,11 +456,9 @@ async def entity_builder_turn(
                 },
             ) from e
         except Exception as e:
-            logger.warning("entity builder: turn failed: %s", e)
-            raise HTTPException(
-                status_code=502,
-                detail={"kind": "builder_turn_failed", "hint": "The assistant could not answer. Try again."},
-            ) from e
+            # Names the failure instead of collapsing every cause into
+            # "try again" — see builder_core.turn_failure.
+            raise turn_failure(e, label="entity builder") from e
 
     patch = _sanitize_patch(result.get("patch"), entity_type=entity_type, categories=categories)
     return turn_response(

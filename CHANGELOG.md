@@ -16,6 +16,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **A failed builder turn names its cause.** All four builders collapsed every distinguishable failure into one 502 telling the author to try again — advice that can never work for a rejected credential, an unavailable model or a refused request. Each now gets its own `kind` (`builder_llm_credential_rejected`, `builder_llm_model_unavailable`, `builder_llm_rate_limited`, `builder_llm_unreachable`, `builder_llm_request_refused`), a hint that says whether retrying can help, and the provider's own error text (length-capped) so the cause is visible without shell access to the server. A 404 from the provider is typed as `LLMModelNotFoundError` instead of escaping as a bare SDK exception.
+
 ### Removed
 
 ### Internal
