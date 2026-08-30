@@ -244,7 +244,7 @@ def _native_semantic_status(
     if not linked:
         return _domain_result(
             STATUS_MISSING,
-            "no semantic source is linked to this connection — register one with `agnes admin semantic-source add`",
+            "no semantic source is linked to this connection — register one with `agnes admin semantic source add`",
             raw=raw,
         )
 

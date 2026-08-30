@@ -1,9 +1,10 @@
 """CLI tests for `agnes semantic-model validate-query` (query-validation
 engine wiring, parity spec §5).
 
-Not to be confused with `tests/test_cli_semantic_model.py`, which covers the
-admin document CRUD + schema-validate surface (`agnes admin semantic-model
-...`) — this is the non-admin query validator.
+Not to be confused with its sibling `agnes semantic-model validate`, which
+schema-checks a DOCUMENT file offline — covered, along with the admin document
+CRUD surface (`agnes admin semantic …`), in `tests/test_cli_semantic_model.py`
+and `tests/test_cli_semantic_consolidation.py`. This is the query validator.
 """
 
 from __future__ import annotations

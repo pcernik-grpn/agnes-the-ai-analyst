@@ -51,7 +51,7 @@ def _health_body(**overrides) -> dict:
 
 
 def test_a_clean_report_says_nothing_is_wrong():
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, _health_body())):
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, _health_body())):
         result = runner.invoke(app, ["semantic-model", "health"])
     assert result.exit_code == 0
     assert "No sync failures, disconnected models, or invalid documents." in result.output
@@ -63,7 +63,7 @@ def test_an_orphaned_metric_binding_is_reported_with_the_missing_table_name():
             {"binding": "metric", "metric_id": "met1", "name": "revenue", "missing_tables": ["orders_gone"]}
         ]
     )
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, body)):
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
         result = runner.invoke(app, ["semantic-model", "health"])
     assert result.exit_code == 0
     assert "revenue" in result.output
@@ -76,7 +76,7 @@ def test_orphaned_columns_are_reported_with_the_table_id_and_count():
     body = _health_body(
         orphaned_table_bindings=[{"binding": "column", "table_id": "orders_gone", "column_count": 12}]
     )
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, body)):
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
         result = runner.invoke(app, ["semantic-model", "health"])
     assert result.exit_code == 0
     assert "orders_gone" in result.output
@@ -87,7 +87,7 @@ def test_json_flag_passes_the_key_through_verbatim():
     body = _health_body(
         orphaned_table_bindings=[{"binding": "column", "table_id": "orders_gone", "column_count": 3}]
     )
-    with patch("cli.commands.semantic_model.api_get", return_value=_resp(200, body)):
+    with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, body)):
         result = runner.invoke(app, ["semantic-model", "health", "--json"])
     assert result.exit_code == 0
     assert "orphaned_table_bindings" in result.output

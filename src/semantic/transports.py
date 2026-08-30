@@ -250,7 +250,7 @@ def import_source(source_id: str) -> ImportReport:
     source = repo.get(source_id)
     if source is None:
         raise LookupError(
-            f"semantic source {source_id!r} not found — list them with `agnes admin semantic-source list`"
+            f"semantic source {source_id!r} not found — list them with `agnes admin semantic source list`"
         )
 
     try:
