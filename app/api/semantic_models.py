@@ -992,6 +992,13 @@ async def link_semantic_model_package(
     if not data_packages_repo().get(body.package_id):
         raise HTTPException(status_code=404, detail="data_package_not_found")
     repo.link_package(body.package_id, model["id"])
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_model.link_package",
+        resource=model["id"],
+        params={"slug": slug, "package_id": body.package_id},
+    )
     return {"package_ids": repo.list_packages_for_model(model["id"])}
 
 
@@ -1019,6 +1026,13 @@ async def unlink_semantic_model_package(
     if model is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{slug}' not found")
     repo.unlink_package(package_id, model["id"])
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_model.unlink_package",
+        resource=model["id"],
+        params={"slug": slug, "package_id": package_id},
+    )
     return {"package_ids": repo.list_packages_for_model(model["id"])}
 
 
