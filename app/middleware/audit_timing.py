@@ -18,7 +18,7 @@ from starlette.requests import Request
 
 from app.auth.client_ip import trusted_client_ip
 from app.logging_config import request_id_var
-from src.audit_context import mark_request_start, set_request_meta
+from src.audit_context import begin_request_write_tracking, mark_request_start, set_request_meta
 
 
 class AuditTimingMiddleware:
@@ -28,6 +28,13 @@ class AuditTimingMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             mark_request_start()
+            # Installed HERE, outside every BaseHTTPMiddleware in the stack,
+            # because those run the downstream app in their own asyncio task
+            # and a new task only gets a COPY of the context. The counter is
+            # a mutable box for that reason — see src/audit_context.py.
+            # Without this, a self-auditing handler's write is invisible to
+            # AuditFallbackMiddleware and the request gets a duplicate row.
+            begin_request_write_tracking()
             request = Request(scope)
             set_request_meta(client_ip=trusted_client_ip(request), correlation_id=request_id_var.get())
         await self.app(scope, receive, send)

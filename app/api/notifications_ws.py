@@ -159,6 +159,31 @@ async def _deliver(ws: WebSocket, raw: str) -> None:
         logger.warning("failed to deliver notification")
 
 
+def _audit_ws_connect(user_id: str) -> None:
+    """One row per successful handshake (audit-coverage wave 2, Task 3) —
+    this WS route had no audit trail at all before this task."""
+    from src.audit_helpers import log_safe
+
+    log_safe(user_id=user_id, action="notifications.ws_connect", resource=f"user:{user_id}", result="success")
+
+
+def _audit_ws_rejected(reason: str, user_id: Optional[str] = None) -> None:
+    """One row per refused handshake. ``user_id`` is only known once a
+    (possibly invalid) token has already been decoded far enough to carry a
+    ``sub`` claim — every earlier rejection (timeout, malformed JSON, wrong
+    message shape, a token that fails validation) has none, and the row is
+    still worth keeping (unattributed, ``result="denied"``)."""
+    from src.audit_helpers import log_safe
+
+    log_safe(
+        user_id=user_id,
+        action="notifications.ws_rejected",
+        resource=f"user:{user_id}" if user_id else None,
+        params={"reason": reason},
+        result="denied",
+    )
+
+
 async def _heartbeat_loop(user: str, ws: WebSocket) -> None:
     """Send periodic pings and disconnect on missed pongs.
 
@@ -202,6 +227,7 @@ async def notifications_ws(ws: WebSocket) -> None:
         try:
             raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
         except asyncio.TimeoutError:
+            _audit_ws_rejected("auth_timeout")
             await ws.send_json({"type": "auth_error", "message": "Auth timeout"})
             await ws.close()
             return
@@ -209,17 +235,20 @@ async def notifications_ws(ws: WebSocket) -> None:
         try:
             data = json.loads(raw)
         except (ValueError, TypeError):
+            _audit_ws_rejected("invalid_json")
             await ws.send_json({"type": "auth_error", "message": "Invalid JSON"})
             await ws.close()
             return
 
         if data.get("type") != "auth" or "token" not in data:
+            _audit_ws_rejected("invalid_auth_message")
             await ws.send_json({"type": "auth_error", "message": "Expected auth message with token"})
             await ws.close()
             return
 
         payload = validate_desktop_token(data["token"])
         if payload is None:
+            _audit_ws_rejected("invalid_token")
             await ws.send_json({"type": "auth_error", "message": "Invalid token"})
             await ws.close()
             return
@@ -227,12 +256,14 @@ async def notifications_ws(ws: WebSocket) -> None:
         user = payload["sub"]
 
         if len(_connections.get(user, ())) >= MAX_CONNECTIONS_PER_USER:
+            _audit_ws_rejected("too_many_connections", user_id=user)
             await ws.send_json({"type": "auth_error", "message": "Too many connections"})
             await ws.close()
             return
 
         _register_connection(user, ws)
         registered = True
+        _audit_ws_connect(user)
 
         # Subscribe THIS socket to its own notify:{user} channel. The
         # handler may run on this coroutine's own event loop (memory

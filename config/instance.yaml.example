@@ -359,6 +359,26 @@ auth:
 #   # How many days to keep `audit_log` rows before the daily audit-prune
 #   # scheduler job deletes them. Set to 0 to keep rows forever. Default 365.
 #   retention_days: 365
+#
+#   # Per-action sampling (optional, Wave 2 — Task 4). Off by default: an
+#   # action not listed here is NEVER sampled, full stop. Each entry is
+#   # `<action>: <ratio 0.0-1.0>`; a row for that action is written on
+#   # exactly 1 of every round(1 / ratio) calls, using a deterministic
+#   # per-action counter (NOT a random draw), so "1 in 10" is exactly true
+#   # even on a low-traffic instance. `1.0` (or simply omitting the action)
+#   # means always write; `0` means never write — the supported way to
+#   # silence a noisy, low-stakes action without touching its call site.
+#   # Measure actual volume first with `scripts/audit_volume_estimate.py`
+#   # before reaching for this knob.
+#   #
+#   # SECURITY: never list an action here that matters for security or
+#   # compliance — auth (login/token/password), RBAC/grant changes, secret
+#   # rotation, admin configuration, or anything an incident review might
+#   # need every row of. Sampling exists only for high-volume, low-stakes
+#   # reads (a routine chat tool call, a catalog list) — never for the
+#   # actions that record who changed what.
+#   sampling:
+#     chat.tool_call: 0.1   # keep 1 in 10 chat tool-call rows
 
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY
@@ -1212,6 +1232,16 @@ facts:
 # extraction-worker deployment) — this is operator/deploy-time config, not
 # a runtime toggle. The rest of this block (`producer`, `schedule`,
 # `timeout_s`) is plain instance data, read directly via get_value.
+#
+# Flipping `enabled` here is NOT, by itself, enough to run the
+# extraction-worker compose service. That service sets AGNES_ROLE=worker
+# (a role split), which makes the deployment multi-process — see
+# `deployment.role` and `coordination.backend` above, and
+# docs/DEPLOYMENT.md#multi-process. Before starting it you ALSO need:
+# Postgres app-state (`database.backend`), explicit
+# `JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis`.
+# Without those, `app/startup_guards.py::validate_deployment` refuses to
+# boot the worker container.
 extraction:
   enabled: false
   producer:

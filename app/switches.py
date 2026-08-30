@@ -716,8 +716,12 @@ SWITCHES: tuple[Switch, ...] = (
             "it gates needs a configured `extraction.producer` command AND a worker "
             "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
             "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
-            "feature whose backend is absent. Enable the profile/producer and this flag "
-            "together."
+            "feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
+            "(a role split), which makes the deployment multi-process — it ALSO needs "
+            "Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET, and "
+            "coordination.backend=redis (docs/DEPLOYMENT.md#multi-process), or the "
+            "process refuses to boot. Enable the profile/producer, satisfy those "
+            "multi-process prerequisites, and this flag together."
         ),
         description=(
             "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "

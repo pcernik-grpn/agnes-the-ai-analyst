@@ -28,6 +28,17 @@ import os
 # get_optional_user + explicit 401/redirect check).
 _EXEMPT: dict[str, str] = {
     "/api/health": "liveness probe — no secrets, must be reachable pre-auth",
+    "/api/data-apps/runner-events": (
+        "system-to-system audit report from the apps-runner sidecar, which holds "
+        "the Docker socket but no database access — this is its only path to an "
+        "audit_log row. It carries no user session by design; the shared "
+        "APPS_RUNNER_TOKEN is checked IN the handler with hmac.compare_digest "
+        "plus a 32-char length floor (a shorter secret is treated as auth "
+        "disabled), and the action is validated against a server-side whitelist "
+        "so a compromised sidecar cannot mint arbitrary rows. No user_id is ever "
+        "taken from the request body, so nothing here is attributable to a "
+        "person. See app/api/data_apps.py::record_runner_event"
+    ),
     "/api/data-apps-tls-check": (
         "Caddy's on-demand-TLS `ask` probe — Caddy sends a plain GET carrying no "
         "credential and reads ANY non-2xx as 'cancel issuance', so a Depends() auth "
