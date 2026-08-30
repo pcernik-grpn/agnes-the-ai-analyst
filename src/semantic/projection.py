@@ -842,12 +842,14 @@ def project_document(
                     basetype=column.get("datatype"),
                     description=column.get("description"),
                     source=column_source,
-                    # Recorded, not yet scoped on: `_prune_columns` still
-                    # prunes on `(table_id, source)` alone, and the
-                    # precedence guard above compares `source` alone — see
-                    # `_prune_columns`'s docstring for the collision that
-                    # leaves open and why closing it is a follow-up (the
-                    # column is Postgres-only; DuckDB app-state is frozen).
+                    # Recorded here since the column was added; `_prune_columns`
+                    # additionally SCOPES on it, on Postgres only (DuckDB's
+                    # frozen app-state schema has no such column) — see its
+                    # docstring. The precedence guard above still compares
+                    # `source` alone: it decides ownership between DIFFERENT
+                    # writer kinds (profiler vs. this projection), a question
+                    # `source_ref` (which only distinguishes two instances of
+                    # the SAME writer kind) does not answer.
                     source_ref=source_ref,
                 )
                 field_names.add(column_name)
@@ -913,9 +915,9 @@ def project_document(
                 source_ref,
             )
         else:
-            _prune_columns(column_source, written_columns_by_table, keep_by_table=sibling_claims)
+            _prune_columns(column_source, written_columns_by_table, keep_by_table=sibling_claims, source_ref=source_ref)
     else:
-        _prune_columns(column_source, written_columns_by_table)
+        _prune_columns(column_source, written_columns_by_table, source_ref=source_ref)
 
     if report.glossary_written or report.glossary_pruned:
         glossary_repo().refresh_search_index()
@@ -978,7 +980,9 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
             # model's rows live under `MANUAL_MODEL_COLUMN_SOURCE`, so this
             # prune deletes exactly what `project_document` wrote and can
             # never reach an admin-authored `source='manual'` row.
-            _prune_columns(_column_source(source), written_by_table, keep_by_table=sibling_claims)
+            _prune_columns(
+                _column_source(source), written_by_table, keep_by_table=sibling_claims, source_ref=source_ref
+            )
 
     if report.glossary_pruned:
         glossary_repo().refresh_search_index()
@@ -1131,27 +1135,32 @@ def _prune_columns(
     source: str,
     written_by_table: dict[str, set[str]],
     keep_by_table: Optional[dict[str, set[str]]] = None,
+    *,
+    source_ref: Optional[str] = None,
 ) -> None:
     """Prune fields dropped from a table this document still mentions.
 
-    Scoped on ``(table_id, source)`` — NOT on ``source_ref``, even though
-    Postgres now has the column (``migrations/versions/
-    0075_column_meta_source_ref.py``) and :func:`project_document` records
-    it. Reading it here would fix a live collision and open a backend
-    divergence at the same time, so it is a deliberate follow-up rather
-    than a drive-by: the frozen DuckDB app-state schema (A3) has no such
-    column and cannot gain one, so a source_ref-scoped prune only exists on
-    one backend.
+    Scoped on ``(table_id, source)`` on DuckDB, and ``(table_id, source,
+    source_ref)`` on Postgres. The two backends genuinely differ here rather
+    than one being a stricter version of the other: the frozen DuckDB
+    app-state schema (A3) has no ``column_metadata.source_ref`` column and
+    cannot gain one, so a ``source_ref``-scoped prune only exists on
+    Postgres (``migrations/versions/0075_column_meta_source_ref.py``);
+    ``use_pg()`` selects the read at call time rather than the caller
+    choosing.
 
-    The collision it leaves open, verified against this code: two writers
-    sharing a ``source`` value but not a ``source_ref`` — two registered
-    ``semantic_sources`` of the same kind (both ``ossie_git``,
+    The collision this closes on Postgres, verified against this code: two
+    writers sharing a ``source`` value but not a ``source_ref`` — two
+    registered ``semantic_sources`` of the same kind (both ``ossie_git``,
     ``src/semantic/transports.py``) or two Keboola connections (both
-    ``keboola_metastore``, ``connectors/keboola/semantic_layer.py``) —
-    whose documents describe datasets resolving to the SAME ``table_id``
+    ``keboola_metastore``, ``connectors/keboola/semantic_layer.py``) — whose
+    documents describe datasets resolving to the SAME ``table_id`` used to
     delete each other's field rows on every sync. Same-source_ref sibling
-    models are already spared (:func:`_sibling_column_claims`); this is
-    the cross-source_ref case that read cannot see.
+    models are already spared (:func:`_sibling_column_claims`); this was the
+    cross-source_ref case that a bare ``source`` read could not see. DuckDB
+    keeps the pre-existing, coarser ``(table_id, source)`` scoping — that is
+    unchanged, not a regression: the schema simply has nowhere to record a
+    ``source_ref`` to scope on.
 
     ``keep_by_table`` aside, this also only prunes tables the document
     still lists — a dataset dropped from the document entirely (not just
@@ -1165,11 +1174,16 @@ def _prune_columns(
     carries the whole scope": everything in-source not written here is
     genuinely stale.
     """
+    from src.repositories import use_pg
+
+    scope_by_ref = use_pg()
     repo = column_metadata_repo()
     for table_id, field_names in written_by_table.items():
         keep = field_names | (keep_by_table or {}).get(table_id, set())
         for existing in repo.list_for_table(table_id):
             if (existing.get("source") or "") != source:
+                continue
+            if scope_by_ref and (existing.get("source_ref") or "") != (source_ref or ""):
                 continue
             if existing["column_name"] not in keep:
                 repo.delete(table_id, existing["column_name"])

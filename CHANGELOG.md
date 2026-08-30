@@ -1109,6 +1109,76 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **The semantic-layer soft-enforce advisory now reaches the hybrid query
+  endpoint and the web chat UI.** `POST /api/query/hybrid` — the one query
+  path that joins BigQuery and local data — never called
+  `semantic_validation_for_query`, so a constraint violation or a
+  not-locally-executable metric went unmentioned on exactly the query shape
+  most likely to touch modeled data. It now runs the same check `POST
+  /api/query` does (`target_engine="duckdb"`, since a hybrid query always
+  executes as DuckDB SQL against the analytics connection), guarded the
+  same way so a validator failure only logs a warning and never breaks the
+  delivered result. Separately, the web chat UI had no visual element for
+  the `semantic_validation` field at all — the CLI (stderr) and the MCP
+  tool result already surfaced it, but a chat turn that ran `agnes query`
+  over Bash (the primary path the workspace prompt teaches) or called the
+  `query` MCP tool directly showed nothing. A small amber advisory note
+  (the same `--ds-accent-warn-*` vocabulary `.callout-rec` uses elsewhere)
+  now renders under a tool-result card whenever the field carries a
+  warning, whether the result arrived as a JSON object or as the JSON text
+  a Bash-executed CLI command actually returns.
+- **A named agent profile now gets the same semantic-layer context a plain
+  sandbox session always has.** `src/claude_md.py` injects a summary of
+  every readable model (slug, description, the author's own `ai_context
+  .instructions`) into the sandbox's CLAUDE.md, but `app/chat/agent_profile
+  .py`'s `DATA_ACCESS_RAILS` — appended to a persona instead, since a
+  persona replaces the workspace CLAUDE.md — had no equivalent, so a named
+  agent (web chat with a persona, Slack, `agnes chat`, the one-shot agent
+  API) got zero semantic context. `build_profile` now accepts the caller's
+  `user_email` and appends the same condensed, RBAC-filtered summary via a
+  new `_semantic_layer_section`; omitted (the default) it behaves exactly
+  as before. Documented in `docs/semantic-layer.md` → "Reaching an agent:
+  CLAUDE.md injection".
+- **The semantic-layer column-metadata prune no longer collides across two
+  sources of the same kind, on Postgres.** `_prune_columns`
+  (`src/semantic/projection.py`) scoped only on `(table_id, source)`, so two
+  writers sharing a `source` value but not a `source_ref` — two registered
+  `ossie_git` sources, or two Keboola connections — whose documents describe
+  datasets resolving to the same table deleted each other's column
+  descriptions on every sync. Postgres already had the `source_ref` column
+  (`0075_column_meta_source_ref`); the prune now reads it too. DuckDB's
+  frozen app-state schema has no such column and keeps the pre-existing,
+  coarser scoping — an accepted asymmetry, not a regression.
+- **Linking/unlinking a semantic model to a Data Package is now audited.**
+  `POST`/`DELETE /api/admin/semantic-models/{slug}/packages[/{package_id}]`
+  change who can read a model — the same class of change `reattach` already
+  audits — but wrote no row and had no cataloged action. Added
+  `semantic_model.link_package`/`semantic_model.unlink_package` to the audit
+  catalog and route-posture map, and a test proving the link created by the
+  real endpoint (not a direct repo call) is what grants a non-admin caller
+  read access through the real export endpoint.
+- **Security: the sandbox Bash approval gate now covers semantic-layer
+  mutations, not just data-app and access-control ones.** #1707 Block 1
+  fixed this same class of bug on the MCP door (the chat approval gate now
+  routes by tool annotation, not by name), but the exact same gap survived
+  one door over: the bundled `PreToolUse` hook's hand-maintained prefix
+  lists prompt for admin and data-app mutations, but nothing named
+  `agnes semantic-model apply` / `agnes admin semantic import|delete|
+  detach|reattach|link-package|unlink-package|source …|mute|unmute|coverage
+  tag|untag|feedback resolve` existed — an admin-identity chat session
+  could overwrite or delete a live semantic model, mute a health check, or
+  re-tag coverage via Bash with no confirmation at all. The auto-draft
+  sweep's own prompt (`src/semantic_autodraft.py`) even instructs an agent
+  to apply a draft this way, though it runs under the non-admin
+  semantic-drafter identity, which still lands in the review queue rather
+  than going live. A new `SEMANTIC_LAYER_PROMPT_PREFIXES` list mirrors the
+  MCP approval gate's own non-read-only semantic tools one-for-one
+  (`apply_semantic_model`, `mute_semantic_check`/`unmute_semantic_check`,
+  `semantic_model_coverage_tag`/`untag`, `semantic_feedback_resolve`),
+  including the deprecated one-release command-group aliases Block 6 of
+  #1707 left behind (`admin semantic-model …`, `admin semantic-source …`,
+  `semantic-model mute/unmute/coverage/feedback resolve`), since those still
+  execute and delegate to the exact same functions.
 - **Semantic layer browse: the active `q` filter is now visible and has one
   removable control, not three partial ones (#1707, A8).** `/semantic-layer
   /{slug}` tabs are plain links (`?tab={t}`, no `q`), so arriving at

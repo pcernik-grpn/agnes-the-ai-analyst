@@ -114,6 +114,53 @@ DATA_APP_PROMPT_PREFIXES = (
     "agnes app stop",
 )
 
+# Semantic-layer mutations. Same rationale as DATA_APP_PROMPT_PREFIXES above —
+# parity with app/chat/runner.py::ApprovalGate, which gates every non-read-only
+# MCP semantic tool (apply_semantic_model, semantic_model_coverage_tag/untag,
+# mute_semantic_check/unmute_semantic_check, semantic_feedback_resolve — see
+# app/api/mcp/foundation_tools.py's own comments on why those are deliberately
+# not MCP-exempt), but a Bash call to the same underlying endpoint is one word
+# away from the same effect and the MCP annotation covers only its own door.
+# Verified against cli/commands/admin_semantic.py + cli/commands/
+# semantic_model.py (Block 6 of #1707 collapsed five command groups into two —
+# "agnes admin semantic-model apply" never existed; the real write command is
+# "agnes semantic-model apply"). The old pre-Block-6 group spellings
+# (admin_semantic_model.py / admin_semantic_source.py / the semantic-model
+# health/mute/mutes/unmute/coverage/feedback-resolve aliases) still execute —
+# hidden, kept for one release, each delegating to the exact same function —
+# so they are listed too; drop them once those alias modules are deleted.
+SEMANTIC_LAYER_PROMPT_PREFIXES = (
+    # Canonical (post-Block-6) spellings.
+    "agnes semantic-model apply",
+    "agnes admin semantic import",
+    "agnes admin semantic delete",
+    "agnes admin semantic detach",
+    "agnes admin semantic reattach",
+    "agnes admin semantic link-package",
+    "agnes admin semantic unlink-package",
+    "agnes admin semantic source add",
+    "agnes admin semantic source sync",
+    "agnes admin semantic source rm",
+    "agnes admin semantic mute",
+    "agnes admin semantic unmute",
+    "agnes admin semantic coverage tag",
+    "agnes admin semantic coverage untag",
+    "agnes admin semantic feedback resolve",
+    # Deprecated one-release aliases — same functions, different spelling.
+    "agnes admin semantic-model import",
+    "agnes admin semantic-model detach",
+    "agnes admin semantic-model reattach",
+    "agnes admin semantic-model link-package",
+    "agnes admin semantic-model unlink-package",
+    "agnes admin semantic-source add",
+    "agnes admin semantic-source sync",
+    "agnes semantic-model mute",
+    "agnes semantic-model unmute",
+    "agnes semantic-model coverage tag",
+    "agnes semantic-model coverage untag",
+    "agnes semantic-model feedback resolve",
+)
+
 _ENUM_PREFIXES = ("find /", "ls /home", "ls /etc", "cat /etc/", "cat /proc/")
 
 
@@ -317,6 +364,21 @@ _OPERATOR_CHARS = frozenset(";&|\n")
 
 def _is_operator(tok: str) -> bool:
     return bool(tok) and all(c in _OPERATOR_CHARS for c in tok)
+
+
+def _matches_prefix_word(text: str, prefix: str) -> bool:
+    """True if ``text`` IS ``prefix`` or starts with ``prefix`` at a word
+    boundary — never on a mere character-run match.
+
+    A plain ``text.startswith(prefix)`` also fires on ``"agnes admin semantic
+    mutes"`` for the prefix ``"agnes admin semantic mute"``: the read-only
+    list command and the mutating mute-a-check command share nothing but a
+    name, yet the shorter one is a string-prefix of the longer. Any list that
+    pairs a singular mutation with its own plural listing (mute/mutes here;
+    the same shape could recur) needs the boundary check, not a bare
+    ``startswith``.
+    """
+    return text == prefix or text.startswith(prefix + " ")
 
 
 def _blank_arithmetic(line: str) -> str:
@@ -926,8 +988,19 @@ def _scan(cmd: str) -> list[tuple[str, str]]:
             verdicts.append(
                 (
                     "ask",
-                    "This command creates, changes or tears down a hosted data app; "
-                    "confirm before running.",
+                    "This command creates, changes or tears down a hosted data app; confirm before running.",
+                )
+            )
+
+        # Semantic-layer mutations need it for the same reason (see the prefix list)
+        if any(_matches_prefix_word(unwrapped_lower, p) for p in SEMANTIC_LAYER_PROMPT_PREFIXES):
+            verdicts.append(
+                (
+                    "ask",
+                    (
+                        "This command changes or replaces a live semantic model, source, "
+                        "or health-check state; confirm before running."
+                    ),
                 )
             )
 
