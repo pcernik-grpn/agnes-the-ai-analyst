@@ -30,12 +30,21 @@ messages, and CHANGELOG stay English.
    "maintained", not "abandoned". Never "PG later". A schema change (new
    column/table) on an existing pair still follows rule 2 — PG-only,
    regardless of whether the table predates the ratchet.
-4. **CHANGELOG.** Add a `## [Unreleased]` bullet for any user-visible behavior.
-5. **Vendor-agnostic.** No customer-specific tokens (deployments, project IDs,
+4. **Audit posture.** Any new surface a user or admin can reach — HTTP route,
+   worker job kind, MCP tool, bot command — declares itself in
+   `src/audit_posture.py` (a cataloged action from `src/audit_events.py`, or
+   `exempt:<reason>` from the closed vocabulary). A declared action is what the
+   fallback middleware EMITS, so most routes need no logging code at all; write
+   `log_safe(...)` only when you can say more than the middleware can, and never
+   both for one event. Never `audit_repo().log()` outside the repo layer. Content
+   (prompts, SQL, bodies, secret values) never enters `params`. See `audit.md` —
+   it also lists the SEVEN places a new `/api/*` route must touch.
+5. **CHANGELOG.** Add a `## [Unreleased]` bullet for any user-visible behavior.
+6. **Vendor-agnostic.** No customer-specific tokens (deployments, project IDs,
    hostnames, private-repo references) in code, config, comments, or docs.
-6. **Scope discipline + issue economy.** Don't refactor unrelated code; fix or
+7. **Scope discipline + issue economy.** Don't refactor unrelated code; fix or
    close, don't spawn issues.
-7. **Web pages** extend `base_page.html` / `base_ds.html`, never `base.html`.
+8. **Web pages** extend `base_page.html` / `base_ds.html`, never `base.html`.
 
 ## Routing — load the matching playbook
 
@@ -48,6 +57,7 @@ Read the one `agnes-conventions/references/*.md` that fits the task:
 | New dashboard page | `web-page.md` |
 | New repository / method | `repo-parity.md` |
 | Schema change | `migration.md` |
+| New route / job kind / MCP tool / bot command | `audit.md` |
 
 ## Output contract
 
