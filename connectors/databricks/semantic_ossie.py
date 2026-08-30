@@ -265,6 +265,32 @@ class DatabricksMetricViewAdapter:
     row never becomes a second place a warehouse credential is stored.
     """
 
+    def unconfigured_reason(self, config: Dict[str, Any]) -> Optional[str]:
+        """The optional pre-flight hook (``src/semantic/adapters/__init__.py``):
+        ``None`` when this instance has a Databricks workspace to read, a
+        reason when it does not.
+
+        This is what a source that OUTLIVED its configuration needs.
+        ``ensure_semantic_source()`` refuses to create the Databricks source
+        row on an unconfigured instance, but it returns an existing row's id
+        before that gate — so a workspace deconfigured after registration
+        (credentials rotated out, connection removed) left the row importing
+        on every sweep, raising :meth:`extract`'s "not configured" every time,
+        forever. The sweep asks this first and skips the row instead; the row
+        itself is untouched, because an existing row is one an admin shaped
+        and an outage is not consent to delete it.
+        """
+        # Imported at call time for the same reason `extract` does it below.
+        from connectors.databricks.semantic_layer import resolve_databricks_settings
+
+        if resolve_databricks_settings():
+            return None
+        return (
+            "Databricks is not configured on this instance (data_source.databricks.host + "
+            "warehouse_id, and the DATABRICKS_TOKEN env var / vault secret); skipping this "
+            "source until it is configured again"
+        )
+
     def extract(self, config: Dict[str, Any]) -> List[str]:
         # Imported at call time, not module scope, so a test patching the
         # defining module reaches this lookup (same reason as the Snowflake
@@ -273,6 +299,9 @@ class DatabricksMetricViewAdapter:
 
         settings = resolve_databricks_settings()
         if not settings:
+            # Still fatal HERE: a manual `POST /semantic-sources/{id}/sync` an
+            # admin asked for must say why it did nothing, and the pre-flight
+            # hook above is only consulted by the scheduled sweep.
             raise RuntimeError(
                 "Databricks is not configured (data_source.databricks.host + warehouse_id, "
                 "and the DATABRICKS_TOKEN env var / vault secret); refusing to sync semantic views"

@@ -1054,6 +1054,28 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **A Databricks semantic source no longer fails forever once the workspace is
+  deconfigured (#1707).** The connector refuses to CREATE its semantic source
+  row on an instance with no Databricks workspace — exactly so nothing carries
+  a source that fails on every run for a warehouse it does not have — but an
+  existing row short-circuits before that check, so a workspace deconfigured
+  AFTER registration (credentials rotated out, connection removed) landed in
+  that state from the other direction: every scheduled sweep imported the row,
+  the adapter raised "Databricks is not configured", and the source accrued a
+  fresh error and a fresh warning, every run, indefinitely. The sweep now asks
+  each source's adapter whether its connector is configured at all and skips
+  the ones that are not — counted as `skipped_not_configured` in the
+  `POST /api/admin/run-semantic-sources-refresh` response, the sweep's log
+  line and its audit row, and recorded on the source itself as
+  `last_sync_status='skipped'` with the reason, so `/admin/semantic-sources`
+  shows a muted "skipped" with the explanation instead of a red failure
+  nothing is trying to reach any more. The row is never deleted: a rotated
+  credential is an outage, not consent to discard a source an admin named,
+  scoped and enabled — it resumes syncing on the first sweep after the
+  configuration returns. A manual sync of such a source still fails loudly,
+  since that one was explicitly asked for. The check is a new optional
+  adapter method (`unconfigured_reason`), so any connector-backed adapter
+  opts in with one function and git/upload sources need no opinion.
 - **Security: the cloud-chat approval gate now covers mutating MCP tools, not
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,

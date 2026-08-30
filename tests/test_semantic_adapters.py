@@ -45,3 +45,65 @@ def test_every_connector_adapter_is_mirrored_in_the_coverage_map():
         "not registered in src/semantic/adapters — those connections' semantic column would "
         "score against an adapter that cannot run"
     )
+
+
+class TestUnconfiguredReason:
+    """The optional pre-flight hook the sources sweep asks before importing:
+    "is the connector behind this source configured at all right now?".
+
+    Optional by design — an adapter that does not implement it is simply
+    always ready — and best-effort: it is a PRE-check, so it may never be the
+    thing that fails a source. Whatever it cannot answer, the import answers
+    for real.
+    """
+
+    def test_an_adapter_without_the_hook_is_always_ready(self):
+        from src.semantic.adapters import unconfigured_reason
+
+        assert unconfigured_reason({"adapter": "native", "kind": "upload", "config": {}}) is None
+
+    def test_an_unknown_adapter_is_left_to_the_import_to_reject(self):
+        """A source naming an adapter that is not registered must still reach
+        `import_source`, which raises UnknownAdapter and records it on the
+        row. Swallowing it here as "skipped" would hide a broken source."""
+        from src.semantic.adapters import unconfigured_reason
+
+        assert unconfigured_reason({"adapter": "nope", "kind": "connection", "config": {}}) is None
+
+    def test_a_raising_hook_is_treated_as_ready(self):
+        from src.semantic.adapters import register_adapter, unconfigured_reason
+
+        class Exploding:
+            def extract(self, config):
+                return []
+
+            def unconfigured_reason(self, config):
+                raise RuntimeError("vault unreachable")
+
+        register_adapter("test_exploding_precheck", Exploding())
+        try:
+            assert unconfigured_reason({"adapter": "test_exploding_precheck", "config": {}}) is None
+        finally:
+            from src.semantic.adapters import _REGISTRY
+
+            _REGISTRY.pop("test_exploding_precheck", None)
+
+    def test_the_databricks_adapter_reports_an_unconfigured_workspace(self, monkeypatch):
+        from src.semantic.adapters import unconfigured_reason
+
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda *a, **k: None,
+        )
+        reason = unconfigured_reason({"adapter": "databricks_metric_views", "config": {}})
+        assert reason is not None
+        assert "not configured" in reason.lower()
+
+    def test_the_databricks_adapter_is_ready_when_the_workspace_resolves(self, monkeypatch):
+        from src.semantic.adapters import unconfigured_reason
+
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda *a, **k: {"host": "example.cloud.databricks.com", "warehouse_id": "w1", "token": "t"},
+        )
+        assert unconfigured_reason({"adapter": "databricks_metric_views", "config": {}}) is None

@@ -179,11 +179,13 @@ the label must be a migrated legacy one, the source must run that label's
 adapter, and the `source_ref` must be the source's own connection (or, for the
 legacy env-credential row, the pair that path has ever stamped).
 
-Two things the sweep skips rather than syncs, both carried over from guards
-the retired triggers had built in:
+Three things the sweep skips rather than syncs — two carried over from guards
+the retired triggers had built in, one for a source that outlived the
+connector it reads:
 
 | Skip | When | Where it shows |
 |---|---|---|
+| `skipped_not_configured` | the connector behind a `connection`-kind source is no longer configured on this instance (credentials rotated out, connection removed) — importing it would raise that connector's own "not configured" on every run, forever. The row is never deleted: skipping is reversible when the configuration returns | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
 | `skipped_running` | a Keboola source whose rows the login-triggered sync (`run_semantic_layer_refresh_background`) is writing right now — the two share one single-flight guard, so they can never overlap | the sweep's response only; the row keeps its last real sync state and the next sweep picks it up |
 | `skipped_duplicate_project` | a second source resolving to the SAME upstream Keboola project as one already imported this sweep (two connections may point at one project) — importing both would write one project's rows under two refs that then delete each other's | the sweep's response, plus `last_sync_status='skipped'` with the reason in `last_sync_error` on the row |
 
@@ -201,6 +203,19 @@ class MyAdapter:
 
 Register it in `src/semantic/adapters/__init__.py`. That is the whole contract —
 which is the point: a new format is one function, not a new write path.
+
+An adapter backed by a **connector** may add one optional method, and should:
+
+```python
+    def unconfigured_reason(self, config: dict) -> str | None:
+        """Why this connector cannot be read on this instance right now."""
+```
+
+It answers only "is the connector configured at all" — never "is the upstream
+reachable", which is a failure and belongs on the row. The scheduled sweep
+asks it before importing and skips the source (`skipped_not_configured`)
+instead of failing it on every run once an admin deconfigures the connector
+under a source that already exists.
 
 Return the document text **as produced**, never re-serialized through a YAML
 dumper. Export hands that exact text back out, so a round-trip through

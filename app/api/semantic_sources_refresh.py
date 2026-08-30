@@ -31,6 +31,14 @@ instance:
   would orphan every existing metric and write a duplicate beside it.
 * ``reconcile_after_import()`` runs after each successful import and performs
   the post-sync legacy-row cleanup those endpoints used to do inline.
+* ``src.semantic.adapters.unconfigured_reason()`` is asked of every source
+  before its import: a source whose CONNECTOR is no longer configured on this
+  instance (credentials rotated out, connection removed) is skipped
+  (``skipped_not_configured``) rather than imported into its connector's own
+  "not configured" failure on every run, forever. The row is left exactly as
+  the admin shaped it — skipping is reversible the moment the configuration
+  returns, deleting the row is not — with the reason recorded on it so
+  /admin/semantic-sources shows why it stopped syncing.
 * ``claim_source_for_import()`` and ``duplicate_upstream_reason()`` carry over
   the two guards those triggers had built in: a migrated Keboola source is
   skipped (``skipped_running``) while the login-triggered sync that writes the
@@ -77,6 +85,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.auth.access import require_admin
 from src.audit_helpers import log_safe
 from src.repositories import semantic_source_repo
+from src.semantic.adapters import unconfigured_reason
 from src.semantic.legacy_migration import (
     claim_source_for_import,
     duplicate_upstream_reason,
@@ -134,6 +143,7 @@ def _run_sweep() -> dict[str, Any]:
     synced = 0
     failed = 0
     skipped_disabled = 0
+    skipped_not_configured = 0
     skipped_running = 0
     skipped_duplicate_project = 0
     results: list[dict[str, Any]] = []
@@ -147,6 +157,37 @@ def _run_sweep() -> dict[str, Any]:
         if source.get("enabled") is False:
             skipped_disabled += 1
             results.append({"id": source_id, "name": name, "status": "skipped_disabled"})
+            continue
+
+        # The connector this source reads is no longer configured on this
+        # instance. Asked of the ADAPTER (`src/semantic/adapters`), so the
+        # sweep stays generic: a git/upload source has no connector and never
+        # answers, a connector adapter opts in with one method.
+        #
+        # Skipped, not failed and NOT deleted. Importing it would raise the
+        # connector's own "not configured" on every single run, forever —
+        # which is precisely the state the connector's create-time gate
+        # exists to prevent but cannot, since it returns an existing row's id
+        # before checking. The row keeps everything an admin gave it: a
+        # rotated credential or a removed connection is an outage, not
+        # consent to throw the source away.
+        unconfigured = unconfigured_reason(source)
+        if unconfigured:
+            skipped_not_configured += 1
+            results.append({"id": source_id, "name": name, "status": "skipped_not_configured", "error": unconfigured})
+            # info, not warning: this is a deliberate admin state that would
+            # otherwise log at warning level on every tick, forever — the
+            # noise half of the very bug this skip fixes.
+            logger.info(
+                "semantic sources refresh: source %s skipped, its connector is not configured: %s",
+                source_id,
+                unconfigured,
+            )
+            # Recorded on the row for the same reason the duplicate-project
+            # skip is: without it the row would keep rendering the red
+            # "failed" from the last sweep that still tried, and nothing
+            # would ever say why it stopped trying.
+            repo.record_sync(source_id, status="skipped", error=unconfigured)
             continue
 
         # Single-flight against the OTHER writer of this source's rows (the
@@ -210,6 +251,7 @@ def _run_sweep() -> dict[str, Any]:
         "synced": synced,
         "failed": failed,
         "skipped_disabled": skipped_disabled,
+        "skipped_not_configured": skipped_not_configured,
         "skipped_running": skipped_running,
         "skipped_duplicate_project": skipped_duplicate_project,
         "migrated": migrated,
@@ -260,11 +302,12 @@ async def run_semantic_sources_refresh(
 
     logger.info(
         "semantic sources refresh: run_id=%s synced=%s failed=%s skipped_disabled=%s "
-        "skipped_running=%s skipped_duplicate_project=%s migrated=%s",
+        "skipped_not_configured=%s skipped_running=%s skipped_duplicate_project=%s migrated=%s",
         run_id,
         result["synced"],
         result["failed"],
         result["skipped_disabled"],
+        result["skipped_not_configured"],
         result["skipped_running"],
         result["skipped_duplicate_project"],
         len(result["migrated"]),
@@ -281,6 +324,7 @@ async def run_semantic_sources_refresh(
             "synced": result["synced"],
             "failed": result["failed"],
             "skipped_disabled": result["skipped_disabled"],
+            "skipped_not_configured": result["skipped_not_configured"],
             "skipped_running": result["skipped_running"],
             "skipped_duplicate_project": result["skipped_duplicate_project"],
             "migrated": len(result["migrated"]),

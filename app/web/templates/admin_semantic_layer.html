@@ -421,7 +421,12 @@ document.getElementById("sl-refresh-btn").addEventListener("click", async () => 
       showToast(
         `Synced ${body.synced ?? 0} source(s)` +
           (failed ? `, ${failed} failed` : "") +
-          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : ""),
+          (body.skipped_disabled ? `, ${body.skipped_disabled} disabled` : "") +
+          // Called out beside "disabled" because it is the other STANDING
+          // skip: a source whose connector is no longer configured syncs
+          // nothing on every run until an admin acts, and a bare
+          // "Synced 0 source(s)" would not say so.
+          (body.skipped_not_configured ? `, ${body.skipped_not_configured} not configured` : ""),
         failed === 0,
       );
       setTimeout(() => window.location.reload(), 1200);

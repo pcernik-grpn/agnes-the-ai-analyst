@@ -409,6 +409,39 @@ class TestSweepSummary:
         assert summary["last_result"]["synced"] == 1
 
 
+#: A workspace that resolves — what ``resolve_databricks_settings()`` returns
+#: on a CONFIGURED instance. Enough shape for the sweep's pre-flight check;
+#: no test here ever reaches the warehouse itself.
+_DATABRICKS_SETTINGS = {
+    "host": "example.cloud.databricks.com",
+    "warehouse_id": "wh-1",
+    "catalog": "main",
+    "catalogs": ["main"],
+    "token": "t0ken",
+}
+
+
+def _register_databricks_row():
+    """The production row, created the way the connector creates it.
+
+    ``ensure_semantic_source()`` writes it through the repository under a
+    FIXED id; the admin API generates its own, so tests that need THAT row go
+    the same route the connector does.
+    """
+    from connectors.databricks.semantic_layer import DATABRICKS_SEMANTIC_SOURCE_ID
+    from src.repositories import semantic_source_repo
+
+    semantic_source_repo().create(
+        id=DATABRICKS_SEMANTIC_SOURCE_ID,
+        kind="connection",
+        name="Databricks metric views",
+        adapter="databricks_metric_views",
+        config={"safe_prune": True},
+        enabled=True,
+    )
+    return DATABRICKS_SEMANTIC_SOURCE_ID
+
+
 def test_the_databricks_row_is_swept_exactly_once(seeded_app, monkeypatch):
     """The inverse of the guard this sweep needed before the migration.
 
@@ -419,21 +452,17 @@ def test_the_databricks_row_is_swept_exactly_once(seeded_app, monkeypatch):
     writer — the row must be imported, exactly once, like any other.
     """
     from connectors.databricks.semantic_layer import DATABRICKS_SEMANTIC_SOURCE_ID
-    from src.repositories import semantic_source_repo
 
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
-    # The production row is created by ensure_semantic_source() through the
-    # repository with this FIXED id — the admin API generates its own ids,
-    # so go the same route the connector does.
-    semantic_source_repo().create(
-        id=DATABRICKS_SEMANTIC_SOURCE_ID,
-        kind="connection",
-        name="Databricks metric views",
-        adapter="databricks_metric_views",
-        config={"safe_prune": True},
-        enabled=True,
+    # Configured workspace: the sweep's pre-flight check skips a row whose
+    # connector is NOT configured (see TestASourceWhoseConnectorIsGone), so a
+    # test about the import running has to say which of the two it is.
+    monkeypatch.setattr(
+        "connectors.databricks.semantic_layer.resolve_databricks_settings",
+        lambda *a, **k: _DATABRICKS_SETTINGS,
     )
+    _register_databricks_row()
 
     calls = []
 
@@ -451,3 +480,152 @@ def test_the_databricks_row_is_swept_exactly_once(seeded_app, monkeypatch):
     assert {"id": DATABRICKS_SEMANTIC_SOURCE_ID, "name": "Databricks metric views", "status": "ok"} in body["sources"]
     # The counter that named the retired job is gone with it.
     assert "skipped_legacy_owned" not in body
+
+
+class TestASourceWhoseConnectorIsGone:
+    """A source outlives the connector configuration it reads.
+
+    ``ensure_semantic_source()`` refuses to CREATE a Databricks source on an
+    unconfigured instance, precisely so no instance carries a source that
+    fails on every run forever — but it returns an existing row's id before
+    that gate, so a workspace deconfigured AFTER the row was registered
+    (credentials rotated out, connection removed, vault unreadable) landed in
+    exactly the state the gate exists to prevent: every sweep imported it,
+    the adapter raised "Databricks is not configured", and the row accrued a
+    fresh error, forever.
+
+    The sweep now asks the adapter first and SKIPS the row. It does not
+    delete it: an existing row is one the admin shaped, and an outage is not
+    consent to throw it away.
+    """
+
+    @pytest.fixture
+    def unconfigured(self, monkeypatch):
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda *a, **k: None,
+        )
+
+    @pytest.fixture
+    def no_import(self, monkeypatch):
+        """Records every ``import_source`` the sweep makes — a skipped source
+        must reach the importer zero times, not fail inside it."""
+        calls: list = []
+        import app.api.semantic_sources_refresh as endpoint_module
+
+        def _record(source_id):
+            calls.append(source_id)
+            return _FAKE_REPORT
+
+        monkeypatch.setattr(endpoint_module, "import_source", _record)
+        return calls
+
+    def test_the_row_is_skipped_counted_and_never_imported(self, seeded_app, unconfigured, no_import):
+        source_id = _register_databricks_row()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        assert no_import == [], "an unconfigured source must not reach the importer at all"
+        assert body["skipped_not_configured"] == 1
+        assert body["synced"] == 0
+        assert body["failed"] == 0
+        entry = {s["id"]: s for s in body["sources"]}[source_id]
+        assert entry["status"] == "skipped_not_configured"
+        assert "not configured" in entry["error"].lower()
+
+    def test_the_row_is_not_deleted(self, seeded_app, unconfigured, no_import):
+        """The admin may be mid-outage. Skipping is reversible; deleting the
+        row (and with it its name, scope and enabled flag) is not."""
+        source_id = _register_databricks_row()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+
+        row = c.get(f"/api/admin/semantic-sources/{source_id}", headers=_auth(token))
+        assert row.status_code == 200, row.text
+        assert row.json()["config"]["safe_prune"] is True
+
+    def test_the_row_shows_skipped_with_the_reason_not_a_fresh_error(self, seeded_app, unconfigured, no_import):
+        """/admin/semantic-sources renders `last_sync_status='skipped'` muted
+        with `last_sync_error` as its tooltip (same as
+        `skipped_duplicate_project`). Without recording that, a row that once
+        failed would keep showing a red "✗ failed" from the last run the
+        sweep actually attempted — a state nothing is trying to reach any
+        more."""
+        source_id = _register_databricks_row()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+
+        row = c.get(f"/api/admin/semantic-sources/{source_id}", headers=_auth(token)).json()
+        assert row["last_sync_status"] == "skipped"
+        assert "not configured" in (row["last_sync_error"] or "").lower()
+
+    def test_repeated_sweeps_stay_skipped_and_never_accrue_an_error(self, seeded_app, unconfigured, no_import):
+        source_id = _register_databricks_row()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        for _ in range(3):
+            body = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token)).json()
+            assert body["failed"] == 0
+            assert body["skipped_not_configured"] == 1
+
+        row = c.get(f"/api/admin/semantic-sources/{source_id}", headers=_auth(token)).json()
+        assert row["last_sync_status"] == "skipped"
+
+    def test_other_sources_are_unaffected(self, seeded_app, unconfigured):
+        """The skip is per-source: a git/upload source next to it still syncs
+        in the same sweep."""
+        _register_databricks_row()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        good_id = _create_source(c, token, kind="upload", name="Good bundle", config={"documents": [DOC]})
+
+        body = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token)).json()
+        assert body["synced"] == 1
+        assert body["skipped_not_configured"] == 1
+        statuses = {s["id"]: s["status"] for s in body["sources"]}
+        assert statuses[good_id] == "ok"
+
+    def test_a_configured_instance_still_syncs_the_row(self, seeded_app, monkeypatch, no_import):
+        """The other half of the gate: the check must skip ONLY the
+        deconfigured case, never a workspace that resolves."""
+        source_id = _register_databricks_row()
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda *a, **k: _DATABRICKS_SETTINGS,
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        body = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token)).json()
+        assert no_import == [source_id]
+        assert body["synced"] == 1
+        assert body["skipped_not_configured"] == 0
+
+    def test_the_counter_rides_the_audit_row(self, seeded_app, unconfigured, no_import):
+        """The audit params mirror the response counters — a new counter that
+        is not there leaves the audit row describing a sweep that never
+        happened."""
+        import json
+
+        from src.repositories import audit_repo
+
+        _register_databricks_row()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
+
+        rows, _cursor = audit_repo().query(action="run_semantic_sources_refresh", limit=10)
+        assert rows, "the sweep must leave an audit row"
+        raw = rows[0].get("params")
+        params = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        assert params["skipped_not_configured"] == 1
