@@ -1248,3 +1248,230 @@ def declared_read_action(method: str, path_template: str, *, posture: dict[str, 
     if value is None or value.startswith("exempt:"):
         return None
     return value
+
+
+# ---------------------------------------------------------------------------
+# JOB_POSTURE / MCP_TOOL_POSTURE / BOT_COMMAND_POSTURE -- extending the
+# declared-action ratchet past HTTP (Wave 2 -- non-HTTP surfaces task): a new
+# worker job kind, MCP foundation tool, or bot slash-command/callback used to
+# ship with NO audit posture at all and nothing would fail, because the two
+# ratchets above only ever inspect ``app.routes`` -- there is no ASGI route
+# for a `jobs.kind` value, an MCP tool name, or a Slack/Telegram command
+# string. These three dicts close that gap the same way POSTURE/
+# READ_POSTURE/WS_POSTURE do above: every entry in the surface's own
+# enumerable registry must have a posture entry here, and vice versa (a
+# stale entry -- the registry entry it names no longer exists -- fails too).
+# The three registries: ``app.worker.registry.JOB_KINDS``,
+# ``app.api.mcp.foundation_tools.FOUNDATION_TOOL_NAMES``, and the bot
+# modules' own command sets -- ``services.slack_bot.commands.SLACK_COMMANDS``
+# and ``services.telegram_bot.bot.TELEGRAM_COMMANDS`` (both extracted BY this
+# task from what used to be a bare if/elif chain, so the dispatch code and
+# the ratchet can never drift apart the way a hand-maintained duplicate list
+# would).
+#
+# Design decision (read this before adding a new kind/tool/command): each of
+# the three surfaces already writes ONE generic, non-differentiating audit
+# row per invocation, independent of this map --
+#
+# - ``job.run``          (``app/worker/kinds.py::dispatch_job``)
+# - ``mcp.tool_call``     (``app/api/mcp/tools_generator.py::install_tool_call_audit``)
+# - ``slack.command``     (``services/slack_bot/commands.py::_audit_slash_command``)
+# - ``telegram.message``  (``services/telegram_bot/bot.py::handle_message``)
+#
+# each carrying the kind/tool/command name in ``params`` so the row is
+# already attributable and queryable per-name today -- just not DECLARED
+# anywhere the way a route is, which is the actual gap this task closes.
+# This task is declarative-only (same scope cut as WS_POSTURE above -- no
+# new emission wiring, no middleware-equivalent for any of these three
+# transports). Every entry below is therefore one of two shapes:
+#
+# - **Supplements** the already-firing generic action: the entry names that
+#   SAME action, because nothing more specific fires for that name on this
+#   path. The entry's only job is to make a future kind/tool/command that
+#   forgets to register here fail the build -- catching exactly the
+#   silent-gap risk this task closes -- not to add a second row.
+# - **Names a more specific action** that a downstream call already writes
+#   for real on that exact path -- an MCP tool that self-calls a REST route
+#   over HTTP (which runs through that route's OWN declared posture, a
+#   genuine second row) or `telegram.script_run` on the sudo-run callback.
+#   The generic row above still ALSO fires in these cases (there is no
+#   middleware dedup for any of these three transports) -- this is
+#   deliberately not a "replaces" relationship, unlike the HTTP mutating
+#   path's fallback-vs-self-write choice.
+# ---------------------------------------------------------------------------
+
+JOB_POSTURE: dict[str, str] = {
+    # Every kind here reuses the generic `job.run` row `dispatch_job` already
+    # writes for every execution (params carry `kind`) -- no handler below
+    # writes a second, kind-specific row of its own, so there is nothing
+    # more specific to name (see "Supplements" above).
+    "data-refresh": "job.run",
+    "marketplaces-sync": "job.run",
+    "session-collector": "job.run",
+    "corporate-memory": "job.run",
+    "jira-refresh": "job.run",
+    "jira-org-refresh": "job.run",
+    "ducklake-maintenance": "job.run",
+    "analytics-migrate": "job.run",
+    "distribution-mirror": "job.run",
+    "webhook-deliver": "job.run",
+    "analytics-rebuild": "job.run",
+    "collections-purge": "job.run",
+    "corpus-extraction": "job.run",
+    # Conditionally registered (only on a process hosting a live ChatManager
+    # -- see register_all_kinds()'s docstring) but still a real, enumerable
+    # kind name when it IS registered, so it still needs an entry here.
+    "agent_response": "job.run",
+}
+
+# MCP foundation tools (app/api/mcp/foundation_tools.py::FOUNDATION_TOOL_NAMES,
+# the SSE + Streamable-HTTP transports). Most tools self-call the matching
+# REST endpoint over real HTTP (the same running app, so the call passes
+# through that route's own POSTURE/READ_POSTURE-declared posture for real) --
+# those entries below reuse that route's exact action/exempt-reason, per the
+# "names a more specific action" shape above. A handful of tools never make
+# that HTTP round trip -- the `fact_*` tools call `facts_repo()` directly
+# in-process (see `_facts_caller`'s docstring), `chat_upload_file` always
+# raises before any call on this server-hosted transport, and
+# `agnes_data_app_refresh`/`agnes_data_app_close` are pure client-render
+# directives with no server round-trip at all -- those reuse the generic
+# `mcp.tool_call` action instead, per the "Supplements" shape.
+MCP_TOOL_POSTURE: dict[str, str] = {
+    "server_info": "exempt:health",  # primary call is GET /api/health
+    "catalog": "catalog.list",
+    "collections_list": "exempt:ui_support",
+    "collection_get": "exempt:ui_support",
+    "collections_search": "collection.search",
+    "collection_file_read": "collection.file_preview",
+    "knowledge_search": "knowledge.search",
+    "glossary_search": "exempt:ui_support",
+    "semantic_model_search": "exempt:ui_support",
+    "semantic_model_get": "exempt:ui_support",
+    "validate_semantic_query": "semantic_model.validate_query",
+    "get_semantic_context": "exempt:ui_support",
+    "get_semantic_schema": "exempt:ui_support",
+    "apply_semantic_model": "authoring_suggestion.submit",
+    "collections_reingest": "collection.file_reingest",
+    # In-process facts_repo() calls, no HTTP self-call -- see module note.
+    "fact_search": "mcp.tool_call",
+    "fact_type_map": "mcp.tool_call",
+    "fact_facets": "mcp.tool_call",
+    "fact_neighbors": "mcp.tool_call",
+    "fact_claims": "mcp.tool_call",
+    "schema": "catalog.schema",
+    "describe": "catalog.sample",  # calls schema then sample; sample is the substantive read
+    "query": "query.local",
+    "skills": "exempt:ui_support",
+    "chat_skills": "exempt:ui_support",
+    "stack_browse": "exempt:self",
+    "stack_subscribe": "stack.subscribe",
+    "stack_unsubscribe": "stack.unsubscribe",
+    "stack_artefacts_candidates": "exempt:self",
+    "stack_artefact_add": "stack.artefact_add",
+    "stack_artefact_remove": "stack.artefact_remove",
+    "store_rate": "store.entity.rate",
+    "store_status": "exempt:ui_support",
+    "store_publish_markdown": "store.entity.create",
+    "store_compose_plugin": "store.entity.create",
+    "marketplace_search": "exempt:ui_support",
+    "marketplace_detail": "exempt:ui_support",
+    # Branches on curated-vs-flea id shape (`_split_marketplace_id`); curated
+    # named as primary per the multi-branch convention documented at the top
+    # of POSTURE above -- the flea branch's own action (store.entity.install /
+    # store.entity.uninstall) is real and cataloged too, just not repeated here.
+    "marketplace_add": "marketplace.curated.install",
+    "marketplace_remove": "marketplace.curated.uninstall",
+    "store_update": "store.entity.update",
+    "store_delete": "store.entity.archive",
+    "admin_store_lint_findings": "exempt:ui_support",
+    "admin_store_lint_audit": "run_store_lint_audit",
+    "admin_store_lint_dismiss": "dismiss_store_lint_finding",
+    "documentation_api": "exempt:static",  # reads a bundled markdown file, no self-call
+    "tool_docs": "exempt:static",  # reads TOOL_DOCS in-process, no self-call
+    "list_contributed_skills": "exempt:ui_support",
+    "contribute_skill": "contributed_skill.create",
+    "delete_contributed_skill": "contributed_skill.delete",
+    "admin_config_surface": "exempt:ui_support",
+    "admin_source_connections_list": "exempt:ui_support",
+    "admin_register_table": "register_table",  # dry_run branch -> table_registry.register_precheck, also real
+    "admin_semantic_layer_coverage": "exempt:ui_support",
+    "admin_knowledge_digests_list": "exempt:ui_support",
+    "admin_knowledge_digest_get": "exempt:ui_support",
+    "admin_knowledge_digest_create": "knowledge_digest.create",
+    "admin_knowledge_digest_update": "knowledge_digest.update",
+    "admin_knowledge_digest_delete": "knowledge_digest.delete",
+    # Always raises before any call on this server-hosted transport (reading
+    # a caller-named path server-side would be an arbitrary-file-read) -- see
+    # the tool's own docstring. Only the local stdio `agnes mcp` server (which
+    # never reaches this process's audit log) can actually upload a file.
+    "chat_upload_file": "mcp.tool_call",
+    "my_secret_test": "mcp_user_secret.test",
+    "admin_jobs_list": "exempt:noise",
+    "admin_job_get": "exempt:noise",
+    "admin_job_enqueue": "job.enqueue",
+    "activity": "activity.read",
+    "admin_analytics_migrate": "analytics.migrate",
+    "agent_list": "exempt:self",
+    "agent_ask": "agent.invoke",
+    "agent_usage": "exempt:self",
+    "data_apps_list": "exempt:ui_support",
+    "data_app_get": "exempt:ui_support",
+    "data_app_deploy": "data_app.deploy",
+    "data_app_create": "data_app.create",
+    "data_app_create_draft": "data_app.draft_create",
+    "data_app_delete_draft": "data_app.draft_delete",
+    "data_app_git_credential": "data_app.git_credential",
+    "data_app_logs": "data_app.logs_read",
+    "data_app_set_description": "data_app.set_description",
+    # Placeholder call (empty `url`) makes no server request at all; the
+    # live-URL call is the one that mints the preview grant -- named primary.
+    "agnes_data_app_preview": "data_app.preview_grant",
+    # Pure client-render directive, no server round-trip at all.
+    "agnes_data_app_refresh": "mcp.tool_call",
+    "agnes_data_app_close": "mcp.tool_call",
+    "agnes_data_app_credentials": "exempt:ui_support",
+}
+
+# Slack (`/agnes`, `/agnes-new`, `/agnes-status`) and Telegram (`/start`,
+# `/whoami`, `/status`, `/test`, `/help`, plus the inline "run script" button
+# callback) bot commands -- keys namespaced by platform so the two command
+# spaces (and Telegram's separate text-vs-callback dispatch) can't collide.
+BOT_COMMAND_POSTURE: dict[str, str] = {
+    # Every recognized slash command already gets `_audit_slash_command`'s
+    # `slack.command` row (params carry `command`) -- see
+    # services/slack_bot/commands.py.
+    "slack:/agnes": "slack.command",
+    "slack:/agnes-new": "slack.command",
+    "slack:/agnes-status": "slack.command",
+    # Every recognized text command already gets `handle_message`'s
+    # `telegram.message` row for a LINKED account (params carry `command`) --
+    # see services/telegram_bot/bot.py. `/start` for an UNLINKED account (the
+    # common case -- it's the linking command) writes no row: there is no
+    # `user_id` to attribute it to yet, the same unauthenticated-skip
+    # reasoning `mcp.tool_call`'s own dispatch wrapper uses above.
+    "telegram:/start": "telegram.message",
+    "telegram:/whoami": "telegram.message",
+    "telegram:/status": "telegram.message",
+    "telegram:/test": "telegram.message",
+    "telegram:/help": "telegram.message",
+    # The sudo-run callback -- `handle_callback_query` already writes this
+    # for real, independent of this map. Must NEVER be exempt: it is a
+    # button press running an operator script as an arbitrary OS user via
+    # `sudo -u` (services/telegram_bot/runner.py) -- the highest-value row
+    # on this whole surface.
+    "telegram:callback:run_script": "telegram.script_run",
+}
+
+
+def declared_nonhttp_action(posture: dict[str, str], key: str) -> str | None:
+    """The read-side-shaped lookup for JOB_POSTURE / MCP_TOOL_POSTURE /
+    BOT_COMMAND_POSTURE: the cataloged action *key* declares, or `None`
+    (exempt, or undeclared). Same two-value contract as `declared_action()`/
+    `declared_read_action()` above, generalized over the posture dict since
+    none of these three surfaces has a single canonical lookup signature
+    (job kind name, tool name, and namespaced bot command key all differ).
+    """
+    value = posture.get(key)
+    if value is None or value.startswith("exempt:"):
+        return None
+    return value

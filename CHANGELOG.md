@@ -305,6 +305,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   404-on-add path keeps its People wording — that is a race, not a person who
   was never invited.
 
+- Extended the audit-posture ratchet past HTTP: worker job kinds, MCP foundation tools, and
+  Slack/Telegram bot commands now declare a cataloged action or an exempt reason
+  (`JOB_POSTURE` / `MCP_TOOL_POSTURE` / `BOT_COMMAND_POSTURE` in `src/audit_posture.py`),
+  closing the gap where those surfaces could ship unaudited with nothing failing. The
+  agent kit now documents the audit contract (`.claude/skills/agnes-conventions/references/audit.md`).
+
 ### Changed
 
 - **The Library says what your agents get, not what the server does.** Every
