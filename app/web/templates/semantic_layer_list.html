@@ -1,4 +1,5 @@
 {% extends "base_page.html" %}
+{% import "macros/_state.html" as state %}
 
 {# NAME: "Semantic models", never "Semantic layer" — that name was worn by
    three of the four semantic surfaces at once (this page, /catalog/semantics
@@ -75,6 +76,11 @@
     color: var(--ds-accent-danger-ink);
 }
 .slb-errors li { margin-bottom: 2px; }
+.slb-empty-related-link {
+    margin: var(--space-3) 0 0;
+    font-size: 12.5px;
+    color: var(--ds-text-secondary);
+}
 </style>
 {% endblock %}
 
@@ -115,12 +121,25 @@
     {% endfor %}
 </div>
 {% else %}
-<div class="empty-state">
-    <h3 class="empty-state__title">No semantic model available</h3>
-    <p class="empty-state__description">
-        Ask an admin to import or author one, or to grant you access to an existing one
-        (<a href="/catalog/semantics">Metrics &amp; glossary</a> is a related, separate view).
-    </p>
-</div>
+{# No `q` on this page — every model the caller can read is listed, so a
+   zero-row result is the collection genuinely being empty, never a filter
+   collapse. `empty`, not `nothing_found`.
+
+   The CTA must be a path that can actually succeed (spec §3): on a fresh
+   instance, "Metrics & glossary" is ANOTHER empty page, so it can't be the
+   primary action. Only an admin can act on this state (import/register a
+   source), so the primary CTA is admin-only, mirroring how the rest of the
+   chrome gates admin actions (`session.user.is_admin`, e.g. _admin_nav.html,
+   store_upload.html); a non-admin (or a page that somehow doesn't know the
+   caller) gets a neutral body link instead, never a CTA that dead-ends. #}
+{% if session.user.is_admin %}
+{{ state.panel('empty', 'No semantic model available',
+               body='Import or author a semantic model to get started.',
+               cta_label='Add a semantic source', cta_href='/admin/semantic-sources') }}
+{% else %}
+{{ state.panel('empty', 'No semantic model available',
+               body='Ask an admin to import or author one, or to grant you access to an existing one.') }}
+{% endif %}
+<p class="slb-empty-related-link"><a href="/catalog/semantics">Metrics &amp; glossary</a> is a related, separate view.</p>
 {% endif %}
 {% endblock %}
