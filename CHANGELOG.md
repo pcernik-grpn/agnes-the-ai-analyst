@@ -21,8 +21,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   projector's own id formula, so a metric authored by hand or imported from
   YAML — which has no document object — renders no link, and neither does one
   whose model the caller cannot read. The registry link lands filtered
-  (`/catalog/semantics?q=<metric>`), on the row it means rather than on the
-  full list.
+  (`/semantic-layer?tab=all_metrics&q=<metric>`), on the row it means rather
+  than on the full list.
 - **A semantic source now reports WHAT it scanned, not only that the scan
   worked (#1707).** Observed live: a Snowflake semantic view existed, the role
   Agnes connects as held no privilege on it, `SHOW SEMANTIC VIEWS` came back
@@ -492,6 +492,42 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
 ### Changed
+- **The Library's Definitions footer is now a Semantic models section, and the
+  metric/glossary page folded into `/semantic-layer` (#1707).** Three changes
+  to one surface:
+  - **The Library page is rebuilt on its redesigned structure.** The tabbed
+    Knowledge / Capabilities shell over named sections, the per-kind Access
+    vocabulary ("Add to my agents" / "Agents can use this" rather than the old
+    stack wording), the "some of your library couldn't be loaded" notice, the
+    per-file indexing state and the Knowledge tab's type map arrive together;
+    every section below is built on that structure rather than on the flat
+    list it replaced.
+  - **The semantic layer is a real Library section (N3).** It used to close
+    the page as a "Definitions" aside below an unbounded list — after every
+    row, which is where a reader stops looking. It is now a named
+    **Semantic models** section in a fixed slot directly under Data packages,
+    with one row per model the caller can read (each opening its own
+    `/semantic-layer/{slug}`) and the metric and glossary counts as links on
+    the section's band. The distinction the old aside was built on survives:
+    a metric or a glossary term is still not a row here — nobody owns, shares
+    or drops a definition — but the stored DOCUMENT answers Owner, Sharing and
+    Access honestly, so it always could have been one. A caller with visible
+    metrics but no readable document still gets the section, with its links
+    and a line saying why it lists nothing.
+  - **`/catalog/semantics` folded into `/semantic-layer` (N5).** Two pages
+    over one semantic layer asked the reader to know, before arriving, whether
+    they wanted "a metric" or "the model a metric came from". The flat
+    `metric_definitions` / `glossary_terms` projection is now two more tabs of
+    the model list — **All metrics** and **All glossary** — reading the same
+    two tables through the same RBAC row filter, so metrics with no Ossie
+    document behind them (hand-authored, `yaml_import`, connector-written)
+    stay listed exactly as before; the model cards remain the default tab.
+    The old URL answers with a **308** that preserves the query string, so
+    bookmarks, chat citations and the deep links from the metric object page
+    keep landing — the tab now rides `?tab=`, because the `#metrics` fragment
+    those links carried never reached the server. Agnes's own emitters (the
+    Library section, global search, the chat glossary citation, the object
+    page's back link, the web-UI guide skill) point at the new addresses.
 - **The three semantic-layer browse pages moved onto the design system
   (#1707).** `/semantic-layer`, its model-detail tabs and an object's own page
   were each built out of page-local markup that predated the shared

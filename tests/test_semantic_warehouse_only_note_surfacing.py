@@ -17,7 +17,8 @@ where it is stamped fails here rather than silently rendering nothing:
 - ``agnes catalog --metrics --show <id>`` (``cli/commands/catalog.py``) —
   where ``CLAUDE.md``'s agent rails send an agent for the canonical
   definition, under "Never invent metric SQL".
-- ``GET /catalog/semantics`` (``app/web/templates/catalog_semantics.html``).
+- the flat registry (``app/web/templates/semantic_layer_list.html``, reached
+  as ``GET /catalog/semantics`` → 308 → ``?tab=all_metrics``).
 """
 
 from __future__ import annotations

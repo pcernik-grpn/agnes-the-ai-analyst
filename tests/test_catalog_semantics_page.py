@@ -1,10 +1,18 @@
-"""GET /catalog/semantics — read-only browser for the semantic layer
+"""The flat semantic projection — business metrics from `metric_definitions`
+plus the glossary from `glossary_terms` (both already shipped via
+`GET /api/metrics` and `GET /api/glossary*`). Analyst-facing tier
+(get_current_user, no admin gate) — mirrors the RBAC tier of the underlying
+REST endpoints and of /catalog itself. Picks up issue #853 plus the glossary.
 
-(business metrics from `metric_definitions` + the glossary from
-`glossary_terms`, both already shipped via `GET /api/metrics` and
-`GET /api/glossary*`). Analyst-facing tier (get_current_user, no admin
-gate) — mirrors the RBAC tier of the underlying REST endpoints and of
-/catalog itself. Picks up issue #853 plus the glossary.
+It used to be its own page at `GET /catalog/semantics`. Since #1707 N5 it is
+two TABS of the model list (`/semantic-layer?tab=all_metrics|all_glossary`)
+and the old URL is a 308 onto the first of them. Most of this file still
+drives the page through `/catalog/semantics` on purpose: following the
+redirect is what proves the fold preserved the behaviour rather than
+approximating it. Tests that were about the STANDALONE page's shell — its
+back link out, its client-side tab row — are gone with the shell; the fold's
+own contract (the redirect, the tab strip, the deep link's URL shape) lives
+in tests/test_web_semantic_layer_browse.py::TestFlatProjectionTabsFold.
 """
 
 from __future__ import annotations
@@ -71,12 +79,14 @@ class TestCatalogSemanticsContent:
         assert resp.status_code == 200
         body = resp.text
 
-        # Tab strip — page-local .sl-tab buttons (redesign replaced .tab-strip).
-        assert 'class="sl-tab' in body
-        assert 'data-tab="metrics"' in body
-        assert 'data-tab="glossary"' in body
-        assert "Metrics" in body
-        assert "Glossary" in body
+        # Tab strip — the shared `ds.tabs` link strip since the fold, so the
+        # tab is part of the ADDRESS (the page-local `.sl-tab` buttons it
+        # replaced could only carry it in a fragment).
+        assert 'class="tab-strip__item' in body
+        assert 'href="/semantic-layer?tab=all_metrics"' in body
+        assert 'href="/semantic-layer?tab=all_glossary"' in body
+        assert "All metrics" in body
+        assert "All glossary" in body
 
         # Server-rendered metrics list: category grouping + row content.
         assert "revenue" in body
@@ -86,10 +96,14 @@ class TestCatalogSemanticsContent:
         # Client-side filter input for metrics (no new search endpoint).
         assert 'id="metric-filter"' in body
 
-        # Glossary search input, wired to the existing search endpoint.
-        assert 'id="glossary-search"' in body
-        assert "/api/glossary/search" in body
-        assert "/api/glossary" in body
+        # Glossary search input, wired to the existing search endpoint. Its own
+        # tab is its own REQUEST now — the two panels no longer share a DOM, so
+        # the sidebar that belongs to the glossary renders only there.
+        glossary = c.get("/semantic-layer?tab=all_glossary", headers=_auth(token))
+        assert glossary.status_code == 200
+        assert 'id="glossary-search"' in glossary.text
+        assert "/api/glossary/search" in glossary.text
+        assert "/api/glossary" in glossary.text
 
     def test_metrics_grouped_by_category(self, seeded_app):
         _make_metric(id="revenue/mrr", name="mrr", category="revenue")
@@ -277,33 +291,44 @@ class TestCatalogSemanticsRBAC:
 
 class TestCatalogSemanticsLinkFromCatalog:
     def test_library_carries_the_door_to_semantics(self):
-        """The Definitions block in the Library is the way in.
+        """The Library's Semantic models section is the way in.
 
         This asked /catalog for a rendered link, which the classic template's
         (now retired) Semantic layer card supplied. The unified Catalog offers
-        only what the caller does not already have, and the semantic layer is not one of
-        those — the rail's own IA note names the Library's Definitions block as
-        the door instead.
+        only what the caller does not already have, and the semantic layer is
+        not one of those — the rail's own IA note names the Library as the
+        door instead. Since #1707 N3 that door is a NAMED section rather than
+        a footer aside, and since N5 it opens the tabs directly.
 
-        Asserted on the template rather than on a render because the block is
-        conditional on the instance having definitions to show, and seeding
+        Asserted on the template rather than on a render because the section
+        is conditional on the instance having definitions to show, and seeding
         metrics + glossary entries here would be testing the Library's empty
         state rather than the presence of the link."""
         from pathlib import Path
 
         library = Path("app/web/templates/library.html").read_text(encoding="utf-8")
-        assert "/catalog/semantics" in library, (
-            "library.html no longer links /catalog/semantics — under the rail that "
-            "block is the page's entry point (see the IA note in _app_rail.html)"
+        assert "/semantic-layer?tab=all_metrics" in library, (
+            "library.html no longer links the metric registry — under the rail that "
+            "section is the page's entry point (see the IA note in _app_rail.html)"
+        )
+        assert "/catalog/semantics" not in library, (
+            "library.html still emits the retired URL — the 308 is for links Agnes "
+            "does not control, not for its own emitters"
         )
 
 
 class TestCatalogSemanticsWayOut:
-    """The page is link-only — reached from the Library's Definitions block,
-    a chat citation or global search (the classic Catalog's card is retired,
-    see the class above) — and is a nav destination in neither chrome. Without a back link the browser's
-    Back button was the only way out, and under the rail no nav item lit up
-    either, so the chrome read as "nowhere"."""
+    """The projection is reached from the Library's Semantic models section, a
+    chat citation or global search (the classic Catalog's card is retired, see
+    the class above) — and is a nav destination in neither chrome, so without
+    something lighting up the chrome reads as "nowhere".
+
+    The standalone page answered that with its own `.sl-back` link out. Since
+    the fold there is no standalone page to leave: the projection is a tab of
+    the model list, and the tab strip beside it is the way to the rest of the
+    surface. What survives from the original bug is the RAIL half — the
+    Library item must still light up, or every semantic surface is a
+    navigation blank spot."""
 
     def _body(self, seeded_app) -> str:
         c = seeded_app["client"]
@@ -312,34 +337,15 @@ class TestCatalogSemanticsWayOut:
         assert resp.status_code == 200
         return resp.text
 
-    def test_back_link_returns_to_the_library(self, seeded_app):
-        """The way out. It pointed at /catalog while the classic Catalog page
-        carried the card that linked here; the Library's Definitions block is
-        that door now, so the back link follows it — a back link to a page that
-        no longer offers the surface is the "nowhere" this class exists about."""
-        body = self._body(seeded_app)
-        assert 'class="sl-back"' in body
-        assert 'href="/library' in body
-
-    def test_rail_back_link_returns_to_the_definitions_block(self, seeded_app, monkeypatch):
-        # /library is the rail's one browse surface and carries the block the
-        # reader clicked; /catalog is not in the rail nav at all. The ANCHOR is
-        # the point: the Definitions block closes /library below the whole
-        # inventory, so a bare /library returns them to the top of the page
-        # with everything they own between them and where they were.
+    def test_the_definitions_anchor_the_library_script_binds_to_exists(self, seeded_app, monkeypatch):
+        # `#lib-defs` is what the Library's own "that word is a definition"
+        # search hint binds to (library.html). It was also the back link's
+        # target until the fold removed the back link; the id outlives it
+        # because the script still needs it, and a silently-renamed id turns
+        # the hint off with nothing failing.
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
-        body = self._body(seeded_app)
-        assert '<a class="sl-back" href="/library#lib-defs">' in body
-        assert '<a class="sl-back" href="/catalog">' not in body
-
-    def test_the_anchor_the_back_link_targets_exists_on_the_library(self, seeded_app, monkeypatch):
-        # A back link into an id no page emits is a link to the top of that
-        # page — indistinguishable from the bare /library it replaced, and
-        # silently so. Pin the two ends together.
-        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
-        # The block renders under `if definitions_footer` — set only when the
-        # caller can see at least one metric or term, which is also the only
-        # state in which they could have clicked through from it.
+        # The section renders under `if definitions_footer` — set only when the
+        # caller can see at least one metric or term.
         _make_metric()
         c = seeded_app["client"]
         token = seeded_app["analyst_token"]
@@ -483,9 +489,9 @@ class TestCatalogSemanticsSidebarLayout:
         import re
         from pathlib import Path
 
-        css = (Path("app/web/templates/catalog_semantics.html")).read_text(encoding="utf-8")
+        css = (Path("app/web/templates/semantic_layer_list.html")).read_text(encoding="utf-8")
         m = re.search(r"\.sl-cat-nav\s*\{([^}]*)\}", css)
-        assert m, ".sl-cat-nav rule not found in catalog_semantics.html"
+        assert m, ".sl-cat-nav rule not found in semantic_layer_list.html"
         body = m.group(1)
         assert re.search(r"display\s*:\s*block\b", body), (
             ".sl-cat-nav must declare `display: block` so its category buttons "
@@ -507,7 +513,7 @@ def test_every_heading_the_allowlist_admits_is_styled_in_the_detail():
 
     import app.markdown_render as mr
 
-    tpl = Path("app/web/templates/catalog_semantics.html").read_text(encoding="utf-8")
+    tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
     admitted = {
         t for t in (mr._ALLOWED_TAGS | mr._HTML_SOURCE_EXTRA_TAGS) if len(t) == 2 and t[0] == "h" and t[1].isdigit()
     }
@@ -646,12 +652,16 @@ class TestCatalogSemanticsDoorToTheDocument:
         assert resp.status_code == 200
         return resp.text
 
-    def test_no_door_when_the_instance_has_no_model(self, seeded_app):
+    def test_empty_state_claims_no_document_when_there_is_none(self, seeded_app):
+        """Since the fold the Models tab is structural — the strip links to it
+        from every tab, and it renders its own honest empty panel, so the
+        old "is the door offered at all" gate has nothing left to protect.
+        What still needs protecting is the SENTENCE: the metrics tab may only
+        say "but this instance has a semantic model" when this caller has
+        one."""
         body = self._body(seeded_app, "admin_token")
-        assert _DOOR not in body, (
-            "offered the browse page with no model to browse — the link must be "
-            "gated on a readable document, not rendered unconditionally"
-        )
+        assert "No metrics registered yet" in body
+        assert "but this instance has a semantic model" not in body
 
     def test_door_is_offered_when_a_readable_model_exists(self, seeded_app):
         self._seed_model()
@@ -672,13 +682,14 @@ class TestCatalogSemanticsDoorToTheDocument:
             "wants metrics — the document link is added beside it, not instead of it"
         )
 
-    def test_analyst_without_a_grant_is_not_sent_to_a_page_they_cannot_read(self, seeded_app):
+    def test_analyst_without_a_grant_is_not_told_a_document_awaits_them(self, seeded_app):
         """`_can_read_model` is not admin-only, but it is not open either: an
         analyst with neither a direct model grant nor a Data Package grant
-        would get a 404/empty browse page, so they must not see the door."""
+        would find the Models tab empty, so the metrics tab must not promise
+        them a document sitting next door."""
         self._seed_model()
         body = self._body(seeded_app, "analyst_token")
-        assert _DOOR not in body
+        assert "but this instance has a semantic model" not in body
 
 
 class TestCatalogSemanticsDeepLinkIntoTheDocument:
@@ -821,7 +832,7 @@ class TestCatalogSemanticsDeepLinkIntoTheDocument:
 
         obj = c.get("/semantic-layer/retail/metric:revenue", headers=headers)
         assert obj.status_code == 200, obj.text
-        produced = re.search(r'href="/catalog/semantics\?q=([^"#]*)#metrics"', obj.text)
+        produced = re.search(r'href="/semantic-layer\?tab=all_metrics&amp;q=([^"]*)"', obj.text)
         assert produced, "the metric object page emitted no registry back link"
         term = unquote(produced.group(1)).lower()
 

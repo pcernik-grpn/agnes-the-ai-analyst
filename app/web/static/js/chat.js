@@ -4163,7 +4163,7 @@ const _PREVIEW_TOOL_NAMES = new Set([
 // claim provenance that may not exist. Citing the specific definition an
 // answer used (rather than noting that one was consulted) is issue #1134.
 const _DEFINITION_LOOKUP_TOOLS = {
-  glossary_search: { text: "Checked your organization's glossary", href: "/catalog/semantics#glossary" },
+  glossary_search: { text: "Checked your organization's glossary", href: "/semantic-layer?tab=all_glossary" },
 };
 
 function _definitionLookupLabel(toolName) {

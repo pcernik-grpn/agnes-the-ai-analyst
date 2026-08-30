@@ -1,26 +1,35 @@
 """One name per semantic-layer page — a naming contract, not a styling one.
 
-Agnes ships FOUR semantic-layer surfaces, and three of them shipped under the
-same name: ``/catalog/semantics`` and ``/semantic-layer`` rendered the
+Agnes shipped FOUR semantic-layer surfaces, and three of them shipped under
+the same name: ``/catalog/semantics`` and ``/semantic-layer`` rendered the
 byte-identical ``<title>Semantic layer — …</title>``, and the admin lens at
 ``/admin/semantic-layer`` used it a third time. A reader could not tell from a
 browser tab, a bookmark, a history entry or a link label which of the three
 they were looking at — and the templates' own comments said so out loud
 ("Both pages are titled 'Semantic layer'").
 
-The names are now distinct and each says what its page is FOR:
+Three LIVE pages remain, each named for what it is FOR:
 
 ===========================  ==========================================
-``/semantic-layer``          **Semantic models** — the stored documents
-``/catalog/semantics``       **Metrics & glossary** — the flat projection
+``/semantic-layer``          **Semantic models** — the stored documents,
+                             plus the flat metric and glossary registries
+                             as its "All metrics" / "All glossary" tabs
 ``/admin/semantic-layer``    **Semantic layer health** — is it complete
 ``/admin/semantic-sources``  **Semantic sources** — where documents come from
 ===========================  ==========================================
 
+``/catalog/semantics`` is the fourth, and it is no longer a page: #1707 N5
+folded the flat projection into the model list and left a 308 behind. Two
+pages over one semantic layer asked the reader to know, before arriving,
+whether they wanted "a metric" or "the model a metric came from" — a
+distinction the naming above could make legible but never remove.
+
 What is pinned here:
 
-(a) No two of the four share a ``<title>``. This is the guard proper — a
-    future page rename can move a name, but it can never re-collide.
+(a) No two LIVE pages share a ``<title>``. This is the guard proper — a
+    future page rename can move a name, but it can never re-collide. A
+    redirect has no title to collide with, which is why the retired URL is
+    pinned as a redirect instead.
 (b) Each page's title is the decided name above, so a link label written
     against this table stays true.
 (c) The health page's door points at ``/semantic-layer`` and is LABELLED
@@ -29,8 +38,8 @@ What is pinned here:
     two adjacent admin pages disagreeing about where "the layer" is. Health
     reports on documents, so it links to documents.
 
-URLs are deliberately NOT renamed: every bookmark, skill reference and deep
-link keeps working. Only the human-readable names changed.
+Live URLs are deliberately NOT renamed: every bookmark, skill reference and
+deep link keeps working. Only the human-readable names changed.
 """
 
 from __future__ import annotations
@@ -44,9 +53,15 @@ import pytest
 #: templates together; nothing else in the suite encodes these names.
 PAGE_NAMES: dict[str, str] = {
     "/semantic-layer": "Semantic models",
-    "/catalog/semantics": "Metrics & glossary",
     "/admin/semantic-layer": "Semantic layer health",
     "/admin/semantic-sources": "Semantic sources",
+}
+
+#: The retired URL and where it now lands. A page that folded into another
+#: has no name of its own to guard — what has to hold instead is that it
+#: still ANSWERS, permanently and without rewriting the request.
+RETIRED_PAGES: dict[str, str] = {
+    "/catalog/semantics": "/semantic-layer?tab=all_metrics",
 }
 
 #: The door on /admin/semantic-layer, asserted as a full anchor: a bare
@@ -72,7 +87,7 @@ def _page_name(body: str, path: str) -> str:
 
 
 def test_no_two_semantic_pages_share_a_title(seeded_app) -> None:
-    """The collision guard. Three of these four were "Semantic layer"."""
+    """The collision guard. Three of these were "Semantic layer" once."""
     titles: dict[str, str] = {}
     for path in PAGE_NAMES:
         body = _render(seeded_app, path)
@@ -103,3 +118,13 @@ def test_health_page_door_points_at_semantic_models(seeded_app) -> None:
         "/admin/semantic-layer still links to the metric/glossary projection — "
         "its neighbour /admin/semantic-sources points at /semantic-layer, and the two must agree."
     )
+
+
+@pytest.mark.parametrize(("path", "target"), sorted(RETIRED_PAGES.items()))
+def test_retired_page_permanently_redirects(seeded_app, path: str, target: str) -> None:
+    """A folded page keeps answering — with a 308, so the method and body are
+    preserved and every bookmark, chat citation and skill reference lands on
+    the surface that absorbed it."""
+    resp = seeded_app["client"].get(path, headers=_auth(seeded_app["admin_token"]), follow_redirects=False)
+    assert resp.status_code == 308, f"{path} → {resp.status_code}, expected a permanent redirect"
+    assert resp.headers["location"] == target

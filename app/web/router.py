@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -445,11 +445,12 @@ _RAIL_DETAIL_BACK: dict[str, tuple[str, str]] = {
     "skill": ("/library?section=skill", "All skills"),
     "agent": ("/library?section=agent", "All agents"),
     "files": ("/library?section=files", "Library"),
-    # /catalog/semantics is not a `type_key`: the Definitions block is an
-    # adjacent destination BELOW the inventory, not one of the bands, so it
-    # has no `?section=` to open. It gets an anchor instead — without one the
-    # bare /library the fallback returns lands the reader at the top of the
-    # page, with the whole inventory between them and the block they clicked.
+    # The flat metric/glossary registries are not a `type_key`: they are a
+    # destination the Semantic models band links OUT to, not one of the
+    # Library's bands, so they have no `?section=` to open. They get the
+    # band's own anchor instead — without one the bare /library the fallback
+    # returns lands the reader at the top of the page, with the whole
+    # inventory between them and the section they clicked.
     # `#lib-defs` exists exactly when that block rendered (library.html emits
     # it under `if definitions_footer`, set only when the caller can see at
     # least one metric or glossary term); when it did not, the anchor is inert
@@ -2096,8 +2097,34 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: rather than literals at each site because they are the same sentence
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
-_LOCKED_STACK_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-_GRANTED_STACK_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
+_LOCKED_STACK_TOOLTIP = (
+    "Required by your admin — your agents get this automatically, and you cannot remove it."
+)
+_GRANTED_STACK_TOOLTIP = (
+    "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
+)
+
+#: The Access column asks ONE question — *can my agent use this* — and the
+#: three kinds answer it differently, which is the honest shape of the
+#: product rather than an inconsistency to paper over: a capability is the
+#: caller's to add, granted data is the admin's to give. The old copy named
+#: the MECHANISM instead ("Install", "Add to stack", "In stack"), which said
+#: what the server does and left the reader to infer what they get. Named
+#: once, because this column has already collected four spellings of one
+#: state and every extra literal is how a fifth arrives.
+_AGENT_ADD = "Add to my agents"
+_AGENT_REMOVE = "Remove"
+# The resting states drop the possessive the ACTION keeps ("Add to my
+# agents"): the action is a sentence about you, the state is a fact about the
+# row, and repeating "your agents" on every line both clipped the 142px cell
+# and said nothing the lede above the list has not already said.
+_AGENT_HAS = "Agents can use this"
+_AGENT_CAN_QUERY = "Agents can query this"
+_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
+_AGENT_HAS_TOOLTIP = (
+    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
+    "sees what that scope allows."
+)
 
 
 def _library_row_base(
@@ -2150,6 +2177,15 @@ def _library_row_base(
         # the wording can differ from the filtered value. Empty → the template
         # falls back to "In stack".
         "stack_pill": "",
+        # The VERB, per kind. One label ("Add to stack") used to sit on every
+        # row while the click posted to four different endpoints meaning four
+        # different things — install a skill, install a plugin, ask for a local
+        # copy of granted data, pin a collection. A control has to name what it
+        # does, so each kind supplies its own three words: the action, the
+        # resting state once done, and the undo. Blank falls back to the old
+        # stack vocabulary, which is still right for a collection.
+        "stack_action": "",
+        "stack_undo": "",
         # Membership the caller cannot drop — any group grant, whichever tier.
         # It reads the SAME "In stack" as any other member (it is one) and is
         # marked by a LOCK plus a tooltip naming who *can* remove it. The tier
@@ -2237,10 +2273,10 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Option
     ``semantic_models`` read failure must degrade to "no link" and leave the
     rest of the page intact rather than 500 it. ``surface`` only labels the log.
 
-    Shared by ``/library``'s Definitions footer and ``/catalog/semantics``'
-    header + empty state. One reader, because the two disagreeing is exactly
-    how the standalone page came to claim "no metrics registered yet" on an
-    instance whose Library was already offering the document next door.
+    Shared by ``/library``'s Semantic models section and the model list's own
+    empty states. One reader, because the two disagreeing is exactly how the
+    flat page came to claim "no metrics registered yet" on an instance whose
+    Library was already offering the document next door.
 
     ``rows`` passes in a sweep the caller already did this request (see
     :func:`_readable_semantic_model_rows`) — same answer, no second sweep.
@@ -2248,6 +2284,30 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Option
     if rows is None:
         rows = _readable_semantic_model_rows(user, conn, surface=surface)
     return bool(rows)
+
+
+def _library_type_map(user: dict) -> list[dict]:
+    """Node types with caller-scoped counts for the Knowledge tab's head.
+
+    Fails soft on every axis, because this is a decoration on a page that
+    must render without it: the `facts` feature can be off, the app-state
+    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
+    and the graph can simply be empty. Any of those renders the Library
+    exactly as it does today, with no type map — never a 500 on the
+    caller's main inventory page.
+    """
+    try:
+        from app.instance_config import feature_enabled
+
+        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+            return []
+        from src.repositories import facts_repo
+
+        counts = facts_repo().count_visible_facts_by_type(user)
+    except Exception:  # noqa: BLE001 - decoration must never break the page
+        logger.debug("library: type map unavailable", exc_info=True)
+        return []
+    return [{"type": t, "count": n} for t, n in counts.items()]
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -2308,6 +2368,29 @@ async def library_page(
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
 
+    # ── What could not be read ────────────────────────────────────────────
+    # Every content block below is wrapped so one broken source cannot take the
+    # page down — the right instinct, wrongly finished: a band that raised is
+    # simply ABSENT, and every count on the page is derived from what survived,
+    # so a library whose data packages failed to load looks exactly like a
+    # library that has none. Bad enough and it renders "Your library is empty"
+    # to someone whose library is not. Recorded here so the page can say so.
+    #
+    # Only CONTENT losses are recorded. A failed fact count, grant lookup or
+    # item count degrades a detail on rows that are still there; a notice for
+    # those would cry wolf and teach people to ignore the one that matters.
+    _load_errors: list[str] = []
+
+    #: What a lost content group is CALLED to the person reading the page —
+    #: the internal type name means nothing to them.
+    _ETYPE_LABELS = {"skill": "skills", "plugin": "plugins", "agent": "agent templates"}
+    _RT_LABELS = {"data_package": "data packages", "memory_domain": "memory"}
+
+    def _lost(label: str, exc: Exception) -> None:
+        logger.warning("/library: could not resolve %s: %s", label, exc)
+        if label not in _load_errors:
+            _load_errors.append(label)
+
     # The onboarding step is literally "Explore your Library" — so looking at it
     # completes it. It used to need a click on the checklist row instead, which
     # made the row a box to tick rather than a thing to do: someone who had spent
@@ -2357,14 +2440,25 @@ async def library_page(
     items: list = []
 
     # ── Artefacts (file_corpora) ──────────────────────────────────────────
-    fc_repo = file_corpora_repo()
-    cf_repo = corpus_files_repo()
+    # Resolving the repos and listing the collections sits INSIDE the guard
+    # below, not above it: outside, a backend that cannot answer took the whole
+    # page down with a 500, which is the one outcome this block's try/except
+    # exists to prevent. The guard only ever protected the loop, so it covered
+    # every failure except the one most likely to happen.
+    fc_repo = None
+    cf_repo = None
     # Resolved ONCE, not per collection: the flag/backend check is the same
     # for every row, and a fresh count query per row is only worth paying
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
-    _all_cols = fc_repo.list()
+    _all_cols: list = []
+    try:
+        fc_repo = file_corpora_repo()
+        cf_repo = corpus_files_repo()
+        _all_cols = fc_repo.list()
+    except Exception as e:
+        _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
     # count re-resolved the caller's readable-collection set (a grants query
     # plus a full owned-collections scan), so the page cost grew with the
@@ -2421,8 +2515,16 @@ async def library_page(
             file_type_key, file_type_label = _artefact_type(file_count, first_file)
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
-            fname = first_file.get("filename") if first_file else ""
             is_folder = file_count != 1
+            # What this row can be FOUND by. Nobody searches for the folder —
+            # they search for the file inside it ("kpis"), and until now the
+            # engine saw only the folder's own name, so a file sitting visibly
+            # on screen answered "Nothing matches these filters". A folder is
+            # therefore searchable by every filename it holds; the client then
+            # opens it and hides the siblings, so the hit reads as the file.
+            fname = " ".join(f.get("filename") or "" for f in files) if is_folder else (
+                first_file.get("filename") if first_file else ""
+            )
             row = _library_row_base(
                 item_id=col["id"],
                 kind="artefact",
@@ -2454,17 +2556,15 @@ async def library_page(
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
-            row["stack_title"] = (
-                "The default agent can use this artefact"
-                if row["in_stack"]
-                else "You can reach this, but the default agent can't until you add it"
-            )
+            row["stack_title"] = _AGENT_HAS_TOOLTIP if row["in_stack"] else _AGENT_ADD_TOOLTIP
             # An artefact is the one kind whose membership IS the caller's to
             # set (no admin grant tier exists for a personal upload), so its
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
             # a folder shows its folder's state as a plain badge.
-            row["stack_pill"] = "In stack"
+            row["stack_pill"] = _AGENT_HAS
+            row["stack_action"] = _AGENT_ADD
+            row["stack_undo"] = _AGENT_REMOVE
             # Membership here is a `user_stack_subscriptions` row, and it is the
             # caller's to add or drop either way. Children deliberately inherit
             # neither flag: Stack membership is per collection, so a file inside a
@@ -2482,6 +2582,18 @@ async def library_page(
             # description every file shared word for word. A collection prints its
             # file count there instead, so it needs none.
             row["file_format"] = "" if is_folder else _artefact_format(first_file)
+            row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
+            # `file_format` is what the row PRINTS (a folder prints its file
+            # count instead, so it has none). `format_keys` is what the row can
+            # be FILTERED by, which for a folder is every format inside it —
+            # the same reason its search text holds every filename. Keeping the
+            # two apart is what lets a folder answer "show me PDFs" without
+            # claiming to be a PDF.
+            row["format_keys"] = (
+                sorted({fmt for f in files if (fmt := _artefact_format(f))})
+                if is_folder
+                else ([row["file_format"]] if row["file_format"] else [])
+            )
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2532,6 +2644,13 @@ async def library_page(
                     # nested rows are files too, and the retired Type column is
                     # where their format used to show.
                     child["file_format"] = _artefact_format(f)
+                    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
+                    # Whether the extraction pass actually got text out of this
+                    # file. Only surfaced when it is NOT `indexed`: a healthy
+                    # file saying "indexed" on every row is noise, but a file
+                    # nobody can search is worth knowing about without opening
+                    # the collection page to find it.
+                    child["ingest_label"] = _ingest_label(f)
                     child["file_id"] = f["id"]
                     child["file_name"] = f.get("filename") or ""
                     child["slug"] = slug or ""
@@ -2549,7 +2668,7 @@ async def library_page(
                     row["children"].append(child)
             items.append(row)
     except Exception as e:
-        logger.warning("/library: could not enumerate artefacts: %s", e)
+        _lost("files and collections", e)
 
     # ── Store entities the caller may see: SKILLS and PLUGINS ─────────────
     # The Library is the single source of truth for what a user can reach, so it
@@ -2576,7 +2695,7 @@ async def library_page(
         for inst in user_store_installs_repo().list_for_user(uid):
             installed_store[inst["id"]] = inst
     except Exception as e:
-        logger.warning("/library: could not resolve store installs: %s", e)
+        _lost("skills, plugins and agent templates", e)
 
     for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
         try:
@@ -2587,7 +2706,7 @@ async def library_page(
                 limit=1000,
             )
         except Exception as e:
-            logger.warning("/library: could not enumerate %ss: %s", _etype, e)
+            _lost(_ETYPE_LABELS.get(_etype, _etype + "s"), e)
             continue
         for s in _entities:
             status = s.get("visibility_status") or "pending"
@@ -2679,18 +2798,24 @@ async def library_page(
             # caller either way — including on their own entity.
             _inst = installed_store.get(s["id"])
             items[-1]["stack_endpoint"] = f"/api/store/entities/{s['id']}/install"
+            # The endpoint is ``/install`` and a store entity was never a stack
+            # member (``/api/stack`` takes only data_package and memory_domain),
+            # so the row says what the click actually does.
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             if _inst:
                 items[-1]["stack_state"] = "in_stack"
-                items[-1]["stack_pill"] = "In stack"
+                items[-1]["stack_pill"] = _AGENT_HAS
                 items[-1]["stack_removable"] = True
-                items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+                items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
             else:
                 items[-1]["stack_state"] = "available"
                 items[-1]["stack_addable"] = True
+                # An author looking at their own unadded skill needs the extra
+                # fact that authoring it did not add it; everyone else needs
+                # only the general one.
                 items[-1]["stack_title"] = (
-                    "Yours, but not part of your Stack"
-                    if owned
-                    else "Available to you, but the default agent can't use it until you add it"
+                    "You wrote this, but your agents cannot use it until you add it." if owned else _AGENT_ADD_TOOLTIP
                 )
 
     # ── Everything else the caller has ACCESS to ──────────────────────────
@@ -2739,11 +2864,11 @@ async def library_page(
     ) -> None:
         """Append one access-granted row (never owner-shareable).
 
-        ``droppable``: the membership is the caller's own subscription
-        (classic mode, optional tier) — render the REMOVE control, exactly
-        as /catalog offers for the same membership. Callers whose
-        membership is the grant itself (auto-membership, recipes, plugins)
-        leave it False and get the locked pill."""
+        ``droppable``: the membership is the caller's own subscription, which
+        only exists under CLASSIC membership — there, subscribing is what makes
+        a granted resource queryable, so the control is real and the caller may
+        undo it. Under auto-membership (the default) the grant IS the
+        membership and callers leave this False."""
         items.append(
             _library_row_base(
                 item_id=item_id,
@@ -2768,45 +2893,50 @@ async def library_page(
                 owner_key=owner_key or "workspace",
             )
         )
-        # Membership is the caller's mode-resolved reality, not the grant
-        # (Devin Review on #1199): under auto-membership every granted row IS
-        # in the Stack (``in_stack`` arrives True, rendering exactly as
-        # before); under the classic default a granted-but-unsubscribed
-        # ``available`` resource is NOT a member — claiming "In stack" there
-        # would label rows the agent cannot actually query (membership also
-        # drives ``get_accessible_tables``). Callers whose membership
-        # genuinely is the grant (recipes, plugins) omit the argument.
+        # What this column can offer depends on which membership mode the
+        # instance runs, because the two modes disagree about what a
+        # subscription DOES.
+        #
+        # Auto-membership (the default since Wave 0): the grant already put the
+        # resource in reach — StackResolver.stack returns required ∪ available
+        # regardless of any subscription — so there is nothing here for the
+        # caller to add. The only thing a subscription still decides is whether
+        # `agnes pull` writes a local copy, which changes how fast THEIR
+        # queries run and nothing about what their agents can do; that is a
+        # workspace question and it lives on the package's own page
+        # (/catalog/p/<slug>, sourced from `entry.materialized`) and in
+        # `agnes stack add`. An "Add to my agents" control here would claim to
+        # grant access the admin's grant already gave.
+        #
+        # Classic membership: subscribing is exactly what makes the resource
+        # queryable (membership drives get_accessible_tables), so the control
+        # is real, the verb is true, and a self-subscription is the caller's to
+        # drop — rendering it as a locked admin mandate is what Devin Review
+        # #1199 was about.
         if in_stack and droppable:
-            # Classic self-subscription: the caller added it, the caller can
-            # remove it — HERE, not just on /catalog. This row used to render
-            # the locked pill ("only an admin can remove it"), which was
-            # false for a self-subscription and read as a required mandate;
-            # /catalog offered Remove for the very same membership. The lock
-            # is driven by droppability, and this membership IS droppable.
             import json as _json
 
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In stack"
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
-            # Remove is a path-param DELETE; re-add (after a remove, without
-            # a reload) POSTs the generic subscribe endpoint with a body —
-            # the row carries both so the click handler can cycle.
+            # Remove is a path-param DELETE; re-add (after a remove, without a
+            # reload) POSTs the generic subscribe endpoint with a body — the
+            # row carries both so the click handler can cycle.
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Added by you — click to remove it from your stack"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
         elif in_stack:
             items[-1]["stack_state"] = "in_stack"
-            # Every non-droppable member row says the same thing about
-            # membership — "In stack" — and is LOCKED: there is no per-user
-            # membership to drop, only a grant an admin can revoke (required
-            # tier, or auto-membership where the grant IS the membership).
-            # The lock is driven by *droppability*, not by the grant tier:
-            # keying it on ``requirement == 'required'`` (as this once did)
-            # left an optional grant rendering the success-tinted check that
-            # a REMOVABLE row wears at rest. The tier stays legible in the
-            # tooltip and the Optional/Required facet.
-            items[-1]["stack_pill"] = "In stack"
+            # ONE pill for both grant tiers, because the caller can do exactly
+            # the same thing with either: query it, and not remove it. The
+            # tiers differ only in WHY, which is what the tooltip is for — two
+            # pills promising two different things about removal is what made
+            # a single state read as two. The tier stays legible in the tooltip
+            # and in the Access facet.
+            items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
             if requirement == "required":
                 items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
@@ -2825,10 +2955,12 @@ async def library_page(
 
             items[-1]["stack_state"] = "available"
             items[-1]["stack_addable"] = True
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Granted to you, but not in your stack — add it to make it queryable"
+            items[-1]["stack_title"] = _AGENT_ADD_TOOLTIP
 
     # Governed data packages + memory domains — StackResolver.browse() is
     # exactly "required ∪ available for my groups" for these two types.
@@ -2858,9 +2990,7 @@ async def library_page(
     except Exception as e:
         logger.warning("/library: could not count memory-domain items: %s", e)
         dom_counts = None
-    # Membership mode decides droppability below: classic optional members
-    # are the caller's own subscriptions (removable here, as on /catalog);
-    # under auto-membership the grant IS the membership, nothing to drop.
+    # Only classic membership has a subscription to drop; see _add_shared_row.
     from app.instance_config import get_stack_auto_membership
 
     _auto_membership = get_stack_auto_membership()
@@ -2921,7 +3051,7 @@ async def library_page(
                     droppable=(not _auto_membership and e.in_stack and e.requirement != "required"),
                 )
         except Exception as e:
-            logger.warning("/library: could not resolve %s: %s", rt.value, e)
+            _lost(_RT_LABELS.get(rt.value, rt.value), e)
 
     # Recipes — granted, resolved straight off the repo (no _fetch_entries
     # support for this type in StackResolver).
@@ -2946,7 +3076,7 @@ async def library_page(
                     owner_label="Your workspace",
                 )
     except Exception as e:
-        logger.warning("/library: could not resolve recipes: %s", e)
+        _lost("recipes", e)
 
     # Curated marketplace plugins — grant resource_id is the canonical
     # "<marketplace_slug>/<plugin_name>" path, so match on that.
@@ -3035,27 +3165,30 @@ async def library_page(
                 # (`curated_install` / `curated_uninstall`). The Library's toggle
                 # is kind-agnostic — it POSTs/DELETEs whatever the row names.
                 row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
+                # Same verb as a store entity, and for the same reason.
+                row["stack_action"] = "Install"
+                row["stack_undo"] = "Uninstall"
                 # Droppable unless an admin pinned it globally (`is_system`) or
                 # required-tier-granted it to one of the caller's groups. Those
                 # are precisely the two cases `curated_uninstall` answers 409
                 # to, so the lock promises exactly what the API enforces.
                 locked = bool(pl.get("is_system")) or key in plugin_required
+                row["stack_action"] = _AGENT_ADD
+                row["stack_undo"] = _AGENT_REMOVE
                 if key in plugin_in_stack:
                     row["stack_state"] = "in_stack"
-                    row["stack_pill"] = "In stack"
+                    row["stack_pill"] = _AGENT_HAS
                     row["stack_locked"] = locked
                     row["stack_removable"] = not locked
-                    row["stack_title"] = (
-                        _LOCKED_STACK_TOOLTIP if locked else "The default agent can use this — click to remove it"
-                    )
+                    row["stack_title"] = _LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP
                 else:
                     row["stack_state"] = "available"
                     row["stack_pill"] = ""
                     row["stack_locked"] = False
                     row["stack_addable"] = True
-                    row["stack_title"] = "Granted to you, but the default agent can't use it until you add it"
+                    row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve marketplace plugins: %s", e)
+        _lost("plugins from your organization", e)
 
     # Installed AGENTS. Skills and plugins are already covered by the store sweep
     # above — whether installed or not — so listing them here again would double
@@ -3084,12 +3217,14 @@ async def library_page(
             # Installing a store item IS its Stack membership, and the caller may
             # undo it — the same install endpoint, removed.
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In stack"
+            items[-1]["stack_pill"] = _AGENT_HAS
+            items[-1]["stack_action"] = _AGENT_ADD
+            items[-1]["stack_undo"] = _AGENT_REMOVE
             items[-1]["stack_removable"] = True
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
-            items[-1]["stack_title"] = "The default agent can use this — click to remove it"
+            items[-1]["stack_title"] = _AGENT_HAS_TOOLTIP
     except Exception as e:
-        logger.warning("/library: could not resolve installed agents: %s", e)
+        _lost("agent templates", e)
 
     # ── Hosted data apps ───────────────────────────────────────────────
     # Same visibility set as the /apps page (data_apps_list_page): the
@@ -3212,27 +3347,32 @@ async def library_page(
                     )
                 )
         except Exception as e:
-            logger.warning("/library: could not list data apps: %s", e)
+            _lost("apps", e)
 
-    # ── Definitions — the semantic layer, as a page FOOTER ────────────────
-    # Deliberately NOT rows in the list above. Metrics and glossary terms are
-    # the one thing here nobody owns, shares, installs, drops or edits: they
-    # are the organization's agreed vocabulary, maintained by an admin and
-    # readable by everyone unconditionally. Modelled as inventory they had to
-    # neuter all four of the table's columns at once — Owner said "Your
-    # workspace" (true of nothing in particular), Sharing said "Workspace" but
-    # refused to change, Stack said "In stack" but locked, Actions was empty —
-    # and four special-cased columns is the table saying the object is not one
-    # of its rows. A data package looks similar but is genuinely different:
-    # access to it VARIES per caller, which is what makes it "what I have".
-    # Everyone has the whole glossary, so there is no having involved.
+    # ── The semantic layer — a SECTION, and its two flat projections ──────
+    # This closed the page as a footer aside for one good reason and one bad
+    # one. The good one still holds: a METRIC or a glossary term is not a row
+    # here — it is the organization's agreed vocabulary, which nobody owns,
+    # shares, installs or drops, so as a row it had to neuter all four of the
+    # table's columns at once (Owner / Sharing / Stack / Actions), and four
+    # special-cased columns is the table saying the object is not one of its
+    # rows.
     #
-    # So it closes the page instead: an adjacent destination under the
-    # inventory, carrying its two counts and a door into each tab. The counts
-    # are computed here (RBAC-filtered on the metric side exactly as
-    # /catalog/semantics filters it, so the page never advertises definitions
-    # the caller cannot open); the glossary is deliberately ungated there
-    # (business vocabulary, not data), so its count is instance-wide.
+    # The bad one was treating the MODEL like the metric. A semantic model
+    # answers every one of those columns honestly — it has a source, it
+    # reaches you through a grant exactly as a Data Package does, your agents
+    # do read it, and it has a detail page — so the thing that could not be a
+    # row was never the document, only its projection. #1707 N3: the models
+    # are rows in a NAMED section at a fixed slot in the order above, and the
+    # two flat projections ride that section's band as links into their tabs
+    # on /semantic-layer (they were `/catalog/semantics#metrics` and
+    # `#glossary`; that page is now a 308 onto the same two tabs).
+    #
+    # The counts are computed here — RBAC-filtered on the metric side by the
+    # same `_first_inaccessible_table` predicate those tabs apply, so the
+    # section never advertises definitions the caller cannot open; the
+    # glossary is deliberately ungated (business vocabulary, not data), so its
+    # count is instance-wide.
     definitions_footer: dict = {}
     try:
         from app.api.metrics import _first_inaccessible_table
@@ -3279,7 +3419,50 @@ async def library_page(
         # hide the one thing this UI exists to browse. Read in its own guard so
         # a semantic_models failure leaves the metric/glossary footer already
         # computed above intact instead of suppressing it.
-        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+        #
+        # ONE `_can_read_model` sweep (the #1850 memo): the same list answers
+        # the browse gate below AND supplies the section's rows. The check
+        # resolves a model's Data Packages per row, so a second sweep would
+        # double this page's semantic-layer cost for an answer it already had.
+        _readable_models = _readable_semantic_model_rows(user, conn, surface="/library")
+        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library", rows=_readable_models)
+
+        # One row per SLUG — the newest readable row, matching what
+        # `/semantic-layer/{slug}` resolves to. Two models can share a slug
+        # (unique only per source/source_ref), and a second row would link to
+        # the same page as the first (Devin #1398).
+        _newest_by_slug: dict = {}
+        for _m in _readable_models:
+            _cur = _newest_by_slug.get(_m.get("slug"))
+            if _cur is None or str(_m.get("updated_at") or "") > str(_cur.get("updated_at") or ""):
+                _newest_by_slug[_m.get("slug")] = _m
+        for _slug, _m in sorted(_newest_by_slug.items(), key=lambda kv: str(kv[0])):
+            from app.web.semantic_layer_view import model_of, object_counts, source_label
+
+            try:
+                _counts = object_counts(model_of(_m))
+            except Exception:  # noqa: BLE001 - a stale document costs the meta line, not the row
+                _counts = {}
+            _meta = " · ".join(
+                f"{_counts[k]} {lbl}{'' if _counts[k] == 1 else 's'}"
+                for k, lbl in (("datasets", "dataset"), ("metrics", "metric"), ("glossary", "glossary term"))
+                if _counts.get(k)
+            )
+            _add_shared_row(
+                item_id=_m["id"],
+                title=_m.get("name") or _slug,
+                description=_m.get("description") or "",
+                href=f"/semantic-layer/{quote(str(_slug))}",
+                glyph="data",
+                type_key="semantic_model",
+                type_label="Semantic model",
+                origin="granted",
+                origin_label="Shared with you",
+                added=None,
+                meta_text=_meta,
+                owner_label=source_label(_m.get("source")),
+                owner_key=str(_m.get("source") or "manual"),
+            )
 
         if _visible_metrics or _glossary_terms or _has_readable_model:
             definitions_footer = {
@@ -3319,6 +3502,16 @@ async def library_page(
             labels[k] = c.get(label_key) or k
         return sorted(((k, labels[k], n) for k, n in counts.items()), key=lambda x: x[1])
 
+    def _present_multi(attr_key: str) -> list:
+        """Tally a list-valued key. The count is top-level ROWS, not files:
+        it must equal what clicking the option leaves on screen, and the
+        engine returns rows."""
+        counts: dict = {}
+        for c in items:
+            for k in c.get(attr_key) or []:
+                counts[k] = counts.get(k, 0) + 1
+        return sorted(((k, k, n) for k, n in counts.items()), key=lambda x: x[1])
+
     library_origins = _present("origin", "origin_label")
     library_requirements = _present("requirement", "requirement_label")
     library_owners = _present("owner_key", "owner_label")
@@ -3336,6 +3529,52 @@ async def library_page(
     # rows with no stack membership at all (files, apps) are neither in nor
     # addable. Zero means the toggle doesn't render: no dead filters.
     library_available_count = sum(1 for c in items if c.get("stack_state") == "available")
+
+    #: Recency, as a facet rather than only a sort. "What arrived this week" is
+    #: the question a growing library gets asked most, and `data-added` could
+    #: only ever answer it by sorting — which shows you the newest row but not
+    #: how many are new. The buckets are CUMULATIVE and stored as a set on the
+    #: row (`7d|30d|90d`), so picking "Last 30 days" matches everything inside
+    #: 30 days rather than a 23-day slice; the engine's `multi` mode does the
+    #: containment test. A row with no date carries nothing and is simply never
+    #: matched, which is honest — we do not know when it arrived.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    _now = _dt.now(_tz.utc)
+    _age_labels = [("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30), ("90d", "Last 90 days", 90)]
+    _age_counts: dict = {}
+    for c in items:
+        iso = c.get("added_iso")
+        buckets = []
+        if iso:
+            try:
+                when = _dt.fromisoformat(iso)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_tz.utc)
+                age = _now - when
+                buckets = [key for key, _lbl, days in _age_labels if age <= _td(days=days)]
+            except ValueError:
+                buckets = []
+        c["age_buckets"] = buckets
+        for b in buckets:
+            _age_counts[b] = _age_counts.get(b, 0) + 1
+    library_ages = [(k, lbl, _age_counts[k]) for k, lbl, _d in _age_labels if _age_counts.get(k)]
+
+    #: How the caller relates to the row, which is a different question from
+    #: Owner (a *who*). Retired with the three-way Scope segment; it was the one
+    #: part of that control worth keeping, because "things I made" and "things
+    #: shared with me" are separate piles in everyone's head.
+    _OWNERSHIP_LABELS = {
+        "mine": "Created by you",
+        "shared_by_me": "Shared by you",
+        "shared_with_me": "Shared with you",
+    }
+    _own_counts: dict = {}
+    for c in items:
+        k = c.get("ownership")
+        if k in _OWNERSHIP_LABELS:
+            _own_counts[k] = _own_counts.get(k, 0) + 1
+    library_ownerships = [(k, lbl, _own_counts[k]) for k, lbl in _OWNERSHIP_LABELS.items() if _own_counts.get(k)]
 
     # Tags are multi-valued per row, so they need their own tally.
     tag_counts: dict = {}
@@ -3364,24 +3603,57 @@ async def library_page(
     # Unlisted types fall to the end, alphabetically.
     _SECTION_ORDER = [
         "data_package",
-        "data_app",
+        # Directly under the governed data, because it is what that data
+        # MEANS: the reader who has just seen "Data packages" is one line away
+        # from the definitions those tables are queried through. A FIXED slot,
+        # never the tail of the page — this was a footer aside below an
+        # unbounded list, i.e. after every row, which is where a reader stops
+        # looking (#1707 N3).
+        "semantic_model",
         "plugin",
         "skill",
         "agent",
         "recipe",
-        # Loose files + collections-as-folders (and hosted data apps).
+        # Loose files + collections-as-folders.
         "files",
+        # Apps read AFTER the caller's own files — the same reading order they
+        # had as a trailing block inside the Artefacts band, now carried by the
+        # section order instead of by row order within one band.
+        "data_app",
         "memory_domain",
     ]
-    #: Kinds that land INSIDE another kind's section instead of getting their
-    #: own. Data apps live among the caller's artifacts in Files — the
-    #: original "Data apps coming soon" badge on that band promised exactly
-    #: this — while their rows keep ``type_key="data_app"`` so the Type facet
-    #: and the row's own label stay honest.
-    _SECTION_OF = {"data_app": "files"}
+    #: Which TAB a section belongs to. The Library answers two questions that
+    #: a single flat list served badly: "what does this organization know"
+    #: (documents, governed data, memory, recipes, and the apps built on that
+    #: data — everything you read, query or open) and "what can my agent do"
+    #: (the three kinds that actually change an agent's behaviour). Anything
+    #: unlisted falls to Knowledge, which is the browse half.
+    _TAB_KNOWLEDGE = "knowledge"
+    _TAB_CAPABILITIES = "capabilities"
+    _SECTION_TAB = {
+        "data_package": _TAB_KNOWLEDGE,
+        "semantic_model": _TAB_KNOWLEDGE,
+        "data_app": _TAB_KNOWLEDGE,
+        "recipe": _TAB_KNOWLEDGE,
+        "files": _TAB_KNOWLEDGE,
+        "memory_domain": _TAB_KNOWLEDGE,
+        "plugin": _TAB_CAPABILITIES,
+        "skill": _TAB_CAPABILITIES,
+        "agent": _TAB_CAPABILITIES,
+    }
+    #: Data apps used to land INSIDE the Files band (``_SECTION_OF``). They
+    #: have their own band now: an app is not an artefact the caller uploaded,
+    #: and the Files hint had to claim it was one. Their rows keep
+    #: ``type_key="data_app"`` either way, so the Type facet and the row label
+    #: are unaffected.
     grouped: dict = {}
     for c in items:
-        grouped.setdefault(_SECTION_OF.get(c["type_key"], c["type_key"]), []).append(c)
+        # The tab rides the ROW, not just the section: the filter engine's
+        # segmented control reads it off `data-tab` (see library.html), which
+        # is what makes tab switching share one code path with search, the
+        # facets and the empty-section hiding instead of growing a second one.
+        c["tab"] = _SECTION_TAB.get(c["type_key"], _TAB_KNOWLEDGE)
+        grouped.setdefault(c["type_key"], []).append(c)
 
     def _section_rank(type_key: str) -> tuple:
         try:
@@ -3403,6 +3675,12 @@ async def library_page(
         "agent": "Agent templates",
         "recipe": "Recipes",
         "data_package": "Data packages",
+        # The name this surface carries everywhere — the /semantic-layer page's
+        # own title, the nav label, this section (#1844). "Definitions" was the
+        # footer aside's name and is retired with it: it named the CONTENTS
+        # (metrics, terms) while the section holds the documents those are
+        # projected from.
+        "semantic_model": "Semantic models",
         "data_app": "Apps",
         "memory_domain": "Memory",
     }
@@ -3413,12 +3691,13 @@ async def library_page(
     #: it to explain itself. Kept to a short clause; a group with no hint simply
     #: renders none.
     _SECTION_HINTS = {
-        "files": "Files you upload, outputs your agent generates, and your hosted data apps.",
+        "files": "Files you upload and the outputs your agent generates.",
         "skill": "Skills built here.",
         "plugin": "Bundles of skills and commands.",
         "agent": "Assistants you installed.",
         "recipe": "Prepared analyses you can run.",
         "data_package": "Governed data you can query.",
+        "semantic_model": "What your data means — your agents answer with these.",
         "data_app": "Hosted apps running next to your data.",
         "memory_domain": "Curated organizational knowledge.",
     }
@@ -3446,6 +3725,11 @@ async def library_page(
         "agent": ("agent", "agent"),
         "recipe": ("recipe", "recipes"),
         "data_package": ("data", "data"),
+        # The `data` accent, deliberately shared with Data packages rather than
+        # given a `--ds-kind-semantic` of its own: a semantic model is a
+        # statement ABOUT the governed data, and the model cards on
+        # /semantic-layer already wear this kind (semantic_layer_list.html).
+        "semantic_model": ("data", "data"),
         "data_app": ("app", "app"),
         "memory_domain": ("memory", "memory"),
     }
@@ -3457,16 +3741,25 @@ async def library_page(
         share it, so the folders come FIRST as their own block — the reader sees
         the containers before the loose contents, and the drop targets are all
         in one place. Everything else keeps the global recency order.
+
+        Data apps had a third block here while they lived inside this band;
+        they have their own section now, so folders-then-loose is the whole
+        rule.
         """
         if key != "files":
             return rows
-        # Three stable blocks: folders (containers first, drop targets in one
-        # place), then loose files, then data apps — the sub-kinds of the
-        # Artefacts umbrella stay grouped instead of interleaving by recency.
         folders = [r for r in rows if r.get("is_folder")]
-        apps = [r for r in rows if r.get("type_key") == "data_app"]
-        loose = [r for r in rows if not r.get("is_folder") and r.get("type_key") != "data_app"]
-        return folders + loose + apps
+        loose = [r for r in rows if not r.get("is_folder")]
+        return folders + loose
+
+    # The semantic layer is the one section that can exist with NO rows: a
+    # caller may have visible metrics and glossary terms yet no readable
+    # DOCUMENT, and the two flat projections are still theirs to open. Given
+    # its own empty band rather than dropped, because dropping it is how the
+    # footer aside's whole failure mode returns — the definitions become
+    # unreachable from the page that is supposed to inventory them.
+    if definitions_footer and "semantic_model" not in grouped:
+        grouped["semantic_model"] = []
 
     library_sections = []
     for key, rows in sorted(grouped.items(), key=lambda kv: _section_rank(kv[0])):
@@ -3474,6 +3767,7 @@ async def library_page(
         library_sections.append(
             {
                 "key": key,
+                "tab": _SECTION_TAB.get(key, _TAB_KNOWLEDGE),
                 "label": _SECTION_LABELS.get(key) or (rows[0]["type_label"] + "s"),
                 "hint": _SECTION_HINTS.get(key, ""),
                 "soon": _SECTION_SOON.get(key, ""),
@@ -3481,11 +3775,42 @@ async def library_page(
                 "rows": _section_rows(key, rows),
                 "kind": kind,
                 "glyph": glyph,
+                # Links carried by the section's own BAND rather than by any
+                # row — the flat metric/glossary projections are a destination,
+                # not inventory (see the note where `definitions_footer` is
+                # built). Only this section supplies them; every other renders
+                # its band exactly as before.
+                "defs": definitions_footer if key == "semantic_model" else None,
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
                 "count": len(rows),
             }
         )
+
+    #: The tab bar itself — one entry per tab, in reading order, each with the
+    #: number of top-level rows behind it (a folder counts once, matching the
+    #: section counts). A tab with nothing in it still renders: the pair is the
+    #: page's structure, and hiding one would make the remaining tab look like
+    #: a stray control. The labels are the two questions the page answers.
+    _TAB_LABELS = [(_TAB_KNOWLEDGE, "Knowledge"), (_TAB_CAPABILITIES, "Capabilities")]
+    _tab_counts: dict[str, int] = {_TAB_KNOWLEDGE: 0, _TAB_CAPABILITIES: 0}
+    for _sec in library_sections:
+        _tab_counts[_sec["tab"]] = _tab_counts.get(_sec["tab"], 0) + _sec["count"]
+    library_tabs = [{"key": k, "label": lbl, "count": _tab_counts.get(k, 0)} for k, lbl in _TAB_LABELS]
+
+    # Which tab opens. `?tab=` is the explicit form; a detail page's back link
+    # arrives as `?section=<type_key>` instead (router._detail_back) and must
+    # land on the tab that HOLDS that section, or the reader follows "back" to
+    # a page where their row is filtered out. Validated against our own keys,
+    # so what reaches the page's JS is never caller text.
+    _requested_tab = request.query_params.get("tab")
+    _requested_section = request.query_params.get("section")
+    if _requested_tab in _tab_counts:
+        library_active_tab = _requested_tab
+    elif _requested_section in _SECTION_TAB:
+        library_active_tab = _SECTION_TAB[_requested_section]
+    else:
+        library_active_tab = _TAB_KNOWLEDGE
 
     from app.instance_config import feature_enabled
 
@@ -3494,6 +3819,8 @@ async def library_page(
         user=user,
         library_items=items,
         library_sections=library_sections,
+        library_tabs=library_tabs,
+        library_active_tab=library_active_tab,
         definitions_footer=definitions_footer,
         library_origins=library_origins,
         library_requirements=library_requirements,
@@ -3502,6 +3829,16 @@ async def library_page(
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
+        #: The kind. Left out for a long time because "the list is already
+        #: GROUPED by type into these very sections" — true of one flat list of
+        #: eight kinds, but a tab now holds several and grouping is not
+        #: filtering: it tells you where a kind is, not how to see only it.
+        #: File formats, from the rows that have one. Rendered on every file row
+        #: already and filterable by nothing until now.
+        library_formats=_present_multi("format_keys"),
+        library_ownerships=library_ownerships,
+        library_load_errors=_load_errors,
+        library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
         # Band to open on arrival — a detail page's back link returns here as
@@ -3544,6 +3881,9 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
+        # TCRD-250: node types with live, caller-scoped counts at the head
+        # of the Knowledge tab. Empty list = render nothing, see helper.
+        library_type_map=_library_type_map(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
@@ -3640,8 +3980,9 @@ def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
     """``{metric_definitions id: object-page URL}`` for every metric of every
     semantic model the caller can read (#1707).
 
-    The two views of one metric — the flat registry on ``/catalog/semantics``
-    and the document object at ``/semantic-layer/{slug}/metric:{name}`` — had
+    The two views of one metric — the flat registry (the model list's "All
+    metrics" tab) and the document object at
+    ``/semantic-layer/{slug}/metric:{name}`` — had
     no link between them. The join is the projector's own id formula
     (``app/web/semantic_layer_view.py::projected_metric_ids`` →
     ``src/semantic/projection.py::projected_metric_id``): a row whose id is a
@@ -3681,14 +4022,14 @@ def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
                 hrefs[metric_id] = f"/semantic-layer/{quote(slug)}/{object_id('metric', quote(metric_name))}"
         return hrefs
     except Exception as e:  # noqa: BLE001 - the links are best-effort
-        logger.warning("/catalog/semantics: metric → document link resolution failed: %s", e)
+        logger.warning("/semantic-layer: metric → document link resolution failed: %s", e)
         return {}
 
 
 def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> Optional[str]:
-    """The ``/catalog/semantics`` URL that lands on this document metric's
-    projected row, or ``None`` when the metric has no row this caller would
-    see there (#1707).
+    """The flat-registry URL that lands on this document metric's projected
+    row — the model list's "All metrics" tab — or ``None`` when the metric
+    has no row this caller would see there (#1707).
 
     The return leg of ``_document_metric_hrefs``, resolved the same way: the
     id the projector would have written for this ``(row, metric)`` either
@@ -3724,132 +4065,52 @@ def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> 
         # The filter term is the REGISTRY row's own `name`, not the document's
         # — identical today (the projector writes one from the other), but the
         # row can be renamed through `POST /api/admin/metrics` under the same
-        # id, and this link has to match what `/catalog/semantics` indexes.
+        # id, and this link has to match what the All-metrics tab indexes.
         # `expected` is sorted so a document declaring the same metric name in
         # two models resolves to the same row on every render.
-        return f"/catalog/semantics?q={quote(str(visible[0].get('name') or metric_name))}#metrics"
+        #
+        # The CANONICAL target since the fold (#1707 N5): the flat registry is
+        # the model list's "All metrics" tab, and the term rides `q` in the
+        # query string rather than a `#metrics` fragment — a fragment never
+        # reaches the server, so it could never have chosen the tab. The old
+        # `/catalog/semantics?q=…#metrics` shape still lands, through the 308
+        # on that route; this emitter names where the page now IS.
+        return f"/semantic-layer?tab=all_metrics&q={quote(str(visible[0].get('name') or metric_name))}"
     except Exception as e:  # noqa: BLE001 - the link is best-effort
         logger.warning("/semantic-layer: registry back-link resolution failed: %s", e)
         return None
 
 
 @router.get("/catalog/semantics", response_class=HTMLResponse)
-async def catalog_semantics(
-    request: Request,
-    user: dict = Depends(get_current_user),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
-    """Read-only browser for the semantic layer — business metrics
-    (`metric_definitions`) and the glossary (`glossary_terms`) in one page
-    (issue #853 + the Keboola glossary import, #920).
+async def catalog_semantics(request: Request, user: dict = Depends(get_current_user)):
+    """Retired page — a 308 onto the model list's "All metrics" tab (#1707 N5).
 
-    Analyst-facing tier: ``get_current_user``, no admin gate and no
-    per-resource grant — matches the RBAC tier of the underlying
-    ``GET /api/metrics`` / ``GET /api/glossary*`` endpoints this page reuses,
-    and mirrors /catalog's own gate.
+    Agnes shipped two pages over one semantic layer: this flat
+    ``metric_definitions`` / ``glossary_terms`` projection, and
+    ``/semantic-layer``'s stored documents. The split was never a distinction
+    a reader could make BEFORE arriving — "metrics" lived here, "the model
+    those metrics came from" lived there, and each page's way to the other
+    was one line of prose. The projection is now two tabs of the model list
+    (``?tab=all_metrics`` / ``?tab=all_glossary``), rendered from the same two
+    tables this page read.
 
-    Metrics are RBAC-filtered the same way ``GET /api/metrics`` is (#953):
-    a metric whose ``table_name``/``tables`` reference a table outside the
-    caller's Data Package stack is omitted before grouping, so a category
-    left with zero visible metrics never renders its header either. Glossary
-    is intentionally NOT gated this way (business vocabulary, not data).
+    A 308 rather than a deletion, and a 308 rather than a 302: the method and
+    body must not be rewritten, and every bookmark, chat citation, skill
+    reference and #1850 back link keeps landing. The redirect PRESERVES the
+    query string, which is what makes the old deep links survive — they carry
+    the filter term as ``?q=<name>`` and the tab as a ``#metrics`` fragment,
+    and a fragment never reaches the server. So the tab is supplied here (the
+    metrics one, which is where every `q`-carrying link meant to go) and the
+    caller's own ``tab`` wins when they named one. The stale fragment rides
+    along untouched — the browser re-appends it — and the destination page
+    reads it only to correct ``#glossary`` onto the glossary tab.
 
-    Metrics are server-rendered (grouped by category, same reading order as
-    ``agnes catalog --metrics``) — the scale is tens-to-low-hundreds so a
-    client-side substring filter over the rendered rows is enough; no new
-    search endpoint. Glossary starts empty and is populated client-side via
-    the existing ``GET /api/glossary`` / ``GET /api/glossary/search``.
+    Still behind ``get_current_user``: the destination is authenticated, and
+    an anonymous 308 into it would only move the login bounce one hop later.
     """
-    from app.api.metrics import _first_inaccessible_table, stores_html
-    from app.markdown_render import render_plain, render_safe
-    from src.rbac import get_accessible_tables
-
-    accessible_ids = get_accessible_tables(user, conn)
-    allowed = None if accessible_ids is None else set(accessible_ids)
-    metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
-
-    def _variants(raw) -> dict:
-        """``sql_variants`` as a mapping the template can iterate.
-
-        The repository serializes this column on write but does not
-        deserialize on read, so it arrives as a JSON *string* — on which
-        ``.items()`` silently yields nothing in Jinja, which is how the
-        variants stayed invisible. Parsed here rather than in the repo:
-        changing the read shape there would ripple through both backends and
-        their contract tests. Anything that is not an object is dropped,
-        since the template renders one labelled block per key.
-        """
-        if isinstance(raw, str):
-            try:
-                raw = _json.loads(raw)
-            except ValueError:
-                return {}
-        return raw if isinstance(raw, dict) else {}
-
-    # Two projections of the description: sanitized HTML for the expanded
-    # detail, plain text for the one-line row preview and the client-side
-    # filter index. Metric descriptions carry the business definition; the
-    # detail must show it, not just the SQL.
-    #
-    # This column holds two dialects, and ``stores_html`` decides per row which
-    # renderer applies (keyed on the writer recorded in ``source``, never on
-    # what the text looks like — see its docstring). Rendered as pure markdown,
-    # an HTML-dialect description escaped into entities and then unescaped back
-    # into visible `<p><strong>` characters in both projections.
-    #
-    # `model_href` is the per-row door into the document browser: set only for
-    # a row projected from a document object this caller can read, absent for
-    # a hand-authored or yaml_import metric that has no such object.
-    #
-    # ONE `_can_read_model` sweep per request, shared with the page header's
-    # browse-link gate below — the check costs a Data Package resolution per
-    # model, so running it once for the links and again for the gate doubled
-    # the page's semantic-layer cost for an answer it already had.
-    readable_models = _readable_semantic_model_rows(user, conn, surface="/catalog/semantics")
-    document_hrefs = _document_metric_hrefs(readable_models)
-    metrics = [
-        {
-            **m,
-            "description_html": render_safe(m.get("description"), html_source=stores_html(m)),
-            "description_text": render_plain(m.get("description"), html_source=stores_html(m)),
-            "sql_variants": _variants(m.get("sql_variants")),
-            "model_href": document_hrefs.get(m.get("id")),
-        }
-        for m in metrics
-    ]
-    by_category: dict[str, list[dict]] = {}
-    for m in metrics:
-        by_category.setdefault(m.get("category") or "uncategorized", []).append(m)
-    metric_categories = [
-        {"name": cat, "metrics": sorted(items, key=lambda m: m.get("name") or "")}
-        for cat, items in sorted(by_category.items())
-    ]
-
-    # Total glossary count for the tab label. GlossaryRepository.list() has
-    # no unlimited mode (deliberately, to bound a full-table scan) — 500 is
-    # the endpoint's own max `limit` (app/api/glossary.py), comfortably above
-    # the "tens-to-low-hundreds" scale this feature targets, so it's an
-    # exact count in practice rather than a true cap.
-    glossary_count = len(glossary_repo().list(limit=500))
-
-    ctx = _build_context(
-        request,
-        user=user,
-        metric_categories=metric_categories,
-        metric_count=len(metrics),
-        glossary_count=glossary_count,
-        # The door to Semantic models (/semantic-layer). Both pages were once
-        # titled "Semantic layer" (this one is now "Metrics & glossary", see
-        # tests/test_semantic_page_names_contract.py) and this is the more
-        # reachable one, so without the link a document with
-        # datasets and relationships but no metrics rendered as "there is no
-        # semantic layer here". Same gate /library's Definitions footer uses —
-        # a readable document, never this page's own metric/glossary counts.
-        has_semantic_models=_has_readable_semantic_model(
-            user, conn, surface="/catalog/semantics", rows=readable_models
-        ),
-    )
-    return templates.TemplateResponse(request, "catalog_semantics.html", ctx)
+    params: list[tuple[str, str]] = [("tab", request.query_params.get("tab") or "all_metrics")]
+    params += [(k, v) for k, v in request.query_params.multi_items() if k != "tab"]
+    return RedirectResponse(url="/semantic-layer?" + urlencode(params), status_code=308)
 
 
 # ---------------------------------------------------------------------------
@@ -3904,22 +4165,69 @@ def _readable_model_by_slug(slug: str, user: dict, conn) -> Optional[dict]:
     return candidates[0]
 
 
+#: The model-list level's tabs (#1707 N5). ``models`` is the card view this
+#: page has always been; ``all_metrics`` and ``all_glossary`` are the flat
+#: ``metric_definitions`` / ``glossary_terms`` projections folded in from the
+#: retired ``/catalog/semantics``.
+#:
+#: "All", not "Metrics"/"Glossary": ONE model's tabs already carry those two
+#: names a level down (``_SEMANTIC_LAYER_TABS``), and these are a different
+#: collection — every row in the instance, including the many written by hand,
+#: by ``yaml_import`` or by a connector with no Ossie document behind them.
+#: Those rows appear on no model card, which is why folding the page in could
+#: not be deleting it.
+_SEMANTIC_LAYER_LIST_TABS = ("models", "all_metrics", "all_glossary")
+
+_SEMANTIC_LAYER_LIST_TAB_LABELS = {
+    "models": "Models",
+    "all_metrics": "All metrics",
+    "all_glossary": "All glossary",
+}
+
+
+def _glossary_terms_count() -> int:
+    """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
+    unbounded mode (it bounds a full-table scan) — comfortably above the
+    tens-to-low-hundreds scale this feature targets, so an exact count in
+    practice rather than a true cap."""
+    return len(glossary_repo().list(limit=500))
+
+
 @router.get("/semantic-layer", response_class=HTMLResponse)
 async def semantic_layer_list(
     request: Request,
+    tab: str = Query("models"),
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Level 1 — every semantic model the caller can read, with its object
-    counts, SQL dialect(s) and validation status.
+    """Level 1 — the semantic layer's front door, in three tabs.
 
-    A ``status='invalid'`` row still lists (an invalid import must be
-    visible, not silent) and renders its stored ``validation_errors``
-    instead of object counts, since an invalid document's ``document_json``
-    may be stale or absent.
+    **Models** (default) — every semantic model the caller can read, with its
+    object counts, SQL dialect(s) and validation status. A ``status='invalid'``
+    row still lists (an invalid import must be visible, not silent) and renders
+    its stored ``validation_errors`` instead of object counts, since an invalid
+    document's ``document_json`` may be stale or absent.
+
+    **All metrics** / **All glossary** — the flat ``metric_definitions`` and
+    ``glossary_terms`` projections, folded in from ``/catalog/semantics``
+    (#1707 N5, which is now a 308 onto this page). They are the SAME two
+    tables that page read, filtered by the SAME row predicate, and they hold
+    rows no model card can show.
+
+    ``q`` is the deep link's filter term, carried in the query string because
+    the fragment the old links used (``#metrics``) never reaches the server.
+    It is applied client-side over the rendered rows, exactly as it was on the
+    flat page — the scale is tens-to-low-hundreds and there is no search
+    endpoint to add.
+
+    ONE ``_can_read_model`` sweep serves all three tabs (the #1850 memo): the
+    model cards, the per-metric "Open in the model" links and the browse gate
+    are three answers off one list. The check resolves a model's Data Packages
+    per row, so a second sweep doubles the page's cost for an answer it has.
     """
-    from app.api.semantic_models import _can_read_model
     from app.web.semantic_layer_view import is_imported, model_dialects, model_of, object_counts, source_label
+
+    active_tab = tab if tab in _SEMANTIC_LAYER_LIST_TABS else "models"
 
     # One card per slug — the newest readable row, matching what the
     # drill-down (`_readable_model_by_slug`) resolves to. Two models can share
@@ -3929,10 +4237,9 @@ async def semantic_layer_list(
     # reachability — the older row is unreachable from this UI either way — and
     # removes the misleading card. Full disambiguation (both reachable) needs a
     # unique-per-row URL, the follow-up noted on `_readable_model_by_slug`.
+    readable_rows = _readable_semantic_model_rows(user, conn, surface="/semantic-layer")
     newest_by_slug: dict[str, dict] = {}
-    for row in semantic_model_repo().list_all():
-        if not _can_read_model(user, row, conn):
-            continue
+    for row in readable_rows:
         current = newest_by_slug.get(row["slug"])
         if current is None or str(row.get("updated_at") or "") > str(current.get("updated_at") or ""):
             newest_by_slug[row["slug"]] = row
@@ -3962,7 +4269,112 @@ async def semantic_layer_list(
             }
         )
 
-    ctx = _build_context(request, user=user, models=models)
+    # Both flat counts are resolved on EVERY tab, because they are the tab
+    # strip's own labels: a tab that only knows its size once you are standing
+    # on it cannot tell you whether it is worth opening. Two bounded reads, the
+    # same pair the Library's own semantic section pays for.
+    #
+    # ``_first_inaccessible_table`` (#953) is the SAME predicate the retired
+    # ``/catalog/semantics`` applied and the same one ``GET /api/metrics``
+    # applies — reused, never re-derived: a metric bound to a table outside
+    # the caller's Data Package stack is dropped before anything is grouped
+    # or counted, so a category left with zero visible metrics never renders
+    # a header either. The glossary is deliberately NOT gated this way
+    # (business vocabulary, not data), so its count is instance-wide.
+    from app.api.metrics import _first_inaccessible_table
+    from src.rbac import get_accessible_tables
+
+    accessible_ids = get_accessible_tables(user, conn)
+    allowed = None if accessible_ids is None else set(accessible_ids)
+    visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
+    glossary_count = _glossary_terms_count()
+
+    # The per-row rendering (markdown, SQL variants, document links) is paid
+    # for only by the tab that shows the rows.
+    metric_categories: list[dict] = []
+    if active_tab == "all_metrics":
+        from app.api.metrics import stores_html
+        from app.markdown_render import render_plain, render_safe
+
+        def _variants(raw) -> dict:
+            """``sql_variants`` as a mapping the template can iterate.
+
+            The repository serializes this column on write but does not
+            deserialize on read, so it arrives as a JSON *string* — on which
+            ``.items()`` silently yields nothing in Jinja, which is how the
+            variants stayed invisible. Parsed here rather than in the repo:
+            changing the read shape there would ripple through both backends
+            and their contract tests. Anything that is not an object is
+            dropped, since the template renders one labelled block per key.
+            """
+            if isinstance(raw, str):
+                try:
+                    raw = _json.loads(raw)
+                except ValueError:
+                    return {}
+            return raw if isinstance(raw, dict) else {}
+
+        # Two projections of the description: sanitized HTML for the expanded
+        # detail, plain text for the one-line row preview and the client-side
+        # filter index. Metric descriptions carry the business definition; the
+        # detail must show it, not just the SQL.
+        #
+        # This column holds two dialects, and ``stores_html`` decides per row
+        # which renderer applies (keyed on the writer recorded in ``source``,
+        # never on what the text looks like — see its docstring). Rendered as
+        # pure markdown, an HTML-dialect description escaped into entities and
+        # then unescaped back into visible `<p><strong>` characters in both
+        # projections.
+        #
+        # `model_href` is the per-row door into the document browser: set only
+        # for a row projected from a document object this caller can read,
+        # absent for a hand-authored or yaml_import metric that has no such
+        # object.
+        document_hrefs = _document_metric_hrefs(readable_rows)
+        rendered = [
+            {
+                **m,
+                "description_html": render_safe(m.get("description"), html_source=stores_html(m)),
+                "description_text": render_plain(m.get("description"), html_source=stores_html(m)),
+                "sql_variants": _variants(m.get("sql_variants")),
+                "model_href": document_hrefs.get(m.get("id")),
+            }
+            for m in visible_metrics
+        ]
+        by_category: dict[str, list[dict]] = {}
+        for m in rendered:
+            by_category.setdefault(m.get("category") or "uncategorized", []).append(m)
+        metric_categories = [
+            {"name": cat, "metrics": sorted(items, key=lambda m: m.get("name") or "")}
+            for cat, items in sorted(by_category.items())
+        ]
+
+    tab_counts = {
+        "models": len(models),
+        "all_metrics": len(visible_metrics),
+        "all_glossary": glossary_count,
+    }
+    tabs = [
+        {
+            "label": f"{_SEMANTIC_LAYER_LIST_TAB_LABELS[key]} ({tab_counts[key]})",
+            # The default tab keeps the BARE URL — one canonical address for
+            # the page, so a link to it and a click on its own tab agree.
+            "href": "/semantic-layer" if key == "models" else f"/semantic-layer?tab={key}",
+            "active": key == active_tab,
+        }
+        for key in _SEMANTIC_LAYER_LIST_TABS
+    ]
+
+    ctx = _build_context(
+        request,
+        user=user,
+        models=models,
+        active_tab=active_tab,
+        tabs=tabs,
+        metric_categories=metric_categories,
+        metric_count=len(visible_metrics),
+        glossary_count=glossary_count,
+    )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
 
 
@@ -4195,7 +4607,7 @@ async def semantic_layer_object(
     )
 
     # The way back to the flat registry (#1707): this page renders the
-    # document object, `/catalog/semantics` renders the projected row (the
+    # document object, the All-metrics tab renders the projected row (the
     # composed SQL, synonyms, source badge). Offered only when the metric
     # actually projected — the projector skips a metric with no usable
     # expression or an unresolvable binding, and a link to a registry that
@@ -4727,6 +5139,25 @@ async def catalog_recipe_detail(
         related_tables=related_tables,
     )
     return templates.TemplateResponse(request, "catalog_recipe_detail.html", ctx)
+
+
+# What a file's extraction state is CALLED on a Library row. `indexed` is
+# deliberately absent: a healthy file is the overwhelming majority, and a row
+# that says "indexed" on every line spends the slot on the one value that
+# carries no information. Absence means fine; a label means look.
+_INGEST_LABELS = {
+    "pending": "Not indexed yet",
+    "processing": "Indexing",
+    "needs_review": "Needs review",
+    "rejected": "Not indexed",
+}
+
+
+def _ingest_label(f: dict | None) -> str:
+    """The row-level note for a file whose text your agents cannot search yet."""
+    if not f:
+        return ""
+    return _INGEST_LABELS.get(f.get("processing_status") or "", "")
 
 
 def _human_size(n: int) -> str:

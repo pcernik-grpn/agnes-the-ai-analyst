@@ -1,6 +1,8 @@
 """Web UI routes for Collections — /library and /library/{slug}."""
 
 from __future__ import annotations
+
+from pathlib import Path
 import pytest
 
 import io
@@ -89,17 +91,21 @@ def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
         glossary_repo().create(id=f"g{i}", term=f"Term {i}", definition="What it means here.")
 
 
-def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
-    """The semantic layer closes the page; it is NOT part of the inventory.
+def test_library_shows_definitions_on_the_semantic_models_band(seeded_app):
+    """The metric and glossary registries are a DESTINATION, not inventory.
 
-    It shipped briefly as a "Definitions" band holding two rows, and that was
-    wrong: metrics and glossary terms are the one thing here nobody owns,
-    shares, installs, drops or edits, so as rows they had to blank all four of
-    the table's columns at once (Owner / Sharing / Stack / Actions). Four
-    special-cased columns is the list saying the object is not one of its rows.
-    A data package looks similar but differs where it counts — access to it
-    varies per caller, which is what makes it "what I have"; everyone has the
-    whole glossary.
+    Two things were conflated here and the split is the whole point. A metric
+    or a glossary term is the one thing on this page nobody owns, shares,
+    installs, drops or edits, so as a row it would blank all four of the
+    table's columns at once (Owner / Sharing / Access / Actions) — and four
+    special-cased columns is the list saying the object is not one of its
+    rows. It therefore stays a pair of LINKS.
+
+    Where those links live did change (#1707 N3): they used to close the page
+    as a footer aside below an unbounded list, i.e. after every row. They now
+    ride the band of the Library's own "Semantic models" section, which holds
+    the stored documents those registries are projected from — documents that
+    answer all four columns honestly and ARE rows.
     """
     _seed_definitions(metrics=2, terms=3)
     c = seeded_app["client"]
@@ -108,9 +114,11 @@ def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
     assert 'id="lib-defs"' in r.text
     assert "2 metrics" in r.text
     assert "3 glossary terms" in r.text
-    assert 'href="/catalog/semantics#metrics"' in r.text
-    assert 'href="/catalog/semantics#glossary"' in r.text
-    # Not inventory: no band, no row, no kind.
+    # Into the folded tabs (#1707 N5), never the retired flat page.
+    assert 'href="/semantic-layer?tab=all_metrics"' in r.text
+    assert 'href="/semantic-layer?tab=all_glossary"' in r.text
+    assert "/catalog/semantics" not in r.text
+    # Still not inventory: the definitions themselves are no row and no kind.
     assert 'data-lib-sec="definitions"' not in r.text
     assert 'data-kind="definitions"' not in r.text
     # And not the retired header link either.
@@ -370,9 +378,17 @@ def _row_for(body: str, title: str) -> str:
 
 #: The locked-membership tooltips, verbatim. A test that paraphrases them would
 #: let the shipped copy drift from the spec, so the exact sentences are asserted.
-#: Both tiers are locked; only the wording differs.
-LOCKED_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-GRANTED_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
+#: Both tiers are locked, and the ROW now says so identically — one pill,
+#: "Agents can query this" — because the caller can do exactly the same thing
+#: with either tier: query it, and not remove it. The old pair of pills promised
+#: two different things about removal ("cannot be removed" vs "only an admin can
+#: remove it") for one state, which is what made a single state read as two. The
+#: tier survives here, in the tooltip, where it explains WHY rather than
+#: pretending to be a different capability.
+LOCKED_TOOLTIP = "Required by your admin — your agents get this automatically, and you cannot remove it."
+GRANTED_TOOLTIP = (
+    "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
+)
 
 
 def test_library_required_grant_is_locked_in_stack(seeded_app):
@@ -388,7 +404,12 @@ def test_library_required_grant_is_locked_in_stack(seeded_app):
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Mandated Package")
-    assert "In stack" in row
+    # The pill states the OUTCOME, not the tier and not the mechanism. A granted
+    # package is queryable the moment it is granted (auto-membership), so "In
+    # stack" described a membership the caller could neither create nor drop —
+    # and naming the tier instead just moved the problem, since the two tiers
+    # are one capability. What the reader needs is what their agents can do.
+    assert "Agents can query this" in row
     assert "lib-instack--locked" in row  # locked → lock glyph + info tint
     assert LOCKED_TOOLTIP in row
     # Not a button, and not addable — nothing to click either way.
@@ -421,7 +442,8 @@ def test_library_available_grant_reads_in_stack_and_offers_no_toggle(seeded_app,
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Offered Package")
-    assert "In stack" in row
+    # Same pill as the required tier — deliberately. See LOCKED_TOOLTIP above.
+    assert "Agents can query this" in row
     assert "lib-instack--fixed" in row
     assert "lib-instack--locked" in row  # not the removable pill's rest state
     assert "data-add-to-stack" not in row
@@ -480,7 +502,15 @@ def test_library_available_grant_classic_is_not_claimed_in_stack(seeded_app, mon
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Classic Offered Package")
     assert 'data-stack="in_stack"' in row
-    assert "In stack" in row
+    # Classic (opt-in) mode: the caller subscribed, and under classic that is
+    # what makes the package queryable — membership drives
+    # get_accessible_tables — so the row states the OUTCOME in the same
+    # vocabulary every other row uses, and offers the undo. It used to read
+    # "Local copy", which described the side effect (`agnes pull` keeps a copy)
+    # rather than the thing the caller changed, in a word the page no longer
+    # speaks anywhere else.
+    assert "Agents can query this" in row
+    assert 'data-remove-from-stack="' in row
 
 
 def test_library_lists_granted_curated_plugins(seeded_app):
@@ -850,3 +880,39 @@ def test_data_app_detail_shows_no_error_row_when_healthy(seeded_app, monkeypatch
     r = seeded_app["client"].get("/apps/detail/okapp", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
     assert 'id="dda-state-detail"' not in r.text
+
+
+# ---------------------------------------------------------------------------
+# Type map at the head of the Knowledge tab (TCRD-250). The macro and its CSS
+# ship in the facts branch; this is the wiring — the page must render it when
+# the graph has something, stay exactly as it was when it doesn't, and never
+# 500 because a decoration is unavailable.
+# ---------------------------------------------------------------------------
+
+
+def test_library_renders_without_a_type_map_when_the_graph_is_empty(seeded_app):
+    """The facts feature is off by default, so this is the ordinary case: the
+    Library must look exactly as it did before this wiring existed."""
+    r = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200, r.text
+    assert 'id="lib-typemap"' not in r.text
+
+
+def test_the_type_map_block_starts_hidden_and_follows_the_active_tab():
+    """Two failure modes this guards, both invisible in a screenshot: the map
+    flashing on Capabilities before the first apply(), and it never hiding at
+    all because nothing drives it. `data-lib-tabpane` was a guess that did not
+    exist — the real mechanism is the page's own onApply chain."""
+    src = (Path("app/web/templates/library.html")).read_text(encoding="utf-8")
+    assert '<div id="lib-typemap" hidden>' in src, "must start hidden — no flash on the wrong tab"
+    assert "function syncTypeMap()" in src
+    assert "syncTypeMap();" in src, "must be joined to the onApply chain, or nothing drives it"
+    assert "data-lib-tabpane" not in src, "that attribute was never a real hook"
+
+
+def test_the_type_map_helper_fails_soft_on_every_axis():
+    """Facts off, DuckDB backend, or an empty graph all return [] — the
+    Library must not 500 because a decoration is unavailable."""
+    from app.web.router import _library_type_map
+
+    assert _library_type_map({"id": "nobody", "email": "nobody@test.com"}) == []

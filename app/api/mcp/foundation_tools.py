@@ -533,7 +533,7 @@ def register_foundation_tools(
         public). Results are typed ``chunk | knowledge | table | metric | glossary``;
         a ``table`` hit means structured data: pivot to SQL via the ``query``
         tool with the hit's ``table_id`` instead of reading text chunks.
-        A ``metric`` hit links to /catalog/semantics#metrics; a ``glossary``
+        A ``metric`` hit links to /semantic-layer?tab=all_metrics; a ``glossary``
         hit carries the term definition inline.
         The response's ``retrieval`` field labels the chunk engine's mode:
         ``hybrid`` (lexical + semantic) or ``lexical_only`` — the degraded

@@ -405,9 +405,13 @@ class TestRailOptIn:
         # only when flipping it would change the list.
         assert "control: '#lib-stack-toggle'" in text
         assert 'data-facet="availability"' in text, "the demoted acquisition filter must exist"
-        # The segment is gone, not merely hidden — a filter is not a tab.
+        # The SCOPE segment is gone, not merely hidden — a filter is not a tab.
+        # A segmented control as such is fine again, and there is one: the
+        # Knowledge / Capabilities tabs. That is the distinction this test was
+        # always drawing — those ARE tabs, and they change which half of the
+        # Library you are in rather than narrowing the list you are looking at.
         assert 'id="lib-scope"' not in text
-        assert "segments: {" not in text
+        assert "container: '#lib-scope'" not in text
 
     def test_rail_has_no_studio_or_marketplace_entry(self, web_client, admin_cookie, monkeypatch):
         """Studio is retired from the rail and Marketplace is no longer a rail
@@ -492,8 +496,11 @@ class TestRailOptIn:
         # Every "add something" path sits behind ONE chevron button.
         assert 'id="lib-new-btn"' in text
         assert 'id="lib-new-menu"' in text
+        # Matched on the closing bracket, not the closing tag: every item now
+        # carries a `<small>` description, so the label is no longer the whole
+        # span. Same trick the agent-template check below uses.
         for label in ("Build a skill", "Build a plugin", "Upload a file"):
-            assert f"<span>{label}</span>" in text
+            assert f">{label}<" in text
         # The page-head `.pnote` caveats are retired, and so are the two tinted
         # panels that replaced them. What is left above the inventory is ONE thin
         # row (the caveat about the list), and Data apps states its schedule as a
