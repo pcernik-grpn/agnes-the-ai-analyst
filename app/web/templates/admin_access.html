@@ -973,6 +973,20 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     max-width: min(52ch, 100%); font-weight: 400;
   }
+  /* Reaches this group via Everyone. Present, because the page's question is
+     what the group can use — but visibly not one of its own grants, because
+     it cannot be revoked from here. */
+  /* Keyed off the attribute, not a class in the class list: the row element
+     itself must stay byte-identical between the group and bundle views —
+     TestRowsAndTheirHandlerAgree counts the literal, and that guard is what
+     keeps the two lenses from drifting into separate implementations. */
+  .ax-r[data-inherited] { background: color-mix(in srgb, var(--ds-text-primary) 3%, transparent); }
+  .ax-inherit {
+    font-size: 12px; color: var(--ds-text-muted); text-decoration: none;
+    white-space: nowrap;
+  }
+  .ax-inherit:hover { color: var(--ds-primary); text-decoration: underline; }
+
   .ax-add {
     display: flex; align-items: baseline; gap: 8px; width: 100%;
     margin-top: 14px; padding: 10px 2px; text-align: left;
@@ -2716,10 +2730,47 @@
      The server's `grant_count` is `COUNT(*) WHERE group_id = ?` over the
      same table `grants` is listed from, so this is the identical number —
      just one source instead of two. */
-  const grantCountOf = (groupId) => grantsFor(groupId).length;
+  // DIRECT only, deliberately. This feeds the group row's count and the
+  // delete-group confirmation ("N people lose the M things granted through
+  // this group") — deleting a group does not revoke Everyone's grants, so
+  // counting inherited ones here would overstate the blast radius of a
+  // destructive action. It also keeps matching the server's
+  // `COUNT(*) WHERE group_id = ?`, as the comment above says.
+  const grantCountOf = (groupId) => grantsFor(groupId, { directOnly: true }).length;
 
-  function grantsFor(groupId) {
-    return (overview.grants || []).filter((g) => g.group_id === groupId);
+  //: The `Everyone` group's id, or null if this instance has none. Everyone
+  //  is auto-membership: every active account is in it, so a grant written
+  //  against it reaches the members of every other group too.
+  function everyoneGroupId() {
+    const g = (overview.groups || []).find((x) => x.is_everyone);
+    return g ? g.id : null;
+  }
+
+  /* Grants a group's members can actually use — DIRECT grants plus the ones
+     inherited from Everyone.
+
+     This filtered on `group_id === groupId` alone, which answers "what was
+     written against this group" and not "what can this group see". Since
+     every account is in Everyone, a company-wide grant reaches Finance's
+     members too — and filtering to Finance hid it, so the page's own
+     question ("what each one can use") had an incomplete answer, and an
+     admin checking whether Finance could reach something had to remember to
+     go and look at Everyone as well.
+
+     Inherited rows are TAGGED, never silently merged: they are not this
+     group's to revoke, and the controls key off `inherited` to say so. */
+  function grantsFor(groupId, opts) {
+    const direct = (overview.grants || []).filter((g) => g.group_id === groupId);
+    if (opts && opts.directOnly) return direct;
+    const evId = everyoneGroupId();
+    if (!evId || groupId === evId) return direct;
+    const held = new Set(direct.map((g) => `${g.resource_type}:${g.resource_id}`));
+    const inherited = (overview.grants || [])
+      // A direct grant WINS: it may carry a different tier, and it is the one
+      // this group's row can actually edit.
+      .filter((g) => g.group_id === evId && !held.has(`${g.resource_type}:${g.resource_id}`))
+      .map((g) => Object.assign({}, g, { inherited: true, inherited_from: "Everyone" }));
+    return direct.concat(inherited);
   }
   function grantOf(groupId, type, resourceId) {
     return grantsFor(groupId).find((g) => g.resource_type === type && g.resource_id === resourceId);
@@ -3295,11 +3346,16 @@
     // much of everything grantable this group actually holds. The same two
     // numbers label the scope segments, so the control says what picking it
     // would show before you pick it.
-    const held = grantsFor(selectedGroup).length;
+    const direct = grantsFor(selectedGroup, { directOnly: true }).length;
+    const viaEveryone = grantsFor(selectedGroup).length - direct;
     // "7 of 25" counted the instance's whole grantable surface — a
     // denominator this list stopped showing when it became the holding.
-    // What it holds is the number.
-    setAccessHead(`${held} granted`);
+    // What it holds is the number. The inherited count rides alongside
+    // rather than being folded in: "10 granted" for a group with 7 of its
+    // own would be a different claim than the one the rows support.
+    setAccessHead(viaEveryone
+      ? `${direct} granted · ${viaEveryone} via Everyone`
+      : `${direct} granted`);
 
     const types = (overview.resources || []).slice().sort((a, b) => {
       const al = a.type_key === LEAD_TYPE ? 0 : 1;
@@ -3354,11 +3410,18 @@
       const name = esc(itemName(i));
       const nameHtml = hrefFn ? `<a href="${hrefFn(i.resource_id)}">${name}</a>` : name;
       const who = whoGranted(grant);
-      const control = controlCell(t.type_key, tier, {
-        href: owned && hrefFn ? hrefFn(i.resource_id) : "",
-      });
+      // An inherited row is NOT this group's to change: the tier control and
+      // Revoke both act on the Everyone grant, so offering them here would
+      // let an admin quietly alter a company-wide grant while looking at one
+      // group. Say where it comes from and send them there instead.
+      const control = grant.inherited
+        ? `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
+              title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`
+        : controlCell(t.type_key, tier, {
+            href: owned && hrefFn ? hrefFn(i.resource_id) : "",
+          });
       return `
-      <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
+      <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
         ${kindTag(t)}
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
           <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
@@ -4594,9 +4657,22 @@
     const section = (r) => {
       const reach = reachOf(r.held.map((g) => g.group_id));
       const nobody = !r.held.length;
+      // NAME the groups, don't just count them. "1 group · 1 person" made the
+      // reader expand every row to learn the one thing the lens exists to
+      // answer — who can see this — and "1 group" reads identically whether
+      // that group is Everyone (the whole company) or a two-person team. Up
+      // to three are named inline; beyond that the count is the readable
+      // summary and the rows below carry the detail.
+      const heldNames = r.held
+        .map((g) => (overview.groups || []).find((x) => x.id === g.group_id))
+        .filter(Boolean)
+        .map((g) => g.name);
+      const who = heldNames.length && heldNames.length <= 3
+        ? heldNames.join(", ")
+        : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"}`;
       const meta = nobody
         ? "granted to nobody"
-        : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`;
+        : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
       <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}" data-bb="${esc(bkey)}"${
