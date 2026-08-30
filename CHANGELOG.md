@@ -12,6 +12,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **The extraction worker lane's concurrency is now configurable (Stage 1 of Agnes-owned extraction parallelism).** `extraction.concurrency` (`instance.yaml`, default 1) / `AGNES_EXTRACTION_CONCURRENCY` lets several `corpus-extraction` jobs for DIFFERENT connections run at once instead of the previous hardcoded one-at-a-time lane; per-connection idempotency at enqueue time still prevents two jobs for the SAME connection from ever coexisting. Resolved once at worker start (a config change needs a worker restart), clamped to `[1, 8]`, invalid values fall back to 1 with a logged warning rather than crashing the worker. Heavy/light lanes are unaffected.
+
 ### Changed
 
 ### Fixed
