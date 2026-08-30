@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import threading
 from typing import Any
 
 from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
@@ -27,7 +28,7 @@ def hash_args(args: Any) -> str:
 # may produce, and every surface a caller can stamp explicitly (F0 —
 # audit-full-coverage plan, Task 1). Kept as the single source of truth so a
 # new surface doesn't invent its own ad-hoc string.
-CLIENT_KINDS = ("web", "cli", "mcp", "slack", "telegram", "agent", "broker", "scheduler")
+CLIENT_KINDS = ("web", "cli", "mcp", "slack", "telegram", "agent", "broker", "scheduler", "system")
 
 
 def log_safe(**kwargs) -> None:
@@ -151,3 +152,65 @@ def identity_for_audit(user) -> tuple:
     if not isinstance(user, dict):
         return getattr(user, "owner_user_id", None), getattr(user, "owner_email", None)
     return user.get("id"), user.get("email")
+
+
+# ---------------------------------------------------------------------------
+# should_sample — per-action sampling gate (Wave 2 — Task 4, audit-coverage
+# plan). An operator's only lever against a noisy action besides retention.
+# ---------------------------------------------------------------------------
+
+#: Per-action call counters backing the deterministic sampler below. Module
+#: state on purpose (mirrors a real process's lifetime), guarded by
+#: ``_SAMPLE_LOCK`` for the rare case of concurrent writers on the same
+#: action. Tests reach in and ``.clear()`` this between cases.
+_SAMPLE_COUNTS: dict[str, int] = {}
+_SAMPLE_LOCK = threading.Lock()
+
+
+def should_sample(action: str) -> bool:
+    """True when *this* call for *action* should actually write its audit row.
+
+    Reads ``audit.sampling.<action>`` from instance config (see the
+    ``audit:`` block in ``config/instance.yaml.example``) as a ratio in
+    ``[0, 1]``:
+
+    - **Unconfigured (the default for every action)** -> always ``True``.
+      Sampling is strictly opt-in per action; nothing is throttled unless an
+      operator explicitly lists it.
+    - ``1.0`` -> always ``True`` (an explicit no-op entry).
+    - ``0`` -> always ``False`` — the supported way to silence a noisy,
+      low-stakes action entirely without touching its call site.
+    - Anything in between -> ``True`` on exactly 1 of every
+      ``round(1 / ratio)`` calls.
+
+    Deterministic via a per-action call counter — **not** ``random`` — on
+    purpose: a random sampler makes "1 in 10" untrue on a low-traffic
+    instance (the 10th call might just never land heads) and makes any test
+    of it flaky. A counter makes the ratio exact and reproducible.
+
+    SECURITY: never configure this for an action that matters for security
+    or compliance (auth, RBAC/grant changes, secret rotation, admin
+    configuration) — see the caveat next to the worked example in
+    ``config/instance.yaml.example``. This function has no way to enforce
+    that; it is a documentation-level contract for whoever edits the config.
+    """
+    from app.instance_config import get_value
+
+    sampling = get_value("audit", "sampling", default=None) or {}
+    ratio = sampling.get(action) if isinstance(sampling, dict) else None
+    if ratio is None:
+        return True
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        return True
+    if ratio >= 1:
+        return True
+    if ratio <= 0:
+        return False
+
+    every_n = max(1, round(1 / ratio))
+    with _SAMPLE_LOCK:
+        count = _SAMPLE_COUNTS.get(action, 0) + 1
+        _SAMPLE_COUNTS[action] = count
+    return count % every_n == 1

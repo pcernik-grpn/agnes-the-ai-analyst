@@ -35,6 +35,20 @@ def test_audit_written_marker(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     from src.repositories import audit_repo
 
+    # The counter is per-request: the middleware installs one at the start of
+    # every HTTP request. Outside a request (scheduler, worker, CLI) there is
+    # nothing to duplicate, so counting is deliberately a no-op.
+    audit_context.begin_request_write_tracking()
     before = audit_context.audit_written_count()
     audit_repo().log(user_id="u1", action="catalog.list")
     assert audit_context.audit_written_count() == before + 1
+
+
+def test_audit_written_marker_is_a_noop_outside_a_request(tmp_path, monkeypatch, shared_app):
+    """A scheduler/worker write must not need — or fake — a request scope."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from src.repositories import audit_repo
+
+    audit_context._reset_for_tests()
+    audit_repo().log(user_id=None, action="run_audit_prune")
+    assert audit_context.audit_written_count() == 0

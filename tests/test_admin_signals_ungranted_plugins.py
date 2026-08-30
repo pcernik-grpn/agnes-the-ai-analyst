@@ -91,16 +91,27 @@ class TestUngrantedPluginsSignal:
 
 class TestAccessPageShowsTheOrphan:
     def test_access_page_marks_resources_granted_to_nobody(self):
-        """The /api/access/overview payload already carries every grant and
-        every item, so the page can compute 'granted to nobody' client-side.
-        The badge must exist and derive from the grants payload — not from a
-        second endpoint that could disagree with the checkboxes."""
+        """Same guarantee, a better surface.
+
+        The badge used to ride each row of the group view — where a resource
+        nobody holds can never appear, because that view shows one group's
+        holdings and a thing nobody holds is in no group's. It is a
+        first-class state of the BUNDLE view now, the reading that can
+        actually see it: those bundles are collected behind their own line,
+        counted by kind, and each says so on its own row.
+
+        It still derives from the grants payload the controls read, which is
+        the part that matters — a second source could disagree with them.
+        """
         template = Path("app/web/templates/admin_access.html").read_text(encoding="utf-8")
-        badge_block = template.split("const grantedAnywhere")[1].split("const itemRow")[0]
-        assert "marketplace_plugin" in badge_block, (
-            "the nobody badge must cover marketplace_plugin rows, not only collections"
-        )
-        assert "grantedAnywhere" in badge_block, (
-            "the badge must derive from the grants payload the checkboxes read, "
-            "not a second data source that could disagree with them"
+        assert "granted to nobody" in template
+        assert "Granted to nobody:" in template          # the collected line
+        assert "is-nobody" in template                   # …and the row's own state
+
+        # Scoped to the bundle renderer: `const rows = []` appears in the
+        # group view too, and that one says nothing about this state.
+        held_block = template.split("function renderBundles()")[1].split("const nobodyLine")[0]
+        assert "overview.grants" in held_block, (
+            "the nobody state must derive from the grants payload the controls "
+            "read, not a second data source that could disagree with them"
         )

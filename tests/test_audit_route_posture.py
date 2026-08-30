@@ -1,9 +1,10 @@
-"""Route-posture ratchet (F1 — audit-full-coverage plan, Task 2).
+"""Route-posture ratchet (F1 — audit-full-coverage plan, Task 2; contract
+tightened by Wave 2 — Task 1: ``"fallback"`` is no longer a legal value).
 
 Every mutating route registered on the app must declare its audit posture
-in ``src/audit_posture.py`` — a real cataloged action, ``"fallback"``, or
+in ``src/audit_posture.py`` — a real cataloged action, or
 ``"exempt:<reason>"`` — so a NEW route can never silently reopen the
-196/352-audited gap this plan closes. See ``src/audit_posture.py``'s module
+coverage gap this plan closes. See ``src/audit_posture.py``'s module
 docstring for the full contract.
 """
 
@@ -35,7 +36,8 @@ def test_every_mutating_route_declares_posture(shared_app):
 
 def test_posture_values_are_valid():
     for key, v in POSTURE.items():
-        assert v == "fallback" or v.startswith("exempt:") or is_cataloged(v), (key, v)
+        assert v != "fallback", f"{key}: 'fallback' is no longer a legal posture value"
+        assert v.startswith("exempt:") or is_cataloged(v), (key, v)
 
 
 def test_mutating_is_the_standard_http_write_verbs():

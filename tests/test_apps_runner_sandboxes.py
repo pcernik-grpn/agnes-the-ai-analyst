@@ -204,7 +204,7 @@ class FakeDocker:
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    monkeypatch.setenv("APPS_RUNNER_TOKEN", "tok")
+    monkeypatch.setenv("APPS_RUNNER_TOKEN", "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
     monkeypatch.setenv("CHAT_SANDBOX_IMAGE_PREFIX", "agnes-chat-sandbox")
     from services.apps_runner import api
 
@@ -234,7 +234,7 @@ def SPEC(tmp, **over):
 
 
 def _up(c, tmp, **over):
-    return c.post(f"/sandboxes/{NAME}/up", headers={"X-Runner-Token": "tok"}, json={"spec": SPEC(tmp, **over)})
+    return c.post(f"/sandboxes/{NAME}/up", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"spec": SPEC(tmp, **over)})
 
 
 # --- token gating ---------------------------------------------------------
@@ -294,7 +294,7 @@ def test_up_rejects_foreign_container_name(client):
     c, _, tmp = client
     r = c.post(
         "/sandboxes/agnes-dataapp-s/up",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         json={"spec": SPEC(tmp, name="agnes-dataapp-s")},
     )
     assert r.status_code == 400
@@ -305,7 +305,7 @@ def test_up_rejects_spec_name_mismatch(client):
     c, _, tmp = client
     r = c.post(
         f"/sandboxes/{NAME}/up",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         json={"spec": SPEC(tmp, name="agnes-chatsbx-other-1")},
     )
     assert r.status_code == 400
@@ -454,7 +454,7 @@ def test_up_resolves_bind_sources_via_dind(client, monkeypatch):
 def test_stream_demuxes_stdout_and_stderr(client):
     c, _fake, tmp = client
     _up(c, tmp)
-    r = c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "tok"})
+    r = c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     frames = [json.loads(line) for line in r.text.splitlines() if line.strip()]
     assert frames[0]["stream"] == "stdout"
@@ -471,10 +471,10 @@ def test_stream_replays_only_when_asked(client):
     _up(c, tmp)
     cont = fake.by_name[NAME]
 
-    c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "tok"})
+    c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert cont.attach_params["logs"] == 0
 
-    c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "tok"}, params={"replay": "true"})
+    c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, params={"replay": "true"})
     assert cont.attach_params["logs"] == 1
 
 
@@ -488,7 +488,7 @@ def test_stream_delivers_frames_already_buffered_by_the_header_parse(client):
     _up(c, tmp)
     cont = fake.by_name[NAME]
     cont.buffer_all_frames_before_handoff = True
-    r = c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "tok"}, params={"replay": "true"})
+    r = c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, params={"replay": "true"})
     assert r.status_code == 200
     frames = [json.loads(line) for line in r.text.splitlines() if line.strip()]
     assert [base64.b64decode(f["data"]) for f in frames] == [b'{"type":"runner_ready"}\n', b"stderr-line\n"]
@@ -496,7 +496,7 @@ def test_stream_delivers_frames_already_buffered_by_the_header_parse(client):
 
 def test_stream_absent_container_is_404(client):
     c, _, _ = client
-    assert c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "tok"}).status_code == 404
+    assert c.get(f"/sandboxes/{NAME}/stream", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).status_code == 404
 
 
 def test_stdin_writes_bytes_to_the_attach_socket(client):
@@ -505,7 +505,7 @@ def test_stdin_writes_bytes_to_the_attach_socket(client):
     payload = base64.b64encode(b'{"type":"user_msg","text":"hi"}\n').decode()
     r = c.post(
         f"/sandboxes/{NAME}/stdin",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         json={"data_b64": payload},
     )
     assert r.status_code == 200
@@ -518,7 +518,7 @@ def test_stdin_absent_container_is_404(client):
     c, _, _ = client
     r = c.post(
         f"/sandboxes/{NAME}/stdin",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         json={"data_b64": base64.b64encode(b"x").decode()},
     )
     assert r.status_code == 404
@@ -534,7 +534,7 @@ def test_write_file_puts_a_tar_rooted_at_slash(client):
     _up(c, tmp)
     r = c.post(
         f"/sandboxes/{NAME}/files",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         json={"path": "/tmp/agnes-cli/agnes.whl", "content_b64": base64.b64encode(b"WHEEL").decode()},
     )
     assert r.status_code == 200
@@ -555,7 +555,7 @@ def test_read_file_streams_raw_content(client):
     cont.archives["/work/outputs/report.csv"] = _tar_bytes({"report.csv": b"a,b\n1,2\n"})
     r = c.get(
         f"/sandboxes/{NAME}/files",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         params={"path": "/work/outputs/report.csv", "op": "read"},
     )
     assert r.status_code == 200
@@ -573,7 +573,7 @@ def test_read_file_past_the_ceiling_is_413(client, monkeypatch):
     cont.archives["/work/outputs/huge.bin"] = _tar_bytes({"huge.bin": b"x" * 4096})
     r = c.get(
         f"/sandboxes/{NAME}/files",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         params={"path": "/work/outputs/huge.bin", "op": "read"},
     )
     assert r.status_code == 413
@@ -596,7 +596,7 @@ def test_list_is_not_capped_by_the_read_ceiling(client, monkeypatch):
     )
     r = c.get(
         f"/sandboxes/{NAME}/files",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         params={"path": "/work/outputs", "op": "list"},
     )
     assert r.status_code == 200
@@ -613,7 +613,7 @@ def test_list_dir_returns_entries(client):
     )
     r = c.get(
         f"/sandboxes/{NAME}/files",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         params={"path": "/work/outputs", "op": "list"},
     )
     assert r.status_code == 200
@@ -630,7 +630,7 @@ def test_read_missing_path_is_404(client):
     _up(c, tmp)
     r = c.get(
         f"/sandboxes/{NAME}/files",
-        headers={"X-Runner-Token": "tok"},
+        headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
         params={"path": "/work/outputs/nope", "op": "read"},
     )
     assert r.status_code == 404
@@ -644,45 +644,45 @@ def test_pause_resume_rm_and_status(client):
     _up(c, tmp)
     cont = fake.by_name[NAME]
 
-    assert c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "tok"}).json()["container"] == "running"
+    assert c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).json()["container"] == "running"
 
-    assert c.post(f"/sandboxes/{NAME}/pause", headers={"X-Runner-Token": "tok"}).json() == {"status": "paused"}
+    assert c.post(f"/sandboxes/{NAME}/pause", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).json() == {"status": "paused"}
     assert cont.paused is True
-    assert c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "tok"}).json()["container"] == "paused"
+    assert c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).json()["container"] == "paused"
 
-    assert c.post(f"/sandboxes/{NAME}/resume", headers={"X-Runner-Token": "tok"}).json() == {"status": "running"}
+    assert c.post(f"/sandboxes/{NAME}/resume", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).json() == {"status": "running"}
     assert cont.unpaused is True
 
-    assert c.post(f"/sandboxes/{NAME}/rm", headers={"X-Runner-Token": "tok"}).json() == {"status": "removed"}
+    assert c.post(f"/sandboxes/{NAME}/rm", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).json() == {"status": "removed"}
     assert cont.removed is True
 
 
 def test_status_absent_and_exit_code(client):
     c, fake, tmp = client
-    r = c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "tok"})
+    r = c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.json() == {"container": "absent", "exit_code": None}
     _up(c, tmp)
     fake.by_name[NAME].status = "exited"
     fake.by_name[NAME].attrs = {"State": {"ExitCode": 3}}
-    r = c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "tok"})
+    r = c.get(f"/sandboxes/{NAME}/status", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.json() == {"container": "stopped", "exit_code": 3}
 
 
 def test_pause_absent_is_404(client):
     c, _, _ = client
-    assert c.post(f"/sandboxes/{NAME}/pause", headers={"X-Runner-Token": "tok"}).status_code == 404
+    assert c.post(f"/sandboxes/{NAME}/pause", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).status_code == 404
 
 
 def test_resume_absent_is_404(client):
     c, _, _ = client
-    assert c.post(f"/sandboxes/{NAME}/resume", headers={"X-Runner-Token": "tok"}).status_code == 404
+    assert c.post(f"/sandboxes/{NAME}/resume", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}).status_code == 404
 
 
 def test_rm_with_grace_stops_before_removing(client):
     c, fake, tmp = client
     _up(c, tmp)
     cont = fake.by_name[NAME]
-    r = c.post(f"/sandboxes/{NAME}/rm", headers={"X-Runner-Token": "tok"}, json={"grace_sec": 5})
+    r = c.post(f"/sandboxes/{NAME}/rm", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, json={"grace_sec": 5})
     assert r.status_code == 200
     assert cont.stopped_with == 5
     assert cont.removed is True
@@ -690,7 +690,7 @@ def test_rm_with_grace_stops_before_removing(client):
 
 def test_rm_absent_is_idempotent(client):
     c, _, _ = client
-    r = c.post(f"/sandboxes/{NAME}/rm", headers={"X-Runner-Token": "tok"})
+    r = c.post(f"/sandboxes/{NAME}/rm", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     assert r.json() == {"status": "absent"}
 
@@ -701,7 +701,7 @@ def test_list_sandboxes_filters_by_ownership_label(client):
     other = FakeSandboxContainer("agnes-dataapp-s")
     other.labels = {"agnes.data-app": "app_1"}
     fake.by_name["agnes-dataapp-s"] = other
-    r = c.get("/sandboxes", headers={"X-Runner-Token": "tok"})
+    r = c.get("/sandboxes", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     rows = r.json()["sandboxes"]
     assert [row["name"] for row in rows] == [NAME]
@@ -735,7 +735,7 @@ def test_age_seconds_unparseable_is_zero():
 
 def test_probe_reports_daemon_and_image(client):
     c, fake, _ = client
-    r = c.get("/sandboxes/probe", headers={"X-Runner-Token": "tok"}, params={"image": "agnes-chat-sandbox:dev"})
+    r = c.get("/sandboxes/probe", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, params={"image": "agnes-chat-sandbox:dev"})
     assert r.status_code == 200
     assert r.json() == {"ok": True, "daemon": True, "image": True, "detail": "docker sandbox runner ready"}
     assert fake.pinged is True
@@ -743,7 +743,7 @@ def test_probe_reports_daemon_and_image(client):
 
 def test_probe_reports_missing_image(client):
     c, _, _ = client
-    r = c.get("/sandboxes/probe", headers={"X-Runner-Token": "tok"}, params={"image": "agnes-chat-sandbox:nope"})
+    r = c.get("/sandboxes/probe", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}, params={"image": "agnes-chat-sandbox:nope"})
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False and body["daemon"] is True and body["image"] is False
@@ -759,7 +759,7 @@ def test_probe_reports_unreachable_daemon(client, monkeypatch):
         raise docker.errors.DockerException("cannot connect")
 
     fake.ping = _boom
-    r = c.get("/sandboxes/probe", headers={"X-Runner-Token": "tok"})
+    r = c.get("/sandboxes/probe", headers={"X-Runner-Token": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"})
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False and body["daemon"] is False

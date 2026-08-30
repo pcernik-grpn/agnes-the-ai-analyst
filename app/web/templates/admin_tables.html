@@ -2395,7 +2395,8 @@
               '<div data-group-id="' + gid + '" '
               + 'style="display:flex; gap:8px; align-items:center; '
               +        'padding:6px; border:1px solid var(--border); border-radius:6px;">'
-              + '<span style="flex:1;">' + gname + '</span>'
+              + '<span style="flex:1; display:flex; align-items:center; gap:6px;">'
+              + (window.AgnesKindGlyph ? window.AgnesKindGlyph.groupGlyph() : '') + escapeHtml(gname) + '</span>'
               + '<select id="' + selId + '" class="edp-rbac-req ds-dropdown-native" style="padding:4px; border:1px solid var(--border); border-radius:4px;">'
               +   opt('', '(no grant)')
               +   opt('available', 'available')

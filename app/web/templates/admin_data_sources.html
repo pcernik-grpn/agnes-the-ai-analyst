@@ -5002,7 +5002,7 @@ async function _renderShareStep() {
       <div class="ds-wshare-row" data-pkg="${_esc(p.localId)}" data-group="${_esc(g.id)}">
         <input type="checkbox" ${share ? "checked" : ""} aria-label="Share ${_esc(p.name)} with ${_esc(g.name)}">
         <div>
-          <div class="g-name">${_esc(g.name)}</div>
+          <div class="g-name">${AgnesKindGlyph.groupGlyph()}${_esc(g.name)}</div>
           <div class="g-sub ${everyone ? "everyone" : ""}">${everyone
             ? "the whole company — every account, automatically"
             : `${g.member_count ?? 0} member${(g.member_count ?? 0) === 1 ? "" : "s"}`}</div>
@@ -6222,7 +6222,7 @@ function spRenderShare(items) {
     const warn = noGroup ? '<span class="sp-warn">&#9888; indexed but invisible — no group yet</span>' : "";
     const groupsHtml = (spGroups || []).map((g) => {
       const on = pending.has(g.id);
-      return `<label><input type="checkbox" data-spw-share-group="${spEsc(s.source_scope_id)}" value="${spEsc(g.id)}"${on ? " checked" : ""}> ${spEsc(g.name)}</label>`;
+      return `<label><input type="checkbox" data-spw-share-group="${spEsc(s.source_scope_id)}" value="${spEsc(g.id)}"${on ? " checked" : ""}> ${AgnesKindGlyph.groupGlyph()}${spEsc(g.name)}</label>`;
     }).join("") || '<span class="ds-drawer__opt">No groups yet — create one in <a href="/admin/access">Access</a>.</span>';
     return `<div class="sp-share-row" data-spw-share-row="${spEsc(s.source_scope_id)}">` +
       `<div class="sp-share-row__main">` +

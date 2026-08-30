@@ -5835,7 +5835,9 @@ details.section-card > summary {
    --ds-readonly (sharing-state semantic) — either would misattribute meaning.
    See the allowlist note in tests/test_design_system_contract.py. */
 .group-chip {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     padding: 3px 10px;
     border-radius: var(--radius-full);
     font-size: var(--text-sm);

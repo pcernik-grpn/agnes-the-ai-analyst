@@ -44,10 +44,35 @@ _client_kind: ContextVar["str | None"] = ContextVar("audit_client_kind", default
 # without re-running the auth dependency.
 _audit_identity: ContextVar["tuple[str | None, str | None] | None"] = ContextVar("audit_identity", default=None)
 
+
 # How many audit rows this request/context has written so far. The F1
 # fallback middleware (Task 2) uses this to detect "the handler already
 # wrote its own row" and skip the generic fallback row.
-_written: ContextVar[int] = ContextVar("audit_written_count", default=0)
+class _WriteCounter:
+    """A mutable box holding this request's audit-write count.
+
+    Deliberately an OBJECT rather than a plain ``int`` in the ContextVar.
+    Starlette's ``BaseHTTPMiddleware`` (several are mounted below this
+    middleware pair — posthog injection, version headers, metrics) runs the
+    downstream app in its own asyncio task, and a new task gets a COPY of
+    the context: a ``ContextVar.set(n + 1)`` performed inside the handler
+    mutates only that copy and is invisible to the outer middleware once
+    the request unwinds. Copies share the same object REFERENCE, though, so
+    mutating one box is visible everywhere.
+
+    This is what makes "did the handler audit itself?" answerable without a
+    database round-trip. Storing an int here instead re-opens the
+    duplicate-row bug: a self-auditing handler's row goes unseen and the
+    fallback middleware writes a second, generic row alongside it.
+    """
+
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+
+_written: ContextVar["_WriteCounter | None"] = ContextVar("audit_written_count", default=None)
 
 
 def mark_request_start() -> None:
@@ -115,17 +140,30 @@ def auto_audit_identity() -> "tuple[str | None, str | None]":
     return identity if identity is not None else (None, None)
 
 
+def begin_request_write_tracking() -> None:
+    """Install a fresh write counter for this request.
+
+    Called once by ``AuditTimingMiddleware``, which sits OUTSIDE every
+    ``BaseHTTPMiddleware`` in the stack — so the box it installs is the box
+    every inner context copy sees and mutates.
+    """
+    _written.set(_WriteCounter())
+
+
 def mark_audit_written() -> None:
-    """Record that one more audit row was written in this context. Called
+    """Record that one more audit row was written in this request. Called
     by ``AuditRepository.log()`` (both backends) on every successful
-    insert."""
-    _written.set(_written.get() + 1)
+    insert. A no-op outside a request (scheduler, worker, CLI)."""
+    counter = _written.get()
+    if counter is not None:
+        counter.n += 1
 
 
 def audit_written_count() -> int:
-    """How many audit rows :func:`mark_audit_written` has recorded in this
-    context so far. ``0`` outside any write."""
-    return _written.get()
+    """How many audit rows :func:`mark_audit_written` has recorded for this
+    request so far. ``0`` outside a request scope."""
+    counter = _written.get()
+    return counter.n if counter is not None else 0
 
 
 def _reset_for_tests() -> None:
@@ -148,4 +186,4 @@ def _reset_for_tests() -> None:
     _request_meta.set(None)
     _client_kind.set(None)
     _audit_identity.set(None)
-    _written.set(0)
+    _written.set(None)
