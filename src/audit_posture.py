@@ -148,6 +148,10 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
+    # trigger. Handler writes nothing itself; the fallback middleware emits
+    # this cataloged action on its behalf (src/audit_events.py CATALOG).
+    "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync": "sharepoint_acl.sync_triggered",
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",

@@ -3140,6 +3140,14 @@ KNOWN_UNTESTED = {
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
     "POST /api/admin/sharepoint/extraction/run-due",
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
+    # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
+    # EXISTING jobs table, no new schema surface" reasoning as the
+    # extraction routes above; auth matrix, flag-gate 409, dedup, and the
+    # exact payload shape are covered by
+    # tests/test_admin_sharepoint.py::TestAclSyncTrigger; not duplicated
+    # in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

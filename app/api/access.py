@@ -64,52 +64,92 @@ def _audit(
         logger.warning("audit log failed for %s/%s", action, resource)
 
 
-def _is_google_managed(g: dict) -> bool:
-    """Whether a group row is owned by Google sync — admin UI/API treat such
-    rows as read-only.
+#: Every writer-segregated sync that owns groups outright — a row it
+#: created is read-only through this API (add/remove member, rename,
+#: delete all reject with the mapped 409 code). Keyed on the EXACT
+#: ``created_by`` sentinel that writer stamps on ``user_groups`` (see
+#: ``docs/auth-groups.md`` for Google/Microsoft;
+#: ``connectors/sharepoint/acl_sync.py`` for SharePoint ACL mirroring).
+#: Value: ``(code, source_name, where_to_edit)`` — the 409 body's ``code``
+#: plus the two fragments the message is built from. New sync writer?
+#: Add one entry here; no other call site needs to change (every mutation
+#: already routes through :func:`_guard_google_managed` /
+#: :func:`_guard_sync_managed`).
+_SYNC_MANAGED_SENTINELS: dict = {
+    "system:google-sync": ("google_managed_readonly", "Google Workspace", "admin.google.com"),
+    "system:sharepoint-acl-sync": ("sharepoint_managed_readonly", "SharePoint ACL sync", "the source system"),
+}
 
-    Two ways a group can be Google-managed:
 
-    1. ``created_by='system:google-sync'`` — auto-created by the OAuth
-       callback when the user belonged to a prefix-matching Workspace
-       group; ``name`` is the full Workspace email.
-    2. ``is_system=TRUE`` AND the group's name matches the env-configured
-       admin/everyone Workspace email — the OAuth callback routes
-       memberships from those Workspace groups into the seeded system
-       row instead of creating a separate user_groups row, so the system
-       row effectively *becomes* a Google-synced row in this deployment.
-       Without the env mapping, system groups stay regular admin-managed
-       rows (renaming Admin is still blocked separately by
+def _sync_managed_reason(g: dict) -> Optional[tuple]:
+    """Whether a group row is owned by an external sync writer — admin UI/
+    API treat such rows as read-only. Returns the matching
+    ``_SYNC_MANAGED_SENTINELS`` entry, or ``None`` when the group is
+    ordinary (admin-managed).
+
+    Two ways a group can be sync-managed:
+
+    1. ``created_by`` is exactly one of ``_SYNC_MANAGED_SENTINELS``'s keys
+       — auto-created/reconciled by that writer (Google: the OAuth
+       callback for a prefix-matching Workspace group, ``name`` is the
+       full Workspace email; SharePoint: ``entra:<oid>``/``sp-direct:
+       <scope>`` groups the ``sharepoint-acl-sync`` job creates).
+    2. Google only: ``is_system=TRUE`` AND the group's name matches the
+       env-configured admin/everyone Workspace email — the OAuth callback
+       routes memberships from those Workspace groups into the seeded
+       system row instead of creating a separate ``user_groups`` row, so
+       the system row effectively *becomes* a Google-synced row in this
+       deployment. Without the env mapping, system groups stay regular
+       admin-managed rows (renaming Admin is still blocked separately by
        ``UserGroupsRepository`` for code-reference safety).
     """
-    if (g.get("created_by") or "") == "system:google-sync":
-        return True
+    created_by = g.get("created_by") or ""
+    if created_by in _SYNC_MANAGED_SENTINELS:
+        return _SYNC_MANAGED_SENTINELS[created_by]
     if g.get("is_system"):
         from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
 
         admin_email = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip().lower()
         everyone_email = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip().lower()
         if admin_email and g.get("name") == SYSTEM_ADMIN_GROUP:
-            return True
+            return _SYNC_MANAGED_SENTINELS["system:google-sync"]
         if everyone_email and g.get("name") == SYSTEM_EVERYONE_GROUP:
-            return True
-    return False
+            return _SYNC_MANAGED_SENTINELS["system:google-sync"]
+    return None
+
+
+def _is_google_managed(g: dict) -> bool:
+    """Whether a group row is owned by Google sync SPECIFICALLY — used for
+    ``GroupResponse.is_google_managed`` (never true for a group managed by
+    a different sync writer, e.g. SharePoint ACL mirroring)."""
+    reason = _sync_managed_reason(g)
+    return reason is not None and reason[0] == "google_managed_readonly"
+
+
+def _guard_sync_managed(g: dict) -> None:
+    """Raise ``409 <code>`` when the group is managed by ANY external sync
+    writer (``_SYNC_MANAGED_SENTINELS``) — the generalized form of the
+    original Google-only guard."""
+    reason = _sync_managed_reason(g)
+    if reason is None:
+        return
+    code, source_name, where = reason
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": code,
+            "message": (
+                f"This group is managed by {source_name} and is read-only here. Add or remove members via {where}."
+            ),
+        },
+    )
 
 
 def _guard_google_managed(g: dict) -> None:
-    """Raise 409 google_managed_readonly when the group is Google-managed."""
-    if _is_google_managed(g):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "google_managed_readonly",
-                "message": (
-                    "This group is managed by Google Workspace and is "
-                    "read-only here. Add or remove members via "
-                    "admin.google.com, or sign in again to refresh."
-                ),
-            },
-        )
+    """Thin wrapper kept for its many existing call sites — the real,
+    generalized check (every sync writer, not just Google) is
+    :func:`_guard_sync_managed`."""
+    _guard_sync_managed(g)
 
 
 def _validate_resource_type(value: str) -> ResourceType:
@@ -269,9 +309,7 @@ async def access_overview(
             "family_display": RESOURCE_FAMILIES[spec.family].display_name,
             "blocks": spec.list_blocks(),
         }
-        for spec in sorted(
-            enabled_resource_types(), key=lambda s: _family_rank[s.family]
-        )
+        for spec in sorted(enabled_resource_types(), key=lambda s: _family_rank[s.family])
     ]
     # Section headers travel separately from the types, so a family with
     # nothing granted still renders as an empty section rather than
@@ -515,9 +553,7 @@ async def update_group(
         if new_name:
             clash = repo.get_by_name(new_name)
             if clash and clash["id"] != group_id:
-                raise HTTPException(
-                    status_code=409, detail=f"Group {new_name!r} already exists"
-                )
+                raise HTTPException(status_code=409, detail=f"Group {new_name!r} already exists")
         try:
             repo.update(group_id, **updates)
         except SystemGroupProtected:

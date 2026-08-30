@@ -1010,6 +1010,258 @@ class TestNoGroupWarning:
         assert r.json()["detail"]["error"] == "invalid_group_id"
 
 
+# ---------------------------------------------------------------------------
+# SharePoint ACL mirroring (2026-08-30 plan, Task 5) — access_mode, drive_id,
+# mirrored (sentinel-owned) grants staying read-only through the wizard's
+# own share-step checkboxes, and the admin "sync now" trigger.
+# ---------------------------------------------------------------------------
+
+
+class TestAccessModeAndDriveId:
+    def test_access_mode_defaults_to_manual_and_drive_id_defaults_to_none(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-default")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:am1", "display_path": "Manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["access_mode"] == "manual"
+        assert r.json()["drive_id"] is None
+
+    def test_mirrored_without_drive_id_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-missing-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:am2", "display_path": "Mirrored", "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "missing_drive_id"
+
+    def test_mirrored_with_drive_id_round_trips_through_list_and_confirm(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-mirrored")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:am3",
+                "display_path": "Mirrored",
+                "access_mode": "mirrored",
+                "drive_id": "drive-abc123",
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["access_mode"] == "mirrored"
+        assert body["drive_id"] == "drive-abc123"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["access_mode"] == "mirrored"
+        assert listed["drive_id"] == "drive-abc123"
+
+    def test_malformed_drive_id_is_422_not_a_500(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-bad-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:am4",
+                "display_path": "Mirrored",
+                "access_mode": "mirrored",
+                "drive_id": "not/a-valid-id",
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_manual_scope_may_omit_drive_id(self, seeded_app):
+        """The obligation's other half: a manual scope never needs one."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-manual-no-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:am5", "display_path": "Manual", "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["drive_id"] is None
+
+
+class TestMirroredGrantsSurviveTheShareStep:
+    """A sentinel-owned (``assigned_by='system:sharepoint-acl-sync'``) grant
+    is the ``sharepoint-acl-sync`` job's own bookkeeping — the wizard's
+    share-step checkboxes (``group_ids``) must never delete it, even when
+    every OTHER group is unticked. "Stop mirroring" is ``access_mode``, not
+    this checkbox (spec §2.3/§2.5)."""
+
+    def _confirm_with_sentinel_grant(self, c, token, conn_id, *, source_scope_id, admin_group_id):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": source_scope_id, "display_path": "Sentinel", "group_ids": [admin_group_id]},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        # A sentinel-owned group+grant, written the way `run_acl_sync` would.
+        sentinel_group = user_groups_repo().ensure(name=f"entra:{source_scope_id}", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+        return collection_id, sentinel_group["id"]
+
+    def test_unticking_every_group_deletes_the_admin_grant_not_the_sentinel_one(self, seeded_app):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sentinel-guard")
+        admin_group_id = c.post("/api/admin/groups", json={"name": "sp-admin-grant"}, headers=_auth(token)).json()["id"]
+
+        collection_id, sentinel_group_id = self._confirm_with_sentinel_grant(
+            c, token, conn_id, source_scope_id="drive:sentinel", admin_group_id=admin_group_id
+        )
+
+        # Untick everything through the share step.
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sentinel", "display_path": "Sentinel", "group_ids": []},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        # The admin grant is gone; the sentinel one is the only survivor —
+        # NOT an empty list, since the row is still (mirror-)granted.
+        assert r.json()["group_ids"] == [sentinel_group_id]
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert len(remaining) == 1
+        assert remaining[0]["group_id"] == sentinel_group_id
+        assert remaining[0]["assigned_by"] == ACL_SYNC_SENTINEL
+
+    def test_switching_mirrored_to_manual_deletes_the_sentinel_grant(self, seeded_app):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-switch")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:switch",
+                "display_path": "Switching",
+                "access_mode": "mirrored",
+                "drive_id": "drive-switch",
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(name="entra:switch-oid", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:switch", "display_path": "Switching", "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["access_mode"] == "manual"
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert remaining == []
+
+
+class TestAclSyncTrigger:
+    """``POST /connections/{connection_id}/acl-sync`` — admin "sync now"
+    trigger for the ``sharepoint-acl-sync`` job (spec §5.1)."""
+
+    ACL_SYNC = "{base}/{cid}/acl-sync"
+
+    @pytest.fixture(autouse=True)
+    def _clear_acl_mirroring_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            self.ACL_SYNC.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(self.ACL_SYNC.format(base=BASE, cid="nope"))
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        r = seeded_app["client"].post(
+            self.ACL_SYNC.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-flag-off")
+        r = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-happy")
+        r = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["job_id"]
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(body["job_id"])
+        assert job["kind"] == "sharepoint-acl-sync"
+        assert job["payload_json"] == {"connection_id": conn_id}
+
+    def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-dup")
+        first = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert first.status_code == 202, first.text
+        second = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "acl_sync_already_running"
+        assert second.json()["detail"]["job_id"] == first.json()["job_id"]
+
+
 class TestCertificateMetadata:
     """`GET /connections/{id}/certificate` — read-only certificate metadata
     for the source card / an admin's own comparison against the identity

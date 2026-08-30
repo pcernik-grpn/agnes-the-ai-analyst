@@ -871,7 +871,14 @@ async def update_connection(
     ``extraction: null``) in the request still clears it deliberately. The
     full set of keys is ``app.api.admin_sharepoint.
     SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by
-    ``tests/test_sharepoint_config_carry_forward_ratchet.py``.
+    ``tests/test_sharepoint_config_carry_forward_ratchet.py``. Two more keys
+    — ``config.acl_sync_last_run``/``config.acl_sync_last_success_at``,
+    written by the ``sharepoint-acl-sync`` WORKER JOB rather than an
+    ``admin_sharepoint.py`` endpoint (``connectors.sharepoint.acl_sync
+    .ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``) — get the same carry-forward
+    treatment just below, kept as a separate hand-maintained list because
+    that ratchet's static scan is deliberately scoped to one file and
+    cannot see a different module's writes.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -968,6 +975,32 @@ async def update_connection(
                 for _sp_key in SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS:
                     if _sp_key not in config and old_config.get(_sp_key) is not None:
                         config = {**config, _sp_key: old_config[_sp_key]}
+
+                # The `sharepoint-acl-sync` WORKER JOB (2026-08-30 plan, Task
+                # 4/5) writes its own two config keys
+                # (`acl_sync_last_run`/`acl_sync_last_success_at`,
+                # `connectors/sharepoint/acl_sync.py::_sync_connection`) —
+                # from a background job, never from an
+                # `app/api/admin_sharepoint.py` endpoint. That is why they are
+                # NOT part of `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS` above:
+                # `tests/test_sharepoint_config_carry_forward_ratchet.py`
+                # statically scans ONLY `admin_sharepoint.py`'s own writers
+                # (its own module docstring states the one-file scope), so
+                # listing a key written from a different module there would
+                # fail that ratchet the other way ("declared but no writer
+                # found"). Same erasure risk as `scopes`/`extraction` above —
+                # an ordinary edit through this wholesale-`config`-replacing
+                # endpoint would otherwise silently drop the connection's last
+                # ACL-sync run/success timestamp — carried forward here by
+                # hand instead, imported from the module that actually owns
+                # them (`connectors.sharepoint.acl_sync
+                # .ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS`) so the two lists
+                # never drift out of sync with each other.
+                from connectors.sharepoint.acl_sync import ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _acl_key in ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS:
+                    if _acl_key not in config and old_config.get(_acl_key) is not None:
+                        config = {**config, _acl_key: old_config[_acl_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`

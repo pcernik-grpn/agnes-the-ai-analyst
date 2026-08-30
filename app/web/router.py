@@ -2096,9 +2096,7 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: rather than literals at each site because they are the same sentence
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
-_LOCKED_STACK_TOOLTIP = (
-    "Required by your admin — your agents get this automatically, and you cannot remove it."
-)
+_LOCKED_STACK_TOOLTIP = "Required by your admin — your agents get this automatically, and you cannot remove it."
 _GRANTED_STACK_TOOLTIP = (
     "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
 )
@@ -2497,8 +2495,10 @@ async def library_page(
             # on screen answered "Nothing matches these filters". A folder is
             # therefore searchable by every filename it holds; the client then
             # opens it and hides the siblings, so the hit reads as the file.
-            fname = " ".join(f.get("filename") or "" for f in files) if is_folder else (
-                first_file.get("filename") if first_file else ""
+            fname = (
+                " ".join(f.get("filename") or "" for f in files)
+                if is_folder
+                else (first_file.get("filename") if first_file else "")
             )
             row = _library_row_base(
                 item_id=col["id"],
@@ -8266,7 +8266,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             if not isinstance(raw_scope, dict):
                 continue
             try:
-                scopes.append(_scope_out(raw_scope, declared_corpus_ids))
+                scopes.append(_scope_out(raw_scope, declared_corpus_ids, conn))
             except Exception as e:
                 logger.debug(
                     "sharepoint pipeline cell: scope row resolution failed for %s: %s",

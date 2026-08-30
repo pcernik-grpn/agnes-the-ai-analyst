@@ -79,14 +79,26 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 shape (walk + per-row due-check +
                                                                 enqueue into an EXISTING job kind,
                                                                 no second scheduling mechanism).
+  POST   /api/admin/sharepoint/connections/{id}/acl-sync       — admin "sync now" trigger (spec
+                                                                §5.1; 2026-08-30 plan, Task 5) for
+                                                                the ``sharepoint-acl-sync`` job
+                                                                (``connectors/sharepoint/
+                                                                acl_sync.py::run_acl_sync``). Same
+                                                                enqueue/dedup mechanics as
+                                                                ``.../extract`` above; refuses with
+                                                                ``409 feature_disabled`` when
+                                                                ``acl_mirroring.enabled`` is off.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
-backends). Each row is exactly ``{source_scope_id, display_path, anonymize,
-collection_id}`` (spec §13.2); group grants are NOT duplicated here — they
-are ordinary ``resource_grants`` rows on the collection, same primitive
-``/admin/access`` already reads (spec: "facts are never granted... zero new
-grant type").
+backends). Each row is ``{source_scope_id, display_path, anonymize,
+collection_id, access_mode, drive_id}`` (spec §13.2, extended by §2.5/§5 for
+ACL mirroring); group grants are NOT duplicated here — they are ordinary
+``resource_grants`` rows on the collection, same primitive ``/admin/access``
+already reads (spec: "facts are never granted... zero new grant type"),
+except a ``sharepoint-acl-sync``-written (sentinel-owned, ``assigned_by
+='system:sharepoint-acl-sync'``) grant, which this wizard's own group-grant
+checkboxes never delete (see :func:`confirm_scope`).
 
 Idempotency: confirming the SAME ``source_scope_id`` twice reuses the
 existing row's ``collection_id`` rather than creating a second collection —
@@ -108,6 +120,7 @@ from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin
 from app.resource_types import ResourceType
+from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
@@ -142,6 +155,21 @@ class ConfirmScopeBody(BaseModel):
     source_scope_id: str = Field(..., min_length=1)
     display_path: str = Field(..., min_length=1)
     anonymize: bool = False
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5). ``manual`` (the
+    # default) is today's behavior unchanged; ``mirrored`` opts this scope
+    # into the ``sharepoint-acl-sync`` job's per-scope group/grant
+    # reconciliation (connectors/sharepoint/acl_sync.py). Always persisted
+    # on confirm — like ``anonymize`` above, not "omitted means unchanged"
+    # like ``group_ids`` below.
+    access_mode: Literal["manual", "mirrored"] = "manual"
+    # The Graph drive id for this scope root — REQUIRED when
+    # ``access_mode='mirrored'`` (the ACL sync needs both a drive id and an
+    # item id to read `.../permissions`; see connectors/sharepoint/
+    # acl_sync.py's module docstring "Gap closed" note). Optional for
+    # ``manual`` scopes, which never read it. ``None`` means "not supplied
+    # on this call" — same always-overwritten-on-confirm semantics as
+    # ``access_mode``/``anonymize``.
+    drive_id: Optional[str] = None
     # Step 3: applied as ordinary `resource_grants` rows on the collection —
     # never stored on the scope row itself (see module docstring). ``None``
     # (the field omitted) and ``[]`` mean DIFFERENT things: omitted is "this
@@ -305,13 +333,39 @@ def _latest_run_anonymized_corpus_ids() -> set:
     return set(scopes.keys()) if isinstance(scopes, dict) else set()
 
 
-def _scope_out(scope: Dict[str, Any], declared_corpus_ids: Optional[set] = None) -> Dict[str, Any]:
+def _acl_sync_summary(connection: Optional[Dict[str, Any]], scope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The scope row's slice of the connection's last ``sharepoint-acl-sync``
+    run (``connectors/sharepoint/acl_sync.py::_sync_connection`` writes the
+    full block into ``config["acl_sync_last_run"]``, aggregated across every
+    mirrored scope on the connection) — ``None`` when no connection was
+    given or no run has completed yet, so ``_scope_out`` can omit the key
+    entirely rather than emit a block of nulls."""
+    if not connection:
+        return None
+    last_run = (connection.get("config") or {}).get("acl_sync_last_run")
+    if not isinstance(last_run, dict):
+        return None
+    stale_scopes = last_run.get("stale_scopes") or []
+    return {
+        "at": last_run.get("at"),
+        "ok": last_run.get("ok"),
+        "matched": last_run.get("matched"),
+        "unmatched": last_run.get("unmatched"),
+        "stale": scope.get("source_scope_id") in stale_scopes,
+    }
+
+
+def _scope_out(
+    scope: Dict[str, Any],
+    declared_corpus_ids: Optional[set] = None,
+    connection: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     collection = file_corpora_repo().get(scope.get("collection_id") or "")
     group_ids = _group_ids_for_collection(scope.get("collection_id") or "")
     if declared_corpus_ids is None:
         declared_corpus_ids = _latest_run_anonymized_corpus_ids()
     anonymize = bool(scope.get("anonymize"))
-    return {
+    out = {
         "source_scope_id": scope.get("source_scope_id"),
         "display_path": scope.get("display_path"),
         "anonymize": anonymize,
@@ -331,7 +385,17 @@ def _scope_out(scope: Dict[str, Any], declared_corpus_ids: Optional[set] = None)
         # but invisible' is the worst silent state)" — the wizard's step-3
         # preview reads this per row rather than re-deriving it client-side.
         "no_group_warning": no_group_warning(group_ids),
+        # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — `manual`
+        # (today's behavior) unless the admin opted this scope into
+        # `sharepoint-acl-sync`'s reconciliation; `None` (a pre-Task-5 row)
+        # reads as `manual` too, never a bare null.
+        "access_mode": scope.get("access_mode") or "manual",
+        "drive_id": scope.get("drive_id"),
     }
+    summary = _acl_sync_summary(connection, scope)
+    if summary is not None:
+        out["acl_sync_last_run"] = summary
+    return out
 
 
 def no_group_warning(group_ids: List[str]) -> bool:
@@ -670,7 +734,7 @@ async def list_scopes(
     enriched with its collection and current group grants."""
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
-    return {"items": [_scope_out(s, declared) for s in _scopes(row)]}
+    return {"items": [_scope_out(s, declared, row) for s in _scopes(row)]}
 
 
 @router.post("/connections/{connection_id}/scopes", status_code=201)
@@ -683,19 +747,41 @@ async def confirm_scope(
 
     Creates its collection on first confirmation; re-confirming the same
     ``source_scope_id`` reuses that same collection (idempotent) and updates
-    ``display_path``/``anonymize`` in place — a rename or move in the source
-    does not fork a second collection (§6 applied to the wizard's own
-    bookkeeping). ``group_ids``, **if the field is present**, is the complete
-    set of groups for this collection (step 3): listed groups are granted,
-    and any other group's grant on this collection is revoked. The wizard's
-    checkboxes are pre-checked from the grants that exist and its row warns
-    the moment the last one is unticked, so the screen already promises that
-    unticking removes access — making the handler additive-only meant the
-    admin was shown a revocation that never happened. Omitting the field
-    touches no grant at all, which is what keeps a rename or an anonymize
-    toggle from stripping access as a side effect.
+    ``display_path``/``anonymize``/``access_mode``/``drive_id`` in place — a
+    rename or move in the source does not fork a second collection (§6
+    applied to the wizard's own bookkeeping). ``group_ids``, **if the field
+    is present**, is the complete set of groups for this collection (step
+    3): listed groups are granted, and any other group's grant on this
+    collection is revoked — EXCEPT a mirrored (sentinel-owned) grant, which
+    this checkbox can never touch (see the revoke loop below); "stop
+    mirroring" is ``access_mode``, not a checkbox. The wizard's checkboxes
+    are pre-checked from the grants that exist and its row warns the moment
+    the last one is unticked, so the screen already promises that unticking
+    removes access — making the handler additive-only meant the admin was
+    shown a revocation that never happened. Omitting the field touches no
+    grant at all, which is what keeps a rename or an anonymize toggle from
+    stripping access as a side effect.
+
+    ``access_mode='mirrored'`` (spec §2.5) opts this scope into the
+    ``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``
+    (``400 missing_drive_id`` otherwise — the sync needs both a drive id and
+    an item id to address the scope root on Graph). Switching an already-
+    mirrored scope back to ``manual`` deletes the sync's own sentinel-owned
+    grants for this collection and converts nothing — the admin re-grants
+    manually, same as any other scope that was never mirrored.
     """
     row = _sharepoint_connection_or_404(connection_id)
+
+    if body.access_mode == "mirrored" and not body.drive_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_drive_id",
+                "message": "access_mode='mirrored' requires drive_id — the ACL sync cannot address this scope root without it.",
+            },
+        )
+    if body.drive_id:
+        _validate_graph_id(body.drive_id, "drive_id")
 
     if body.group_ids:
         groups_repo = user_groups_repo()
@@ -705,11 +791,14 @@ async def confirm_scope(
 
     scopes = _scopes(row)
     existing = next((s for s in scopes if s.get("source_scope_id") == body.source_scope_id), None)
+    previous_access_mode = (existing or {}).get("access_mode") or "manual"
 
     if existing is not None:
         collection_id = existing["collection_id"]
         existing["display_path"] = body.display_path
         existing["anonymize"] = body.anonymize
+        existing["access_mode"] = body.access_mode
+        existing["drive_id"] = body.drive_id
     else:
         collection_id = _create_scope_collection(
             connection_name=row.get("name") or connection_id,
@@ -723,6 +812,8 @@ async def confirm_scope(
                 "display_path": body.display_path,
                 "anonymize": body.anonymize,
                 "collection_id": collection_id,
+                "access_mode": body.access_mode,
+                "drive_id": body.drive_id,
             }
         )
 
@@ -731,9 +822,10 @@ async def confirm_scope(
     new_config = {**(row.get("config") or {}), "scopes": scopes}
     source_connections_repo().update(connection_id, config=new_config)
 
+    grants = resource_grants_repo()
+
     if body.group_ids is not None:
         wanted = set(body.group_ids)
-        grants = resource_grants_repo()
         for group_id in wanted:
             grants.ensure_grant(
                 group_id,
@@ -742,9 +834,23 @@ async def confirm_scope(
                 assigned_by=user.get("id"),
             )
         # Revoke what was unticked. Scoped to grants on THIS collection, so a
-        # group's access to anything else is untouched.
+        # group's access to anything else is untouched — and a mirrored
+        # (sentinel-owned) row is never touched here: it would only
+        # resurrect at the next sync, and "stop mirroring" is access_mode,
+        # not this checkbox (spec §2.3).
         for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
-            if grant.get("resource_id") == collection_id and grant.get("group_id") not in wanted:
+            if grant.get("resource_id") != collection_id or grant.get("group_id") in wanted:
+                continue
+            if (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
+                continue
+            grants.delete(grant["id"])
+
+    if previous_access_mode == "mirrored" and body.access_mode == "manual":
+        # Spec §2.5: switching mirrored -> manual deletes the sync's own
+        # grants for this scope's collection and converts nothing — the
+        # admin re-grants manually.
+        for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
+            if grant.get("resource_id") == collection_id and (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
                 grants.delete(grant["id"])
 
     logger.info(
@@ -754,7 +860,7 @@ async def confirm_scope(
         collection_id,
     )
     updated_row = next(s for s in scopes if s.get("source_scope_id") == body.source_scope_id)
-    return _scope_out(updated_row)
+    return _scope_out(updated_row, connection=row)
 
 
 @router.delete("/connections/{connection_id}/scopes", status_code=204)
@@ -875,6 +981,62 @@ async def trigger_extraction(
 
     _record_extraction_dispatch(row, job["id"])
     logger.info("sharepoint connection %s: extraction job %s enqueued (manual trigger)", connection_id, job["id"])
+    return {"job_id": job["id"], "status": job["status"]}
+
+
+def _acl_sync_idempotency_key(connection_id: str) -> str:
+    """A STABLE per-connection idempotency key for the ``sharepoint-acl-sync``
+    job — mirrors :func:`_extraction_idempotency_key`'s shape so a manual
+    "sync now" and any other in-flight run for the same connection can never
+    both be queued at once."""
+    return f"sharepoint-acl-sync:{connection_id}"
+
+
+@router.post("/connections/{connection_id}/acl-sync", status_code=202)
+async def trigger_acl_sync(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Admin-triggered one-off run of the ``sharepoint-acl-sync`` job for
+    this connection (spec §5.1's "sync now" action; 2026-08-30 plan, Task
+    5) — enqueues ``connectors.sharepoint.acl_sync.run_acl_sync`` (via
+    ``app/worker/kinds.py::_run_sharepoint_acl_sync``) with
+    ``{"connection_id": connection_id}``, the SAME mechanics as
+    :func:`trigger_extraction`.
+
+    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
+    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
+    .enabled`` is off — the job handler itself would just no-op (spec §5.1
+    "the scheduler enqueues this kind unconditionally"), but a manual
+    trigger should tell the admin why nothing happened rather than return a
+    202 for a run that will do nothing.
+
+    Deduped on a STABLE per-connection idempotency key
+    (:func:`_acl_sync_idempotency_key`) — a second trigger while one is
+    already queued/running for this connection gets ``409
+    acl_sync_already_running`` instead of a second job.
+    """
+    from app.instance_config import feature_enabled
+
+    _sharepoint_connection_or_404(connection_id)
+
+    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
+        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "sharepoint-acl-sync",
+        {"connection_id": connection_id},
+        idempotency_key=_acl_sync_idempotency_key(connection_id),
+    )
+    if job["deduped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "acl_sync_already_running", "job_id": job["id"]},
+        )
+
+    logger.info("sharepoint connection %s: acl-sync job %s enqueued (manual trigger)", connection_id, job["id"])
     return {"job_id": job["id"], "status": job["status"]}
 
 

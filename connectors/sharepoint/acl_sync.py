@@ -20,20 +20,19 @@ memberships (:mod:`src.repositories.user_group_members`
 action (spec §5.1). Entirely behind ``acl_mirroring.enabled`` (default off);
 see :func:`run_acl_sync`'s own docstring for the sync lifecycle.
 
-**Known gap, not closed by this task:** a confirmed scope row
+**Gap closed (2026-08-30 plan, Task 5):** a confirmed scope row
 (``app/api/admin_sharepoint.py``'s ``ConfirmScopeBody``/``confirm_scope``)
-persists only ``{source_scope_id, display_path, anonymize, collection_id}``
-— no ``drive_id``. Addressing a Graph item requires both a drive id and an
-item id, and nothing in this repo resolves the former from the latter alone
-(the existing ``corpus-extraction`` job hands the connection off to an
-external producer wholesale rather than addressing an item itself — see
-``app/worker/kinds.py::_run_corpus_extraction``). ``run_acl_sync`` therefore
-reads an OPTIONAL ``scope["drive_id"]`` and, when it is absent (true for
-every scope today, since nothing yet writes one), skips that scope with a
-typed ``missing_drive_id`` per-scope error rather than crashing the whole
-connection's run. A follow-up needs to capture ``drive_id`` at
-``confirm_scope`` time — the wizard's tree browse already has it when an
-admin picks a folder — for a mirrored scope to ever actually sync.
+now persists an optional ``drive_id`` alongside ``{source_scope_id,
+display_path, anonymize, collection_id, access_mode}`` — REQUIRED
+(``400 missing_drive_id``) when ``access_mode='mirrored'``, since addressing
+a Graph item needs both a drive id and an item id and nothing in this repo
+resolves the former from the latter alone. A scope confirmed before Task 5
+(or a manual-mode scope that never set one) still has no ``drive_id`` on its
+row; ``run_acl_sync`` reads the OPTIONAL ``scope["drive_id"]`` and, when it
+is absent, skips that scope with a typed ``missing_drive_id`` per-scope
+error rather than crashing the whole connection's run — the same
+degradation as before, now only reachable for scopes confirmed before this
+field existed.
 
 **Sentinel-segregation contract.** Every row the sync writes —
 ``user_groups`` (``created_by``), ``user_group_members`` (``source``),
@@ -79,6 +78,20 @@ ACL_SYNC_SOURCE = "sharepoint_sync"
 """Tag written to ``user_group_members.source`` for every membership row
 this sync writes — the scope ``replace_group_members_for_source`` DELETEs
 within (never another source's rows for the same group)."""
+
+ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS = ("acl_sync_last_run", "acl_sync_last_success_at")
+"""Keys THIS module (a worker job, not an ``app/api/admin_sharepoint.py``
+endpoint) writes into a SharePoint connection's ``config`` — see
+:func:`_sync_connection`. ``app/api/admin_source_connections.py::
+update_connection`` carries these two forward by hand (imported from here)
+the same way it carries forward ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``
+(``app/api/admin_sharepoint.py``) — but deliberately NOT added to that
+OTHER tuple: ``tests/test_sharepoint_config_carry_forward_ratchet.py``
+statically scans ``admin_sharepoint.py``'s own writers only (its own module
+docstring states the one-file scope), so a key written from this module
+would show up there as "declared but no writer found" and fail the ratchet
+in the wrong direction. Carried forward without a mechanical ratchet across
+this module boundary — reviewed by hand instead."""
 
 
 def entra_group_name(oid: str) -> str:
@@ -216,12 +229,11 @@ _DEFAULT_MAX_STALE_HOURS = 72
 def _mirrored_scopes(connection: Dict[str, Any]) -> List[Dict[str, Any]]:
     """This connection's ``access_mode == 'mirrored'`` scope rows.
 
-    ``access_mode`` does not exist on any scope row yet (it is a LATER
-    task's addition to ``ConfirmScopeBody``/``confirm_scope`` — this sync is
-    written against the field name the design spec/plan already reserves for
-    it), so today this always returns ``[]`` on a real instance until that
-    field starts being written. Tests build scope rows with it set directly
-    via the repos, bypassing the wizard endpoint.
+    ``access_mode`` is written by ``app/api/admin_sharepoint.py::
+    confirm_scope`` (2026-08-30 plan, Task 5's ``ConfirmScopeBody
+    .access_mode``, defaulting to ``'manual'``) — a real instance returns
+    ``[]`` here until an admin opts a scope into mirroring through that
+    endpoint.
     """
     scopes = (connection.get("config") or {}).get("scopes")
     if not isinstance(scopes, list):
