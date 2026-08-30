@@ -492,6 +492,53 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
 ### Changed
+- **The three semantic-layer browse pages moved onto the design system
+  (#1707).** `/semantic-layer`, its model-detail tabs and an object's own page
+  were each built out of page-local markup that predated the shared
+  components, so the browse path looked and behaved unlike the rest of the
+  product. One batch, three conversions:
+  - **The model list extends the shared list-page shell.** It used to extend
+    `base_page.html`'s hero shell — the shell most of the app's *list* pages
+    had already left behind (Library, Skills, Agents, Chats, Profile, My
+    connections and the admin builders all extend `base_index.html`;
+    `base_page.html` stays correct for non-list pages like Data apps and
+    Studio) — with ~60 lines of bespoke card CSS. Model cards now render
+    through `fbar_card()`, the same macro `/admin/data-packages` renders
+    server-side and the Library projects client-side. Only what that macro has
+    no slot for stays page-local: the invalid-model tint and its stored
+    validation-error list. Object counts now ride the card's `tags` slot, so —
+    like every other tag list in the product — the first three show and the
+    rest collapse to "+N".
+  - **Empty states say which kind of empty they are.** Every zero-row case
+    used to render the same legacy `.empty-state` markup, collapsing the
+    distinction the shared `state.panel(kind, …)` vocabulary exists to keep
+    visible. A tab whose non-blank filter matched nothing in an otherwise
+    non-empty collection now renders `nothing_found` and names the filter,
+    while a genuinely empty collection — zero rows regardless of the filter, a
+    blank/whitespace-only filter, no model available, no fields declared, no
+    expression declared — renders `empty`. The empty list's call to action
+    changed with it: it used to link "Metrics & glossary", a related but
+    equally-likely-empty page. The primary CTA is now an admin-only "Add a
+    semantic source" pointing at `/admin/semantic-sources` — a path that can
+    actually resolve the state — with the "Metrics & glossary" link demoted to
+    plain body text, and a non-admin sees no primary CTA at all.
+  - **An object's page joins the shared detail scaffold.** It hand-built its
+    panels instead of composing from `macros/_detail.html` the way the table,
+    package, file, plugin, memory-domain and data-app pages do, so its section
+    headings carried a different weight and it had no right rail at all. It
+    now renders through the same macros, which gives it the provenance a
+    reader had drilled two levels to find and could not see: **Source** (for
+    an imported model), **Source ref**, the **Model** it belongs to, and
+    whether **sync** still owns the document or an admin has detached it. An
+    admin also gets a **Manage this model** block in the rail with the door to
+    **Semantic layer health**, instead of retyping admin URLs after spotting a
+    stale object.
+
+  The pages stay read-only for everyone; nothing in this batch edits a model.
+  The constraint severity tooltip and the "Open in the metric registry →" link
+  are unchanged, and a non-`paper` instance keeps its previous object header —
+  the object type still reads in the hero, and the dataset "Source" heading is
+  not reworded where there is no rail to collide with.
 - **Each semantic-layer page has a name of its own (#1707).** Three of the four
   rendered the identical title "Semantic layer", so a browser tab, a bookmark
   or a history entry could not tell them apart, and a link's label routinely
