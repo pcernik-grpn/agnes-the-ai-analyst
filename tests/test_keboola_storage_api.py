@@ -1354,6 +1354,20 @@ class TestEmptySlicedExport:
         assert [d[0] for d in res.description] == ["id", "answer_text"]
         assert conn.execute(f"SELECT COUNT(*) FROM read_parquet('{merged}')").fetchone()[0] == 0
 
+    def test_parquet_site_publishes_through_the_shared_atomic_helper(self, tmp_path):
+        """`src.parquet_publish` semantics, not a bare `pq.write_table`: the
+        bytes land via a temp path that is gone afterwards, and the published
+        file is 0644 regardless of the writer's umask. Guarded statically by
+        tests/test_jira_atomic_parquet_writes.py; this pins the behaviour."""
+        sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id"]})
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+
+        slice_path = _run_parquet_site(c, tmp_path, "in.c-forms.answers")
+
+        assert slice_path.exists()
+        assert oct(slice_path.stat().st_mode)[-3:] == "644"
+        assert list(slice_path.parent.glob("*.tmp")) == [], "staging temp survived the publish"
+
     @_BOTH_SITES
     def test_zero_rows_upstream_is_not_an_error(self, tmp_path, run_site):
         sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id"]})

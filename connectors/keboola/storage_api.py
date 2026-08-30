@@ -56,6 +56,8 @@ except ImportError:  # pragma: no cover - boto3 is a declared dependency
     AWSRequest = None  # type: ignore[assignment]
     Credentials = None  # type: ignore[assignment]
 
+from src.parquet_publish import atomic_publish
+
 logger = logging.getLogger(__name__)
 
 
@@ -407,14 +409,23 @@ def _write_empty_parquet_export(dest_path: Path, columns: List[str]) -> None:
     The file must carry real columns — a view over a column-less parquet
     does not resolve — hence the placeholder fallback when the declared
     schema is unavailable.
+
+    Published through `src.parquet_publish.atomic_publish` like every other
+    parquet writer in `connectors/` — temp path, ``chmod 0644``,
+    ``os.replace``. The destination this writer is handed today is a
+    per-call staging dir rather than a served path, but the protocol is not
+    the caller's to opt out of: `dest_path` is an argument, so what it points
+    at is the next caller's choice, and a reader (the orchestrator's MD5
+    sweep, a master view's glob) must never be able to observe a prefix.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     names = list(columns) or [EMPTY_EXPORT_PLACEHOLDER_COLUMN]
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
     schema = pa.schema([pa.field(name, pa.string()) for name in names])
-    pq.write_table(schema.empty_table(), dest_path)
+    # `atomic_publish` mkdirs `dest_path.parent` itself.
+    with atomic_publish(dest_path) as tmp:
+        pq.write_table(schema.empty_table(), tmp)
 
 
 @dataclass
