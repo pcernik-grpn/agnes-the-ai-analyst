@@ -47,6 +47,23 @@ _AUTH_DETAIL_BY_REASON = {
     "session_revoked": "Session revoked — please sign in again",
 }
 
+
+def auth_detail_for_reason(reason: str | None) -> str:
+    """Human 401 ``detail`` for a ``pat_resolver.ResolutionReason``.
+
+    The public accessor for the vocabulary above, so a non-REST surface that
+    rejects a credential can say the same thing the REST surface says instead
+    of inventing a second wording. Used by the MCP SSE transport's
+    ``_AuthMiddleware`` (``app/api/mcp_http.py``), which used to collapse every
+    rejection — and its own internal errors — into one fixed
+    "Not authenticated".
+
+    An unknown or absent reason falls back to the deliberately vague "Invalid
+    or expired token".
+    """
+    return _AUTH_DETAIL_BY_REASON.get(reason or "", "Invalid or expired token")
+
+
 # X-StorageApi-Token header rejections → 401 detail. Reasons come from
 # app.auth.keboola_header.resolve_header_user.
 _KEBOOLA_HEADER_DETAIL = {

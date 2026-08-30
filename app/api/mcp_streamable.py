@@ -8,8 +8,8 @@ prefer, protected by native OAuth 2.1 + PKCE.
 The SSE app continues to live at /api/mcp/sse for Cowork back-compat —
 this module does NOT replace it.
 
-Authentication path
--------------------
+Authentication path (primary — OAuth 2.1)
+-----------------------------------------
 1. MCP client discovers  GET /.well-known/oauth-protected-resource
    which points to the authorization server at /api/mcp/http.
 2. Client registers via POST /api/mcp/http/register (RFC 7591).
@@ -20,6 +20,18 @@ Authentication path
 5. All subsequent MCP requests carry  Authorization: Bearer <JWT>.
    The JWT is a standard Agnes session JWT — resolve_token_to_user
    accepts it and all RBAC applies unchanged.
+
+Second accepted credential — a plain Agnes PAT
+----------------------------------------------
+``Authorization: Bearer <PAT>`` also authenticates here, so the credential
+the ``/mcp-connect`` page issues works on BOTH HTTP transports rather than
+only on SSE (where it always did). The check lives in the SDK's verifier
+seam — ``AgnesMCPOAuthProvider.load_access_token`` → ``_access_token_from_
+pat`` in app/auth/mcp_oauth.py — and runs only AFTER the OAuth store misses,
+so OAuth issuance, expiry and RFC 7009 revocation are unaffected. It accepts
+``typ="pat"`` and nothing else; that function documents why the line is drawn
+there (a session JWT, including an OAuth token this server itself minted, must
+not ride in on it).
 
 Tools
 -----
