@@ -4,9 +4,33 @@ Mounted at /api/mcp in app/main.py. Exposes the same server-side tools as
 the stdio MCP server but over HTTP, so Claude Desktop's cowork VM (which
 cannot reach localhost) can connect when Agnes is deployed with a public URL.
 
-Authentication: Bearer token in the Authorization header, or ?token= query
-param for clients that cannot send headers on SSE GET requests. The token is
-validated the same way as every other Agnes API endpoint (JWT + DB PAT check).
+Two HTTP transports, two auth stacks — read this before assuming either
+-----------------------------------------------------------------------
+Agnes serves the same tool set over two HTTP transports, mounted separately
+and authenticated by DIFFERENT middleware. They were documented as if only
+this one existed, and a credential that worked here returned ``401
+invalid_token`` there:
+
+- ``/api/mcp`` (this module, SSE) sits behind Agnes ``_AuthMiddleware``
+  below. It accepts any credential ``resolve_token_to_user`` accepts —
+  in practice a PAT (the ``/mcp-connect`` snippets issue one) or a session
+  JWT — in the ``Authorization: Bearer`` header, or in the ``?token=`` query
+  param for clients that cannot set headers on an SSE GET (operator-
+  disablable; see ``_query_param_token_allowed``). A restricted principal
+  (co-session / agent-session) is refused by design.
+- ``/api/mcp/http`` (``app/api/mcp_streamable.py``, Streamable-HTTP) sits
+  behind the MCP SDK's own bearer middleware, whose verifier is
+  ``app.auth.mcp_oauth.AgnesMCPOAuthProvider``. It accepts an OAuth 2.1
+  access token that provider issued — the flow remote connectors
+  (claude.ai, Cursor, VS Code) discover and drive themselves — AND, since
+  the PAT contract below is a documented promise that should not depend on
+  which transport a client speaks, a plain Agnes PAT
+  (``mcp_oauth._access_token_from_pat``). A session JWT is NOT a streamable
+  credential; see that function for why the widening stops at ``typ="pat"``.
+
+Auth failures from THIS transport carry a machine-readable ``reason`` beside
+the human ``detail`` (see ``_send_auth_error``), and an internal error on the
+auth path answers 500, not 401.
 
 Cowork bundle settings.json points to:
     {server_url}/api/mcp/sse
@@ -172,7 +196,7 @@ class _AuthMiddleware:
                 _warn_query_param_token_once()
 
         if not auth.lower().startswith("bearer "):
-            await _send_401(scope, send)
+            await _send_401(scope, send, "no_token")
             return
 
         raw_token = auth[7:]
@@ -191,8 +215,19 @@ class _AuthMiddleware:
                 if conn is not None:
                     conn.close()
         except Exception:
+            # NOT a 401: this is Agnes failing, not the caller presenting a bad
+            # credential. Answering 401 here told an operator whose system DB
+            # was unreachable that their token was rejected, and sent them off
+            # to rotate a perfectly good one.
             logger.exception("MCP auth error")
-            await _send_401(scope, send)
+            await _send_auth_error(scope, send, status=500, reason=AUTH_INTERNAL_ERROR)
+            return
+
+        if user is None:
+            # The typed reason from pat_resolver (invalid_token, pat_revoked,
+            # pat_expired, agent_pat_wrong_surface, deactivated, …) travels to
+            # the caller as its REST wording — same vocabulary, one source.
+            await _send_401(scope, send, reason or "invalid_token")
             return
 
         # A restricted principal (co-session / agent-session token) is refused
@@ -203,8 +238,12 @@ class _AuthMiddleware:
         # full tool surface with the scope filter silently skipped. The
         # sandbox reaches MCP through the stdio server + the REST passthrough
         # endpoints (which are principal-aware), never through SSE.
-        if user is None or isinstance(user, PRINCIPAL_TYPES):
-            await _send_401(scope, send)
+        #
+        # Its own reason: the credential is live and valid, it is this SURFACE
+        # that refuses it, which is a different thing to tell the caller than
+        # "your token is bad" (mirrors `agent_pat_wrong_surface`).
+        if isinstance(user, PRINCIPAL_TYPES):
+            await _send_401(scope, send, PRINCIPAL_WRONG_SURFACE)
             return
 
         tok = _current_token.set(raw_token)
@@ -226,24 +265,61 @@ class _AuthMiddleware:
             _current_user_id.reset(uid)
 
 
-async def _send_401(scope: Scope, send: Send) -> None:
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [
-                [b"content-type", b"application/json"],
-                [b"www-authenticate", b'Bearer realm="Agnes MCP"'],
-            ],
-        }
-    )
-    await send(
-        {
-            "type": "http.response.body",
-            "body": b'{"detail":"Not authenticated"}',
-            "more_body": False,
-        }
-    )
+# Two reasons this transport adds to the ``pat_resolver.ResolutionReason``
+# vocabulary, for outcomes that resolution itself never produces.
+#
+# The credential is live and valid; this SURFACE refuses it (see the middleware
+# for why a restricted principal cannot be served here). Named after
+# ``agent_pat_wrong_surface``, which says the same thing about an agent PAT.
+PRINCIPAL_WRONG_SURFACE = "principal_wrong_surface"
+# Agnes broke while checking the credential. Never a 401 — see the middleware.
+AUTH_INTERNAL_ERROR = "auth_internal_error"
+
+_TRANSPORT_DETAIL_BY_REASON = {
+    PRINCIPAL_WRONG_SURFACE: "Session principal token not valid on this surface",
+    AUTH_INTERNAL_ERROR: "Authentication check failed — this is a server-side problem, retry later",
+}
+
+
+def _auth_error_detail(reason: str) -> str:
+    """Human ``detail`` for ``reason``, in the REST 401 vocabulary.
+
+    Everything the resolver can return is worded by
+    ``app.auth.dependencies.auth_detail_for_reason`` so this transport and the
+    REST surface cannot drift; only the two transport-local reasons above are
+    worded here.
+    """
+    if reason in _TRANSPORT_DETAIL_BY_REASON:
+        return _TRANSPORT_DETAIL_BY_REASON[reason]
+    from app.auth.dependencies import auth_detail_for_reason
+
+    return auth_detail_for_reason(reason)
+
+
+async def _send_auth_error(scope: Scope, send: Send, *, status: int, reason: str) -> None:
+    """Answer an auth failure with a body that says WHICH failure it was.
+
+    Carries a machine-readable ``reason`` (a fixed vocabulary defined in
+    Agnes, never anything derived from the request) beside the human
+    ``detail``. The credential itself — and any internal exception text — is
+    never echoed: the caller learns which check failed, not what they sent or
+    what broke behind it.
+    """
+    import json
+
+    body = json.dumps({"detail": _auth_error_detail(reason), "reason": reason}).encode()
+    headers = [
+        [b"content-type", b"application/json"],
+        [b"content-length", str(len(body)).encode()],
+    ]
+    if status == 401:
+        headers.append([b"www-authenticate", b'Bearer realm="Agnes MCP"'])
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _send_401(scope: Scope, send: Send, reason: str = "invalid_token") -> None:
+    await _send_auth_error(scope, send, status=401, reason=reason)
 
 
 # ── dynamic tool registration (Universal MCP — RFC #461 §7) ───────────────────

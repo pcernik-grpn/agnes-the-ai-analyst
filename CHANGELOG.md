@@ -1156,6 +1156,33 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **An Agnes PAT now authenticates BOTH HTTP MCP transports, and a refused MCP
+  request says which check refused it (#1707).** Two findings in the same auth
+  layer. (1) The two transports authenticated differently while the modules
+  documented only one contract: `/api/mcp` (SSE) sits behind Agnes' own
+  middleware and took a PAT, `/api/mcp/http` (Streamable-HTTP) sits behind the
+  MCP SDK's bearer middleware and took only tokens its OAuth provider had
+  issued — so one documented credential got 200 on one transport and `401
+  invalid_token` on the other, with nothing anywhere saying the second wanted
+  OAuth. A PAT is now accepted on the streamable transport too, in the SDK's
+  own verifier seam and only *after* the OAuth store misses, so OAuth 2.1 —
+  what remote connectors (claude.ai, Cursor, VS Code) discover and drive
+  themselves — is untouched, including issuance, expiry and RFC 7009
+  revocation. The widening stops at `typ="pat"` on purpose: an OAuth access
+  token is itself a signed session JWT, and accepting those would keep
+  honouring a revoked connector token for the rest of its 8-hour life. Both
+  module docstrings now describe both transports and what each accepts. (2)
+  The SSE transport collapsed four different outcomes into one fixed `401
+  {"detail": "Not authenticated"}` — including an exception on the auth path
+  itself, which read to the caller as a bad credential and sent operators off
+  to rotate a working token during what was really an Agnes-side outage. The
+  four are now distinguishable: a missing header, a rejected credential (the
+  typed resolver reason — `invalid_token`, `pat_revoked`, `pat_expired`,
+  `agent_pat_wrong_surface`, `deactivated`, … — worded in the same vocabulary
+  the REST 401s use, via the new `auth_detail_for_reason`), and a by-design
+  refusal of a co-session/agent-session principal each answer 401 with their
+  own `reason`, while an internal error answers **500** and stays logged with
+  its traceback. No credential material appears in any body, header or log.
 - **`POST /api/semantic-models/validate-query` now discloses that its dataset
   match is a heuristic, not a fact (#1707).** The endpoint's `used_datasets` /
   `used_metrics` come from a best-effort text match — a `WHERE status = …`
