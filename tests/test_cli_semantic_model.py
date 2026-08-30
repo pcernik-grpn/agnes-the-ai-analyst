@@ -358,6 +358,60 @@ class TestSemanticSourceList:
         assert "own no models" not in result.output
 
 
+class TestSemanticSourceListScanScope:
+    """Finding A17 on #1707: "ok · 0 models" still cannot separate "there is
+    nothing upstream" from "the role I connect as cannot see it". The row also
+    names what was scanned."""
+
+    @staticmethod
+    def _row(**overrides) -> dict:
+        row = {
+            "id": "ss_sf",
+            "kind": "connection",
+            "name": "Warehouse",
+            "enabled": True,
+            "last_sync_status": "ok",
+            "owned_model_count": 0,
+            "scan_scope": "ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE",
+        }
+        row.update(overrides)
+        return row
+
+    def _run(self, rows: list[dict]):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, rows)):
+            return runner.invoke(app, ["admin", "semantic", "source", "list"])
+
+    def test_the_row_names_what_was_scanned(self):
+        result = self._run([self._row()])
+        assert result.exit_code == 0
+        assert "scanned ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE" in result.output
+
+    def test_the_scope_sits_beside_the_model_count(self):
+        """Both, not one instead of the other — the count says nothing came
+        back, the scope says where it looked."""
+        result = self._run([self._row()])
+        line = next(line for line in result.output.splitlines() if line.startswith("ss_sf"))
+        assert "0 models" in line
+        assert "scanned ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE" in line
+
+    def test_a_source_without_a_derivable_scope_prints_none(self):
+        result = self._run([self._row(scan_scope=None)])
+        assert result.exit_code == 0
+        assert "scanned" not in result.output
+
+    def test_a_server_too_old_to_send_the_field_prints_none(self):
+        rows = [self._row()]
+        rows[0].pop("scan_scope")
+        result = self._run(rows)
+        assert result.exit_code == 0
+        assert "scanned" not in result.output
+
+    def test_json_carries_the_scope_verbatim(self):
+        with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, [self._row()])):
+            result = runner.invoke(app, ["admin", "semantic", "source", "list", "--json"])
+        assert json.loads(result.stdout)[0]["scan_scope"] == "ESHOP_DEMO.RAW as ESHOP_DEMO_ROLE"
+
+
 class TestSemanticSourceSync:
     def test_sync_reports_counts(self):
         report = {"models_written": 2, "models_unchanged": 1, "models_pruned": [], "invalid": []}

@@ -10,6 +10,34 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **A semantic source now reports WHAT it scanned, not only that the scan
+  worked (#1707).** Observed live: a Snowflake semantic view existed, the role
+  Agnes connects as held no privilege on it, `SHOW SEMANTIC VIEWS` came back
+  empty — and the source reported `ok` with zero owned models, identical to a
+  correctly-scoped source pointed at an upstream that genuinely holds nothing.
+  "There is nothing upstream" and "I cannot see it, and I am not saying so"
+  are different statements, and the second is a misconfiguration an admin has
+  to fix. The four surfaces that already show `owned_model_count` now also
+  carry `scan_scope`: `GET /api/admin/semantic-sources` (list, single-source
+  `GET`, and the `POST`/`PUT` responses), the `sources` block of `GET
+  /api/admin/semantic-layer/health`, the **Last sync** cell on
+  `/admin/semantic-sources` (`✓ ok · <when> · scanned ESHOP_DEMO.RAW as
+  ESHOP_DEMO_ROLE`), and `agnes admin semantic source list`. The health
+  report's **"Sources that synced but imported nothing"** finding names the
+  scope too — on the `/admin/semantic-layer` Health tab and in `agnes admin
+  semantic health` — so the finding points at the grant to check instead of
+  ending at "check this source's config". Per adapter: Snowflake reports
+  database, schema (or `(whole database)`) and the ROLE it connects as;
+  Keboola the project its connection is bound to; Databricks the Unity
+  Catalog catalogs and workspace; a git source its repository, ref and file
+  glob (stated even when it is the default — a repo of `*.yml` documents
+  against the default `**/*.yaml` clones fine and matches nothing, which is
+  the same failure in git shape); an upload source its document count. Derived from the source's own config at
+  read time (`src/semantic/scan_scope.py`) and never stored — the scope is a
+  property of the row, not of a run — so nothing can drift, and an adapter
+  with no resolver reports `null` and every surface omits it. Coordinates
+  only: no token, no credential env-var name, and any URL echoed has its
+  `user:pass@` userinfo stripped first.
 - **A semantic source that syncs successfully and imports nothing is no longer
   indistinguishable from a healthy one (#1707).** `last_sync_status='ok'` says
   the fetch worked, not that it brought anything back — a `connection` source

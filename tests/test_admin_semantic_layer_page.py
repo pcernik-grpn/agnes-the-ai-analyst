@@ -620,6 +620,28 @@ class TestTheHealthTabReportsSilentlyEmptySources:
         assert "danger" not in section
         assert "error" not in section
 
+    def test_the_finding_names_what_the_source_scanned(self, seeded_app):
+        """A17: "imported nothing" is the symptom; the scope is what the
+        admin can act on."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        assert "scan_scope" in section
+        assert "scanned ${s.scan_scope}" in section
+
+    def test_an_absent_scope_adds_nothing_to_the_finding(self, seeded_app):
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        assert 'typeof s.scan_scope === "string"' in section
+
+    def test_the_scope_is_rendered_as_text_never_as_markup(self, seeded_app):
+        """It is composed from admin-supplied config (a repo URL, a database
+        name), so it goes through createTextNode, never innerHTML."""
+        body = self._body(seeded_app)
+        section = body.split('hlSection(container, "Sources that synced but imported nothing"')[1].split("});")[0]
+        scoped_line = [line for line in section.splitlines() if "scanned ${s.scan_scope}" in line]
+        assert scoped_line, section
+        assert all("innerHTML" not in line for line in section.splitlines())
+
 
 class TestTheHealthTabReportsSkippedSources:
     """The page twin of the CLI section: `hlRender` filtered `sources` on

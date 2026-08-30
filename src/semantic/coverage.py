@@ -493,7 +493,8 @@ def compute_cross_domain_coverage(source_id: str | None = None) -> dict[str, Any
 
 
 def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per-source sync state, plus how many models each source OWNS.
+    """Per-source sync state, how many models each source OWNS, and what it
+    SCANNED.
 
     ``last_sync_status='ok'`` says the fetch worked, never that it brought
     anything back — a source scoped at an upstream with no semantic content
@@ -503,10 +504,20 @@ def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     "healthy" from "silently empty" without a stored counter. It is ``None``
     for a source whose provenance could not be resolved — "cannot say", which
     is a different statement from "owns nothing".
+
+    ``scan_scope`` answers the question the count cannot: a source owning zero
+    models may be pointed at an empty upstream, or at one whose contents its
+    role/scope simply cannot see (finding A17 — a Snowflake semantic view
+    existed and the connecting role held no grant on it). It names the
+    database/schema/role, project, catalog or repository the sync looked at,
+    derived from the source's own config (``src/semantic/scan_scope.py``), and
+    is ``None`` when no scope can be stated faithfully.
     """
     from src.semantic.ownership import owned_model_counts
+    from src.semantic.scan_scope import scan_scopes
 
     counts = owned_model_counts(sources)
+    scopes = scan_scopes(sources)
     return [
         {
             "source_id": s["id"],
@@ -517,6 +528,8 @@ def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # `None` when the provenance could not be resolved — "cannot
             # say", never a confident 0 (see src/semantic/ownership.py).
             "owned_model_count": counts.get(s["id"]),
+            # `None` when this source's config states no derivable scope.
+            "scan_scope": scopes.get(s["id"]),
         }
         for s in sources
     ]
