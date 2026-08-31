@@ -3313,6 +3313,21 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestAclSyncTrigger; not duplicated
     # in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync",
+    # Extraction observability (2026-08-31 design §9) — read-only run
+    # status/history/config for the source card. The three run routes are
+    # backed by the PG-only `extraction_runs` table, so their per-backend
+    # behaviour IS the point and is asserted directly (200 + shape on PG,
+    # typed 501 on DuckDB, 403 for a non-admin, 404 before any repo work) by
+    # tests/test_admin_extraction.py and tests/db_pg/test_extraction_runs_pg.py;
+    # not duplicated in this generic smoke sweep.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/status",
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs",
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}",
+    # The config read-out touches no run rows at all (it reads instance
+    # config + the switch registry + the connection's own scopes), so it
+    # answers identically on both backends by construction; covered by
+    # tests/test_admin_extraction.py::TestExtractionConfig.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

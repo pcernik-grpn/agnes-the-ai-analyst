@@ -1220,6 +1220,17 @@ CATALOG: dict[str, AuditEvent] = {
         "An admin overrode a detected broken-inheritance subtree exclusion "
         "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
     ),
+    # -- 2026-08-31 extraction-observability-ui design §9 (A5). The run
+    # status/history reads beside it are `exempt:noise` / `exempt:ui_support`
+    # (counters and outcomes, no content); this one is cataloged because it
+    # discloses credential env-var NAMES and the per-scope audience-class
+    # mapping — the same disclosure class as `certificate_read`/`scopes_read`.
+    "sharepoint_connection.extraction_config_read": AuditEvent(
+        "sharepoint_connection.extraction_config_read",
+        "read",
+        "An admin read a SharePoint connection's effective extraction configuration — "
+        "values, their origins, and credential env-var names (never their values).",
+    ),
 }
 
 

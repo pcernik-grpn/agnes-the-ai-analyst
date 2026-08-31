@@ -704,6 +704,22 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sessions/list": "admin.sessions_browse",
     "GET /api/admin/sessions/{username}/{session_file}/download": "session_download",
     "GET /api/admin/sessions/{username}/{session_file}/transcript": "session.transcript_view",
+    # -- app.api.admin_extraction (extraction observability, 2026-08-31 design §9) --
+    # A1 is the source card's poll (3 s while a run is active, 30 s idle) and
+    # returns run COUNTERS, no document content — the same class as
+    # `GET /api/jobs` below.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/status": "exempt:noise",
+    # A2/A3 back the run-history drawer: outcomes, durations, counters and
+    # the capped skip list (paths of documents the crawl refused). No
+    # document content, no secrets, no other user's data.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs": "exempt:ui_support",
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}": "exempt:ui_support",
+    # A5 is NOT exempt: it discloses credential env-var NAMES and the
+    # per-scope audience-class mapping — the same disclosure class as its
+    # `scopes_read` / `certificate_read` siblings below.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config": (
+        "sharepoint_connection.extraction_config_read"
+    ),
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",

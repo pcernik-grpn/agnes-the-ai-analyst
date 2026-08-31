@@ -986,6 +986,58 @@
   }
   .sp-corpus-map { font-size: 12px; }
 </style>
+<style>
+  /* ── Extraction observability (2026-08-31 design §4/§6) ───────────────
+     A self-contained block: every selector is `.ext-*`, every colour is a
+     `--ds-*` token, and nothing here restyles an existing card element.
+     The live crawl cell, the `Run` fact row, the run-history drawer and
+     the configuration drawer are all filled by `extraction-observability`
+     JS below — the card's own markup contributes two empty anchors. */
+  .ext-live { display: inline-flex; align-items: center; gap: 6px; }
+  .ext-dot {
+    width: 7px; height: 7px; border-radius: var(--ds-radius-pill);
+    background: var(--ds-accent-info-ink); flex: none;
+  }
+  /* The pulse marks LIVE work, so it must stop the moment liveness stops
+     being observed — a run past its checkpoint window renders `stalled`
+     with a static warn dot, never an unbounded pulse. */
+  .ext-dot--live { animation: ext-pulse 1.6s var(--ds-ease-standard) infinite; }
+  .ext-dot--warn { background: var(--ds-accent-warn-ink); }
+  .ext-dot--danger { background: var(--ds-accent-danger-ink); }
+  .ext-dot--ok { background: var(--ds-accent-success-ink); }
+  .ext-dot--idle { background: var(--ds-text-muted); }
+  @keyframes ext-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) {
+    .ext-dot--live { animation: none; }
+  }
+  .ext-lines { display: flex; flex-direction: column; gap: 3px; }
+  .ext-sub { font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.45; }
+  .ext-warn { color: var(--ds-accent-warn-ink); }
+  .ext-danger { color: var(--ds-accent-danger-ink); }
+  .ext-stale {
+    display: inline-block; margin-top: 2px; padding: 1px 8px;
+    border-radius: var(--ds-radius-pill); font-size: 11px; font-weight: 600;
+    background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
+  }
+  .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-drawer { margin: 4px 16px 8px; }
+  .ext-runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .ext-runs li {
+    padding: 8px 10px; border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-btn); background: var(--ds-surface);
+    font-size: 12.5px; color: var(--ds-text-primary);
+  }
+  .ext-run__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; }
+  .ext-run__when { color: var(--ds-text-muted); }
+  .ext-cfg { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .ext-cfg th, .ext-cfg td {
+    text-align: left; padding: 6px 8px; vertical-align: top;
+    border-bottom: 1px solid var(--ds-border);
+  }
+  .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+  .ext-cfg td code { font-size: 11.5px; color: var(--ds-text-muted); }
+  .ext-cfg__note { display: block; margin-top: 3px; font-size: 11px; color: var(--ds-text-muted); line-height: 1.45; }
+</style>
 {% endblock %}
 
 {% block admin_content %}
@@ -1952,6 +2004,7 @@ function _sharepointPipelineStripHtml(row) {
     `<div class="ds-pipe__cell">
        <span class="ds-pipe__k">Crawl</span>
        <span class="ds-pipe__v">${fs.crawl.documents} document${fs.crawl.documents === 1 ? "" : "s"}</span>
+       <span class="ext-live" id="ext-crawl-live-${row.id}" hidden></span>
      </div>`,
     `<div class="ds-pipe__cell" title="${_esc(extractTitle)}">
        <span class="ds-pipe__k">Extraction</span>
@@ -2362,6 +2415,8 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-k" title="Crawl runs externally — this line is a label, not live state.">Schedule</span>
     <span class="ds-src__fact-v">${_esc(fs.schedule.text)}</span>
   </div>
+  <div id="ext-block-${row.id}" data-ext-conn="${row.id}" hidden></div>
+  <div class="ext-drawer" id="ext-drawer-${row.id}" hidden></div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — a separate lane from the external producer's own crawl schedule above.">In-Agnes extraction</span>
     <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
@@ -6866,5 +6921,471 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (document.getElementById("sp-wizard-overlay").classList.contains("show")) closeSpWizard();
 });
+</script>
+
+{# ── Extraction observability (2026-08-31 design §4 "What is running right
+   now" + §6 "How it is configured") ────────────────────────────────────
+   A self-contained block. The card's own markup contributes three EMPTY
+   anchors (`#ext-crawl-live-<id>`, `#ext-block-<id>`, `#ext-drawer-<id>`);
+   everything inside them is rendered here, so this script has no load-order
+   dependency on the main one and no function above needed changing.
+
+   The honesty rules this code exists to keep:
+
+   * Absolute counters only — no fraction, no percentage bar, no ETA. The
+     crawl enumerates and processes in lockstep per delta page, and its
+     files/s counts only new+changed documents, so both would be arithmetic
+     dressed up as knowledge.
+   * Liveness is derived server-side; a `stalled` run is drawn with a static
+     warn dot and its age, never an unbounded pulse.
+   * A failed poll marks the numbers STALE and keeps them; it never blanks
+     them and never re-renders them as current. Three failures collapse the
+     block to a FAILED panel with a Retry.
+   * A typed 501 (PG-only `extraction_runs` on a DuckDB instance) renders
+     once, explains itself, and STOPS polling — the same degradation the
+     card already words for the facts graph.
+   * No Stop control: v1 has no cooperative cancel flag in the crawl
+     (`can_stop: false`), and a button without a mechanism is a lie. #}
+<script>
+const EXT_POLL_ACTIVE_MS = 3000;
+const EXT_POLL_IDLE_MS = 30000;
+const EXT_POLL_MAX_BACKOFF_MS = 60000;
+const EXT_MAX_FAILURES = 3;
+
+/* Per-connection poll state. `stopped` is terminal (a 501): nothing
+   re-arms it short of a page reload, because the answer will not change
+   until the instance changes backend. */
+const _extState = {};
+let _extTimer = null;
+let _extInFlight = false;
+
+function _extS(id) {
+  if (!_extState[id]) _extState[id] = { failures: 0, stopped: false, data: null, lastOk: null, error: null };
+  return _extState[id];
+}
+
+function _extEsc(v) {
+  return typeof _esc === "function" ? _esc(v == null ? "" : String(v)) : String(v == null ? "" : v);
+}
+
+function _extTime(iso) {
+  if (!iso) return "unknown";
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? "unknown" : d.toLocaleString();
+}
+
+function _extDuration(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function _extNum(n) {
+  return Number(n || 0).toLocaleString();
+}
+
+/* One dot per outcome. `running` is the ONLY animated one — a run past its
+   checkpoint window is `stalled` and gets a static warn dot instead. */
+const EXT_DOT = {
+  running: "ext-dot--live",
+  stalled: "ext-dot--warn",
+  interrupted: "ext-dot--warn",
+  failed: "ext-dot--danger",
+  done: "ext-dot--ok",
+};
+
+function _extDot(outcome) {
+  return `<span class="ext-dot ${EXT_DOT[outcome] || "ext-dot--idle"}" aria-hidden="true"></span>`;
+}
+
+/* The pipeline strip's Crawl cell gains a live line ONLY while there is a
+   live run to describe; otherwise it stays exactly the document count it
+   always was. */
+function _extRenderCrawlCell(connId, status) {
+  const el = document.getElementById(`ext-crawl-live-${connId}`);
+  if (!el) return;
+  const run = status && status.running;
+  if (!run) { el.hidden = true; el.innerHTML = ""; return; }
+  const label = run.outcome === "stalled" ? "stalled" : "crawling";
+  el.hidden = false;
+  el.innerHTML = `${_extDot(run.outcome)}<span class="ext-sub">${_extEsc(label)} · ${_extNum(run.files_done)} files</span>`;
+}
+
+function _extRunLine(run) {
+  const bits = [];
+  if (run.new != null) bits.push(`${_extNum(run.new)} new`);
+  if (run.changed != null) bits.push(`${_extNum(run.changed)} changed`);
+  if (run.unchanged != null) bits.push(`${_extNum(run.unchanged)} unchanged`);
+  if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
+  if (run.bytes_downloaded_human) bits.push(`${run.bytes_downloaded_human} downloaded`);
+  return bits.join(" · ");
+}
+
+function _extThrottleLine(run) {
+  if (!run.http_429) return "";
+  const waited = run.throttle_wait_s ? `, ${_extDuration(run.throttle_wait_s)} waited` : "";
+  return `<div class="ext-sub ext-warn">throttled — ${_extNum(run.http_429)}× HTTP 429${_extEsc(waited)}</div>`;
+}
+
+/* The `Run` fact row. Counters are absolute; the caption names the moment
+   they were last true (the RUN's own checkpoint), which is not the same
+   moment this page last asked. */
+function _extRunRowHtml(connId, st) {
+  const status = st.data;
+  const run = status.running;
+  const last = status.last_completed;
+  let head;
+  let sub = "";
+
+  if (run) {
+    const verb = run.outcome === "stalled" ? "no longer reporting" : "running";
+    head = `${_extDot(run.outcome)} <strong>${_extEsc(verb)}</strong> · ${_extNum(run.files_done)} files processed`;
+    const started = `started ${_extEsc(_extTime(run.started_at))}`;
+    const elapsed = run.elapsed_s != null ? ` · ${_extEsc(_extDuration(run.elapsed_s))} elapsed` : "";
+    sub += `<div class="ext-sub">${started}${elapsed} · as of ${_extEsc(_extTime(run.checkpoint_at))}</div>`;
+    const line = _extRunLine(run);
+    if (line) sub += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    sub += _extThrottleLine(run);
+    if (run.outcome === "stalled") {
+      sub += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note || "no recent checkpoint")}</div>`;
+    }
+    if (status.can_stop === false) {
+      sub += `<div class="ext-sub">A running crawl cannot be stopped from here yet — it finishes, or the worker ends it.</div>`;
+    }
+  } else if (last) {
+    head = `${_extDot(last.outcome)} <strong>${_extEsc(last.outcome)}</strong> · ${_extNum(last.files_done)} files`;
+    sub += `<div class="ext-sub">finished ${_extEsc(_extTime(last.finished_at))}`;
+    if (last.duration_s != null) sub += ` · took ${_extEsc(_extDuration(last.duration_s))}`;
+    sub += `</div>`;
+    const line = _extRunLine(last);
+    if (line) sub += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    if (last.skips_total) {
+      sub += `<div class="ext-sub ext-warn">${_extNum(last.skips_total)} document${last.skips_total === 1 ? "" : "s"} not indexed — see the run</div>`;
+    }
+  } else {
+    head = `${_extDot("idle")} never run`;
+    sub = `<div class="ext-sub">No extraction run has been recorded for this connection yet.</div>`;
+  }
+
+  if (st.error) {
+    sub += `<div class="ext-sub ext-danger"><span class="ext-stale">stale</span> couldn't refresh — last read ${_extEsc(_extTime(st.lastOk))}</div>`;
+  }
+
+  const total = status.runs_total || 0;
+  const actions = `
+      <div class="ext-actions">
+        <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
+                ${total ? "" : "disabled"}>Run history (${total})</button>
+      </div>`;
+
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The built-in extraction pipeline's own run state — read from the recorded run, not from this page's clock.">Run</span>
+    <span class="ds-src__fact-v">
+      <span class="ext-lines">
+        <span>${head}</span>
+        ${sub}
+      </span>
+      ${actions}
+    </span>
+  </div>
+  ${_extConfigRowHtml(connId)}`;
+}
+
+/* The `Configuration` fact row (design §6.1): a read-out with origins, not
+   an editor. The whole `extraction` block is deploy-time, and inventing a
+   second write path for it would be a new settings surface — which is
+   exactly what "zero new navigation" forbids. So the row says what it is
+   and opens the drawer; it never offers a control. */
+function _extConfigRowHtml(connId) {
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Every effective extraction setting with its origin — instance.yaml, an env var, per-scope, or a built-in constant.">Configuration</span>
+    <span class="ds-src__fact-v">
+      <span class="ext-sub">Read-only — the extraction block is deploy-time configuration.</span>
+      <div class="ext-actions">
+        <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'config')">View configuration</button>
+      </div>
+    </span>
+  </div>`;
+}
+
+function _extPanelHtml(tone, title, body, connId, retry) {
+  const retryBtn = retry
+    ? `<div class="ext-actions"><button type="button" class="btn btn-secondary" onclick="extRetry('${connId}')">Retry</button></div>`
+    : "";
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Run</span>
+    <span class="ds-src__fact-v ${tone}">
+      <span class="ext-lines">
+        <span><strong>${_extEsc(title)}</strong></span>
+        <div class="ext-sub">${_extEsc(body)}</div>
+      </span>
+      ${retryBtn}
+    </span>
+  </div>`;
+}
+
+function _extRender(connId) {
+  const block = document.getElementById(`ext-block-${connId}`);
+  if (!block) return;
+  const st = _extS(connId);
+
+  if (st.stopped) {
+    block.hidden = false;
+    block.innerHTML = _extPanelHtml(
+      "",
+      "Run history needs a Postgres backend",
+      "Extraction runs are recorded in a Postgres-only table, so this instance cannot show run state. Everything else on this card is unaffected.",
+      connId,
+      false,
+    );
+    _extRenderCrawlCell(connId, null);
+    return;
+  }
+
+  if (!st.data && st.failures >= EXT_MAX_FAILURES) {
+    block.hidden = false;
+    block.innerHTML = _extPanelHtml(
+      "is-warn",
+      "Couldn't read the extraction run state",
+      `${st.failures} attempts failed. Nothing here is being updated.`,
+      connId,
+      true,
+    );
+    return;
+  }
+
+  if (!st.data) { block.hidden = true; block.innerHTML = ""; return; }
+
+  block.hidden = false;
+  block.innerHTML = _extRunRowHtml(connId, st);
+  _extRenderCrawlCell(connId, st.data);
+}
+
+async function _extFetchOne(connId) {
+  const st = _extS(connId);
+  if (st.stopped) return;
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/status`, {
+      credentials: "include",
+    });
+    if (r.status === 501) {
+      // Terminal and self-explaining: the answer cannot change until the
+      // instance changes backend, so polling on would be pure noise.
+      st.stopped = true;
+      _extRender(connId);
+      return;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    st.data = await r.json();
+    st.lastOk = st.data.as_of;
+    st.failures = 0;
+    st.error = null;
+  } catch (e) {
+    // Keep the last good numbers, VISIBLY marked stale. Blanking them, or
+    // redrawing them as current, are the two ways this goes wrong.
+    st.failures += 1;
+    st.error = String(e && e.message ? e.message : e);
+  }
+  _extRender(connId);
+}
+
+function _extConnectionIds() {
+  return Array.from(document.querySelectorAll("[data-ext-conn]")).map((el) => el.dataset.extConn);
+}
+
+function _extNextDelay() {
+  const states = Object.values(_extState);
+  const worstFailures = states.reduce((a, s) => Math.max(a, s.stopped ? 0 : s.failures), 0);
+  if (worstFailures) {
+    return Math.min(EXT_POLL_ACTIVE_MS * Math.pow(2, worstFailures), EXT_POLL_MAX_BACKOFF_MS);
+  }
+  const live = states.some((s) => s.data && s.data.running);
+  return live ? EXT_POLL_ACTIVE_MS : EXT_POLL_IDLE_MS;
+}
+
+async function _extTick() {
+  if (_extInFlight) return;
+  if (document.visibilityState !== "visible") return;   // a hidden tab watches nothing
+  const ids = _extConnectionIds();
+  if (!ids.length) return;
+  _extInFlight = true;
+  try {
+    // Sequential, one request in flight at a time — an admin page with
+    // several SharePoint connections must not open N sockets every 3s.
+    for (const id of ids) await _extFetchOne(id);
+  } finally {
+    _extInFlight = false;
+  }
+}
+
+function _extSchedule() {
+  if (_extTimer) clearTimeout(_extTimer);
+  _extTimer = setTimeout(async () => {
+    await _extTick();
+    _extSchedule();
+  }, _extNextDelay());
+}
+
+function extRetry(connId) {
+  const st = _extS(connId);
+  st.failures = 0;
+  st.error = null;
+  _extFetchOne(connId);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    _extTick();
+    _extSchedule();
+  }
+});
+
+/* ── Drawer: `runs` and `config` segments ──────────────────────────────
+   Its own element and its own toggle, deliberately NOT the error-badge
+   drawer's: that one renders the LAST INGEST run's rejection categories
+   from server-rendered data, this one fetches per segment. Sharing the
+   element would have meant one function that means two things. */
+async function toggleExtractionDrawer(connId, segment) {
+  const el = document.getElementById(`ext-drawer-${connId}`);
+  if (!el) return;
+  if (el.dataset.segment === segment && !el.hidden) {
+    el.hidden = true;
+    delete el.dataset.segment;
+    return;
+  }
+  el.dataset.segment = segment;
+  el.hidden = false;
+  el.innerHTML = `<div class="ds-empty">Loading…</div>`;
+  const path = segment === "config" ? "extraction/config" : "extraction/runs?limit=10";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/${path}`, {
+      credentials: "include",
+    });
+    if (r.status === 501) {
+      el.innerHTML = `<div class="ds-empty">Run history needs a Postgres backend — this instance records no extraction runs.</div>`;
+      return;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    el.innerHTML = segment === "config" ? _extConfigHtml(body) : _extRunsHtml(body);
+  } catch (e) {
+    el.innerHTML = `<div class="ds-empty">Couldn't load this ${_extEsc(segment)} — ${_extEsc(e && e.message)}.</div>`;
+  }
+}
+
+function _extRunsHtml(body) {
+  const runs = body.runs || [];
+  if (!runs.length) return `<div class="ds-empty">No extraction runs recorded yet.</div>`;
+  const rows = runs.map((run) => {
+    const when = _extTime(run.started_at);
+    const dur = run.duration_s != null
+      ? _extDuration(run.duration_s)
+      : (run.elapsed_s != null ? `${_extDuration(run.elapsed_s)} so far` : "");
+    const line = _extRunLine(run);
+    let detail = "";
+    if (line) detail += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    if (run.skips_total) {
+      const listed = run.skips_listed != null && run.skips_listed !== run.skips_total
+        ? ` (${_extNum(run.skips_listed)} listed by name)`
+        : "";
+      detail += `<div class="ext-sub ext-warn">${_extNum(run.skips_total)} not indexed${_extEsc(listed)}</div>`;
+    }
+    if (run.http_429) detail += _extThrottleLine(run);
+    // An interrupted run ingested what it ingested and the next run resumes
+    // from the persisted cTags. A FAILED run gets no such reassurance.
+    if (run.outcome === "interrupted") {
+      detail += `<div class="ext-sub">interrupted — what it ingested is kept; the next run resumes from where it stopped.</div>`;
+    }
+    if (run.outcome === "stalled" && run.liveness_note) {
+      detail += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note)}</div>`;
+    }
+    if (run.error) detail += `<div class="ext-sub ext-danger">${_extEsc(run.error)}</div>`;
+    return `
+      <li>
+        <div class="ext-run__head">
+          ${_extDot(run.outcome)}
+          <strong>${_extEsc(run.outcome)}</strong>
+          <span class="ext-run__when">${_extEsc(when)}</span>
+          ${dur ? `<span class="ext-run__when">${_extEsc(dur)}</span>` : ""}
+          <span class="ext-run__when">${_extNum(run.files_done)} files</span>
+        </div>
+        ${detail}
+      </li>`;
+  });
+  const hidden = (body.total || 0) - runs.length;
+  const more = hidden > 0
+    ? `<div class="ext-sub">${_extNum(hidden)} older run${hidden === 1 ? "" : "s"} not shown.</div>`
+    : "";
+  return `<ul class="ext-runs">${rows.join("")}</ul>${more}`;
+}
+
+/* Read-only, with an origin on every row. `editable: false` renders as bare
+   text plus its reason — no chevron, because there is nothing to open. */
+const EXT_ORIGIN_LABEL = {
+  env: "env",
+  yaml: "instance.yaml",
+  default: "built-in default",
+  builtin: "built in",
+};
+
+function _extConfigHtml(body) {
+  const rows = (body.effective || []).map((row) => {
+    const origin = EXT_ORIGIN_LABEL[row.origin] || row.origin || "";
+    const originText = row.origin === "env" && row.env_name ? `env ${row.env_name}` : origin;
+    const value = row.value === null || row.value === undefined || row.value === ""
+      ? "not set"
+      : String(row.value);
+    const lock = row.editable
+      ? ""
+      : `<span class="ext-sub" title="${_extEsc(row.lock_reason || "")}">deploy-time</span>`;
+    return `
+      <tr>
+        <th scope="row">${_extEsc(row.label)}</th>
+        <td>
+          ${_extEsc(value)}
+          ${row.key ? `<code>${_extEsc(row.key)}</code>` : ""}
+          ${row.note ? `<span class="ext-cfg__note">${_extEsc(row.note)}</span>` : ""}
+        </td>
+        <td>${_extEsc(originText)} ${lock}</td>
+      </tr>`;
+  });
+
+  const scopes = (body.scopes || []).map((s) => {
+    const anon = !s.anonymize
+      ? "anonymize —"
+      : s.anonymization_declared
+        ? "anonymize ✓ requested · declared ✓"
+        : "anonymize ✓ requested · not declared";
+    const audience = (s.audience_classes || []).map((c) => c.name).join(" ▸ ");
+    return `
+      <tr>
+        <th scope="row">${_extEsc(s.display_path || s.source_scope_id || "")}</th>
+        <td>
+          ${_extEsc(anon)}
+          ${audience ? `<span class="ext-cfg__note">audience: ${_extEsc(audience)}</span>` : ""}
+          ${s.no_group_warning ? `<span class="ext-cfg__note ext-warn">no group can see this collection</span>` : ""}
+        </td>
+        <td>per-scope</td>
+      </tr>`;
+  });
+
+  const scopeBlock = scopes.length
+    ? `<table class="ext-cfg"><tbody>${scopes.join("")}</tbody></table>`
+    : `<div class="ds-empty">No confirmed scopes yet.</div>`;
+
+  return `
+    <table class="ext-cfg"><tbody>${rows.join("")}</tbody></table>
+    <div class="ext-sub">${_extEsc(body.section_lock_reason || "")}</div>
+    <div class="ext-sub"><strong>Per scope</strong></div>
+    ${scopeBlock}`;
+}
+
+_extTick();
+_extSchedule();
 </script>
 {% endblock %}

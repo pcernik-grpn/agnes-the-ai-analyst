@@ -28,6 +28,7 @@ from src.models.config import GlossaryTerm, InstanceTemplate, MetricDefinition, 
 from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
+from src.models.extraction import ExtractionRun
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
 from src.models.jobs import Job
 from src.models.knowledge import (
@@ -135,6 +136,7 @@ __all__ = [
     "DataPackageTable",
     "DataPackageTool",
     "Edge",
+    "ExtractionRun",
     "Fact",
     "FactAlias",
     "FactAliasSource",

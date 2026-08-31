@@ -1232,6 +1232,25 @@ _EXEMPT: dict[str, str] = {
         "2026-08-30 plan Task 5) — admin/scheduler maintenance op, mirrors the "
         "extract/run-due exemptions above; no analyst CLI/MCP analogue"
     ),
+    # Extraction observability (2026-08-31 design §9, A1/A2/A3/A5) — read-only
+    # display primitives feeding ONE admin card (its live crawl cell, its run
+    # drawer and its config drawer). Same exemption class as the certificate
+    # metadata read above: an admin page's own data, no analyst CLI/MCP
+    # analogue.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/status": (
+        "live run state for the source card's crawl cell — polled admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/runs": (
+        "run history for the source card's run drawer — admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}": (
+        "one run's stored report/skip list for the source card's run drawer — admin "
+        "display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/config": (
+        "read-only effective extraction configuration with per-leaf origins for the "
+        "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.

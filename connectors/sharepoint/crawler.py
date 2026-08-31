@@ -218,6 +218,171 @@ def save_state(connection_id: str, state: Dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------
+# Run recording — the second destination for the checkpoint this crawl
+# already writes (2026-08-31 extraction-observability-ui design §7.1).
+#
+# Everything in this section is OBSERVABILITY, never load-bearing: the
+# recorder swallows every failure of its own (including the typed
+# `RequiresPostgresBackend` a DuckDB-backed instance raises the moment the
+# PG-only repo is resolved) and the crawl runs on unchanged. A crawl that
+# cannot be watched is worse than one that is; a crawl that FAILS because
+# nobody could watch it is worse still.
+# --------------------------------------------------------------------------
+
+
+class _RunRecorder:
+    """Writes this run's row: open at start, update at every existing
+    checkpoint, finalize on done / interrupt / crash.
+
+    Outcome precedence is severity-first — ``failed`` beats ``interrupted``.
+    A crashed crawl is BOTH "did not finish" and "broke"; recording it as
+    the benign outcome (and inviting the operator to trust the resume copy
+    that attaches to it) is exactly the unverified-renders-healthy failure
+    the design forbids. Only a cancellation/shutdown signal
+    (``CancelledError``, ``KeyboardInterrupt``, ``SystemExit``) records as
+    ``interrupted``; every other exception records as ``failed`` with its
+    message.
+    """
+
+    def __init__(self, connection_id: str, *, job_id: Optional[str] = None) -> None:
+        self.connection_id = connection_id
+        self.job_id = job_id
+        self.run_id: Optional[str] = None
+        self._repo: Any = None
+
+    def _resolve(self) -> Any:
+        if self._repo is None:
+            from src.repositories import extraction_runs_repo
+
+            self._repo = extraction_runs_repo()
+        return self._repo
+
+    def start(self) -> None:
+        try:
+            self.run_id = self._resolve().start(
+                connection_id=self.connection_id,
+                job_id=self.job_id,
+                phase="crawl",
+            )
+        except Exception as exc:  # noqa: BLE001 — recording is never load-bearing
+            self.run_id = None
+            logger.info(
+                "sharepoint crawl: run recording unavailable for connection %s (%s) — crawling anyway",
+                self.connection_id,
+                type(exc).__name__,
+            )
+
+    def checkpoint(self, stats: "CrawlStats") -> None:
+        if not self.run_id:
+            return
+        try:
+            self._resolve().checkpoint(
+                self.run_id,
+                phase="crawl",
+                files_seen=stats.items_seen,
+                files_done=stats.items_done,
+                # The delta feed can always hand back another page, so
+                # enumeration is never "done" until the run itself is.
+                enumeration_done=False,
+                progress=_progress_snapshot(stats),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sharepoint crawl: run checkpoint failed (%s) — continuing", type(exc).__name__)
+
+    def finish(
+        self,
+        stats: "CrawlStats",
+        *,
+        status: str,
+        report: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        if not self.run_id:
+            return
+        try:
+            from src.repositories.extraction_runs_pg import cap_skips
+
+            self._resolve().finish(
+                self.run_id,
+                status=status,
+                report=report or {},
+                skips=cap_skips(_skip_rows(stats), total=_skip_total(stats)),
+                # No LLM detector is wired into the crawl's anonymize seam
+                # yet (design §7.2), so no tokens are spent and none are
+                # reported. `{}` means "none spent" — a different claim
+                # from "$0.00", and the UI must keep saying so.
+                usage={},
+                files_seen=stats.items_seen,
+                files_done=stats.items_done,
+                error=error,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sharepoint crawl: run finalize failed (%s) — continuing", type(exc).__name__)
+
+
+def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
+    """The ABSOLUTE counters a live run may honestly show. No fraction, no
+    percentage, no ETA: ``files_per_s`` counts only new+changed documents,
+    so a remaining-time figure derived from it is wrong by construction on
+    any run with a meaningful `unchanged` share."""
+    return {
+        "files_done": stats.items_done,
+        "new": stats.new,
+        "changed": stats.changed,
+        "unchanged": stats.unchanged,
+        "deleted": stats.deleted,
+        "downloads": stats.downloads,
+        "bytes_downloaded": stats.bytes_downloaded,
+        "bytes_downloaded_human": human_bytes(stats.bytes_downloaded),
+        "errors": stats.errors,
+        "http_429": stats.http_429,
+        "throttle_wait_s": round(stats.throttle_wait_s, 1),
+        "oversize_files": stats.oversize_files,
+        "elapsed_s": round(max(time.monotonic() - stats.started, 0.0), 1),
+    }
+
+
+def _skip_rows(stats: "CrawlStats") -> List[Dict[str, Any]]:
+    """The skips this run can name a PATH for. Only oversize skips keep
+    paths (`note_oversize`); convert/anonymize/permission refusals keep
+    counts alone, and are reported as counts by :func:`_skip_total` rather
+    than invented as rows."""
+    return [
+        {
+            "path": entry.get("path"),
+            "reason": "oversize",
+            "detail": f"{human_bytes(int(entry.get('size') or 0))} — over the size cap, never downloaded",
+        }
+        for entry in stats.oversize_largest
+    ]
+
+
+def _skip_total(stats: "CrawlStats") -> int:
+    """Every document this run did NOT index, path or no path — so "20
+    listed" can never be mistaken for "20 skipped"."""
+    return (
+        stats.oversize_files
+        + stats.convert_failed
+        + stats.anonymize_failed
+        + stats.excluded_subtree_skips
+        + stats.permission_skips
+    )
+
+
+def _record_status_for(exc: BaseException) -> str:
+    """Severity-first outcome for a crawl that raised.
+
+    A cancellation or a shutdown signal is an ``interrupted`` run — it did
+    what it did and the next run resumes from the persisted cTags. Anything
+    else is a ``failed`` run, and must never be softened into the benign
+    outcome.
+    """
+    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+        return "interrupted"
+    return "failed"
+
+
+# --------------------------------------------------------------------------
 # Run report
 # --------------------------------------------------------------------------
 
@@ -265,6 +430,14 @@ class CrawlStats:
     oversize_files: int = 0
     oversize_bytes: int = 0
     oversize_largest: List[Dict[str, Any]] = field(default_factory=list)
+    #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
+    #: Not in :meth:`report` — the report's contract is unchanged — but read
+    #: by the run recorder so a live run has honest ABSOLUTE counters (a
+    #: fraction would be a lie here: this crawl enumerates and processes in
+    #: lockstep per 200-row delta page, so the two are equal at every
+    #: checkpoint and there is no meaningful denominator to divide by).
+    items_seen: int = 0
+    items_done: int = 0
 
     def note_oversize(self, path: str, size: int) -> None:
         size = int(size or 0)
@@ -998,9 +1171,13 @@ async def _crawl_drive(
     stats: CrawlStats,
     max_file_mb: int,
     anonymization_key: Optional[bytes],
+    recorder: Optional["_RunRecorder"] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
-    persisted ``deltaLink``."""
+    persisted ``deltaLink``.
+
+    ``recorder`` (optional, defaults to no recording) rides the checkpoint
+    this function already writes — see :class:`_RunRecorder`."""
     delta_links: Dict[str, Any] = state["delta_links"]
     base = f"{target.delta_url}?$top={_DELTA_PAGE_SIZE}"
     url: Optional[str] = delta_links.get(target.state_key) or base
@@ -1048,6 +1225,7 @@ async def _crawl_drive(
         for item in page.get("value", []):
             if not isinstance(item, dict) or not item.get("id"):
                 continue
+            stats.items_seen += 1
             await _process_item(
                 item,
                 target=target,
@@ -1059,6 +1237,7 @@ async def _crawl_drive(
                 max_file_mb=max_file_mb,
                 anonymization_key=anonymization_key,
             )
+            stats.items_done += 1
 
         # Rows first, then the link: the deltaLink is persisted only after
         # everything the page produced is ingested and its cTags are on disk,
@@ -1072,6 +1251,12 @@ async def _crawl_drive(
             next_link = page.get("@odata.nextLink")
             save_state(connection_id, state)
             url = _require_graph_url(str(next_link)) if next_link else None
+        # The SAME checkpoint boundary, a second destination — no new write
+        # loop and no new frequency (design §7.1). It runs after the state
+        # file, so a recorder failure can never cost the crawl its resume
+        # point.
+        if recorder is not None:
+            recorder.checkpoint(stats)
 
 
 def _confirmed_scopes(connection: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1116,6 +1301,7 @@ async def _run_crawl_async(
     connection: Dict[str, Any],
     *,
     only_scope_ids: Optional[Sequence[str]] = None,
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     scopes = _confirmed_scopes(connection)
@@ -1141,6 +1327,10 @@ async def _run_crawl_async(
     ingestor = _Ingestor()
     state = load_state(connection_id)
     scope_errors: List[Dict[str, Any]] = []
+    # Opened BEFORE the first request so a run that dies in its first scope
+    # is still a rendered row rather than a silence (design §4.3).
+    recorder = _RunRecorder(connection_id, job_id=job_id)
+    recorder.start()
 
     try:
         for scope in scopes:
@@ -1174,13 +1364,24 @@ async def _run_crawl_async(
                     stats=stats,
                     max_file_mb=max_file_mb,
                     anonymization_key=anonymization_key,
+                    recorder=recorder,
                 )
-    except BaseException:
+    except BaseException as exc:
         # A crashed run still owes the operator its numbers and its state —
         # the rows are already ingested, so record what got done instead of
         # losing the pass.
-        state["last_run"] = stats.report(max_file_mb=max_file_mb, interrupted=True)
+        interrupted_report = stats.report(max_file_mb=max_file_mb, interrupted=True)
+        state["last_run"] = interrupted_report
         save_state(connection_id, state)
+        # Severity-first: only a cancellation records as `interrupted`; a
+        # crash records as `failed` with its message, so the card can never
+        # dress a broken run up as a benign one (see `_record_status_for`).
+        recorder.finish(
+            stats,
+            status=_record_status_for(exc),
+            report=interrupted_report,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         raise
 
     report = stats.report(max_file_mb=max_file_mb)
@@ -1188,6 +1389,7 @@ async def _run_crawl_async(
     report["scope_errors"] = scope_errors
     state["last_run"] = report
     save_state(connection_id, state)
+    recorder.finish(stats, status="done", report=report)
     logger.info(
         "sharepoint crawl: connection %s — %d new, %d changed, %d unchanged, %d deleted, "
         "%d errors, %d oversize skipped",
@@ -1215,6 +1417,12 @@ def run_builtin_crawl(payload: dict) -> dict:
     Returns the crawl report — the same dict persisted as ``last_run`` in
     this connection's crawl state, so the job result and the state file can
     never disagree about what a run did.
+
+    An optional ``job_id`` in the payload is recorded on the run row
+    (``extraction_runs.job_id``) so the card can join a run to its job's
+    lifecycle. Nothing supplies it today — the worker hands this handler the
+    job's PAYLOAD, not its id — so the column is honestly null rather than
+    guessed, and the liveness check falls back to checkpoint age.
     """
     connection_id = payload.get("connection_id")
     if not connection_id:
@@ -1227,7 +1435,13 @@ def run_builtin_crawl(payload: dict) -> dict:
         raise CrawlError(f"sharepoint crawl: connection {connection_id!r} not found or not a sharepoint connection")
 
     try:
-        return asyncio.run(_run_crawl_async(connection, only_scope_ids=payload.get("scopes")))
+        return asyncio.run(
+            _run_crawl_async(
+                connection,
+                only_scope_ids=payload.get("scopes"),
+                job_id=payload.get("job_id"),
+            )
+        )
     except SharePointSettingsError as exc:
         # Named cause, not a bare traceback — the same typed handling
         # `app/api/admin_sharepoint.py::_resolved_token` gives this error.
