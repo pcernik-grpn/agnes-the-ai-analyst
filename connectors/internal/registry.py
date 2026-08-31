@@ -92,9 +92,9 @@ def ensure_internal_tables_registered() -> set[str]:
                 # /admin/sync), so a more readable string than the
                 # lowercase "agnes" is worth setting. It feeds no
                 # analyst-facing grouping: the synthetic "Agnes
-                # Internal" card on Data Packages was removed in #333,
-                # and internal tables are excluded from all package
-                # surfaces since.
+                # Internal" card on Data Packages was removed in #333;
+                # since the seeded `agnes-usage` package (below) the
+                # tables are packageable like any other registered row.
                 bucket="Agnes Internal",
                 source_table=table.source_table,
                 query_mode="internal",
