@@ -348,6 +348,16 @@
       : '<span class="ag-status ag-status--draft">○ Draft</span>';
   }
 
+  /* A row the caller does not own (shared into one of their groups) names its
+     owner instead of offering controls that can only ever be refused —
+     `DELETE`/`PUT /api/v1/agents/{id}` require ownership, so a Delete or Save
+     on a shared row fails for everyone, admins included. `owner_name` comes
+     from the same list/read responses (absent on the caller's own rows). */
+  function ownedByHtml(a) {
+    return '<span class="ag-card-locked" title="Shared with you — only the owner can edit or delete it">' +
+      (a.owner_name ? 'Owned by ' + esc(a.owner_name) : 'Shared with you') + '</span>';
+  }
+
   var pageHead = document.getElementById('ag-page-head');
   // Collapse the whole .idx-head band (not just its content) so the builder
   // view doesn't leave an empty grey strip above the white surface band.
@@ -457,12 +467,17 @@
       '<div class="ag-card-foot">' +
         '<span class="ag-card-count">' + agentCounts(a) + '</span>' +
         '<span class="ag-card-acts">' + alt +
-          // The seeded default agent is not deletable (the API refuses it with
+          // A shared row is labeled with its owner — before this, another
+          // user's "Default" was indistinguishable from the caller's own, and
+          // their draft offered a Delete that could only ever 403. The seeded
+          // default agent is likewise not deletable (the API refuses it with
           // 400 default_agent_undeletable) — every chat session is attributed
           // to it. Render the reason in place of a control that cannot work.
-          (a.is_default
-            ? '<span class="ag-card-locked" title="Every chat is attributed to this agent">Default</span>'
-            : '<button type="button" class="ag-del" data-ag-del="' + esc(a.id) + '">Delete</button>') +
+          (a.mine === false
+            ? ownedByHtml(a)
+            : a.is_default
+              ? '<span class="ag-card-locked" title="Every chat is attributed to this agent">Default</span>'
+              : '<button type="button" class="ag-del" data-ag-del="' + esc(a.id) + '">Delete</button>') +
         '</span>' +
       '</div>' +
     '</div>';
@@ -901,7 +916,9 @@
   function loadSchedules(a) {
     var gen = ++schedGen;
     schedules = null; schedulesErr = null;
-    if (!a || !a.slug) { schedules = []; return Promise.resolve(); }
+    // Schedules are the owner's private machinery — the API refuses a
+    // non-owner (a shared agent's builder is view-only), so don't ask.
+    if (!a || !a.slug || a.mine === false) { schedules = []; return Promise.resolve(); }
     return fetch('/api/v1/agents/' + encodeURIComponent(a.slug) + '/schedules', { credentials: 'same-origin' })
       .then(function (r) {
         // Superseded while in flight — a newer load owns `schedules` now, and
@@ -1352,6 +1369,10 @@
         '<button type="button" class="cc-btn" data-ag-save' + busy + '>' +
           (saving ? 'Saving…' : 'Save as draft') + '</button>' + mark;
     }
+    // A shared (not owned) agent is view-and-chat only: every mutating route
+    // behind these buttons requires ownership, so Save / Mark ready / Delete
+    // could only ever fail. Name the owner instead of arming them.
+    if (a.mine === false) return statusPill(a) + ownedByHtml(a);
     return statusPill(a) +
       (dirty ? '<span class="ag-unsaved" title="Not saved yet">Unsaved changes</span>' : '') +
       // Same reason as the list card: the default agent has no delete.
