@@ -2823,9 +2823,7 @@ async def library_page(
                     # An entity already published to everyone has nothing left
                     # to grant, so only a private one is shareable.
                     share_type=(
-                        ResourceType.STORE_ENTITY.value
-                        if (s.get("visibility_status") or "") != "approved"
-                        else None
+                        ResourceType.STORE_ENTITY.value if (s.get("visibility_status") or "") != "approved" else None
                     ),
                     tags=[s["category"]] if s.get("category") else [],
                     owner_key=owner_key,
@@ -8503,17 +8501,23 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             "origin": settings.credential_source,
             "env_name": settings.credential_env,
             "set_at": settings.credential_set_at.isoformat() if settings.credential_set_at else None,
+            "auth_method": settings.auth_method,
             "error": None,
         }
-        meta = certificate_metadata(settings.private_key)
-        if meta["certificate"] is not None:
-            cert_cell.update(meta["certificate"])
+        if settings.auth_method == "client_secret":
+            # A client secret has no certificate to describe — the card
+            # renders the method label instead of thumbprint/expiry rows.
+            pass
         else:
-            # A resolvable-but-unusable certificate (no CERTIFICATE PEM
-            # block, or one that fails to parse) — distinct from `error`
-            # above, which is a settings-RESOLUTION failure, not a content
-            # one.
-            cert_cell["metadata_reason"] = meta["reason"]
+            meta = certificate_metadata(settings.private_key)
+            if meta["certificate"] is not None:
+                cert_cell.update(meta["certificate"])
+            else:
+                # A resolvable-but-unusable certificate (no CERTIFICATE PEM
+                # block, or one that fails to parse) — distinct from `error`
+                # above, which is a settings-RESOLUTION failure, not a content
+                # one.
+                cert_cell["metadata_reason"] = meta["reason"]
         cell["certificate"] = cert_cell
     except Exception as e:
         # Logged, not just rendered: this block swallowed a real type bug

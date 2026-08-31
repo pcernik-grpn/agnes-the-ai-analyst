@@ -1623,8 +1623,17 @@ def _run_corpus_extraction(payload: dict) -> dict:
         **_extraction_producer_env(),
         "AGNES_SHAREPOINT_TENANT_ID": settings.tenant_id,
         "AGNES_SHAREPOINT_CLIENT_ID": settings.client_id,
-        "AGNES_SHAREPOINT_PRIVATE_KEY": settings.private_key,
     }
+    # Exactly one credential key, matching the connection's auth_method — an
+    # empty AGNES_SHAREPOINT_PRIVATE_KEY placeholder next to a client secret
+    # would read as "certificate configured but blank" to the producer. The
+    # method marker keeps the producer's dispatch explicit rather than
+    # inferred from which variable happens to be set.
+    child_env["AGNES_SHAREPOINT_AUTH_METHOD"] = settings.auth_method
+    if settings.auth_method == "client_secret":
+        child_env["AGNES_SHAREPOINT_CLIENT_SECRET"] = settings.client_secret
+    else:
+        child_env["AGNES_SHAREPOINT_PRIVATE_KEY"] = settings.private_key
     if corpus_id:
         child_env["AGNES_EXTRACTION_CORPUS_ID"] = str(corpus_id)
 

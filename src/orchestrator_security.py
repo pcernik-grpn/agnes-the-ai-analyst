@@ -94,10 +94,15 @@ _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
 # them in, so they are never listed twice.
 _CONFIG_SECRET_ONLY_ENVS: frozenset[str] = frozenset(
     {
-        # PEM private key for a SharePoint app registration's certificate —
-        # Microsoft Graph refuses client secrets for app-only access, so the
-        # certificate IS the credential (connectors.sharepoint.settings).
+        # PEM cert+key for a SharePoint app registration's certificate
+        # credential — the default and only universal method (legacy
+        # SharePoint REST app-only refuses client secrets; Microsoft Graph
+        # accepts both) (connectors.sharepoint.settings).
         "SHAREPOINT_CERT_PRIVATE_KEY",
+        # Entra client secret for auth_method="client_secret" connections —
+        # covers the Graph-only calls Agnes itself makes
+        # (connectors.sharepoint.settings).
+        "SHAREPOINT_CLIENT_SECRET",
         # Decrypts SNOWFLAKE_PRIVATE_KEY locally before the ATTACH — never
         # sent as the TOKEN itself (connectors.snowflake.settings).
         "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",

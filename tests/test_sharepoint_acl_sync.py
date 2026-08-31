@@ -140,7 +140,7 @@ def _audit_count(action_prefix: str = None, action: str = None) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def _fake_get_app_token(tenant_id, client_id, private_key):
+async def _fake_get_app_token(tenant_id, client_id, private_key, *, client_secret=""):
     return "fake-token"
 
 
@@ -458,7 +458,7 @@ class TestConfigPatchRaceRegression:
             _members_fake({"g-1": [{"mail": "frank@example.com", "userPrincipalName": "frank@example.com"}]}),
         )
 
-        async def _token_then_concurrent_sweep_write(tenant_id, client_id, private_key):
+        async def _token_then_concurrent_sweep_write(tenant_id, client_id, private_key, *, client_secret=""):
             # The sync has already read its `connection` snapshot (in
             # `_run_acl_sync_async`) by the time it gets here — this is the
             # earliest point in `_sync_connection`'s body we can hook to

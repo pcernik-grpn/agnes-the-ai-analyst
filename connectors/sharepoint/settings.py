@@ -48,6 +48,17 @@ logger = logging.getLogger(__name__)
 #: still be on the shared allowlist.
 SHAREPOINT_CERT_PRIVATE_KEY_ENV = "SHAREPOINT_CERT_PRIVATE_KEY"
 
+#: Default env var for ``auth_method="client_secret"`` connections — same
+#: role as :data:`SHAREPOINT_CERT_PRIVATE_KEY_ENV` above, overridden per
+#: connection via ``config.client_secret_env`` (allowlist-gated).
+SHAREPOINT_CLIENT_SECRET_ENV = "SHAREPOINT_CLIENT_SECRET"
+
+#: ``config.auth_method`` vocabulary. Certificate is the default and the only
+#: universal one (legacy SharePoint REST app-only refuses client secrets);
+#: ``client_secret`` covers the Graph-only calls Agnes itself makes with a
+#: single-line credential that needs none of the PEM ergonomics.
+_AUTH_METHODS = ("certificate", "client_secret")
+
 _REQUIRED_IDENTITY_FIELDS = ("tenant_id", "client_id")
 
 
@@ -85,6 +96,14 @@ class SharePointSettings:
     #: none is invented). The source card's certificate row (spec §13.2)
     #: shows this alongside ``credential_source``, never the value.
     credential_set_at: Optional[datetime] = None
+    #: ``"certificate"`` (default — ``private_key`` holds the combined PEM)
+    #: or ``"client_secret"`` (``client_secret`` holds the value and
+    #: ``private_key`` is empty).
+    auth_method: str = "certificate"
+    #: The Entra client secret for ``auth_method="client_secret"`` — same
+    #: opaque-secret-material posture as ``private_key``: this module never
+    #: parses or logs it.
+    client_secret: str = ""
 
 
 def _vault_secret(connection_id: str) -> Optional[str]:
@@ -129,11 +148,13 @@ def _vault_secret_updated_at(connection_id: str) -> Optional[datetime]:
         return None
 
 
-def _env_secret(env_name: str) -> str:
-    """Read a named env var, refusing any name outside the shared allowlist."""
+def _env_secret(env_name: str, field: str = "cert_private_key_env") -> str:
+    """Read a named env var, refusing any name outside the shared allowlist.
+    ``field`` names the config field the name came from, so the error blames
+    the right one (``cert_private_key_env`` vs ``client_secret_env``)."""
     if not is_config_secret_env_allowed(env_name):
         raise SharePointSettingsError(
-            f"cert_private_key_env={env_name!r} is not an allowed credential variable. "
+            f"{field}={env_name!r} is not an allowed credential variable. "
             "Add it to AGNES_CONFIG_SECRET_ENVS if the deployment really injects "
             "the SharePoint certificate under that name, or upload the certificate to "
             "the connection instead."
@@ -177,7 +198,9 @@ def resolve_sharepoint_settings(connection: Dict[str, Any]) -> SharePointSetting
 
     Order: identity fields first (a typo there is the likeliest mistake and
     costs nothing to report), then the credential — vault, then the named
-    environment variable.
+    environment variable. ``config.auth_method`` picks which credential the
+    resolved value IS: the combined cert+key PEM (default) or an Entra
+    client secret.
     """
     config = connection.get("config") or {}
 
@@ -185,22 +208,44 @@ def resolve_sharepoint_settings(connection: Dict[str, Any]) -> SharePointSetting
     if missing:
         raise SharePointSettingsError("SharePoint connection is missing required field(s): " + ", ".join(missing))
 
+    auth_method = str(config.get("auth_method") or "certificate").strip() or "certificate"
+    if auth_method not in _AUTH_METHODS:
+        raise SharePointSettingsError(
+            f"auth_method {auth_method!r} is not supported — expected one of {', '.join(_AUTH_METHODS)}"
+        )
+    is_secret = auth_method == "client_secret"
+
+    tenant_id = str(config["tenant_id"]).strip()
+    client_id = str(config["client_id"]).strip()
+
     connection_id = connection.get("id") or ""
     vault_value = _vault_secret(connection_id)
     if vault_value:
         return SharePointSettings(
-            tenant_id=str(config["tenant_id"]).strip(),
-            client_id=str(config["client_id"]).strip(),
-            private_key=vault_value,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            private_key="" if is_secret else vault_value,
+            client_secret=vault_value if is_secret else "",
+            auth_method=auth_method,
             credential_source="vault",
             credential_set_at=_vault_secret_updated_at(connection_id),
         )
 
-    env_name = str(config.get("cert_private_key_env") or "").strip() or SHAREPOINT_CERT_PRIVATE_KEY_ENV
+    if is_secret:
+        env_name = str(config.get("client_secret_env") or "").strip() or SHAREPOINT_CLIENT_SECRET_ENV
+        # The client secret is opaque single-line material — the base64-PEM
+        # transport decode is a certificate concern and never applies (it
+        # only rewrites values whose decode contains a PEM marker anyway).
+        secret_value = _env_secret(env_name, field="client_secret_env")
+    else:
+        env_name = str(config.get("cert_private_key_env") or "").strip() or SHAREPOINT_CERT_PRIVATE_KEY_ENV
+        secret_value = _env_secret(env_name)
     return SharePointSettings(
-        tenant_id=str(config["tenant_id"]).strip(),
-        client_id=str(config["client_id"]).strip(),
-        private_key=_env_secret(env_name),
+        tenant_id=tenant_id,
+        client_id=client_id,
+        private_key="" if is_secret else secret_value,
+        client_secret=secret_value if is_secret else "",
+        auth_method=auth_method,
         credential_source="env",
         credential_env=env_name,
     )
