@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 # `runner` is imported for the stdin-protocol constants it defines (the
 # UNATTENDED approval decision) — it is stdlib-only at import time and does
@@ -34,7 +35,16 @@ from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.coordination.leases import default_holder_id
 from src.llm_pricing import cost_usd
-from src.repositories import agents_repo, llm_usage_repo, ticket_repo, usage_repo, users_repo
+from src.repositories import (
+    RequiresPostgresBackend,
+    agents_repo,
+    llm_usage_repo,
+    ticket_repo,
+    usage_repo,
+    usage_turns_repo,
+    use_pg,
+    users_repo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -639,6 +649,79 @@ class ChatManager:
             logger.warning(
                 "daily token budget: coordination backend unavailable; turn's tokens not recorded for %s",
                 user_email,
+            )
+
+    def _record_turn_usage(self, live: LiveSession, frame: dict) -> None:
+        """Record one completed assistant turn in ``usage_turns``.
+
+        This is the only place a chat turn's PROMPT-CACHE figures are kept.
+        ``chat_messages`` cannot grow columns for them (the DuckDB app-state
+        ladder is frozen under A3), and a chat's session jsonl is exported
+        only when the session ends — so before this write a live chat's
+        cached-context volume, the dominant term in a long session's cost,
+        was simply unmeasured. Writing here also covers every surface at
+        once: web, Slack, Telegram and the agent runtime all funnel their
+        turns through this one frame-persist seam.
+
+        Never raises and never blocks the turn on telemetry:
+
+        * ``usage_turns`` is Postgres-only by construction (A3), so on a
+          DuckDB app-state instance there is nothing to write to — that is a
+          supported configuration, and it stays silent rather than warning on
+          every single turn;
+        * any other failure is logged at WARNING and swallowed. The user's
+          answer is already persisted at this point; losing a measurement
+          must never cost them the turn.
+        """
+        token_fields = ("tokens_in", "tokens_out", "cache_read_tokens", "cache_creation_tokens")
+        if all(frame.get(field_name) is None for field_name in token_fields):
+            # Some producers (the engine provider) emit an assistant message
+            # with no usage on it at all. Storing zeros would assert a
+            # measurement nobody made — and would drag every average down.
+            return
+        try:
+            if not use_pg():
+                return
+            user_id: Optional[str] = None
+            with contextlib.suppress(Exception):
+                # Identity is best-effort: a turn from an address with no
+                # `users` row is still worth measuring, just unattributed.
+                user_id = (users_repo().get_by_email(live.user_email) or {}).get("id")
+            usage_turns_repo().insert_batch(
+                [
+                    {
+                        # Same key the session export writes its jsonl under
+                        # (``chat-<chat_id>.jsonl``), so a chat's live turns
+                        # and its later session summary describe one session.
+                        "session_file": f"chat-{live.chat_id}.jsonl",
+                        "session_id": str(live.chat_id),
+                        "user_id": user_id,
+                        # The value `chat_sessions.surface` holds — web /
+                        # slack_dm / slack_thread / telegram / api.
+                        "surface": live.surface,
+                        # A fresh id per turn: chat turns are written exactly
+                        # once, live, so this is a unique key rather than the
+                        # dedup key it is for the (re-runnable) jsonl walker.
+                        "turn_uuid": str(uuid4()),
+                        "model": frame.get("model"),
+                        "input_tokens": int(frame.get("tokens_in") or 0),
+                        "output_tokens": int(frame.get("tokens_out") or 0),
+                        "cache_read_tokens": int(frame.get("cache_read_tokens") or 0),
+                        "cache_creation_tokens": int(frame.get("cache_creation_tokens") or 0),
+                        "occurred_at": datetime.now(timezone.utc),
+                    }
+                ]
+            )
+        except RequiresPostgresBackend:
+            # The use_pg() guard above normally keeps us out of here; a
+            # backend declared mid-process can still land on it. Expected
+            # configuration, not a fault — stay quiet.
+            return
+        except Exception:
+            logger.warning(
+                "usage_turns write failed for chat turn in %s (non-fatal)",
+                live.chat_id,
+                exc_info=True,
             )
 
     @staticmethod
@@ -2356,6 +2439,10 @@ class ChatManager:
                     frame.get("tokens_out"),
                     frame.get("cache_creation_tokens"),
                 )
+                # ...and into the per-turn usage table, AFTER the budget
+                # counter above: that counter gates the user's next turn, so
+                # it must never queue behind a telemetry write.
+                self._record_turn_usage(live, frame)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
                 # Auto-title: the first assistant_message in a session
