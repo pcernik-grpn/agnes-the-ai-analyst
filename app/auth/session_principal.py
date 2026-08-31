@@ -9,8 +9,8 @@ carries no participant identity (SR-4), so this object is always live-fresh.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, field
+from typing import Mapping, Union
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,22 @@ class ProducerPrincipal:
     connection_id: str
     collection_ids: frozenset[str]
     jti: str
+
+    #: EMPTY, and deliberately so — this principal has no grant-table
+    #: authority at all. It exists because ``PRINCIPAL_TYPES`` conflates two
+    #: questions its members are branched on: "not a full user dict?" (true
+    #: here) and "read its ``intersection``?" (meaningless here). Five sites
+    #: ask the first and then do the second —``src.rbac.get_accessible_ids``,
+    #: ``src.marketplace_filter``, ``app.services.stack_resolver``,
+    #: ``app.api.knowledge_search``, ``app.api.memory`` — so a member without
+    #: the attribute makes each an ``AttributeError`` (a 500) instead of a
+    #: clean deny. Unreachable today only because ``app.auth.producer_token``
+    #: fail-closes this principal to five endpoints none of those sit behind;
+    #: an empty mapping makes the seam TOTAL, so adding a sixth endpoint
+    #: denies rather than crashes. Never the authorization itself: that stays
+    #: the surface allowlist plus each endpoint's own explicit
+    #: ``connection_id``/``collection_ids`` check.
+    intersection: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 #: Either restricted principal. Consumers that mean "not a full user dict —

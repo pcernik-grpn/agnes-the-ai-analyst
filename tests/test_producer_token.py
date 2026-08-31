@@ -182,3 +182,42 @@ class TestResolveProducerPrincipal:
         request = _fake_request("POST", "/api/facts/ingest", {})
 
         assert resolve_producer_principal(token, request) is None
+
+
+class TestPrincipalTypesSeamIsTotal:
+    """``PRINCIPAL_TYPES`` conflates "not a full user dict" with "read its
+    ``intersection``". Five call sites ask the first and then do the second,
+    so every member must carry the attribute or those become an
+    ``AttributeError`` (a 500) instead of a clean deny."""
+
+    def test_every_principal_type_exposes_an_intersection(self):
+        import dataclasses
+
+        from app.auth.session_principal import PRINCIPAL_TYPES
+
+        missing = [
+            t.__name__ for t in PRINCIPAL_TYPES if "intersection" not in {f.name for f in dataclasses.fields(t)}
+        ]
+        assert not missing, (
+            f"{missing} are in PRINCIPAL_TYPES but carry no `intersection` — "
+            "src.rbac.get_accessible_ids and four sibling sites branch on "
+            "PRINCIPAL_TYPES and then read it, so such a member 500s there."
+        )
+
+    def test_a_producer_principal_denies_through_the_generic_grant_helpers(self):
+        from app.auth.access import can_access_session
+        from app.auth.session_principal import ProducerPrincipal
+        from src.rbac import get_accessible_ids
+
+        principal = ProducerPrincipal(
+            connection_id="conn-1",
+            collection_ids=frozenset({"col-a"}),
+            jti="jti-1",
+        )
+
+        # Denied even for a collection its OWN token names: the generic
+        # grant-table primitives are not where a producer's authority lives
+        # (that is the surface allowlist + each endpoint's own scope check),
+        # so they must answer "nothing", never crash and never widen.
+        assert get_accessible_ids(principal, "collection") == frozenset()
+        assert can_access_session(principal, "collection", "col-a") is False
