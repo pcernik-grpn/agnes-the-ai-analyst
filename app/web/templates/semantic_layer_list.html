@@ -35,6 +35,28 @@
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <style>
+/* ── The way back (#1898) ────────────────────────────────────────────────
+   This page is reached from the Library's Definitions block and from the
+   retired /catalog/semantics, and the rail has no Semantic-layer row of its
+   own — so without this link the browser's Back button was the only exit.
+   Same resolver and same 'semantics' key the retired page used, so both
+   entry points return the reader to the Definitions block that sent them
+   rather than to the top of a long Library.
+
+   `--ds-text-secondary`, not `--ds-text-muted` — muted is 3.67:1 on this
+   page's background, under the 4.5:1 AA floor for 13px text. */
+.sl-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ds-text-secondary);
+    text-decoration: none;
+}
+.sl-back:hover { color: var(--ds-text-primary); }
+.sl-back svg { width: 15px; height: 15px; }
+
 /* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
 .sl-head { margin: 2px 0 0; }
 .sl-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
@@ -392,6 +414,11 @@
 {% endblock %}
 
 {% block page_head %}
+{% set _back = detail_back('semantics', '/library', 'Library') %}
+<a class="sl-back" href="{{ _back.href }}">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  {{ _back.label }}
+</a>
 <div class="sl-head">
   <div class="sl-kicker">Semantic layer</div>
   <h1>Semantic models</h1>

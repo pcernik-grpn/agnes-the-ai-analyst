@@ -197,6 +197,22 @@ def _seed_document(slug: str, doc: dict, *, source: str = "manual") -> dict:
 
 
 class TestModelList:
+    def test_the_list_offers_a_way_back(self, seeded_app):
+        """It was a dead end (#1898).
+
+        The page is reached from the Library's Definitions block and from
+        /catalog/semantics; the rail has no Semantic-layer row (/library is its
+        one browse surface) and the page carried no back link, so the only route
+        out was the browser's Back button. It returns to the Definitions block
+        rather than to the top of the Library — the same `semantics` key
+        /catalog/semantics resolves, so the two pages leave by the same door."""
+        _seed_model()
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert '<a class="slb-back" href="/library#lib-defs">' in r.text
+        assert "Library" in r.text.split('class="slb-back"', 1)[1].split("</a>", 1)[0]
+
     def test_list_shows_counts_and_source_badge(self, seeded_app):
         _seed_model(source="manual")
         c = seeded_app["client"]

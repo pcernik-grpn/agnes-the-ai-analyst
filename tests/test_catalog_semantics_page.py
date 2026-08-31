@@ -844,3 +844,94 @@ class TestCatalogSemanticsDeepLinkIntoTheDocument:
         # ...and the consumer end is wired at all: without this read the term
         # arrives in the URL and the list renders unfiltered.
         assert "URLSearchParams(window.location.search).get('q')" in body
+
+
+class TestSemanticPagesAreWhiteSheets:
+    """The semantic layer pages are white, like the app around
+    them (#1898).
+
+    Both are reached from the Library's Definitions block, and the Library — like
+    every index page (`.idx`) and every admin page (`.container--full`) — paints
+    its shell `--ds-surface`. A semantic page that extends a base which does
+    not paint turned the canvas grey on the way in: two products, one journey.
+    Each of the three now lands on a white sheet through the shell it is
+    actually on — the index shell's own `.idx` rule, the shared
+    `body.page-sheet` modifier, or the `body.detail-page` family on the same
+    CSS rule — rather than by carrying a page background of its own, which is
+    what the design-system contract forbids and what would drift the moment one
+    of them was edited."""
+
+    # One assertion per page, naming the mechanism that actually paints it —
+    # the three pages sit on three different shells since the #1707 rebuild,
+    # and asserting a single `page-sheet` opt-in across all three would pass
+    # only by adding a redundant class to two pages that are already white.
+    def test_every_semantic_page_lands_on_a_white_sheet(self):
+        from pathlib import Path
+
+        tpl = Path("app/web/templates")
+
+        # The model list is on the index shell, whose `.idx` rule paints
+        # --ds-surface for every index page (My Stack, Catalog, Library).
+        lst = (tpl / "semantic_layer_list.html").read_text(encoding="utf-8")
+        assert '{% extends "base_index.html" %}' in lst
+        idx = Path("app/web/static/style-custom.css").read_text(encoding="utf-8")
+        assert "background: var(--ds-surface)" in idx.split(".idx {", 1)[1].split("}", 1)[0], (
+            "the index shell stopped painting its own surface — the model list "
+            "would fall back onto the grey canvas with nothing to say so"
+        )
+
+        # The model detail page is on `base_page.html`, which paints nothing of
+        # its own, so it is the one page that opts in by name.
+        detail = (tpl / "semantic_layer_detail.html").read_text(encoding="utf-8")
+        assert '{% extends "base_page.html" %}' in detail
+        assert '{% block body_attrs %}class="page-sheet"{% endblock %}' in detail
+
+        # The object page carries `detail-page`, which the same CSS rule covers.
+        obj = (tpl / "semantic_layer_object.html").read_text(encoding="utf-8")
+        assert '{% block body_attrs %}class="detail-page"{% endblock %}' in obj
+
+    def test_the_modifier_paints_the_body_and_outranks_the_theme(self):
+        """On the BODY, so it is full bleed — painting the padded `.container`
+        would leave grey gutters beside a white column. And with the extra
+        element in the selector, so it beats `[data-theme="paper"] body` (which
+        is what paints the grey) without depending on sheet order."""
+        from pathlib import Path
+
+        css = Path("app/web/static/style-custom.css").read_text(encoding="utf-8")
+        assert "html body.page-sheet,\nhtml body.detail-page { background: var(--ds-surface); }" in css, (
+            "the sheet rule must paint both the opt-in class and the detail-page family"
+        )
+        paper = Path("app/web/static/css/paper-skin.css").read_text(encoding="utf-8")
+        assert '[data-theme="paper"] body {' in paper, (
+            "the rule this one has to outrank has moved — re-check the specificity note"
+        )
+
+    # The app-side detail pages, named rather than globbed: `*_detail.html` also
+    # matches the admin ones (already white via `.container--full`) and the
+    # semantic-layer document page (an opt-in above, since it is not on the
+    # shared detail shell).
+    DETAIL_FAMILY = (
+        "catalog_package_detail.html",
+        "catalog_table_detail.html",
+        "catalog_recipe_detail.html",
+        "marketplace_plugin_detail.html",
+        "marketplace_item_detail.html",
+        "data_app_detail.html",
+        "library_detail.html",
+        "library_file_detail.html",
+        "memory_domain_detail.html",
+    )
+
+    def test_the_detail_page_family_is_on_the_same_rule(self):
+        """These nine already carry `body.detail-page` for their footer treatment,
+        so they join the sheet by that marker rather than by nine separate
+        opt-ins — one selector, and nothing to forget when a tenth is written.
+
+        The assertion is that the marker is still what they all carry: the day one
+        of them drops it, it silently drops back onto the grey canvas."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates")
+        for name in self.DETAIL_FAMILY:
+            text = (tpl / name).read_text(encoding="utf-8")
+            assert 'class="detail-page"' in text, f"{name} lost the class that paints its sheet"
