@@ -1232,6 +1232,11 @@ _EXEMPT: dict[str, str] = {
         "2026-08-30 plan Task 5) — admin/scheduler maintenance op, mirrors the "
         "extract/run-due exemptions above; no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
+        "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "
+        "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "
+        "the acl-sync exemption right above; no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.

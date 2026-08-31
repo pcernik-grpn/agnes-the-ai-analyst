@@ -279,4 +279,68 @@ grep -q "pg_dump" "$transcript" && fail "D: pg_dump must not run when the postgr
 echo "OK: D — persisted side_car backend with no running container skips pg_dump (container-presence gate)"
 rm -rf "$tmp"
 
+# =====================================================================
+# Scenario E: side-car backend with NO system.duckdb at all — a PG-native
+# instance (born on Postgres) or one whose frozen post-migration snapshot
+# was retired. The DuckDB half must SKIP (not FAIL): STATUS=SKIPPED, no
+# webhook, exit 0 — while the pg_dump + restore-canary half still runs.
+# =====================================================================
+run_scenario E
+cat > "$instance_yaml" <<'YAML'
+database:
+  backend: side_car
+YAML
+rm "$tmp/data/state/system.duckdb"
+
+TRANSCRIPT="$transcript" CURL_CALLED="$curl_called_file" \
+    AGNES_DB_BACKUP_INSTANCE_YAML="$instance_yaml" \
+    AGNES_DB_BACKUP_POSTGRES_CONTAINER="agnes-postgres-1" \
+    FAKE_PG_CONTAINER_UP=1 \
+    WEBHOOK_URL="https://example.invalid/webhook" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed" || fail "E: script must exit 0 when there is no system.duckdb to back up"
+
+dated_dest="$tmp/data/backups/system-duckdb/$(date -u +%Y%m%d)"
+grep -q '^SKIPPED ' "$dated_dest/STATUS" || fail "E: STATUS must read SKIPPED (got: $(cat "$dated_dest/STATUS" 2>/dev/null))"
+grep -q '^OK ' "$dated_dest/PG_STATUS" || fail "E: pg half must still run and pass (got: $(cat "$dated_dest/PG_STATUS" 2>/dev/null))"
+grep -qF "docker exec agnes-postgres-1 pg_dump -U agnes -F c agnes" "$transcript" \
+    || fail "E: pg_dump must still run without a DuckDB file"
+grep -q "docker exec agnes-app-1 python" "$transcript" \
+    && fail "E: the DuckDB verify must not run against a file that does not exist"
+grep -q "curl-called" "$curl_called_file" && fail "E: a skipped DuckDB half must not alert"
+grep -q "verify=SKIPPED" "$tmp/agnes-watchdog.log" || fail "E: log line must say verify=SKIPPED"
+echo "OK: E — missing system.duckdb skips the DuckDB half cleanly while the pg canary still runs"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario F: NO system.duckdb and NO Postgres side-car — a DuckDB-backend
+# instance whose state file has vanished (deleted, broken mount, disk not
+# mounted). This is the catastrophe the unit exists to catch, so it must
+# NOT be reported as a skip: STATUS=FAILED, the webhook fires, exit
+# non-zero. Scenario E's skip is legitimate only BECAUSE Postgres holds
+# the state instead; without a side-car there is no such second copy.
+# =====================================================================
+run_scenario F
+cat > "$instance_yaml" <<'YAML'
+database:
+  backend: duckdb
+YAML
+rm "$tmp/data/state/system.duckdb"
+
+TRANSCRIPT="$transcript" CURL_CALLED="$curl_called_file" \
+    AGNES_DB_BACKUP_INSTANCE_YAML="$instance_yaml" \
+    AGNES_DB_BACKUP_POSTGRES_CONTAINER="agnes-postgres-1" \
+    WEBHOOK_URL="https://example.invalid/webhook" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed" && fail "F: a DuckDB-backend instance with no system.duckdb must exit non-zero"
+
+dated_dest="$tmp/data/backups/system-duckdb/$(date -u +%Y%m%d)"
+grep -q '^FAILED ' "$dated_dest/STATUS" \
+    || fail "F: STATUS must read FAILED, not SKIPPED (got: $(cat "$dated_dest/STATUS" 2>/dev/null))"
+[ -f "$dated_dest/PG_STATUS" ] && fail "F: no side-car, so there must be no PG_STATUS"
+grep -q "curl-called" "$curl_called_file" \
+    || fail "F: losing the only copy of the app state must alert"
+echo "OK: F — a vanished system.duckdb on a DuckDB-backend instance still FAILS and alerts"
+rm -rf "$tmp"
+
 echo "OK"

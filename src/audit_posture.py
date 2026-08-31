@@ -163,6 +163,10 @@ POSTURE: dict[str, str] = {
     # trigger. Handler writes nothing itself; the fallback middleware emits
     # this cataloged action on its behalf (src/audit_events.py CATALOG).
     "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync": "sharepoint_acl.sync_triggered",
+    # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
+    # subtrees now" trigger. Same "handler writes nothing itself; fallback
+    # middleware emits" posture as the acl-sync trigger right above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/subtree-sweep": "sharepoint_acl.sweep_triggered",
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
