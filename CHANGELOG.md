@@ -538,6 +538,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **A semantic source stranded on the retired `databricks_semantic` adapter name is repaired automatically.** The first cut of the Databricks metric-view auto-migration stamped its `databricks_default` row with `adapter='databricks_semantic'`; the adapter was renamed to `databricks_metric_views` the next day with no repair for rows already written, so an instance that deployed the in-between build kept a semantic source failing "unknown semantic adapter" on every sweep, forever — even with no Databricks workspace configured, since the creation gate landed only alongside the rename. `ensure_semantic_source()` now renames such a row in place on the next sweep (everything an admin shaped on the row survives), after which an unconfigured workspace is skipped (`skipped_not_configured`) like any other.
 - **The catalog's `fetch_via` hint for internal tables promised a local path that does not exist.** `query_mode='internal'` rows (`agnes_sessions`/`agnes_telemetry`/`agnes_audit`) claimed they become queryable locally "after the usage export + `agnes pull`" — no such export exists, and both `agnes pull` and the signed-URL sync API refuse internal tables. The hint now says server-side only.
 - A chat turn ended by the idle watchdog now persists its prompt-cache tokens like any other turn. The partial-save path carried only `tokens_in`/`tokens_out`, so it under-counted both the measured cost and the daily budget for precisely the turns most likely to be expensive.
 

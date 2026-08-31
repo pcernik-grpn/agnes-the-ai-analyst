@@ -44,6 +44,14 @@ DATABRICKS_SEMANTIC_SOURCE_NAME = "Databricks metric views"
 # forgotten: `purge_legacy_metric_rows()` reconciles rows still carrying it.
 LEGACY_METRIC_SOURCE = "databricks_semantic_layer"
 
+# The adapter name this module's first cut stamped on the row it auto-created,
+# before the adapter was renamed to `databricks_metric_views` — with no repair
+# for rows already written. An instance that ran the in-between build carries a
+# source that fails "unknown semantic adapter" on every sweep, forever: the
+# rename happened in "unreleased" code, but instances deploying from main had
+# already executed it. `ensure_semantic_source()` renames such a row in place.
+RETIRED_SEMANTIC_ADAPTER = "databricks_semantic"
+
 
 def _resolve_row_token(connection: dict[str, Any], token_env: str) -> str:
     """Vault-first (this connection's own vault slot), then the named env
@@ -234,7 +242,16 @@ def ensure_semantic_source() -> str | None:
     an admin may be one credential away from using again.
 
     Never a get-or-*replace*: an existing row keeps whatever an admin did to
-    it (rename, disable, narrower ``config.catalogs``).
+    it (rename, disable, narrower ``config.catalogs``). The ONE field it does
+    repair is an ``adapter`` still carrying :data:`RETIRED_SEMANTIC_ADAPTER` —
+    that spelling was only ever written by this function's first cut (the
+    create API has refused it since it stopped being registered), so it is a
+    leftover of ours, not an admin's choice, and leaving it strands the row in
+    an "unknown semantic adapter" failure on every sweep. On an instance with
+    no workspace the rename is still the right move: the sweep's
+    ``unconfigured_reason`` check only answers for an adapter it can resolve,
+    so the repaired row is *skipped* (``skipped_not_configured``) instead of
+    erroring forever.
 
     No ``config.provenance`` override — Databricks already writes under the
     generic ``ossie_connection`` provenance since the Track D6 cutover, so an
@@ -247,6 +264,13 @@ def ensure_semantic_source() -> str | None:
     repo = semantic_source_repo()
     existing = repo.get(DATABRICKS_SEMANTIC_SOURCE_ID)
     if existing is not None:
+        if (existing.get("adapter") or "").strip() == RETIRED_SEMANTIC_ADAPTER:
+            repo.update(DATABRICKS_SEMANTIC_SOURCE_ID, adapter="databricks_metric_views")
+            logger.info(
+                "databricks semantic source %s: repaired retired adapter %r -> 'databricks_metric_views'",
+                DATABRICKS_SEMANTIC_SOURCE_ID,
+                RETIRED_SEMANTIC_ADAPTER,
+            )
         return DATABRICKS_SEMANTIC_SOURCE_ID
     if resolve_databricks_settings() is None:
         return None
