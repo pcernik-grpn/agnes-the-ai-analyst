@@ -4,7 +4,7 @@ motivating case).
 
 The existing `runtime_secret_env` writes `<ENV>=<fetched>` as one .env line,
 which a multiline value breaks three ways at once: the .env format itself,
-`agnes-auto-upgrade.sh`'s `set -a; . .env` bash source, and docker compose's
+the startup script's own `set -a; . .env` bash source, and docker compose's
 env_file parsing (multiline support varies by compose version). The multiline
 variant therefore base64-encodes the fetched value into a single line, and
 the app-side consumer (`connectors/sharepoint/settings._env_secret`) decodes

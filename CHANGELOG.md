@@ -363,6 +363,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - SharePoint ACL sync now runs every N hours (`acl_sync.interval_hours`, default 4) and the broken-inheritance sweep daily (`acl_sync.sweep_interval_days` default lowered 7 → 1) — source-side revocation and detection windows are hours-scale. New `acl_sync.zones_enabled` switch (default off) prepares permission zones.
 - SharePoint producer handoff: the corpus map now carries permission-zone keys (nested under their parent scope; resolver must match longest-prefix-first) and the exclusion env list may contain unique-permission file ids.
+- **One type scale for a page head — the title and the sentence under it.**
+  The lede was the worse half: it rendered three different sizes depending on
+  where it was written — 15px on a `page_hero_plain` header (most of
+  `/admin/*`), 15px in the hand-built `/agents` and `/chats` heads, and, on a
+  page that wrote a bare `<p class="lede">` with no rule behind it
+  (`/me/activity`, `/me/connections`, `/semantic-layer`, `/marketplace/guide`,
+  `/library/builder`), whatever the browser gives a paragraph — the largest of
+  the three. The `<h1>` above it was 24px everywhere except `/library`.
+
+  Both halves are now one rule each in `style-custom.css`, at the `/library`
+  sizes because that page sized the two as a pair: `.page-title` at 22px and
+  `.page-lede` at 13px `--ds-text-muted`, capped at 68ch. A plain-variant
+  header picks both up through `page_hero_title` / `page_hero_subtitle`; a
+  hand-built head opts in by class. Every page-scoped copy of the type scale
+  is gone, so a new page inherits the head instead of guessing it — while a
+  head's own LAYOUT (the flex row `/library`, `/agents` and `/library/builder`
+  use for a badge beside the name, `overflow-wrap` on `/profile` and the admin
+  user detail) stays page-local. `/home`'s marketing hero writes the bare
+  `.lede` class and deliberately keeps its own larger type.
+
+
 - **The Library's Definitions footer is now a Semantic models section, and the
   metric/glossary page folded into `/semantic-layer` (#1707).** Three changes
   to one surface:
@@ -546,6 +567,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - SharePoint tree listings now follow Graph paging — folders with more than ~200 children were only partially browsed and, in the ACL subtree sweep, only partially probed for broken permission inheritance.
 - Removing a SharePoint scope now deletes the ACL sync's own mirrored grants for its collection instead of leaving them dangling.
 - **The SharePoint connect wizard now works for app registrations holding only `Sites.Selected`.** That permission 403-forbids all site discovery by design, so the wizard's site picker dead-ended with a generic "SharePoint did not answer" even when the certificate was fine. The sites level gains an "Add a site by URL" fallback (`GET /api/admin/sharepoint/connections/{id}/tree?site_url=…`, Graph by-path addressing — a pasted deep link is trimmed to its site), sites added this way accumulate and render as ordinary rows, and a Graph 403 on discovery or on a named site is now a typed, actionable error (`sharepoint_discovery_forbidden` / `sharepoint_site_not_granted`) instead of reading as an outage.
+- **The customer-instance module's `runtime_secret_env` no longer corrupts `/opt/agnes/.env` on a hostile-shaped secret value.** A multiline value (a PEM, an SA-key JSON) mapped through the plain map by mistake was written raw, breaking every following `.env` line — and the startup script's own `set -a; . .env` then executed the value's lines as commands at boot. The startup script now refuses a multiline value (blanked, with a boot-log warning pointing at `runtime_secret_env_multiline`) and writes single-line values double-quoted with `\` `"` `$` and backtick escaped, the one escape set bash sourcing and docker compose's dotenv parser unescape identically — so a value containing spaces, quotes, `$` or backticks now survives both consumers instead of aborting the boot or being mangled.
 - **The catalog's `fetch_via` hint for internal tables promised a local path that does not exist.** `query_mode='internal'` rows (`agnes_sessions`/`agnes_telemetry`/`agnes_audit`) claimed they become queryable locally "after the usage export + `agnes pull`" — no such export exists, and both `agnes pull` and the signed-URL sync API refuse internal tables. The hint now says server-side only.
 - A chat turn ended by the idle watchdog now persists its prompt-cache tokens like any other turn. The partial-save path carried only `tokens_in`/`tokens_out`, so it under-counted both the measured cost and the daily budget for precisely the turns most likely to be expensive.
 
