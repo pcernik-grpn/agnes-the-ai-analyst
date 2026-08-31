@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from src.repositories import column_metadata_repo, glossary_repo, metric_repo
 from src.semantic.dialect import resolve_expression_any
@@ -95,7 +95,7 @@ def _agnes_payload(obj: dict) -> dict:
     return merged
 
 
-def _resolve_keboola_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
+def _resolve_keboola_table_row(table_ref: str, lookup: dict) -> dict | None:
     """The ``table_registry`` row a raw Keboola tableId (``bucket.table``)
     resolves to, via the ``(bucket, table) -> view name`` ``lookup``
     (:func:`connectors.keboola.semantic_layer.table_lookup_from_registry`).
@@ -147,7 +147,7 @@ def _generic_table_lookup() -> dict[tuple[str, str], str]:
     return lookup
 
 
-def _resolve_generic_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
+def _resolve_generic_table_row(table_ref: str, lookup: dict) -> dict | None:
     """The ``table_registry`` row a table identifier resolves to via a
     generic LAST-TWO-SEGMENTS split — the Snowflake/Databricks-shaped
     sibling of :func:`_resolve_keboola_table_row`.
@@ -176,7 +176,7 @@ def _resolve_generic_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
     return table_registry_repo().get_by_name(name)
 
 
-def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str]:
+def resolve_dataset_table(dataset: dict, source: str, conn=None) -> str | None:
     """The ``table_registry.id`` a dataset resolves to, or ``None`` when it
     can't be resolved — source-agnostic, used by both the metric-binding
     leg of :func:`project_document` (via :func:`_table_binder`) and
@@ -343,7 +343,7 @@ def _table_binder():
     if not kb_lookup and not generic_lookup:
         return None
 
-    def resolve(table_id: str) -> Optional[str]:
+    def resolve(table_id: str) -> str | None:
         row = _resolve_keboola_table_row(table_id, kb_lookup) if kb_lookup else None
         if row is None and generic_lookup:
             row = _resolve_generic_table_row(table_id, generic_lookup)
@@ -395,7 +395,7 @@ def _relationship_lookup_from_model(model: dict) -> dict:
 
 def _bind_metric(
     fragment: str, table_id: str, binder, kb_lookups, rel_lookup: dict
-) -> Optional[tuple[str, Optional[str], Optional[list]]]:
+) -> tuple[str, str | None, list | None] | None:
     """Resolve one metric's SQL against its declared table binding.
 
     Returns ``(sql, table_name, tables)`` or ``None`` (caller SKIPS). Four
@@ -439,7 +439,7 @@ def _bind_metric(
     return compose_sql(fragment, table_name), table_name, None
 
 
-def _constraints_for(metric_name: str, constraints: list) -> Optional[dict]:
+def _constraints_for(metric_name: str, constraints: list) -> dict | None:
     """The `validation` payload for one metric — the constraints whose
     `metrics[]` names it. Mirrors the legacy importer's `merge_constraints`
     output shape, which `agnes catalog --metrics --show` already renders."""
@@ -456,7 +456,7 @@ def _constraints_for(metric_name: str, constraints: list) -> Optional[dict]:
     return {"rules": rules} if rules else None
 
 
-def _check_name_collision(metric_name: str, metric_id: str, source: str, source_ref: Optional[str]) -> bool:
+def _check_name_collision(metric_name: str, metric_id: str, source: str, source_ref: str | None) -> bool:
     """True when ``metric_name`` is already held by a DIFFERENT metric id
     from a DIFFERENT (source, source_ref) scope — logged as a WARN, never a
     skip.
@@ -505,7 +505,7 @@ def _slugify(text: str) -> str:
     return _NON_ALNUM_RE.sub("_", text.lower()).strip("_")
 
 
-def _scoped_id(source: str, source_ref: Optional[str], *parts: str) -> str:
+def _scoped_id(source: str, source_ref: str | None, *parts: str) -> str:
     """A stable id unique per (source, source_ref, *parts) — re-projecting the
     same document produces the same ids (upsert, not duplicate); two
     source_refs of the same source never collide even when their models or
@@ -539,7 +539,7 @@ def _model_key(model: dict) -> str:
     return model.get("name") or ""
 
 
-def projected_metric_id(source: str, source_ref: Optional[str], model: dict, metric_name: str) -> str:
+def projected_metric_id(source: str, source_ref: str | None, model: dict, metric_name: str) -> str:
     """The ``metric_definitions.id`` :func:`project_document` writes for
     ``metric_name`` of ``model`` — the writer's own formula, exposed so a
     READER can map a flat row back to the document object it came from.
@@ -589,7 +589,7 @@ def _synonyms_of(ai_context: Any) -> list[str]:
     return []
 
 
-def _model_synonyms(model: dict) -> Optional[list[str]]:
+def _model_synonyms(model: dict) -> list[str] | None:
     """Model-level and dataset-level `ai_context.synonyms`, combined onto
     every metric of the model.
 
@@ -645,7 +645,7 @@ def project_document(
     document_json: dict,
     *,
     source: str,
-    source_ref: Optional[str],
+    source_ref: str | None,
     safe_prune: bool = False,
     partial: bool = False,
 ) -> ProjectionReport:
@@ -925,7 +925,7 @@ def project_document(
     return report
 
 
-def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) -> ProjectionReport:
+def prune_model(document_json: dict, *, source: str, source_ref: str | None) -> ProjectionReport:
     """Delete everything :func:`project_document` previously wrote for the
     model(s) declared in ``document_json`` — the write path's inverse, for
     when the document ITSELF is being deleted (not merely re-projected
@@ -991,8 +991,8 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
 
 
 def _sibling_column_claims(
-    source: str, source_ref: Optional[str], exclude_model_keys: set[str]
-) -> Optional[dict[str, set[str]]]:
+    source: str, source_ref: str | None, exclude_model_keys: set[str]
+) -> dict[str, set[str]] | None:
     """``table_id -> field names`` still claimed by the OTHER currently-stored
     valid models of this ``(source, source_ref)`` scope — the column prune's
     analogue of the ``model_prefixes`` narrowing the metric/glossary prunes
@@ -1050,7 +1050,7 @@ def _sibling_column_claims(
     return claims
 
 
-def _in_prune_scope(row_id: str, scope_prefixes: Optional[set[str]]) -> bool:
+def _in_prune_scope(row_id: str, scope_prefixes: set[str] | None) -> bool:
     """Whether an in-(source, source_ref) row is also inside the narrowed
     prune scope. ``None`` means "no narrowing" — the whole (source,
     source_ref), which is what reclaims a model deleted upstream. A set of id
@@ -1063,11 +1063,11 @@ def _in_prune_scope(row_id: str, scope_prefixes: Optional[set[str]]) -> bool:
 
 def _prune_metrics(
     source: str,
-    source_ref: Optional[str],
+    source_ref: str | None,
     written: set[str],
     *,
     safe_prune: bool = False,
-    scope_prefixes: Optional[set[str]] = None,
+    scope_prefixes: set[str] | None = None,
 ) -> int:
     repo = metric_repo()
     in_scope = {
@@ -1099,11 +1099,11 @@ def _prune_metrics(
 
 def _prune_glossary(
     source: str,
-    source_ref: Optional[str],
+    source_ref: str | None,
     written: set[str],
     *,
     safe_prune: bool = False,
-    scope_prefixes: Optional[set[str]] = None,
+    scope_prefixes: set[str] | None = None,
 ) -> int:
     repo = glossary_repo()
     # No list_all(): list(limit=...) with a high ceiling is the established
@@ -1134,9 +1134,9 @@ def _prune_glossary(
 def _prune_columns(
     source: str,
     written_by_table: dict[str, set[str]],
-    keep_by_table: Optional[dict[str, set[str]]] = None,
+    keep_by_table: dict[str, set[str]] | None = None,
     *,
-    source_ref: Optional[str] = None,
+    source_ref: str | None = None,
 ) -> None:
     """Prune fields dropped from a table this document still mentions.
 
@@ -1145,7 +1145,7 @@ def _prune_columns(
     than one being a stricter version of the other: the frozen DuckDB
     app-state schema (A3) has no ``column_metadata.source_ref`` column and
     cannot gain one, so a ``source_ref``-scoped prune only exists on
-    Postgres (``migrations/versions/0075_column_meta_source_ref.py``);
+    Postgres (``migrations/versions/0085_column_meta_source_ref.py``);
     ``use_pg()`` selects the read at call time rather than the caller
     choosing.
 

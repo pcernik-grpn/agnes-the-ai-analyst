@@ -4405,6 +4405,7 @@ async def semantic_layer_detail(
         source_label,
         warehouse_only_metric_count,
     )
+    from src.repositories import use_pg
 
     row = _readable_model_by_slug(slug, user, conn)
     if row is None:
@@ -4523,6 +4524,7 @@ async def semantic_layer_detail(
         and row.get("source_content_hash") != row.get("detach_base_hash"),
         status=row.get("status"),
         validation_errors=row.get("validation_errors") or [],
+        pg_backend=use_pg(),
         active_tab=active_tab,
         tabs=tabs,
         q=q,
@@ -8740,11 +8742,8 @@ def _keboola_credentialed() -> bool:
     return value is not None
 
 
-# The in-page lenses of /admin/semantic-layer. "coverage" (F4.1), "mute"
-# (F4.3) and "feedback" (F4.5) are built; "health" is the settled shape of the
-# section that follows, rendered as a named placeholder rather than left
-# invisible — a tab nobody can see is a tab the next author redesigns from
-# scratch.
+# The in-page lenses of /admin/semantic-layer: "coverage" (F4.1), "health"
+# (F4.2), "mute" (F4.3) and "feedback" (F4.5) — all four are fully built.
 _SEMANTIC_LAYER_ADMIN_TABS = ("coverage", "health", "mute", "feedback")
 
 _SEMANTIC_LAYER_ADMIN_TAB_LABELS = {

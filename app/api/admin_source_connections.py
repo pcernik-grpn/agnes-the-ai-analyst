@@ -1203,8 +1203,9 @@ def _semantic_reference_count(connection_id: str) -> int:
     the path every native adapter — Snowflake, Databricks, uploads/git —
     takes), or directly (``model.source_ref == connection_id``), which is
     what the Keboola metastore sync stamps
-    (``source='keboola_metastore'``) since it never creates a
-    ``semantic_sources`` row at all.
+    (``source='keboola_metastore'``). The auto-migration sweep may also
+    register a ``semantic_sources`` row for it now; projected rows still
+    key off the connection id directly, so this branch stays load-bearing.
     """
     from src.repositories import semantic_model_repo, semantic_source_repo
 

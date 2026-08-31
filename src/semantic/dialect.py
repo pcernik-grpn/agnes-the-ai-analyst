@@ -1,18 +1,28 @@
 """Pick the SQL a DuckDB-backed instance can actually run.
 
-Preference order is DUCKDB, then ANSI_SQL. Anything else is reported as
-unusable WITH ITS REASON rather than spliced into a query: a warehouse-specific
-fragment that happens to parse is more dangerous than one that fails.
+The vendored, pinned Ossie schema's ``$defs.Dialect`` enum only accepts
+``ANSI_SQL``, ``SNOWFLAKE``, ``MDX``, ``TABLEAU``, ``DATABRICKS``, ``MAQL``,
+``BIGQUERY`` — there is no ``DUCKDB`` value, so no document can actually
+declare ``dialect: DUCKDB`` today (it would fail schema validation). ANSI_SQL
+is therefore the only dialect that is both authorable and locally runnable.
+
+``_PREFERRED`` still lists DUCKDB ahead of ANSI_SQL as a dormant preference:
+cheap forward-compat for if/when the vendored schema grows a DUCKDB value, at
+zero cost today since it can never match. See
+``tests/test_semantic_dialect.py::test_vendored_schema_does_not_offer_duckdb_as_a_dialect``
+for the pin that flags the day this needs conscious re-activation.
+
+Anything not locally runnable is reported as unusable WITH ITS REASON rather
+than spliced into a query: a warehouse-specific fragment that happens to parse
+is more dangerous than one that fails.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
-_PREFERRED = ("DUCKDB", "ANSI_SQL")
+_PREFERRED = ("DUCKDB", "ANSI_SQL")  # DUCKDB is dormant — see module docstring
 
 
-def resolve_expression(expression: dict) -> Tuple[Optional[str], Optional[str]]:
+def resolve_expression(expression: dict) -> tuple[str | None, str | None]:
     dialects = (expression or {}).get("dialects") or []
     by_name = {
         d.get("dialect"): d.get("expression")
@@ -30,7 +40,7 @@ def resolve_expression(expression: dict) -> Tuple[Optional[str], Optional[str]]:
     return None, f"only warehouse-specific dialects offered ({offered}); no DUCKDB or ANSI_SQL"
 
 
-def resolve_expression_any(expression: dict) -> Tuple[Optional[str], Optional[str], bool]:
+def resolve_expression_any(expression: dict) -> tuple[str | None, str | None, bool]:
     """Resolve one metric expression the way :func:`resolve_expression` does,
     but instead of reporting a warehouse-only expression as unusable, fall
     back to it — so a caller (the projector) can still store the raw SQL

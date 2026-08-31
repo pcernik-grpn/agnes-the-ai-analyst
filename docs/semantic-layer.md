@@ -343,9 +343,13 @@ parsed for those two and carried whole in the model's `custom_extensions`. A
 malformed payload costs its annotations and nothing else.
 
 **Every expression is tagged `SNOWFLAKE`, which makes it readable but not
-runnable here.** `src/semantic/dialect.py` prefers `DUCKDB` then `ANSI_SQL` and
-reports anything else as unusable *with its reason* — so an imported Snowflake
-metric will not be spliced into a local DuckDB query. That is the intended
+runnable here.** `src/semantic/dialect.py` resolves `ANSI_SQL` as the local
+dialect — the only one the pinned schema's `Dialect` enum accepts today that
+is also locally runnable (a dormant `DUCKDB` preference sits ahead of it in
+code for when the vendored schema grows that value, but no document can
+declare it yet) — and reports anything else as unusable *with its reason* —
+so an imported Snowflake metric will not be spliced into a local DuckDB
+query. That is the intended
 outcome: importing gives you the catalog, the metric SQL, the lineage and
 Snowflake's own AI instructions; it does not give you local execution. Facts and
 metrics marked `PRIVATE` upstream carry that label in `custom_extensions` rather

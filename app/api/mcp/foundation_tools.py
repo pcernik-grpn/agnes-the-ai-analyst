@@ -206,8 +206,8 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # Is the layer trustworthy right now (F4.2) — sync failures, models whose
     # source is gone, invalid documents, three static document-quality checks,
     # F4.1's coverage roll-up, and every active mute, in one call. Triple-
-    # surface with GET /api/admin/semantic-layer/health + `agnes
-    # semantic-model health`.
+    # surface with GET /api/admin/semantic-layer/health + `agnes admin
+    # semantic health`.
     "semantic_layer_health",
     # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the one tool
     # here an ORDINARY caller may use — the agent that cannot ground its own
@@ -566,7 +566,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def glossary_search(query: str, k: int = 10) -> dict:
-        """Search Keboola-imported business-term definitions (glossary).
+        """Search business-term definitions (glossary), from any semantic model source.
 
         Relevance-ranked (BM25) search across term + definition, RBAC tier
         matches knowledge_search (any authenticated user). Use this to
