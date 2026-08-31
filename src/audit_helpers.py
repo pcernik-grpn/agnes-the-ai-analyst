@@ -28,7 +28,7 @@ def hash_args(args: Any) -> str:
 # may produce, and every surface a caller can stamp explicitly (F0 —
 # audit-full-coverage plan, Task 1). Kept as the single source of truth so a
 # new surface doesn't invent its own ad-hoc string.
-CLIENT_KINDS = ("web", "cli", "mcp", "slack", "telegram", "agent", "broker", "scheduler", "system")
+CLIENT_KINDS = ("web", "cli", "mcp", "slack", "telegram", "agent", "broker", "scheduler", "system", "producer")
 
 
 def log_safe(**kwargs) -> None:

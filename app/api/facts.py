@@ -33,7 +33,12 @@ either a human admin session/PAT or the scheduler shared-secret bearer token
 ``scheduler@system.local`` user, a member of the ``Admin`` group, through
 ``get_current_user`` — the SAME dual-accept pattern ``app/api/jobs.py`` uses,
 no special-casing needed here). CSRF is n/a — bearer auth only, never a
-cookie session:
+cookie session. ``POST /api/facts/ingest`` and ``GET /api/facts/corrections``
+use ``Depends(require_admin_or_producer)`` instead — the SAME admin/scheduler
+acceptance, plus a ``ProducerPrincipal`` (a corpus-extraction producer's own
+scoped callback credential, ``app.auth.producer_token``), scope-checked
+per-document at ``/ingest`` and unfiltered (documented TODO) at
+``/corrections``:
 
 - ``POST /api/facts/ingest``          — the producer contract (spec §7.2):
   batch caps, doc_id resolution, the verbatim gate (§8), union/replace
@@ -59,7 +64,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.auth.access import require_admin, require_facts_enabled
+from app.auth.access import require_admin, require_admin_or_producer, require_facts_enabled
 from app.auth.dependencies import get_current_user
 from src.audit_helpers import identity_for_audit, log_safe
 from src.repositories import audit_repo, facts_ingest_runs_repo, facts_repo
@@ -377,6 +382,112 @@ def _refuse_undeclared_anonymize_marked_corpora(body: "FactsIngestRequest") -> N
         )
 
 
+def _batch_references_a_doc_id(body: "FactsIngestRequest") -> bool:
+    """True if anything in this batch would make ``ingest_batch`` resolve a
+    ``doc_id`` — a ``full_documents`` entry (replace mode: it DELETES that
+    document's existing claims) or any node/edge evidence naming one.
+
+    Tolerant of shape, like the rest of this endpoint: ``nodes``/``edges``
+    are deliberately ``Dict[str, Any]`` so an unknown producer-side field
+    is not a 422, which means ``evidence`` may be absent or not a list and
+    an element may not be a dict. Anything unreadable counts as "no doc_id
+    here" rather than raising — the repository is the layer that rejects a
+    malformed batch, and this helper only decides whether the scope gate
+    above has to fire.
+    """
+    if body.full_documents:
+        return True
+    for item in (*body.nodes, *body.edges):
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for ev in evidence:
+            if isinstance(ev, dict) and ev.get("doc_id"):
+                return True
+    return False
+
+
+def _refuse_producer_out_of_scope_documents(body: "FactsIngestRequest", user: Any) -> None:
+    """Authorization-level gate for a ``ProducerPrincipal`` caller: every
+    ``documents[]`` row's ``corpus_id`` must be one of the token's own
+    ``collection_ids`` — a producer scoped to collections A/B must never
+    write into collection C just because it can reach this endpoint at
+    all.
+
+    Independent of (and checked BEFORE) ``FactsPgRepository.ingest_batch``'s
+    own ``ambiguous_cross_collection_doc_id`` handling, which is a
+    data-integrity rule about EVIDENCE anchoring, not an authorization
+    boundary — a document naming an in-scope ``corpus_id`` here can still
+    be rejected by that other rule for an unrelated reason.
+
+    A no-op for every other caller (human admin, or the scheduler token
+    resolving to the admin user) — neither has a ``collection_ids`` claim
+    to check against, and neither is scope-restricted this way.
+    """
+    from app.auth.session_principal import ProducerPrincipal
+
+    if not isinstance(user, ProducerPrincipal):
+        return
+    out_of_scope = sorted(
+        {
+            str(d["corpus_id"])
+            for d in body.documents
+            if d.get("corpus_id") and str(d["corpus_id"]) not in user.collection_ids
+        }
+    )
+    if out_of_scope:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "producer_corpus_out_of_scope",
+                "corpus_ids": out_of_scope,
+                "message": (
+                    "this producer credential is scoped to a different set of collections; these "
+                    "documents' corpus_id are outside its scope"
+                ),
+            },
+        )
+
+    # …and the batch must DECLARE a corpus whenever anything in it needs a
+    # doc_id resolved. Without this the check above is bypassable outright:
+    # `FactsPgRepository.ingest_batch`'s doc_id ladder falls back to an
+    # UNRESTRICTED, instance-wide scan (`_resolve_doc` tier 3b) precisely
+    # when `documents[]` declared no `(doc_id, corpus_id)` pair at all —
+    # the documented "documents may be omitted when every doc_id already
+    # resolves" replay flow (spec §7.2). A producer scoped to collections
+    # A/B could therefore POST `documents: []` plus `nodes`/`edges` whose
+    # evidence names a doc_id living in collection C, and its claims would
+    # anchor onto C's file — or pass that doc_id in `full_documents` and
+    # DELETE C's existing claims for it (replace mode). Neither row carries
+    # a `corpus_id` for the loop above to inspect, so both slip through.
+    #
+    # Refused only for a ProducerPrincipal: tier 3b stays exactly as it was
+    # for an admin or the scheduler token, which is what the replay flow's
+    # existing callers use and what its docstring says depends on it. A
+    # producer that declares at least one `documents[]` pair keeps every
+    # tier, because `declared_corpus_ids` is then a subset of the token's
+    # own scope (the loop above has already refused any other corpus_id) and
+    # resolution cannot leave it.
+    declares_corpus = any(d.get("doc_id") and d.get("corpus_id") for d in body.documents)
+    if declares_corpus:
+        return
+    if _batch_references_a_doc_id(body):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "producer_batch_declares_no_corpus",
+                "message": (
+                    "a producer credential must declare each document's corpus_id in "
+                    "documents[]; a batch that references doc_ids without declaring any "
+                    "corpus would resolve them across every collection, escaping this "
+                    "credential's scope"
+                ),
+            },
+        )
+
+
 class FactsIngestRequest(BaseModel):
     """Wire format accepted verbatim (spec §7.0/§7.2) — ``documents`` are the
     crawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/
@@ -424,8 +535,10 @@ def _validate_evidence_audience(body: "FactsIngestRequest") -> None:
 
 
 @router.post("/ingest")
-def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[str, Any]:
-    """Ingest one producer batch (spec §7.2) — scheduler token or admin PAT.
+def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_producer)) -> Dict[str, Any]:
+    """Ingest one producer batch (spec §7.2) — scheduler token, admin PAT,
+    or a corpus-extraction producer credential (``ProducerPrincipal``, see
+    ``app.auth.producer_token``) scoped to a set of collections.
 
     Batch caps (≤500 documents, ≤5000 claims/request) 413; a single
     document's evidence alone exceeding the claim cap is a distinct 422
@@ -500,11 +613,27 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     than treated as "nothing is marked" — see
     :func:`_refuse_undeclared_anonymize_marked_corpora`.
 
+    Producer scope gate: a ``ProducerPrincipal`` caller additionally has
+    every ``documents[]`` row's ``corpus_id`` checked against its own
+    ``collection_ids`` claim — any row naming a corpus outside that set is
+    REJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,
+    itemizing the offending corpus ids), an authorization boundary
+    independent of the ``ambiguous_cross_collection_doc_id`` data-integrity
+    rule above — AND, because the repository's doc_id ladder falls back to
+    an unrestricted instance-wide scan exactly when ``documents[]`` declared
+    no corpus at all, a producer batch that references any doc_id (node/edge
+    evidence, or ``full_documents``' replace-mode delete list) without
+    declaring one is refused whole (``403``
+    ``producer_batch_declares_no_corpus``). See
+    :func:`_refuse_producer_out_of_scope_documents`. A human admin (or the
+    scheduler token) has no such claim, keeps the documented
+    documents-omitted replay flow, and is unaffected by either half.
     ``evidence[].audience`` (Task 10, spec §4.2) is format-validated FIRST,
     before either gate below — see :func:`_validate_evidence_audience`.
     """
     _validate_evidence_audience(body)
     _refuse_undeclared_anonymize_marked_corpora(body)
+    _refuse_producer_out_of_scope_documents(body, user)
     try:
         report = facts_repo().ingest_batch(
             documents=body.documents,
@@ -527,10 +656,14 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             detail={"reason": "reserved_source_stable_id", "stable_ids": exc.stable_ids},
         )
 
+    from app.auth.session_principal import ProducerPrincipal
+
+    is_producer = isinstance(user, ProducerPrincipal)
     user_id, _email = identity_for_audit(user)
     log_safe(
         user_id=user_id,
         action="facts.ingest",
+        client_kind="producer" if is_producer else None,
         params={
             "documents": len(body.documents),
             "claims_written": report.get("claims_written", 0),
@@ -540,9 +673,10 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
 
     try:
         corpus_ids = sorted({d.get("corpus_id") for d in body.documents if d.get("corpus_id")})
+        caller = f"producer:{user.connection_id}" if is_producer else (user.get("email") or user.get("id", "admin"))
         facts_ingest_runs_repo().create(
             corpus_ids=corpus_ids,
-            caller=user.get("email") or user.get("id", "admin"),
+            caller=caller,
             documents_seen=len(body.documents),
             claims_written=report.get("claims_written", 0),
             claims_rejected=report.get("claims_rejected", []),
@@ -630,13 +764,28 @@ def delete_correction(
 
 
 @router.get("/corrections")
-def list_corrections(user: dict = Depends(require_admin)) -> Dict[str, Any]:
+def list_corrections(user=Depends(require_admin_or_producer)) -> Dict[str, Any]:
     """The producer export (spec §7.4): every ``wrong`` subject with its
     ``natural_keys`` snapshot, so a producer's re-extraction pass can prune
     them before re-asserting claims. Server-side, corrections are ALSO
     enforced at read time regardless (§4) — a producer that ignores this
     export cannot resurrect a withheld fact, this just saves it the wasted
-    work. Scheduler token or admin PAT."""
+    work. Scheduler token, admin PAT, or a corpus-extraction
+    ``ProducerPrincipal`` (``app.auth.producer_token``).
+
+    NOT filtered to the caller's own ``collection_ids`` — a ``corrections``
+    row is keyed on ``(subject_kind, subject_id)`` with only a
+    ``natural_keys`` snapshot (spec §3: it must survive the subject itself
+    being deleted and re-created), so there is no cheap, always-correct way
+    to join it back to a collection: the fact/edge it corrected may no
+    longer exist at all, and even when it does, "which collection" is a
+    property of its CLAIMS' evidence, not of the correction row. A producer
+    scoped to two of an instance's five collections therefore currently
+    sees every withheld subject, instance-wide, exactly like an admin does
+    — TODO(TCRD-...): revisit if/when corrections gain a cheap collection
+    join, rather than shipping a filter that would silently return the
+    wrong subset today.
+    """
     return {"corrections": facts_repo().list_wrong_corrections()}
 
 

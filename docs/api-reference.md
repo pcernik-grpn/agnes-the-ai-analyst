@@ -1166,7 +1166,11 @@ Admin-only surface behind the "connect → scope → share" file-source wizard o
 `/admin/data-sources`. The SharePoint connection itself is an ordinary
 `source_type=sharepoint` row through `/api/admin/source-connections` (tenant/
 client id, certificate via vault secret or `config.cert_private_key_env`);
-these three routes are the wizard's own steps 2/3.
+these three routes are the wizard's own steps 2/3. `GET …/scopes` and
+`GET …/corpus-map` additionally accept a corpus-extraction producer's own
+scoped callback credential (`ProducerPrincipal`, `app/auth/producer_token.py`)
+when its `connection_id` claim matches the path — a producer token minted
+for a DIFFERENT connection 403s.
 
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
@@ -1774,7 +1778,11 @@ repository directly — facts have no local scope, so every result is labeled
 `[server]` on the CLI's stderr, a deliberate deviation from the `--scope
 auto|local|server` convention (spec §12).
 
-**Write surface** (build order step 4) — scheduler token or admin PAT, no
+**Write surface** (build order step 4) — scheduler token, admin PAT, or a
+corpus-extraction producer's own scoped callback credential
+(`ProducerPrincipal`, `app/auth/producer_token.py`; `ingest` additionally
+rejects, itemized (`403` `producer_corpus_out_of_scope`), any document
+whose `corpus_id` is outside that credential's own `collection_ids`), no
 CLI/MCP by design (a producer contract, not an analyst command). `ingest`
 is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `413`; a single document's evidence alone over the claim cap is a `422`

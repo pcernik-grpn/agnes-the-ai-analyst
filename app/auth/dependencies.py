@@ -346,6 +346,22 @@ def get_current_user(
             detail="Scheduler user not provisioned",
         )
 
+    # Producer-scoped callback credential (corpus-extraction): resolves to
+    # a RESTRICTED ProducerPrincipal, never a real user. Checked before
+    # pat_resolver for the same reason as the scheduler check above — this
+    # typ has no `sub` naming a real user row. May raise 403 itself (see
+    # docstring) when the token is genuinely a producer JWT but this
+    # request is off its fixed allowed surface — that must not fall
+    # through to pat_resolver's 401 chain.
+    from app.auth.producer_token import resolve_producer_principal
+
+    producer_principal = resolve_producer_principal(token, request)
+    if producer_principal is not None:
+        from src.audit_context import set_client_kind
+
+        set_client_kind("producer")
+        return producer_principal
+
     from app.auth.pat_resolver import resolve_token_to_user
     from app.auth.session_principal import PRINCIPAL_TYPES
 

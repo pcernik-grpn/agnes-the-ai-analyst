@@ -124,9 +124,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth.access import require_admin
+from app.auth.access import require_admin, require_admin_or_producer_connection
 from app.auth.public_url import public_base_url
+from app.auth.session_principal import ProducerPrincipal
 from app.resource_types import ResourceType
+from src.audit_helpers import log_safe
 from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
@@ -811,12 +813,27 @@ async def search_tree(
 @router.get("/connections/{connection_id}/scopes")
 async def list_scopes(
     connection_id: str,
-    _user: dict = Depends(require_admin),
+    user=Depends(require_admin_or_producer_connection("{connection_id}")),
 ):
     """The wizard's step-2/3 source of truth: every confirmed scope row,
-    enriched with its collection and current group grants."""
+    enriched with its collection and current group grants.
+
+    Also the corpus-extraction producer's own callback read (TCRD-...):
+    a ``ProducerPrincipal`` scoped to THIS connection may call this too
+    (see ``require_admin_or_producer_connection``) — self-audited here
+    (``sharepoint_connection.scopes_read``, ``client_kind="producer"``)
+    since a restricted principal's identity is never stashed onto
+    ``request.state.user``, so the generic audit-fallback middleware would
+    otherwise see no attributable caller and write nothing at all.
+    """
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
+    if isinstance(user, ProducerPrincipal):
+        log_safe(
+            action="sharepoint_connection.scopes_read",
+            resource=connection_id,
+            client_kind="producer",
+        )
     return {"items": [_scope_out(s, declared, row) for s in _scopes(row)]}
 
 
@@ -1054,7 +1071,7 @@ async def remove_scope(
 @router.get("/connections/{connection_id}/corpus-map")
 async def corpus_map(
     connection_id: str,
-    _user: dict = Depends(require_admin),
+    user=Depends(require_admin_or_producer_connection("{connection_id}")),
 ):
     """Producer handoff (spec §13.2 / item 3): the corpus map the external
     crawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in
@@ -1075,15 +1092,30 @@ async def corpus_map(
     know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
     row already carries ``anonymize``); Agnes's own ``corpus-extraction``
     job handler does the equivalent lookup internally
-    (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
+    (``app/worker/kinds.py::_anonymize_marked_scope_map``).
+
+    THIS is the primary callback the corpus-extraction producer itself
+    calls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may
+    call it too (see ``require_admin_or_producer_connection``) —
+    self-audited here (``sharepoint_connection.corpus_map_read``,
+    ``client_kind="producer"``) for the same reason ``list_scopes`` above
+    self-audits its own producer branch.
+    """
     row = _sharepoint_connection_or_404(connection_id)
     try:
-        return producer_corpus_map(_scopes(row))
+        mapping = producer_corpus_map(_scopes(row))
     except CorpusMapError as exc:
         raise HTTPException(
             status_code=409,
             detail={"error": "corpus_map_ambiguous", "message": str(exc)},
         ) from exc
+    if isinstance(user, ProducerPrincipal):
+        log_safe(
+            action="sharepoint_connection.corpus_map_read",
+            resource=connection_id,
+            client_kind="producer",
+        )
+    return mapping
 
 
 @router.get("/connections/{connection_id}/certificate")

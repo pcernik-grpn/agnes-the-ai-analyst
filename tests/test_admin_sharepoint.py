@@ -1668,6 +1668,88 @@ class TestExtractionRunDue:
         assert r.json()["dispatched"] == []
 
 
+# ---------------------------------------------------------------------------
+# Producer-scoped callback credential (replaces forwarding the scheduler
+# secret — see app/worker/kinds.py::_agnes_producer_callback_env). A
+# ProducerPrincipal may call `.../scopes` and `.../corpus-map` for its OWN
+# `connection_id` claim; everything else on this router still requires
+# admin (or 403s off-surface before ever reaching this router at all —
+# see tests/test_producer_token.py for that gate's own coverage).
+# ---------------------------------------------------------------------------
+
+
+def _producer_token(connection_id: str, collection_ids=()) -> str:
+    from app.auth.producer_token import mint_producer_token
+
+    return mint_producer_token(connection_id=connection_id, collection_ids=list(collection_ids), ttl_seconds=3600)
+
+
+class TestProducerCallbackAccess:
+    def test_corpus_map_accepts_producer_for_its_own_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-map")
+        confirm = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        token = _producer_token(conn_id)
+        r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        # Keys are the producer resolver's crawler-row shape, not the raw
+        # source_scope_id — see connectors/sharepoint/corpus_map.py::_map_key.
+        assert r.json() == {"A": confirm.json()["collection_id"]}
+
+    def test_scopes_accepts_producer_for_its_own_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-scopes")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        token = _producer_token(conn_id)
+        r = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["items"][0]["source_scope_id"] == "drive:a"
+
+    def test_corpus_map_rejects_producer_scoped_to_a_different_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-1")
+        other_conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-2")
+        token = _producer_token(other_conn_id)
+        r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_scopes_rejects_producer_scoped_to_a_different_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-3")
+        other_conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-4")
+        token = _producer_token(other_conn_id)
+        r = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_scopes_post_still_403s_a_producer_token(self, seeded_app):
+        """POST .../scopes is not on the producer's fixed allowed surface —
+        refused before this router's own dependency ever runs."""
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-write")
+        token = _producer_token(conn_id)
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "x", "display_path": "x"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 403
+
+    def test_tree_still_403s_a_producer_token(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-tree")
+        token = _producer_token(conn_id)
+        r = c.get(f"{BASE}/{conn_id}/tree", headers=_auth(token))
+        assert r.status_code == 403
+
+
 class TestExcludedSubtreeAdvisory:
     """``_scope_out``'s advisory surface for the ``sharepoint-subtree-sweep``
     job's findings (2026-08-30 plan, Task 7) — ``excluded_subtree_count`` and
