@@ -239,9 +239,7 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
-                (tables, source_type_filter)
-            ),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append((tables, source_type_filter)),
         )
 
         JOB_KINDS["data-refresh"].handler({})
@@ -257,9 +255,7 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
-                (tables, source_type_filter)
-            ),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append((tables, source_type_filter)),
         )
 
         JOB_KINDS["data-refresh"].handler({"tables": ["orders"], "source": "keboola"})

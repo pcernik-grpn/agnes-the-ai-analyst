@@ -28,11 +28,22 @@ def test_build_jobs_uses_documented_defaults(monkeypatch):
     lint_job = next(j for j in build_jobs() if j[0] == "store-lint-audit")
     assert lint_job[2] == "/api/admin/store/lint-audit"
     assert lint_job[3] == "POST"
-    # 2026-08-30 plan, Task 7 — broken-inheritance subtree sweep, weekly
-    # (native cron) — Monday 07:00 UTC, offset from store-lint-audit's own
-    # Monday 05:00 row and sharepoint-acl's daily 06:00 row.
-    assert jobs["sharepoint-subtree-sweep"] == "cron 0 7 * * 1"
+    # 2026-08-31 plan, Task 2 — the subtree sweep moved from weekly to daily
+    # (hours-scale cadence), and the ACL sync moved from a fixed daily row to
+    # an interval derived from the acl_sync.interval_hours switch (default 4h).
+    assert jobs["sharepoint-subtree-sweep"] == "daily 07:00"
+    assert jobs["sharepoint-acl"] == "every 4h"
     assert resolved_tick_seconds() == 30
+
+
+def test_acl_sync_schedule_reads_interval(monkeypatch):
+    """2026-08-31 plan, Task 2 — AGNES_ACL_SYNC_INTERVAL_HOURS overrides the
+    default 4h cadence."""
+    monkeypatch.setenv("AGNES_ACL_SYNC_INTERVAL_HOURS", "2")
+    from services.scheduler.__main__ import build_jobs
+
+    jobs = {name: schedule for name, schedule, *_ in build_jobs()}
+    assert jobs["sharepoint-acl"] == "every 2h"
 
 
 def test_build_jobs_honors_bq_metadata_env_override(monkeypatch):

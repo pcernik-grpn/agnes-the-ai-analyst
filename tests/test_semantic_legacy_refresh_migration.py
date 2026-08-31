@@ -502,6 +502,47 @@ class TestDatabricksAutoMigration:
         # `tests/test_databricks_semantic_source_e2e.py` for the end-to-end.
         assert row["config"]["safe_prune"] is True
 
+    def test_repairs_a_row_stranded_on_the_retired_adapter_name(self, e2e_env):
+        """The first cut of this migration stamped ``adapter='databricks_semantic'``,
+        and the rename to ``databricks_metric_views`` shipped with no repair for
+        rows already written — so an instance that ran the in-between build
+        failed that source with "unknown semantic adapter" on every sweep,
+        forever, even with no workspace configured (the creation gate landed in
+        the same rename). The next sweep's migration renames the adapter in
+        place; everything else an admin shaped on the row survives."""
+        from connectors.databricks.semantic_layer import (
+            DATABRICKS_SEMANTIC_SOURCE_ID,
+            RETIRED_SEMANTIC_ADAPTER,
+        )
+        from src.repositories import semantic_source_repo
+        from src.semantic.adapters import unconfigured_reason
+        from src.semantic.legacy_migration import ensure_legacy_semantic_sources
+
+        repo = semantic_source_repo()
+        repo.create(
+            id=DATABRICKS_SEMANTIC_SOURCE_ID,
+            kind="connection",
+            name="Databricks metric views (renamed by an admin)",
+            adapter=RETIRED_SEMANTIC_ADAPTER,
+            config={"catalogs": ["main"]},
+        )
+
+        # No workspace configured — the exact instance shape that hit this in
+        # the wild — and a repair is not a creation: nothing reports migrated.
+        assert ensure_legacy_semantic_sources() == []
+
+        row = repo.get(DATABRICKS_SEMANTIC_SOURCE_ID)
+        assert row["adapter"] == "databricks_metric_views"
+        # Admin-shaped fields are untouched: only the adapter is ours.
+        assert row["name"] == "Databricks metric views (renamed by an admin)"
+        assert row["config"] == {"catalogs": ["main"]}
+        # With the adapter resolvable again, the sweep's pre-flight can answer
+        # and the unconfigured row is SKIPPED instead of failed forever.
+        assert unconfigured_reason(row)
+        # Idempotent: the repaired row is left alone by the next pass.
+        assert ensure_legacy_semantic_sources() == []
+        assert repo.get(DATABRICKS_SEMANTIC_SOURCE_ID)["adapter"] == "databricks_metric_views"
+
 
 # ---------------------------------------------------------------------------
 # Provenance override + safe_prune (the transport/importer knobs)
@@ -810,9 +851,7 @@ class TestOneUpstreamProjectPerSweep:
         # And the skip is visible on the row, not only in this response.
         skipped = semantic_source_repo().get("keboola_conn-b")
         assert skipped["last_sync_status"] == "skipped"
-        assert "conn-a" in (skipped["last_sync_error"] or "") or "keboola_conn-a" in (
-            skipped["last_sync_error"] or ""
-        )
+        assert "conn-a" in (skipped["last_sync_error"] or "") or "keboola_conn-a" in (skipped["last_sync_error"] or "")
 
     def test_two_distinct_projects_both_import(self, e2e_env, vault_key):
         """The guard keys on the resolved upstream identity, not on "two

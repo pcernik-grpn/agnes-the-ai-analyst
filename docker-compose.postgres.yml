@@ -123,10 +123,13 @@ services:
       - DATABASE_URL=postgresql+psycopg://agnes:${POSTGRES_PASSWORD}@postgres:5432/agnes
       - DATA_DIR=/data
     volumes:
-      # Read-only mount: this service must not mutate DuckDB state. ``:ro``
-      # belt-and-suspenders alongside ``duckdb.connect(..., read_only=True)``
-      # inside the script.
-      - data:/data:ro
+      # Read-write so a completed migration can record itself in
+      # ``system.duckdb.migrated`` next to the source — the marker is what
+      # stops later re-runs from resurrecting rows deleted from Postgres
+      # after the cutover. The DuckDB file itself is still never mutated:
+      # the script opens it with ``duckdb.connect(..., read_only=True)``
+      # and writes nothing else under /data.
+      - data:/data
     restart: "no"
 
   app:
@@ -142,7 +145,9 @@ services:
       data-migrate:
         # Same gate for the data copy: app must not serve traffic against a
         # schema-only PG while DuckDB still holds the source-of-truth rows.
-        # On re-runs the data-migrate exit is a near-instant no-op.
+        # Once a run completes it writes ``system.duckdb.migrated`` and
+        # every later re-run exits 0 without copying (see the marker gate
+        # in scripts/migrate_duckdb_to_pg/__main__.py).
         condition: service_completed_successfully
     environment:
       - DATABASE_URL=postgresql+psycopg://agnes:${POSTGRES_PASSWORD}@postgres:5432/agnes

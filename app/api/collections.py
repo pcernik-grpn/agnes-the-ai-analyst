@@ -1331,6 +1331,38 @@ async def upload_files(
             cf_repo=cf_repo,
         )
 
+    # 2026-08-31 plan, Task 5: SharePoint source-ACL ingest gate — refuse a
+    # batch carrying any file whose source path/item sits under an excluded
+    # subtree, an excluded unique-permission file, or another collection's
+    # active permission zone, BEFORE a single byte is stored. A strict no-op
+    # for every non-SharePoint (or acl_mirroring-off) collection.
+    from connectors.sharepoint.ingest_gate import source_acl_index_for_collection, source_acl_refusal
+
+    acl_index = source_acl_index_for_collection(collection_id)
+    if acl_index is not None:
+        acl_offenders = []
+        for idx in range(len(files)):
+            acl_path = _nth_field(paths, idx)
+            acl_reason = source_acl_refusal(
+                acl_index,
+                path=acl_path,
+                stable_id=_nth_field(source_stable_ids, idx),
+            )
+            if acl_reason:
+                acl_offenders.append({"index": idx, "path": acl_path, "reason": acl_reason})
+        if acl_offenders:
+            log_safe(
+                action="sharepoint_acl.ingest_rejected",
+                resource=f"file_corpus:{collection_id}",
+                params={"count": len(acl_offenders)},
+                result="error",
+                client_kind="api",
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "source_acl_excluded_paths", "items": acl_offenders},
+            )
+
     # A content-changed match now keeps the row's id, and the derived
     # `table_id` is computed from that id — so on a process WITHOUT the worker
     # role the enqueued derived purge and an in-process `ingest_file` would

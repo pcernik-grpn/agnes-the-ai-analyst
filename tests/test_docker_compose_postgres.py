@@ -94,6 +94,26 @@ class TestDataMigrateFreshVolumeBoot:
             "truncate live post-cutover data on every boot"
         )
 
+    def test_data_migrate_never_forces_past_completion(self, compose_pg):
+        cmd = compose_pg["services"]["data-migrate"]["command"]
+        assert "--force" not in cmd, (
+            "data-migrate re-runs on every compose up — --force would ignore "
+            "the completion marker and resurrect rows deleted from Postgres "
+            "after the cutover on every boot"
+        )
+
+    def test_data_migrate_volume_allows_marker_write(self, compose_pg):
+        """The completion marker (``system.duckdb.migrated``) is written next
+        to the source, so the mount must be read-write. The DuckDB file
+        itself stays protected by ``duckdb.connect(..., read_only=True)``
+        inside the script."""
+        volumes = compose_pg["services"]["data-migrate"]["volumes"]
+        assert "data:/data" in volumes, (
+            "data-migrate needs a read-write /data mount to record the "
+            "completion marker; a :ro mount silently re-enables the "
+            "row-resurrection re-copy on every compose up"
+        )
+
     def test_app_and_scheduler_gate_on_data_migrate(self, compose_pg):
         """The dependency that makes the missing-source tolerance
         boot-critical: both runtime services block on data-migrate."""

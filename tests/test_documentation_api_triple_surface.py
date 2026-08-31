@@ -1251,6 +1251,11 @@ _EXEMPT: dict[str, str] = {
         "read-only effective extraction configuration with per-leaf origins for the "
         "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
+        "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "
+        "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "
+        "the acl-sync exemption right above; no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.

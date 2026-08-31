@@ -603,3 +603,96 @@ def test_read_surface_still_rejects_a_producer_token(facts_client):
     token = _producer_token(["col_a"])
     r = facts_client["client"].post("/api/facts/search", json={"type": "client"}, headers=_auth(token))
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# SharePoint source-ACL ingest gate (2026-08-31 plan, Task 5 —
+# connectors/sharepoint/ingest_gate.py) — independent of, and checked
+# alongside, the anonymize-fail-closed and producer-scope gates above. Direct
+# repo writes (never the wizard's HTTP endpoint) so the fixture can seed
+# `excluded_subtrees`/`access_mode`, which `_create_sharepoint_connection`
+# above does not exercise.
+# ---------------------------------------------------------------------------
+
+
+def _seed_sharepoint_scope_with_exclusion(corpus_id: str, *, connection_id: str) -> None:
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().create(
+        id=connection_id,
+        name=f"SP Facts Gate {connection_id}",
+        source_type="sharepoint",
+        config={
+            "tenant_id": "tenant-1",
+            "client_id": "client-1",
+            "scopes": [
+                {
+                    "source_scope_id": "root-1",
+                    "display_path": "Site/Documents",
+                    "anonymize": False,
+                    "collection_id": corpus_id,
+                    "drive_id": "d1",
+                    "access_mode": "mirrored",
+                    "excluded_subtrees": [
+                        {
+                            "item_id": "X",
+                            "path": "Secret",
+                            "rel_path": "Secret",
+                            "kind": "folder",
+                            "detected_at": "2026-08-31T00:00:00+00:00",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+
+def test_ingest_refuses_a_document_under_an_excluded_sharepoint_subtree(facts_client, monkeypatch):
+    """The fact-graph ingest gate independently enforces the same
+    SharePoint source-ACL exclusions the upload endpoint does — a producer
+    that batches claims straight from crawl metadata cannot land them for
+    content Agnes has already excluded, even if it skipped the upload."""
+    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    client, token = facts_client["client"], facts_client["admin_token"]
+    _seed_sharepoint_scope_with_exclusion("col_gate_1", connection_id="conn-facts-gate-1")
+
+    r = client.post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_gate_1", "path": "Secret/contract.docx"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "source_acl_excluded_documents"
+    assert detail["items"] == [{"doc_id": "d1", "reason": "source_acl_excluded"}]
+
+
+def test_ingest_allows_a_document_outside_the_excluded_subtree(facts_client, monkeypatch):
+    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    client, token = facts_client["client"], facts_client["admin_token"]
+    _seed_sharepoint_scope_with_exclusion("col_gate_2", connection_id="conn-facts-gate-2")
+
+    r = client.post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_gate_2", "path": "open/notes.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text  # cleared this gate; PG-only repo fails clean past it
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_ingest_source_acl_gate_is_a_noop_when_acl_mirroring_is_off(facts_client):
+    """Same excluded-subtree config, but the feature flag stays off — the
+    gate must be a strict no-op (proven by the 501 falling through
+    unchanged, exactly like the pre-existing anonymize/producer no-op
+    tests above)."""
+    client, token = facts_client["client"], facts_client["admin_token"]
+    _seed_sharepoint_scope_with_exclusion("col_gate_3", connection_id="conn-facts-gate-3")
+
+    r = client.post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_gate_3", "path": "Secret/contract.docx"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text

@@ -262,7 +262,9 @@ class TestSiteByUrl:
         conn_id = _create_connection(c, seeded_app["admin_token"], name="by-url-deep")
         r = c.get(
             f"{BASE}/{conn_id}/tree",
-            params={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub/Shared%20Documents/Forms/AllItems.aspx"},
+            params={
+                "site_url": "https://contoso.sharepoint.com/sites/ProjectHub/Shared%20Documents/Forms/AllItems.aspx"
+            },
             headers=_auth(seeded_app["admin_token"]),
         )
         assert r.status_code == 200, r.text
@@ -1038,6 +1040,51 @@ class TestScopeRemoval:
         r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "nope"}, headers=_auth(token))
         assert r.status_code == 404
 
+    def test_removing_a_scope_deletes_its_sentinel_owned_grants(self, seeded_app):
+        """2026-08-31 plan, Task 8: the sync's own mirrored grants must not
+        dangle once the scope row that anchors them is gone — an
+        admin-assigned grant on the same collection survives untouched."""
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-grant-hygiene")
+        admin_group_id = c.post("/api/admin/groups", json={"name": "sp-remove-admin"}, headers=_auth(token)).json()[
+            "id"
+        ]
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:remove-hygiene",
+                "display_path": "Hygiene",
+                "group_ids": [admin_group_id],
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(name="entra:remove-hygiene-oid", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.delete(
+            f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:remove-hygiene"}, headers=_auth(token)
+        )
+        assert r.status_code == 204
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert len(remaining) == 1
+        assert remaining[0]["group_id"] == admin_group_id
+
 
 class TestNoGroupWarning:
     def test_unit_no_group_warning(self):
@@ -1428,6 +1475,83 @@ class TestAclSyncTrigger:
         assert second.json()["detail"]["job_id"] == first.json()["job_id"]
 
 
+class TestSubtreeSweepTrigger:
+    """``POST /connections/{connection_id}/subtree-sweep`` — admin
+    "re-check subtrees now" trigger for the ``sharepoint-subtree-sweep`` job
+    (2026-08-31 plan, Task 8). Mirrors ``TestAclSyncTrigger`` exactly — same
+    idempotency-key/dedup/flag-gate mechanics, same job-kind family."""
+
+    SWEEP = "{base}/{cid}/subtree-sweep"
+
+    @pytest.fixture(autouse=True)
+    def _clear_acl_mirroring_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            self.SWEEP.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(self.SWEEP.format(base=BASE, cid="nope"))
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        r = seeded_app["client"].post(
+            self.SWEEP.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-flag-off")
+        r = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-happy")
+        r = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["job_id"]
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(body["job_id"])
+        assert job["kind"] == "sharepoint-subtree-sweep"
+        assert job["payload_json"] == {"connection_id": conn_id}
+
+    def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-dup")
+        first = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert first.status_code == 202, first.text
+        second = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "sweep_already_running"
+        assert second.json()["detail"]["job_id"] == first.json()["job_id"]
+
+    def test_idempotency_key_is_distinct_from_acl_sync(self, seeded_app, monkeypatch):
+        """A sweep trigger and an acl-sync trigger for the SAME connection
+        must never dedup against each other — they are different job kinds
+        with different idempotency-key prefixes."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-vs-acl-sync")
+        sweep = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert sweep.status_code == 202, sweep.text
+        acl_sync = c.post(f"{BASE}/{conn_id}/acl-sync", headers=_auth(seeded_app["admin_token"]))
+        assert acl_sync.status_code == 202, acl_sync.text
+        assert sweep.json()["job_id"] != acl_sync.json()["job_id"]
+
+
 class TestCertificateMetadata:
     """`GET /connections/{id}/certificate` — read-only certificate metadata
     for the source card / an admin's own comparison against the identity
@@ -1615,6 +1739,126 @@ class TestCorpusMap:
         mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
         assert mapping.status_code == 200
         assert mapping.json() == {}
+
+    def test_corpus_map_includes_active_zone_rows(self, seeded_app):
+        """2026-08-31 plan, Task 7: an active permission zone becomes an
+        ADDITIONAL, nested corpus-map key under its parent scope — the
+        external producer's resolver must match longest-prefix-first. A
+        dissolved zone is never mapped."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="map-zone-conn")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:zone-map-1", "display_path": "Site/Documents/Team"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        parent_collection_id = confirmed.json()["collection_id"]
+
+        from src.repositories import source_connections_repo
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        zones = [
+            {
+                "zone_item_id": "zone-legal",
+                "parent_scope_id": "drive:zone-map-1",
+                "drive_id": "d1",
+                "name": "Legal",
+                "display_path": "Site/Documents/Team/Legal",
+                "rel_path": "Legal",
+                "collection_id": "col_zone_legal",
+                "detected_at": "2026-08-31T00:00:00+00:00",
+                "status": "active",
+            },
+            {
+                "zone_item_id": "zone-old",
+                "parent_scope_id": "drive:zone-map-1",
+                "drive_id": "d1",
+                "name": "Old",
+                "display_path": "Site/Documents/Team/Old",
+                "rel_path": "Old",
+                "collection_id": "col_zone_old",
+                "detected_at": "2026-08-30T00:00:00+00:00",
+                "status": "dissolved",
+            },
+        ]
+        repo.update(conn_id, config={**row["config"], "acl_zones": zones})
+
+        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert mapping.status_code == 200, mapping.text
+        assert mapping.json() == {
+            "Site/Team": parent_collection_id,
+            "Site/Team/Legal": "col_zone_legal",
+        }
+
+
+class TestProducerCorpusMapZonesUnit:
+    """Direct, DB-free coverage of ``producer_corpus_map(scopes, zones)``
+    itself (2026-08-31 plan, Task 7) — the HTTP-level equivalent lives in
+    ``TestCorpusMap.test_corpus_map_includes_active_zone_rows`` above."""
+
+    def test_zone_rows_produce_nested_keys(self):
+        from connectors.sharepoint.corpus_map import producer_corpus_map
+
+        scopes = [{"source_scope_id": "root-1", "display_path": "Site/Documents/Team", "collection_id": "col_p"}]
+        zones = [
+            {
+                "zone_item_id": "Z",
+                "display_path": "Site/Documents/Team/Legal",
+                "collection_id": "col_z",
+                "status": "active",
+                "parent_scope_id": "root-1",
+            }
+        ]
+        m = producer_corpus_map(scopes, zones)
+        assert m["Site/Team"] == "col_p"
+        assert m["Site/Team/Legal"] == "col_z"
+
+    def test_dissolved_zone_not_mapped(self):
+        from connectors.sharepoint.corpus_map import producer_corpus_map
+
+        scopes = [{"source_scope_id": "root-1", "display_path": "Site/Documents/Team", "collection_id": "col_p"}]
+        zones = [
+            {
+                "zone_item_id": "Z",
+                "display_path": "Site/Documents/Team/Legal",
+                "collection_id": "col_z",
+                "status": "dissolved",
+                "parent_scope_id": "root-1",
+            }
+        ]
+        m = producer_corpus_map(scopes, zones)
+        assert m == {"Site/Team": "col_p"}
+        assert "Site/Team/Legal" not in m
+
+    def test_no_zones_argument_is_backward_compatible(self):
+        """The old one-argument call shape (pre-Task-7 callers) keeps
+        working — ``zones`` defaults to empty."""
+        from connectors.sharepoint.corpus_map import producer_corpus_map
+
+        scopes = [{"source_scope_id": "root-1", "display_path": "Site", "collection_id": "col_p"}]
+        assert producer_corpus_map(scopes) == {"Site": "col_p"}
+
+    def test_colliding_zone_and_scope_keys_refuse_loudly(self):
+        """Same silent-loss class the existing scope/scope collision check
+        guards against, extended to a zone whose key collides with a
+        DIFFERENT collection than an existing scope's."""
+        from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
+
+        scopes = [{"source_scope_id": "root-1", "display_path": "Site/Documents/Team", "collection_id": "col_p"}]
+        zones = [
+            {
+                "zone_item_id": "Z",
+                "display_path": "Site/Documents/Team",
+                "collection_id": "col_other",
+                "status": "active",
+            }
+        ]
+        with pytest.raises(CorpusMapError):
+            producer_corpus_map(scopes, zones)
 
 
 class TestChangesFeedFailsCleanOnDuckDB:
@@ -1958,7 +2202,9 @@ class TestProducerCallbackAccess:
 class TestExcludedSubtreeAdvisory:
     """``_scope_out``'s advisory surface for the ``sharepoint-subtree-sweep``
     job's findings (2026-08-30 plan, Task 7) — ``excluded_subtree_count`` and
-    ``excluded_subtrees`` (id + path only, never the raw ``detected_at``)."""
+    ``excluded_subtrees`` (id, path, rel_path, kind — never the raw
+    ``detected_at``); ``excluded_file_count`` is the sweep-v2 (2026-08-31
+    plan, Task 3/8) ``kind == "file"`` slice of the same list."""
 
     def test_scope_out_reports_zero_when_no_sweep_has_run(self, seeded_app):
         c = seeded_app["client"]
@@ -1971,15 +2217,15 @@ class TestExcludedSubtreeAdvisory:
         )
         assert r.status_code == 201, r.text
         assert r.json()["excluded_subtree_count"] == 0
+        assert r.json()["excluded_file_count"] == 0
         assert r.json()["excluded_subtrees"] == []
         assert r.json()["include_excluded_subtrees"] is False
 
-    def test_scope_out_surfaces_excluded_subtrees_written_by_the_sweep(self, seeded_app):
-        """Simulates the sweep job's own write (connectors/sharepoint/
-        acl_sync.py::_sweep_connection persists into config.scopes[*]
-        .excluded_subtrees) and asserts the wizard's read path (_scope_out)
-        projects only {item_id, path} — never the raw detected_at
-        timestamp."""
+    def test_scope_out_surfaces_a_legacy_pre_sweep_v2_entry_as_a_folder(self, seeded_app):
+        """Simulates the sweep job's own PRE-sweep-v2 write (no ``kind``/
+        ``rel_path`` on the entry) and asserts the wizard's read path
+        (``_scope_out``) reads it as ``kind="folder"``/``rel_path=None`` —
+        "treat-missing-as-legacy" — never the raw ``detected_at`` timestamp."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="sweep-advisory-populated")
@@ -2001,7 +2247,128 @@ class TestExcludedSubtreeAdvisory:
 
         listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
         assert listed["excluded_subtree_count"] == 1
-        assert listed["excluded_subtrees"] == [{"item_id": "item-A", "path": "Sweep/A"}]
+        assert listed["excluded_file_count"] == 0
+        assert listed["excluded_subtrees"] == [
+            {"item_id": "item-A", "path": "Sweep/A", "rel_path": None, "kind": "folder"}
+        ]
+
+    def test_scope_out_reports_excluded_file_count(self, seeded_app):
+        """Sweep v2 (2026-08-31 plan, Task 3) probes files as well as
+        folders — ``excluded_file_count`` (Task 8) is the ``kind == "file"``
+        slice, and ``rel_path``/``kind`` ride through the full projection."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sweep-file-count")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sweep3", "display_path": "Sweep"},
+            headers=_auth(token),
+        )
+
+        from src.repositories import source_connections_repo
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        scopes = row["config"]["scopes"]
+        scopes[0]["excluded_subtrees"] = [
+            {
+                "item_id": "item-B",
+                "path": "Sweep/B",
+                "rel_path": "B",
+                "kind": "folder",
+                "detected_at": "2026-08-31T00:00:00+00:00",
+            },
+            {
+                "item_id": "item-C",
+                "path": "Sweep/C.docx",
+                "rel_path": "C.docx",
+                "kind": "file",
+                "detected_at": "2026-08-31T00:00:00+00:00",
+            },
+        ]
+        repo.update(conn_id, config={**row["config"], "scopes": scopes})
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["excluded_subtree_count"] == 2
+        assert listed["excluded_file_count"] == 1
+        assert listed["excluded_subtrees"] == [
+            {"item_id": "item-B", "path": "Sweep/B", "rel_path": "B", "kind": "folder"},
+            {"item_id": "item-C", "path": "Sweep/C.docx", "rel_path": "C.docx", "kind": "file"},
+        ]
+
+
+class TestZoneVisibility:
+    """``GET /connections/{connection_id}/scopes``'s ``"zones"`` key
+    (2026-08-31 plan, Task 3/8) — a read-only projection of ``config
+    ["acl_zones"]`` (``connectors/sharepoint/acl_sync.py::zone_rows``),
+    ACTIVE and DISSOLVED zones alike."""
+
+    def test_no_zones_returns_empty_list(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="zone-visibility-empty")
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["zones"] == []
+
+    def test_scopes_response_includes_zone_rows(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="zone-visibility")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:zone-parent", "display_path": "Zoned"},
+            headers=_auth(token),
+        )
+
+        from src.repositories import source_connections_repo
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        zones = [
+            {
+                "zone_item_id": "zone-1",
+                "parent_scope_id": "drive:zone-parent",
+                "drive_id": "d1",
+                "name": "Legal",
+                "display_path": "Zoned/Legal",
+                "rel_path": "Legal",
+                "collection_id": "col_zone_1",
+                "detected_at": "2026-08-31T00:00:00+00:00",
+                "status": "active",
+            },
+            {
+                "zone_item_id": "zone-2",
+                "parent_scope_id": "drive:zone-parent",
+                "drive_id": "d1",
+                "name": "Old",
+                "display_path": "Zoned/Old",
+                "rel_path": "Old",
+                "collection_id": "col_zone_2",
+                "detected_at": "2026-08-30T00:00:00+00:00",
+                "status": "dissolved",
+            },
+        ]
+        repo.update(conn_id, config={**row["config"], "acl_zones": zones})
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["zones"] == [
+            {
+                "zone_item_id": "zone-1",
+                "display_path": "Zoned/Legal",
+                "collection_id": "col_zone_1",
+                "status": "active",
+                "detected_at": "2026-08-31T00:00:00+00:00",
+            },
+            {
+                "zone_item_id": "zone-2",
+                "display_path": "Zoned/Old",
+                "collection_id": "col_zone_2",
+                "status": "dissolved",
+                "detected_at": "2026-08-30T00:00:00+00:00",
+            },
+        ]
 
 
 class TestSubtreeOverride:
