@@ -210,6 +210,20 @@ def test_duckdb_query_denial_does_not_promise_a_package_that_cannot_help(booted)
     assert "Postgres" in detail
 
 
+def test_denial_message_helper_says_unavailable_not_ungranted():
+    """Pinned at the helper too, since every table gate funnels through it
+    (`/api/data/*/download`, `/api/v2/sample`, `/api/v2/schema`), not only
+    the `/api/query` route the tests above drive."""
+    from src.rbac import table_not_in_stack_message
+
+    msg = table_not_in_stack_message(TURNS_ID)
+    assert TURNS_ID in msg
+    assert "Postgres" in msg
+    assert USAGE_PACKAGE_SLUG not in msg
+    # The tables that DO exist here keep the package wording.
+    assert USAGE_PACKAGE_SLUG in table_not_in_stack_message("agnes_sessions")
+
+
 # ---------------------------------------------------------------------------
 # The gate keys on the ACTIVE backend, not on a build-time constant
 # ---------------------------------------------------------------------------
