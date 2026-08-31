@@ -129,6 +129,12 @@
           st.apps = rows.map(function (a) {
             return {
               id: String(a.id), name: String(a.name || a.slug || a.id),
+              /* Kept alongside `id` because the two are used for different
+                 things and are NOT interchangeable: `id` is this panel's own
+                 per-app key (`st.chosen`), while a `data_app` grant is keyed
+                 by SLUG — `id_format="<slug>"` on the ResourceTypeSpec, and
+                 `_can_view` looks up `can_access(…, row["slug"])`. */
+              slug: String(a.slug || a.id),
               url: String(a.external_url || a.url || ''),
               description: String(a.description || ''),
             };
@@ -148,13 +154,20 @@
        real failure is RETURNED rather than thrown: "shared with Finance" and
        "shared with nobody" look identical on the next page, so the caller has
        to be able to say which happened. */
+    /* `resource_id` is the app's SLUG, not its row id. Every reader of a
+       `data_app` grant looks it up by slug — `_can_view` calls
+       `can_access(…, row["slug"])`, the Library's apps band tests
+       `da["slug"] in granted_ids`, and the ResourceTypeSpec declares
+       `id_format="<slug>"`. Sending `a.id` wrote grant rows that nothing ever
+       reads: publishing reported success, redirected to the Library, and the
+       granted group still could not see the apps. */
     function publish() {
       var groups = (o.groups && o.groups()) || [];
       var calls = [];
       chosen().forEach(function (a) {
         groups.forEach(function (g) {
           calls.push(
-            sendJson(GRANTS_API, { group_id: g.id, resource_type: 'data_app', resource_id: a.id })
+            sendJson(GRANTS_API, { group_id: g.id, resource_type: 'data_app', resource_id: a.slug })
               .then(function () { return null; })
               .catch(function (e) {
                 if (e && e.status === 409) return null;
