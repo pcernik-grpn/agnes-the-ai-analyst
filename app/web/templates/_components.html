@@ -88,6 +88,36 @@
 
 
 {# ─────────────────────────────────────────────────────────────────────
+   Group mark — the one shape that says "this name is a GROUP, not a
+   person and not a thing". A group is named on a dozen pages (access,
+   people, a profile, every share dialog, every builder's scope list) and
+   before this it was drawn four different ways: a lettered square, an
+   origin-coloured pill, an origin pill after the name, and — most
+   often — nothing at all, which is what let a group name and a package
+   name sit one line apart in identical type.
+
+   Deliberately COLOURLESS: `--ds-kind-*` is a palette of content types
+   and a group is not content, it is who the content reaches. See the
+   `[data-kind="group"]` note in components.css.
+
+   Two densities, and the JS twin is `AgnesKindGlyph.groupTile()` /
+   `.groupGlyph()` (static/js/kind_glyph.js) for the client-rendered
+   surfaces:
+
+       {{ ds.group_mark() }}          tile  — the leading marker of a ROW
+       {{ ds.group_mark('inline') }}  glyph — inside a chip, a link, prose
+   ───────────────────────────────────────────────────────────────────── #}
+{% macro group_mark(density='tile', klass='') -%}
+  {%- from "macros/_catalog_card.html" import kind_glyph -%}
+  {%- if density == 'inline' -%}
+    <span class="ds-groupglyph{% if klass %} {{ klass }}{% endif %}" role="img" aria-label="Group">{{ kind_glyph('group') }}</span>
+  {%- else -%}
+    <span class="ds-kindtag ds-kindtag--glyph{% if klass %} {{ klass }}{% endif %}" data-kind="group" role="img" aria-label="Group" data-tip="Group">{{ kind_glyph('group') }}</span>
+  {%- endif -%}
+{%- endmacro %}
+
+
+{# ─────────────────────────────────────────────────────────────────────
    Primary nav — top-level horizontal nav (.app-header family).
 
    Parameterized version of what the topnav chrome (`_app_header.html`)
@@ -165,7 +195,7 @@
            items=[
                {'label': 'Browse',   'href': '/marketplace?tab=browse',
                 'active': True},
-               {'label': 'My Stack', 'href': '/marketplace?tab=my',
+               {'label': 'Yours', 'href': '/marketplace?tab=my',
                 'active': False},
            ],
        ) }}

@@ -2,12 +2,12 @@
 
 **Date:** 2026-08-27 (rev 3)
 **Status:** buildable draft — revision 3 after a six-way audit (spec internals,
-Agnes code, cuesta-star-graph, evaluation workbook v0.2, licences/services, UI)
+Agnes code, the producer repo, evaluation workbook v0.2, licences/services, UI)
 **Verified against:** Agnes worktree `zs/facts-scope-access` (base `d97e186a8`),
-`keboola/cuesta-star-graph` main `753be22`, `eval_scoring_workbook_v0.2.xlsx`
+the producer repo's main at `753be22`, `eval_scoring_workbook_v0.2.xlsx`
 (FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
 **Scope note:** this spec deliberately contains customer-specific material
-(the evaluation workbook, Kantata, personas, TCRD ticket ids, the 1P vault
+(the evaluation workbook, Woodgrove PSA, personas, TCRD ticket ids, the 1P vault
 name) by owner decision of 2026-08-27 — concentrated in §14–§17 but also
 present in §1, §5, §7 and §8. If this repository ever returns to public
 distribution, the spec must be scrubbed or moved to a private repo as a
@@ -46,7 +46,7 @@ constrains the design.
 **Rev 2 → 3 (full audit against artifacts):**
 
 6. **The evaluation standard is workbook v0.2 in full** (§14) — five arms,
-   five thresholds, 0/1/2 rubric, cadence, protocol. The cuesta repo's eval
+   five thresholds, 0/1/2 rubric, cadence, protocol. The producer repo's eval
    was aligned to v0.2 on 2026-08-27 (commit `753be22`): its 12 sandbox
    questions now map onto the ten workbook prompts (two are sandbox-only
    leftovers and two workbook ids are uncovered — §14.5), and its protocol already
@@ -115,7 +115,7 @@ itself pre-registers the uncomfortable answer as a legitimate outcome.
     the file's chunks AND claims for what is really a no-op rename — five
     subjects 404'd after one rename in a live run, reappearing with NEW ids
     on re-ingest. Fixed at the root: the gate now also accepts a quote that
-    is a substring of the document's own SERVER-STORED `filename`/`path`
+    EQUALS a whole unit of the document's own SERVER-STORED `filename`/`path`
     (§8.2, never a producer-supplied identity string, which would let a
     producer self-certify an invented quote) — the header workaround is no
     longer needed. Counted honestly (`claims_accepted_via_identity` in the
@@ -134,18 +134,18 @@ from documents, where every assertion carries the document it came from, the
 verbatim sentence supporting it, and the date of that document. Built as a
 layer **over the existing Collections subsystem**, not beside it.
 
-It is a general Agnes capability. SharePoint (via the cuesta-star-graph
+It is a general Agnes capability. SharePoint (via the producer
 crawler) is the first contributor of documents; anything that can put files
 into a collection contributes the same way. Agnes owns the schema; producers
 write into it through the contract in §7.
 
 **Out of scope, deliberately** (each is somebody's work, not nobody's):
 
-- the crawler — **adopted** from `keboola/cuesta-star-graph`, with a named
+- the crawler — **adopted** from the producer repo, with a named
   hardening backlog (§7.1), never rewritten;
 - the extraction pass (`extract.py` + `skills/kg-builder-agent.md`) — a
   producer against §7's contract;
-- the structured lane (Kantata for prompt X1) — a normal connector/table
+- the structured lane (Woodgrove PSA for prompt X1) — a normal connector/table
   concern, a dependency of the evaluation only (§14.5);
 - second document sources (Drive, S3), non-document facts, multi-language
   corpora, and load testing at corpus scale (§15.6 names them so absence is a
@@ -214,7 +214,7 @@ facts        id TEXT PK                    -- 'f_' + token_hex(8); opaque, never
 
 fact_aliases fact_id TEXT NOT NULL FK→facts ON DELETE CASCADE
              type TEXT NOT NULL            -- denormalized from facts, like corpus_id on claims
-             natural_key TEXT NOT NULL     -- producer slug, e.g. 'myers-emergency-power-systems'
+             natural_key TEXT NOT NULL     -- producer slug, e.g. 'fabrikam-emergency-power-systems'
              UNIQUE (type, natural_key)
 
 fact_alias_sources                         -- NEW PG-only table (§4/§5, S9, 2026-08-29):
@@ -527,7 +527,7 @@ same as any other edge — only the READ path (§4/§5) withholds it.
 
 ### 7.0 Wire format (verbatim from the producing pipeline)
 
-The producer is the cuesta-star-graph pipeline (crawl → convert → anonymize →
+The producer is the external producer pipeline (crawl → convert → anonymize →
 extract → reconcile → gates). Its emitted shapes, which the ingest endpoint
 accepts as-is:
 
@@ -543,7 +543,7 @@ accepts as-is:
 ```
 
 Conventions the pipeline enforces and ingest relies on
-(cuesta-star-graph, verified): node id matches
+(producer repo, verified): node id matches
 `([a-z_]+):([a-z0-9][a-z0-9-]*)` with prefix == type
 (`validate_graph.py:60`); slugs are lowercase ASCII with `&`→`and`; every
 **edge** carries ≥1 evidence entry (`possible_duplicate_of` exempt —
@@ -723,13 +723,19 @@ HEAVY (concurrency 1) would block every table sync.
 
 ## 8. What "verbatim" actually means
 
-The gate: a claim's quote must be a substring of **either** (a) one chunk of
-the document's extracted text (`corpus_chunks.text`; `corpus_files` holds no
-text), **or** (b) the document's own **server-stored identity strings** —
-`corpus_files.filename` / `corpus_files.path`, exactly as Agnes holds them,
-never a producer-supplied name/path read off the wire (that would let a
-producer self-certify an invented quote by declaring whatever string it
-likes — see §8.3). Rejected at write, mechanical, the single most valuable
+The gate: a claim's quote must be a substring of one chunk of the document's
+extracted text (`corpus_chunks.text`; `corpus_files` holds no text), **or**
+it must EQUAL a whole unit of the document's own **server-stored identity
+strings** — `corpus_files.filename` / `corpus_files.path`, exactly as Agnes
+holds them, never a producer-supplied name/path read off the wire (that
+would let a producer self-certify an invented quote by declaring whatever
+string it likes — see §8.3). The identity half is equality, not substring
+(P0 review finding, 2026-08-29, hardened same-day as §8.2's widening below):
+a whole path component (a folder name, or the filename with or without its
+extension), the full stored path, or a contiguous run of whole components
+(e.g. `"folder/filename.ext"`) — never an arbitrary fragment, or a bare
+`.pptx`/`/`/short slice would self-certify as a cited quote via the
+document's own name. Rejected at write, mechanical, the single most valuable
 check — and narrower than it sounds. Four limits, stated for customer
 material:
 
@@ -747,10 +753,10 @@ material:
    the same strings a caller sees in the Library UI — but shares the next
    two.
 3. **A quote cannot cross a boundary** — the substring test is per chunk for
-   (a), and `filename`/`path` are checked as two SEPARATE strings for (b),
-   never concatenated: a quote spanning "the folder name / the file name" in
-   a way that isn't literally contiguous in either string still fails, even
-   though a human reading the two together would recognize it.
+   (a); for (b) the quote must equal one of the whole-unit candidates
+   (§8.2) derived from `filename`/`path` — a quote spanning "the folder name
+   / the file name" in a way that isn't one of those candidates still fails,
+   even though a human reading the two together would recognize it.
 4. **Cross-language extraction fails the gate by construction** (Czech
    document, English claim → no substring) — for both halves: a folder path
    in one language and a claim in another still produces no match. Open
@@ -804,7 +810,7 @@ place.
 Conversion fidelity is therefore a **correctness dependency**, gated by test
 EQ8 (§15.3).
 
-### 8.2 The identity haystack (ratified 2026-08-29, live regression fix)
+### 8.2 The identity haystack (ratified 2026-08-29, hardened same-day)
 
 **Why identity strings count as evidence at all.** The extraction ontology
 legitimately treats a document's own identity — folder path + filename — as
@@ -824,6 +830,20 @@ that declared an invented `path` on the wire cannot use it to manufacture a
 match: the gate only ever sees the identity Agnes itself assigned at upload
 time (`app/api/collections.py::_upsert_corpus_file`), so self-certification
 is refused by construction, not by a runtime check that could be forgotten.
+
+**The predicate is a whole unit, never a substring** (same-day review
+finding: an initial `quote in path` shape admitted a bare `.pptx`, a stray
+`/`, or any short fragment — enough to attach a fabricated attribute to a
+real document and have it render as a confidently-cited quote, which is
+worse than a rejected claim). The candidate set for `(filename, path)`:
+the full stored `path`; `filename` with and without its extension; every
+single whole path component (a folder name, or the filename); and every
+CONTIGUOUS run of whole path components (e.g. `"Project Kemp/Parts
+Authority — Overview.pptx"`, the folder+filename shape the example above
+cites), the run ending at the filename also getting an extension-stripped
+variant. The quote must equal one member of that set exactly — no
+normalization, matching the chunk-text comparison (an NFC/NFD mismatch
+fails identically on both sides).
 
 **The count.** Every ingest response reports `claims_accepted_via_identity`
 — the subset of `claims_written` whose quote matched ONLY the identity
@@ -859,6 +879,51 @@ producer can treat a non-zero count as "re-ingest this document", closing
 the loop the two systems previously ran past each other on. (Consuming the
 signal on the producer side is a separate, later change; this section
 defines the contract it will read.)
+
+### 8.4 The meaningfulness floor (ratified 2026-08-29)
+
+A plain substring test has no notion of "meaningful": any character
+sequence that occurs literally in the text, OR (for a quote the content
+check misses) in the document's own identity strings (§8.2), satisfies it —
+including a bare file-extension fragment (`.pdf`) or a lone path separator
+(`/`). Live finding: both were accepted as claims, `claims_accepted_via_
+identity == 0` (i.e. via the content half, not identity), rendering as
+verified evidence for a claim quoting nothing at all.
+
+**The rule.** Before either half of the gate is tried, a quote must be at
+least 2 characters (trimmed) and must START with a word character (letter,
+digit, or underscore, Unicode-aware). Applied once, ahead of both checks, so
+a degenerate quote cannot fail the content half and then be self-certified
+by the identity half instead — one check closes the hole on both paths.
+
+**Why not a length floor alone.** `.pdf` and `ARR` (a real metric name) are
+the same length once `.pdf`'s leading punctuation is set aside — a raw
+character count, or a floor on word-character count, cannot tell them
+apart. What distinguishes them is shape: `.pdf`'s leading `.` can never be a
+complete word's own left edge — a real sentence never begins mid-token —
+while `ARR` is not attached to anything.
+
+**Why only the START, not the end.** A quote citing a whole sentence or
+clause routinely — and legitimately — ends in terminal punctuation ("Acme
+Corp is the client."). Sentence-final punctuation is a closing delimiter of
+the unit actually quoted; leading punctuation with nothing before it in the
+quote is not. An earlier draft of this rule checked both edges and broke
+this common, legitimate shape outright.
+
+**Why a constant, not `facts.single_valued_edges`-style config.** This
+guards evidence integrity — can a fabricated or degenerate extraction get
+past the gate — not a per-instance ontology choice; an operator should not
+be able to loosen it, the way `facts.single_valued_edges` legitimately can
+be (it encodes which edge types an instance's own ontology treats as
+functionally single-valued, a modeling decision, not a security floor). A
+future length floor guarding a *query* (cost/quality) would be a different
+problem and belongs in its own constant, never shared with this one.
+
+**The reason.** A rejected degenerate quote gets `quote_not_meaningful` in
+`claims_rejected`, distinct from `verbatim_gate_failed`: the quote WAS
+present verbatim (or trivially would be), it just isn't evidence of
+anything — a different failure than "cited text absent from the document,"
+which calls for a different fix on the producer side.
 
 ---
 
@@ -966,6 +1031,26 @@ be granted by mistake — but the decision is not ours alone.
 Anonymization is chosen **at source-connect time, per scope** (a column in
 the wizard, §13.2); on a collection detail it is a state plus a named batch
 task ("Anonymize collection…" over N documents), never a toggle.
+
+**Ingest-time enforcement (2026-08-29 hardening, closing a fail-open gap
+found post-#1715):** the producer's `anonymization` declaration on `POST
+/api/facts/ingest` (§7.2) is no longer merely recorded — Agnes now
+**refuses** (`403 anonymization_not_declared`) any batch that documents a
+corpus whose SharePoint scope is anonymize-marked (`config.scopes[]
+.anonymize`) unless that same batch's `anonymization` block declares the
+corpus. This closes the path where an unrelated edit through the generic
+connection editor silently wiped `config.scopes` (server-written, never
+echoed back by that editor's wholesale config replace), which emptied the
+anonymize map, skipped the HMAC-key resolution, raised no error, and let
+the pipeline ship un-anonymized content into a collection an admin believed
+was anonymized — reported as success. Agnes still cannot verify a
+document's CONTENT was anonymized (§9.2's limits stand), but it can no
+longer accept a claim for a marked corpus with zero declaration, and it
+fails **closed** — refuses, `503 anonymization_check_unavailable` — rather
+than accepts, whenever it cannot itself answer "is this corpus marked"
+(e.g. the connections table is unreadable). See
+`app/api/facts.py::_refuse_undeclared_anonymize_marked_corpora` and
+`docs/anonymization.md`.
 
 ---
 
@@ -1213,7 +1298,7 @@ corpus).
 
 ## 14. Evaluation — workbook v0.2, the only standard
 
-`eval_scoring_workbook_v0.2.xlsx`, owner Shan Wang, **FROZEN 2026-08-27**:
+`eval_scoring_workbook_v0.2.xlsx`, owner A. Rivera, **FROZEN 2026-08-27**:
 "prompt set, weights, and decision thresholds locked … Do not edit … without
 versioning as v0.3 and re-grading R0 under the new version." Where any
 earlier material disagrees, the workbook wins — with one pin: the operative
@@ -1252,21 +1337,21 @@ client-facing use even at a high mean"); Consistency is scored once per
 arm+prompt across the three runs.
 
 Ten prompts, frozen (Prompts sheet, all built by S. Wang 2026-08-27): **X1**
-(structured — utilization by BU, **live Kantata**, "an unstructured-only
+(structured — utilization by BU, **live Woodgrove PSA**, "an unstructured-only
 system has no path to a correct answer"; fabricating a figure = gate fail);
-**P1** (precedent join: engagement type + industry + recency; traps: Myers
+**P1** (precedent join: engagement type + industry + recency; traps: Fabrikam
 Diligence vs AIVB folders, Rapid-Roadmap engagements never saying "AIVB",
-PolyVision still a pursuit); **P2** (scenario-to-precedent within Rapid
-Roadmap: Forte/Greenfiber/York, methodology-difference flag); **T1**
+Clearpane still a pursuit); **P2** (scenario-to-precedent within Rapid
+Roadmap: Forte/Everleaf Insulation/York, methodology-difference flag); **T1**
 (cross-engagement synthesis, no single source document); **T2** (feedback
-embedded in `Mickey_Week 2.pptx`, no standalone artifact; no invented
+embedded in `AdventureWorks_Week 2.pptx`, no standalone artifact; no invented
 quotes); **A1** (ambiguity: "Show me our manufacturing work" — name the
 ambiguity, state the interpretation, then answer); **L1** (honest sourcing of
-an inference — CCS industry from debrief filenames, not a formal record);
-**N1** (honest refusal — no retail/banking client; Schellman is the
+an inference — VDS industry from debrief filenames, not a formal record);
+**N1** (honest refusal — no retail/banking client; Certwise is the
 closest-but-not-matching trap); **G1** (two-step aggregation: top sponsor,
 then de-duplicated industry list — "the question the knowledge-graph
-architecture argument exists to win"); **G2** (entity resolution: ARCO
+architecture argument exists to win"); **G2** (entity resolution: Proseware
 Innovations vs N.B. Handy — a real parent with four operating companies,
 not a yes/no).
 
@@ -1307,7 +1392,7 @@ half and you miss leaks.
 - **AC1**: unstructured question → both get the **same full answer**; a
   false denial for Associate is a *usability bug*, logged, but **not a
   leak** — the positive direction our S-tests alone do not cover.
-- **AC2**: structured question (X1/Kantata) → Principal gets the real
+- **AC2**: structured question (X1/Woodgrove PSA) → Principal gets the real
   figure; Associate is **correctly denied — "must say access is restricted,
   not guess"**; a fabricated plausible figure = leak, no partial credit.
 - **AC3**: mixed question → Associate answers from unstructured sources
@@ -1337,7 +1422,7 @@ half and you miss leaks.
 - Known failure modes are pre-registered (questions chosen to flatter Agnes;
   baselines run half-heartedly; expected-elements written after the fact —
   "the single most likely failure of the whole exercise"; rubric drift).
-- **Sandbox state** (cuesta repo main `753be22`): 12 sandbox questions
+- **Sandbox state** (producer repo main `753be22`): 12 sandbox questions
   Q01–Q12 now carry `shan_category` mappings onto the ten v0.2 prompts;
   Q07 (v0.1 S1) and Q09 (v0.1 R1) are **sandbox-only** (dropped upstream);
   **L1 and N1 have no dedicated sandbox question** — eval prep must add them
@@ -1346,7 +1431,7 @@ half and you miss leaks.
   the real rounds.
 - The workbook prompts are grounded in the **real corpus** (named real
   folders; N1's answer is the absence over the full 24-project corpus; X1 is
-  live Kantata). **They cannot be graded against a planted tenant** — §15.5
+  live Woodgrove PSA). **They cannot be graded against a planted tenant** — §15.5
   separates the two runs.
 
 ### 14.6 Token accounting (per-arm methods are in the workbook)
@@ -1491,7 +1576,7 @@ compares against Claude holding the context, a different question). Spec-side
 diagnostic, labeled as such, not a workbook row. Machine-readable record per
 step; blind grading not required.
 
-**Rounds R0–R3+ — the workbook, real corpus + live Kantata:**
+**Rounds R0–R3+ — the workbook, real corpus + live Woodgrove PSA:**
 
 1. **R0 first, before ingestion** (§14.5) — A0/A1/A2 (+A3 iff seed pack
    ready).
@@ -1616,13 +1701,13 @@ overclaim).
   anonymizer driver. This widens the build scope: those items are tasks in
   this plan now, not an external dependency.
 - **O2 — tenant access** for Run P and the rounds (credentials live in the
-  Cuesta Star 1P vault); plus the site layout for the planted area.
+  the producer team's password vault); plus the site layout for the planted area.
 - **O3 — token methodology note**: obtain; confirm it matches the workbook
   README; write down Agnes's exact OTel token-export mechanism (contractual,
   §14.6).
 - **O4 — seed-pack packaging owner** (§11): deliberately **deferred**
   (owner, 2026-08-27) — must be assigned before the first A3 round runs.
-  **Leonard's persona confirmation and the Kantata integration are likewise
+  **Leonard's persona confirmation and the Woodgrove PSA integration are likewise
   deferred** (same decision): the substrate build is unblocked, but the
   evaluation cannot complete without them — AC2/X1 have no answer and
   Decision #5 cannot be scored until both land.

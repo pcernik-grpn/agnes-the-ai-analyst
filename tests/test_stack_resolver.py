@@ -287,3 +287,134 @@ class TestResourceEntryShape:
         assert e.in_stack is False
         assert e.materialized is False
         assert e.requirement == "available"
+
+
+# -------- Lifecycle status: draft / coming-soon ----------------------------
+
+
+class TestLifecycleStatusGating:
+    """The ``status`` picker makes two promises the resolver has to keep.
+
+    ``draft`` says "admin-only, hidden from analysts" and ``coming-soon``
+    says "visible but not usable yet". Both were presentational only — the
+    status drove a pill and a hero filter and nothing else — so a granted
+    draft package landed in the analyst's Library fully materialized, and
+    ``coming-soon`` delivered parquets like any other row.
+
+    ``browse()``/``stack()``/``_fetch_entries`` are the single chokepoint the
+    pull manifest also runs through (``app/api/sync.py`` builds its
+    ``data_packages`` section from ``resolver.stack``), so gating here is what
+    makes the labels true on every surface at once.
+    """
+
+    def test_draft_package_is_hidden_from_browse(self, conn):
+        conn.execute("UPDATE data_packages SET status = 'draft' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "required")
+        entries = StackResolver(conn).browse("u1", ResourceType.DATA_PACKAGE)
+        assert "pkg_sales" not in {e.id for e in entries}
+
+    def test_draft_package_is_absent_from_stack(self, conn):
+        """The stack feeds the pull manifest — a draft must not deliver."""
+        conn.execute("UPDATE data_packages SET status = 'draft' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "required")
+        entries = StackResolver(conn).stack("u1", ResourceType.DATA_PACKAGE)
+        assert "pkg_sales" not in {e.id for e in entries}
+
+    def test_non_draft_package_is_unaffected(self, conn):
+        """The gate is narrow: prod is the default and must not be touched."""
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "required")
+        entries = StackResolver(conn).browse("u1", ResourceType.DATA_PACKAGE)
+        assert "pkg_sales" in {e.id for e in entries}
+
+    def test_coming_soon_is_visible_but_never_materialized(self, conn):
+        """'Visible but not usable yet' — it browses, it does not download."""
+        conn.execute("UPDATE data_packages SET status = 'coming-soon' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "required")
+        entries = StackResolver(conn).browse("u1", ResourceType.DATA_PACKAGE)
+        entry = next(e for e in entries if e.id == "pkg_sales")
+        assert entry.materialized is False
+
+    def test_coming_soon_is_absent_from_stack(self, conn):
+        """Not usable yet means the manifest must not carry it either."""
+        conn.execute("UPDATE data_packages SET status = 'coming-soon' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "required")
+        entries = StackResolver(conn).stack("u1", ResourceType.DATA_PACKAGE)
+        assert "pkg_sales" not in {e.id for e in entries}
+
+    def test_browse_admin_still_shows_draft(self, conn):
+        """Admins author drafts, so their own Browse must keep showing them."""
+        conn.execute("UPDATE data_packages SET status = 'draft' WHERE id = 'pkg_sales'")
+        entries = StackResolver(conn).browse_admin("u1", ResourceType.DATA_PACKAGE)
+        assert "pkg_sales" in {e.id for e in entries}
+
+    def test_draft_is_hidden_from_a_principal_intersection(self, conn):
+        """An agent inherits its owner's reach, so it must not see a draft
+        the owner cannot see either."""
+        conn.execute("UPDATE data_packages SET status = 'draft' WHERE id = 'pkg_sales'")
+
+        class _P:
+            intersection = {"data_package": frozenset({"pkg_sales"})}
+
+        import app.auth.session_principal as sp
+
+        original = sp.PRINCIPAL_TYPES
+        sp.PRINCIPAL_TYPES = (_P,)
+        try:
+            entries = StackResolver(conn).stack(_P(), ResourceType.DATA_PACKAGE)
+        finally:
+            sp.PRINCIPAL_TYPES = original
+        assert "pkg_sales" not in {e.id for e in entries}
+
+
+class TestSubscribeHonoursStatus:
+    """The gate above hides a status from every READ. Subscribing is the write
+    that was left behind, and it was the one a member could actually reach.
+
+    A subscription is a request for a local copy, and ``stack()`` — which
+    builds the pull manifest — refuses to carry a hidden or undeliverable
+    status. So the write returned ``{"subscribed": true}`` for a download that
+    could never arrive: no error, no row in the manifest, and nothing on any
+    screen to explain the silence. Refusing in ``add_to_stack`` rather than in
+    the endpoint is what makes it true of all four surfaces at once (Library,
+    chat, CLI, MCP), since every one of them subscribes through this method.
+    """
+
+    def test_subscribe_to_a_draft_is_a_404(self, conn):
+        """404, not 403 — every read behaves as though a draft is not there,
+        and the write has no business being the one surface that admits it
+        exists."""
+        import pytest
+        from fastapi import HTTPException
+
+        conn.execute("UPDATE data_packages SET status = 'draft' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "available")
+        with pytest.raises(HTTPException) as exc:
+            StackResolver(conn).add_to_stack("u1", ResourceType.DATA_PACKAGE, "pkg_sales")
+        assert exc.value.status_code == 404
+
+    def test_subscribe_to_coming_soon_is_a_409(self, conn):
+        """'Visible but not usable yet' is a different answer from 'not there':
+        the caller found a real thing and asked too early, so the refusal says
+        so and the id stays namable."""
+        import pytest
+        from fastapi import HTTPException
+
+        conn.execute("UPDATE data_packages SET status = 'coming-soon' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "available")
+        with pytest.raises(HTTPException) as exc:
+            StackResolver(conn).add_to_stack("u1", ResourceType.DATA_PACKAGE, "pkg_sales")
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "not_available_yet"
+
+    def test_prod_still_subscribes(self, conn):
+        """The gate is narrow — the ordinary path must be untouched."""
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "available")
+        StackResolver(conn).add_to_stack("u1", ResourceType.DATA_PACKAGE, "pkg_sales")
+        entries = StackResolver(conn).stack("u1", ResourceType.DATA_PACKAGE)
+        assert next(e for e in entries if e.id == "pkg_sales").materialized is True
+
+    def test_a_type_without_a_status_is_not_blocked(self, conn):
+        """Only packages and domains carry a status. Every other type must
+        subscribe as before rather than trip a lookup that does not apply."""
+        _grant(conn, "g_sales", "collection", "col_1", "available")
+        StackResolver(conn).add_to_stack("u1", ResourceType.COLLECTION, "col_1")

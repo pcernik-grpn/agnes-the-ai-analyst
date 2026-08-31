@@ -716,14 +716,83 @@ SWITCHES: tuple[Switch, ...] = (
             "it gates needs a configured `extraction.producer` command AND a worker "
             "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
             "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
-            "feature whose backend is absent. Enable the profile/producer and this flag "
-            "together."
+            "feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
+            "(a role split), which makes the deployment multi-process — it ALSO needs "
+            "Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET, and "
+            "coordination.backend=redis (docs/DEPLOYMENT.md#multi-process), or the "
+            "process refuses to boot. Enable the profile/producer, satisfy those "
+            "multi-process prerequisites, and this flag together."
         ),
         description=(
             "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "
             "own worker lane — gates the `corpus-extraction` job kind's handler, which "
             "shells out to the operator-configured `extraction.producer` command/module. "
             "New feature — off by default."
+        ),
+    ),
+    Switch(
+        name="acl_mirroring",
+        config_keys=("acl_mirroring", "enabled"),
+        env_var="AGNES_ACL_MIRRORING_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope "
+            "access_mode='mirrored', and the admin sync-now endpoint. OFF by default — "
+            "turning it on changes nothing until a scope opts into mirroring."
+        ),
+    ),
+    Switch(
+        name="acl_guarantee_mode",
+        config_keys=("acl_sync", "guarantee_mode"),
+        env_var="AGNES_ACL_GUARANTEE_MODE",
+        kind="select",
+        options=("must_not", "should_not"),
+        default="must_not",
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Cross-audience-leak posture (design Q7). must_not = fail closed: "
+            "broken-inheritance subtrees are always excluded, mirrored grants are "
+            "suspended past acl_sync.max_stale_hours, and untagged claims in an "
+            "audience-tiered scope are admin-only. should_not = best effort: advisory "
+            "overrides allowed, stale grants persist with warnings, untagged claims "
+            "stay unrestricted within their collection."
+        ),
+    ),
+    Switch(
+        name="acl_max_stale_hours",
+        config_keys=("acl_sync", "max_stale_hours"),
+        env_var="AGNES_ACL_MAX_STALE_HOURS",
+        kind="int",
+        default=72,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "must_not mode only: hours a failed ACL sync may leave mirrored grants "
+            "standing before they are suspended (deleted until the next successful "
+            "sync rewrites them)."
+        ),
+    ),
+    Switch(
+        name="acl_sweep_interval_days",
+        config_keys=("acl_sync", "sweep_interval_days"),
+        env_var="AGNES_ACL_SWEEP_INTERVAL_DAYS",
+        kind="int",
+        default=7,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Days between full sharepoint-subtree-sweep passes (broken-inheritance "
+            "folder detection, spec §3(b)) for one connection's mirrored scopes. The "
+            "scheduler row itself already fires weekly (native cron); this is a "
+            "per-connection self-guard against a restart-refire, not the primary cadence."
         ),
     ),
 )

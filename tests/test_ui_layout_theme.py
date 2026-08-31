@@ -353,7 +353,12 @@ class TestRailOptIn:
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         text = resp.text
-        head = text.split('class="lib-head"', 1)[1].split('class="fbar-dock"', 1)[0]
+        # Bounded by the browsing block, which is the next landmark after the
+        # header. It used to slice to `class="fbar-dock"`, which /library has not
+        # rendered since #1751 — so the slice silently ran to the end of the
+        # document and the assertion below covered the whole page instead of the
+        # header.
+        head = text.split('class="lib-head"', 1)[1].split('class="lib-browse"', 1)[0]
         assert 'href="/stack"' not in head
 
         rows = re.findall(r"<tr[^>]*\bdata-item-id=[^>]*>", text)
@@ -569,7 +574,7 @@ class TestRailOptIn:
         assert "data, memory & files" in text
         # Available-but-not-yet-added marketplace items are surfaced and the
         # ones already in the stack are marked (not filtered out).
-        assert "In your stack" in text
+        assert "Agents can use this" in text
         assert "any plugin or skill available to you" in text.lower()
         # The "work in progress" notice is GONE (AGT-6). It said agents were
         # saved but that running them was still to come — and running them is
@@ -739,6 +744,14 @@ class TestRailChatHistory:
         don't carry one either, and it navigates rather than expands)."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
+        # This slot holds one of two rows, and it is the ANALYST one under
+        # test here. An admin mid-chain gets the setup chain instead, so the
+        # chain is stood down for this test — the state every member is always
+        # in, and the state an admin reaches once their instance is set up.
+        import app.web.router as _router
+
+        monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
+        _router.templates.env.globals["admin_setup_rail"] = lambda: None
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         # Asserted against the rail chrome slice, not the whole document — the
@@ -1057,7 +1070,11 @@ class TestRailTwoZones:
             'class="rail-admin"',  # ...Admin behind a divider
             'class="rail-foot"',  # zone 3 — always reachable, never collapsed
             'href="/how-it-works#connect"',  # …take Agnes elsewhere,
-            'class="rail-getstarted"',  # …then the onboarding row,
+            # Either row — the analyst journey or the admin setup chain, which
+            # share this slot and this class. Anchored without the closing
+            # quote so the chain's `class="rail-getstarted rail-setupchain"`
+            # matches too; the assertion is about WHERE the row sits.
+            'class="rail-getstarted',  # …then the onboarding row,
             'id="userMenu"',  # …then profile, at the very bottom
         ]
         positions = [rail.find(anchor) for anchor in sequence]
@@ -1369,14 +1386,24 @@ class TestRailChatsDestination:
         assert 'class="rail-history"' not in rail
         assert 'id="rail-pinned"' not in rail
 
-    def test_the_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
+    def test_the_analyst_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
         """It measures the ANALYST's journey — take Agnes to your tools, ask your
         first question — and it is the only element in the rail with a coloured
         progress arc, so it pulls hardest of anything on screen while you are
         registering a table. Nothing is lost: the checklist is still reachable from
-        the account menu and from the chat dashboard's "Set up Agnes" door."""
+        the account menu and from the chat dashboard's "Set up Agnes" door.
+
+        The exclusion is of that journey, not of the slot. The admin's OWN
+        chain now uses it (sibling test below), and the reason above is why
+        that is the right way round rather than an exception to this rule: on
+        an admin page the chain names the exact job you are there to do.
+        """
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
+        _router.templates.env.globals["admin_setup_rail"] = lambda: None
         admin_rail = self._rail(web_client, admin_cookie, "/admin/users")
         assert 'id="railGetStarted"' not in admin_rail
         assert "rail-getstarted" not in admin_rail
@@ -1384,6 +1411,87 @@ class TestRailChatsDestination:
         assert "js/chat_onboarding.js" not in web_client.get("/admin/users", cookies=admin_cookie).text
         # Still there on an app page — this is a scoping change, not a removal.
         assert 'id="railGetStarted"' in self._rail(web_client, admin_cookie)
+
+    def test_the_admin_chain_takes_the_slot_while_it_is_unfinished(self, web_client, admin_cookie, monkeypatch):
+        """An admin mid-chain had no view of their own progress anywhere but
+        /chat, and on app pages the rail showed them the ANALYST checklist —
+        six steps, none of them their job.
+
+        The row switches on whose steps can currently succeed: until a source
+        is connected and shared, "ask your first question" has nothing to
+        answer from. It is server-rendered with its own ids, so
+        chat_onboarding.js — whose every lookup is guarded — finds nothing and
+        cannot write analyst numbers over admin ones.
+        """
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        chain = {
+            "done": 1,
+            "total": 6,
+            "complete": False,
+            "steps": [
+                {"label": "Connect a source", "done": True, "failed": False, "href": "/admin/data-sources"},
+                {"label": "Choose tables", "done": False, "failed": False, "href": "/admin/tables"},
+                {"label": "Invite people", "done": False, "failed": True, "href": "/admin/users"},
+            ],
+        }
+        _router.templates.env.globals["admin_setup_rail"] = lambda: chain
+        try:
+            for path in ("/library", "/admin/users"):
+                rail = self._rail(web_client, admin_cookie, path)
+                assert 'id="railSetupChain"' in rail, f"the chain is missing on {path}"
+                assert "1 of 6 steps complete" in rail
+                assert "Connect a source" in rail and "Choose tables" in rail
+                # The analyst row stands down — one journey in the slot, which
+                # is the whole reason this row exists.
+                assert 'id="railGetStarted"' not in rail
+                # A step whose own check raised says so instead of reading as
+                # an ordinary open step on a healthy chain.
+                assert "could not check" in rail
+        finally:
+            _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
+
+    def test_the_chain_is_wired_end_to_end_without_a_stub(self, web_client, admin_cookie, monkeypatch):
+        """The two tests around this one inject the chain through the Jinja
+        global, which proves the ROW renders and proves nothing about how the
+        row gets its data.
+
+        That gap is not hypothetical: it let a build pass every test while the
+        row appeared on no page at all, and the twenty minutes that followed
+        went on debugging a template that was fine. So this one calls the real
+        registered global — resolver, memo and registration included — and
+        only asserts the shape, because the numbers depend on the fixture's
+        instance and pinning them would make this a test of the seed data.
+        """
+        import app.web.router as _router
+
+        chain = _router.templates.env.globals["admin_setup_rail"]()
+        assert chain is not None, "the chain resolver returned nothing on a seeded instance"
+        assert chain["total"] > 0
+        assert isinstance(chain["steps"], list) and chain["steps"]
+        for st in chain["steps"]:
+            assert st["label"], "a step with no label renders as an empty row"
+            assert st["href"], "every step is a door — one with no href is a dead line of text"
+
+    def test_a_finished_chain_hands_the_slot_back(self, web_client, admin_cookie, monkeypatch):
+        """Once the instance is set up the admin is also a user, and the
+        analyst steps become things that can actually succeed. The row is not
+        retired — it is handed back."""
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        _router.templates.env.globals["admin_setup_rail"] = lambda: {
+            "done": 6, "total": 6, "complete": True, "steps": [],
+        }
+        try:
+            rail = self._rail(web_client, admin_cookie)
+            assert 'id="railSetupChain"' not in rail
+            assert 'id="railGetStarted"' in rail
+        finally:
+            _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
 
 
 class TestRailAdminIsOnePlainLink:
@@ -1611,7 +1719,14 @@ class TestRailDashboard:
         # That button is the CONNECT action, never the journey's current step:
         # `admin_notice.cta` can read "Invite people" on a partly-set-up
         # instance, which is incoherent beside "nothing is registered yet".
-        assert "Invite people" not in text
+        # Scoped to the hero, not the document: the rail's setup-chain row
+        # lists every step by name — "Invite people" among them — which is
+        # correct there and says nothing about this button. Before that row
+        # existed the whole page was a safe proxy for the hero; it is not any
+        # more, and a document-wide assertion would have started failing for a
+        # reason unrelated to what it is checking.
+        _hero = text.split('cld-door--setup', 1)[1].split("</section>", 1)[0]
+        assert "Invite people" not in _hero
         assert "/admin/data-sources?add=" in text
         # The composer must not advertise the one thing that cannot work here.
         assert "summarize revenue trends" not in text, "the zero state still offers a data example"
@@ -2298,17 +2413,68 @@ class TestRedesignedPageContracts:
             conn.close()
         return web_client.get("/chat", cookies=admin_cookie)
 
-    def test_chat_keeps_upload_menu_journey_and_row_menu(self, web_client, admin_cookie, monkeypatch):
-        """The composer "+" menu and the row menu render on the page; the
-        journey checklist is the rail's own ``railGetStarted`` card
-        (chat.html's ``#chat-journey`` div is the retired topnav sidebar's
-        slot — the live page never renders it)."""
+    def test_chat_keeps_upload_menu_and_row_menu(self, web_client, admin_cookie, monkeypatch):
+        """The composer "+" menu and the row menu render on the page."""
         resp = self._chat(web_client, admin_cookie)
         assert resp.status_code == 200
         assert 'id="chat-plus-menu"' in resp.text
-        assert 'id="railGetStarted"' in resp.text
         assert "chat_row_menu.js" in resp.text
         assert 'id="chat-copy-transcript"' in resp.text
+
+    def test_the_analyst_journey_yields_to_an_unfinished_admin_chain(
+        self, web_client, admin_cookie, monkeypatch
+    ):
+        """Two six-step "setup" journeys must never render together.
+
+        The rail's ``railGetStarted`` card is the ANALYST journey (ask a
+        question, explore your Library, put knowledge in your stack…). The
+        hero card on the same page is the ADMIN chain (connect a source,
+        choose tables, bundle, invite, share, verify). They share no steps,
+        and rendering both put two "of 6" counters with different numerators
+        on one screen — the one the front door drove being the one that never
+        mentions the admin's actual job.
+
+        So for an admin whose chain is unfinished the analyst journey yields.
+        This asserts the narrowing in BOTH directions: it is not "the journey
+        is gone", it is "the journey is not shown to the wrong person at the
+        wrong time". A non-admin, and an admin who has finished, still get it.
+        """
+        resp = self._chat(web_client, admin_cookie)
+        assert resp.status_code == 200
+        # This fixture's instance has no source and no tables, so the admin
+        # chain is unfinished and the analyst journey must stand down.
+        assert 'id="railGetStarted"' not in resp.text
+        assert "window._agAdminSetupPending = true" in resp.text
+
+    def test_the_analyst_journey_is_untouched_for_a_non_admin(self):
+        """The narrowing keys off `admin_setup`, which the chat route computes
+        only for an admin — so a member's render is bit-for-bit unchanged.
+
+        Asserted on the template condition itself rather than through a second
+        seeded user: the condition IS the contract, and a member fixture would
+        test the seeding as much as the rule.
+        """
+        from jinja2 import Environment
+
+        env = Environment()
+        pill = env.from_string(
+            "{% if not (admin_setup and not admin_setup.complete) %}PILL{% else %}NONE{% endif %}"
+        )
+        flag = env.from_string(
+            "{% if admin_setup and not admin_setup.complete %}FLAG{% else %}NONE{% endif %}"
+        )
+        # A non-admin never gets `admin_setup` at all.
+        assert pill.render() == "PILL"
+        assert flag.render() == "NONE"
+        assert pill.render(admin_setup=None) == "PILL"
+        # An admin who has finished is, for this purpose, just a user again.
+        done = {"done": 6, "total": 6, "complete": True}
+        assert pill.render(admin_setup=done) == "PILL"
+        assert flag.render(admin_setup=done) == "NONE"
+        # Only the unfinished admin yields.
+        mid = {"done": 2, "total": 6, "complete": False}
+        assert pill.render(admin_setup=mid) == "NONE"
+        assert flag.render(admin_setup=mid) == "FLAG"
 
     # ── Wave 2 (spec 2026-08-07-default-chrome-ux-parity): the page rewrites. ──
 

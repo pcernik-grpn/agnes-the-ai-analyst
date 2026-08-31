@@ -53,7 +53,9 @@
    hero (macros/_detail.html imports it) so index cards and detail pages
    show the same glyph. Accepts both the card's plural kinds and the
    hero's singular aliases (recipe→recipes, plugin→plugins, table→data).
-   Keep in lockstep with KIND_GLYPH in static/js/catalog_card.js. #}
+   This is the ORIGINAL; static/js/kind_glyph.js is its client-side
+   transcription and every JS surface reads the set from there. Adding a
+   kind here means adding it there — and nowhere else. #}
 {%- macro kind_glyph(kind) -%}
   {%- set kind = {'recipe': 'recipes', 'plugin': 'plugins', 'table': 'data'}.get(kind, kind) -%}
   {%- if kind == 'data' -%}
@@ -88,6 +90,15 @@
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h3.2a1.5 1.5 0 0 1 1.06.44L11 7.5h7.5A1.5 1.5 0 0 1 20 9v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M4 10.5h16" stroke="currentColor" stroke-width="1.6"/></svg>
   {%- elif kind == 'skill' -%}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M13 3 4 14h6l-1 7 9-11h-6l1-7Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+  {%- elif kind == 'group' -%}
+    {# A GROUP — an audience, not a resource. It is in this set because it is
+       drawn on as many pages as any kind is (access, people, sharing, an
+       agent's scope) and a second drawing of it would drift the way the
+       kinds did. It deliberately has NO --ds-kind-group colour: the
+       categorical palette names types of CONTENT, and a group is who the
+       content reaches. It is marked in neutral ink instead, which is also
+       what keeps it legible beside a coloured kind in a mixed row. #}
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M16 20v-1.6a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4V20" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="9.5" cy="7.5" r="3.5" stroke="currentColor" stroke-width="1.6"/><path d="M16.5 4.4a3.5 3.5 0 0 1 0 6.7M21 20v-1.6a4 4 0 0 0-3-3.87" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
   {%- elif kind == 'agent' -%}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="8" width="16" height="11" rx="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M12 4v4M8.5 13h.01M15.5 13h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="4" r="1.2" fill="currentColor"/></svg>
   {%- else -%}
@@ -183,10 +194,10 @@
               data-remove-url="{{ a.remove_url }}"
               {% if a.rt %}data-rt="{{ a.rt }}" data-rid="{{ a.rid }}"{% endif %}>
         {% if a.state == 'in' %}
-          <span class="cc-btn-instack"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> {{ 'Downloaded' if is_dl else 'In stack' }}</span>
+          <span class="cc-btn-instack"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> {{ 'Downloaded' if is_dl else words.has }}</span>
           <span class="cc-btn-remove"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> {{ 'Remove local copy' if is_dl else 'Remove' }}</span>
         {% else %}
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> {{ 'Download locally' if is_dl else 'Add to stack' }}
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> {{ words.keep_local if is_dl else words.add }}
         {% endif %}
       </button>
     {% else %}

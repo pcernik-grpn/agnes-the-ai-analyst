@@ -42,8 +42,16 @@ WORKSPACE_LINK_ENTRIES = (".claude", "CLAUDE.md", "snapshots", "scripts", "scaff
 #: `agnes-data-apps-extras`, called `data_apps_list`, and got a 404
 #: `data_apps_disabled` — a wasted round trip, and worse, the skill had already
 #: aimed it at building a hosted dashboard for what was a one-off plot.
+# skill name -> (config section, key, env var, DEFAULT when unset).
+#
+# The default is per-entry, not a constant: `data_apps.enabled` is off until an
+# operator turns it on, but `mcp.connector_ui_enabled` is on until an operator
+# turns it OFF (app/instance_config.py). A shared `default=False` would have
+# pruned the connect skill from every instance that simply never mentioned the
+# flag — the common case — so each entry carries the default its own flag has.
 _FEATURE_GATED_SKILLS = {
-    "agnes-data-apps-extras": ("data_apps", "enabled", "AGNES_DATA_APPS_ENABLED"),
+    "agnes-data-apps-extras": ("data_apps", "enabled", "AGNES_DATA_APPS_ENABLED", False),
+    "connect-this-tool": ("mcp", "connector_ui_enabled", "AGNES_MCP_CONNECTOR_UI_ENABLED", True),
 }
 
 
@@ -61,8 +69,8 @@ def skill_disabled_on_this_instance(skill_name: str) -> bool:
     gate = _FEATURE_GATED_SKILLS.get(skill_name)
     if gate is None:
         return False
-    section, key, env_var = gate
-    return not feature_enabled(section, key, env_var=env_var, default=False)
+    section, key, env_var, default = gate
+    return not feature_enabled(section, key, env_var=env_var, default=default)
 
 
 def _reconcile_feature_gated_skills(ws: Path, bundled_template_dir: Path, *, allow_restore: bool = True) -> None:
@@ -218,9 +226,10 @@ def _prune_disabled_feature_skills(ws: Path) -> None:
     skills_root = ws / ".claude" / "skills"
     if not skills_root.is_dir():
         return
-    for skill_name, (section, key, _env_var) in _FEATURE_GATED_SKILLS.items():
+    for skill_name, gate in _FEATURE_GATED_SKILLS.items():
         if not skill_disabled_on_this_instance(skill_name):
             continue
+        section, key = gate[0], gate[1]
         target = skills_root / skill_name
         if not target.is_dir():
             continue

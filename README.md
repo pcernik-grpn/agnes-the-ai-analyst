@@ -143,8 +143,9 @@ uv pip install ".[dev,server]"
 # Run FastAPI locally with hot reload
 uvicorn app.main:app --reload
 
-# Run the test suite
-pytest tests/ connectors/ -v
+# Run the test suite. Locally, run a lane — the full suite is CI's job.
+pytest tests/ connectors/ --lane fast -n auto -q     # ~3 min pre-push gate
+pytest tests/ connectors/ -v                         # everything, ~12 min
 ```
 
 ## Project Structure
@@ -205,7 +206,7 @@ Key entry points:
 ## Contributing
 
 1. Fork the repository and create a feature branch.
-2. Run `pytest tests/ connectors/ -v` to verify all tests pass before opening a pull request.
+2. Run `pytest tests/ connectors/ --lane fast -n auto -q` before opening a pull request — CI runs the full suite on the push. See [CONTRIBUTING.md](CONTRIBUTING.md) for the lanes.
 3. Keep commits focused and messages concise.
 4. Open a pull request against `main` with a clear description of the change.
 

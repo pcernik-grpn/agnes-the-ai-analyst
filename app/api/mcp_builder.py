@@ -56,6 +56,7 @@ from app.api.builder_core import (
     panel_prompt_section,
     slots_prompt_section,
     stub_enabled,
+    turn_failure,
     turn_response,
 )
 from app.auth.access import require_admin
@@ -394,11 +395,9 @@ async def mcp_builder_turn(payload: McpTurnRequest):
                 },
             ) from e
         except Exception as e:
-            logger.warning("mcp builder: turn failed: %s", e)
-            raise HTTPException(
-                status_code=502,
-                detail={"kind": "builder_turn_failed", "hint": "The assistant could not answer. Try again."},
-            ) from e
+            # Names the failure instead of collapsing every cause into
+            # "try again" — see builder_core.turn_failure.
+            raise turn_failure(e, label="mcp builder") from e
 
     patch = _sanitize_patch(result.get("patch"), draft=draft)
     return turn_response(

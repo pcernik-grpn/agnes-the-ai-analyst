@@ -1453,7 +1453,6 @@ _NATIVE_DIALOG_ALLOWLIST: set[str] = {
     "_app_scripts.html",
     "admin_chat.html",
     "admin_data_sources.html",
-    "admin_linked_apps.html",
     "admin_marketplaces.html",
     "admin_mcp_source_detail.html",
     "admin_tables.html",

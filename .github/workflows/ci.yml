@@ -16,6 +16,29 @@ on:
     - cron: "0 3 * * *"  # Nightly at 03:00 UTC — runs docker-e2e
   workflow_dispatch:
 
+# One CI run per pull request at a time. Without this, a measured 16-hour
+# window held 100 runs across 47 branches of which 25 were STILL RUNNING after
+# a newer push to the same branch had already started — 12 jobs each, ~105
+# job-hours spent on head commits nobody would ever look at. That is not a
+# billing footnote: it is the runner contention that turns a 15-minute shard
+# into a 43-minute one and puts `tests/test_stack_resolver_perf.py` over
+# pytest's timeout, which then reads as a red PR and costs a manual rerun.
+# Agent-driven review rounds make it worse — three pushes to one PR in an hour
+# is normal here.
+#
+# `cancel-in-progress` is deliberately scoped to `pull_request`. A push to
+# `main` or `integration` is the merge-gate result for THAT commit and must
+# never be cancelled by the next merge landing behind it.
+#
+# This does NOT reproduce the stuck-red-check problem `release.yml` had (see
+# scripts/ci/docs_only_change.py): that came from two runs racing for the SAME
+# commit, so the cancelled one's contexts stayed attached to the head SHA.
+# Here the cancelled run belongs to the SUPERSEDED head, and GitHub evaluates
+# required checks against the new head only.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-shard:
     runs-on: ubuntu-latest

@@ -1303,6 +1303,8 @@ class TestStoreSmoke:
         "POST /api/store/entities/from-markdown",
         "POST /api/store/entities/from-components",
         "PUT /api/store/entities/{entity_id}",
+        "GET /api/store/entities/{entity_id}/markdown",
+        "PUT /api/store/entities/{entity_id}/from-markdown",
         "POST /api/store/entities/{entity_id}/install",
         "DELETE /api/store/entities/{entity_id}/install",
         "POST /api/store/entities/{entity_id}/rate",
@@ -1311,6 +1313,18 @@ class TestStoreSmoke:
         "GET /api/store/bundle.zip",
         "POST /api/store/import-bundle",
     }
+
+    def test_reading_and_writing_an_entity_document(self, seeded_app_both):
+        """The editing pair. Both refuse an unknown id the same way the rest of
+        the store does — 404, without admitting whether the row exists."""
+        c, h = seeded_app_both["client"], _admin_headers(seeded_app_both)
+        assert c.get("/api/store/entities/nope/markdown", headers=h).status_code == 404
+        r = c.put(
+            "/api/store/entities/nope/from-markdown",
+            json={"name": "whatever", "skill_md": "# hi"},
+            headers=h,
+        )
+        assert r.status_code == 404, r.text
 
     def test_categories(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/store/categories", headers=_admin_headers(seeded_app_both))
@@ -1437,19 +1451,44 @@ class TestMcpBuilderSmoke:
 
     COVERED_ROUTES = {
         "GET /admin/mcp-sources/new",
+        "GET /admin/mcp-sources/{source_id}/edit",
+        "GET /admin/data-packages/{pkg_id}/edit",
         "POST /api/admin/mcp-sources/builder/turn",
         "GET /admin/linked-apps/new",
     }
+
+    def test_editing_an_unknown_package_is_a_404(self, seeded_app_both):
+        """Same reason as the source below: an edit page pointed at nothing
+        would render an empty builder that CREATES on save."""
+        r = seeded_app_both["client"].get(
+            "/admin/data-packages/does-not-exist/edit", headers=_admin_headers(seeded_app_both)
+        )
+        assert r.status_code == 404, r.text
+
+    def test_editing_an_unknown_source_is_a_404(self, seeded_app_both):
+        """The edit page is the create page pointed at a row — so it has to
+        refuse an id that is not one, rather than rendering an empty builder
+        that would register a second source on save."""
+        r = seeded_app_both["client"].get(
+            "/admin/mcp-sources/does-not-exist/edit", headers=_admin_headers(seeded_app_both)
+        )
+        assert r.status_code == 404, r.text
 
     def test_builder_page_renders_for_an_admin(self, seeded_app_both):
         r = seeded_app_both["client"].get("/admin/mcp-sources/new", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200, r.text
         assert "mcp-builder-view" in r.text
 
-    def test_linked_apps_builder_page_renders_for_an_admin(self, seeded_app_both):
-        r = seeded_app_both["client"].get("/admin/linked-apps/new", headers=_admin_headers(seeded_app_both))
-        assert r.status_code == 200, r.text
-        assert "la-builder-view" in r.text
+    def test_the_old_new_linked_app_path_redirects(self, seeded_app_both):
+        """There is no separate create step for a linked app any more:
+        publishing them is picking a connected server and reading its list."""
+        r = seeded_app_both["client"].get(
+            "/admin/linked-apps/new",
+            headers=_admin_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == "/admin/linked-apps"
 
     def test_the_opening_turn_reports_slots_and_engine(self, seeded_app_both):
         """An empty first message is the builder speaking first; it must come
@@ -2178,6 +2217,13 @@ KNOWN_UNTESTED = {
     # Sandboxed data-apps authoring replay (Task 7, wave 3B) — same
     # ticket-authed, never parameter-free shape as the broker routes above.
     "POST /api/broker/data-apps",
+    # apps-runner audit report-back: shared-secret (X-Runner-Token) header
+    # auth, not a user session, so this parameter-free sweep can only ever
+    # 401 here uninformatively. Behaviour — token floor, constant-time
+    # compare, action whitelist, params cap, and the audit row it writes —
+    # is covered on both backends' shared code path in
+    # tests/test_audit_gap_surfaces.py.
+    "POST /api/data-apps/runner-events",
     # Git smart-HTTP transport for that same authoring agent — ticket-authed
     # like its siblings, and additionally never reachable with parameter-free
     # inputs: the client is `git` speaking the wire protocol (its first call
@@ -3231,6 +3277,14 @@ KNOWN_UNTESTED = {
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
     "POST /api/admin/sharepoint/extraction/run-due",
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
+    # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
+    # EXISTING jobs table, no new schema surface" reasoning as the
+    # extraction routes above; auth matrix, flag-gate 409, dedup, and the
+    # exact payload shape are covered by
+    # tests/test_admin_sharepoint.py::TestAclSyncTrigger; not duplicated
+    # in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and
@@ -3249,6 +3303,18 @@ KNOWN_UNTESTED = {
     # covered by tests/db_pg/test_facts_ingest_runs_pg.py + the source-card
     # PG test; the write happens post-ingest in tests/db_pg/test_facts_ingest_pg.py.
     "GET /api/facts/ingest-runs",
+    # Node-type counts for the Library's Knowledge tab (TCRD-250) — covered
+    # by tests/test_api_facts.py (flag-off 404, auth, DuckDB typed-501) and
+    # tests/db_pg/test_facts_read_pg.py (per-caller counts, a type the
+    # caller cannot see is absent, agreement with search()); not duplicated
+    # here.
+    "GET /api/facts/type-map",
+    # The maintained digests a caller can read (TCRD-250) — covered by
+    # tests/test_api_knowledge_digests_distribution.py::TestAnalystDigestList
+    # (401, RBAC both ways, never-generated omitted, staleness, no markdown
+    # in the list, and agreement with the sync manifest for the same
+    # caller); not duplicated here.
+    "GET /api/knowledge/digests",
 }
 
 

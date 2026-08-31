@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -63,6 +64,12 @@ MAX_NEIGHBORS_DEPTH = 2
 MAX_NEIGHBORS_FANOUT = 100
 MAX_NEIGHBORS_RESULT = 500
 MAX_SEARCH_FILTERS = 20
+# P2 review finding: a 1-char `q` drives a full-scan ILIKE over every
+# fact_aliases row with no useful selectivity. Enforced here (repo layer),
+# not only in the REST Pydantic model, so an MCP/CLI caller reaching
+# `search()` directly cannot bypass it. A blank/whitespace `q` is exempt —
+# that already degrades to "no filter" (pre-existing contract).
+MIN_SEARCH_Q_LENGTH = 2
 
 # Ingest batch caps (spec §7.2): "≤500 documents, ≤5000 claims per request".
 # A single document's evidence count over MAX_INGEST_CLAIMS is a protocol
@@ -71,6 +78,23 @@ MAX_SEARCH_FILTERS = 20
 # `full_documents`-listed document's COMPLETE claim set to arrive together.
 MAX_INGEST_DOCUMENTS = 500
 MAX_INGEST_CLAIMS = 5000
+
+# Meaningfulness floor for a verbatim quote (spec §8): a plain substring test
+# alone accepts ANY fragment that happens to occur literally in the text or
+# the document's own identity strings, including one with no evidentiary
+# value — a bare file-extension fragment (".pdf") or a lone path separator
+# ("/") both pass whenever the document mentions a filename or a date/
+# fraction/URL anywhere. A raw length floor alone cannot separate these from
+# a legitimate short quote: ".pdf" and "ARR" (a real metric name) are the
+# same length once ".pdf"'s leading punctuation is set aside. What
+# distinguishes them is not length but SHAPE — ".pdf" is a punctuation-
+# fringed fragment, dependent on characters outside the quote, never a
+# complete token on its own; "ARR" is not. A constant, not a
+# `facts.single_valued_edges`-style `get_value` knob: this guards evidence
+# INTEGRITY (can a fabricated/degenerate LLM extraction get past the gate),
+# not a per-instance ontology choice, so it is not something an operator
+# should be able to loosen. See `_is_meaningful_quote`.
+MIN_MEANINGFUL_QUOTE_LENGTH = 2
 
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
@@ -169,6 +193,202 @@ def _readable_ids(caller) -> Optional[frozenset]:
     if ids is None:
         return None
     return frozenset(ids)
+
+
+def _audience_context(caller, readable: Optional[frozenset]) -> Tuple[List[str], List[str]]:
+    """The two audience-selector bind lists every non-admin read threads
+    alongside ``:readable`` into :meth:`FactsPgRepository._visibility_predicate`
+    (2026-08-30 sharepoint-acl-mirroring plan, Task 10; spec §4.2-§4.4):
+
+    - ``tiered_hidden`` — collection ids to hide an UNTAGGED claim from
+      entirely, i.e. every audience-tiered collection (
+      :func:`src.audience_classes.tiered_collection_ids`), but ONLY under
+      the ``must_not`` guarantee mode (design Q7 fork, the SAME
+      ``acl_guarantee_mode`` switch ``connectors/sharepoint/acl_sync.py``
+      reads) — enabling tiers on a scope is a gated re-index precisely so no
+      untagged full-detail claim survives it (spec §4.4); ``should_not``
+      leaves untagged claims unrestricted within their collection, matching
+      today's pre-audience behavior. Empty under ``should_not`` or for an
+      admin (the caller of this function skips it entirely then).
+    - ``audience_pairs`` — ``"{corpus_id}:{class}"`` strings for every
+      audience class ``caller`` holds on every TIERED collection in
+      ``readable`` (:func:`src.audience_classes.audience_classes_for_caller`)
+      — the tagged-claim half of the selector.
+
+    ``readable=None`` (admin, per :func:`_readable_ids`) short-circuits to
+    ``([], [])`` — the caller of this function must never call it for an
+    admin in the first place (:meth:`_visibility_predicate` returns ``TRUE``
+    unconditionally then, referencing neither bind), but returning empty
+    lists rather than raising keeps this a plain, total function."""
+    if readable is None:
+        return [], []
+
+    from app.switches import switch_value
+    from src.audience_classes import audience_classes_for_caller, tiered_collection_ids
+
+    tiered_hidden = list(tiered_collection_ids()) if switch_value("acl_guarantee_mode") == "must_not" else []
+    per_collection = audience_classes_for_caller(caller, readable)
+    audience_pairs = [f"{corpus_id}:{cls}" for corpus_id, classes in per_collection.items() for cls in classes]
+    return tiered_hidden, audience_pairs
+
+
+def _class_rank_map() -> Dict[str, Dict[str, int]]:
+    """``{corpus_id: {class_name: rank}}``, rank 0 = most privileged — the
+    per-corpus privilege order :func:`src.audience_classes.audience_class_map`
+    already carries (wizard-persisted, most-privileged first), reshaped for
+    :func:`_pick_most_privileged`'s O(1) rank lookup. A collection absent
+    from the result is non-tiered (or unknown); :func:`_pick_most_privileged`
+    treats a class name it can't find here the same as untagged — the
+    least-privileged floor, never a crash."""
+    from src.audience_classes import audience_class_map
+
+    return {
+        corpus_id: {name: idx for idx, (name, _group_ids) in enumerate(classes)}
+        for corpus_id, classes in audience_class_map().items()
+    }
+
+
+# Sentinel rank for "no better-known privilege" — anything untagged, or
+# tagged with a class this instance's audience_class_map no longer
+# recognizes (renamed/removed since the claim was written), floors here
+# rather than raising. One less than the true floor is reserved so a KNOWN
+# tagged class always outranks an unrecognized one, which in turn always
+# outranks untagged (spec §4.2: untagged is the least-privileged variant).
+_UNTAGGED_RANK = 10**9
+_UNKNOWN_CLASS_RANK = _UNTAGGED_RANK - 1
+
+
+def _pick_most_privileged(rows: List[Any], class_rank: Dict[str, Dict[str, int]]) -> List[Any]:
+    """Among CLAIM rows (each a mapping carrying at least ``fact_id``,
+    ``edge_id``, ``corpus_file_id``, ``corpus_id`` and ``audience`` — a
+    fixed field absent from the row's own subject reads as ``None``, so a
+    ``claims()`` result where ``fact_id``/``edge_id`` is constant for the
+    whole list still groups correctly by ``corpus_file_id`` alone), keep
+    only the rows at the BEST (lowest) privilege rank within each
+    ``(fact_id, edge_id, corpus_file_id)`` group (spec §4.2's "most
+    privileged variant" rule, 2026-08-30 sharepoint-acl-mirroring plan, Task
+    10).
+
+    Deliberately rank-floor-based, not "keep exactly one row per group": a
+    group where EVERY row is untagged (all rank at the shared
+    ``_UNTAGGED_RANK`` floor) keeps ALL of them — two genuinely distinct
+    untagged quotes about the same file are independent evidence, never
+    collapsed into one. A group MIXING an untagged row with a tagged one
+    (or several tagged tiers) keeps only the row(s) at the single best rank
+    present, dropping the rest — the "$20k vs <redacted>" shape. Order-
+    preserving over the input."""
+
+    def _rank(row: Any) -> int:
+        audience = row.get("audience")
+        if audience is None:
+            return _UNTAGGED_RANK
+        return class_rank.get(row.get("corpus_id"), {}).get(audience, _UNKNOWN_CLASS_RANK)
+
+    def _key(row: Any) -> Tuple[Any, Any, Any]:
+        return (row.get("fact_id"), row.get("edge_id"), row.get("corpus_file_id"))
+
+    best_rank: Dict[Tuple[Any, Any, Any], int] = {}
+    for row in rows:
+        key = _key(row)
+        rank = _rank(row)
+        if key not in best_rank or rank < best_rank[key]:
+            best_rank[key] = rank
+    return [row for row in rows if _rank(row) == best_rank[_key(row)]]
+
+
+def _add_path_component_candidates(candidates: Set[str], value: str) -> None:
+    """Decompose ``value`` (a stored ``path`` OR a stored ``filename`` — see
+    ``_identity_candidates``) into whole-unit candidates and add them to
+    ``candidates`` in place: the string itself; every single whole
+    ``/``-separated component (a folder name, or the final segment); and
+    every CONTIGUOUS run of whole components (e.g. ``"folder/name.ext"``) —
+    the run ending at the final segment also gets an extension-stripped
+    variant. A separator-free ``value`` (the ordinary case) decomposes to
+    exactly ``{value, stem}``, identical to the pre-bundle-support shape."""
+    candidates.add(value)
+    parts = [p for p in value.split("/") if p]
+    n = len(parts)
+    for i in range(n):
+        for j in range(i + 1, n + 1):
+            candidates.add("/".join(parts[i:j]))
+            if j == n:  # this run ends at the final segment
+                last = parts[j - 1]
+                dot = last.rfind(".")
+                if dot > 0:
+                    candidates.add("/".join(parts[i : j - 1] + [last[:dot]]))
+
+
+def _identity_candidates(filename: Optional[str], path: Optional[str]) -> Set[str]:
+    """Whole-unit identity-evidence candidates for the verbatim gate (spec
+    §8, P0 review finding). A quote counts as identity-grounded evidence
+    only when it EQUALS one of these — never merely CONTAINS one as a
+    substring, which let a fabricated quote self-certify on any fragment of
+    the document's own name (a bare ``".pptx"``, a stray ``"/"``, a 2-char
+    slice). Both ``filename`` and ``path`` are decomposed the SAME way
+    (``_add_path_component_candidates``) — an ordinary ``filename`` has no
+    ``/`` so this changes nothing for it, but a bundle member's stored
+    ``filename`` IS itself a path (``src/ingest/bundle.py`` stores the
+    archive-relative member path there, with no ``path`` at all), so
+    decomposing only ``path`` silently starved that case of any component
+    candidates (live cross-PR regression: a zip member's own folder name
+    was rejected). Candidates: each of ``filename``/``path`` in full; each
+    with its extension stripped; every single whole ``/``-separated
+    component of each (a folder name, or the final segment); and every
+    CONTIGUOUS run of whole components (e.g. ``"folder/filename.ext"``, the
+    folder+filename shape a `part_of` edge legitimately cites) — the run
+    ending at the final segment also gets an extension-stripped variant. No
+    normalization anywhere: matches the chunk-text comparison exactly (an
+    NFC/NFD quote fails identically on both sides)."""
+    candidates: Set[str] = set()
+    if filename:
+        _add_path_component_candidates(candidates, filename)
+    if path:
+        _add_path_component_candidates(candidates, path)
+    candidates.discard("")
+    return candidates
+
+
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
+
+
+def _is_meaningful_quote(quote: str) -> bool:
+    """Verbatim-gate meaningfulness floor (spec §8; see
+    ``MIN_MEANINGFUL_QUOTE_LENGTH`` for the design rationale). Two
+    independent conditions, each closing a different degenerate shape:
+
+    1. **Length** — the trimmed quote must be at least
+       ``MIN_MEANINGFUL_QUOTE_LENGTH`` characters. Closes a bare single
+       character — trivially "starts with a word character" per condition 2
+       below, but still not specific enough to be evidence of anything — and
+       a run of whitespace, which strips to zero.
+    2. **Shape** — the trimmed quote must START with a word character
+       (``\\w``: letter, digit, or underscore, Unicode-aware). Closes a
+       quote that is entirely punctuation (``/``) AND one that is a
+       punctuation-fringed fragment of a longer token (``.pdf`` — the
+       leading "." can never be a complete word's own left edge; a real
+       sentence never begins mid-token) — both shapes a raw length or
+       word-character-count floor cannot tell apart from a short legitimate
+       quote of the same length (an acronym, a ticker, a year, a product
+       name: ".pdf" and "ARR" are the same length once ".pdf"'s leading
+       punctuation is set aside).
+
+       Deliberately checks only the START, not the end: a quote's trailing
+       character is routinely punctuation for an entirely ordinary reason —
+       it is citing a whole sentence or clause ("Acme Corp is the client.",
+       "the engagement is on schedule;") — and requiring a clean end as well
+       rejected that common, legitimate shape outright. A quote beginning
+       mid-token has no such innocent reading; sentence-final punctuation is
+       a closing delimiter of the unit actually quoted, leading punctuation
+       with nothing before it in the quote is not.
+
+    Deliberately does NOT require a minimum number of word characters, or
+    forbid internal/trailing punctuation — "N/A", "3.14", and "Acme Corp is
+    the client." all read fine as evidence.
+    """
+    stripped = quote.strip()
+    if len(stripped) < MIN_MEANINGFUL_QUOTE_LENGTH:
+        return False
+    return bool(_WORD_CHAR_RE.match(stripped[0]))
 
 
 def _single_valued_edge_types() -> frozenset:
@@ -302,6 +522,7 @@ class FactsPgRepository:
         quote: str,
         attrs: Optional[dict] = None,
         document_date: Optional[date] = None,
+        audience: Optional[str] = None,
     ) -> Optional[str]:
         """Insert a claim; ``ON CONFLICT ... DO NOTHING`` on the (subject,
         corpus_file_id, quote_hash) functional unique index makes a replay
@@ -309,33 +530,61 @@ class FactsPgRepository:
         claim id, or ``None`` when this exact triple already existed — the
         ingest write path (build order step 4) uses that to count
         ``claims_written`` accurately across a replayed batch; no other
-        caller (read-path fixtures) inspects the return value."""
+        caller (read-path fixtures) inspects the return value.
+
+        ``audience`` (Task 10, spec §4.2) is an optional index-time variant
+        tag — ``None`` (the default) stays unrestricted-within-collection,
+        today's pre-audience behavior. Format validation (the
+        ``^[a-z0-9_-]{1,64}$`` shape) is the CALLER's job (``app/api/facts.py``
+        rejects a malformed wire value with a 422 before this ever runs) —
+        this method stores whatever it is given verbatim, matching every
+        other claim field here.
+
+        The ``audience`` column is referenced in the INSERT only when a
+        caller actually passes one — ``tests/db_pg/test_facts_read_pg.py``'s
+        S9 backfill tests deliberately pin the Alembic chain to
+        ``0083_ingest_runs_source_urls`` (before this column existed) and
+        seed legacy-shaped data through this exact method; a hardcoded
+        ``audience`` column reference would break that schema-version
+        pinning for a value that's ``NULL`` either way. Storing ``None``
+        by omitting the column has the identical on-disk result as storing
+        it explicitly (the column's own default is ``NULL``), so this is
+        never a behavior change against a fully-migrated schema — only
+        against one older than 0086."""
         if (fact_id is None) == (edge_id is None):
             raise ValueError("add_claim requires exactly one of fact_id/edge_id")
         claim_id = "c_" + secrets.token_hex(8)
         quote_hash = hashlib.sha256(quote.encode("utf-8")).hexdigest()[:16]
+        columns = (
+            "id, fact_id, edge_id, corpus_file_id, corpus_id, file_sha256, attrs, quote, quote_hash, document_date"
+        )
+        placeholders = (
+            ":id, :fact_id, :edge_id, :corpus_file_id, :corpus_id, :file_sha256, "
+            "CAST(:attrs AS JSONB), :quote, :quote_hash, :document_date"
+        )
+        params: Dict[str, Any] = {
+            "id": claim_id,
+            "fact_id": fact_id,
+            "edge_id": edge_id,
+            "corpus_file_id": corpus_file_id,
+            "corpus_id": corpus_id,
+            "file_sha256": file_sha256,
+            "attrs": json.dumps(attrs or {}),
+            "quote": quote,
+            "quote_hash": quote_hash,
+            "document_date": document_date,
+        }
+        if audience is not None:
+            columns += ", audience"
+            placeholders += ", :audience"
+            params["audience"] = audience
         with self._engine.begin() as conn:
             result = conn.execute(
                 sa.text(
-                    "INSERT INTO claims "
-                    "(id, fact_id, edge_id, corpus_file_id, corpus_id, file_sha256, attrs, quote, "
-                    " quote_hash, document_date) "
-                    "VALUES (:id, :fact_id, :edge_id, :corpus_file_id, :corpus_id, :file_sha256, "
-                    "        CAST(:attrs AS JSONB), :quote, :quote_hash, :document_date) "
+                    f"INSERT INTO claims ({columns}) VALUES ({placeholders}) "
                     "ON CONFLICT (COALESCE(fact_id, edge_id), corpus_file_id, quote_hash) DO NOTHING"
                 ),
-                {
-                    "id": claim_id,
-                    "fact_id": fact_id,
-                    "edge_id": edge_id,
-                    "corpus_file_id": corpus_file_id,
-                    "corpus_id": corpus_id,
-                    "file_sha256": file_sha256,
-                    "attrs": json.dumps(attrs or {}),
-                    "quote": quote,
-                    "quote_hash": quote_hash,
-                    "document_date": document_date,
-                },
+                params,
             )
         return claim_id if result.rowcount else None
 
@@ -442,12 +691,46 @@ class FactsPgRepository:
 
     @staticmethod
     def _visibility_predicate(column: str, is_admin: bool) -> str:
-        """SQL fragment for "this claim's corpus_id is in the caller's
-        readable set" — ``TRUE`` for admin (no filter, per
-        ``accessible_collection_ids``), else a bound-parameter ``= ANY``
-        check. ``column`` is always a literal we control (``c.corpus_id``),
-        never caller input."""
-        return "TRUE" if is_admin else f"{column} = ANY(:readable)"
+        """SQL fragment for "this claim is visible to the caller" — ``TRUE``
+        for admin (no filter, per ``accessible_collection_ids``), else the
+        outer reachability gate AND-ed with the audience selector (2026-08-30
+        sharepoint-acl-mirroring plan, Task 10; spec §4.2-§4.4):
+
+            outer gate (reachability):  corpus_id ∈ caller's readable set
+            inner selector (variant):   audience ∈ caller's classes, or
+                                         untagged outside a tiered-hidden
+                                         collection
+
+        The collection grant always wins on reachability — no audience tag
+        makes a claim in an unreadable collection readable, the audience
+        column only narrows WITHIN the readable set (never widens it). An
+        untagged claim (``audience IS NULL``) stays unrestricted-within-
+        collection, today's pre-audience behavior, UNLESS its collection is
+        in ``:tiered_hidden`` (populated only under the ``must_not``
+        guarantee mode, by :func:`_audience_context`) — enabling tiers on a
+        scope is a gated re-index precisely so no untagged claim survives it
+        there (spec §4.4). A tagged claim is visible iff its
+        ``corpus_id || ':' || audience`` pair is in ``:audience_pairs``.
+
+        ``column`` is always a literal we control (``c.corpus_id``), never
+        caller input; the audience column referenced is threaded off the
+        SAME alias (``column.rsplit(".", 1)[0]``) — every CTE/subquery this
+        is used against must therefore select an ``audience`` column
+        alongside whichever ``corpus_id`` it already selects. Every caller
+        binding ``:readable`` when ``is_admin`` is False must now ALSO bind
+        ``:tiered_hidden`` and ``:audience_pairs`` (see :func:`_audience_context`
+        — empty lists are fine, but the params must be present or the bound
+        SQL text fails to execute)."""
+        if is_admin:
+            return "TRUE"
+        alias = column.rsplit(".", 1)[0]
+        audience_column = f"{alias}.audience"
+        return (
+            f"({column} = ANY(:readable) AND ("
+            f"({audience_column} IS NULL AND NOT ({column} = ANY(:tiered_hidden)))"
+            f" OR (({column} || ':' || {audience_column}) = ANY(:audience_pairs))"
+            "))"
+        )
 
     @staticmethod
     def _alias_readable_sql(*, revealed_expr: str, is_admin: bool) -> str:
@@ -461,7 +744,16 @@ class FactsPgRepository:
         entirely, spec §4) OR at least one ``fact_alias_sources`` row for
         this EXACT ``(fa.type, fa.natural_key)`` whose ``corpus_id`` the
         caller can read. Every caller must alias ``fact_aliases`` as
-        ``fa`` and bind ``:readable`` when ``is_admin`` is False."""
+        ``fa`` and bind ``:readable`` when ``is_admin`` is False.
+
+        Deliberately audience-agnostic (Task 10, spec §4.4): a name's
+        provenance is corpus-level (``fact_alias_sources.corpus_id`` — which
+        COLLECTION's evidence minted this alias string), never claim-level,
+        so there is no ``audience`` column to select here and nothing for
+        :meth:`_visibility_predicate`'s inner selector to narrow. An alias
+        stays visible whenever its provenance corpus is readable, exactly as
+        before this task — same reasoning as ``_projection_cte_sql``'s
+        alias-visibility rule, one layer up."""
         if is_admin:
             return "TRUE"
         return (
@@ -480,6 +772,8 @@ class FactsPgRepository:
         is_admin: bool,
         all_evidence: bool,
         readable: Optional[frozenset] = None,
+        tiered_hidden: Optional[List[str]] = None,
+        audience_pairs: Optional[List[str]] = None,
     ) -> Dict[str, bool]:
         """One query, reused by every single-subject visibility check
         (``neighbors`` node expansion, ``claims``) — same shape and cost
@@ -493,14 +787,20 @@ class FactsPgRepository:
         therefore be visible purely because an edge naming it carries a
         readable claim. For ``subject_kind='edge'`` the corpus is unchanged:
         the edge's own claims only (spec S3 — edge visibility is never
-        inferred from its endpoints)."""
+        inferred from its endpoints).
+
+        ``tiered_hidden``/``audience_pairs`` (Task 10, from
+        :func:`_audience_context`) thread the audience selector into the
+        SAME ``vis`` fragment below — ``relevant_claims`` therefore selects
+        ``audience`` alongside ``corpus_id`` so :meth:`_visibility_predicate`
+        has a column to read off the ``rc`` alias."""
         vis = self._visibility_predicate("rc.corpus_id", is_admin)
         if subject_kind == "fact":
             relevant_claims_cte = """
                 relevant_claims AS (
-                    SELECT corpus_id FROM claims WHERE fact_id = :subject_id
+                    SELECT corpus_id, audience FROM claims WHERE fact_id = :subject_id
                     UNION ALL
-                    SELECT c.corpus_id
+                    SELECT c.corpus_id, c.audience
                     FROM claims c
                     JOIN edges e ON e.id = c.edge_id
                     WHERE (e.src = :subject_id OR e.dst = :subject_id)
@@ -512,7 +812,9 @@ class FactsPgRepository:
                 )
             """
         else:
-            relevant_claims_cte = "relevant_claims AS (SELECT corpus_id FROM claims WHERE edge_id = :subject_id)"
+            relevant_claims_cte = (
+                "relevant_claims AS (SELECT corpus_id, audience FROM claims WHERE edge_id = :subject_id)"
+            )
         if all_evidence:
             has_claim_visibility = (
                 "EXISTS (SELECT 1 FROM relevant_claims) "
@@ -532,6 +834,8 @@ class FactsPgRepository:
         params: Dict[str, Any] = {"kind": subject_kind, "subject_id": subject_id}
         if not is_admin:
             params["readable"] = list(readable) if readable else []
+            params["tiered_hidden"] = tiered_hidden or []
+            params["audience_pairs"] = audience_pairs or []
         row = conn.execute(sql, params).mappings().first()
         assert row is not None
         return dict(row)
@@ -644,6 +948,8 @@ class FactsPgRepository:
         is_admin: bool,
         readable: Optional[frozenset],
         with_aliases: bool,
+        tiered_hidden: Optional[List[str]] = None,
+        audience_pairs: Optional[List[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Own-claims-only attrs/aliases/claim_count projection for an
         EXACT, already-determined set of subject ids — never a visibility
@@ -689,6 +995,8 @@ class FactsPgRepository:
         params: Dict[str, Any] = {"ids": ids, "revealed": revealed_flags}
         if not is_admin:
             params["readable"] = list(readable) if readable else []
+            params["tiered_hidden"] = tiered_hidden or []
+            params["audience_pairs"] = audience_pairs or []
         rows = conn.execute(sql, params).mappings().all()
         out: Dict[str, Dict[str, Any]] = {}
         for r in rows:
@@ -721,6 +1029,24 @@ class FactsPgRepository:
         edge) always serves ``attrs: {}`` and a ``claim_count`` of 0, closing
         the attribute oracle (S2) exactly as before this refinement.
 
+        Audience variants (Task 10, spec §4.2): ``counted_claims`` filters
+        through :meth:`_visibility_predicate`, so a claim whose audience tag
+        the caller doesn't hold never enters ``attr_kv`` at all — the S2
+        guarantee ("attrs never include an unreadable variant") extends to
+        variants mechanically, no extra code here. Unlike ``claims()``, this
+        method's rows are one-per-SUBJECT (already ``GROUP BY subject_id``
+        through ``_projection_cte_sql``'s CTE chain), never one-per-CLAIM, so
+        there is no ``(fact_id, corpus_file_id, edge_id)`` grouping key left
+        to apply :func:`_pick_most_privileged` to by the time rows reach this
+        method — a caller holding more than one audience class on the SAME
+        tiered collection may see ``attrs`` degrade to ``"conflicted": true``
+        for a key where distinct-privilege claim variants disagree, rather
+        than the most-privileged value alone. Narrower than a leak (no
+        variant outside the caller's classes is ever included); closing it
+        would mean reworking the SQL projection to rank-filter claims BEFORE
+        ``attr_kv``, left as a follow-up should multi-class membership on one
+        tiered collection turn out to be a real shape.
+
         ``q`` is an OPTIONAL free-text name lookup, matched against
         ``fact_aliases.natural_key`` ONLY — never a claim's quote or attrs,
         so it can never reopen the S2 attribute oracle. It is a real FILTER
@@ -737,7 +1063,12 @@ class FactsPgRepository:
         extension) similarity ranking: this schema does not enable one, and
         this repo intentionally does not add the operational dependency —
         this deterministic CASE-based tiering needs nothing beyond stock
-        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"."""
+        Postgres. A blank/whitespace-only ``q`` degrades to "no filter"; a
+        non-blank ``q`` shorter than ``MIN_SEARCH_Q_LENGTH`` raises
+        ``ValueError`` (P2 review finding — a 1-char query has no useful
+        selectivity against a full ILIKE scan). The query itself runs under
+        a bounded Postgres statement timeout, same mechanism as
+        ``neighbors()``."""
         filters = filters or {}
         if len(filters) > MAX_SEARCH_FILTERS:
             raise ValueError(f"too many filters (max {MAX_SEARCH_FILTERS})")
@@ -746,6 +1077,7 @@ class FactsPgRepository:
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
         vis = self._visibility_predicate("c.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
         candidates_alias_readable = self._alias_readable_sql(
@@ -756,6 +1088,8 @@ class FactsPgRepository:
         )
 
         q_clean = (q or "").strip()
+        if q_clean and len(q_clean) < MIN_SEARCH_Q_LENGTH:
+            raise ValueError(f"q must be at least {MIN_SEARCH_Q_LENGTH} characters")
         q_norm = q_clean.casefold().replace(" ", "-") if q_clean else None
         q_substr: Optional[str] = None
         q_prefix: Optional[str] = None
@@ -776,6 +1110,8 @@ class FactsPgRepository:
         }
         if not is_admin:
             params["readable"] = list(readable)
+            params["tiered_hidden"] = tiered_hidden
+            params["audience_pairs"] = audience_pairs
         for i, (fkey, fval) in enumerate(filters.items()):
             params[f"fkey{i}"] = str(fkey)
             params[f"fval{i}"] = json.dumps(fval)
@@ -824,7 +1160,11 @@ class FactsPgRepository:
                 -- via a non-withheld edge (module docstring, "Endpoint
                 -- evidence"). Never joined into attr_kv/counted_claims — the
                 -- attrs projection and claim_count stay OWN-claims-only.
-                SELECT DISTINCT cand.subject_id AS subject_id, c.corpus_id AS corpus_id
+                -- `audience` selected so `vis_ec` (Task 10's audience
+                -- selector) has a column to read off this alias too — an
+                -- endpoint claim that fails the audience gate doesn't count
+                -- toward existence either.
+                SELECT DISTINCT cand.subject_id AS subject_id, c.corpus_id AS corpus_id, c.audience AS audience
                 FROM candidates cand
                 JOIN edges e ON (e.src = cand.subject_id OR e.dst = cand.subject_id)
                 JOIN claims c ON c.edge_id = e.id
@@ -904,7 +1244,13 @@ class FactsPgRepository:
             LIMIT :limit_plus_one
             """
         )
-        with self._engine.connect() as conn:
+        # P2 review finding: bound this statement the same way `neighbors()`
+        # is bounded (spec §12) — an ILIKE-driven candidate scan with no cap
+        # could stall a connection out of the pool. `.begin()` (not
+        # `.connect()`) so `SET LOCAL` applies to the query that follows in
+        # the same transaction.
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             rows = conn.execute(sql, params).mappings().all()
 
         limit_applied = len(rows) > limit
@@ -948,6 +1294,7 @@ class FactsPgRepository:
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
         with self._engine.begin() as conn:
             conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
@@ -959,6 +1306,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 all_evidence=all_evidence,
                 readable=readable,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             if not self._is_visible(root_status):
                 raise FactNotFound(subject_id)
@@ -1023,6 +1372,8 @@ class FactsPgRepository:
                     params: Dict[str, Any] = {"node_id": node_id, "fanout_plus_one": fanout + 1}
                     if not is_admin:
                         params["readable"] = list(readable)
+                        params["tiered_hidden"] = tiered_hidden
+                        params["audience_pairs"] = audience_pairs
                     if edge_types:
                         params["edge_types"] = list(edge_types)
                     edge_rows = conn.execute(edge_sql, params).mappings().all()
@@ -1040,6 +1391,8 @@ class FactsPgRepository:
                                 is_admin=is_admin,
                                 all_evidence=all_evidence,
                                 readable=readable,
+                                tiered_hidden=tiered_hidden,
+                                audience_pairs=audience_pairs,
                             )
                             if not self._is_visible(other_status):
                                 # traversal does not tunnel (§5 rule 3, S4):
@@ -1108,6 +1461,8 @@ class FactsPgRepository:
                         check_params["seen"] = list(edges_seen)
                     if not is_admin:
                         check_params["readable"] = list(readable)
+                        check_params["tiered_hidden"] = tiered_hidden
+                        check_params["audience_pairs"] = audience_pairs
                     more = conn.execute(check_sql, check_params).first()
                     truncated["depth"] = more is not None
 
@@ -1124,6 +1479,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 readable=readable,
                 with_aliases=True,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             edge_proj = self._project_subjects(
                 conn,
@@ -1132,6 +1489,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 readable=readable,
                 with_aliases=False,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
 
         nodes_out = []
@@ -1168,10 +1527,24 @@ class FactsPgRepository:
         subject, so a visible endpoint-only fact (zero own claims, visible
         only via an incident edge's claim) returns `{"claims": [], ...}`
         (200) rather than a 404 — the claims LIST itself stays own-claims
-        only, same as `search()`'s attrs projection."""
+        only, same as `search()`'s attrs projection.
+
+        Audience variants (Task 10, spec §4.2, canonical example): a claim
+        the caller's audience selector rejects never reaches ``rows`` at all
+        (the same ``vis`` fragment used everywhere else). Among the
+        SURVIVING rows, :func:`_pick_most_privileged` then collapses each
+        ``(fact_id, edge_id, corpus_file_id)`` group down to its highest-
+        privilege variant — the "$20k vs <redacted>" shape — WITHOUT ever
+        touching a group that is entirely untagged (two genuinely distinct
+        untagged quotes about the same file are untouched, never collapsed
+        to one). Skipped entirely for an admin caller OR when ``is_revealed``:
+        both admin god-mode and a `revealed` correction outrank the audience
+        selector (spec §4.3's conflict table — "sees everything, both
+        layers") and show every variant, exactly as before this task."""
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
         with self._engine.connect() as conn:
             kind = self._subject_kind(conn, subject_id)
@@ -1185,6 +1558,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 all_evidence=all_evidence,
                 readable=readable,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             if not self._is_visible(status):
                 raise FactNotFound(subject_id)
@@ -1195,7 +1570,8 @@ class FactsPgRepository:
             clause = "TRUE" if is_revealed else vis
             sql = sa.text(
                 f"""
-                SELECT c.id, c.corpus_id, c.corpus_file_id, c.quote, c.attrs, c.document_date,
+                SELECT c.id, c.fact_id, c.edge_id, c.corpus_id, c.corpus_file_id, c.audience,
+                       c.quote, c.attrs, c.document_date,
                        cf.filename, cf.path, cfs.source_url
                 FROM claims c
                 JOIN corpus_files cf ON cf.id = c.corpus_file_id
@@ -1207,7 +1583,16 @@ class FactsPgRepository:
             params: Dict[str, Any] = {"subject_id": subject_id}
             if not is_admin and not is_revealed:
                 params["readable"] = list(readable)
+                params["tiered_hidden"] = tiered_hidden
+                params["audience_pairs"] = audience_pairs
             rows = conn.execute(sql, params).mappings().all()
+
+        # Dedup is a NON-ADMIN, non-revealed narrowing only: admin god-mode
+        # and a `revealed` correction both outrank the audience selector by
+        # design (spec §4.3's conflict table — "sees everything, both
+        # layers") and must keep every variant, never collapse them.
+        if not is_admin and not is_revealed:
+            rows = _pick_most_privileged(rows, _class_rank_map())
 
         out = []
         for r in rows:
@@ -1256,7 +1641,9 @@ class FactsPgRepository:
     # into actually lists.
     # ------------------------------------------------------------------
 
-    def _visible_facts_for_corpus_cte(self, is_admin: bool, all_evidence: bool) -> str:
+    def _visible_facts_for_corpus_cte(
+        self, is_admin: bool, all_evidence: bool, *, all_collections: bool = False
+    ) -> str:
         """SQL for a ``visible(subject_id, is_revealed)`` CTE: facts with at
         least one OWN claim evidenced by ``:corpus_id`` (bound by the
         caller — candidacy is deliberately still OWN-claims-only: "evidenced
@@ -1271,16 +1658,29 @@ class FactsPgRepository:
         be revealed by a readable incident-edge claim. Returned as a
         fragment (no leading ``WITH``) so callers can embed it beside their
         own CTEs; every caller must bind ``:corpus_id`` and, when
-        ``is_admin`` is False, ``:readable``."""
+        ``is_admin`` is False, ``:readable``, ``:tiered_hidden`` and
+        ``:audience_pairs`` (:func:`_audience_context` — Task 10's audience
+        selector rides the same ``vis``/``vis3``/``vis_ec`` fragments below).
+
+        With ``all_collections=True`` the ONLY change is candidacy: every
+        non-withheld fact instead of the ones evidenced by a bound
+        ``:corpus_id`` (which must then NOT be bound), giving the same
+        population ``search()`` gates with ``type=None``. The visibility
+        rule below is shared verbatim rather than restated for the wider
+        scope — a second copy is how the two drift, and drift in this gate
+        is the S2 existence oracle the spec's rev 1->2 closed."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
         all_ev_sql = "TRUE" if all_evidence else "FALSE"
+        candidate_where = (
+            "c.fact_id IS NOT NULL" if all_collections else "c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL"
+        )
         return f"""
             candidates AS (
                 SELECT DISTINCT c.fact_id AS subject_id
                 FROM claims c
-                WHERE c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL
+                WHERE {candidate_where}
                   AND NOT EXISTS (
                     SELECT 1 FROM corrections co
                     WHERE co.subject_kind = 'fact' AND co.subject_id = c.fact_id
@@ -1291,7 +1691,10 @@ class FactsPgRepository:
                 SELECT subject_id FROM corrections WHERE subject_kind = 'fact' AND verdict = 'revealed'
             ),
             endpoint_claims AS (
-                SELECT DISTINCT cand.subject_id AS subject_id, c.corpus_id AS corpus_id
+                -- `audience` selected alongside `corpus_id` so `vis_ec`
+                -- (Task 10's audience selector) has a column to read off
+                -- this alias — same reasoning as `search()`'s own copy.
+                SELECT DISTINCT cand.subject_id AS subject_id, c.corpus_id AS corpus_id, c.audience AS audience
                 FROM candidates cand
                 JOIN edges e ON (e.src = cand.subject_id OR e.dst = cand.subject_id)
                 JOIN claims c ON c.edge_id = e.id
@@ -1330,6 +1733,130 @@ class FactsPgRepository:
             )
             """
 
+    def count_visible_facts_by_type(self, caller) -> Dict[str, int]:
+        """Caller-scoped ``{type: count}`` over every visible fact — the
+        Library type map's live counts (spec §13.2 "Library"), where each
+        type is a way in to the graph.
+
+        Shares :meth:`_visible_facts_for_corpus_cte`'s gate via
+        ``all_collections=True``, so a type's number counts exactly the
+        subjects this caller could reach through ``search(type=...)`` and
+        never more. A naive ``SELECT type, COUNT(*) FROM facts GROUP BY
+        type`` would be the S2 existence oracle in aggregate form: it would
+        report facts whose every claim sits in a collection the caller
+        cannot read, letting a reader count what they cannot see. A type
+        with no visible subjects is omitted rather than reported as 0 — the
+        caller cannot distinguish "no such type in this ontology" from
+        "none you can see", which is the same non-disclosure
+        ``search()`` makes.
+        """
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        params: Dict[str, Any] = (
+            {}
+            if is_admin
+            else {"readable": list(readable), "tiered_hidden": tiered_hidden, "audience_pairs": audience_pairs}
+        )
+        sql = sa.text(
+            f"WITH {cte} "
+            "SELECT f.type, COUNT(*) AS n FROM visible v JOIN facts f ON f.id = v.subject_id "
+            "GROUP BY f.type ORDER BY f.type"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+        return {r["type"]: int(r["n"]) for r in rows}
+
+    def facet_values(self, caller, *, types: List[str], limit_per_type: int = 50) -> Dict[str, List[Dict[str, Any]]]:
+        """Filterable entity values per type, with how many DOCUMENTS each
+        one is evidenced by — the Library's entity facets (spec §13.2
+        "Library", TCRD-250 piece 4).
+
+        This is what "filter by tags" should have meant here: the vocabulary
+        the extraction pass already produces (client, industry, service
+        offering, document type), rather than tags nobody maintains.
+
+        Same visibility gate as :meth:`count_visible_facts_by_type` — shared
+        via ``all_collections=True``, never restated — so a facet lists only
+        subjects this caller could reach through ``search(type=...)``.
+
+        Two deliberate conservatisms, both about not leaking a count:
+
+        * The document tally counts only claims whose collection the caller
+          can READ, even for a subject carrying a ``revealed`` correction.
+          A revealed correction reveals the SUBJECT, not the geography of
+          its evidence (spec §4) — counting its unreadable documents would
+          report how many files exist in a collection the caller cannot
+          open.
+        * A subject whose readable document count is 0 is still listed when
+          it is visible, because visibility may come from an incident edge
+          (endpoint evidence). Its count is an honest 0, not an omission —
+          the caller CAN reach the subject, just not any document naming it.
+
+        ``limit_per_type`` caps each facet's value list; a facet menu is a
+        menu, not a dump.
+        """
+        if not types:
+            return {}
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        vis_claims = self._visibility_predicate("c.corpus_id", is_admin)
+        alias_readable = self._alias_readable_sql(
+            revealed_expr="fa.fact_id IN (SELECT subject_id FROM revealed_ids)", is_admin=is_admin
+        )
+        params: Dict[str, Any] = {"types": list(types)}
+        if not is_admin:
+            params["readable"] = list(readable)
+            params["tiered_hidden"] = tiered_hidden
+            params["audience_pairs"] = audience_pairs
+        sql = sa.text(
+            f"""
+            WITH {cte},
+            readable_claims AS (
+                SELECT c.fact_id, c.corpus_file_id
+                FROM claims c
+                JOIN visible v ON v.subject_id = c.fact_id
+                WHERE {vis_claims}
+            ),
+            labels AS (
+                SELECT fa.fact_id, MIN(fa.natural_key) AS label
+                FROM fact_aliases fa
+                WHERE fa.fact_id IN (SELECT subject_id FROM visible)
+                  AND {alias_readable}
+                GROUP BY fa.fact_id
+            )
+            SELECT f.type AS type, v.subject_id AS subject_id,
+                   l.label AS label,
+                   COUNT(DISTINCT rc.corpus_file_id) AS n
+            FROM visible v
+            JOIN facts f ON f.id = v.subject_id
+            LEFT JOIN readable_claims rc ON rc.fact_id = v.subject_id
+            LEFT JOIN labels l ON l.fact_id = v.subject_id
+            WHERE f.type = ANY(:types)
+            GROUP BY f.type, v.subject_id, l.label
+            ORDER BY f.type, COUNT(DISTINCT rc.corpus_file_id) DESC, v.subject_id
+            """
+        )
+        out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
+        with self._engine.connect() as conn:
+            for r in conn.execute(sql, params).mappings():
+                bucket = out.setdefault(r["type"], [])
+                if len(bucket) >= limit_per_type:
+                    continue
+                bucket.append(
+                    {
+                        "subject_id": r["subject_id"],
+                        "label": r["label"] or r["subject_id"],
+                        "document_count": int(r["n"]),
+                    }
+                )
+        return out
+
     def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
         """Caller-scoped count of facts evidenced by ``corpus_id`` — the
         Library collection card's "M facts" number (spec §13.2 "Library").
@@ -1364,7 +1891,12 @@ class FactsPgRepository:
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
-        base: Dict[str, Any] = {} if is_admin else {"readable": list(readable)}
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        base: Dict[str, Any] = (
+            {}
+            if is_admin
+            else {"readable": list(readable), "tiered_hidden": tiered_hidden, "audience_pairs": audience_pairs}
+        )
         sql = sa.text(f"WITH {self._visible_facts_for_corpus_cte(is_admin, all_evidence)} SELECT COUNT(*) FROM visible")
 
         out: Dict[str, int] = {}
@@ -1389,7 +1921,9 @@ class FactsPgRepository:
         endpoints), withheld (``wrong``/``restricted``) edges excluded,
         ``revealed`` ones included unconditionally. Returned as a fragment
         (no leading ``WITH``); every caller must bind ``:corpus_id`` and,
-        when ``is_admin`` is False, ``:readable``."""
+        when ``is_admin`` is False, ``:readable``, ``:tiered_hidden`` and
+        ``:audience_pairs`` (:func:`_audience_context`, same as
+        :meth:`_visible_facts_for_corpus_cte`)."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         return f"""
             edge_candidates AS (
@@ -1421,7 +1955,12 @@ class FactsPgRepository:
         once shape."""
         readable = _readable_ids(caller)
         is_admin = readable is None
-        base: Dict[str, Any] = {} if is_admin else {"readable": list(readable)}
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        base: Dict[str, Any] = (
+            {}
+            if is_admin
+            else {"readable": list(readable), "tiered_hidden": tiered_hidden, "audience_pairs": audience_pairs}
+        )
         sql = sa.text(f"WITH {self._visible_edges_for_corpus_cte(is_admin)} SELECT COUNT(*) FROM edge_visible")
 
         out: Dict[str, int] = {}
@@ -1463,9 +2002,12 @@ class FactsPgRepository:
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
         vis_params: Dict[str, Any] = {"corpus_id": corpus_id}
         if not is_admin:
             vis_params["readable"] = list(readable)
+            vis_params["tiered_hidden"] = tiered_hidden
+            vis_params["audience_pairs"] = audience_pairs
         cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
 
         with self._engine.connect() as conn:
@@ -1543,6 +2085,8 @@ class FactsPgRepository:
                 claims_params: Dict[str, Any] = {"ids": page_ids, "revealed_ids": revealed_ids}
                 if not is_admin:
                     claims_params["readable"] = list(readable)
+                    claims_params["tiered_hidden"] = tiered_hidden
+                    claims_params["audience_pairs"] = audience_pairs
                 claim_rows = conn.execute(claims_sql, claims_params).mappings().all()
 
                 claim_count: Dict[str, int] = {}
@@ -1586,10 +2130,22 @@ class FactsPgRepository:
                     )
 
                 review_items = self._review_items_for_corpus(
-                    conn, corpus_id=corpus_id, is_admin=is_admin, all_evidence=all_evidence, readable=readable
+                    conn,
+                    corpus_id=corpus_id,
+                    is_admin=is_admin,
+                    all_evidence=all_evidence,
+                    readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
                 )
                 review_items += self._single_valued_review_items_for_corpus(
-                    conn, corpus_id=corpus_id, is_admin=is_admin, all_evidence=all_evidence, readable=readable
+                    conn,
+                    corpus_id=corpus_id,
+                    is_admin=is_admin,
+                    all_evidence=all_evidence,
+                    readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
                 )
 
         return {
@@ -1601,7 +2157,15 @@ class FactsPgRepository:
         }
 
     def _review_items_for_corpus(
-        self, conn, *, corpus_id: str, is_admin: bool, all_evidence: bool, readable: Optional[frozenset]
+        self,
+        conn,
+        *,
+        corpus_id: str,
+        is_admin: bool,
+        all_evidence: bool,
+        readable: Optional[frozenset],
+        tiered_hidden: Optional[List[str]] = None,
+        audience_pairs: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """`possible_duplicate_of` edges touching a fact evidenced by
         ``corpus_id`` — spec §7.2's entity-resolution review items, surfaced
@@ -1615,6 +2179,8 @@ class FactsPgRepository:
         vis_params: Dict[str, Any] = {"corpus_id": corpus_id}
         if not is_admin:
             vis_params["readable"] = list(readable)
+            vis_params["tiered_hidden"] = tiered_hidden or []
+            vis_params["audience_pairs"] = audience_pairs or []
         edge_sql = sa.text(
             f"""
             WITH {cte}
@@ -1637,6 +2203,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 all_evidence=all_evidence,
                 readable=readable,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             if not self._is_visible(edge_status):
                 continue
@@ -1647,6 +2215,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 all_evidence=all_evidence,
                 readable=readable,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             b_status = self._subject_status(
                 conn,
@@ -1655,6 +2225,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 all_evidence=all_evidence,
                 readable=readable,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             if not (self._is_visible(a_status) and self._is_visible(b_status)):
                 continue
@@ -1673,7 +2245,15 @@ class FactsPgRepository:
         return out
 
     def _single_valued_review_items_for_corpus(
-        self, conn, *, corpus_id: str, is_admin: bool, all_evidence: bool, readable: Optional[frozenset]
+        self,
+        conn,
+        *,
+        corpus_id: str,
+        is_admin: bool,
+        all_evidence: bool,
+        readable: Optional[frozenset],
+        tiered_hidden: Optional[List[str]] = None,
+        audience_pairs: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Functionally single-valued edges (spec §7.3) whose src fact is
         evidenced by ``corpus_id``: >1 distinct dst, each carrying its OWN
@@ -1696,6 +2276,8 @@ class FactsPgRepository:
         vis_params: Dict[str, Any] = {"corpus_id": corpus_id, "types": list(types)}
         if not is_admin:
             vis_params["readable"] = list(readable)
+            vis_params["tiered_hidden"] = tiered_hidden or []
+            vis_params["audience_pairs"] = audience_pairs or []
         # Step 1: candidate (src, type) pairs with RAW distinct-dst count >1
         # among live (>=1 claim) edges — cheap pre-filter before the
         # per-edge visibility walk below.
@@ -1724,6 +2306,8 @@ class FactsPgRepository:
                 is_admin=is_admin,
                 all_evidence=all_evidence,
                 readable=readable,
+                tiered_hidden=tiered_hidden,
+                audience_pairs=audience_pairs,
             )
             edge_rows = (
                 conn.execute(
@@ -1743,6 +2327,8 @@ class FactsPgRepository:
                     is_admin=is_admin,
                     all_evidence=all_evidence,
                     readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
                 )
                 if not self._is_visible(edge_status):
                     continue
@@ -1753,6 +2339,8 @@ class FactsPgRepository:
                     is_admin=is_admin,
                     all_evidence=all_evidence,
                     readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
                 )
                 if not self._is_visible(dst_status):
                     continue
@@ -2086,6 +2674,21 @@ class FactsPgRepository:
         # the first's resolution.
         doc_id_resolution: Dict[Tuple[str, str], str] = {}
         doc_declared_pairs: Set[Tuple[str, str]] = set()  # {(corpus_id, doc_id)} this batch's documents[] touched
+        # RBAC review follow-up (P1): every corpus a `documents[]` entry
+        # NAMED, regardless of whether that entry actually resolved to a
+        # corpus_file_id. `doc_declared_pairs` alone under-counts this on a
+        # rename race (stable_id/path match nothing yet, no prior
+        # corpus_file_sources row either) — the entry silently fails to
+        # resolve, so its corpus never lands in `doc_declared_pairs`, and a
+        # batch with exactly one such entry would otherwise present as
+        # "documents[] omitted" to `_resolve_doc` and fall through to its
+        # unrestricted tier-3 scan. `declared_corpus_ids` is the batch's
+        # true declared scope: the gate for tier 3 below.
+        declared_corpus_ids: Set[str] = set()
+        # doc_id -> this batch's own declared `modified` date. Keyed by
+        # doc_id, NOT corpus_file_id (P2 review finding) — see the write
+        # site below for why a file_id key silently drops the date on a
+        # TCRD-241 duplicate-copy override.
         doc_dates: Dict[str, date] = {}
         # O7 follow-up: a `source_url` the validator dropped — itemized so a
         # non-zero count on the run report tells the operator "your producer
@@ -2101,6 +2704,7 @@ class FactsPgRepository:
                 corpus_id = doc.get("corpus_id")
                 if not doc_id or not corpus_id:
                     continue
+                declared_corpus_ids.add(corpus_id)
                 stable_id = doc.get("stable_id") or None
                 path = doc.get("path") or None
 
@@ -2160,7 +2764,17 @@ class FactsPgRepository:
                 if file_id is not None:
                     parsed = _parse_document_date(doc.get("modified"))
                     if parsed is not None:
-                        doc_dates[file_id] = parsed
+                        # P2 review finding: keyed by `doc_id`, NOT `file_id`.
+                        # TCRD-241's deterministic override (below) can
+                        # re-point a doc_id's resolution at a DIFFERENT
+                        # corpus_file_id than the one THIS entry resolved to
+                        # (an older, already-indexed copy winning over the
+                        # fresh one THIS batch declared) — a file_id-keyed
+                        # date would then look up a key nothing set,
+                        # silently writing `document_date=NULL` and handing
+                        # the succession/latest-wins projection a stale,
+                        # dated claim over the new undated one.
+                        doc_dates[doc_id] = parsed
 
         def _copies_for(corpus_id: str, doc_id: str, conn) -> List[Dict[str, Any]]:
             """Every ``corpus_files`` row anchored to ``(corpus_id, doc_id)``
@@ -2208,7 +2822,13 @@ class FactsPgRepository:
             if doc_id not in doc_id_to_corpus or corpus_id < doc_id_to_corpus[doc_id]:
                 doc_id_to_corpus[doc_id] = corpus_id
 
-        batch_corpus_ids = sorted({corpus_id for corpus_id, _ in doc_declared_pairs})
+        # P1 review follow-up: gate tier 3 on whether `documents[]` was
+        # DECLARED AT ALL (`declared_corpus_ids`, every corpus a documents[]
+        # entry NAMED, whether or not that entry went on to resolve) —
+        # never on `doc_declared_pairs` alone, which only holds entries that
+        # actually resolved and so silently drops the scope of a rename-race
+        # entry (see the ladder docstring's 3a).
+        batch_corpus_ids = sorted(declared_corpus_ids)
         # RBAC review (PR #1736, TCRD-241 follow-up): a doc_id that resolves
         # ONLY by escaping every corpus THIS batch's `documents[]` declared
         # is rejected, never written — see the ladder docstring below.
@@ -2218,31 +2838,42 @@ class FactsPgRepository:
             """Corpus-scoped, deterministic doc_id -> corpus_file_id
             resolution (TCRD-241). Ladder:
 
-            1. This batch's OWN `documents[]` declared (corpus_id, doc_id) —
-               indexed-preferred among any duplicate copies within it.
-            2. Not declared this batch: scan only the corpora THIS batch's
-               `documents[]` touched — a producer batch is normally scoped
-               to one collection, so an omitted-but-already-resolved doc_id
-               from the SAME crawl run is overwhelmingly likely to live
-               there too.
+            1. This batch's OWN `documents[]` declared (corpus_id, doc_id)
+               AND it resolved — indexed-preferred among any duplicate
+               copies within it.
+            2. Not declared this batch (or declared but unresolved — a
+               rename race the upsert loop tolerates without erroring):
+               scan only the corpora THIS batch's `documents[]` NAMED
+               (`declared_corpus_ids` — every entry's own corpus_id,
+               regardless of whether that entry itself resolved) — a
+               producer batch is normally scoped to one collection, so an
+               omitted-but-already-resolved doc_id from the SAME crawl run
+               is overwhelmingly likely to live there too.
             3a. This batch's `documents[]` declared at LEAST ONE corpus
                 (`batch_corpus_ids` non-empty) but this doc_id isn't
                 anchored in ANY of them: refuse to escape to some OTHER,
                 possibly more broadly-granted corpus — that would grant the
                 claim wider visibility than the producer's batch ever
-                declared (RBAC review PR #1736). A probe checks whether the
-                doc_id resolves ANYWHERE at all, purely to distinguish the
-                rejection reason (`ambiguous_cross_collection_doc_id` — it
-                exists, just outside this batch's scope) from a doc_id that
-                plain doesn't exist (`unresolved_doc_id`, existing
-                behavior) — nothing is ever written on this path.
-            3b. This batch's `documents[]` is EMPTY (no batch-declared scope
-                to escape at all) — the documented "documents may be
-                omitted when every doc_id already resolves" replay flow
-                (spec §7.2). Tier 3 here is the SOLE resolution mechanism by
-                design (dozens of existing callers depend on it), so it
-                still resolves via an unrestricted, deterministically
-                ordered global scan, unchanged from before this review.
+                declared (RBAC review PR #1736). This also covers a
+                documents[] entry that named a corpus but never itself
+                resolved (P1 follow-up) — `declared_corpus_ids` still
+                carries that corpus, so the scoped scan below (not tier 3)
+                runs even though `doc_declared_pairs` has no matching pair.
+                A probe checks whether the doc_id resolves ANYWHERE at all,
+                purely to distinguish the rejection reason
+                (`ambiguous_cross_collection_doc_id` — it exists, just
+                outside this batch's scope) from a doc_id that plain
+                doesn't exist (`unresolved_doc_id`, existing behavior) —
+                nothing is ever written on this path.
+            3b. This batch's `documents[]` is EMPTY — no entry named ANY
+                corpus at all, i.e. `documents` itself was omitted or every
+                entry lacked a `doc_id`/`corpus_id` (no batch-declared scope
+                to escape) — the documented "documents may be omitted when
+                every doc_id already resolves" replay flow (spec §7.2).
+                Tier 3 here is the SOLE resolution mechanism by design
+                (dozens of existing callers depend on it), so it still
+                resolves via an unrestricted, deterministically ordered
+                global scan, unchanged from before this review.
             """
             if not doc_id:
                 return None
@@ -2370,17 +3001,26 @@ class FactsPgRepository:
             evidence: List[Dict[str, Any]],
             row_ref: str,
             row_attrs: Optional[Dict[str, Any]] = None,
-            alias_type: Optional[str] = None,
-            alias_natural_key: Optional[str] = None,
+            alias_targets: Optional[List[Tuple[str, str]]] = None,
         ) -> None:
-            """``alias_type``/``alias_natural_key`` (fact rows only — edges
-            carry no aliases) name the ONE alias this node's evidence is
-            establishing/reinforcing: security hardening (module docstring's
-            alias-visibility rule) records each evidence item's corpus as
-            provenance for THAT alias specifically, never for every alias
-            the fact happens to carry — the exact distinction that closes
-            the bug (a fact's OTHER, unrelated readable claim must never
-            grant visibility to a name minted from a different corpus)."""
+            """``alias_targets`` — ``[(type, natural_key), ...]`` — names
+            the alias(es) THIS evidence is establishing/reinforcing:
+            security hardening (module docstring's alias-visibility rule)
+            records each evidence item's corpus as provenance for exactly
+            those aliases, never for every alias a fact happens to carry —
+            the distinction that closes the bug (a fact's OTHER, unrelated
+            readable claim must never grant visibility to a name minted
+            from a different corpus).
+
+            A node's own evidence (``kind="fact"``) targets its OWN single
+            alias. An edge's evidence (``kind="edge"``) targets BOTH
+            endpoint aliases — an edge's claim evidences its endpoints too
+            (module docstring, "Endpoint evidence"), so a node that exists
+            ONLY as an edge anchor (zero claims of its own — the common
+            `works_in_industry`/`sponsored_by`/`staffed_by`-style ontology
+            shape) still gets its alias's provenance from the edge that
+            names it, never staying permanently admin-only. The edge
+            itself carries no alias of its own (edges have none)."""
             nonlocal claims_written, claims_accepted_via_identity
             with self._engine.connect() as conn:
                 for ev_idx, ev in enumerate(evidence):
@@ -2389,6 +3029,21 @@ class FactsPgRepository:
                     item_ref = f"{row_ref}.evidence[{ev_idx}]"
                     if not quote:
                         claims_rejected.append({"row": item_ref, "reason": "empty_quote", "doc_id": doc_id})
+                        continue
+                    if not _is_meaningful_quote(quote):
+                        # Applied BEFORE either half of the gate below, so a
+                        # degenerate quote (a bare file-extension fragment, a
+                        # lone separator) cannot fall through the content
+                        # check and be self-certified by the identity
+                        # haystack instead — one check closes the hole on
+                        # both paths. Distinct reason from
+                        # `verbatim_gate_failed`: the quote WAS present
+                        # verbatim (or would be, trivially), it just isn't
+                        # evidence of anything — a different failure an
+                        # operator should be able to tell apart (a producer
+                        # citing junk vs. a producer citing text absent from
+                        # the document).
+                        claims_rejected.append({"row": item_ref, "reason": "quote_not_meaningful", "doc_id": doc_id})
                         continue
                     file_id = _resolve_doc(doc_id, conn)
                     frow = _file_row(file_id) if file_id else None
@@ -2425,11 +3080,15 @@ class FactsPgRepository:
                         # RESOLVE which row this evidence is about, never as
                         # evidence itself, or a producer could self-certify
                         # an invented quote by declaring whatever string it
-                        # likes. No normalization is applied here, matching
-                        # the chunk-text check above exactly — an NFC/NFD
-                        # form mismatch fails identically on both sides.
-                        identity_haystack = [s for s in (frow.get("filename"), frow.get("path")) if s]
-                        if any(quote in s for s in identity_haystack):
+                        # likes. P0 review finding: the quote must EQUAL a
+                        # whole identity unit (`_identity_candidates`) —
+                        # never merely a substring of one, which admitted a
+                        # bare ".pptx" or "/" and let a fabricated attribute
+                        # ride in as a confidently-cited quote. No
+                        # normalization is applied here, matching the
+                        # chunk-text check above exactly — an NFC/NFD form
+                        # mismatch fails identically on both sides.
+                        if quote in _identity_candidates(frow.get("filename"), frow.get("path")):
                             accepted_via_identity = True
                         else:
                             claims_rejected.append(
@@ -2454,13 +3113,31 @@ class FactsPgRepository:
                         # ever supplies one (forward-compatible, unused
                         # today).
                         attrs=ev.get("attrs") or row_attrs or {},
-                        document_date=doc_dates.get(file_id),
+                        # P2 review finding: looked up by the EVIDENCE'S OWN
+                        # `doc_id`, not the resolved `file_id` — the
+                        # TCRD-241 deterministic override can resolve this
+                        # doc_id to a corpus_file_id THIS batch never itself
+                        # declared a date for (see `doc_dates`' definition
+                        # above), which previously wrote `document_date` as
+                        # silently NULL.
+                        document_date=doc_dates.get(doc_id),
+                        # Index-time audience-variant tag (Task 10, spec
+                        # §4.2) — format-validated up front by
+                        # `app/api/facts.py` before `ingest_batch` ever
+                        # runs, so a malformed value here would already
+                        # have been refused with a 422; this stores
+                        # whatever survived that gate, verbatim.
+                        audience=ev.get("audience"),
                     )
-                    if kind == "fact" and alias_type and alias_natural_key:
+                    for alias_type, alias_natural_key in alias_targets or []:
                         # Recorded regardless of `written_id` (a replayed,
                         # already-existing claim still means this corpus
                         # genuinely evidences the alias — the provenance
-                        # set only grows, see `add_alias_source`).
+                        # set only grows, see `add_alias_source`). A no-op
+                        # if the alias row hasn't been minted yet (it
+                        # always has by this point — `_resolve_alias` runs
+                        # before any evidence write, for both nodes and
+                        # edge endpoints).
                         self.add_alias_source(
                             type=alias_type, natural_key=alias_natural_key, corpus_id=frow["corpus_id"]
                         )
@@ -2473,6 +3150,13 @@ class FactsPgRepository:
 
         # ---- nodes: alias resolution + evidence.
         node_fact_ids: Dict[str, str] = {}
+        # Parallel to `node_fact_ids` — the alias's own `type` (spec §3:
+        # denormalized onto `fact_aliases`, not always the node id's own
+        # `<type>:` prefix, since a producer-declared `type` can override
+        # it in `_resolve_alias`). `_endpoint()`'s already-resolved-this-
+        # batch fast path below needs it for `alias_targets`, same as the
+        # freshly-resolved path already gets from `_resolve_alias`.
+        node_types: Dict[str, str] = {}
         for idx, node in enumerate(nodes):
             node_id = node.get("id")
             row_ref = f"nodes[{idx}]"
@@ -2489,14 +3173,14 @@ class FactsPgRepository:
                 if resolution.get("reattached"):
                     corrections_active.append(resolution["reattached"])
             node_fact_ids[node_id] = resolution["fact_id"]
+            node_types[node_id] = resolution["type"]
             _write_evidence(
                 kind="fact",
                 subject_id=resolution["fact_id"],
                 evidence=node.get("evidence") or [],
                 row_ref=row_ref,
                 row_attrs=node.get("attrs") or {},
-                alias_type=resolution["type"],
-                alias_natural_key=node_id,
+                alias_targets=[(resolution["type"], node_id)],
             )
 
         # ---- edges: endpoints resolve via the SAME alias mechanism (an
@@ -2506,7 +3190,13 @@ class FactsPgRepository:
         # item (§7.2) regardless of whether it carries any.
         def _endpoint(node_id: str, conn) -> Dict[str, Any]:
             if node_id in node_fact_ids:
-                return {"fact_id": node_fact_ids[node_id], "created": False, "error": None, "reattached": None}
+                return {
+                    "fact_id": node_fact_ids[node_id],
+                    "type": node_types[node_id],
+                    "created": False,
+                    "error": None,
+                    "reattached": None,
+                }
             return self._resolve_alias(conn, node_id, None)
 
         for idx, edge in enumerate(edges):
@@ -2546,6 +3236,14 @@ class FactsPgRepository:
                 evidence=edge.get("evidence") or [],
                 row_ref=row_ref,
                 row_attrs=edge.get("attrs") or {},
+                # An edge's claim evidences BOTH endpoints too (module
+                # docstring, "Endpoint evidence") — a node with zero
+                # claims of its own, reachable only as an edge anchor
+                # (the common works_in_industry/sponsored_by/staffed_by
+                # ontology shape), must still get its alias's provenance
+                # from here, or it stays permanently admin-only despite
+                # being visible and findable by existence.
+                alias_targets=[(src_res["type"], src_id), (dst_res["type"], dst_id)],
             )
 
         # ---- functionally single-valued edges (spec §7.3): a (src, type)

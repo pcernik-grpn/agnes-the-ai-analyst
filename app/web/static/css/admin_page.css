@@ -407,37 +407,12 @@
 
    Rendered only where a tab declares a `purpose` (see admin_nav.py); every
    other section keeps `.tab-strip` untouched. */
-.tab-flow {
-    display: flex;
-    align-items: stretch;
-    flex-wrap: wrap;
-    gap: 2px;
-    margin: 0 0 18px;
-    border-bottom: 1px solid var(--ds-border);
-    padding-bottom: 0;
-}
-/* ONE LINE. The item briefly stacked a name over a purpose caption; the
-   names carry the stage now, so this is the same height and weight as
-   `.tab-strip__item` — the two variants differ in their connectors, not in
-   their density. */
-.tab-flow__item {
-    display: inline-flex;
-    align-items: center;
-    padding: 9px 14px 10px;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-    font-size: 13.5px;
-    font-weight: 600;
-    text-decoration: none;
-    color: var(--ds-text-secondary);
-    border-radius: var(--ds-radius-btn) var(--ds-radius-btn) 0 0;
-}
-.tab-flow__item:hover { background: var(--ds-surface-dim); }
-.tab-flow__item.is-active {
-    color: var(--ds-primary-dark);
-    border-bottom-color: var(--ds-primary);
-}
+/* The strip and its items are `.tab-strip`'s, in css/components.css — the
+   two variants differ in their CONNECTORS, not in their items, which is what
+   this file used to claim while carrying a second copy of the item rules that
+   drifted from the first. Only the connectors live here now. */
 
+/* The pipeline's connectors — the only thing the flow variant adds. */
 .tab-flow__arrow {
     display: flex;
     align-items: center;
@@ -514,4 +489,20 @@
     font-weight: 700;
     background: var(--ds-surface-sunken);
     color: var(--ds-text-secondary);
+}
+
+/* ── The admin surface is a white sheet, like every index page ────────────
+   `base_index.html` pages (Library, Agents, Chats) paint their whole shell
+   `--ds-surface` — see `.idx` in style-custom.css, whose own comment gives
+   the reason: the header zone should read as part of the page surface, not
+   as a grey band above it. Admin pages extend a different base and so sat
+   on the app background, which is why an admin page and the Library read as
+   two products even when their components matched.
+
+   Scoped by the sheet, not by a selector: `admin_page.css` is loaded by the
+   two admin bases and nothing else, so `.container--full` here can only ever
+   mean an admin page's shell. One rule moves all forty of them. */
+.container--full {
+    background: var(--ds-surface);
+    min-height: 100vh;
 }

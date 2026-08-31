@@ -1,6 +1,9 @@
 {
   "frozen": "2026-08-27",
   "note": "sha256 of tests/fixtures/eval/workbook_v0_2/prompts.yaml as committed. scripts/eval/prompts.py recomputes this hash at load time and refuses to run on a mismatch -- the prompt set is frozen per the workbook README (STATUS line): 'Do not edit prompt text, weights, or thresholds below without versioning as v0.3 and re-grading R0 under the new version.'",
-  "prompts_sha256": "b69ca0d30f4ea65d39c4d01b5e51107881cbfee61498d0186b0ef1150080b7b2",
-  "source": "eval_scoring_workbook_v0.2.xlsx (FROZEN 2026-08-27)"
+  "prompts_sha256": "a59312c973ffcde6e9d9ddbc8121f4c7a10b5ee15d321578bd01e39cc779d4e1",
+  "source": "eval_scoring_workbook_v0.2.xlsx (FROZEN 2026-08-27)",
+  "refrozen": "2026-08-30",
+  "refrozen_reason": "Vendor-neutral scrub: real client, sponsor and personal names, a third-party PSA product name and live SharePoint folder paths were replaced with a fictional cast. ENTITY NAMES ONLY -- prompt ids, weights, thresholds and the YAML structure are byte-verified unchanged (keys/numbers/booleans skeleton identical). The set is NOT versioned to v0.3 because no prompt semantics changed; but R0 grades recorded under the previous names refer to entities that no longer appear here, so re-grade before comparing scores across the scrub.",
+  "prompts_sha256_before_scrub": "b69ca0d30f4ea65d39c4d01b5e51107881cbfee61498d0186b0ef1150080b7b2"
 }

@@ -205,3 +205,75 @@ class TestAStructuredErrorDetail:
             )
         assert result.exit_code != 0
         assert "connection_not_found" in result.output
+
+
+class TestFromFile:
+    """`--from-file` exists for multiline secrets — a SharePoint combined
+    cert+key PEM cannot travel through the single-line hidden prompt. A file
+    PATH on argv is fine (the security rule bans the secret VALUE on argv)."""
+
+    def test_from_file_reads_the_file_and_skips_the_prompt(self, tmp_path):
+        pem = "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nxyz\n-----END PRIVATE KEY-----\n"
+        f = tmp_path / "combined.pem"
+        f.write_text(pem)
+        with patch(
+            "cli.commands.admin_connection.api_put",
+            return_value=_resp(204),
+        ) as put:
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--from-file", str(f)],
+            )
+        assert result.exit_code == 0, result.output
+        put.assert_called_once_with(
+            "/api/admin/source-connections/CONN/secret",
+            json={"value": pem.strip(), "kind": "storage"},
+        )
+
+    def test_from_file_dash_reads_stdin(self):
+        with patch(
+            "cli.commands.admin_connection.api_put",
+            return_value=_resp(204),
+        ) as put:
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--from-file", "-"],
+                input="line1\nline2\n",
+            )
+        assert result.exit_code == 0, result.output
+        put.assert_called_once_with(
+            "/api/admin/source-connections/CONN/secret",
+            json={"value": "line1\nline2", "kind": "storage"},
+        )
+
+    def test_missing_file_fails_cleanly_naming_the_path(self, tmp_path):
+        with patch("cli.commands.admin_connection.api_put") as put:
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--from-file", str(tmp_path / "nope.pem")],
+            )
+        assert result.exit_code != 0
+        assert "nope.pem" in result.output
+        put.assert_not_called()
+
+    def test_empty_file_is_refused(self, tmp_path):
+        f = tmp_path / "empty.pem"
+        f.write_text("   \n")
+        with patch("cli.commands.admin_connection.api_put") as put:
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--from-file", str(f)],
+            )
+        assert result.exit_code != 0
+        put.assert_not_called()
+
+    def test_from_file_with_remove_is_refused(self, tmp_path):
+        f = tmp_path / "combined.pem"
+        f.write_text("x")
+        with patch("cli.commands.admin_connection.api_delete") as delete:
+            result = runner.invoke(
+                app,
+                ["admin", "connection", "secret", "CONN", "--remove", "--from-file", str(f)],
+            )
+        assert result.exit_code != 0
+        delete.assert_not_called()

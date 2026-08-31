@@ -69,7 +69,10 @@ class TestAccessCanCreateInPlace:
     def test_group_list_carries_a_create_control(self, seeded_app):
         c = seeded_app["client"]
         body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
-        assert 'id="ax-new-group"' in body
+        # The control is the list's own first row now, not a toolbar button
+        # with an id: `#ax-groups` is rewritten on every repaint, so it is
+        # addressed by attribute and bound by delegation.
+        assert "data-new-group" in body
         assert "New group" in body
 
     def test_it_opens_the_drawer_rather_than_navigating(self, seeded_app):
@@ -92,17 +95,44 @@ class TestTheFlowItself:
     def test_the_duplicated_editors_are_gone_not_hidden(self):
         """Steps 2 and 3 were a second member editor and a second grant
         editor. /admin/access owns both; a dormant copy here is how the two
-        would start disagreeing about one pair of tables."""
+        would start disagreeing about one pair of tables.
+
+        The drawer DOES seed a new group's first people, which is why this
+        no longer bans the member endpoints outright — what it bans is the
+        editor those endpoints were part of. The line between the two is
+        drawn by the three tests below, not by the absence of a URL."""
         js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
         for gone in (
             "'/api/admin/grants'",
             "'/api/admin/access-overview'",
-            "'/api/users'",
-            "/members",
             "renderPeople",
             "renderAccess",
         ):
             assert gone not in js, f"drawer still carries {gone}"
+
+    def test_seeding_is_additive_only(self):
+        """A member editor is one that can take membership away. This one
+        adds, and the roster that would let you do anything else is what
+        /admin/access exists for — so no DELETE, and no roster row."""
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "'DELETE'" not in js, "the drawer can remove a member — that is the editor returning"
+        assert "rmmember" not in js
+        # What it may do: find someone, and put them in the new group.
+        assert "'/api/users'" in js and "/members" in js
+
+    def test_seeding_is_creation_only(self):
+        """On an existing group the field must be gone, not merely empty —
+        two live places to add a member is the same divergence in slower
+        motion."""
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "els.people.hidden = !!g" in js, "the people field survives into edit mode"
+
+    def test_a_partial_seed_does_not_close_over_the_failure(self):
+        """The group is created before anyone is added, so a half-failure
+        has to stay on screen — closing would report success for work that
+        did not happen."""
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "failed.length" in js and "st.picked = failed" in js
 
     def test_it_writes_through_the_existing_group_api(self):
         """No new storage and no batched submit — the group exists when the

@@ -284,6 +284,64 @@ def _resolve_store_lint() -> Optional[Signal]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_vault_key_missing() -> Optional[Signal]:
+    """No vault key — this instance cannot connect any data source at all.
+
+    `#ds-add-btn` on /admin/data-sources is `disabled` without
+    `AGNES_VAULT_KEY`, so the whole data path is shut, and nothing on /admin
+    said so: step 1 of the setup chain linked straight to the page that
+    refuses. Docker and GCP deploys mint the key on boot, so this fires on
+    the manual install path — the one QUICKSTART addresses.
+
+    Uses `can_store_secrets()`, the same predicate the write path guards on,
+    rather than `vault_key_configured()` — the narrower question answers
+    False in LOCAL_DEV_MODE where the write would in fact succeed, and a
+    dashboard error on a working dev instance is noise.
+    """
+    from app.secrets_vault import can_store_secrets
+
+    if can_store_secrets():
+        return None
+    return Signal(
+        count=1,
+        href="/admin/data-sources",
+        blurb="no vault key is set, so no data source can be connected. Set AGNES_VAULT_KEY and restart.",
+    )
+
+
+def _resolve_sources_without_credential() -> Optional[Signal]:
+    """Connections that exist but hold no credential.
+
+    A connection whose token failed validation is still a row, and every
+    other surface counted rows: the setup chain called it "connected" and the
+    wizard offered to go straight to its tables. Derived exactly as the
+    source card derives `has_secret`, so the two cannot disagree.
+    """
+    from src.repositories import connection_secrets_repo, source_connections_repo
+
+    secrets = connection_secrets_repo()
+    broken = 0
+    for row in source_connections_repo().list():
+        if (row.get("token_env") or "").strip():
+            continue
+        try:
+            if not secrets.has(row["id"]):
+                broken += 1
+        except Exception:  # noqa: BLE001
+            # Cannot prove it works — say so rather than claim health.
+            broken += 1
+    if not broken:
+        return None
+    return Signal(
+        count=broken,
+        href="/admin/data-sources",
+        blurb=(
+            f"{_plural(broken, 'source has', 'sources have')} no credential stored — "
+            f"{_plural(broken, 'it', 'they')} cannot read any table."
+        ),
+    )
+
+
 def _resolve_sync_failures() -> Optional[Signal]:
     from src.repositories import sync_state_repo
 
@@ -419,6 +477,26 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         resolve=_resolve_store_lint,
     ),
     # --- Needs fixing ------------------------------------------------------
+    # Configuration health comes FIRST in this zone. The dashboard had eight
+    # signals — five content-moderation, three operational — and none about
+    # broken configuration, so "Nothing needs your attention" sat above a
+    # credential-less connection and a source that had never synced.
+    # `_resolve_sync_failures` cannot cover it: it counts sync RUNS with a
+    # non-ok status, and a source that never ran produces none.
+    SignalSpec(
+        key="vault_key_missing",
+        title="Vault key not set",
+        zone=ZONE_NEEDS_FIXING,
+        severity="error",
+        resolve=_resolve_vault_key_missing,
+    ),
+    SignalSpec(
+        key="sources_without_credential",
+        title="Sources without a credential",
+        zone=ZONE_NEEDS_FIXING,
+        severity="error",
+        resolve=_resolve_sources_without_credential,
+    ),
     SignalSpec(
         key="sync_failures",
         title="Failed syncs",

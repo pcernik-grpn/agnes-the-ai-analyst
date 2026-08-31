@@ -274,41 +274,28 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         ],
     },
     {
-        # DESTINATION. TWO tabs, not three: "Groups" was a separate list page
-        # over the same rows the workspace's left column already carries, so a
-        # section whose first two tabs were both "here are the groups" now has
-        # one — the workspace — and one question, Simulate.
+        # DESTINATION. NO tabs. It had two — "Groups" and "Simulate a
+        # person" — and both stopped being true. "Groups" named one of the
+        # ways the page now groups its list (the other is by bundle), so a
+        # tab with that label promised a page rather than a grouping. And
+        # Simulate is the THIRD way of reading the same grants, by person,
+        # which makes it a third position in the page's own switch and not
+        # a second destination: `?by=group | bundle | person`.
         #
-        # `/admin/groups` and `/admin/groups/{id}` 308 onto this page (the
-        # detail page's members and grants are the workspace's two panes), so
-        # every link, bookmark and shortcut aimed at the old URLs still lands.
+        # `?lens=simulate` still works and still lands on the person view —
+        # every existing link, bookmark and the per-group "See it as a
+        # person" keep working — it is just no longer a tab.
         #
-        # Simulate is a real URL (`?lens=simulate`) rather than an in-page
-        # button strip, so both tabs navigate the same way. The editor keeps
-        # its selected group across the trip by restoring it from
-        # sessionStorage (see admin_access.html) — the state the old
-        # pane-switch protected, without a second navigation model on one page.
+        # `/admin/groups` and `/admin/groups/{id}` still 308 onto this page.
         "key": "access",
         "label": "Access",
         "icon": "shield-check",
         "href": "/admin/access",
-        "tabs": [
-            {"label": "Groups", "href": "/admin/access", "match": ["/admin/access"]},
-            {
-                "label": "Simulate a person",
-                "href": "/admin/access?lens=simulate",
-                # No `match` of its own: a query string is not a path, so this
-                # tab can never win the path-prefix race against "Groups".
-                # `resolve_section_tabs` marks it active off the query instead
-                # — the one tab whose active-state is not positional.
-                "match": [],
-            },
-        ],
-        # The two retired URLs. They redirect, but the nav still has to claim
-        # them: a 308 is followed by the browser, and anything that resolves a
-        # section from a path (the reverse guard, a mid-redirect render) must
-        # light Access rather than nothing.
-        "match": ["/admin/grants", "/admin/groups"],
+        # The section owns its own prefixes now. They used to sit on the
+        # retired "Groups" tab, which is why deleting the tabs made
+        # `/admin/access` resolve to no section at all: the page's own path
+        # was only ever matched by a tab of its own section.
+        "match": ["/admin/access", "/admin/grants", "/admin/groups"],
     },
     {
         # Key stays `library` (it is the localStorage collapse key and the
@@ -345,14 +332,22 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {
                 "label": "MCP sources",
                 "href": "/admin/mcp-sources",
-                "gloss": "MCP servers whose tools analysts can use",
+                "gloss": "MCP servers whose tools — and apps — analysts can use",
                 "match": ["/admin/mcp-sources", "/admin/mcp-tools"],
             },
+            # Publishing apps is ALSO the last section of the MCP builder, for
+            # the server being connected. This row is the other errand: a
+            # server connected weeks ago, and today's job starting from the app
+            # list rather than from a connection form.
             {
-                "label": "Linked apps",
+                "label": "Publish apps",
                 "href": "/admin/linked-apps",
-                "gloss": "Hosted elsewhere, granted from here",
+                "gloss": "Apps a connected server lists, granted from here",
                 "match": ["/admin/linked-apps"],
+                # Data apps are off by default and the page 404s when they are,
+                # which is the whole reason the retired wizard was an
+                # operator-hostile surface. Gate the row on the same predicate.
+                "when": "can_data_apps",
             },
             # Conditional — the hub is off by default (see the module
             # docstring). `match` stays the bare prefix: Submissions and Store

@@ -182,13 +182,18 @@ uv pip install ".[dev,server]"
 # Run FastAPI locally
 uvicorn app.main:app --reload
 
-# Run tests (connectors/ too — every connector keeps its tests beside the
-# code, and CI runs both; `tests/` alone silently skips them)
-.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
+# Run tests. Locally you run a LANE, not the whole suite — the full ~24 000
+# tests are CI's job on every push (see CONTRIBUTING.md → "Test lanes").
+# `connectors/` is always included: every connector keeps its tests beside the
+# code and `tests/` alone silently skips them.
+.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q   # what your diff touches
+.venv/bin/pytest tests/ connectors/ --lane fast     --tb=short -n auto -q   # 2:57, pre-push gate
+.venv/bin/pytest tests/ connectors/                 --tb=short -n auto -q   # 10:28, rarely needed locally
 
 # Locally `-n auto` is capped at 6 workers (each is a ~430 MB process, and the
-# suite is I/O-bound past that). Raise or lower it for a one-off run:
-AGNES_TEST_MAX_WORKERS=12 .venv/bin/pytest tests/ -n auto -q
+# suite is I/O-bound past that). The fast lane is cheaper per worker, so raising
+# the cap pays off there: it lands at 1:59 with 10 workers on a 14-core machine.
+AGNES_TEST_MAX_WORKERS=10 .venv/bin/pytest tests/ connectors/ --lane fast -n auto -q
 
 # Trigger sync manually
 curl -X POST http://localhost:8000/api/sync/trigger
@@ -483,7 +488,7 @@ Full recipe, deploy workflows, manual rollback runbook, weekly tag-housekeeping,
 
 - **Changelog discipline.** Every PR that changes user-visible behavior MUST add a bullet under `## [Unreleased]` in `CHANGELOG.md`, in the same PR — grouped Added/Changed/Fixed/Removed/Internal, `**BREAKING**` prefix for breaking changes. No follow-ups.
 - **Release-cut is a dedicated cut PR, never a feature PR.** A feature/fix PR only ever adds an `[Unreleased]` bullet — it never bumps `pyproject.toml`/`server.json` or renames `[Unreleased]`. `.github/workflows/daily-cut.yml` cuts once a day (minor bump; `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR labeled `release-cut` that a human reviews and merges — this is what killed the old CHANGELOG-rename race between competing feature PRs. After merge: `gh workflow run tag-release.yml -f tag=vX.Y.Z` (the cut PR's body carries the exact command) tags the merge commit and creates the GitHub Release.
-- **Run the full test suite before every push** — `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q` (this is what CI runs). `connectors/` is not optional: every connector keeps its tests beside the code, so `tests/` alone skips them and a connector regression passes a "full" local run and fails in CI. Failures in code you touched: fix before pushing. Failures unrelated to your diff: confirm with `git stash` they reproduce on a clean branch, note them in the PR body, don't block on them.
+- **Run the fast lane before every push, not the full suite** — `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q` (2:57, or 1:59 with `AGNES_TEST_MAX_WORKERS=10`), after `--lane impacted` for the tests your diff actually touches. CI runs the full suite on the push; running it locally as well is the single biggest cost in the merge cycle and buys nothing CI is not about to compute. `connectors/` is not optional in any lane: every connector keeps its tests beside the code, so `tests/` alone skips them and a connector regression passes a "full" local run and fails in CI. Failures in code you touched: fix before pushing. Failures unrelated to your diff: confirm with `git stash` they reproduce on a clean branch, note them in the PR body, don't block on them. Full local runs are for merge-magnet changes (`src/db.py`, `tests/conftest.py`, `app/main.py`) and for reproducing a CI failure a lane will not show.
 - **Watch the post-merge `release.yml` run.** On `main` pushes a `smoke-test` job pulls the just-built `:stable` image and runs a docker-compose stack; if it fails, the `rollback-on-smoke-fail` job calls the reusable `rollback.yml` workflow which re-points `:stable` to the previous known-good build and opens a tracking issue labeled `bug`. Success signal after merge = `smoke-test` green + `rollback-on-smoke-fail` skipped. If the rollback fires, the merge shipped a broken image to GHCR — investigate the tracking issue before any further push (the issue body has the failing image, commit SHA, deprecated tag, and rollback target). Manual rollback / forced target / weekly tag-pruning operator commands are in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Specialized agents, skills & commands
@@ -494,7 +499,7 @@ the right tool:
 | Need | Use | How |
 |---|---|---|
 | Chart a large, foggy effort — destination known, too many decisions open to write a plan | `agnes-wayfinder` | a map + numbered decision tickets as markdown under `docs/superpowers/maps/<effort>/`; resolve one per session (`research` excepted) until the route is clear, then hand off to `superpowers:writing-plans` → `/agnes-build`. Explicit invocation only; if you can already state the steps, skip it. |
-| Verify a change before claiming it's done | `verify-agnes-change` | cheapest-first loop: `scripts/verify_syncmap.py` (instant, the sync-map rows no test guards) → the guards your diff touches → full suite → `/agnes-review`. Fix and re-run each gate until it passes. |
+| Verify a change before claiming it's done | `verify-agnes-change` | cheapest-first loop: `scripts/verify_syncmap.py` (instant, the sync-map rows no test guards) → the guards your diff touches → `--lane impacted` → `--lane fast` → `/agnes-review`. The full suite is CI's job on the push. Fix and re-run each gate until it passes. |
 | Review a change before merge | `/agnes-review` | scope-gated review **team** (rules always fires; adversarial is opt-in via `--adversarial`; architecture / rbac / parity fire only in-scope) + `agnes-review-consolidator` → one advisory report (`file:line` + severity, ≤15 findings). Read-only working tree; optional comment-only PR post. |
 | Implement a whole plan in parallel | `/agnes-build` | decomposes a plan into independent tasks (sync-map coupling), builds each in its own git worktree via `agnes-builder`, integrates (migration serialized last), then runs `/agnes-review`. |
 | Implement a feature (connector / endpoint / web page / repo method / migration) | `agnes-builder` | disciplined implementer (TDD-first, DuckDB↔PG parity in the same change, migration-ladder sync, CHANGELOG, vendor-agnostic, scope discipline). Routes to the `agnes-conventions` playbooks. |
@@ -545,8 +550,12 @@ token on state-changing web POSTs and never mutate on GET; scope infra exposure
 per-instance, never fleet-wide. `agnes-reviewer-rules` runs the reviewer
 quick-scan from that playbook on every PR. Every audit action string must be
 registered in `src/audit_events.py`'s `CATALOG` (or covered by
-`DYNAMIC_ACTION_PREFIXES`), and new audit writes go through `log_safe` —
-enforced by `tests/test_audit_catalog.py` and `tests/test_audit_route_posture.py`.
+`DYNAMIC_ACTION_PREFIXES`), and new audit writes go through `log_safe`. Every
+mutating, read (`GET`), and WebSocket route must declare its audit posture in
+`src/audit_posture.py` — a cataloged action or an exempt reason from the
+closed vocabulary, never left undeclared — enforced by
+`tests/test_audit_catalog.py`, `tests/test_audit_route_posture.py`, and
+`tests/test_audit_read_posture.py`.
 
 ### Vendor-agnostic public repo — no customer-specific content
 This repo is the public source-available distribution. **Nothing customer-specific belongs in code, config defaults, comments, docs, commit messages, or PR titles/bodies** — no specific deployments or brands, cloud project IDs, internal hostnames, runbook paths, internal SA emails, or cross-references to private repos. Frame motivations abstractly ("behind a TLS-terminating reverse proxy"); use placeholders in examples (`example.com`, `<your-host>`, `<install-dir>`). Customer-specific automation lives in the private infra repos that *consume* this repo. Before opening a PR, scan the diff and PR body for customer-specific tokens.

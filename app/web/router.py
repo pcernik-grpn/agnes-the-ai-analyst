@@ -8,8 +8,8 @@ import os
 import secrets
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import quote, urlencode
+from typing import Any, Final, Optional
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -19,6 +19,7 @@ import duckdb
 import jinja2
 
 from app.auth.access import is_user_admin, require_admin
+from app.web import vocabulary
 from app.web.studio import STUDIO_DOMAINS, get_domain as get_studio_domain
 from app.auth.dependencies import get_current_user, get_optional_user, _get_db
 from app.instance_config import (
@@ -232,6 +233,42 @@ def _store_display_name(name: str | None) -> str:
 templates.env.filters["store_display_name"] = _store_display_name
 
 
+_EXTERNAL_URL_PREFIXES: Final = ("http://", "https://", "//", "data:")
+
+
+def has_cover_variant(url: str) -> bool:
+    """True when ``url`` is one of our serving routes and can take a ``?w=`` variant.
+
+    Our own cover-serving routes (the ``/uploads`` static mount, the two
+    curated-marketplace asset routes, the store entity-photo route) are
+    always emitted as relative paths, never absolute or protocol-relative
+    URLs — so an ``http(s)://`` URL, a protocol-relative ``//host/...`` URL
+    (the browser resolves that against the page's own scheme, still a
+    foreign host), or a ``data:`` URL is by definition an external cover
+    with no variant to request. Templates use this to skip emitting
+    ``srcset``/``sizes`` for those (a duplicated URL under two width
+    descriptors would be a lying srcset).
+    """
+    return not url.lower().startswith(_EXTERNAL_URL_PREFIXES)
+
+
+def cover_variant_url(url: str, width: int) -> str:
+    """Point a served cover-image URL at its ``?w=<width>`` WebP variant.
+
+    An external absolute http(s) URL that isn't one of our own serving
+    routes is returned unchanged — it has no variant to request. Every
+    other URL gets the width appended, as ``&w=`` when it already carries
+    a query string (store photo URLs carry ``?v=<version>``).
+    """
+    if not has_cover_variant(url):
+        return url
+    return f"{url}{'&' if '?' in url else '?'}w={width}"
+
+
+templates.env.filters["cover_w"] = cover_variant_url
+templates.env.filters["has_cover_variant"] = has_cover_variant
+
+
 # ---- PostHog template wiring ----
 # Two Jinja globals injected into every render so the `_posthog.html` partial
 # (included from `base.html` and `base_login.html`) can render the browser
@@ -321,6 +358,33 @@ def _data_apps_nav_enabled() -> bool:
         return False
 
 
+def _admin_setup_rail() -> object:
+    """The admin's setup chain for the rail, or None.
+
+    Registered as a Jinja global for the same reason as `data_apps_enabled`
+    above: `_app_rail.html` is shared by both context builders, and the chain
+    now has to reach EVERY page rather than only `/chat`. Threading it through
+    every route would have meant touching each one and forgetting the next.
+
+    The admin gate is the TEMPLATE's (`session.user.is_admin and dev_preview
+    != 'member'`), not this function's: the rail already holds that fact, and
+    the same expression is what decides the Admin badge two rows down, so
+    reading it in one place keeps a member-preview from showing the chain
+    while the badge beside it says member. This returns instance state — the
+    chain is identical for every admin — and None when it cannot be resolved,
+    which leaves the analyst row rendering exactly as before rather than a
+    chain claiming zero progress.
+    """
+    try:
+        from app.services.admin_dashboard import resolve_setup_rail
+
+        return resolve_setup_rail()
+    except Exception:
+        logger.warning("rail: admin setup chain unavailable", exc_info=True)
+        return None
+
+
+templates.env.globals["admin_setup_rail"] = _admin_setup_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
 
 
@@ -359,6 +423,7 @@ from app.web.admin_nav import (  # noqa: E402
     resolve_section_tabs,
 )
 
+vocabulary.install(templates.env)
 templates.env.globals["admin_nav_sections"] = ADMIN_NAV_SECTIONS
 templates.env.globals["admin_nav_docs"] = ADMIN_NAV_DOCS
 templates.env.globals["admin_nav_home"] = ADMIN_NAV_HOME
@@ -1711,8 +1776,8 @@ def _data_package_entry_dict(
     (subscribe = keep a local copy), not stack membership.
     """
     description = entry.description or (
-        f"Bundle of {table_count} table{'s' if table_count != 1 else ''}. "
-        f"Download locally so `agnes pull` syncs the data to your workspace."
+        f"{table_count} table{'s' if table_count != 1 else ''}. "
+        f"Keep a local copy so `agnes pull` syncs the data to your workspace."
     )
     out = {
         "id": entry.id,
@@ -2097,9 +2162,7 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: rather than literals at each site because they are the same sentence
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
-_LOCKED_STACK_TOOLTIP = (
-    "Required by your admin — your agents get this automatically, and you cannot remove it."
-)
+_LOCKED_STACK_TOOLTIP = "Required by your admin — your agents get this automatically, and you cannot remove it."
 _GRANTED_STACK_TOOLTIP = (
     "Granted to your group by your admin — your agents can already use it, and only an admin can change that."
 )
@@ -2112,19 +2175,16 @@ _GRANTED_STACK_TOOLTIP = (
 #: what the server does and left the reader to infer what they get. Named
 #: once, because this column has already collected four spellings of one
 #: state and every extra literal is how a fifth arrives.
-_AGENT_ADD = "Add to my agents"
-_AGENT_REMOVE = "Remove"
+_AGENT_ADD = vocabulary.ADD
+_AGENT_REMOVE = vocabulary.REMOVE
 # The resting states drop the possessive the ACTION keeps ("Add to my
 # agents"): the action is a sentence about you, the state is a fact about the
 # row, and repeating "your agents" on every line both clipped the 142px cell
 # and said nothing the lede above the list has not already said.
-_AGENT_HAS = "Agents can use this"
-_AGENT_CAN_QUERY = "Agents can query this"
-_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
-_AGENT_HAS_TOOLTIP = (
-    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
-    "sees what that scope allows."
-)
+_AGENT_HAS = vocabulary.HAS
+_AGENT_CAN_QUERY = vocabulary.CAN_QUERY
+_AGENT_ADD_TOOLTIP = vocabulary.ADD_TOOLTIP
+_AGENT_HAS_TOOLTIP = vocabulary.HAS_TOOLTIP
 
 
 def _library_row_base(
@@ -2284,6 +2344,30 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Option
     if rows is None:
         rows = _readable_semantic_model_rows(user, conn, surface=surface)
     return bool(rows)
+
+
+def _library_type_map(user: dict) -> list[dict]:
+    """Node types with caller-scoped counts for the Knowledge tab's head.
+
+    Fails soft on every axis, because this is a decoration on a page that
+    must render without it: the `facts` feature can be off, the app-state
+    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
+    and the graph can simply be empty. Any of those renders the Library
+    exactly as it does today, with no type map — never a 500 on the
+    caller's main inventory page.
+    """
+    try:
+        from app.instance_config import feature_enabled
+
+        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+            return []
+        from src.repositories import facts_repo
+
+        counts = facts_repo().count_visible_facts_by_type(user)
+    except Exception:  # noqa: BLE001 - decoration must never break the page
+        logger.debug("library: type map unavailable", exc_info=True)
+        return []
+    return [{"type": t, "count": n} for t, n in counts.items()]
 
 
 def _library_type_map(user: dict) -> list[dict]:
@@ -2522,8 +2606,10 @@ async def library_page(
             # on screen answered "Nothing matches these filters". A folder is
             # therefore searchable by every filename it holds; the client then
             # opens it and hides the siblings, so the hit reads as the file.
-            fname = " ".join(f.get("filename") or "" for f in files) if is_folder else (
-                first_file.get("filename") if first_file else ""
+            fname = (
+                " ".join(f.get("filename") or "" for f in files)
+                if is_folder
+                else (first_file.get("filename") if first_file else "")
             )
             row = _library_row_base(
                 item_id=col["id"],
@@ -2697,7 +2783,12 @@ async def library_page(
     except Exception as e:
         _lost("skills, plugins and agent templates", e)
 
-    for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
+    # Agent templates were missing from this tuple, so a published one appeared
+    # in no listing at all — while the error label three lines up, the type
+    # label map, and the builder's own "Open in Library" success action all
+    # said otherwise. The author followed their own success banner to a page
+    # that did not contain their work.
+    for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin"), ("agent", "Agent template")):
         try:
             _entities, _total = store_entities_repo().list(
                 type=_etype,
@@ -2774,9 +2865,17 @@ async def library_page(
                     visibility=visibility,
                     visibility_label=visibility_label,
                     meta_text=" · ".join(meta_bits),
-                    # Store visibility, not a group grant — the badge reports the
-                    # model rather than offering a grant nothing would read.
-                    share_type=None,
+                    # The author's OWN item, so the badge is a control. It used
+                    # to be inert here on the grounds that a grant on a store
+                    # entity was read by nothing — true then, false now: a
+                    # granted group can find, open and install a private item.
+                    # An entity already published to everyone has nothing left
+                    # to grant, so only a private one is shareable.
+                    share_type=(
+                        ResourceType.STORE_ENTITY.value
+                        if (s.get("visibility_status") or "") != "approved"
+                        else None
+                    ),
                     tags=[s["category"]] if s.get("category") else [],
                     owner_key=owner_key,
                 )
@@ -2841,6 +2940,40 @@ async def library_page(
         except Exception as e:
             logger.warning("/library: could not resolve %s grants: %s", rt, e)
             return set()
+
+    # Why the caller has a granted row, cached per resource type. The row
+    # already said WHAT it is and that an admin put it there; the one thing a
+    # member could not learn anywhere in the product was through WHICH of
+    # their groups — which is also the only part they can act on, because it
+    # is what they ask their admin to change.
+    _via_cache: dict[str, dict[str, list[str]]] = {}
+
+    def _granted_via(rt: str) -> dict[str, list[str]]:
+        if rt not in _via_cache:
+            try:
+                _via_cache[rt] = resolver.granting_groups(uid, ResourceType(rt))
+            except Exception as e:
+                logger.warning("/library: could not resolve %s grant groups: %s", rt, e)
+                _via_cache[rt] = {}
+        return _via_cache[rt]
+
+    def _because_of(type_key: str, item_id: str) -> str:
+        """The trailing clause naming the caller's granting groups.
+
+        Appended to the membership tooltip rather than replacing it, because
+        the existing sentence answers "can I remove this" and this answers a
+        different question. Capped at three names — past that the list stops
+        being a fact a person holds in their head and the count is the more
+        useful shape.
+        """
+        names = _granted_via(type_key).get(item_id) or []
+        if not names:
+            return ""
+        if len(names) == 1:
+            return f" You have it because you are in {names[0]}."
+        if len(names) <= 3:
+            return " You have it because you are in " + ", ".join(names[:-1]) + f" and {names[-1]}."
+        return f" You have it through {len(names)} of your groups, including {names[0]} and {names[1]}."
 
     def _add_shared_row(
         *,
@@ -2938,10 +3071,11 @@ async def library_page(
             # and in the Access facet.
             items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
+            _why = _because_of(type_key, item_id)
             if requirement == "required":
-                items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
+                items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP + _why
             else:
-                items[-1]["stack_title"] = _GRANTED_STACK_TOOLTIP
+                items[-1]["stack_title"] = _GRANTED_STACK_TOOLTIP + _why
         else:
             # Classic non-member: a real Add control, not a dead pill (Devin
             # Review on #1199, round 4). The generic subscribe endpoint takes
@@ -3190,13 +3324,22 @@ async def library_page(
     except Exception as e:
         _lost("plugins from your organization", e)
 
-    # Installed AGENTS. Skills and plugins are already covered by the store sweep
-    # above — whether installed or not — so listing them here again would double
-    # every row. Agents are not swept (they have their own surface at /agents),
-    # so an installed one is surfaced here, as it always has been.
+    # Installed AGENT TEMPLATES the sweep did not already list.
+    #
+    # The sweep covers approved entities and the caller's own, of all three
+    # types. This pass exists for the remainder: an entity the caller
+    # installed that the sweep will not show them — someone else's item that
+    # has since been archived, or one shared with them rather than published.
+    # It used to be "agents are never swept", and when they joined the sweep
+    # this loop started listing an installed one a second time. Skipping what
+    # is already on the page is the durable form of that rule: it stays right
+    # whichever types the sweep covers next.
+    _listed_ids = {row.get("id") for row in items}
     try:
         for inst in installed_store.values():
             if (inst.get("type") or "").lower() != "agent":
+                continue
+            if inst["id"] in _listed_ids:
                 continue
             _add_shared_row(
                 item_id=inst["id"],
@@ -3962,16 +4105,37 @@ async def skills_page(
     "submit" CTA, the ``?from=skills`` detail back-link and the tour anchors.
     ``?type=skill|plugin|agent`` deep-links past the picker."""
     from src.store_categories import STORE_CATEGORIES
+    from src.store_naming import sanitize_username
 
     from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
 
+    # The name an author types is not the name their item answers to — the
+    # store appends `-by-<owner>`. /store/new has always shown that; the
+    # builder replaced that page without carrying it over, so the preview
+    # promised a handle the save then changed.
+    try:
+        owner_username = sanitize_username(user.get("email") or "")
+    except ValueError:
+        owner_username = ""
     _guardrails_enabled = get_guardrails_enabled()
     ctx = _build_context(
         request,
         user=user,
         store_categories=list(STORE_CATEGORIES),
+        owner_username=owner_username,
+        # The floors Check and Save actually enforce, so the form can state
+        # them instead of letting the author discover them in a refusal.
+        guardrail=_guardrail_thresholds(),
         guardrails_enabled=_guardrails_enabled,
         guardrails_llm_ready=_guardrails_enabled and get_guardrails_llm_provider_ready(),
+        # Whether the BUILDER's assistant can answer at all — a different
+        # question from the guardrail reviewer's provider above. Resolved
+        # here so the page opens in the right state: it used to find out by
+        # dispatching a turn, which meant greeting the author, taking their
+        # message, and only then withdrawing the offer and discarding what
+        # they wrote. Worse on the edit path, which fires no opening turn, so
+        # the notice waited until they had typed.
+        builder_llm_ready=_builder_llm_ready(),
     )
     return templates.TemplateResponse(request, "skills.html", ctx)
 
@@ -4682,6 +4846,18 @@ async def catalog_package_detail(
     if not pkg:
         raise HTTPException(status_code=404, detail="data_package_not_found")
 
+    # A draft is hidden from every member-facing list (StackResolver's
+    # HIDDEN_STATUSES, applied in _fetch_entries), so its detail page has to be
+    # hidden too — otherwise the page an admin has not published yet is one
+    # guessed slug away from any member with a grant, and it reads as shipped.
+    # 404, not 403: browse behaves as though it does not exist, and a 403 would
+    # confirm the name of an unpublished package. Admins author drafts, so
+    # theirs still opens.
+    from app.services.stack_resolver import HIDDEN_STATUSES
+
+    if (pkg.get("status") or "prod") in HIDDEN_STATUSES and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+
     # Admin bypass via is_user_admin; otherwise require a grant (any tier).
     # The detail token is DISTINCT (same pattern as admin_elevation_paused)
     # so error.html can answer with language and a request-access action
@@ -4692,7 +4868,7 @@ async def catalog_package_detail(
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.DATA_PACKAGE.value, pkg["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail=f"package_not_shared:{pkg['name']}")
+        raise HTTPException(status_code=403, detail=f"not_shared:data package:{pkg['name']}")
 
     # Telemetry: emit data_package.view (Section 9.2). source=browse|my-stack
     # passed as ?source=…; default 'direct' for typed/bookmarked navigation.
@@ -4983,7 +5159,10 @@ async def catalog_table_detail(
     except Exception:
         logger.warning("could not enumerate parent packages for %s", table_id, exc_info=True)
     if not (is_admin or has_grant):
-        raise HTTPException(status_code=403, detail="access_denied")
+        # Same door the package 403 opens, same reason: the route 404s a table
+        # that does not exist, so a 403 already confirms existence and naming
+        # it leaks nothing while making the request-access copy worth sending.
+        raise HTTPException(status_code=403, detail=f"not_shared:table:{table.get('name') or table_id}")
 
     # Resolve any pairs_well_with ids to (id, name) pairs the template
     # can render as links. Unknown ids (deleted tables) silently dropped.
@@ -5404,7 +5583,7 @@ async def memory_domain_detail(
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.MEMORY_DOMAIN.value, domain["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail="access_denied")
+        raise HTTPException(status_code=403, detail=f"not_shared:memory domain:{domain['name']}")
 
     source_hint = request.query_params.get("source", "direct")
     try:
@@ -5589,6 +5768,9 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         # Marketplaces, and verification's own switch), so the page was a
         # landing spot for links you can reach directly.
         "can_store_moderation": get_store_moderation_enabled(),
+        # Publishing external apps — off by default, and its page 404s when it
+        # is off, so the row goes with it.
+        "can_data_apps": _data_apps_nav_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -5758,7 +5940,7 @@ async def data_app_detail_page(
     if not row or row.get("state") == "linked_hidden":
         raise HTTPException(status_code=404, detail="data_app_not_found")
     if not _can_view(user, row):
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise HTTPException(status_code=403, detail=f"not_shared:data app:{row.get('name') or slug}")
 
     is_admin = is_user_admin(user["id"])
     is_owner = user["id"] == row["owner_user_id"]
@@ -5916,6 +6098,78 @@ async def studio(
     )
 
 
+def _simulate_preview_ctx(request: Request) -> dict | None:
+    """Who the admin came here to fix, when they arrived from the person lens.
+
+    The Access page's person lens links out with `?from=simulate&user=<id>`,
+    and a page that understands it can show "← Back to preview: Jane" and a
+    "Re-check Jane →" return link — a closed loop, instead of dropping the
+    person the moment you leave the audit.
+
+    This lived inline in the data-package route, so the package page was the
+    only destination that closed the loop; the memory link was a one-way exit
+    with no way back at all. Resolved server-side to a name plus their groups
+    so the banner can say "Jane — Everyone, product-team" rather than echoing
+    a uuid. An unknown or garbage id resolves to None and the page renders
+    normally — the banner is chrome, never a 500.
+    """
+    if request.query_params.get("from") != "simulate":
+        return None
+    uid = request.query_params.get("user") or ""
+    if not uid:
+        return None
+    try:
+        person = users_repo().get_by_id(uid)
+    except Exception:  # noqa: BLE001
+        person = None
+    if not person:
+        return None
+    try:
+        groups = list(user_group_members_repo().list_group_names_for_user(uid))
+    except Exception:  # noqa: BLE001
+        groups = []
+    return {
+        "user_id": uid,
+        "name": person.get("name") or person.get("email") or uid,
+        "groups": [g for g in groups if g],
+        "back_href": f"/admin/access?lens=simulate&user={uid}",
+    }
+
+
+def _access_group_ctx(request: Request) -> dict | None:
+    """Which group the admin was reading, when they arrived from Access.
+
+    The sibling of :func:`_simulate_preview_ctx` for the *group* lens. That
+    one closes the loop for a person — "← Back to preview: Jane" plus a
+    "Re-check Jane →" return link — and the group lens had no equivalent, so
+    a package opened while filtered to one group fell through to the
+    hard-coded "← Packages" back link and rendered its Sharing block for
+    every group the package reaches. The admin had narrowed to one group and
+    the page showed them three.
+
+    Same contract as its sibling: resolved server-side to a name so the
+    banner can say "Finance" rather than echoing a uuid, and an unknown or
+    garbage id resolves to None so the page renders normally — the banner is
+    chrome, never a 500.
+    """
+    if request.query_params.get("from") != "access":
+        return None
+    gid = request.query_params.get("group") or ""
+    if not gid:
+        return None
+    try:
+        group = user_groups_repo().get(gid)
+    except Exception:  # noqa: BLE001
+        group = None
+    if not group:
+        return None
+    return {
+        "group_id": gid,
+        "name": group.get("name") or gid,
+        "back_href": f"/admin/access?group={gid}",
+    }
+
+
 @router.get("/admin/corporate-memory", response_class=HTMLResponse)
 async def corporate_memory_admin(
     request: Request,
@@ -6007,6 +6261,7 @@ async def corporate_memory_admin(
         contradictions=contradictions,
         audit_entries=[],
         knowledge_json_exists=knowledge_json_exists,
+        preview_ctx=_simulate_preview_ctx(request),
     )
     return templates.TemplateResponse(request, "admin_corporate_memory.html", ctx)
 
@@ -6375,6 +6630,25 @@ async def install_redirect(request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _builder_llm_ready() -> bool:
+    """Whether a builder turn could reach a model, without building a client.
+
+    ``stub_enabled()`` counts as ready: the stub answers every turn, which is
+    what the page needs to know. Never raises — a page must render whatever
+    the config says.
+    """
+    try:
+        from app.api.builder_core import stub_enabled
+
+        if stub_enabled():
+            return True
+        from connectors.llm import llm_configured
+
+        return llm_configured()
+    except Exception:  # noqa: BLE001 - any failure here means "assume not configured"
+        return False
+
+
 def _guardrail_thresholds() -> dict[str, int]:
     """Live admin-configurable thresholds surfaced into the upload UI.
 
@@ -6609,6 +6883,14 @@ async def marketplace_flea_detail(
         and not entity_has_adverse_verdict(entity.get("id") or "")
     )
 
+    # Hero cover, server-side — same helper the page's own detail XHR
+    # (``flea_detail`` in app/api/marketplace.py) resolves its cover URL
+    # through, so the browser's preload scanner sees the LCP image in the
+    # initial HTML instead of waiting on that follow-up request.
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     # v104 trust strip. `entity_owner_label` resolves the byline the same way
     # the card does (display name → email → username) so the detail page never
     # shows a kebab-case username where the grid showed a real name.
@@ -6642,6 +6924,7 @@ async def marketplace_flea_detail(
         # Where the visitor came from, so the detail page's back link can point
         # home to the right surface (e.g. ?from=skills → the Skill builder).
         from_source=from_source,
+        cover_image_url=cover_image_url,
     )
 
     if entity["type"] == "plugin":
@@ -6782,6 +7065,11 @@ async def marketplace_flea_skill_detail(
     _enforce_visibility(entity, user, conn)
     is_owner = entity.get("owner_user_id") == user.get("id")
     is_admin = is_user_admin(user["id"], conn)
+
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     ctx = _build_context(
         request,
         user=user,
@@ -6793,6 +7081,7 @@ async def marketplace_flea_skill_detail(
         entity=entity,
         is_owner=is_owner,
         is_admin=is_admin,
+        cover_image_url=cover_image_url,
     )
     return templates.TemplateResponse(
         request,
@@ -6825,6 +7114,11 @@ async def marketplace_flea_agent_detail(
     _enforce_visibility(entity, user, conn)
     is_owner = entity.get("owner_user_id") == user.get("id")
     is_admin = is_user_admin(user["id"], conn)
+
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     ctx = _build_context(
         request,
         user=user,
@@ -6836,6 +7130,7 @@ async def marketplace_flea_agent_detail(
         entity=entity,
         is_owner=is_owner,
         is_admin=is_admin,
+        cover_image_url=cover_image_url,
     )
     return templates.TemplateResponse(
         request,
@@ -6988,27 +7283,15 @@ async def admin_hub(
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
 
 
-@router.get("/admin/linked-apps/new", response_class=HTMLResponse)
+@router.get("/admin/linked-apps/new")
 async def admin_linked_apps_builder(
     request: Request,
     user: dict = Depends(require_admin),
-):
-    """Publish externally-hosted apps into the Library, in the builder shell.
-
-    /admin/linked-apps stays as the wizard for now; this is the path the
-    Library's "+ Add" reaches. What it fixes is the two things that made the
-    wizard an operator-hostile surface: step 1 asked which MCP source to read
-    apps from, with a dead end under it ("Not registered yet? Register one
-    first, then come back"), and step 2 asked for a projection map — which
-    response field is the app's name, which is its URL.
-
-    A projection map is an integration author's artifact. The adapter already
-    falls back to alias guesses (src/data_apps/keboola_adapter.py), so the
-    mapping is an escape hatch shown only when a row came back that the aliases
-    could not read, and the source and its lister tool are detected rather than
-    chosen.
-    """
-    return templates.TemplateResponse(request, "admin_linked_apps_builder.html", _build_context(request, user=user))
+) -> RedirectResponse:
+    """The old "new linked app" path. There is no separate create step any
+    more — publishing apps is picking a connected server and reading its list
+    — so this lands on the page that does it."""
+    return RedirectResponse("/admin/linked-apps", status_code=302)
 
 
 @router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
@@ -7032,6 +7315,30 @@ async def admin_mcp_builder(
     return templates.TemplateResponse(request, "admin_mcp_builder.html", _build_context(request, user=user))
 
 
+@router.get("/admin/mcp-sources/{source_id}/edit", response_class=HTMLResponse)
+async def admin_mcp_builder_edit(
+    source_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The same builder, opened on a source that already exists.
+
+    Registering used to be a builder and revising was a different surface —
+    the detail page's own form — so the connection, the tool curation and the
+    grants were entered in one vocabulary and changed in another. The detail
+    page stays what it is (the operations console: secrets, per-user
+    connections, OAuth registration, classification, materialize); what moved
+    here is the part the builder created, so it is edited where it was made.
+    """
+    from src.repositories import mcp_sources_repo
+
+    if mcp_sources_repo().get(source_id) is None:
+        raise HTTPException(status_code=404, detail="mcp_source_not_found")
+    ctx = _build_context(request, user=user)
+    ctx["edit_source_id"] = source_id
+    return templates.TemplateResponse(request, "admin_mcp_builder.html", ctx)
+
+
 @router.get("/admin/data-packages/new", response_class=HTMLResponse)
 async def admin_package_builder(
     request: Request,
@@ -7053,6 +7360,30 @@ async def admin_package_builder(
     # theme and the rest of the app chrome. Without it the page renders as a
     # builder floating on nothing.
     return templates.TemplateResponse(request, "admin_package_builder.html", _build_context(request, user=user))
+
+
+@router.get("/admin/data-packages/{pkg_id}/edit", response_class=HTMLResponse)
+async def admin_package_builder_edit(
+    pkg_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The same builder page, opened on a package that already exists.
+
+    Authoring one was a workspace and revising it was an overlay on top of
+    whatever page you happened to be on — the same fields, the same component,
+    at two sizes, so the edit read as a smaller and lesser thing than the
+    create. The drawer keeps the case it was built for (mid-sentence on
+    /admin/tables, assigning a table to a package that does not exist yet);
+    editing on purpose gets the page.
+    """
+    from src.repositories import data_packages_repo
+
+    if data_packages_repo().get(pkg_id) is None:
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+    ctx = _build_context(request, user=user)
+    ctx["edit_pkg_id"] = pkg_id
+    return templates.TemplateResponse(request, "admin_package_builder.html", ctx)
 
 
 @router.get("/admin/data-packages", response_class=HTMLResponse)
@@ -7475,31 +7806,36 @@ async def admin_package_detail(
     except Exception as e:  # noqa: BLE001
         logger.warning("package detail: could not compute delivery state: %s", e)
 
+    # A lifecycle status can VETO everything the counts above just said. Since
+    # v114 `draft` really is hidden from analysts and `coming-soon` really is
+    # undeliverable (app/services/stack_resolver.py), so "3 people get this
+    # automatically" is true of the grants and false of the world. The page
+    # has to say which, or it re-tells the lie the gate was added to end.
+    from app.services.stack_resolver import HIDDEN_STATUSES, UNDELIVERABLE_STATUSES
+
+    _pkg_status = (pkg.get("status") or "prod").strip()
+    if _pkg_status in HIDDEN_STATUSES:
+        delivery["withheld"] = "hidden"
+    elif _pkg_status in UNDELIVERABLE_STATUSES:
+        delivery["withheld"] = "undeliverable"
+    else:
+        delivery["withheld"] = None
+    delivery["withheld_status"] = _pkg_status if delivery["withheld"] else None
+
+    # A second veto, and the one the audit caught: the panel reported
+    # "N has not pulled since — shared, not yet delivered" while the manifest
+    # was empty, because the manifest is built from `sync_state`
+    # (app/api/sync.py) and no table in the package had ever synced. There
+    # was nothing to pull, so blaming the analyst for not pulling is exactly
+    # backwards. The real blocker rendered as a grey "never synced" fact in
+    # the sidebar while the loud strips were reserved for other states.
+    delivery["nothing_to_deliver"] = bool(member_ids) and newest_sync is None
+
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
-    # The Simulate lens's "Share it →" lands here carrying WHO the admin came
-    # to fix. Resolved server-side to a name + their groups so the banner can
-    # say "Jane — Everyone, product-team" instead of echoing a uuid, and the
-    # back link returns to the preview with the same person still selected.
-    # Unknown/garbage ids resolve to None and the page renders normally.
-    preview_ctx = None
-    if request.query_params.get("from") == "simulate":
-        _puid = request.query_params.get("user") or ""
-        if _puid:
-            try:
-                _pu = users_repo().get_by_id(_puid)
-            except Exception:  # noqa: BLE001 — the banner is chrome, never a 500
-                _pu = None
-            if _pu:
-                try:
-                    _pgroups = list(user_group_members_repo().list_group_names_for_user(_puid))
-                except Exception:  # noqa: BLE001
-                    _pgroups = []
-                preview_ctx = {
-                    "user_id": _puid,
-                    "name": _pu.get("name") or _pu.get("email") or _puid,
-                    "groups": [g for g in _pgroups if g],
-                    "back_href": f"/admin/access?lens=simulate&user={_puid}",
-                }
+    preview_ctx = _simulate_preview_ctx(request)
+    # The group lens's equivalent. Both are chrome: at most one is set, and
+    # the template prefers the person banner when somehow both are.
+    group_ctx = _access_group_ctx(request)
 
     ctx = _build_context(
         request,
@@ -7513,6 +7849,7 @@ async def admin_package_detail(
         all_groups=all_groups,
         delivery=delivery,
         preview_ctx=preview_ctx,
+        group_ctx=group_ctx,
         newest_sync=newest_sync.isoformat() if newest_sync else None,
         newest_sync_age_minutes=(int((now - newest_sync).total_seconds() // 60) if newest_sync else None),
     )
@@ -7896,7 +8233,15 @@ async def admin_datasource_credentials_page(
     here — the JS loads presence/source status from
     ``GET /api/admin/datasource-secrets`` and writes via PUT/DELETE.
     """
-    from app.secrets_vault import vault_key_configured
+    # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
+    # guards on the former (app/api/admin_source_connections.py), and the
+    # latter is the narrower "is a real key set" question that answers False
+    # in LOCAL_DEV_MODE where the write in fact succeeds. Using the narrow one
+    # here rendered a blocking "Vault key not configured" banner and a
+    # disabled "+ Add source" on an instance whose API would have accepted the
+    # credential — the UI refusing what the server allows. `secrets_vault`'s
+    # own docstring flags the distinction.
+    from app.secrets_vault import can_store_secrets as vault_key_configured
 
     ctx = _build_context(request, user=user)
     ctx["vault_key_configured"] = vault_key_configured()
@@ -7922,7 +8267,15 @@ async def admin_data_sources_page(
     ``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without
     it).
     """
-    from app.secrets_vault import vault_key_configured
+    # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
+    # guards on the former (app/api/admin_source_connections.py), and the
+    # latter is the narrower "is a real key set" question that answers False
+    # in LOCAL_DEV_MODE where the write in fact succeeds. Using the narrow one
+    # here rendered a blocking "Vault key not configured" banner and a
+    # disabled "+ Add source" on an instance whose API would have accepted the
+    # credential — the UI refusing what the server allows. `secrets_vault`'s
+    # own docstring flags the distinction.
+    from app.secrets_vault import can_store_secrets as vault_key_configured
 
     ctx = _build_context(request, user=user)
     ctx["vault_key_configured"] = vault_key_configured()
@@ -8335,6 +8688,12 @@ def _source_inventory(user: dict | None = None) -> dict:
 # the producer reports real per-item cost.
 _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
+# Every `claims_rejected` reason the verbatim gate itself produces (spec §8 +
+# §8.4) — both fold into the "rejected quotes" badge, never "protocol
+# errors" (unresolved doc id, malformed edge, …), even though they are
+# distinct reasons an operator can tell apart in the drawer.
+_VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
+
 
 def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
     """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
@@ -8416,13 +8775,15 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     / rejected quote) — those live in the CRAWLER's own per-document error
     log, which Agnes never receives. The badges below are the ones Agnes's
     own ingest run report actually carries: `rejected_quotes` (the verbatim
-    gate, spec §8, doing its job), `deferred` (a claim whose file was not
-    yet `indexed` — free retry once it is), `protocol_errors` (every OTHER
-    `claims_rejected` reason — unresolved doc id, malformed edge, alias type
-    conflict, …), and `source_urls_rejected` (O7 follow-up: a document's
-    `source_url` the ingest validator dropped — the claim itself still
-    wrote, only its citation link is missing; a producer that never sends
-    `source_url` is not in this list at all).
+    gate, spec §8, doing its job — both `verbatim_gate_failed` and the
+    meaningfulness floor's `quote_not_meaningful`, §8.4: two different
+    reasons the SAME gate refuses a quote), `deferred` (a claim whose file
+    was not yet `indexed` — free retry once it is), `protocol_errors` (every
+    OTHER `claims_rejected` reason — unresolved doc id, malformed edge,
+    alias type conflict, …), and `source_urls_rejected` (O7 follow-up: a
+    document's `source_url` the ingest validator dropped — the claim itself
+    still wrote, only its citation link is missing; a producer that never
+    sends `source_url` is not in this list at all).
 
     Every sub-block degrades independently on its own `try/except` — a
     repo call that raises (PG-only `RequiresPostgresBackend` on a
@@ -8495,8 +8856,8 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # a different signal than every `claims_rejected` reason and gets
         # its own badge rather than muddying "why was nothing written".
         source_urls_rejected = last_run.get("source_urls_rejected") or []
-        rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
-        protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
+        rejected_quotes = [r for r in claims_rejected if r.get("reason") in _VERBATIM_GATE_REASONS]
+        protocol_errors = [r for r in claims_rejected if r.get("reason") not in _VERBATIM_GATE_REASONS]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
         cell["cost_estimate"] = {
             "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
@@ -8646,7 +9007,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             if not isinstance(raw_scope, dict):
                 continue
             try:
-                scopes.append(_scope_out(raw_scope, declared_corpus_ids))
+                scopes.append(_scope_out(raw_scope, declared_corpus_ids, conn))
             except Exception as e:
                 logger.debug(
                     "sharepoint pipeline cell: scope row resolution failed for %s: %s",
@@ -9254,6 +9615,14 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     which is how /admin/tables' "Manage access" arrives.
     """
     ctx = _build_context(request, user=user)
+    # Inviting from a group's People search completes an address rather than
+    # asking for one. The instance's configured sign-in domains are the only
+    # ones an invited account could ever authenticate with, so they are the
+    # candidates worth offering; with none configured the field takes a full
+    # address, as before.
+    from app.instance_config import get_allowed_domains
+
+    ctx["invite_domains"] = get_allowed_domains() or []
     return templates.TemplateResponse(request, "admin_access.html", ctx)
 
 
@@ -9284,13 +9653,39 @@ async def admin_marketplaces_page(
 async def admin_linked_apps_page(
     request: Request,
     user: dict = Depends(require_admin),
+    source: str | None = None,
 ):
-    """Guided admin flow for linking externally-hosted (Keboola) data apps:
-    pick an MCP source → materialize its data-app lister → select the ingested
-    apps and grant them to a group. Wires existing admin APIs (mcp-sources,
-    mcp-tools, materialize, data-apps ?kind=linked, access/grants) — no new
-    control-plane surface beyond the page itself."""
+    """Publish apps from a tool server that is already connected.
+
+    The other half of the MCP builder's apps section, and a different errand:
+    there you are connecting a server and its apps are the obvious next move;
+    here the server was connected weeks ago and today's job starts from the
+    app list. Routing that through the connection form would ask an admin to
+    re-answer questions they answered once.
+
+    It is the same panel in both places (``linked_apps_panel.js``), so "what
+    does reading the list write" cannot have two answers. What the retired
+    wizard did wrong is not repeated: the source is CHOSEN from a list rather
+    than detected by elimination, and the empty state hands off to the builder
+    instead of saying "register one first, then come back".
+
+    ``?source=`` preselects a server — how the builder's "publish these
+    elsewhere" link and a return trip from connecting one land on the right
+    row instead of an empty picker.
+    """
+    if not _data_apps_nav_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "data_apps_disabled",
+                "message": (
+                    "Linked apps are switched off on this instance. Turn on data_apps.enabled "
+                    "in server config, then come back."
+                ),
+            },
+        )
     ctx = _build_context(request, user=user)
+    ctx["prefer_source_id"] = source
     return templates.TemplateResponse(request, "admin_linked_apps.html", ctx)
 
 

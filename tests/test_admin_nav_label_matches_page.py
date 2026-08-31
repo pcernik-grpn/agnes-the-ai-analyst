@@ -14,11 +14,13 @@ fragile step that lets a page slip through (a route registered outside
 
 Scope — sidebar ITEM rows only:
 
-  * DESTINATION sections (People, Data, Access) are one page with a tab strip,
-    so the heading is correctly the SECTION name and the tabs are lenses
-    within it. Comparing a tab label to the page heading would demand
-    "Tokens" as the title of the People page. See `admin_nav.py`'s two-tier
-    docstring.
+  * DESTINATION sections (People, Data, Access) are one page of their own, so
+    the heading is correctly the SECTION name. Where such a page carries a tab
+    strip the tabs are lenses within it, and comparing a tab label to the page
+    heading would demand "Tokens" as the title of the People page. A
+    destination need not have tabs at all — Access carries its lenses in its
+    own `?by=` switch — so what puts a section in scope here is carrying
+    `items`, not lacking `tabs`. See `admin_nav.py`'s two-tier docstring.
   * Rows behind a `when` flag are included — the flags are all turned on here,
     which is the only state where those pages render at all.
 
@@ -41,16 +43,20 @@ _FLAGS = (
     "AGNES_KNOWLEDGE_DIGESTS_ENABLED",
     "AGNES_CONTRIBUTE_SKILL_ENABLED",
     "AGNES_STORE_MODERATION_ENABLED",
+    "AGNES_DATA_APPS_ENABLED",
 )
 
-# Item rows from the legacy GROUP sections only — see the module docstring for
-# why the tabbed destinations are out of scope.
-_ROWS = [
-    (entry["label"], entry["href"])
-    for section in ADMIN_NAV_SECTIONS
-    if not section.get("tabs")
-    for entry in section["items"]
-]
+# Item rows from the GROUP sections only — see the module docstring for why the
+# destinations are out of scope.
+#
+# A GROUP section is one that CARRIES rows (`items`); a DESTINATION is a page of
+# its own (`href`), with or without a tab strip. Selecting on `tabs` read "no
+# tabs ⇒ group", which a TABLESS destination falsifies — it has neither tabs nor
+# items, so the old `section["items"]` raised KeyError at collection and took the
+# whole module with it. Access became exactly that when its two tabs turned into
+# one page's own `?by=` switch. `items` is the property actually being read here,
+# so select on it directly rather than on a proxy for it.
+_ROWS = [(entry["label"], entry["href"]) for section in ADMIN_NAV_SECTIONS for entry in section.get("items", ())]
 
 
 def _auth(token: str) -> dict:

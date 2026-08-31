@@ -261,6 +261,115 @@ function showToast(text, kind = "ok", { durationMs = 2400 } = {}) {
   setTimeout(dismiss, durationMs);
 }
 
+/** Instant, styled tooltips for icon-only controls (`data-tip="..."`).
+ *
+ *  Replaces the native `title` attribute on the session-files drawer's
+ *  actions. `title` has a ~1s browser delay, cannot be styled, and cannot be
+ *  shown on keyboard focus — so the one sentence explaining what an icon
+ *  does was, in practice, unreachable. That mattered most AFTER saving a
+ *  file, where "open in Library" lived only in a `title` nobody saw.
+ *
+ *  The tooltip node is a single element on `document.body`, positioned
+ *  `fixed`. It has to be: `.cloud-chat-files-list` is `overflow-y: auto`, so
+ *  a tooltip rendered inside a row would be clipped by its own scroll
+ *  container. Listeners are delegated from `document` because the file list
+ *  is re-rendered on every refresh — per-node binding would leak and would
+ *  miss rows added later.
+ *
+ *  Accessibility: the trigger keeps its own `aria-label` as its accessible
+ *  name; while visible the tooltip is also wired up via `aria-describedby`,
+ *  and it appears on `:focus-visible`, so a keyboard user gets what a mouse
+ *  user gets. */
+/** Where a tooltip bubble goes, as pure geometry — no DOM, so the flip and
+ *  clamp rules are testable without jsdom.
+ *
+ *  `rect` is the trigger's viewport rect, `tip` the bubble's measured size,
+ *  `view` the viewport. Returns `{top, left, below}`. Above is preferred; it
+ *  flips below only when the bubble would not clear the top margin, and the
+ *  horizontal centre is clamped so a control near either edge still shows a
+ *  fully on-screen bubble. */
+function _tipPosition(rect, tip, view, { offset = 8, margin = 8 } = {}) {
+  const below = rect.top - tip.height - offset < margin;
+  const top = below ? rect.bottom + offset : rect.top - tip.height - offset;
+  const centred = rect.left + rect.width / 2 - tip.width / 2;
+  const left = Math.max(margin, Math.min(centred, view.width - tip.width - margin));
+  return { top: Math.round(top), left: Math.round(left), below };
+}
+
+const Tip = (() => {
+  let node = null;
+  let trigger = null;
+
+  function ensure() {
+    if (node) return node;
+    node = document.createElement("div");
+    node.className = "ds-tip";
+    node.id = "ds-tip";
+    node.setAttribute("role", "tooltip");
+    node.hidden = true;
+    document.body.appendChild(node);
+    return node;
+  }
+
+  function place(el) {
+    const { top, left, below } = _tipPosition(
+      el.getBoundingClientRect(),
+      node.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight }
+    );
+    node.style.top = `${top}px`;
+    node.style.left = `${left}px`;
+    node.classList.toggle("is-below", below);
+  }
+
+  function show(el) {
+    const text = el.getAttribute("data-tip");
+    if (!text) return;
+    ensure();
+    trigger = el;
+    node.textContent = text;
+    node.hidden = false;
+    el.setAttribute("aria-describedby", "ds-tip");
+    place(el);
+  }
+
+  function hide() {
+    if (!node || node.hidden) return;
+    node.hidden = true;
+    if (trigger) trigger.removeAttribute("aria-describedby");
+    trigger = null;
+  }
+
+  function bind() {
+    document.addEventListener("mouseover", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (!el || el === trigger) return;
+      show(el);
+    });
+    document.addEventListener("mouseout", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el && el === trigger) hide();
+    });
+    document.addEventListener("focusin", (e) => {
+      const el = e.target.closest && e.target.closest("[data-tip]");
+      if (el) show(el);
+    });
+    document.addEventListener("focusout", hide);
+    // A tooltip anchored to a rect that has since moved is worse than none,
+    // so any scroll or resize retires it rather than trying to re-follow.
+    document.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    document.addEventListener("click", hide, true);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") hide();
+    });
+  }
+
+  return { bind, hide };
+})();
+
+Tip.bind();
+
 /** Set the title strip above the messages area. Pass ``null`` to
  *  hide it (empty-state / new-chat shell), pass a string to show it.
  *  Long titles ellipsis via CSS. */
@@ -518,6 +627,34 @@ function extractNextActions(markdown) {
     out = out.slice(0, open.index) + out.slice(close + _NEXT_ACTIONS_CLOSE.length);
   }
   return { text: out.trimEnd(), actions: actions.slice(0, _NEXT_ACTIONS_MAX) };
+}
+
+/** True while the stream sits inside a trailer fence whose closing ``` has
+ *  not arrived yet.
+ *
+ *  This is the window TCRD-213 is actually about. The `next_actions` chips are
+ *  NOT a second LLM call made after streaming — they are a fenced trailer at
+ *  the end of the SAME streamed answer, and `_streamingSafeText` deliberately
+ *  withholds a half-open fence so raw ``` markup never flashes on screen. The
+ *  consequence is that once the prose ends, tokens keep arriving for as long
+ *  as the model spends on `sources` + `next_actions`, while the painted text
+ *  cannot change. The turn is working; the screen cannot show it. A blinking
+ *  caret under finished-looking prose is indistinguishable from a hang, which
+ *  is exactly the "vypadá to, jako by se aplikace zasekla" report.
+ *
+ *  Scans to the LAST opener of either trailer and asks whether a close
+ *  follows it, so a closed `sources` fence ahead of an still-open
+ *  `next_actions` one is judged on the open one. */
+function _inWithheldTrailer(text) {
+  const s = text || "";
+  let last = -1;
+  for (const re of [_SOURCES_OPEN_RE, _NEXT_ACTIONS_OPEN_RE]) {
+    const g = new RegExp(re.source, "gi");
+    let m;
+    while ((m = g.exec(s)) !== null) last = Math.max(last, m.index + m[0].length);
+  }
+  if (last === -1) return false;
+  return s.indexOf("```", last) === -1;
 }
 
 function stripNextActionsFence(markdown) {
@@ -1790,6 +1927,45 @@ async function openSession(chatId, wsUrlOverride) {
   };
 }
 
+// Plain-language copy for a failed turn. Chat pasted `frame.kind` +
+// `frame.message` straight into the stream, so the product's core action
+// failed with "Something went wrong: engine_error — engine turn failed:
+// 503: kai_integration_not_configured" — no cause a non-technical reader can
+// act on, no next step, and a second truncated copy in a toast.
+//
+// The same error families already have written copy in
+// components/builder_preview.js (`errorCopy`), which the preview surface has
+// been using all along. This is that mapping, worded for chat: same families,
+// same order, so the two surfaces cannot describe one failure differently.
+function chatErrorCopy(raw, kind) {
+  const msg = String(raw == null ? "" : raw).trim();
+  const k = String(kind == null ? "" : kind).trim();
+  const both = `${k} ${msg}`;
+  if (/not_configured|no_provider|provider_unavailable|integration/i.test(both)) {
+    return "Agnes needs a chat engine to answer, and none is configured on this " +
+      "instance yet. An admin sets that up — your message was not lost.";
+  }
+  if (/concurrency_cap/i.test(both)) {
+    return "Too many conversations are running right now. Try again in a moment.";
+  }
+  if (/budget|429/i.test(both)) {
+    return "This instance has used its message budget for the month. An admin can raise it.";
+  }
+  if (/runner_not_ready|did not become ready/i.test(both)) {
+    return "The chat engine did not start in time. The first conversation after a restart " +
+      "is the slow one, so trying again usually works — if it keeps failing, ask an admin " +
+      "to check the chat engine.";
+  }
+  if (/timeout|timed out/i.test(both)) {
+    return "That took too long and was stopped. Try a narrower question, or ask again.";
+  }
+  // Unrecognised: say plainly that it failed and keep the detail visible
+  // rather than inventing a cause we do not know.
+  return msg
+    ? `Agnes could not finish that answer. The engine reported: ${msg}`
+    : "Agnes could not finish that answer. Try again, or ask an admin to check the chat engine.";
+}
+
 function handleFrame(frame) {
   // Track last-seen seq per session (wave-2F task 2/3 — see
   // lastSeenSeqByChat above). Additive/back-compat: a frame with no `seq`
@@ -1944,10 +2120,10 @@ function handleFrame(frame) {
       break;
     case "error":
       _flushStreamingTail();
-      renderSystemNote(
-        `Something went wrong: ${frame.kind || "error"}${frame.message ? ` — ${frame.message}` : ""}`,
-        "error",
-      );
+      renderSystemNote(chatErrorCopy(frame.message, frame.kind), "error");
+      // The status line keeps the raw pair: it is the one place a developer
+      // or an admin reading over a shoulder can still see `frame.kind`, and
+      // it is not the sentence the user is being asked to act on.
       setStatus(`Error: ${frame.kind} (${frame.message || ""})`, "error");
       $("cancel-btn").hidden = true;
       clearThinkingPlaceholder();
@@ -2705,6 +2881,9 @@ function _renderStreamingMarkdown() {
   _streamLastRender = performance.now();
   if (!currentAssistantBody) return; // finalized (or never started) — nothing to paint
   const visible = _streamingSafeText(currentAssistantText);
+  if (currentAssistantArticle) {
+    currentAssistantArticle.classList.toggle("is-trailing", _inWithheldTrailer(currentAssistantText));
+  }
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
   } catch (_e) {
@@ -2764,7 +2943,7 @@ function _resetStreamingState() {
   _turnSealedText = "";
   _turnSealedArticles = [];
   if (!article || !body) return;
-  article.classList.remove("is-streaming");
+  article.classList.remove("is-streaming", "is-trailing");
   if (!text.trim()) return; // an empty bubble has nothing to finish
   enhanceCodeBlocks(body);
   enhanceTables(body);
@@ -2792,7 +2971,7 @@ function _sealStreamingSegment() {
     currentAssistantArticle.remove();
   } else {
     _flushStreamingTail();
-    currentAssistantArticle.classList.remove("is-streaming");
+    currentAssistantArticle.classList.remove("is-streaming", "is-trailing");
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
     renderMermaidBlocks(currentAssistantBody);
@@ -2875,7 +3054,7 @@ function finalizeAssistantMessage(frame) {
   _turnSealedText = "";
   _turnSealedArticles = [];
   if (currentAssistantArticle && currentAssistantBody) {
-    currentAssistantArticle.classList.remove("is-streaming");
+    currentAssistantArticle.classList.remove("is-streaming", "is-trailing");
     currentAssistantBody.innerHTML = renderAnswerMarkdown(tail);
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
@@ -5854,7 +6033,7 @@ function renderCoPresence(host, participants) {
     const name = document.createElement("span");
     name.className = "cloud-chat-files-name";
     name.textContent = f.name;
-    name.title = f.path;
+    name.setAttribute("data-tip", f.name);
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
     // Engine listings carry no mtime (modified_at is null) — skip the segment
@@ -5884,7 +6063,7 @@ function renderCoPresence(host, participants) {
     const dl = document.createElement("a");
     dl.className = "cloud-chat-files-btn";
     dl.innerHTML = ICON_DOWNLOAD;
-    dl.title = "Download";
+    dl.setAttribute("data-tip", "Download a copy");
     dl.setAttribute("aria-label", "Download " + f.name);
     dl.href =
       "/api/chat/sessions/" + encodeURIComponent(chatId) +
@@ -5895,7 +6074,7 @@ function renderCoPresence(host, participants) {
     save.type = "button";
     save.className = "cloud-chat-files-btn";
     save.innerHTML = ICON_SAVE;
-    save.title = "Save to Library — it outlives this session";
+    save.setAttribute("data-tip", "Save to Library — it outlives this session");
     save.setAttribute("aria-label", "Save " + f.name + " to Library");
     save.addEventListener("click", async () => {
       save.disabled = true;
@@ -5915,12 +6094,21 @@ function renderCoPresence(host, participants) {
           const link = document.createElement("a");
           link.className = "cloud-chat-files-btn";
           link.innerHTML = ICON_IN_LIBRARY;
-          link.title = "Saved — open in Library";
+          link.setAttribute("data-tip", "Open in your Library");
           link.setAttribute("aria-label", "Saved to Library — open");
           link.href = data.library_url || "/library";
           link.target = "_blank";
           link.rel = "noopener";
           save.replaceWith(link);
+          // Record the outcome IN THE ROW, not only in a toast that expires
+          // and an icon that explains itself only on hover. This is the
+          // "co se stalo a kam" half of TCRD-212: a reader returning to the
+          // drawer a minute later can still see which files they kept.
+          const saved = document.createElement("span");
+          saved.className = "cloud-chat-files-saved";
+          saved.textContent = "Saved to Library";
+          meta.appendChild(saved);
+          li.classList.add("is-saved");
           showToast("Saved to your Library", "ok");
         } else {
           let msg = "Could not save to Library.";

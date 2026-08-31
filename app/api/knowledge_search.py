@@ -16,7 +16,7 @@ empty state tables there (the backend-split bug class).
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -103,8 +103,12 @@ def _empty_combined_hint(collections: int, tables: int, metrics: int) -> str:
     # ones a caller can check against `collections_list` / `catalog`.
     scope = f"{collections} collection(s) and {tables} table(s), plus knowledge notes and the glossary,"
     return (
-        f"Searched {scope} and found no match. You DO have access — this is a wording miss, "
-        "not an access problem. Note: matching is whole word (`test` will not find `Testovaci`) "
+        f"Searched {scope} and found no match. Everything shared with this account "
+        "was searched, so an empty result is NOT evidence that access is missing — "
+        "far more often it is the wording. (This cannot speak for anything that "
+        "has not been shared with you: a term naming that will not match here "
+        "either.) "
+        "Note: matching is whole word (`test` will not find `Testovaci`) "
         "and there is no wildcard (`*` and an empty query return nothing). File names are "
         "searched too, as a fallback when no document body matches — so nothing here matched "
         "either. Try a distinctive word you expect inside the document, or call "
@@ -257,6 +261,54 @@ def _caller_can_read_digest(user, digest_id: str) -> bool:
     if not user_id:
         return False
     return can_access(user_id, ResourceType.KNOWLEDGE_DIGEST.value, digest_id)
+
+
+@router.get("/digests")
+async def list_knowledge_digests_for_caller(user=Depends(get_current_user)) -> Dict[str, Any]:
+    """The maintained digests THIS caller can read (K4, #799).
+
+    The one missing piece of the analyst-facing digest surface. A digest's
+    markdown has been readable at ``/digests/{id}/content`` since K4, and
+    ``agnes pull`` already writes every granted one to
+    ``.claude/rules/ka_<slug>.md`` — but nothing could ENUMERATE them, so a
+    web surface had no way to show a reader which digests exist without
+    already knowing an id. The Library's distillate (TCRD-250) needs exactly
+    that list.
+
+    Filtered with ``_caller_can_read_digest`` — the same fail-closed
+    predicate the manifest builder uses (``app.api.sync._digest_entries``),
+    so the web list and the pulled files can never disagree about what a
+    caller is entitled to. A digest that has never generated (``pending``,
+    empty ``output_md``) is omitted, matching the manifest: there is nothing
+    to read, and listing it would promise a page that 404s.
+
+    Staleness travels per row rather than being hidden, same contract as the
+    content endpoint — a stale digest still ships its last-good markdown, so
+    a reader must be able to see that it is stale.
+
+    Response: ``{"digests": [{"id", "slug", "title", "status",
+    "status_reason", "generated_at"}]}``, sorted by slug.
+    """
+    from src.repositories import knowledge_digests_repo
+
+    out = []
+    for d in knowledge_digests_repo().list():
+        if not (d.get("output_md") or "").strip():
+            continue
+        if not _caller_can_read_digest(user, d["id"]):
+            continue
+        generated_at = d.get("generated_at")
+        out.append(
+            {
+                "id": d["id"],
+                "slug": d["slug"],
+                "title": d["title"],
+                "status": d.get("status") or "pending",
+                "status_reason": d.get("status_reason"),
+                "generated_at": generated_at.isoformat() if generated_at else None,
+            }
+        )
+    return {"digests": sorted(out, key=lambda e: e["slug"])}
 
 
 @router.get("/digests/{digest_id}/content")

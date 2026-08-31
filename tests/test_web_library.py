@@ -916,3 +916,118 @@ def test_the_type_map_helper_fails_soft_on_every_axis():
     from app.web.router import _library_type_map
 
     assert _library_type_map({"id": "nobody", "email": "nobody@test.com"}) == []
+
+
+# ---------------------------------------------------------------------------
+# Why the caller has a granted row
+# ---------------------------------------------------------------------------
+
+
+def _grant_package_to_named_group(conn, *, slug, name, user_id, group_name, requirement="required"):
+    """Seed a package granted through a NAMED group the user belongs to.
+
+    ``_grant_package`` above grants through ``Everyone``, which is the one
+    group whose name makes the reason clause uninformative — everybody is in
+    it. These tests need the interesting case.
+    """
+    import uuid
+
+    from src.repositories.data_packages import DataPackagesRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    pkg_id = DataPackagesRepository(conn).create(
+        name=name, slug=slug, description="d", icon=None, color=None, created_by="test"
+    )
+    gid = UserGroupsRepository(conn).ensure(group_name, description="")["id"]
+    UserGroupMembersRepository(conn).add_member(user_id, gid, source="test")
+    conn.execute(
+        "INSERT INTO resource_grants(id, group_id, resource_type, resource_id, "
+        "requirement, assigned_at, assigned_by) VALUES (?, ?, 'data_package', ?, ?, CURRENT_TIMESTAMP, 'test')",
+        [str(uuid.uuid4()), gid, pkg_id, requirement],
+    )
+    return pkg_id
+
+
+def test_granted_row_names_the_group_that_brought_it(seeded_app):
+    """*Why do I have this?* — the one question about a granted row that the
+    product could not answer anywhere.
+
+    The row already said WHAT it is and that an admin put it there. Through
+    WHICH group was nowhere: not on the row, not on the detail page, not in
+    /me/profile. It is also the only part of the answer a member can act on,
+    because the group is what they ask their admin to change.
+
+    The clause is APPENDED to the existing sentence rather than replacing it —
+    the two answer different questions ("can I remove this" and "why do I have
+    it"), and the existing one is asserted verbatim elsewhere.
+    """
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _grant_package_to_named_group(
+        conn, slug="fin-pkg", name="Finance Core", user_id="analyst1", group_name="Finance team"
+    )
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    row = _row_for(body, "Finance Core")
+    assert LOCKED_TOOLTIP in row
+    assert "You have it because you are in Finance team." in row
+
+
+def test_two_granting_groups_are_both_named(seeded_app):
+    """Reaching a package through two groups is not an edge case — it is what
+    happens the moment an admin grants to a team AND to Everyone. Naming only
+    one would answer the question wrongly rather than partially: the member
+    would ask to be removed from a group that is not the reason.
+    """
+    import uuid
+
+    from src.db import get_system_db
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    pkg_id = _grant_package_to_named_group(
+        conn, slug="dual-pkg", name="Dual Granted", user_id="analyst1", group_name="Analysts"
+    )
+    gid = UserGroupsRepository(conn).ensure("Ops", description="")["id"]
+    UserGroupMembersRepository(conn).add_member("analyst1", gid, source="test")
+    conn.execute(
+        "INSERT INTO resource_grants(id, group_id, resource_type, resource_id, "
+        "requirement, assigned_at, assigned_by) VALUES (?, ?, 'data_package', ?, 'required', CURRENT_TIMESTAMP, 't')",
+        [str(uuid.uuid4()), gid, pkg_id],
+    )
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    row = _row_for(body, "Dual Granted")
+    assert "You have it because you are in Analysts and Ops." in row
+
+
+def test_reason_clause_never_takes_the_row_down(seeded_app, monkeypatch):
+    """The clause is an addition to a tooltip that reads correctly without it,
+    so a failure to resolve the reason must degrade to the old sentence — not
+    to a 500 on the member's main page. Guarded because the lookup reaches two
+    repositories that the rest of the row does not need.
+    """
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _grant_package_to_named_group(
+        conn, slug="boom-pkg", name="Still Renders", user_id="analyst1", group_name="Finance team"
+    )
+    conn.close()
+
+    from app.services.stack_resolver import StackResolver
+
+    def _explode(self, user_id, resource_type):
+        raise RuntimeError("groups repo down")
+
+    monkeypatch.setattr(StackResolver, "granting_groups", _explode)
+    resp = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"]))
+    assert resp.status_code == 200
+    row = _row_for(resp.text, "Still Renders")
+    assert LOCKED_TOOLTIP in row
+    assert "You have it because" not in row

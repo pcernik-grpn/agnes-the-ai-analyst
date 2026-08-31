@@ -1,7 +1,7 @@
 """Microsoft Graph app-only client for the SharePoint connect wizard's
 folder-tree browser (spec 2026-08-27 §13.2).
 
-Not a producer — the actual crawl lives outside Agnes (the cuesta-star-graph
+Not a producer — the actual crawl lives outside Agnes (the producer
 pipeline, §7.1). This module exists only so the wizard's step-2 tree endpoint
 (``GET /api/admin/sharepoint/connections/{id}/tree``) can show an admin real
 sites/drives/folders to pick a scope from, using the same certificate the
@@ -59,7 +59,19 @@ class SharePointGraphError(RuntimeError):
     """A Graph/Entra call failed, or the certificate material could not be
     parsed into a signable assertion. Never carries the certificate, the
     signed assertion, or an access token in its message — only status codes
-    and upstream error bodies, which Entra/Graph document as safe to log."""
+    and upstream error bodies, which Entra/Graph document as safe to log.
+
+    ``status_code`` is the upstream HTTP status when known (``None`` for a
+    parse-time failure, e.g. malformed certificate material, that never made
+    a Graph/Entra call). :func:`search_folders` reads it to classify a
+    failure: a 403/404 on one site or folder is a routine permissions fact
+    to skip past, everything else (network failure, 401, 429, 5xx) means the
+    whole walk is broken and must propagate.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _http_client() -> httpx.AsyncClient:
@@ -130,6 +142,44 @@ def build_client_assertion(tenant_id: str, client_id: str, private_key_pem: str)
         "exp": now + 300,  # Entra ignores anything over ~10 minutes; 5 is comfortable for one call.
     }
     return pyjwt.encode(claims, private_key, algorithm="RS256", headers={"x5t": thumbprint})
+
+
+def validate_certificate_material(pem_text: str) -> Optional[str]:
+    """Why ``pem_text`` cannot serve as SharePoint certificate material, or
+    ``None`` when it can — a parseable ``CERTIFICATE`` block plus a parseable
+    ``PRIVATE KEY`` block, :func:`build_client_assertion`'s exact needs,
+    checked without signing anything.
+
+    The fail-fast seam for the admin PUT that stores the material: garbage
+    used to store fine and surface hours later as an opaque provider auth
+    error on the first Graph call. Never raises, and the reason string never
+    carries key material — the private-key parse failure is deliberately
+    reported without the parser's own message.
+    """
+    blocks = _split_pem_blocks(pem_text or "")
+    cert_pem = blocks.get("CERTIFICATE")
+    key_pem = blocks.get("PRIVATE KEY")
+    if not cert_pem and not key_pem:
+        return "no PEM blocks found — paste the certificate followed by its private key, concatenated in one PEM"
+    if not cert_pem:
+        return (
+            "missing a CERTIFICATE block — the certificate (for the JWT assertion's x5t "
+            "thumbprint) and the private key belong together, concatenated in one PEM"
+        )
+    if not key_pem:
+        return (
+            "missing a PRIVATE KEY block — the private key (to sign the JWT assertion) "
+            "and the certificate belong together, concatenated in one PEM"
+        )
+    try:
+        x509.load_pem_x509_certificate(cert_pem.encode())
+    except Exception as exc:  # noqa: BLE001 — malformed PEM; message names no secret material
+        return f"CERTIFICATE block could not be parsed: {exc}"
+    try:
+        load_pem_private_key(key_pem.encode(), password=None)
+    except Exception:  # noqa: BLE001 — never echo parser detail about key material
+        return "PRIVATE KEY block could not be parsed — an unencrypted PKCS#8 or PKCS#1 key is expected"
+    return None
 
 
 #: A certificate within this many days of ``not_after`` is flagged
@@ -221,7 +271,7 @@ async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str) ->
             resp.status_code,
             resp.text[:500],
         )
-        raise SharePointGraphError(f"token request failed: HTTP {resp.status_code}")
+        raise SharePointGraphError(f"token request failed: HTTP {resp.status_code}", status_code=resp.status_code)
     body = resp.json()
     token = body.get("access_token")
     if not token:
@@ -238,7 +288,9 @@ async def _graph_get(access_token: str, path: str, *, params: Optional[Dict[str,
         )
     if resp.status_code != 200:
         logger.warning("sharepoint graph call %s failed: HTTP %s %s", path, resp.status_code, resp.text[:500])
-        raise SharePointGraphError(f"Graph request to {path} failed: HTTP {resp.status_code}")
+        raise SharePointGraphError(
+            f"Graph request to {path} failed: HTTP {resp.status_code}", status_code=resp.status_code
+        )
     result: Dict[str, Any] = resp.json()
     return result
 
@@ -376,6 +428,21 @@ def build_folder_matcher(query: str, mode: str) -> Callable[[str], bool]:
     raise ValueError(f"unknown search mode: {mode!r}")
 
 
+#: A 403 (Forbidden) or 404 (Not Found) on one site/folder is a routine
+#: permissions fact — app-only Graph access across a real tenant is never
+#: uniform (`Sites.Selected` grants, departmental sites, restricted
+#: libraries) — so :func:`search_folders` skips past it and keeps walking.
+#: Anything else (network failure, 401 unauthorized, 429 rate-limited, a
+#: 5xx) means the call itself is broken, not merely refused, and must
+#: propagate — swallowing it per-site would turn a broken connection into an
+#: empty, successful-looking search across the whole tenant.
+_PERMISSION_SKIP_STATUS_CODES = frozenset({403, 404})
+
+
+def _skip_reason(status_code: int) -> str:
+    return "forbidden" if status_code == 403 else "not_found"
+
+
 async def search_folders(
     access_token: str,
     *,
@@ -400,15 +467,39 @@ async def search_folders(
     enumerating "every reachable site", plus every folder expansion) — the
     one budget that bounds a walk regardless of how it is rooted.
 
+    **Permissions are not errors.** A site (during "search everywhere" root
+    selection) or a folder (mid-walk) that answers 403/404 is skipped, not
+    fatal — see :data:`_PERMISSION_SKIP_STATUS_CODES`. Skipping a folder
+    never discards matches already found: a folder itself is recorded as a
+    match (if it satisfies ``matcher``) when Graph lists it as a CHILD of
+    its parent, before the walk ever tries to descend into it, so a 403 on
+    its own children listing only stops descent, not the match already on
+    the list. Anything else Graph/`httpx` can raise (network failure, 401,
+    429, 5xx) means the whole walk is broken and propagates uncaught — see
+    :class:`SharePointGraphError`.
+
     Returns ``{"matches": [{"item_id", "drive_id", "display_path"}, ...],
-    "visited": int, "truncated": bool}``. ``truncated`` is ``True`` whenever
-    ``max_depth`` or ``max_visited`` is what stopped the walk short of
-    covering everything reachable from the root(s) — never a silent partial
-    result.
+    "visited": int, "truncated": bool, "skipped": [...]}``.
+
+    - ``truncated`` is ``True`` whenever ``max_depth`` or ``max_visited`` is
+      what stopped the walk short of covering everything reachable from the
+      root(s) — never a silent partial result. Deliberately distinct from
+      permission gaps below: a cap and a permission refusal are different
+      facts to a caller, and conflating them into one flag would make
+      "scope the search narrower" (the cap's fix) look like the right
+      response to "ask for access to this site" (the permission fix).
+    - ``skipped`` lists every site/folder the walk could not enter for
+      permissions reasons, each as ``{"scope": "site"|"folder", "reason":
+      "forbidden"|"not_found", "status_code": int, "site_id", "site_name",
+      "drive_id", "item_id", "display_path"}`` (the fields not known at that
+      scope are ``None``) — so a caller can tell "searched everything" from
+      "searched what it could reach" and name what it skipped, honoring the
+      no-silent-partial-result contract the same way ``truncated`` does.
     """
     roots: List[Tuple[str, Optional[str], List[str]]] = []
     visited = 0
     truncated = False
+    skipped: List[Dict[str, Any]] = []
 
     if drive_id:
         roots.append((drive_id, item_id, []))
@@ -419,7 +510,24 @@ async def search_folders(
             if visited > max_visited:
                 truncated = True
                 break
-            drives = await list_drives(access_token, site["id"])
+            try:
+                drives = await list_drives(access_token, site["id"])
+            except SharePointGraphError as exc:
+                if exc.status_code not in _PERMISSION_SKIP_STATUS_CODES:
+                    raise
+                skipped.append(
+                    {
+                        "scope": "site",
+                        "reason": _skip_reason(exc.status_code),
+                        "status_code": exc.status_code,
+                        "site_id": site["id"],
+                        "site_name": site.get("name"),
+                        "drive_id": None,
+                        "item_id": None,
+                        "display_path": None,
+                    }
+                )
+                continue
             for drv in drives:
                 roots.append((drv["id"], None, [site["name"], drv["name"]]))
 
@@ -432,7 +540,25 @@ async def search_folders(
             truncated = True
             break
         cur_drive, cur_item, depth, prefix = queue.popleft()
-        children = await _list_children(access_token, cur_drive, cur_item)
+        try:
+            children = await _list_children(access_token, cur_drive, cur_item)
+        except SharePointGraphError as exc:
+            visited += 1
+            if exc.status_code not in _PERMISSION_SKIP_STATUS_CODES:
+                raise
+            skipped.append(
+                {
+                    "scope": "folder",
+                    "reason": _skip_reason(exc.status_code),
+                    "status_code": exc.status_code,
+                    "site_id": None,
+                    "site_name": None,
+                    "drive_id": cur_drive,
+                    "item_id": cur_item,
+                    "display_path": " / ".join(prefix) if prefix else None,
+                }
+            )
+            continue
         visited += 1
         for child in children:
             name = child["name"]
@@ -448,7 +574,7 @@ async def search_folders(
     if queue:
         truncated = True
 
-    return {"matches": matches, "visited": visited, "truncated": truncated}
+    return {"matches": matches, "visited": visited, "truncated": truncated, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +677,52 @@ async def probe_unique_permissions(access_token: str, drive_id: str, item_ids: L
                     value = raw
             result[item_id] = value
     return result
+
+
+# ---------------------------------------------------------------------------
+# ACL mirroring readers (design spec 2026-08-28 §6 link 1): unlike the probe
+# above, these two ARE read for enforcement — the ACL sync job (2026-08-30
+# plan, Task 4) classifies their output into Agnes groups/grants. Both page
+# via ``@odata.nextLink``, the standard Graph collection convention.
+# ---------------------------------------------------------------------------
+
+
+async def _graph_get_all_pages(
+    access_token: str, path: str, *, params: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """Collect ``value`` across ``@odata.nextLink`` pages (permissions and
+    transitiveMembers both page; a single-page read costs nothing extra)."""
+    items: List[Dict[str, Any]] = []
+    body = await _graph_get(access_token, path, params=params)
+    while True:
+        items.extend(body.get("value") or [])
+        next_link = body.get("@odata.nextLink")
+        if not next_link:
+            return items
+        # nextLink is absolute and already carries the query string; _graph_get
+        # prepends GRAPH_BASE itself, so strip that same prefix back off.
+        body = await _graph_get(access_token, next_link.split("/v1.0", 1)[-1])
+
+
+async def list_item_permissions(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+    """Raw Graph ``permission`` objects on one drive item (the scope root) —
+    the sync's per-run read of who currently has access. App-only requires
+    ``Sites.FullControl.All`` or a per-site ``Sites.Selected`` full-control
+    role; a Graph failure surfaces as :class:`SharePointGraphError`, never
+    swallowed (the caller marks the run/scope failed and audits it)."""
+    return await _graph_get_all_pages(access_token, f"/drives/{drive_id}/items/{item_id}/permissions")
+
+
+async def list_group_transitive_members(access_token: str, group_id: str) -> List[Dict[str, Any]]:
+    """Transitive USER members of an Entra group — nested groups are
+    flattened by Graph itself; non-user directory objects (nested groups,
+    service principals, ...) are dropped here so callers never have to
+    re-check ``@odata.type``. Requires ``GroupMember.Read.All`` (NOT
+    included in ``Sites.FullControl.All`` — a separate app-registration
+    permission grant)."""
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/groups/{group_id}/transitiveMembers",
+        params={"$select": "id,mail,userPrincipalName", "$top": "999"},
+    )
+    return [r for r in rows if r.get("@odata.type") == "#microsoft.graph.user"]

@@ -359,6 +359,26 @@ auth:
 #   # How many days to keep `audit_log` rows before the daily audit-prune
 #   # scheduler job deletes them. Set to 0 to keep rows forever. Default 365.
 #   retention_days: 365
+#
+#   # Per-action sampling (optional, Wave 2 — Task 4). Off by default: an
+#   # action not listed here is NEVER sampled, full stop. Each entry is
+#   # `<action>: <ratio 0.0-1.0>`; a row for that action is written on
+#   # exactly 1 of every round(1 / ratio) calls, using a deterministic
+#   # per-action counter (NOT a random draw), so "1 in 10" is exactly true
+#   # even on a low-traffic instance. `1.0` (or simply omitting the action)
+#   # means always write; `0` means never write — the supported way to
+#   # silence a noisy, low-stakes action without touching its call site.
+#   # Measure actual volume first with `scripts/audit_volume_estimate.py`
+#   # before reaching for this knob.
+#   #
+#   # SECURITY: never list an action here that matters for security or
+#   # compliance — auth (login/token/password), RBAC/grant changes, secret
+#   # rotation, admin configuration, or anything an incident review might
+#   # need every row of. Sampling exists only for high-volume, low-stakes
+#   # reads (a routine chat tool call, a catalog list) — never for the
+#   # actions that record who changed what.
+#   sampling:
+#     chat.tool_call: 0.1   # keep 1 in 10 chat tool-call rows
 
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY
@@ -1212,6 +1232,16 @@ facts:
 # extraction-worker deployment) — this is operator/deploy-time config, not
 # a runtime toggle. The rest of this block (`producer`, `schedule`,
 # `timeout_s`) is plain instance data, read directly via get_value.
+#
+# Flipping `enabled` here is NOT, by itself, enough to run the
+# extraction-worker compose service. That service sets AGNES_ROLE=worker
+# (a role split), which makes the deployment multi-process — see
+# `deployment.role` and `coordination.backend` above, and
+# docs/DEPLOYMENT.md#multi-process. Before starting it you ALSO need:
+# Postgres app-state (`database.backend`), explicit
+# `JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis`.
+# Without those, `app/startup_guards.py::validate_deployment` refuses to
+# boot the worker container.
 extraction:
   enabled: false
   producer:
@@ -1276,9 +1306,19 @@ extraction:
   # Producer callback credential (TCRD-226): the producer calls BACK into
   # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
   # its actual work, so the child env ALSO carries AGNES_API_URL (this
-  # instance's own base URL — always set, no secret) and, when
+  # instance's own base URL — resolved from SERVER_URL, falling back to
+  # AGNES_INTERNAL_URL, then to this process's own loopback) and, when
   # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
-  # shared-secret bearer token). This is a DELIBERATE OVER-GRANT, not an
+  # shared-secret bearer token). On a role-split `extraction-worker`
+  # container (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
+  # `extraction-worker` service in docker-compose.yml) that loopback
+  # fallback would be the WORKER's own address, not the instance's real
+  # callback surface — so on that topology the job refuses cleanly instead
+  # ("neither SERVER_URL nor AGNES_INTERNAL_URL configured") unless one of
+  # the two is set explicitly. A single-container ("all-in-one") deployment
+  # is unaffected: there, the producer's parent process IS the app, so the
+  # loopback fallback is correct and no explicit configuration is required.
+  # The token itself is a DELIBERATE OVER-GRANT, not an
   # oversight: presenting that token resolves to a synthetic user in the
   # Admin system group (see app/auth/scheduler_token.py) — god-mode on
   # every RBAC check — while the producer only ever needs to read its own
@@ -1319,6 +1359,45 @@ extraction:
 # whole surface.
 studio:
   enabled: false
+
+
+# --- SharePoint ACL mirroring (optional, off by default) ---
+# Mirrors source-system (SharePoint) permissions into Agnes — groups,
+# memberships, collection grants, broken-inheritance exclusions and
+# index-time audience variants — as a third source-segregated sync writer
+# (the same pattern as the Google-nightly group sync). See
+# docs/superpowers/specs/2026-08-28-sharepoint-acl-mirroring-design.md.
+#
+# `acl_mirroring.enabled` / `acl_sync.guarantee_mode` / `acl_sync.
+# max_stale_hours` are registered switches (app/switches.py) — set them
+# here, via the settings panel, or their env vars (see
+# docs/feature-flags.md), not by hand-editing some other key.
+# acl_mirroring:
+#   # Gates the sharepoint-acl-sync job, per-scope access_mode='mirrored',
+#   # and the admin sync-now endpoint. OFF by default — turning it on
+#   # changes nothing until a scope opts into mirroring. Env override:
+#   # AGNES_ACL_MIRRORING_ENABLED.
+#   enabled: false
+#
+# acl_sync:
+#   # Cross-audience-leak posture (design Q7). must_not (default): fail
+#   # closed — broken-inheritance subtrees are always excluded, mirrored
+#   # grants are suspended past max_stale_hours below, and untagged claims
+#   # in an audience-tiered scope are admin-only. should_not: best effort —
+#   # advisory overrides allowed, stale grants persist with warnings,
+#   # untagged claims stay unrestricted within their collection. Env
+#   # override: AGNES_ACL_GUARANTEE_MODE.
+#   guarantee_mode: "must_not"       # must_not | should_not
+#   # must_not mode only: hours a failed ACL sync may leave mirrored grants
+#   # standing before they are suspended (deleted until the next successful
+#   # sync rewrites them). Env override: AGNES_ACL_MAX_STALE_HOURS.
+#   max_stale_hours: 72
+#   # Days between full sharepoint-subtree-sweep passes (broken-inheritance
+#   # folder detection) for one connection's mirrored scopes. The scheduler
+#   # row itself already fires weekly (native cron) — this is a
+#   # per-connection self-guard against a restart-refire, not the primary
+#   # cadence. Env override: AGNES_ACL_SWEEP_INTERVAL_DAYS.
+#   sweep_interval_days: 7
 
 
 # --- Initial Workspace Template (optional) ---

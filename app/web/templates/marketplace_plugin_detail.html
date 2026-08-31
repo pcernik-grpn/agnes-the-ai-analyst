@@ -33,7 +33,7 @@
      action row; the buttons themselves share one row (.actions-row) so
      install / remove / Cowork sit next to each other. The column sizes to
      its widest child (no width cap) so the row never wraps and the layout
-     stays put when the install state toggles between "+ Add to my stack"
+     stays put when the install state toggles between "+ Add to my agents"
      and "In your stack · Remove · Cowork". */
   .plugin-detail .detail-hero__actions {
     flex-direction: column; align-items: flex-end; align-self: flex-start;
@@ -805,12 +805,13 @@
      name_id='hero-name', icon_id='hero-icon', type_label='Plugin',
      trust=(_trust_level if detail.redesign else None), trust_own=is_owner,
      menu=_menu|trim, body_slot=_hero_slot, panel=_hero_panel|trim,
+     cover_image_url=cover_image_url,
      back_href=_back, back_label=_back_label) %}
   {# Three-element install state — see renderInstallState() below. Only one of
      {installBtn} vs {statusPill + removeBtn} is visible at a time. #}
   <div class="actions-row">
-    <button class="btn-install" id="install-btn" type="button" hidden>+ Add to my stack</button>
-    <span class="status-pill" id="status-pill" hidden>✓ In your stack</span>
+    <button class="btn-install" id="install-btn" type="button" hidden>+ Add to my agents</button>
+    <span class="status-pill" id="status-pill" hidden>✓ Agents can use this</span>
     <button class="btn-remove" id="remove-btn" type="button" hidden>✕ Remove from stack</button>
     {# Legacy keeps Cowork as a header button; the redesign moves it into the
        overflow menu above, so the header carries one action. #}
@@ -820,7 +821,7 @@
   </div>
   <div class="stack-hint" id="stack-hint" hidden>
     <div class="head">
-      <span class="title" id="stack-hint-title">✓ Added to your stack</span>
+      <span class="title" id="stack-hint-title">✓ Added to your agents</span>
       <button class="dismiss" id="stack-hint-dismiss" type="button">Don’t show again</button>
     </div>
     <div>Run in Claude Code:</div>
@@ -1045,7 +1046,7 @@
     {{ detail.side_panel_open('') }}
       <span id="rail-stack-status">{{ detail.status('Checking…') }}</span>
       <p class="detail-side__note" id="rail-stack-note">
-        Looking up whether this plugin is in your stack.
+        Looking up whether your agents can already use this plugin.
       </p>
     {{ detail.side_panel_close() }}
   {{ detail.side_close() }}
@@ -1080,6 +1081,24 @@
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, ch => (
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  }
+  // JS mirror of app/web/router.py's cover_variant_url/has_cover_variant Jinja
+  // filters — same external-URL rule (an un-mirrored external cover has no
+  // variant, so the inner-card list below must skip srcset/sizes rather
+  // than repeat the same URL under two width descriptors; the hero uses
+  // coverW alone — see its fixed-480 comment). Our own serving routes are
+  // always relative, so any absolute http(s) URL is external — no URL
+  // parsing needed (and none safe: cover_photo_url is often already
+  // relative).
+  function isMirroredCoverUrl(url) {
+    // Absolute (http/https), protocol-relative (//host/...), or data: URLs
+    // are external -- no ?w= variant to request. Mirrors has_cover_variant
+    // in app/web/router.py.
+    return !/^((https?:)?\/\/|data:)/i.test(url);
+  }
+  function coverW(url, w) {
+    if (!isMirroredCoverUrl(url)) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'w=' + w;
   }
   // Placeholder initials derived from the entity name. Mirrors initialsFor()
   // in marketplace.html: split on any non-alphanumeric separator, take the
@@ -1238,11 +1257,20 @@
   // On a 404 (missing internal file or dead external mirror), drop the
   // overlay and revert to the glyph rather than a broken-image icon.
   const iconEl = document.getElementById('hero-icon');
-  if (iconEl && d.cover_photo_url) {
+  if (iconEl && d.cover_photo_url && !iconEl.querySelector('img')) {
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';
-    coverImg.src = d.cover_photo_url;
+    coverImg.fetchPriority = 'high';
+    coverImg.width = 480;
+    coverImg.height = 240;
+    // No srcset: the governing default renders the hero tile at 132x74 CSS
+    // px (macros/_detail.html .detail-hero__icon--cover), 396 device px
+    // even at DPR 3, so the 480 variant is the honest fetch up to DPR 3.6
+    // on its own (the paper theme narrows the tile further, to 108x62,
+    // detail-page.css) — a srcset here only invited a DPR-3 phone to grab
+    // the 960 for zero visible gain.
+    coverImg.src = coverW(d.cover_photo_url, 480);
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
       coverImg.remove();
@@ -1275,17 +1303,17 @@
       panel.classList.add(installed ? 'detail-side__panel--ok' : 'detail-side__panel--warn');
     }
     chip.innerHTML = `<span class="detail-status detail-status--${installed ? 'ok' : 'warn'}">`
-      + (installed ? 'In your stack' : 'Not in your stack') + '</span>';
+      + (installed ? 'Agents can use this' : 'Not added yet') + '</span>';
     note.textContent = installed
       ? 'Run /update-agnes-plugins in Claude Code to pick up the latest version.'
-      : 'Add it to your stack to use it in Claude Code.';
+      : 'Add it to your agents to use it in Claude Code.';
   }
 
   function renderInstallState(installed) {
     installBtn.hidden = installed;
     statusPill.hidden = !installed;
     statusPill.classList.remove('is-system');
-    statusPill.textContent = '✓ In your stack';
+    statusPill.textContent = '✓ Agents can use this';
     statusPill.removeAttribute('title');
     removeBtn.hidden = !installed;
     renderRailStack(installed);
@@ -1362,7 +1390,7 @@
     removeBtn.hidden = true;
     installBtn.disabled = true;
     installBtn.title = 'This submission is not approved yet — install is disabled until checks pass.';
-    installBtn.textContent = '+ Add to my stack (unavailable while under review)';
+    installBtn.textContent = '+ Add to my agents (unavailable while under review)';
     installBtn.style.background = 'var(--ds-surface-sunken)';
     installBtn.style.color = 'var(--ds-text-muted)';
     installBtn.style.cursor = 'not-allowed';
@@ -1386,7 +1414,7 @@
   // and only when the user hasn't permanently dismissed it. The dismiss
   // flag lives in localStorage so a returning user who already understands
   // the two-step model isn't pestered. Re-shown to nontechnical users
-  // who hit "+ Add to my stack" for the first time on a new browser/laptop.
+  // who hit "+ Add to my agents" for the first time on a new browser/laptop.
   const HINT_DISMISS_KEY = 'mp.stack-hint.dismissed.v1';
   const hintEl = document.getElementById('stack-hint');
   function showHint() {
@@ -1417,8 +1445,8 @@
   function setHintTitle(kind) {
     if (!hintTitle) return;
     hintTitle.textContent = kind === 'removed'
-      ? '✓ Removed from your stack'
-      : '✓ Added to your stack';
+      ? '✓ Removed from your agents'
+      : '✓ Added to your agents';
   }
 
   installBtn.addEventListener('click', async () => {
@@ -1696,8 +1724,11 @@
     // initials from the entity name — same logic as the top-level card grid.
     const cards = items.map(it => {
       const itInitials = deriveInitials(it.name, type);
+      const itMirrored = it.cover_photo_url && isMirroredCoverUrl(it.cover_photo_url);
       const photoMarkup = it.cover_photo_url
-        ? `<div class="photo"><img src="${esc(it.cover_photo_url)}" alt=""
+        ? `<div class="photo"><img src="${esc(coverW(it.cover_photo_url, 480))}" alt="" loading="lazy" decoding="async" width="480" height="240"
+              ${itMirrored ? `srcset="${esc(coverW(it.cover_photo_url, 480))} 480w, ${esc(coverW(it.cover_photo_url, 960))} 960w"
+              sizes="(max-width: 600px) 100vw, 320px"` : ''}
               onerror="this.parentElement.classList.add('photo-failed');
                        this.parentElement.textContent='${itInitials.replace(/'/g, "\\'")}';"></div>`
         : `<div class="photo">${itInitials}</div>`;

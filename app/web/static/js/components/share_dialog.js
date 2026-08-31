@@ -156,6 +156,13 @@
         var name = document.createElement('span');
         name.textContent = g.name;
         label.appendChild(cb);
+        // The mark says GROUP. This list sits beside "Everyone" and the
+        // item's own name, and a bare word here read as neither.
+        if (window.AgnesKindGlyph) {
+          var mark = document.createElement('span');
+          mark.innerHTML = window.AgnesKindGlyph.groupGlyph();
+          label.appendChild(mark.firstChild);
+        }
         label.appendChild(name);
         if (g.is_everyone) {
           var hint = document.createElement('span');

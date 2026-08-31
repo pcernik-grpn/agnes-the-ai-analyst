@@ -48,6 +48,17 @@ class LLMUnsupportedError(LLMError):
     """
 
 
+class LLMModelNotFoundError(LLMError):
+    """The configured model does not exist for this provider/deployment.
+
+    A permanent error with an operator-shaped fix — no retry and no
+    fallback strategy will help. Distinct from LLMUnsupportedError, which
+    means the model is there but will not do what the request asked for.
+    On Vertex this is the "enabled in Model Garden for a different
+    project/region than the one configured" case.
+    """
+
+
 class LLMRefusalError(LLMError):
     """Model refused to generate a response.
 

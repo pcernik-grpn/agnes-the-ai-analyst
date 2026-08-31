@@ -135,6 +135,8 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # `src.repositories.facts_repo()` directly rather than self-calling over
     # HTTP (see `_facts_caller`'s docstring below).
     "fact_search",
+    "fact_type_map",
+    "fact_facets",
     "fact_neighbors",
     "fact_claims",
     "schema",
@@ -148,6 +150,8 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "store_rate",
     "store_status",
     "store_publish_markdown",
+    "store_read_markdown",
+    "store_edit_markdown",
     "store_compose_plugin",
     # Full agent/skill lifecycle parity (REST × CLI × MCP): discover, inspect,
     # install/remove, edit, delete — an agent can manage its own store
@@ -946,6 +950,73 @@ def register_foundation_tools(
         return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
 
     @tool(read_only=True)
+    async def fact_type_map() -> dict:
+        """List every fact type in the graph with a live count of the
+        subjects YOU can see. Use this to orient BEFORE `fact_search` when
+        you do not yet know what types exist — each row's `type` is a valid
+        `fact_search(type=...)` argument, and its `count` tells you whether
+        searching it is worth a call.
+
+        Counted through the same visibility gate `fact_search` applies, so a
+        number is what you could actually reach and never a total inflated
+        by evidence you cannot read. A type with no subjects visible to you
+        is omitted entirely rather than returned with a count of 0 — absence
+        here means "nothing you can see", which is deliberately
+        indistinguishable from "no such type". Behind the `facts` feature
+        flag (off by default); requires the Postgres app-state backend.
+        Mirrors `GET /api/facts/type-map` and `agnes facts type-map`.
+
+        Returns ``{"types": [{"type", "count"}], "total"}``, ordered by type.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        counts = await asyncio.to_thread(facts_repo().count_visible_facts_by_type, caller)
+        return {
+            "types": [{"type": t, "count": n} for t, n in counts.items()],
+            "total": sum(counts.values()),
+        }
+
+    @tool(read_only=True)
+    async def fact_facets(
+        types: list[str] | None = None,
+        limit_per_type: Annotated[int, Field(ge=1, le=200)] = 50,
+    ) -> dict:
+        """List the entity values documents can be filtered by — clients,
+        industries, service offerings, document types — with a document count
+        each. Use this to answer "which clients do we have work for?" or
+        "how much do we have on X?" without reading any document, and to pick
+        a concrete value before calling `fact_search`.
+
+        Counts cover only documents in collections YOU can read, so a facet
+        never reports files you could not open — including for a subject
+        carrying a `revealed` correction, whose unreadable evidence is
+        deliberately not tallied. Behind the `facts` feature flag; requires
+        the Postgres app-state backend. Mirrors `GET /api/facts/facets` and
+        `agnes facts facets`.
+
+        Args:
+            types: Fact types to facet on. Omit for the default four.
+            limit_per_type: Max values returned per type.
+
+        Returns ``{"facets": {type: [{"subject_id", "label", "document_count"}]}}``.
+        """
+        from app.api.facts import DEFAULT_FACET_TYPES
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        wanted = list(types) if types else list(DEFAULT_FACET_TYPES)
+        return {
+            "facets": await asyncio.to_thread(
+                facts_repo().facet_values, caller, types=wanted, limit_per_type=limit_per_type
+            )
+        }
+
+    @tool(read_only=True)
     async def fact_neighbors(
         subject_id: str,
         edge_types: list[str] | None = None,
@@ -1417,6 +1488,76 @@ def register_foundation_tools(
         async with httpx.AsyncClient() as c:
             r = await c.post(
                 f"{base_url}/api/store/entities/from-markdown",
+                json=payload,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def store_read_markdown(entity_id: str) -> dict:
+        """Read back the Markdown of a skill or agent template you own.
+
+        The other half of ``store_publish_markdown``: revising something you
+        published starts by reading what it currently says. Owner or admin
+        only, and a bundle-authored entity answers 409 ``not_markdown_
+        authored`` — there is no single document behind it. Mirrors ``GET
+        /api/store/entities/{id}/markdown`` and ``agnes store show-md``.
+
+        Args:
+            entity_id: The store entity id (from ``store_publish_markdown``
+                       output or ``marketplace_search``).
+
+        Returns ``{"id", "type", "name", "description", "category",
+        "skill_md", "editable", "blocked_reason"}`` — ``editable`` is false
+        while a previous version is still under review.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/store/entities/{entity_id}/markdown",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def store_edit_markdown(
+        entity_id: str,
+        name: str,
+        skill_md: str,
+        description: str | None = None,
+        category: str | None = None,
+    ) -> dict:
+        """Revise a skill or agent template you own from its Markdown.
+
+        ``store_update`` edits the metadata around an entity; this replaces
+        what it SAYS. The server rebuilds the bundle from the document and
+        runs the same guardrail + review pipeline as publishing, so the result
+        may be held for review. Refused with 409 ``prior_version_pending``
+        while an earlier version is still being reviewed. Mirrors ``PUT
+        /api/store/entities/{id}/from-markdown`` and ``agnes store edit-md``.
+
+        Args:
+            entity_id:   The store entity id.
+            name:        Name — lowercase letters, digits, dashes. Pass the
+                         current name to leave it alone; a different one
+                         renames the entity.
+            skill_md:    The full replacement Markdown (frontmatter optional).
+            description: One-line *use when …* trigger.
+            category:    Optional store category (case-insensitive).
+
+        Returns the updated entity — ``{"id", "version", "visibility_status", …}``.
+        """
+        payload: dict = {"name": name, "skill_md": skill_md}
+        if description:
+            payload["description"] = description
+        if category:
+            payload["category"] = category
+        async with httpx.AsyncClient() as c:
+            r = await c.put(
+                f"{base_url}/api/store/entities/{entity_id}/from-markdown",
                 json=payload,
                 headers=headers_fn(),
                 timeout=60,

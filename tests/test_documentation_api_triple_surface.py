@@ -27,6 +27,14 @@ from pathlib import Path
 # (the policy is a ratchet, not a sweep). Tuple of (cli_cmd, mcp_tool).
 _COHORT: dict[str, tuple[str, str]] = {
     "/documentation/api": ("docs api", "documentation_api"),
+    # Fact-graph node types with caller-scoped counts (TCRD-250): the head
+    # of the Library's Knowledge tab, and an agent's way to learn which
+    # types exist before spending a `fact_search` call. Joins its
+    # search/neighbors/claims siblings on all three surfaces.
+    "/api/facts/type-map": ("facts type-map", "fact_type_map"),
+    # Entity facets for the Library's filter menu (TCRD-250 piece 4). Same
+    # three surfaces as its type-map sibling above.
+    "/api/facts/facets": ("facts facets", "fact_facets"),
     # Reading one collection file's text (#1240). The endpoint's path is
     # browser-shaped — the Library's preview modal fetches it directly — but
     # its contract is now agent-facing: an agent shown a file it could not
@@ -48,6 +56,14 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Markdown-first skill publish (studio Skill Builder direct-publish flow,
     # issue #688). CLI: `store publish-md`. MCP: `store_publish_markdown`.
     "/api/store/entities/from-markdown": ("store publish-md", "store_publish_markdown"),
+    # The editing half of the pair above. The builder authors a document and
+    # the only edit surface took a replacement .zip, so the one thing the
+    # builder wrote was the one thing nothing could change; reading it back
+    # and writing it back are one feature and land on all three surfaces
+    # together. (GET → `agnes store show-md` / `store_read_markdown`; PUT →
+    # `agnes store edit-md` / `store_edit_markdown`.)
+    "/api/store/entities/{entity_id}/markdown": ("store show-md", "store_read_markdown"),
+    "/api/store/entities/{entity_id}/from-markdown": ("store edit-md", "store_edit_markdown"),
     # The composed sibling of from-markdown: same JSON-create shape, so it takes
     # the same three surfaces. The .zip upload path stays _EXEMPT (binary).
     "/api/store/entities/from-components": ("store compose", "store_compose_plugin"),
@@ -786,6 +802,19 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/knowledge/digests": (
+        "enumerating maintained digests for a WEB surface (TCRD-250). Both "
+        "other surfaces already RECEIVE digests by a better route than a "
+        "list call: `agnes pull` writes every granted digest to "
+        "`.claude/rules/ka_<slug>.md` from the manifest "
+        "(app/api/sync.py::_digest_entries), and a chat agent therefore "
+        "reads them as files already in its sandbox rather than by calling "
+        "a tool. This route exists only because a browser cannot read that "
+        "directory — it is the enumeration a page needs, not an analyst "
+        "query. Same reasoning as the grandfathered GET "
+        "/api/facts/ingest-runs. The digest CONTENT endpoint it pairs with "
+        "is itself grandfathered, and is what `agnes pull` calls"
+    ),
     "/api/v1/agents/{slug}/delegate": (
         "Track C7 (@delegation MVP) — sandbox-internal RPC, reachable only "
         "by a live agent turn's own in-process delegation tool "
@@ -1169,6 +1198,11 @@ _EXEMPT: dict[str, str] = {
         "connection — admin/scheduler maintenance op, mirrors the "
         "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/acl-sync": (
+        "admin 'sync now' trigger for the sharepoint-acl-sync job (spec §5.1, "
+        "2026-08-30 plan Task 5) — admin/scheduler maintenance op, mirrors the "
+        "extract/run-due exemptions above; no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.
@@ -1480,6 +1514,18 @@ _EXEMPT: dict[str, str] = {
         "client-reported CLI audit event batch upload (F3, audit-full-coverage "
         "plan) — internal to `agnes push`, mirrors the grandfathered "
         "/api/upload/sessions and /api/upload/local-md endpoints; no standalone "
+        "CLI subcommand or MCP analogue"
+    ),
+    # Wave 2, Task 3. System-to-system only: apps-runner holds the Docker
+    # socket but no database access, so this is its ONLY path to an audit_log
+    # row. Authenticated by the shared X-Runner-Token, never a user session —
+    # a human or an agent calling it AS THEMSELVES has nothing to report and
+    # no credential that would work, so a CLI subcommand or MCP tool would be
+    # a surface with no caller. Same class as the webhook/OAuth-callback
+    # carve-outs above.
+    "/api/data-apps/runner-events": (
+        "apps-runner container-lifecycle event report (wave 2, audit-coverage "
+        "plan) — system-to-system, X-Runner-Token authenticated; no user-facing "
         "CLI subcommand or MCP analogue"
     ),
 }

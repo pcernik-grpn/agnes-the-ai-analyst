@@ -131,7 +131,7 @@ def test_cli_command_examples_survive_the_brand_sweep(branded):
     assert "agnes catalog" in resp.text
 
 
-def test_rail_hands_the_resolved_brand_to_the_onboarding_script(branded):
+def test_rail_hands_the_resolved_brand_to_the_onboarding_script(branded, monkeypatch):
     """The rail's onboarding card is branded server-side AND rewritten by
     `chat_onboarding.js` once `/api/chat/journey` resolves, so the resolved
     brand has to reach the script — otherwise a rebranded instance shows its
@@ -139,8 +139,19 @@ def test_rail_hands_the_resolved_brand_to_the_onboarding_script(branded):
 
     The seam is `data-brand-short` on `#railGetStarted` (read by
     `brandShort()`); this pins that the attribute is emitted with the
-    operator's value, not the fallback."""
-    resp = branded["client"].get("/chat", headers=_auth(branded["admin_token"]))
+    operator's value, not the fallback.
+
+    The analyst card stands down for an admin whose setup chain is unfinished
+    — two six-step journeys must not share one slot — and that rule reaches
+    EVERY page now, not just /chat as when this test was written. Reading on
+    /library is no longer an escape hatch, so the chain is stood down here
+    instead: this test is about the brand seam, and it should fail when the
+    brand stops reaching the script, not when an unrelated rule about which
+    card owns the slot changes underneath it."""
+    import app.web.router as _router
+
+    monkeypatch.setitem(_router.templates.env.globals, "admin_setup_rail", lambda: None)
+    resp = branded["client"].get("/library", headers=_auth(branded["admin_token"]))
     assert resp.status_code == 200, resp.text
     assert 'id="railGetStarted"' in resp.text, "rail onboarding card did not render — the widget under test is absent"
     assert f'data-brand-short="{CUSTOM_BRAND}"' in resp.text, (

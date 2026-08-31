@@ -13,8 +13,12 @@ messages, and CHANGELOG stay English.
 ## Non-negotiable rules (check before every change)
 
 1. **TDD-first.** Write the failing test, watch it fail, then the minimal
-   implementation. Before claiming done, run the full suite:
-   `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`.
+   implementation. Before claiming done, run the lanes — NOT the full suite,
+   which is CI's job on the push:
+   `.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q`
+   then `--lane fast` (2:57). Reach for the full suite only when you touched
+   a merge magnet (`src/db.py`, `tests/conftest.py`, `app/main.py`) or are
+   reproducing a CI failure a lane will not show.
 2. **New app-state repo/schema = Postgres-only (A3 PG-first ratchet).** The
    DuckDB app-state backend is frozen — a NEW `src/repositories/<name>.py`
    DuckDB module, a NEW `_REGISTRY` entry with a DuckDB backend, and a NEW
@@ -30,12 +34,21 @@ messages, and CHANGELOG stay English.
    "maintained", not "abandoned". Never "PG later". A schema change (new
    column/table) on an existing pair still follows rule 2 — PG-only,
    regardless of whether the table predates the ratchet.
-4. **CHANGELOG.** Add a `## [Unreleased]` bullet for any user-visible behavior.
-5. **Vendor-agnostic.** No customer-specific tokens (deployments, project IDs,
+4. **Audit posture.** Any new surface a user or admin can reach — HTTP route,
+   worker job kind, MCP tool, bot command — declares itself in
+   `src/audit_posture.py` (a cataloged action from `src/audit_events.py`, or
+   `exempt:<reason>` from the closed vocabulary). A declared action is what the
+   fallback middleware EMITS, so most routes need no logging code at all; write
+   `log_safe(...)` only when you can say more than the middleware can, and never
+   both for one event. Never `audit_repo().log()` outside the repo layer. Content
+   (prompts, SQL, bodies, secret values) never enters `params`. See `audit.md` —
+   it also lists the SEVEN places a new `/api/*` route must touch.
+5. **CHANGELOG.** Add a `## [Unreleased]` bullet for any user-visible behavior.
+6. **Vendor-agnostic.** No customer-specific tokens (deployments, project IDs,
    hostnames, private-repo references) in code, config, comments, or docs.
-6. **Scope discipline + issue economy.** Don't refactor unrelated code; fix or
+7. **Scope discipline + issue economy.** Don't refactor unrelated code; fix or
    close, don't spawn issues.
-7. **Web pages** extend `base_page.html` / `base_ds.html`, never `base.html`.
+8. **Web pages** extend `base_page.html` / `base_ds.html`, never `base.html`.
 
 ## Routing — load the matching playbook
 
@@ -48,6 +61,7 @@ Read the one `agnes-conventions/references/*.md` that fits the task:
 | New dashboard page | `web-page.md` |
 | New repository / method | `repo-parity.md` |
 | Schema change | `migration.md` |
+| New route / job kind / MCP tool / bot command | `audit.md` |
 
 ## Output contract
 

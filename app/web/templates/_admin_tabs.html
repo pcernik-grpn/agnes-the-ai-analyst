@@ -54,7 +54,7 @@
        Still links, still one real URL each — deep links, bookmarks, the back
        button and the nav coverage guard behave exactly as they do for
        `ds.tabs`. Only the drawing changes. #}
-    <nav class="tab-flow" role="tablist" aria-label="Section">
+    <nav class="tab-strip tab-flow" role="tablist" aria-label="Section">
         {%- for item in _tabs %}
         {%- if loop.index0 > 0 %}
             {%- if item.chain %}
@@ -63,7 +63,7 @@
         <span class="tab-flow__break" aria-hidden="true"></span>
             {%- endif %}
         {%- endif %}
-        <a class="tab-flow__item{% if item.active %} is-active{% endif %}"
+        <a class="tab-strip__item tab-flow__item{% if item.active %} is-active{% endif %}"
            href="{{ item.href }}" role="tab"
            aria-selected="{{ 'true' if item.active else 'false' }}">{{ item.label }}</a>
         {%- endfor %}

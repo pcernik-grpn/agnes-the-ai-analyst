@@ -1196,6 +1196,7 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
+- /api/admin/sharepoint/connections/{connection_id}/acl-sync
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1245,16 +1246,35 @@ search to a site or folder, or narrow the pattern") when `truncated` is
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
-collection_id}` inside the connection's own `config.scopes` (no new table).
-`POST` confirms a scope: creates its collection on first confirmation and
-reuses the same collection on every re-confirmation of the same
-`source_scope_id` (idempotent — a rename/move in the source updates
-`display_path` in place rather than forking a second collection), and
-optionally applies group grants (ordinary `resource_grants` rows on the
-collection — never duplicated onto the scope row itself). The response's
-`no_group_warning` flags a collection with no granted group ("indexed but
-invisible"). `DELETE` (`?source_scope_id=`) unselects a scope — an explicit
-exclusion — without touching its already-created collection.
+access_mode, drive_id, collection_id}` inside the connection's own
+`config.scopes` (no new table). `POST` confirms a scope: creates its
+collection on first confirmation and reuses the same collection on every
+re-confirmation of the same `source_scope_id` (idempotent — a rename/move in
+the source updates `display_path` in place rather than forking a second
+collection), and optionally applies group grants (ordinary `resource_grants`
+rows on the collection — never duplicated onto the scope row itself). The
+response's `no_group_warning` flags a collection with no granted group
+("indexed but invisible"). `DELETE` (`?source_scope_id=`) unselects a scope —
+an explicit exclusion — without touching its already-created collection.
+
+`access_mode: "manual"|"mirrored"` (2026-08-30 plan, Task 5) opts a scope into
+the `sharepoint-acl-sync` job's group/grant reconciliation; `mirrored`
+requires `drive_id` (`400 missing_drive_id` otherwise). The response also
+carries the `sharepoint-subtree-sweep` job's own findings (Task 7):
+`excluded_subtree_count` and `excluded_subtrees` (`[{item_id, path}]`) — the
+broken-inheritance folders that job excluded from the crawl by default
+(spec §3(b)). `include_excluded_subtrees: true` on `POST` asks to "include
+anyway" a detected subtree — refused with `409
+must_not_forbids_subtree_override` under the `must_not` guarantee mode
+(`acl_sync.guarantee_mode`, default), accepted and audited
+(`sharepoint_acl.subtree_override`) under `should_not`.
+
+`POST …/acl-sync` is the admin "sync now" trigger for the
+`sharepoint-acl-sync` job (spec §5.1) — enqueues
+`{"connection_id": connection_id}` and returns `202 {"job_id", "status"}`;
+`409 feature_disabled` when `acl_mirroring.enabled` is off, `409
+acl_sync_already_running` when one is already queued/running for this
+connection.
 
 `GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
 collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
@@ -2062,6 +2082,30 @@ Corrections management
 producer export (`GET /api/facts/corrections` — every `wrong` subject's
 natural keys, spec §7.4) round out the write surface.
 
+`GET /api/facts/facets` answers "what can I filter documents by" —
+`{"facets": {type: [{"subject_id", "label", "document_count"}]}}`, defaulting
+to `client`, `industry`, `service_offering` and `doc_type`. The vocabulary
+comes from the extraction pass rather than hand-entered tags, so it is
+maintained by ingestion. Same gate as `search()`; `document_count` tallies
+only documents in collections the caller can READ, and deliberately does not
+tally a `revealed` subject's unreadable evidence — a revealed correction
+reveals the subject, not the geography of its evidence (§4), and counting
+those files would report how many sit in a collection the caller cannot
+open. Triple-surface with `agnes facts facets` and the `fact_facets` MCP
+tool.
+
+`GET /api/facts/type-map` answers "what is in the graph at all" —
+`{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
+through the SAME visibility gate as `search()` with no `type` (shared via
+`_visible_facts_for_corpus_cte(all_collections=True)`, never a second copy
+of the rule), so a type's number is exactly what that caller could reach
+through `search(type=...)`. A type with no subjects visible to the caller
+is OMITTED rather than reported as `0`: absence is deliberately
+indistinguishable from "no such type in this ontology", because a `0` would
+confirm the type exists and that something occupies it — the aggregate form
+of the §5 existence oracle. Triple-surface with `agnes facts type-map` and
+the `fact_type_map` MCP tool.
+
 Every successful ingest batch also persists a copy of its run report to
 `facts_ingest_runs` — written AFTER the ingest transaction commits, so a
 report-write failure never rolls back or fails the ingest itself (see
@@ -2072,6 +2116,8 @@ counts and per-category error badges — an admin-only, UI-internal surface,
 not an analyst query (no CLI/MCP analogue).
 
 - /api/facts/search
+- /api/facts/type-map
+- /api/facts/facets
 - /api/facts/neighbors
 - /api/facts/{subject_id}/claims
 - /api/facts/ingest
@@ -2132,6 +2178,7 @@ by-slug surface but keep their grants for a lossless re-link.
 
 - /api/data-apps
 - /api/data-apps/reap-idle
+- /api/data-apps/runner-events
 - /api/data-apps/{slug}
 - /api/data-apps/{slug}/deploy
 - /api/data-apps/{slug}/drafts
@@ -2357,6 +2404,21 @@ metered server-side.
   `require_resource_access`: ungranted analyst on a known collection → 403;
   unknown corpus or a not-yet-built artifact → 404. REST-only (no CLI/MCP
   analogue — mirrors `/api/data/{table_id}/download`).
+- /api/knowledge/digests — the maintained digests THIS caller can read:
+  `{digests: [{id, slug, title, status, status_reason, generated_at}]}`,
+  sorted by slug, never the markdown itself. The enumeration a WEB surface
+  needs (TCRD-250): the content endpoint below has been readable since K4 and
+  `agnes pull` writes every granted digest to `.claude/rules/ka_<slug>.md`,
+  but nothing could list them, so a page had no way to show a reader which
+  digests exist without already knowing an id. Filtered by the SAME
+  fail-closed `_caller_can_read_digest` predicate the manifest builder uses
+  (`app/api/sync.py::_digest_entries`), so the web list and the pulled files
+  can never disagree about entitlement. A digest that has never generated is
+  omitted, matching the manifest — listing it would promise a page that
+  404s. Staleness travels per row, so a stale digest is visibly stale rather
+  than silently so. REST-only by design (see the triple-surface exemption):
+  the CLI and a chat agent already RECEIVE digests as pulled files, so an
+  enumeration call is a browser's need, not theirs.
 - /api/knowledge/digests/{digest_id}/content — serves one maintained
   digest's markdown (K4, #799): `{id, slug, title, output_md, status,
   status_reason, generated_at}`. Listed in the sync manifest's
@@ -2615,7 +2677,9 @@ reason.
 - /api/store/entities/{entity_id}
 - /api/store/entities/{entity_id}/docs/{filename}
 - /api/store/entities/{entity_id}/files
+- /api/store/entities/{entity_id}/from-markdown
 - /api/store/entities/{entity_id}/install
+- /api/store/entities/{entity_id}/markdown
 - /api/store/entities/{entity_id}/photo
 - /api/store/entities/{entity_id}/publisher
 - /api/store/entities/{entity_id}/rate

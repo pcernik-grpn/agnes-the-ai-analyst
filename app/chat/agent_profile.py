@@ -81,7 +81,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 from app.chat.profiles import ChatProfile
@@ -149,8 +149,68 @@ agnes query "SELECT ..."      # run the query
   `agnes skills show agnes-data-querying`.
 """
 
+#: Fact-graph rails appended after :data:`DATA_ACCESS_RAILS` — ONLY when the
+#: `facts` feature switch is on for this instance.
+#:
+#: `config/claude_md_template.txt` carries the equivalent
+#: "Facts — entity and relationship questions" section, but that template IS
+#: the ``CLAUDE.md`` a persona replaces (see :data:`DATA_ACCESS_RAILS`'s own
+#: docstring for why the replacement itself is correct and stays). Without
+#: this, a persona'd agent silently lost the ONLY text that ever told it to
+#: reach for `fact_search`/`fact_neighbors`/`fact_claims` on a who/what/
+#: relationship question — it fell back to `agnes catalog` + SQL, found no
+#: table shaped like the answer, and reported no data instead of walking the
+#: fact graph, while an agent with no persona (the default rails, unaltered)
+#: answered the same question correctly. That divergence is what made the
+#: product look random rather than genuinely lacking the data.
+#:
+#: Gated on the switch alone, deliberately not on the caller's actual fact
+#: read access: unlike ``DATA_ACCESS_RAILS`` — which just names a CLI, not a
+#: caller-specific slice of it — checking readability here would mean a
+#: repository call on every persona spawn for a fact that only teaches WHEN
+#: to try the tools; the tools (`facts_repo()`) already enforce per-caller
+#: visibility on every call regardless of what this text says. Same
+#: reasoning `src/claude_md.py::_facts_enabled` documents for the default
+#: template's own gate — this mirrors it rather than diverging.
+FACTS_ACCESS_RAILS = """
 
-def _semantic_layer_section(user_email: Optional[str]) -> str:
+---
+
+## Facts — entity and relationship questions
+
+Agnes also extracts typed facts (people, clients, organizations, and the
+relationships between them) into a queryable graph. For a question about
+**who, what, which entity, or how things relate** — "who owns X", "how do
+these two people connect", "which clients per industry" — reach for the
+fact tools FIRST, before writing SQL or searching documents by keyword:
+`fact_search` -> `fact_neighbors` -> `fact_claims` (the same calls as
+`agnes facts search|neighbors|claims` on the CLI).
+
+```
+agnes facts search <type> [query] [--filter key=value]   # find subjects by type, an optional name, and/or attrs
+agnes facts neighbors <subject_id>                        # traverse relationships (depth <= 2)
+agnes facts claims <subject_id>                           # the evidencing quote + document for one subject
+```
+
+Cite every fact you use — `agnes facts claims` gives you the exact quote and
+its source document, name both in your answer. Facts are filtered
+server-side to what YOU can read; a search returning nothing may exist
+outside your access, it is not evidence the fact is absent — fall back to
+`agnes collections search` rather than inventing an answer or refusing
+outright.
+"""
+
+
+def _facts_rails_enabled() -> bool:
+    """Whether this instance has the `facts` feature switched on — the sole
+    gate for appending :data:`FACTS_ACCESS_RAILS`. See that constant's
+    docstring for why this stays switch-only with no RBAC narrowing."""
+    from app.instance_config import feature_enabled
+
+    return feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+
+
+def _semantic_layer_section(user_email: str | None) -> str:
     """The same minimal semantic-layer pointer the sandbox/CLAUDE.md path
     gets (``src.claude_md``'s "## Semantic layer" section), condensed for a
     persona: slug + description + the model author's own truncated
@@ -310,8 +370,8 @@ def _context_skill(agent_row: dict, *, advertise_memory_write: bool = True) -> s
 
 
 def build_profile(
-    agent_row: dict, *, advertise_memory_write: bool = True, user_email: Optional[str] = None
-) -> Optional[ChatProfile]:
+    agent_row: dict, *, advertise_memory_write: bool = True, user_email: str | None = None
+) -> ChatProfile | None:
     """Build a dynamic ``ChatProfile`` from an ``agents`` row.
 
     Returns ``None`` when ``system_prompt`` is empty/whitespace-only — the
@@ -321,12 +381,15 @@ def build_profile(
     chat's generic rails.
 
     The returned ``claude_md`` is the authored persona followed by
-    :data:`DATA_ACCESS_RAILS`, then :func:`_semantic_layer_section` — see
-    that constant for why a persona must never be able to silently drop the
-    platform's data-access floor. The early return above means this only
-    ever applies where a persona actually replaces the workspace prompt; an
-    agent with no persona keeps the full symlinked rails (semantic layer
-    section included) and is untouched.
+    :data:`DATA_ACCESS_RAILS` — see that constant for why a persona must
+    never be able to silently drop the platform's data-access floor — then,
+    when the `facts` feature switch is on, :data:`FACTS_ACCESS_RAILS` after
+    it (see that constant for why a persona needs its own copy of the
+    fact-tool guidance too), and finally :func:`_semantic_layer_section`.
+    The early return above means this only ever applies where a persona
+    actually replaces the workspace prompt; an agent with no persona keeps
+    the full symlinked rails — including the template's own facts and
+    semantic-layer sections — and is untouched.
 
     ``advertise_memory_write`` is threaded to :func:`_context_skill` — pass
     ``False`` when the profile is materialized for a sandbox with no channel
@@ -342,9 +405,13 @@ def build_profile(
     if not system_prompt:
         return None
     slug = agent_row.get("slug") or agent_row.get("id") or "agent"
+    claude_md = system_prompt + DATA_ACCESS_RAILS
+    if _facts_rails_enabled():
+        claude_md += FACTS_ACCESS_RAILS
+    claude_md += _semantic_layer_section(user_email)
     return ChatProfile(
         slug=f"agent-{slug}",
-        claude_md=system_prompt + DATA_ACCESS_RAILS + _semantic_layer_section(user_email),
+        claude_md=claude_md,
         skill_name="agnes-agent-context",
         skill_body=_context_skill(agent_row, advertise_memory_write=advertise_memory_write),
     )
@@ -478,7 +545,7 @@ def _memory_date(memory: dict) -> str:
     return text[:10] if text else "unknown-date"
 
 
-def _rendered_memories_with_count(agent_row: dict) -> tuple[Optional[str], int]:
+def _rendered_memories_with_count(agent_row: dict) -> tuple[str | None, int]:
     """``(document, count)`` for this agent's in-budget active memories —
     ``(None, 0)`` when there is nothing to write. Shared never-raises core of
     :func:`render_memories` and :func:`materialize_memories`."""
@@ -510,7 +577,7 @@ def _rendered_memories_with_count(agent_row: dict) -> tuple[Optional[str], int]:
         return None, 0
 
 
-def render_memories(agent_row: dict) -> Optional[str]:
+def render_memories(agent_row: dict) -> str | None:
     """Render this agent's in-budget active memories as the ``agent-memory.md``
     document, or ``None`` when there is nothing to write.
 

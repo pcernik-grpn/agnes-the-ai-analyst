@@ -2,12 +2,15 @@
 {% block title %}MCP sources — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
-{# Design-system component macros — toolbar "+ Add MCP source" + modal
-   buttons render via `ds.button`. JS-generated per-row actions use the
-   shared `.icon-btn` component (css/icon_btn.css). The three create-modal
-   `<select>`s (transport/scope/auth-method) each get a paired
-   `ds.dropdown()` alongside them (#1055) — see `_components.html`'s
-   `dropdown` macro. #}
+{# Design-system component macros — the toolbar's "+ Add MCP source" renders
+   via `ds.button`. JS-generated per-row actions use the shared `.icon-btn`
+   component (css/icon_btn.css).
+
+   This page used to carry its own create modal, with three paired
+   `ds.dropdown()` selects. It is gone: registering a source is the guided
+   builder at /admin/mcp-sources/new, which refuses to save until it has
+   reached the server, and a second door with the opposite rule is what made
+   the admin nav the unsafe route. #}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/icon_btn.css') }}">
 <style>
@@ -129,7 +132,14 @@
 
   <div class="mcp-toolbar">
     <input id="mcp-search" type="search" class="mcp-search" placeholder="Filter by name, transport, or URL…" aria-label="Filter by name, transport, or URL" autocomplete="off">
-    {{ ds.button('+ Add MCP source', variant='primary', id='open-create-btn') }}
+    {# The GUIDED path, not the modal that used to live here.
+
+       Two doors with opposite safety rules is worse than either: the builder
+       refuses to register until it has actually reached the server and read
+       its tool list, while this page's modal posted whatever was typed — so
+       the route the admin nav leads to was the one that produced enabled,
+       grantable sources exposing nothing. One creation path. #}
+    {{ ds.button('+ Add MCP source', variant='primary', href='/admin/mcp-sources/new') }}
   </div>
 
   <div class="data-table-wrap">
@@ -149,102 +159,7 @@
     <div id="mcp-loading" class="mcp-loading">Loading MCP sources…</div>
     <div id="mcp-empty" class="mcp-empty" style="display:none;">
       <div class="big">No MCP sources registered</div>
-      <div>Click <strong>Add MCP source</strong> to connect to your first MCP server.</div>
-    </div>
-  </div>
-</div>
-
-<!-- Create modal -->
-<div class="modal-backdrop" id="create-modal" role="dialog" aria-modal="true" aria-labelledby="create-modal-title">
-  <div class="modal-card">
-    <h3 id="create-modal-title">Add MCP source</h3>
-    <p class="sub">Register an inbound MCP server. After saving, open the source detail page to introspect and curate its tools.</p>
-
-    <label for="new-name">Display name</label>
-    <input id="new-name" type="text" placeholder="e.g. Acme CRM MCP" required autocomplete="off">
-
-    <label for="new-transport">Transport</label>
-    {# The real <select> stays the control the JS below reads/listens on
-       (syncTransportFields / confirm-create-btn) — untouched. The custom
-       dropdown alongside it is a visual replacement only; which one is
-       visible is a theme decision (paper-skin.css), not a template one. #}
-    <select id="new-transport" class="ds-dropdown-native">
-      <option value="stdio">stdio (subprocess)</option>
-      <option value="http">http (streamable)</option>
-      <option value="sse">sse (server-sent events)</option>
-    </select>
-    {{ ds.dropdown(
-      id='new-transport-dd', target='new-transport',
-      aria_label='Transport', selected='stdio',
-      options=[
-        {'value': 'stdio', 'label': 'stdio (subprocess)'},
-        {'value': 'http', 'label': 'http (streamable)'},
-        {'value': 'sse', 'label': 'sse (server-sent events)'},
-      ],
-    ) }}
-
-    <div class="transport-fields is-active" data-transport="stdio">
-      <label for="new-command">Command</label>
-      <input id="new-command" type="text" placeholder="e.g. npx" autocomplete="off">
-      <div class="help">Executable run by the subprocess transport.</div>
-
-      <label for="new-args">Arguments (one per line)</label>
-      <textarea id="new-args" autocomplete="off" placeholder="-y&#10;@acme/crm-mcp"></textarea>
-      <div class="help">One CLI argument per line, in order.</div>
-    </div>
-
-    <div class="transport-fields" data-transport="http">
-      <label for="new-url-http">Endpoint URL</label>
-      <input id="new-url-http" type="url" placeholder="https://mcp.example.com/sse" autocomplete="off">
-    </div>
-
-    <div class="transport-fields" data-transport="sse">
-      <label for="new-url-sse">SSE URL</label>
-      <input id="new-url-sse" type="url" placeholder="https://mcp.example.com/sse" autocomplete="off">
-    </div>
-
-    <label for="new-scope">Secret scope</label>
-    <select id="new-scope" class="ds-dropdown-native">
-      <option value="shared">shared (one server-wide secret)</option>
-      <option value="per_user">per_user (each analyst supplies their own)</option>
-    </select>
-    {{ ds.dropdown(
-      id='new-scope-dd', target='new-scope',
-      aria_label='Secret scope', selected='shared',
-      options=[
-        {'value': 'shared', 'label': 'shared (one server-wide secret)'},
-        {'value': 'per_user', 'label': 'per_user (each analyst supplies their own)'},
-      ],
-    ) }}
-    <div class="help">Whether this source uses a single shared vault secret or a per-analyst secret.</div>
-
-    <label for="new-env">Environment variables (KEY=VALUE per line)</label>
-    <textarea id="new-env" autocomplete="off" placeholder="CRM_API_URL=https://api.example.com&#10;REGION=eu"></textarea>
-    <div class="help">Non-secret env vars passed to the stdio subprocess (KEY=VALUE per line).</div>
-
-    <label for="new-auth-method">Auth method</label>
-    <select id="new-auth-method" class="ds-dropdown-native">
-      <option value="">none</option>
-      <option value="bearer">bearer (env var)</option>
-          <option value="oauth">oauth (per-user browser connect)</option>
-    </select>
-    {{ ds.dropdown(
-      id='new-auth-method-dd', target='new-auth-method',
-      aria_label='Auth method', selected='',
-      options=[
-        {'value': '', 'label': 'none'},
-        {'value': 'bearer', 'label': 'bearer (env var)'},
-        {'value': 'oauth', 'label': 'oauth (per-user browser connect)'},
-      ],
-    ) }}
-
-    <label for="new-auth-secret-env" style="margin-top:16px;">Auth secret env var — Advanced (legacy)</label>
-    <input id="new-auth-secret-env" type="text" placeholder="e.g. ACME_CRM_TOKEN" autocomplete="off">
-    <div class="help">Advanced/legacy: names a host env var holding the secret. Prefer the vault — set the secret value on the source detail page so no host env var is needed.</div>
-
-    <div class="modal-actions">
-      {{ ds.button('Cancel', variant='secondary', attrs='data-close-modal="create-modal"') }}
-      {{ ds.button('Register', variant='primary', id='confirm-create-btn') }}
+      <div><a href="/admin/mcp-sources/new">Add an MCP source</a> to connect your first server.</div>
     </div>
   </div>
 </div>
@@ -273,17 +188,6 @@ const API = "/api/admin/mcp-sources";
 // ds_dropdown.js's own selectItem() — that module only reacts to clicks on
 // its own menu items, so a direct .value= assignment would otherwise leave
 // the custom dropdown showing a stale label under the paper theme.
-function syncDropdown(selectId, value) {
-  const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${selectId}"]`);
-  if (!host) return;
-  const label = host.querySelector(".ds-dropdown-btn-label");
-  host.querySelectorAll('[role="menuitemradio"]').forEach((item) => {
-    const match = item.dataset.value === value;
-    item.classList.toggle("is-selected", match);
-    item.setAttribute("aria-checked", match ? "true" : "false");
-    if (match && label) label.textContent = item.textContent.trim();
-  });
-}
 
 function esc(s) {
   const d = document.createElement("div");
@@ -293,19 +197,6 @@ function esc(s) {
 
 // Parse a KEY=VALUE-per-line textarea into an object. Blank lines and
 // lines without an `=` are skipped; only the first `=` splits the pair.
-function parseEnvText(raw) {
-  const env = {};
-  (raw || "").split("\n").forEach(line => {
-    const t = line.trim();
-    if (!t) return;
-    const i = t.indexOf("=");
-    if (i < 1) return;
-    const k = t.slice(0, i).trim();
-    const v = t.slice(i + 1).trim();
-    if (k) env[k] = v;
-  });
-  return env;
-}
 
 function toast(msg, kind = "") {
   const el = document.createElement("div");
@@ -332,13 +223,6 @@ document.addEventListener("keydown", e => {
 });
 
 // Transport selector — show/hide the fields appropriate for the chosen transport.
-function syncTransportFields() {
-  const t = document.getElementById("new-transport").value;
-  document.querySelectorAll(".transport-fields").forEach(el => {
-    el.classList.toggle("is-active", el.dataset.transport === t);
-  });
-}
-document.getElementById("new-transport").addEventListener("change", syncTransportFields);
 
 // State
 let allSources = [];
@@ -407,78 +291,6 @@ document.getElementById("mcp-search").addEventListener("input", (e) => {
   renderSources();
 });
 
-document.getElementById("open-create-btn").addEventListener("click", () => {
-  // Reset form
-  document.getElementById("new-name").value = "";
-  document.getElementById("new-transport").value = "stdio";
-  syncDropdown("new-transport", "stdio");
-  document.getElementById("new-command").value = "";
-  document.getElementById("new-args").value = "";
-  document.getElementById("new-url-http").value = "";
-  document.getElementById("new-url-sse").value = "";
-  document.getElementById("new-auth-method").value = "";
-  syncDropdown("new-auth-method", "");
-  document.getElementById("new-auth-secret-env").value = "";
-  document.getElementById("new-scope").value = "shared";
-  syncDropdown("new-scope", "shared");
-  document.getElementById("new-env").value = "";
-  syncTransportFields();
-  openModal("create-modal");
-});
-
-document.getElementById("confirm-create-btn").addEventListener("click", async () => {
-  const btn = document.getElementById("confirm-create-btn");
-  const name = document.getElementById("new-name").value.trim();
-  const transport = document.getElementById("new-transport").value;
-  if (!name) { toast("Display name is required", "error"); return; }
-  const body = { name, transport };
-  if (transport === "stdio") {
-    body.command = document.getElementById("new-command").value.trim();
-    const argsRaw = document.getElementById("new-args").value;
-    body.args = argsRaw.split("\n").map(s => s.trim()).filter(Boolean);
-    if (!body.command) { toast("Command is required for stdio transport", "error"); return; }
-  } else if (transport === "http") {
-    body.url = document.getElementById("new-url-http").value.trim();
-    if (!body.url) { toast("URL is required for http transport", "error"); return; }
-  } else if (transport === "sse") {
-    body.url = document.getElementById("new-url-sse").value.trim();
-    if (!body.url) { toast("URL is required for sse transport", "error"); return; }
-  }
-  const authMethod = document.getElementById("new-auth-method").value;
-  const authSecretEnv = document.getElementById("new-auth-secret-env").value.trim();
-  if (authMethod) body.auth_method = authMethod;
-  if (authSecretEnv) body.auth_secret_env = authSecretEnv;
-  body.scope = document.getElementById("new-scope").value || "shared";
-  const env = parseEnvText(document.getElementById("new-env").value);
-  if (Object.keys(env).length) body.env = env;
-
-  btn.disabled = true;
-  try {
-    const r = await fetch(API, {
-      method: "POST", credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (r.ok) {
-      const created = await r.json();
-      toast("MCP source registered", "success");
-      closeModal("create-modal");
-      await loadSources();
-      // Auto-redirect to the new source detail so the admin can introspect.
-      if (created && created.id) {
-        window.location.href = `/admin/mcp-sources/${encodeURIComponent(created.id)}`;
-      }
-    } else {
-      let detail = r.statusText;
-      try { detail = (await r.json()).detail || detail; } catch (_) {}
-      toast("Register failed: " + detail, "error");
-    }
-  } catch (e) {
-    toast("Register failed: " + e.message, "error");
-  } finally {
-    btn.disabled = false;
-  }
-});
 
 document.getElementById("mcp-tbody").addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-act]");

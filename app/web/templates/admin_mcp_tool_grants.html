@@ -256,7 +256,7 @@ function renderGroups() {
       <input type="checkbox" ${grantedIds.has(g.id) ? "checked" : ""} aria-label="Grant ${esc(g.name)}">
       <div class="gr-group-meta">
         <span class="gr-group-name">
-          ${esc(g.name)}
+          ${AgnesKindGlyph.groupGlyph()}${esc(g.name)}
           <span class="gr-origin-chip gr-origin-${esc(origin)}">${esc(origin.replace("_", " "))}</span>
         </span>
         ${g.description ? `<span class="gr-group-desc">${esc(g.description)}</span>` : ""}

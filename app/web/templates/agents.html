@@ -124,7 +124,7 @@
 <div class="ag-head" id="ag-page-head">
   <div>
     <h1>Agents</h1>
-    <p class="lede">Describe what you need and the builder configures it — grounded in anything you can access: governed data, memory, and your files for what it knows, plus any plugin or skill for what it can do. Try it before you ship it. Everything here respects your existing permissions.</p>
+    <p class="lede">An agent is a narrower version of the chat in your sidebar: one role, only the data you give it, only the tools you enable — and never more than you can reach yourself. Describe what you need and the builder configures it, grounded in anything you can access. Try it in Preview before you mark it ready.</p>
   </div>
 </div>
 {# The "not wired to the surfaces yet" caveat is gone: agents run from here now
@@ -371,7 +371,7 @@
         '<div class="ag-empty">' +
           '<span class="ag-ava">' + AVA_SVG + '</span>' +
           '<h3>No agents yet</h3>' +
-          '<p>Build your first agent — pick what it knows from your stack, what it can do from your plugins, and where it runs.</p>' +
+          '<p>Build your first agent — pick what it knows from what you have, what it can do from your plugins, and where it runs.</p>' +
           '<button type="button" class="cc-btn cc-btn--primary" data-ag-new>+ Build an agent</button>' +
         '</div>';
       return;
@@ -575,9 +575,12 @@
   }
 
   function identityBody(a) {
-    return '<label class="ag-field"><span>Name</span>' +
-        '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
-      '<label class="ag-field"><span>Role <em>— one line</em></span>' +
+    /* Role first, name LAST (TCRD-205). The name is the least interesting
+       decision here and the hardest to make before you have said what the
+       agent is for — so the form opens on the thing itself and closes on
+       what to call it. Safe to reorder: the section summary already renders
+       `Unnamed`, so an un-named draft was never gated. */
+    return '<label class="ag-field"><span>Role <em>— one line</em></span>' +
         '<input type="text" data-ag-field="role" value="' + esc(a.role) + '" placeholder="e.g. Answers revenue questions from our governed metrics." maxlength="90" autocomplete="off"></label>' +
       '<label class="ag-field"><span>Instructions <em>— what it should do, and what it should avoid</em></span>' +
         '<textarea rows="4" data-ag-field="instructions" placeholder="e.g. Always use canonical metric definitions. Cite the table you queried. Never invent numbers.">' + esc(a.instructions) + '</textarea></label>' +
@@ -587,6 +590,19 @@
         }).join('') + '</div></div>' +
       '<label class="ag-field"><span>Greeting</span>' +
         '<textarea rows="2" data-ag-field="greeting" placeholder="Hi, I&#39;m …">' + esc(a.greeting) + '</textarea></label>' +
+      '<label class="ag-field"><span>Name <em>— last, once you know what it is</em></span>' +
+        '<input type="text" data-ag-field="name" value="' + esc(a.name) + '" placeholder="e.g. Revenue Analyst" maxlength="40" autocomplete="off"></label>' +
+      /* The slug is this agent's public address — how the agent API, the CLI
+         and any script reach it. It follows the name while the agent is a
+         draft and FREEZES the moment it is marked ready; the shared module
+         says so and adds that the builder "shows it nowhere". It does now. */
+      (a.slug
+        ? '<div class="ag-field"><span>Address <em>— how scripts and the CLI reach it</em></span>' +
+            '<div class="ag-bnd"><div class="ag-bnd-row"><span class="ag-bnd-k">' + esc(a.slug) + '</span>' +
+            '<span class="ag-bnd-v">' + (a.status === 'ready'
+              ? 'Fixed — marking ready froze it'
+              : 'Still follows the name, until you mark it ready') + '</span></div></div></div>'
+        : '') +
       '<div class="ag-note">Instructions replace the default analyst prompt. Agnes still appends its data-access rails (<code>agnes catalog</code> → <code>schema</code> → <code>query</code>), so you don’t need to restate them — write the persona and its task.</div>';
   }
 
@@ -612,13 +628,28 @@
     '</div>';
   }
 
-  /* An attached id with nothing in the pool to describe it — see the callers. */
+  /* An attached id with nothing in the pool to describe it — see the callers.
+
+     Deliberately NOT resolved to a name, even though the id→name projection
+     exists and every other surface now uses it. The pool IS what this caller
+     can currently see, so an id missing from it names something they cannot
+     reach — and looking it up would print the name of a resource that has been
+     un-shared from them, on their own page, as a side effect of an old
+     attachment. The id they attached themselves is the most this row can
+     honestly say.
+
+     What it CAN do is name the two things that put a row here, because they
+     take opposite actions: the resource was deleted (remove the row) or it was
+     un-shared from you (ask an admin, and removing it loses the attachment).
+     Without that the row was a dead end with one button on it. */
   function unknownRow(id, attr) {
     return '<div class="ag-row">' +
       '<div class="ag-row-body">' +
         '<div class="ag-row-name"><code>' + esc(id) + '</code>' +
           '<span class="ag-kind ag-kind--unknown">Unavailable</span></div>' +
-        '<div class="ag-row-desc">Attached, but not in what you can currently see.</div>' +
+        '<div class="ag-row-desc">Attached, but not in what you can currently see — it was either ' +
+          'deleted, or it is no longer shared with you. Your agent cannot use it either way. If you ' +
+          'still need it, ask an admin to share it back before you remove it here.</div>' +
       '</div>' +
       '<button type="button" class="ag-tglbtn ag-tglbtn--rm" ' + attr + '="' + esc(id) + '">Remove</button>' +
     '</div>';
@@ -697,7 +728,7 @@
       '<div class="ag-row-body">' +
         '<div class="ag-row-name">' + esc(p.name) +
           '<span class="ag-kind ag-kind--' + esc(type) + '">' + esc(TYPE_LABEL[type] || type) + '</span>' +
-          (mode === 'pick' && p.installed ? '<span class="ag-instack">In your stack</span>' : '') +
+          (mode === 'pick' && p.installed ? '<span class="ag-instack">Agents can use this</span>' : '') +
           (p.category ? '<span class="ag-row-meta">' + esc(p.category) + '</span>' : '') + '</div>' +
         '<div class="ag-row-desc">' + esc(p.description || '') + '</div>' +
       '</div>' +
@@ -761,7 +792,7 @@
     },
     capabilities: {
       title: 'Add a plugin or skill',
-      sub: 'Any plugin or skill available to you — not only what is in your stack.',
+      sub: 'Any plugin or skill available to you — not only the ones your agents already use.',
       search: 'Search plugins & skills…',
       foot: 'Browse the full set in the <a href="/catalog?kind=plugins">Catalog</a>.'
     }
@@ -842,12 +873,27 @@
   }
 
   function boundariesBody() {
+    var a = current() || {};
+    /* "Scoped to each user's permissions" was false, and false in the
+       direction that matters: scope resolves against the GRANTER's access,
+       defaulting to the owner, and the broker deliberately runs a turn under
+       the owner-derived principal "regardless of who mentioned the bot". An
+       owner who read the old line and then bound this agent to a Slack
+       channel had been told the opposite of what happens. Model and budget
+       read from the row instead of being asserted — both are settable
+       through the API and were displayed as unset whatever they held. */
     return '<div class="ag-bnd">' +
-        '<div class="ag-bnd-row"><span class="ag-bnd-k">Model</span><span class="ag-bnd-v">Workspace default</span></div>' +
-        '<div class="ag-bnd-row"><span class="ag-bnd-k">Data access</span><span class="ag-bnd-v">Scoped to each user’s permissions</span></div>' +
+        '<div class="ag-bnd-row"><span class="ag-bnd-k">Model</span><span class="ag-bnd-v">' +
+          esc(a.model || 'Workspace default') + '</span></div>' +
+        '<div class="ag-bnd-row"><span class="ag-bnd-k">Monthly tokens</span><span class="ag-bnd-v">' +
+          (a.token_budget_monthly ? esc(String(a.token_budget_monthly)) : 'No cap') + '</span></div>' +
+        '<div class="ag-bnd-row"><span class="ag-bnd-k">Data access</span>' +
+          '<span class="ag-bnd-v">Your access, narrowed to what you attach above</span></div>' +
         '<div class="ag-bnd-row"><span class="ag-bnd-k">Sensitive actions</span><span class="ag-bnd-v">Require confirmation</span></div>' +
       '</div>' +
-      '<div class="ag-note">Inherited from the workspace — you build within them. Ask an admin to change a boundary.</div>';
+      '<div class="ag-note">This agent runs on <strong>your</strong> permissions, never anyone else’s — including ' +
+      'when a teammate talks to it. It reaches only what you attached under Data &amp; resources, and it loses that ' +
+      'the moment you do.</div>';
   }
 
   /* ── Schedules — unattended runs on a cadence. CRUD rides the agent-schedules
@@ -1105,6 +1151,8 @@
      `history` each turn). A reload therefore loses the conversation but never
      the agent: the configuration is what was persisted. */
   var conv = [];            // [{ role: 'user' | 'assistant', text }]
+  var convKept = [];        // fields the last reply left alone because they were the owner's
+  var llmUnavailable = false;  // latched once a turn says this instance has no model
   var convBusy = false;
   var convErr = null;
   var convDraft = '';       // survives re-renders triggered from the config panel
@@ -1160,21 +1208,47 @@
       '“something that looks up policies from the handbook.”\n\nWhat would you like it to do?';
   }
 
+  /* What the last reply left alone, in the owner's words — the page's own
+     account, beside the model's. */
+  var FIELD_WORDS = {
+    name: 'the name', role: 'the role', instructions: 'the instructions',
+    greeting: 'the greeting', tone: 'the tone',
+  };
+  function keptNote() {
+    if (!convKept.length) return '';
+    var w = convKept.map(function (k) { return FIELD_WORDS[k] || k; });
+    var list = w.length < 2 ? w[0] : w.slice(0, -1).join(', ') + ' and ' + w[w.length - 1];
+    return '<p class="sk-patch-note">Left ' + BuilderShell.esc(list) +
+      ' as you had ' + (w.length > 1 ? 'them' : 'it') + '.</p>';
+  }
+
   function convHtml() {
+    /* With no model configured the pane used to show a greeting, a red error
+       under it, and a live composer — all of which fail identically. */
+    if (llmUnavailable) {
+      return BuilderShell.noModelNotice('configuration on the right') +
+        BuilderShell.conversation({ id: 'ag-conv', rows: conv, busy: false, err: null });
+    }
     return BuilderShell.conversation({
       id: 'ag-conv',
       rows: [{ role: 'assistant', text: openingMessage() }].concat(conv),
       busy: convBusy,
       err: convErr,
-    });
+    }) + keptNote();
   }
 
   /* Chips are a create-tab affordance only, and never while a turn is in
      flight — a suggestion you cannot click is noise. */
   function composerHtml(kind, value, placeholder, busy) {
     return BuilderShell.composer({
-      kind: kind, value: value, placeholder: placeholder, busy: busy,
-      chips: (kind === 'create' && !convBusy) ? convChips : [],
+      kind: kind, value: value, busy: busy,
+      // readOnly, not disabled: a disabled textarea is unselectable in Chrome,
+      // so a restored message would be visible and impossible to copy out.
+      readOnly: kind === 'create' && llmUnavailable,
+      placeholder: (kind === 'create' && llmUnavailable)
+        ? 'No AI is configured here — fill the configuration on the right by hand.'
+        : placeholder,
+      chips: (kind === 'create' && !convBusy && !llmUnavailable) ? convChips : [],
     });
   }
 
@@ -1254,10 +1328,25 @@
      Existing: Save, the status toggle, and Delete. "← All agents" leaves
      without saving. Delete is the destructive one and stays furthest from
      Save, which is the button being aimed at. */
+  /* What Mark ready is waiting for, in the owner's words and from the same
+     inputs the gate reads — so a dark button and its explanation cannot name
+     different things. It used to be enabled always: a blank, roleless agent
+     could be published into every colleague's picker, and marking ready also
+     FREEZES the agent's public address for the API and the CLI. */
+  function readyBlocker(a) {
+    var want = [];
+    if (!(a.name || '').trim()) want.push('a name');
+    if (!(a.role || a.instructions || '').trim()) want.push('a role');
+    if (!want.length) return '';
+    return 'Needs ' + (want.length > 1 ? want.join(' and ') : want[0]) + ' before it can go in the agent picker.';
+  }
+
   function headActionsHtml(a) {
     var dirty = isDirty();
     var busy = saving ? ' disabled' : '';
-    var mark = '<button type="button" class="cc-btn cc-btn--primary" data-ag-status' + busy + '>' +
+    var blocked = a.status === 'ready' ? '' : readyBlocker(a);
+    var markOff = busy || (blocked ? ' disabled title="' + esc(blocked) + '"' : '');
+    var mark = '<button type="button" class="cc-btn cc-btn--primary" data-ag-status' + markOff + '>' +
       (a.status === 'ready' ? 'Back to draft' : 'Mark ready') + '</button>';
     if (isNewAgent) {
       return statusPill(a) +
@@ -1268,7 +1357,7 @@
       (dirty ? '<span class="ag-unsaved" title="Not saved yet">Unsaved changes</span>' : '') +
       // Same reason as the list card: the default agent has no delete.
       (a.is_default ? '' : '<button type="button" class="cc-btn ag-del-btn" data-ag-del="' + esc(a.id) + '">Delete</button>') +
-      '<button type="button" class="cc-btn" data-ag-status' + busy + '>' +
+      '<button type="button" class="cc-btn" data-ag-status' + markOff + '>' +
         (a.status === 'ready' ? 'Revert to draft' : 'Mark ready') + '</button>' +
       '<button type="button" class="cc-btn cc-btn--primary" data-ag-save' +
         (saving || !dirty ? ' disabled' : '') + '>' + (saving ? 'Saving…' : 'Save') + '</button>';
@@ -1362,12 +1451,15 @@
     var a = current(); if (!a || convBusy) return;
     conv.push({ role: 'user', text: text });
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    /* What the panel held when this turn was dispatched. A field the owner
+       edits while it is in flight belongs to them, not to the reply. */
+    var sent = {};
+    EDITABLE.forEach(function (k) { sent[k] = a[k]; });
     renderConvPane();
-    fetch('/api/agents/' + encodeURIComponent(a.id) + '/builder/turn', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({
+    BuilderShell.turn({
+      url: '/api/agents/' + encodeURIComponent(a.id) + '/builder/turn',
+      message: text,
+      body: {
         message: text,
         history: conv.slice(0, -1),
         /* Editing is explicit now, so a turn must NOT write: it returns the
@@ -1386,17 +1478,10 @@
         plugin_candidates: (plugins || []).slice(0, 60).map(function (p) {
           return { id: String(p.id), name: String(p.name || ''), description: String(p.description || '').slice(0, 400) };
         })
-      })
-    }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (body) {
-        if (!r.ok) {
-          var d = (body && body.detail) || {};
-          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
-        }
-        return body;
-      });
+      },
     }).then(function (body) {
-      conv.push({ role: 'assistant', text: body.reply || '' });
+      conv.push({ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') });
+      conv = BuilderShell.trimHistory(conv);
       convEngine = body.engine || null;
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
       var patch = body.patch || {};
@@ -1408,18 +1493,36 @@
            agent does not have — is not lost, only moved: an unsaved patch
            grants nothing at all, and Save re-derives the enforced scope
            server-side and returns the row the panel then reflects. */
-        EDITABLE.forEach(function (k) {
-          if (Object.prototype.hasOwnProperty.call(patch, k)) a[k] = patch[k];
-        });
+        /* Skip what the owner owns: a field they are focused in, or one they
+           changed since this turn went out. Writing over it took their caret
+           and, for Instructions, their words. */
         touched = {};
-        Object.keys(patch).forEach(function (k) { touched[k] = true; });
+        var kept = [];
+        EDITABLE.forEach(function (k) {
+          if (!Object.prototype.hasOwnProperty.call(patch, k)) return;
+          var el = document.querySelector('[data-ag-field="' + k + '"]');
+          var mine = (el && document.activeElement === el) ||
+            JSON.stringify(a[k] === undefined ? null : a[k]) !==
+            JSON.stringify(sent[k] === undefined ? null : sent[k]);
+          if (mine) { kept.push(k); return; }
+          a[k] = patch[k];
+          touched[k] = true;
+        });
+        convKept = kept;
         touch();
         renderCfgPane();
         syncPreview();
       }
     }).catch(function (err) {
       console.error('agents: builder turn failed', err);
+      if (err.kind === 'llm_unavailable') llmUnavailable = true;
       convErr = err.message;
+      /* Hand the message back. It was cleared optimistically and, on a
+         failure, existed nowhere the owner could retrieve it. */
+      if (text) {
+        convDraft = text;
+        if (conv.length && conv[conv.length - 1].role === 'user') conv.pop();
+      }
     }).finally(function () {
       convBusy = false;
       renderConvPane();

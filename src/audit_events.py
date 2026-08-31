@@ -565,6 +565,16 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin re-attached a detached semantic model to its source.",
     ),
+    # The `agnes pull` semantic-cache delivery channel. Minted here because
+    # the wave-2 read-posture ratchet (#1802) reached this branch on the
+    # merge and a bundle read is data content leaving the server — the same
+    # call `memory.bundle_download` and `store.bundle_download` already make.
+    "semantic_model.bundle_download": AuditEvent(
+        "semantic_model.bundle_download",
+        "read",
+        "Someone pulled the RBAC-scoped bundle of readable semantic models "
+        "(the local `<workspace>/semantic/` cache `agnes pull` renders).",
+    ),
     "semantic_model.link_package": AuditEvent(
         "semantic_model.link_package",
         "mutation",
@@ -575,6 +585,19 @@ CATALOG: dict[str, AuditEvent] = {
         "semantic_model.unlink_package",
         "mutation",
         "An admin unlinked a semantic model from a Data Package.",
+    ),
+    # The coverage-tag pair writes no row of its own; these two exist so the
+    # fallback middleware emits a real domain action for it, since Wave 2 —
+    # Task 1 retired the "fallback" posture literal this branch declared.
+    "semantic_coverage_tag.create": AuditEvent(
+        "semantic_coverage_tag.create",
+        "mutation",
+        "An admin tagged a semantic-layer scope for the cross-domain coverage report.",
+    ),
+    "semantic_coverage_tag.delete": AuditEvent(
+        "semantic_coverage_tag.delete",
+        "mutation",
+        "An admin removed a semantic-layer coverage tag.",
     ),
     "semantic_health_mute.create": AuditEvent(
         "semantic_health_mute.create",
@@ -595,6 +618,583 @@ CATALOG: dict[str, AuditEvent] = {
         "semantic_feedback.resolved",
         "mutation",
         "An admin resolved a semantic-layer feedback report.",
+    ),
+    # -- Wave 2 -- Task 1: declarative action emission -----------------------
+    # 127 actions minted while flipping the 135 mutating routes that were
+    # declared "fallback" in src/audit_posture.py into their real domain
+    # action; the other 8 reuse an action already cataloged above (one shared
+    # pre-existing action, "initial_workspace.sync", plus 7 duplicate mappings
+    # of a newly-minted action onto more than one route -- see
+    # src/audit_posture.py for the full route -> action table.
+    "table_registry.docs_update": AuditEvent(
+        "table_registry.docs_update", "mutation", "A registered table's admin-authored docs were updated."
+    ),
+    "table_registry.discover_and_register": AuditEvent(
+        "table_registry.discover_and_register",
+        "mutation",
+        "Auto-discovery registered a batch of matching tables at once.",
+    ),
+    "table_registry.register_precheck": AuditEvent(
+        "table_registry.register_precheck",
+        "read",
+        "An admin dry-ran the register-table validation without registering anything.",
+    ),
+    "access_policy.compile": AuditEvent(
+        "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
+    ),
+    "data_source.bigquery_connection_test": AuditEvent(
+        "data_source.bigquery_connection_test",
+        "read",
+        "An admin ran the configured BigQuery connection's health probe.",
+    ),
+    "chat.session.admin_kill": AuditEvent(
+        "chat.session.admin_kill", "mutation", "An admin force-terminated another user's live chat session."
+    ),
+    "chat.secrets.test": AuditEvent(
+        "chat.secrets.test", "read", "An admin tested the configured chat-engine secrets' connectivity."
+    ),
+    "chat.session.tail_ticket_issue": AuditEvent(
+        "chat.session.tail_ticket_issue",
+        "mutation",
+        "An admin issued a short-lived ticket to tail a live chat session's debug stream.",
+    ),
+    "contributed_skill.delete": AuditEvent(
+        "contributed_skill.delete",
+        "mutation",
+        "A contributed-skill plugin was removed from the contributed marketplace.",
+    ),
+    "contributed_skill.create": AuditEvent(
+        "contributed_skill.create", "mutation", "A skill was published to the contributed marketplace."
+    ),
+    "datasource.gws_credentials_validate": AuditEvent(
+        "datasource.gws_credentials_validate",
+        "read",
+        "An admin validated a Google Workspace service-account credential before saving it.",
+    ),
+    "diagnostics.new_instance_check": AuditEvent(
+        "diagnostics.new_instance_check", "system", "An admin ran the new-instance deployment-gate doctor checks."
+    ),
+    "data_source.keboola_connection_test": AuditEvent(
+        "data_source.keboola_connection_test", "read", "An admin ran the configured Keboola connection's health probe."
+    ),
+    "mcp_source.oauth_register": AuditEvent(
+        "mcp_source.oauth_register",
+        "mutation",
+        "An MCP source's OAuth client was dynamically registered with its authorization server.",
+    ),
+    "mcp_source.oauth_client_update": AuditEvent(
+        "mcp_source.oauth_client_update", "mutation", "An MCP source's OAuth client credentials were updated."
+    ),
+    "sharepoint_connection.scope_remove": AuditEvent(
+        "sharepoint_connection.scope_remove",
+        "mutation",
+        "A confirmed SharePoint scope (site/library/folder) was removed from a connection.",
+    ),
+    "sharepoint_connection.scope_confirm": AuditEvent(
+        "sharepoint_connection.scope_confirm",
+        "mutation",
+        "An admin confirmed a SharePoint site/library/folder as an ingested scope.",
+    ),
+    "source_connection.chat_tools_disable": AuditEvent(
+        "source_connection.chat_tools_disable",
+        "mutation",
+        "A source connection's derived chat tools were disabled and removed.",
+    ),
+    "source_connection.chat_tools_enable": AuditEvent(
+        "source_connection.chat_tools_enable",
+        "mutation",
+        "A source connection's tables were registered as derived chat tools.",
+    ),
+    "sso.client_secret_clear": AuditEvent("sso.client_secret_clear", "mutation", "The SSO client secret was cleared."),
+    "sso.config_delete": AuditEvent("sso.config_delete", "mutation", "The SSO configuration was deleted."),
+    "sso.identity_unlink": AuditEvent(
+        "sso.identity_unlink", "mutation", "An admin unlinked a user's external SSO identity."
+    ),
+    "sso.test_config": AuditEvent(
+        "sso.test_config", "read", "An admin tested the SSO configuration's discovery document."
+    ),
+    "sso.client_secret_set": AuditEvent("sso.client_secret_set", "mutation", "The SSO client secret was set."),
+    "sso.config_update": AuditEvent("sso.config_update", "mutation", "The SSO configuration was updated."),
+    "agent.builder_turn": AuditEvent(
+        "agent.builder_turn", "mutation", "An admin exchanged one turn with the agent-profile builder assistant."
+    ),
+    "agent_schedules.delete": AuditEvent(
+        "agent_schedules.delete", "mutation", "A scheduled agent invocation was deleted."
+    ),
+    "agent_schedules.update": AuditEvent(
+        "agent_schedules.update", "mutation", "A scheduled agent invocation was updated."
+    ),
+    "agent_schedules.create": AuditEvent(
+        "agent_schedules.create", "mutation", "A scheduled agent invocation was created."
+    ),
+    "agent.delete": AuditEvent("agent.delete", "mutation", "An agent profile was deleted."),
+    "agent.create": AuditEvent("agent.create", "mutation", "An agent profile was created."),
+    "agent.token_create": AuditEvent("agent.token_create", "mutation", "A PAT scoped to an agent profile was minted."),
+    "agent.update": AuditEvent("agent.update", "mutation", "An agent profile's configuration was updated."),
+    "agent.scope_update": AuditEvent(
+        "agent.scope_update", "mutation", "An agent profile's authority scope was updated."
+    ),
+    "metadata_cache.refresh_table": AuditEvent(
+        "metadata_cache.refresh_table",
+        "mutation",
+        "A single remote table's metadata cache entry was refreshed on demand.",
+    ),
+    "cache_warmup.run": AuditEvent("cache_warmup.run", "mutation", "An admin triggered a catalog cache-warmup run."),
+    "catalog.profile_refresh": AuditEvent(
+        "catalog.profile_refresh", "mutation", "A table's data profile was recomputed on demand."
+    ),
+    "chat.journey_update": AuditEvent(
+        "chat.journey_update", "mutation", "A caller's onboarding/journey progress was updated."
+    ),
+    "chat.session.pin_set": AuditEvent("chat.session.pin_set", "mutation", "A chat session's pinned flag was changed."),
+    "chat.session.title_update": AuditEvent(
+        "chat.session.title_update", "mutation", "A chat session's title was changed."
+    ),
+    "chat.copresence.fork": AuditEvent(
+        "chat.copresence.fork", "mutation", "A shared chat session was forked into the caller's own copy."
+    ),
+    "chat.session_file.save_artefact": AuditEvent(
+        "chat.session_file.save_artefact",
+        "mutation",
+        "A chat session's engine-side file was saved as a permanent chat artefact.",
+    ),
+    "chat.upload": AuditEvent(
+        "chat.upload", "mutation", "A file was uploaded to chat and registered as a workspace table."
+    ),
+    "workspace_prompt_template.reset": AuditEvent(
+        "workspace_prompt_template.reset",
+        "mutation",
+        "The analyst-workspace CLAUDE.md prompt template was reset to its default.",
+    ),
+    "workspace_prompt_template.preview": AuditEvent(
+        "workspace_prompt_template.preview",
+        "read",
+        "An admin previewed the rendered analyst-workspace CLAUDE.md prompt template.",
+    ),
+    "workspace_prompt_template.update": AuditEvent(
+        "workspace_prompt_template.update", "mutation", "The analyst-workspace CLAUDE.md prompt template was updated."
+    ),
+    "collection.delete": AuditEvent("collection.delete", "mutation", "A knowledge collection was deleted."),
+    "collection.file_delete": AuditEvent(
+        "collection.file_delete", "mutation", "A file was deleted from a knowledge collection."
+    ),
+    "collection.create": AuditEvent("collection.create", "mutation", "A knowledge collection was created."),
+    "collection.file_add": AuditEvent(
+        "collection.file_add", "mutation", "A file was uploaded into a knowledge collection."
+    ),
+    "collection.file_move": AuditEvent(
+        "collection.file_move", "mutation", "A file was moved between knowledge collections."
+    ),
+    "collection.file_reingest": AuditEvent(
+        "collection.file_reingest", "mutation", "A knowledge collection file was queued for re-ingestion."
+    ),
+    "setup_token.revoke": AuditEvent(
+        "setup_token.revoke", "mutation", "A self-service Cowork setup token was revoked."
+    ),
+    "setup_token.exchange": AuditEvent(
+        "setup_token.exchange", "auth", "A self-service Cowork setup token was exchanged for a session."
+    ),
+    "cowork_bundle.generate": AuditEvent(
+        "cowork_bundle.generate",
+        "mutation",
+        "A personal Cowork onboarding bundle (credentials + skills) was generated.",
+    ),
+    "data_app.git_fetch": AuditEvent(
+        "data_app.git_fetch", "read", "A data app's own git repo was fetched (clone/pull) over smart-HTTP."
+    ),
+    "data_app.proxy_mutation": AuditEvent(
+        "data_app.proxy_mutation",
+        "mutation",
+        "A non-GET request was proxied into a running data app's own container via the legacy path-based proxy.",
+    ),
+    "db_migration.cancel": AuditEvent(
+        "db_migration.cancel", "mutation", "An admin cancelled an in-progress app-state database migration job."
+    ),
+    "db_migration.start": AuditEvent(
+        "db_migration.start", "mutation", "An admin started an app-state database migration job."
+    ),
+    "store.entity_builder_preview_agent": AuditEvent(
+        "store.entity_builder_preview_agent",
+        "mutation",
+        "An admin previewed the review-agent's response while building a store entity.",
+    ),
+    "store.entity_builder_turn": AuditEvent(
+        "store.entity_builder_turn", "mutation", "An admin exchanged one turn with the store-entity builder assistant."
+    ),
+    "job.enqueue": AuditEvent("job.enqueue", "mutation", "A durable worker-runtime job was enqueued."),
+    "kai.session_create": AuditEvent("kai.session_create", "mutation", "A Kai chat engine session was created."),
+    "kai.tickets_issue": AuditEvent(
+        "kai.tickets_issue", "mutation", "Short-lived Kai session egress tickets were (re)issued."
+    ),
+    "mcp_source.builder_turn": AuditEvent(
+        "mcp_source.builder_turn", "mutation", "An admin exchanged one turn with the MCP-source builder assistant."
+    ),
+    "mcp_source.oauth_disconnect": AuditEvent(
+        "mcp_source.oauth_disconnect", "mutation", "An MCP source's stored OAuth connection was disconnected."
+    ),
+    "mcp_streamable.session_delete": AuditEvent(
+        "mcp_streamable.session_delete", "mutation", "An MCP streamable-HTTP session was terminated."
+    ),
+    "mcp_streamable.request": AuditEvent(
+        "mcp_streamable.request", "system", "A JSON-RPC request was sent over the MCP streamable-HTTP transport."
+    ),
+    "corporate_memory.undismiss": AuditEvent(
+        "corporate_memory.undismiss", "mutation", "A caller un-dismissed a previously dismissed corporate-memory item."
+    ),
+    "corporate_memory.create": AuditEvent(
+        "corporate_memory.create", "mutation", "A corporate-memory knowledge item was submitted."
+    ),
+    "corporate_memory.contradiction_create": AuditEvent(
+        "corporate_memory.contradiction_create",
+        "mutation",
+        "An admin manually recorded a corporate-memory contradiction.",
+    ),
+    "corporate_memory.dismiss": AuditEvent(
+        "corporate_memory.dismiss", "mutation", "A caller dismissed a corporate-memory item from their own feed."
+    ),
+    "corporate_memory.toggle_personal": AuditEvent(
+        "corporate_memory.toggle_personal", "mutation", "A caller toggled a corporate-memory item's personal-only flag."
+    ),
+    "corporate_memory.vote": AuditEvent(
+        "corporate_memory.vote", "mutation", "A caller voted on a corporate-memory item."
+    ),
+    "memory_mining.run": AuditEvent(
+        "memory_mining.run", "mutation", "An admin triggered an ad-hoc corporate-memory mining run."
+    ),
+    "memory_mining.consent_set": AuditEvent(
+        "memory_mining.consent_set", "mutation", "A user set their corporate-memory mining consent preference."
+    ),
+    "table_metadata.save": AuditEvent(
+        "table_metadata.save", "mutation", "An admin saved hand-authored metadata for a registered table."
+    ),
+    "table_metadata.push": AuditEvent(
+        "table_metadata.push", "mutation", "A table's metadata was pushed back to its upstream source system."
+    ),
+    "metric_definition.delete": AuditEvent(
+        "metric_definition.delete", "mutation", "A business metric definition was deleted."
+    ),
+    "metric_definition.upsert": AuditEvent(
+        "metric_definition.upsert", "mutation", "A business metric definition was created or updated."
+    ),
+    "metric_definition.import": AuditEvent(
+        "metric_definition.import", "mutation", "Business metric definitions were bulk-imported from a directory."
+    ),
+    "my_stack.curated_toggle": AuditEvent(
+        "my_stack.curated_toggle",
+        "mutation",
+        "A caller enabled or disabled a curated-marketplace plugin in their own stack.",
+    ),
+    "news_previewed": AuditEvent("news_previewed", "read", "An admin previewed a news banner draft's rendered output."),
+    "observability_view.delete": AuditEvent(
+        "observability_view.delete", "mutation", "A saved observability view was deleted."
+    ),
+    "observability_view.create": AuditEvent(
+        "observability_view.create", "mutation", "A caller saved a new observability view."
+    ),
+    "ontology_draft.delete": AuditEvent("ontology_draft.delete", "mutation", "An ontology draft was deleted."),
+    "ontology_draft.create": AuditEvent("ontology_draft.create", "mutation", "An ontology draft was created."),
+    "ontology_draft.import": AuditEvent(
+        "ontology_draft.import", "mutation", "Text was imported into an ontology draft via the extraction pipeline."
+    ),
+    "ontology_draft.save": AuditEvent("ontology_draft.save", "mutation", "An ontology draft was saved/promoted."),
+    "ontology_draft.dry_run": AuditEvent(
+        "ontology_draft.dry_run", "read", "An admin dry-ran ontology extraction without persisting a draft."
+    ),
+    "ontology_draft.update": AuditEvent("ontology_draft.update", "mutation", "An ontology draft was updated."),
+    "data_package.builder_turn": AuditEvent(
+        "data_package.builder_turn", "mutation", "An admin exchanged one turn with the data-package builder assistant."
+    ),
+    "prompt.delete": AuditEvent(
+        "prompt.delete", "mutation", "An admin-authored system prompt override was reset to its default."
+    ),
+    "prompt.bind_git": AuditEvent(
+        "prompt.bind_git", "mutation", "A system prompt was bound to a git-tracked source file."
+    ),
+    "prompt.preview": AuditEvent("prompt.preview", "read", "An admin previewed a system prompt's rendered output."),
+    "prompt.source_set": AuditEvent(
+        "prompt.source_set", "mutation", "A system prompt's authoring source was changed (inline vs. git-bound)."
+    ),
+    "prompt.update": AuditEvent("prompt.update", "mutation", "An admin-authored system prompt override was updated."),
+    "semantic_model.delete": AuditEvent("semantic_model.delete", "mutation", "A semantic model document was deleted."),
+    "semantic_source.delete": AuditEvent("semantic_source.delete", "mutation", "A semantic-layer source was deleted."),
+    "semantic_model.create": AuditEvent("semantic_model.create", "mutation", "A semantic model document was created."),
+    "semantic_source.create": AuditEvent(
+        "semantic_source.create", "mutation", "A semantic-layer source was registered."
+    ),
+    "semantic_source.sync": AuditEvent(
+        "semantic_source.sync", "mutation", "A semantic-layer source was manually synced."
+    ),
+    "semantic_model.validate_query": AuditEvent(
+        "semantic_model.validate_query",
+        "read",
+        "A SQL query was validated against a semantic model's constraints without executing it.",
+    ),
+    "semantic_model.update": AuditEvent("semantic_model.update", "mutation", "A semantic model document was updated."),
+    "semantic_source.update": AuditEvent(
+        "semantic_source.update", "mutation", "A semantic-layer source's configuration was updated."
+    ),
+    "settings.dataset_update": AuditEvent(
+        "settings.dataset_update", "mutation", "A caller's default dataset preference was updated."
+    ),
+    "share_request.decide": AuditEvent(
+        "share_request.decide", "mutation", "An admin approved or denied a pending share request."
+    ),
+    "sharing.state_update": AuditEvent(
+        "sharing.state_update", "mutation", "A resource's sharing state (which groups can see it) was updated."
+    ),
+    "slack.command_received": AuditEvent(
+        "slack.command_received", "system", "A Slack slash command was received and dispatched."
+    ),
+    "slack.event_received": AuditEvent(
+        "slack.event_received", "system", "A Slack Events API callback was received and dispatched."
+    ),
+    "stack.artefact_remove": AuditEvent(
+        "stack.artefact_remove", "mutation", "A knowledge artefact was removed from a caller's stack."
+    ),
+    "stack.unsubscribe": AuditEvent(
+        "stack.unsubscribe", "mutation", "A caller unsubscribed from a resource in their stack."
+    ),
+    "stack.artefact_add": AuditEvent(
+        "stack.artefact_add", "mutation", "A knowledge artefact was added to a caller's stack."
+    ),
+    "stack.subscribe": AuditEvent(
+        "stack.subscribe", "mutation", "A caller subscribed to a resource (e.g. a data package) in their stack."
+    ),
+    "store.entity_dryrun": AuditEvent(
+        "store.entity_dryrun", "read", "A store entity submission was dry-run validated without being created."
+    ),
+    "store.entity_preview": AuditEvent(
+        "store.entity_preview", "read", "A store entity submission was previewed without being created."
+    ),
+    "dismiss_store_lint_finding": AuditEvent(
+        "dismiss_store_lint_finding", "mutation", "An admin dismissed a store-lint finding."
+    ),
+    "telegram.unlink": AuditEvent("telegram.unlink", "mutation", "A caller unlinked their Telegram account."),
+    "token.admin_revoke": AuditEvent(
+        "token.admin_revoke", "mutation", "An admin revoked another user's personal access token."
+    ),
+    "cover_image.upload": AuditEvent(
+        "cover_image.upload", "mutation", "An admin uploaded a cover image for a data package or memory domain."
+    ),
+    "welcome_template.reset": AuditEvent(
+        "welcome_template.reset", "mutation", "The welcome-banner template was reset to its default."
+    ),
+    "welcome_template.preview": AuditEvent(
+        "welcome_template.preview", "read", "An admin previewed the welcome banner's rendered output."
+    ),
+    "welcome_template.update": AuditEvent(
+        "welcome_template.update", "mutation", "The welcome-banner template was updated."
+    ),
+    "mcp_oauth.consent_decision": AuditEvent(
+        "mcp_oauth.consent_decision", "auth", "A user approved or denied an MCP OAuth client's consent request."
+    ),
+    "auth.magic_link_sent": AuditEvent("auth.magic_link_sent", "auth", "A sign-in magic link was minted and mailed."),
+    "password_reset_requested": AuditEvent("password_reset_requested", "auth", "A password-reset link was requested."),
+    "logout": AuditEvent("logout", "auth", "A user signed out."),
+    # -- Wave 2 -- Task 2: reads and WebSocket routes join the ratchet --------
+    # New actions for sensitive GET routes that were still completely
+    # unaudited (READ_POSTURE, src/audit_posture.py) -- everything else
+    # sensitive reuses an action already cataloged above. Two of these
+    # (adoption.kpis, adoption.user_kpis) plus mcp_oauth.connect were ALREADY
+    # being written by live code before this task (via a positional `action`
+    # argument the catalog literal-scan can't see), just never registered
+    # here -- a pre-existing catalog gap this task closes in passing rather
+    # than filing a follow-up for a one-line fix.
+    "adoption.kpis": AuditEvent(
+        "adoption.kpis", "read", "An admin viewed the adoption dashboard's global KPI summary."
+    ),
+    "adoption.user_kpis": AuditEvent("adoption.user_kpis", "read", "An admin viewed one user's adoption KPI summary."),
+    "admin.sessions_browse": AuditEvent(
+        "admin.sessions_browse", "read", "An admin browsed the cross-user session browser's data grid."
+    ),
+    "admin.user_sessions_read": AuditEvent(
+        "admin.user_sessions_read", "read", "An admin read a specific user's session list."
+    ),
+    "agent.session.artifact_download": AuditEvent(
+        "agent.session.artifact_download", "read", "An agent-API session's harvested artifact was downloaded."
+    ),
+    "chat.session.admin_list": AuditEvent(
+        "chat.session.admin_list", "read", "An admin listed every currently-live chat session across all users."
+    ),
+    "chat.session_file.download": AuditEvent(
+        "chat.session_file.download", "read", "A file inside a chat sandbox session was downloaded."
+    ),
+    "collection.file_download": AuditEvent(
+        "collection.file_download", "read", "A collection file's raw bytes were downloaded."
+    ),
+    "collection.file_preview": AuditEvent("collection.file_preview", "read", "A collection file was previewed."),
+    "collection.search": AuditEvent("collection.search", "read", "The caller's accessible collections were searched."),
+    "knowledge.search": AuditEvent(
+        "knowledge.search",
+        "read",
+        "A combined search ran across documents, the knowledge base, and the table catalog.",
+    ),
+    "mcp_oauth.connect": AuditEvent(
+        "mcp_oauth.connect", "auth", "A user completed an MCP source's OAuth authorization-code exchange."
+    ),
+    "memory.admin_audit_read": AuditEvent(
+        "memory.admin_audit_read", "read", "An admin read the corporate-memory governance audit trail."
+    ),
+    "sharepoint_connection.certificate_read": AuditEvent(
+        "sharepoint_connection.certificate_read",
+        "read",
+        "An admin read a SharePoint connection's certificate metadata (never the private key).",
+    ),
+    "sharepoint_connection.corpus_map_read": AuditEvent(
+        "sharepoint_connection.corpus_map_read",
+        "read",
+        "The SharePoint connection's scope-to-collection corpus map was read.",
+    ),
+    "sharepoint_connection.scopes_read": AuditEvent(
+        "sharepoint_connection.scopes_read", "read", "An admin read a SharePoint connection's configured scopes."
+    ),
+    "sharepoint_connection.tree_browse": AuditEvent(
+        "sharepoint_connection.tree_browse",
+        "read",
+        "An admin browsed a SharePoint connection's site/drive/folder tree.",
+    ),
+    "sharepoint_connection.tree_search": AuditEvent(
+        "sharepoint_connection.tree_search", "read", "An admin searched a SharePoint connection's folder tree."
+    ),
+    "source_connection.tables_discover": AuditEvent(
+        "source_connection.tables_discover",
+        "read",
+        "An admin browsed a connected source's discoverable tables before registering any.",
+    ),
+    "sso.config_read": AuditEvent(
+        "sso.config_read", "read", "An admin read the SSO configuration's status (never the client secret)."
+    ),
+    "sso.identities_list": AuditEvent(
+        "sso.identities_list", "read", "An admin listed every linked external identity across all users."
+    ),
+    "table_registry.discover_preview": AuditEvent(
+        "table_registry.discover_preview",
+        "read",
+        "An admin previewed auto-discoverable tables without registering any.",
+    ),
+    # Wave 2 — Task 3 (the three surfaces that wrote nothing: apps-runner
+    # container lifecycle report-back, the data-app subdomain proxy's
+    # windowed access log, and the notifications WS connect/reject events).
+    "data_app.container_up": AuditEvent(
+        "data_app.container_up",
+        "mutation",
+        "apps-runner started (or replaced) a data app's container. Reported "
+        "best-effort by the runner sidecar, which holds no database "
+        "access of its own — see services/apps_runner/audit_report.py.",
+    ),
+    "data_app.container_stop": AuditEvent(
+        "data_app.container_stop",
+        "mutation",
+        "apps-runner stopped (paused or removed) a data app's container. Reported best-effort by the runner sidecar.",
+    ),
+    "data_app.container_resume": AuditEvent(
+        "data_app.container_resume",
+        "mutation",
+        "apps-runner unpaused a data app's container. Reported best-effort "
+        "by the runner sidecar — this event had no control-plane "
+        "counterpart at all before this task, which is why it was invisible.",
+    ),
+    "data_app.access": AuditEvent(
+        "data_app.access",
+        "read",
+        "An end user's traffic reached a deployed data app through the "
+        "subdomain proxy. One row per (user, app) per 15-minute window, "
+        "not per request — see app/data_apps_subdomain.py.",
+    ),
+    "notifications.ws_connect": AuditEvent(
+        "notifications.ws_connect",
+        "system",
+        "A desktop/browser notifications WebSocket connection authenticated and was registered.",
+    ),
+    "notifications.ws_rejected": AuditEvent(
+        "notifications.ws_rejected",
+        "system",
+        "A notifications WebSocket connection attempt was refused "
+        "(bad/expired token, malformed handshake, or over the per-user cap).",
+    ),
+    # -- Wave 2 — admin chat tail (the WS gap Task 2 flagged rather than
+    # folding into "noise"; closed here) --------------------------------------
+    "chat.session.tail_view": AuditEvent(
+        "chat.session.tail_view",
+        "read",
+        "An admin started streaming another user's live chat log. Distinct "
+        "from chat.session.tail_ticket_issue, which records only that "
+        "permission was granted — this row records that it was used.",
+    ),
+    "chat.session.tail_rejected": AuditEvent(
+        "chat.session.tail_rejected",
+        "system",
+        "A live-chat-log stream was refused (invalid or expired ticket).",
+    ),
+    # -- Landed on `integration` in parallel with this wave; declared here
+    # because the "fallback" posture value they arrived with no longer exists.
+    "sharepoint_connection.extract": AuditEvent(
+        "sharepoint_connection.extract",
+        "mutation",
+        "A document extraction was started for one SharePoint connection.",
+    ),
+    "run_sharepoint_extraction": AuditEvent(
+        "run_sharepoint_extraction",
+        "system",
+        "The scheduler's SharePoint extraction sweep ran.",
+    ),
+    # -- 2026-08-30 plan, Task 4: sharepoint-acl-sync worker job — per-scope
+    # SharePoint permission mirroring (connectors/sharepoint/acl_sync.py).
+    # `sync_triggered` is emitted by Task 5's admin route, registered here
+    # per the plan's instruction (declared alongside its sibling actions).
+    "sharepoint_acl.sync_completed": AuditEvent(
+        "sharepoint_acl.sync_completed",
+        "mutation",
+        "A SharePoint ACL-mirroring sync completed for one connection.",
+    ),
+    "sharepoint_acl.sync_failed": AuditEvent(
+        "sharepoint_acl.sync_failed",
+        "mutation",
+        "A SharePoint ACL-mirroring sync failed for one connection.",
+    ),
+    "sharepoint_acl.grant_added": AuditEvent(
+        "sharepoint_acl.grant_added",
+        "mutation",
+        "A SharePoint ACL sync granted a mirrored group access to a collection.",
+    ),
+    "sharepoint_acl.grant_removed": AuditEvent(
+        "sharepoint_acl.grant_removed",
+        "mutation",
+        "A SharePoint ACL sync revoked a mirrored group's access to a collection (source-side revocation).",
+    ),
+    "sharepoint_acl.membership_replaced": AuditEvent(
+        "sharepoint_acl.membership_replaced",
+        "mutation",
+        "A SharePoint ACL sync replaced a mirrored group's membership from the source directory.",
+    ),
+    "sharepoint_acl.principal_unmatched": AuditEvent(
+        "sharepoint_acl.principal_unmatched",
+        "mutation",
+        "A SharePoint ACL sync could not resolve one or more source principals to an Agnes account "
+        "(one row per run, with counts — never per-user).",
+    ),
+    "sharepoint_acl.grants_suspended": AuditEvent(
+        "sharepoint_acl.grants_suspended",
+        "mutation",
+        "A SharePoint connection's mirrored grants were suspended after exceeding "
+        "acl_sync.max_stale_hours (must_not guarantee mode).",
+    ),
+    "sharepoint_acl.sync_triggered": AuditEvent(
+        "sharepoint_acl.sync_triggered",
+        "mutation",
+        "An admin manually triggered a SharePoint ACL sync for one connection (POST .../acl-sync).",
+    ),
+    # -- 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The
+    # sweep job itself (connectors/sharepoint/acl_sync.py::run_subtree_sweep)
+    # writes no audit row of its own (state persisted into the connection's
+    # config, no log_safe call) -- only the admin-facing per-subtree
+    # "include anyway" override gets one, since it is a deliberate,
+    # security-relevant decision (spec §3(b)'s should_not-only escape hatch).
+    "sharepoint_acl.subtree_override": AuditEvent(
+        "sharepoint_acl.subtree_override",
+        "mutation",
+        "An admin overrode a detected broken-inheritance subtree exclusion "
+        "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
     ),
 }
 

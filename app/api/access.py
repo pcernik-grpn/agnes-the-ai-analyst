@@ -64,52 +64,92 @@ def _audit(
         logger.warning("audit log failed for %s/%s", action, resource)
 
 
-def _is_google_managed(g: dict) -> bool:
-    """Whether a group row is owned by Google sync — admin UI/API treat such
-    rows as read-only.
+#: Every writer-segregated sync that owns groups outright — a row it
+#: created is read-only through this API (add/remove member, rename,
+#: delete all reject with the mapped 409 code). Keyed on the EXACT
+#: ``created_by`` sentinel that writer stamps on ``user_groups`` (see
+#: ``docs/auth-groups.md`` for Google/Microsoft;
+#: ``connectors/sharepoint/acl_sync.py`` for SharePoint ACL mirroring).
+#: Value: ``(code, source_name, where_to_edit)`` — the 409 body's ``code``
+#: plus the two fragments the message is built from. New sync writer?
+#: Add one entry here; no other call site needs to change (every mutation
+#: already routes through :func:`_guard_google_managed` /
+#: :func:`_guard_sync_managed`).
+_SYNC_MANAGED_SENTINELS: dict = {
+    "system:google-sync": ("google_managed_readonly", "Google Workspace", "admin.google.com"),
+    "system:sharepoint-acl-sync": ("sharepoint_managed_readonly", "SharePoint ACL sync", "the source system"),
+}
 
-    Two ways a group can be Google-managed:
 
-    1. ``created_by='system:google-sync'`` — auto-created by the OAuth
-       callback when the user belonged to a prefix-matching Workspace
-       group; ``name`` is the full Workspace email.
-    2. ``is_system=TRUE`` AND the group's name matches the env-configured
-       admin/everyone Workspace email — the OAuth callback routes
-       memberships from those Workspace groups into the seeded system
-       row instead of creating a separate user_groups row, so the system
-       row effectively *becomes* a Google-synced row in this deployment.
-       Without the env mapping, system groups stay regular admin-managed
-       rows (renaming Admin is still blocked separately by
+def _sync_managed_reason(g: dict) -> Optional[tuple]:
+    """Whether a group row is owned by an external sync writer — admin UI/
+    API treat such rows as read-only. Returns the matching
+    ``_SYNC_MANAGED_SENTINELS`` entry, or ``None`` when the group is
+    ordinary (admin-managed).
+
+    Two ways a group can be sync-managed:
+
+    1. ``created_by`` is exactly one of ``_SYNC_MANAGED_SENTINELS``'s keys
+       — auto-created/reconciled by that writer (Google: the OAuth
+       callback for a prefix-matching Workspace group, ``name`` is the
+       full Workspace email; SharePoint: ``entra:<oid>``/``sp-direct:
+       <scope>`` groups the ``sharepoint-acl-sync`` job creates).
+    2. Google only: ``is_system=TRUE`` AND the group's name matches the
+       env-configured admin/everyone Workspace email — the OAuth callback
+       routes memberships from those Workspace groups into the seeded
+       system row instead of creating a separate ``user_groups`` row, so
+       the system row effectively *becomes* a Google-synced row in this
+       deployment. Without the env mapping, system groups stay regular
+       admin-managed rows (renaming Admin is still blocked separately by
        ``UserGroupsRepository`` for code-reference safety).
     """
-    if (g.get("created_by") or "") == "system:google-sync":
-        return True
+    created_by = g.get("created_by") or ""
+    if created_by in _SYNC_MANAGED_SENTINELS:
+        return _SYNC_MANAGED_SENTINELS[created_by]
     if g.get("is_system"):
         from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
 
         admin_email = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip().lower()
         everyone_email = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip().lower()
         if admin_email and g.get("name") == SYSTEM_ADMIN_GROUP:
-            return True
+            return _SYNC_MANAGED_SENTINELS["system:google-sync"]
         if everyone_email and g.get("name") == SYSTEM_EVERYONE_GROUP:
-            return True
-    return False
+            return _SYNC_MANAGED_SENTINELS["system:google-sync"]
+    return None
+
+
+def _is_google_managed(g: dict) -> bool:
+    """Whether a group row is owned by Google sync SPECIFICALLY — used for
+    ``GroupResponse.is_google_managed`` (never true for a group managed by
+    a different sync writer, e.g. SharePoint ACL mirroring)."""
+    reason = _sync_managed_reason(g)
+    return reason is not None and reason[0] == "google_managed_readonly"
+
+
+def _guard_sync_managed(g: dict) -> None:
+    """Raise ``409 <code>`` when the group is managed by ANY external sync
+    writer (``_SYNC_MANAGED_SENTINELS``) — the generalized form of the
+    original Google-only guard."""
+    reason = _sync_managed_reason(g)
+    if reason is None:
+        return
+    code, source_name, where = reason
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": code,
+            "message": (
+                f"This group is managed by {source_name} and is read-only here. Add or remove members via {where}."
+            ),
+        },
+    )
 
 
 def _guard_google_managed(g: dict) -> None:
-    """Raise 409 google_managed_readonly when the group is Google-managed."""
-    if _is_google_managed(g):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "google_managed_readonly",
-                "message": (
-                    "This group is managed by Google Workspace and is "
-                    "read-only here. Add or remove members via "
-                    "admin.google.com, or sign in again to refresh."
-                ),
-            },
-        )
+    """Thin wrapper kept for its many existing call sites — the real,
+    generalized check (every sync writer, not just Google) is
+    :func:`_guard_sync_managed`."""
+    _guard_sync_managed(g)
 
 
 def _validate_resource_type(value: str) -> ResourceType:
@@ -163,6 +203,8 @@ async def access_overview(
     the left, resources tree on the right with per-item checkboxes whose
     state derives from ``grants``.
     """
+    from src.db import SYSTEM_EVERYONE_GROUP
+
     groups_rows = user_groups_repo().list_all()
     members_repo = user_group_members_repo()
     grants_repo = resource_grants_repo()
@@ -190,6 +232,31 @@ async def access_overview(
                 "created_at": str(g["created_at"]) if g.get("created_at") else None,
                 "member_count": members_repo.count_members(g["id"]),
                 "grant_count": grants_repo.count_for_group(g["id"]),
+                # Who is actually in the group, so the UI can report the reach
+                # of a bundle held by SEVERAL groups as a distinct union
+                # rather than a sum. Summing double-counts anyone in two of
+                # them, and produced reach figures larger than the number of
+                # accounts on the instance.
+                #
+                # `Everyone` is deliberately excluded: it holds every account
+                # by construction, so its roster is the largest list on the
+                # instance and shipping it here would dominate a payload that
+                # is refetched on every mutation. The client reads
+                # `is_everyone` + the `account_total` below instead, which is
+                # the same answer at O(1).
+                "is_everyone": g.get("name") == SYSTEM_EVERYONE_GROUP,
+                "member_ids": (
+                    []
+                    if g.get("name") == SYSTEM_EVERYONE_GROUP
+                    else [
+                        # `list_members_for_group` joins users and returns the
+                        # account under `id` (u.id), not `user_id` — identically
+                        # on both backends.
+                        m["id"]
+                        for m in members_repo.list_members_for_group(g["id"])
+                        if m.get("id")
+                    ]
+                ),
             }
         )
 
@@ -200,13 +267,20 @@ async def access_overview(
             "resource_type": r["resource_type"],
             "resource_id": r["resource_id"],
             # The tier belongs in the snapshot: the editor on /admin/access
-            # renders an Optional/Automatic pair per grant off this payload,
-            # and without the field every grant read back as Optional — a
-            # grant saved as Automatic (here, or through the group drawer,
+            # renders an Available/Required pair per grant off this payload,
+            # and without the field every grant read back as Available — a
+            # grant saved as Required (here, or through the group drawer,
             # or by `agnes admin grant`) showed the wrong half lit until the
             # page was reloaded from a different endpoint. Same default the
             # single-grant response uses.
             "requirement": r.get("requirement") or "available",
+            # WHO wrote the grant. Both writers record it — the admin API
+            # stores an email, `library_sharing` (an owner sharing from the
+            # Library) stores a user id — so the page can say where a row
+            # came from instead of presenting every grant as if an admin
+            # made it. The two shapes are resolved client-side against the
+            # user list; neither is assumed to be the other.
+            "assigned_by": r.get("assigned_by"),
         }
         for r in grants_repo.list_all()
     ]
@@ -216,19 +290,50 @@ async def access_overview(
     # surfaces here, no extra wiring. Disabled types (none as of v19 — see
     # `is_resource_type_enabled`) are skipped so the admin UI does not render
     # a chip for grants the runtime cannot enforce yet.
-    from app.resource_types import enabled_resource_types
+    from app.resource_types import RESOURCE_FAMILIES, enabled_resource_types
 
+    # `family` rides along per type so the page can group by it without a
+    # second copy of the mapping in Jinja or JS — the registry stays the one
+    # place a new resource type gets classified.
+    # Sorted into family render order, keeping each family's types in
+    # registry order. The page renders Knowledge → Capabilities → Surfaces;
+    # sending them interleaved (registry order starts on a capability) would
+    # make the UI re-derive an order the registry already knows.
+    _family_rank = {fam: i for i, fam in enumerate(RESOURCE_FAMILIES)}
     resources = [
         {
             "type_key": spec.key.value,
             "type_display": spec.display_name,
             "type_description": spec.description,
+            "family": spec.family.value,
+            "family_display": RESOURCE_FAMILIES[spec.family].display_name,
             "blocks": spec.list_blocks(),
         }
-        for spec in enabled_resource_types()
+        for spec in sorted(enabled_resource_types(), key=lambda s: _family_rank[s.family])
+    ]
+    # Section headers travel separately from the types, so a family with
+    # nothing granted still renders as an empty section rather than
+    # vanishing — "no capabilities yet" and "no such section" are different
+    # things to tell an admin.
+    families = [
+        {
+            "key": fam.value,
+            "display_name": fspec.display_name,
+            "blurb": fspec.blurb,
+        }
+        for fam, fspec in RESOURCE_FAMILIES.items()
     ]
 
-    return {"groups": groups, "grants": grants, "resources": resources}
+    return {
+        "groups": groups,
+        "grants": grants,
+        "resources": resources,
+        "families": families,
+        # Everyone's reach, at O(1) — see the `member_ids` note above. Also
+        # the ceiling for any reach figure the UI prints: no set of groups
+        # can reach more people than there are accounts.
+        "account_total": users_repo().count_all(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -438,12 +543,50 @@ async def update_group(
     if payload.description is not None:
         updates["description"] = payload.description
     if updates:
+        # Taken-name check BEFORE the write, so a rename collision reads the
+        # same way a create collision does. Both backends enforce this with a
+        # UNIQUE constraint, but letting the driver raise gives two different
+        # exception types and — on DuckDB — an unhandled 500. The constraint
+        # is still the authority; this is the readable path, and the handler
+        # below is the backstop for the race between check and write.
+        new_name = updates.get("name")
+        if new_name:
+            clash = repo.get_by_name(new_name)
+            if clash and clash["id"] != group_id:
+                raise HTTPException(status_code=409, detail=f"Group {new_name!r} already exists")
         try:
             repo.update(group_id, **updates)
         except SystemGroupProtected:
             raise HTTPException(
                 status_code=409,
                 detail="System groups cannot be renamed",
+            )
+        except (duckdb.ConstraintException, sa_exc.IntegrityError) as exc:
+            # A rename of a group that has members or grants cannot be done
+            # in place on the DuckDB app-state backend: `user_groups.name`
+            # is UNIQUE, so DuckDB rewrites the row as delete+insert, and the
+            # delete trips the FKs that `user_group_members.group_id` and
+            # `resource_grants.group_id` hold on `user_groups.id` — even when
+            # the name is unchanged. There is no in-place path: DuckDB has no
+            # deferrable constraints and no ALTER TABLE DROP CONSTRAINT, and
+            # dropping the UNIQUE would need a schema step the PG-first
+            # ratchet freezes (src/db.py FROZEN_DUCKDB_SCHEMA_VERSION). The
+            # only DuckDB-side workaround — delete the child rows, rewrite the
+            # parent, re-insert — is not atomic there, and losing a group's
+            # memberships to a mid-write crash is not a trade worth making on
+            # an authorization table.
+            #
+            # Postgres renames in place and is unaffected. So this fails
+            # clean, names the real constraint, and says what to do.
+            logger.warning("group rename rejected by a database constraint: %s", exc)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This group cannot be renamed while it has members or grants, "
+                    "because the app-state database is DuckDB. Move the instance to "
+                    "Postgres to rename it, or create a new group with the name you "
+                    "want. Its description can still be edited here."
+                ),
             )
         _audit(conn, user["id"], "user_group.updated", f"group:{group_id}", updates)
     g = repo.get(group_id)
@@ -1139,6 +1282,64 @@ class EffectiveAccessItem(BaseModel):
     resource_type: str
     resource_id: str
     via_groups: List[dict]  # [{group_id, group_name}]
+    #: Human name for `resource_id`, resolved through the SAME
+    #: `ResourceTypeSpec.list_blocks()` projection `/api/admin/access-overview`
+    #: uses, so the two surfaces cannot disagree about what a thing is called.
+    #: Falls back to the id when a grant no longer resolves — a dangling grant
+    #: is a real state and must render as itself rather than vanish.
+    name: Optional[str] = None
+    #: Where a reader can open the thing, when the type has a page for it.
+    href: Optional[str] = None
+    #: True when the id could not be resolved to a live resource at all.
+    unresolved: bool = False
+
+
+def _resource_display_index(types_needed: set) -> dict:
+    """`(resource_type, resource_id)` -> `{"name", "href"}` for the types asked for.
+
+    Both effective-access surfaces — `/me/profile` and `/admin/users/{id}` —
+    rendered raw primary keys: `DATA PACKAGE pkg_03ab1c829864`, `MEMORY DOMAIN
+    md_24992ef123b2`, `CHAT chat`. These are the two screens a member opens to
+    answer "what do I have" and an admin opens to answer "why can she see
+    that", and neither answered it.
+
+    The names were always one call away: `/api/admin/access-overview`, on the
+    neighbouring page, resolves every one through each type's `list_blocks()`
+    projection. This reuses that projection rather than adding a second source
+    of truth, so a rename lands on both surfaces at once.
+
+    Only the types actually granted are projected — `list_blocks()` reads the
+    whole table for its type, and an instance grants a handful of the sixteen
+    registered types.
+    """
+    from app.resource_types import RESOURCE_TYPES, ResourceType
+
+    index: dict = {}
+    for raw in types_needed:
+        try:
+            spec = RESOURCE_TYPES.get(ResourceType(raw))
+        except ValueError:
+            continue  # a grant naming a type this build does not register
+        if spec is None:
+            continue
+        try:
+            blocks = spec.list_blocks()
+        except Exception:  # noqa: BLE001
+            # One unreadable projection must not blank the whole page; those
+            # rows fall back to their ids.
+            logger.exception("effective-access: list_blocks failed for %s", raw)
+            continue
+        for block in blocks or []:
+            for item in (block.get("items") or []):
+                rid = item.get("resource_id")
+                if not rid:
+                    continue
+                slug = item.get("slug")
+                index[(raw, str(rid))] = {
+                    "name": item.get("name") or str(rid),
+                    "href": f"/catalog/p/{slug}" if raw == "data_package" and slug else None,
+                }
+    return index
 
 
 class TablePolicyDiagnosis(BaseModel):
@@ -1375,16 +1576,33 @@ async def user_effective_access(
     by_gid = {m["group_id"]: m["name"] for m in membership_rows}
     grants_rows = resource_grants_repo().list_for_groups(list(by_gid.keys()))
 
+    # Resolve display names once for the types actually granted, then sort by
+    # NAME rather than id — an id sort is alphabetical over opaque keys, which
+    # is no order at all to a reader.
+    display = _resource_display_index({gr["resource_type"] for gr in grants_rows})
+
     grouped: dict[tuple[str, str], EffectiveAccessItem] = {}
-    for gr in sorted(grants_rows, key=lambda r: (r["resource_type"], r["resource_id"], by_gid.get(r["group_id"], ""))):
+    for gr in sorted(
+        grants_rows,
+        key=lambda r: (
+            r["resource_type"],
+            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name")
+            or r["resource_id"],
+            by_gid.get(r["group_id"], ""),
+        ),
+    ):
         rt, rid, gid = gr["resource_type"], gr["resource_id"], gr["group_id"]
         gname = by_gid.get(gid, gid)
         key = (rt, rid)
         if key not in grouped:
+            shown = display.get(key)
             grouped[key] = EffectiveAccessItem(
                 resource_type=rt,
                 resource_id=rid,
                 via_groups=[],
+                name=(shown or {}).get("name") or rid,
+                href=(shown or {}).get("href"),
+                unresolved=shown is None,
             )
         grouped[key].via_groups.append({"group_id": gid, "group_name": gname})
 

@@ -671,7 +671,20 @@ async function syncNow(id, btn) {
   if (ok) {
     const plugLine = body.plugin_count != null ? `\nplugins: ${body.plugin_count}` : "";
     rb.textContent = `action: ${body.action}\ncommit: ${body.commit}\npath:   ${body.path}${plugLine}`;
-    toast("Sync OK", "success");
+    // A clone that yields zero plugins is the single most likely first
+    // attempt — the wrong repository — and it used to be indistinguishable
+    // from success: HTTP 200, a green "Sync OK", and "plugins: 0" in a
+    // modal nobody reads as an error. Name the manifest it looked for, since
+    // the page never says what makes a repo a marketplace.
+    if (body.plugin_count === 0) {
+      rb.classList.add("err");
+      rb.textContent += "\n\nCloned, but no .claude-plugin/marketplace.json was found at the"
+        + "\nrepo root, so this repo is not a Claude Code marketplace. Check the"
+        + "\nURL and the branch.";
+      toast("Cloned, but no plugins found", "error");
+    } else {
+      toast("Sync OK", "success");
+    }
   } else {
     rb.textContent = body.detail || body.error || "Sync failed";
     toast("Sync failed", "error");

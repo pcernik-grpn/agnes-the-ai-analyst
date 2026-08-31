@@ -30,12 +30,15 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 removes the row, leaves any
                                                                 already-created collection
                                                                 alone.
-  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the flat
-                                                                ``{source_scope_id: collection_id}``
-                                                                mapping ``ship_to_agnes.py
-                                                                --corpus-map`` consumes. Per-scope
-                                                                ``anonymize`` is NOT in this shape
-                                                                (kept flat/backward-compatible) —
+  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the
+                                                                ``{"<site>"|"<site>/<folder path>":
+                                                                collection_id}`` mapping
+                                                                ``ship_to_agnes.py --corpus-map``
+                                                                consumes, in the producer
+                                                                resolver's own key shape. 409
+                                                                ``corpus_map_ambiguous`` rather
+                                                                than a best-guess map. Per-scope
+                                                                ``anonymize`` is NOT in this shape —
                                                                 a producer that needs it reads the
                                                                 sibling ``GET .../scopes`` endpoint
                                                                 instead (each row already carries
@@ -79,14 +82,28 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 shape (walk + per-row due-check +
                                                                 enqueue into an EXISTING job kind,
                                                                 no second scheduling mechanism).
+  POST   /api/admin/sharepoint/connections/{id}/acl-sync       — admin "sync now" trigger (spec
+                                                                §5.1; 2026-08-30 plan, Task 5) for
+                                                                the ``sharepoint-acl-sync`` job
+                                                                (``connectors/sharepoint/
+                                                                acl_sync.py::run_acl_sync``). Same
+                                                                enqueue/dedup mechanics as
+                                                                ``.../extract`` above; refuses with
+                                                                ``409 feature_disabled`` when
+                                                                ``acl_mirroring.enabled`` is off.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
-backends). Each row is exactly ``{source_scope_id, display_path, anonymize,
-collection_id}`` (spec §13.2); group grants are NOT duplicated here — they
-are ordinary ``resource_grants`` rows on the collection, same primitive
-``/admin/access`` already reads (spec: "facts are never granted... zero new
-grant type").
+backends). Each row is ``{source_scope_id, display_path, anonymize,
+collection_id, access_mode, drive_id, audience_classes}`` (spec §13.2,
+extended by §2.5/§5 for ACL mirroring and §4.1-4.3 for the per-scope
+audience-class mapping — 2026-08-30 plan, Task 8); group grants are NOT
+duplicated here — they are ordinary
+``resource_grants`` rows on the collection, same primitive ``/admin/access``
+already reads (spec: "facts are never granted... zero new grant type"),
+except a ``sharepoint-acl-sync``-written (sentinel-owned, ``assigned_by
+='system:sharepoint-acl-sync'``) grant, which this wizard's own group-grant
+checkboxes never delete (see :func:`confirm_scope`).
 
 Idempotency: confirming the SAME ``source_scope_id`` twice reuses the
 existing row's ``collection_id`` rather than creating a second collection —
@@ -108,6 +125,7 @@ from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin
 from app.resource_types import ResourceType
+from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
@@ -120,7 +138,9 @@ from connectors.sharepoint.graph_client import (
     probe_unique_permissions,
     search_folders,
 )
+from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+from src.audit_helpers import log_safe
 from src.repositories import (
     file_corpora_repo,
     resource_grants_repo,
@@ -138,10 +158,37 @@ router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
 # ---------------------------------------------------------------------------
 
 
+class AudienceClassIn(BaseModel):
+    """One per-scope audience-class row (2026-08-30 plan, Task 8; spec
+    §4.1-4.3) — ``name`` is the tag Slice 4b's ``claims.audience`` column
+    will carry (same identifier pattern that column's ingest validation
+    uses), ``group_ids`` is the set of Agnes groups whose membership defines
+    "holds this class". Order carries no ordinal field of its own — position
+    in ``ConfirmScopeBody.audience_classes``'s list IS the privilege rank."""
+
+    name: str = Field(..., min_length=1, pattern=r"^[a-z0-9_-]{1,64}$")
+    group_ids: List[str] = Field(default_factory=list)
+
+
 class ConfirmScopeBody(BaseModel):
     source_scope_id: str = Field(..., min_length=1)
     display_path: str = Field(..., min_length=1)
     anonymize: bool = False
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5). ``manual`` (the
+    # default) is today's behavior unchanged; ``mirrored`` opts this scope
+    # into the ``sharepoint-acl-sync`` job's per-scope group/grant
+    # reconciliation (connectors/sharepoint/acl_sync.py). Always persisted
+    # on confirm — like ``anonymize`` above, not "omitted means unchanged"
+    # like ``group_ids`` below.
+    access_mode: Literal["manual", "mirrored"] = "manual"
+    # The Graph drive id for this scope root — REQUIRED when
+    # ``access_mode='mirrored'`` (the ACL sync needs both a drive id and an
+    # item id to read `.../permissions`; see connectors/sharepoint/
+    # acl_sync.py's module docstring "Gap closed" note). Optional for
+    # ``manual`` scopes, which never read it. ``None`` means "not supplied
+    # on this call" — same always-overwritten-on-confirm semantics as
+    # ``access_mode``/``anonymize``.
+    drive_id: Optional[str] = None
     # Step 3: applied as ordinary `resource_grants` rows on the collection —
     # never stored on the scope row itself (see module docstring). ``None``
     # (the field omitted) and ``[]`` mean DIFFERENT things: omitted is "this
@@ -150,11 +197,59 @@ class ConfirmScopeBody(BaseModel):
     # the last group — the very state the row's "indexed but invisible"
     # warning describes, so it has to be honoured rather than read as silence.
     group_ids: Optional[List[str]] = None
+    # Broken-inheritance subtree sweep (2026-08-30 plan, Task 7 —
+    # ``connectors/sharepoint/acl_sync.py::run_subtree_sweep``). ``should_not``
+    # guarantee mode ONLY: "include anyway" a subtree the sweep detected as
+    # broken-inheritance and (by default) excluded from the crawl — an
+    # advisory override, audited (``sharepoint_acl.subtree_override``).
+    # Under ``must_not`` (the fail-closed default) this is REFUSED with
+    # ``409 must_not_forbids_subtree_override`` — see :func:`confirm_scope`.
+    # Always persisted on confirm, same "not omitted-means-unchanged"
+    # semantics as ``access_mode``/``anonymize`` above.
+    include_excluded_subtrees: bool = False
+    # Per-scope audience-class mapping (2026-08-30 plan, Task 8; spec
+    # §4.1-4.3) — index-time claim variants (Slice 4b) select among these by
+    # caller membership (Slice 3). ORDERED MOST-PRIVILEGED FIRST: the order
+    # is the privilege ranking Slice 4b's projection dedup and the tiered-
+    # collections document-text gate both rank by, not just presentation.
+    # ``None`` (omitted) leaves the scope's existing mapping untouched;
+    # ``[]`` explicitly clears it (back to non-tiered) — the SAME omitted-
+    # vs-empty semantics as ``group_ids`` above, for the same reason: a step
+    # 2/step 3 confirm that says nothing about audience tiers must not
+    # silently wipe a configured mapping.
+    audience_classes: Optional[List[AudienceClassIn]] = None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+#: Keys THIS module writes into a SharePoint connection's ``config`` outside
+#: the generic ``PUT /api/admin/source-connections/{id}`` editor's own
+#: request body: the wizard's confirmed-scope rows (``scopes`` —
+#: :func:`confirm_scope` / :func:`remove_scope`) and the in-Agnes extraction
+#: schedule's own dispatch bookkeeping (``extraction`` —
+#: :func:`_record_extraction_dispatch`, TCRD-226).
+#:
+#: A key earns a place here on ONE test: the server writes it into this
+#: connection's ``config`` and the generic connection-editor FORM never
+#: renders it. ``app/api/admin_source_connections.py::update_connection``
+#: imports this tuple to carry each key forward across an update that omits
+#: it — that endpoint replaces ``config`` wholesale, so without this an
+#: ordinary edit (a rename, a certificate change) silently erases whatever
+#: isn't listed here.
+#:
+#: This is NOT optional bookkeeping — it is a ratcheted list.
+#: ``tests/test_sharepoint_config_carry_forward_ratchet.py`` statically scans
+#: THIS file for every literal key a local writer assigns into the variable
+#: it then passes as ``config=`` to ``source_connections_repo().update(...)``
+#: and fails if that set is not exactly this tuple — so adding a THIRD
+#: server-written key here without adding it to this tuple in the SAME
+#: change fails a test that names the fix, rather than shipping a silent
+#: erasure the way ``scopes`` (2026-08-29 morning) and ``extraction``
+#: (2026-08-29, same day, TCRD-226) both did before this ratchet existed.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction")
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -278,13 +373,58 @@ def _latest_run_anonymized_corpus_ids() -> set:
     return set(scopes.keys()) if isinstance(scopes, dict) else set()
 
 
-def _scope_out(scope: Dict[str, Any], declared_corpus_ids: Optional[set] = None) -> Dict[str, Any]:
+def _acl_sync_summary(connection: Optional[Dict[str, Any]], scope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The scope row's slice of the connection's last ``sharepoint-acl-sync``
+    run (``connectors/sharepoint/acl_sync.py::_sync_connection`` writes the
+    full block into ``config["acl_sync_last_run"]``, aggregated across every
+    mirrored scope on the connection) — ``None`` when no connection was
+    given or no run has completed yet, so ``_scope_out`` can omit the key
+    entirely rather than emit a block of nulls."""
+    if not connection:
+        return None
+    last_run = (connection.get("config") or {}).get("acl_sync_last_run")
+    if not isinstance(last_run, dict):
+        return None
+    stale_scopes = last_run.get("stale_scopes") or []
+    return {
+        "at": last_run.get("at"),
+        "ok": last_run.get("ok"),
+        "matched": last_run.get("matched"),
+        "unmatched": last_run.get("unmatched"),
+        "stale": scope.get("source_scope_id") in stale_scopes,
+    }
+
+
+def _scope_audience_classes_out(scope: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Projects a scope row's stored ``audience_classes`` — ``[{"name":
+    str, "group_ids": [str]}]`` in the wizard-persisted privilege order
+    (most-privileged first). A pre-Task-8 row (or one whose mapping was
+    explicitly cleared with ``[]``) has no key or an empty list; either
+    reads as ``[]`` here, never a null. This is the WIZARD's read shape only
+    — the runtime read path Tasks 9-11 consume is
+    ``src.audience_classes.audience_class_map()``, which scans the same
+    stored field but is keyed by collection id across every connection."""
+    raw = scope.get("audience_classes")
+    if not isinstance(raw, list):
+        return []
+    return [
+        {"name": cls.get("name"), "group_ids": list(cls.get("group_ids") or [])}
+        for cls in raw
+        if isinstance(cls, dict) and cls.get("name")
+    ]
+
+
+def _scope_out(
+    scope: Dict[str, Any],
+    declared_corpus_ids: Optional[set] = None,
+    connection: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     collection = file_corpora_repo().get(scope.get("collection_id") or "")
     group_ids = _group_ids_for_collection(scope.get("collection_id") or "")
     if declared_corpus_ids is None:
         declared_corpus_ids = _latest_run_anonymized_corpus_ids()
     anonymize = bool(scope.get("anonymize"))
-    return {
+    out = {
         "source_scope_id": scope.get("source_scope_id"),
         "display_path": scope.get("display_path"),
         "anonymize": anonymize,
@@ -304,7 +444,35 @@ def _scope_out(scope: Dict[str, Any], declared_corpus_ids: Optional[set] = None)
         # but invisible' is the worst silent state)" — the wizard's step-3
         # preview reads this per row rather than re-deriving it client-side.
         "no_group_warning": no_group_warning(group_ids),
+        # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — `manual`
+        # (today's behavior) unless the admin opted this scope into
+        # `sharepoint-acl-sync`'s reconciliation; `None` (a pre-Task-5 row)
+        # reads as `manual` too, never a bare null.
+        "access_mode": scope.get("access_mode") or "manual",
+        "drive_id": scope.get("drive_id"),
+        # Broken-inheritance subtree sweep (2026-08-30 plan, Task 7) — the
+        # advisory surface's data: how many subtrees the sweep excluded from
+        # the crawl, each as {item_id, path} (never the raw {detected_at}
+        # timestamp — the wizard doesn't need it), plus whether an admin has
+        # overridden the exclusion for this scope (`should_not` mode only).
+        "excluded_subtree_count": len(scope.get("excluded_subtrees") or []),
+        "excluded_subtrees": [
+            {"item_id": item.get("item_id"), "path": item.get("path")}
+            for item in (scope.get("excluded_subtrees") or [])
+            if isinstance(item, dict)
+        ],
+        "include_excluded_subtrees": bool(scope.get("include_excluded_subtrees")),
     }
+    audience_classes = _scope_audience_classes_out(scope)
+    out["audience_classes"] = audience_classes
+    # Non-empty audience_classes IS tiered (2026-08-30 plan, Task 8; spec
+    # §4.1-4.3) — Slice 4b's predicate and Slice 4c's document-text gate
+    # both key off this flag via src.audience_classes.tiered_collection_ids.
+    out["tiered"] = bool(audience_classes)
+    summary = _acl_sync_summary(connection, scope)
+    if summary is not None:
+        out["acl_sync_last_run"] = summary
+    return out
 
 
 def no_group_warning(group_ids: List[str]) -> bool:
@@ -397,6 +565,13 @@ def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
     the schedule would fire must not also queue a second run a tick later.
     """
     config = dict(row.get("config") or {})
+    # Writing a NEW key here (or in any other function in this module)?
+    # Add it to SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS above IN THE SAME
+    # CHANGE — the generic connection editor's carry-forward
+    # (app/api/admin_source_connections.py::update_connection) only
+    # preserves keys listed there, and the ratchet test
+    # (tests/test_sharepoint_config_carry_forward_ratchet.py) will fail
+    # otherwise.
     config["extraction"] = {
         "last_run_at": datetime.now(timezone.utc).isoformat(),
         "last_job_id": job_id,
@@ -573,12 +748,25 @@ async def search_tree(
     every drive of every reachable site. ``item_id`` without ``drive_id``
     is rejected — there is no drive to resolve it against.
 
+    A site or folder the app registration cannot read (Graph 403/404) is
+    skipped, not fatal — app-only permissions are never uniform across a
+    real tenant. It is never silently dropped: see ``skipped`` below.
+
     Response: ``{matches: [{item_id, drive_id, display_path}], visited,
-    truncated, hint}``. ``truncated`` is ``True`` whenever a cap is what
-    stopped the walk — never a silently partial result; ``visited`` is how
-    many "list children" calls it took to get there; ``hint`` is a short,
-    actionable string (scope the search, narrow the pattern) when
-    ``truncated`` is ``True``, else ``null``.
+    truncated, skipped, hint}``.
+
+    - ``truncated`` is ``True`` whenever a cap (``max_depth``/``max_visited``)
+      is what stopped the walk — never a silently partial result.
+    - ``visited`` is how many "list children" calls it took to get there.
+    - ``skipped`` lists every site/folder the walk could not enter for
+      permissions reasons, each as ``{scope: "site"|"folder", reason:
+      "forbidden"|"not_found", status_code, site_id, site_name, drive_id,
+      item_id, display_path}`` — deliberately separate from ``truncated``:
+      a cap and a permission refusal are different facts and call for
+      different admin actions (narrow the search vs. request access).
+    - ``hint`` is a short, actionable string (scope the search, narrow the
+      pattern) when ``truncated`` is ``True``, else ``null`` — unrelated to
+      ``skipped``, which speaks for itself.
     """
     if item_id and not drive_id:
         raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
@@ -623,7 +811,7 @@ async def list_scopes(
     enriched with its collection and current group grants."""
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
-    return {"items": [_scope_out(s, declared) for s in _scopes(row)]}
+    return {"items": [_scope_out(s, declared, row) for s in _scopes(row)]}
 
 
 @router.post("/connections/{connection_id}/scopes", status_code=201)
@@ -636,33 +824,111 @@ async def confirm_scope(
 
     Creates its collection on first confirmation; re-confirming the same
     ``source_scope_id`` reuses that same collection (idempotent) and updates
-    ``display_path``/``anonymize`` in place — a rename or move in the source
-    does not fork a second collection (§6 applied to the wizard's own
-    bookkeeping). ``group_ids``, **if the field is present**, is the complete
-    set of groups for this collection (step 3): listed groups are granted,
-    and any other group's grant on this collection is revoked. The wizard's
-    checkboxes are pre-checked from the grants that exist and its row warns
-    the moment the last one is unticked, so the screen already promises that
-    unticking removes access — making the handler additive-only meant the
-    admin was shown a revocation that never happened. Omitting the field
-    touches no grant at all, which is what keeps a rename or an anonymize
-    toggle from stripping access as a side effect.
+    ``display_path``/``anonymize``/``access_mode``/``drive_id`` in place — a
+    rename or move in the source does not fork a second collection (§6
+    applied to the wizard's own bookkeeping). ``group_ids``, **if the field
+    is present**, is the complete set of groups for this collection (step
+    3): listed groups are granted, and any other group's grant on this
+    collection is revoked — EXCEPT a mirrored (sentinel-owned) grant, which
+    this checkbox can never touch (see the revoke loop below); "stop
+    mirroring" is ``access_mode``, not a checkbox. The wizard's checkboxes
+    are pre-checked from the grants that exist and its row warns the moment
+    the last one is unticked, so the screen already promises that unticking
+    removes access — making the handler additive-only meant the admin was
+    shown a revocation that never happened. Omitting the field touches no
+    grant at all, which is what keeps a rename or an anonymize toggle from
+    stripping access as a side effect.
+
+    ``access_mode='mirrored'`` (spec §2.5) opts this scope into the
+    ``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``
+    (``400 missing_drive_id`` otherwise — the sync needs both a drive id and
+    an item id to address the scope root on Graph). Switching an already-
+    mirrored scope back to ``manual`` deletes the sync's own sentinel-owned
+    grants for this collection and converts nothing — the admin re-grants
+    manually, same as any other scope that was never mirrored.
+
+    ``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to
+    "include anyway" a broken-inheritance subtree the
+    ``sharepoint-subtree-sweep`` job detected on this scope and excluded from
+    the crawl by default (spec §3(b)). Refused with ``409
+    must_not_forbids_subtree_override`` under the ``must_not`` guarantee mode
+    (the fail-closed default — §1.2 disqualifies this override outright);
+    accepted and audited (``sharepoint_acl.subtree_override``) under
+    ``should_not``. This handler writes that ONE audit row INSTEAD of
+    relying on the route's declared fallback action
+    (``sharepoint_connection.scope_confirm``) for a request that turns the
+    override on — see the audit playbook's "never write both for the same
+    event" rule; every other confirm (no override transition) is still
+    covered by the fallback, unchanged.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
-    if body.group_ids:
+    if body.access_mode == "mirrored" and not body.drive_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_drive_id",
+                "message": "access_mode='mirrored' requires drive_id — the ACL sync cannot address this scope root without it.",
+            },
+        )
+    if body.drive_id:
+        _validate_graph_id(body.drive_id, "drive_id")
+
+    if body.include_excluded_subtrees:
+        from app.switches import switch_value
+
+        if switch_value("acl_guarantee_mode") == "must_not":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "must_not_forbids_subtree_override",
+                    "message": (
+                        "acl_sync.guarantee_mode=must_not forbids including an excluded "
+                        "broken-inheritance subtree — switch to should_not to allow this override."
+                    ),
+                },
+            )
+
+    if body.audience_classes is not None:
+        names = [cls.name for cls in body.audience_classes]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "duplicate_audience_class", "names": duplicates},
+            )
+
+    # Every group id referenced anywhere in this request — the share-step
+    # checkboxes AND each audience class's membership — must already exist.
+    # One check, one error shape (``invalid_group_id``), for both sources.
+    _group_ids_to_check: List[str] = list(body.group_ids or [])
+    for cls in body.audience_classes or []:
+        _group_ids_to_check.extend(cls.group_ids)
+    if _group_ids_to_check:
         groups_repo = user_groups_repo()
-        unknown = [gid for gid in body.group_ids if groups_repo.get(gid) is None]
+        seen: set = set()
+        unknown = []
+        for gid in _group_ids_to_check:
+            if gid in seen:
+                continue
+            seen.add(gid)
+            if groups_repo.get(gid) is None:
+                unknown.append(gid)
         if unknown:
             raise HTTPException(status_code=400, detail={"error": "invalid_group_id", "group_ids": unknown})
 
     scopes = _scopes(row)
     existing = next((s for s in scopes if s.get("source_scope_id") == body.source_scope_id), None)
+    previous_access_mode = (existing or {}).get("access_mode") or "manual"
+    previous_override = bool((existing or {}).get("include_excluded_subtrees"))
 
     if existing is not None:
         collection_id = existing["collection_id"]
         existing["display_path"] = body.display_path
         existing["anonymize"] = body.anonymize
+        existing["access_mode"] = body.access_mode
+        existing["drive_id"] = body.drive_id
+        existing["include_excluded_subtrees"] = body.include_excluded_subtrees
     else:
         collection_id = _create_scope_collection(
             connection_name=row.get("name") or connection_id,
@@ -676,15 +942,50 @@ async def confirm_scope(
                 "display_path": body.display_path,
                 "anonymize": body.anonymize,
                 "collection_id": collection_id,
+                "access_mode": body.access_mode,
+                "drive_id": body.drive_id,
+                "include_excluded_subtrees": body.include_excluded_subtrees,
             }
         )
 
+    # Audience-class mapping (2026-08-30 plan, Task 8): omitted (``None``)
+    # leaves whatever is already on the row untouched — a step 2/step 3
+    # confirm that says nothing about audience tiers must not wipe a
+    # configured mapping; ``[]`` explicitly clears it. Same
+    # omitted-vs-empty contract as ``group_ids`` above, applied to the ONE
+    # scope row this request is confirming (new or existing — `existing`
+    # is `None` for a brand-new scope, whose freshly appended dict is the
+    # last entry of `scopes`).
+    target_scope = existing if existing is not None else scopes[-1]
+    if body.audience_classes is not None:
+        target_scope["audience_classes"] = [
+            {"name": cls.name, "group_ids": list(cls.group_ids)} for cls in body.audience_classes
+        ]
+
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": scopes}
     source_connections_repo().update(connection_id, config=new_config)
 
+    # Audit the override TRANSITION only (false -> true) — never on a
+    # re-confirm that resends an already-active override, same
+    # avoid-audit-noise posture as _replace_membership_and_audit in
+    # connectors/sharepoint/acl_sync.py. See this function's own docstring
+    # for why this REPLACES the route's declared fallback action for this
+    # one request.
+    if body.include_excluded_subtrees and not previous_override:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_acl.subtree_override",
+            resource=f"file_corpus:{collection_id}",
+            params={"source_scope_id": body.source_scope_id},
+            result="success",
+        )
+
+    grants = resource_grants_repo()
+
     if body.group_ids is not None:
         wanted = set(body.group_ids)
-        grants = resource_grants_repo()
         for group_id in wanted:
             grants.ensure_grant(
                 group_id,
@@ -693,9 +994,23 @@ async def confirm_scope(
                 assigned_by=user.get("id"),
             )
         # Revoke what was unticked. Scoped to grants on THIS collection, so a
-        # group's access to anything else is untouched.
+        # group's access to anything else is untouched — and a mirrored
+        # (sentinel-owned) row is never touched here: it would only
+        # resurrect at the next sync, and "stop mirroring" is access_mode,
+        # not this checkbox (spec §2.3).
         for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
-            if grant.get("resource_id") == collection_id and grant.get("group_id") not in wanted:
+            if grant.get("resource_id") != collection_id or grant.get("group_id") in wanted:
+                continue
+            if (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
+                continue
+            grants.delete(grant["id"])
+
+    if previous_access_mode == "mirrored" and body.access_mode == "manual":
+        # Spec §2.5: switching mirrored -> manual deletes the sync's own
+        # grants for this scope's collection and converts nothing — the
+        # admin re-grants manually.
+        for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
+            if grant.get("resource_id") == collection_id and (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
                 grants.delete(grant["id"])
 
     logger.info(
@@ -705,7 +1020,7 @@ async def confirm_scope(
         collection_id,
     )
     updated_row = next(s for s in scopes if s.get("source_scope_id") == body.source_scope_id)
-    return _scope_out(updated_row)
+    return _scope_out(updated_row, connection=row)
 
 
 @router.delete("/connections/{connection_id}/scopes", status_code=204)
@@ -724,6 +1039,8 @@ async def remove_scope(
     remaining = [s for s in scopes if s.get("source_scope_id") != source_scope_id]
     if len(remaining) == len(scopes):
         raise HTTPException(status_code=404, detail="scope_not_found")
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": remaining}
     source_connections_repo().update(connection_id, config=new_config)
 
@@ -733,20 +1050,34 @@ async def corpus_map(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
-    """Producer handoff (spec §13.2 / item 3): the flat
-    ``{source_scope_id: collection_id}`` mapping the external crawl pipeline
-    reads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside
-    Agnes. Not wrapped in an envelope key — the producer consumes this
-    verbatim as the mapping itself.
+    """Producer handoff (spec §13.2 / item 3): the corpus map the external
+    crawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in
+    the producer resolver's OWN shape — ``"<site display name>"`` or
+    ``"<site display name>/<drive-relative folder path>"`` — built by the
+    same shared translation the in-Agnes ``corpus-extraction`` job handler
+    uses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff
+    (``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot
+    drift. The earlier flat ``{source_scope_id: collection_id}`` shape was
+    unusable for routing: the resolver matches keys against crawler rows'
+    site/path components, which a Graph scope id never equals.
 
-    Deliberately does NOT carry ``anonymize`` — that would break this
-    endpoint's flat, backward-compatible shape. A producer that needs to
+    ``409 corpus_map_ambiguous`` when the confirmed scopes cannot form an
+    unambiguous map (e.g. a site scope plus a drive scope of the same
+    site) — never a best-guess map.
+
+    Deliberately does NOT carry ``anonymize`` — a producer that needs to
     know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
     row already carries ``anonymize``); Agnes's own ``corpus-extraction``
     job handler does the equivalent lookup internally
     (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
     row = _sharepoint_connection_or_404(connection_id)
-    return {s["source_scope_id"]: s["collection_id"] for s in _scopes(row) if s.get("source_scope_id")}
+    try:
+        return producer_corpus_map(_scopes(row))
+    except CorpusMapError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "corpus_map_ambiguous", "message": str(exc)},
+        ) from exc
 
 
 @router.get("/connections/{connection_id}/certificate")
@@ -824,6 +1155,62 @@ async def trigger_extraction(
 
     _record_extraction_dispatch(row, job["id"])
     logger.info("sharepoint connection %s: extraction job %s enqueued (manual trigger)", connection_id, job["id"])
+    return {"job_id": job["id"], "status": job["status"]}
+
+
+def _acl_sync_idempotency_key(connection_id: str) -> str:
+    """A STABLE per-connection idempotency key for the ``sharepoint-acl-sync``
+    job — mirrors :func:`_extraction_idempotency_key`'s shape so a manual
+    "sync now" and any other in-flight run for the same connection can never
+    both be queued at once."""
+    return f"sharepoint-acl-sync:{connection_id}"
+
+
+@router.post("/connections/{connection_id}/acl-sync", status_code=202)
+async def trigger_acl_sync(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Admin-triggered one-off run of the ``sharepoint-acl-sync`` job for
+    this connection (spec §5.1's "sync now" action; 2026-08-30 plan, Task
+    5) — enqueues ``connectors.sharepoint.acl_sync.run_acl_sync`` (via
+    ``app/worker/kinds.py::_run_sharepoint_acl_sync``) with
+    ``{"connection_id": connection_id}``, the SAME mechanics as
+    :func:`trigger_extraction`.
+
+    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
+    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
+    .enabled`` is off — the job handler itself would just no-op (spec §5.1
+    "the scheduler enqueues this kind unconditionally"), but a manual
+    trigger should tell the admin why nothing happened rather than return a
+    202 for a run that will do nothing.
+
+    Deduped on a STABLE per-connection idempotency key
+    (:func:`_acl_sync_idempotency_key`) — a second trigger while one is
+    already queued/running for this connection gets ``409
+    acl_sync_already_running`` instead of a second job.
+    """
+    from app.instance_config import feature_enabled
+
+    _sharepoint_connection_or_404(connection_id)
+
+    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
+        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "sharepoint-acl-sync",
+        {"connection_id": connection_id},
+        idempotency_key=_acl_sync_idempotency_key(connection_id),
+    )
+    if job["deduped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "acl_sync_already_running", "job_id": job["id"]},
+        )
+
+    logger.info("sharepoint connection %s: acl-sync job %s enqueued (manual trigger)", connection_id, job["id"])
     return {"job_id": job["id"], "status": job["status"]}
 
 

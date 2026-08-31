@@ -2397,3 +2397,60 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
    narrow column to sit on the same centre line as every other icon in the
    rail. Hovering the rail peeks it open and hands back the full box, exactly
    as before. */
+
+/* ── The admin setup chain, in the get-started slot ──────────────────────
+   The row reuses `.rail-getstarted` wholesale — launcher, ring, hover /
+   .is-open panel behaviour, icon-mode label hiding — so only the step list
+   inside the panel is new. Reusing the class rather than copying its rules
+   is what keeps the two rows the same height and the bottom zone from
+   shifting when one replaces the other. */
+html[data-ui-layout="rail"] .rail-setupchain-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+html[data-ui-layout="rail"] .rail-setupchain-step a {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 9px;
+    border-radius: 7px;
+    color: var(--ds-text-primary);
+    text-decoration: none;
+    font-size: 13px;
+    line-height: 1.35;
+}
+html[data-ui-layout="rail"] .rail-setupchain-step a:hover {
+    background: var(--ds-surface-sunken);
+}
+/* The marker is the only thing separating the three states at a glance, so
+   it is dual-encoded — glyph AND colour — rather than colour alone. */
+html[data-ui-layout="rail"] .rail-setupchain-mark {
+    flex: 0 0 auto;
+    width: 15px;
+    text-align: center;
+    font-weight: 700;
+    color: var(--ds-text-muted);
+}
+html[data-ui-layout="rail"] .rail-setupchain-step.is-done .rail-setupchain-mark {
+    color: var(--ds-accent-success-ink);
+}
+html[data-ui-layout="rail"] .rail-setupchain-step.is-failed .rail-setupchain-mark {
+    color: var(--ds-warn-ink);
+}
+/* Done steps recede without disappearing: the chain's shape — how far along
+   this instance is — is the reason the panel exists, and a list that hides
+   what is finished cannot show it. Deliberately NOT struck through; a step
+   that can be revisited ("Add another source") is not cancelled. */
+html[data-ui-layout="rail"] .rail-setupchain-step.is-done .rail-setupchain-label {
+    color: var(--ds-text-muted);
+}
+html[data-ui-layout="rail"] .rail-setupchain-note {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--ds-warn-ink);
+    white-space: nowrap;
+}

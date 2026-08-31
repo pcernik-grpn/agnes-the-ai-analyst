@@ -1,4 +1,8 @@
-"""AuditFallbackMiddleware (F1 — audit-full-coverage plan, Task 2)."""
+"""AuditFallbackMiddleware (F1 — audit-full-coverage plan, Task 2; contract
+rewritten by Wave 2 — Task 1: the middleware emits the route's DECLARED
+action, never a generic ``http.request`` placeholder — see
+``tests/test_audit_declared_actions.py`` for the dedicated coverage of that
+new contract; the tests here focus on the surrounding dedup/auth guards)."""
 
 from __future__ import annotations
 
@@ -15,9 +19,10 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_unannotated_mutation_gets_generic_row(tmp_path, monkeypatch, seeded_app):
+def test_unannotated_mutation_gets_its_declared_action_row(tmp_path, monkeypatch, seeded_app):
     """POST /api/stack/subscribe writes no audit row of its own (only
-    usage_events telemetry) — the fallback middleware must cover it."""
+    usage_events telemetry) — the fallback middleware must cover it under
+    its DECLARED action (`stack.subscribe`), not a generic placeholder."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     client = seeded_app["client"]
     resp = client.post(
@@ -29,16 +34,15 @@ def test_unannotated_mutation_gets_generic_row(tmp_path, monkeypatch, seeded_app
 
     from src.repositories import audit_repo
 
-    rows, _ = audit_repo().query(action="http.request", limit=10)
-    matches = [r for r in rows if r["resource"] == "POST /api/stack/subscribe"]
-    assert matches, "fallback middleware did not write a generic http.request row"
+    rows, _ = audit_repo().query(action="stack.subscribe", limit=10)
+    matches = [r for r in rows if r["resource"] == "/api/stack/subscribe"]
+    assert matches, "fallback middleware did not write the route's declared action"
     assert matches[0]["user_id"] == "admin1"
 
 
 def test_audited_route_gets_no_duplicate(tmp_path, monkeypatch, seeded_app):
     """POST /api/sync/trigger already writes its own `sync.trigger` row —
-    the fallback middleware must not ALSO write a generic http.request row
-    for it."""
+    the fallback middleware must not ALSO write a second row for it."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     client = seeded_app["client"]
     resp = client.post("/api/sync/trigger", headers=_auth(seeded_app["admin_token"]))
@@ -46,12 +50,9 @@ def test_audited_route_gets_no_duplicate(tmp_path, monkeypatch, seeded_app):
 
     from src.repositories import audit_repo
 
-    rows, _ = audit_repo().query(action="http.request", limit=10)
-    matches = [r for r in rows if r["resource"] == "POST /api/sync/trigger"]
-    assert not matches, "fallback middleware duplicated an already-audited route"
-
     trigger_rows, _ = audit_repo().query(action="sync.trigger", limit=10)
     assert trigger_rows, "the route's own audit row is missing"
+    assert len(trigger_rows) == 1, "fallback middleware duplicated an already-audited route"
 
 
 def test_unauthenticated_request_writes_nothing(tmp_path, monkeypatch, seeded_app):
@@ -65,17 +66,17 @@ def test_unauthenticated_request_writes_nothing(tmp_path, monkeypatch, seeded_ap
 
     from src.repositories import audit_repo
 
-    rows, _ = audit_repo().query(action="http.request", limit=10)
-    matches = [r for r in rows if r["resource"] == "POST /api/stack/subscribe"]
+    rows, _ = audit_repo().query(action="stack.subscribe", limit=10)
+    matches = [r for r in rows if r["resource"] == "/api/stack/subscribe"]
     assert not matches, "unauthenticated request must not be attributed an audit row"
 
 
-def test_exempt_route_never_gets_a_generic_row(e2e_env):
-    """A route declared `exempt:<reason>` in POSTURE must never get the
-    generic row, even when authenticated and even though its handler wrote
-    nothing — isolated at the middleware level (no CSRF/debug-flag
-    dependencies from the real route) against the exact key POSTURE uses:
-    `POST /me/profile/refetch-groups`."""
+def test_exempt_route_never_gets_a_row(e2e_env):
+    """A route declared `exempt:<reason>` in POSTURE must never get a row
+    from this middleware, even when authenticated and even though its
+    handler wrote nothing — isolated at the middleware level (no
+    CSRF/debug-flag dependencies from the real route) against the exact key
+    POSTURE uses: `POST /me/profile/refetch-groups`."""
 
     async def handler(request):
         set_audit_identity("admin1", "admin@test.com")
@@ -90,6 +91,5 @@ def test_exempt_route_never_gets_a_generic_row(e2e_env):
 
     from src.repositories import audit_repo
 
-    rows, _ = audit_repo().query(action="http.request", limit=10)
-    matches = [r for r in rows if r["resource"] == "POST /me/profile/refetch-groups"]
-    assert not matches, "exempt route must never get a generic fallback row"
+    rows, _ = audit_repo().query(resource="/me/profile/refetch-groups", limit=10)
+    assert not rows, "exempt route must never get a row from the fallback middleware"

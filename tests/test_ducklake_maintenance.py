@@ -148,6 +148,8 @@ class TestRegistration:
             "analytics-rebuild",
             "collections-purge",
             "corpus-extraction",
+            "sharepoint-acl-sync",
+            "sharepoint-subtree-sweep",
         }
 
 

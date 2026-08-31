@@ -180,7 +180,7 @@
      hiding. A chip whose origin we have no colour for renders neutral, which
      is honest. */
   .group-chip {
-    display: inline-block; max-width: 100%;
+    display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
     padding: 3px 10px; border-radius: var(--ds-radius-pill);
     font-size: 12px; font-weight: 600; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; text-decoration: none;
@@ -241,6 +241,7 @@
      apart. Wraps: a resource can arrive through several groups at once. */
   .ud-via { display: flex; flex-wrap: wrap; gap: 6px; }
   .ud-via a {
+    display: inline-flex; align-items: center; gap: 4px;
     font-size: 11.5px; font-weight: 600; text-decoration: none;
     padding: 2px 9px; border-radius: var(--ds-radius-pill);
     background: var(--ds-surface-sunken); color: var(--ds-text-secondary);
@@ -765,7 +766,8 @@ function renderMemberships() {
     const display = (m.origin === "google_sync" && m.group_name !== "Admin" && m.group_name !== "Everyone")
       ? deriveDisplayName(m.group_name) : m.group_name;
     tr.innerHTML = `
-      <td><a class="group-chip ${cls}" href="/admin/access?group=${encodeURIComponent(m.group_id)}" title="${esc(m.group_name)}">${esc(display)}</a></td>
+      <td><a class="group-chip ${cls}" href="/admin/access?group=${encodeURIComponent(m.group_id)}"
+             title="${esc(m.group_name)}">${AgnesKindGlyph.groupGlyph()}${esc(display)}</a></td>
       <td><span class="ud-src"><em>${esc(sourceLabel)}</em>${addedFragment}</span></td>
       <td class="ud-end">${removable}</td>
     `;
@@ -953,13 +955,18 @@ async function loadEffectiveAccess() {
     // instead of on different pages.
     const viaHtml = (it.via_groups || [])
       .map(g => `<a href="/admin/access?group=${encodeURIComponent(g.group_id)}"
-                    title="Open ${esc(g.group_name)} in Access">${esc(g.group_name)}</a>`).join("");
+                    title="Open ${esc(g.group_name)} in Access">${
+        AgnesKindGlyph.groupGlyph()}${esc(g.group_name)}</a>`).join("");
     const accent = KIND_ACCENT[it.resource_type];
     const kindCls = "ud-kind" + (accent ? ` ud-kind--${accent}` : "");
     html += `
       <tr>
         <td><span class="${kindCls}">${esc(String(it.resource_type).replace(/_/g, " "))}</span></td>
-        <td class="ud-mono">${esc(it.resource_id)}</td>
+        <td${it.unresolved ? ' class="ud-mono"' : ""}>${
+          it.href
+            ? `<a href="${esc(it.href)}">${esc(it.name || it.resource_id)}</a>`
+            : esc(it.name || it.resource_id)
+        }${it.unresolved ? ' <span class="ud-warn">— no longer exists</span>' : ""}</td>
         <td><span class="ud-via">${viaHtml}</span></td>
       </tr>`;
   }

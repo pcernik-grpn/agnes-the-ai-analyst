@@ -337,6 +337,14 @@ class TestToolRegistration:
             "fact_search",
             "fact_neighbors",
             "fact_claims",
+            # Node-type counts for the Library's Knowledge tab (TCRD-250).
+            # Triple-surface with GET /api/facts/type-map and
+            # `agnes facts type-map`.
+            "fact_type_map",
+            # Entity facets for the Library's filter menu (TCRD-250).
+            # Triple-surface with GET /api/facts/facets and
+            # `agnes facts facets`.
+            "fact_facets",
             # Config-surface introspection — an operator's Claude reads this
             # instance's live configurable surface (knobs + sources, registered
             # IWT, marketplaces, infra_repo_url). Triple-surface with
@@ -437,6 +445,10 @@ class TestToolRegistration:
             # Triple-surface with POST /api/store/entities/from-markdown +
             # `agnes store publish-md`.
             "store_publish_markdown",
+            # Reading a published document back and writing a new one over
+            # it — the editing pair for what `store_publish_markdown` made.
+            "store_read_markdown",
+            "store_edit_markdown",
             "store_compose_plugin",
             # Maintained digests (K4, #799) — admin CRUD over LLM-regenerated
             # digest documents. Triple-surface with the
