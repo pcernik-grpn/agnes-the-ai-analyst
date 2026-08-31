@@ -526,12 +526,12 @@ _SMALL_FIXTURE_PATH = _REPO_ROOT / "tests" / "fixtures" / "eval" / "planted_corp
 # the manifest/loader adapters, same shape and values as before reconciling
 # the two ground-truth tasks.
 _SYNTHETIC_FACTS = [
-    {"natural_key": "myers", "type": "client", "aliases": ["myers-eps"], "source_doc_ids": ["document:d1"]},
+    {"natural_key": "fabrikam", "type": "client", "aliases": ["fabrikam-eps"], "source_doc_ids": ["document:d1"]},
     {"natural_key": "acme", "type": "client", "source_doc_ids": ["document:d2"]},
 ]
 
 _SYNTHETIC_ACTUAL_SUBJECTS = [
-    {"id": "f1", "type": "client", "aliases": ["myers"], "attrs": {}, "claim_count": 1, "quote_count": 1},
+    {"id": "f1", "type": "client", "aliases": ["fabrikam"], "attrs": {}, "claim_count": 1, "quote_count": 1},
     {
         "id": "f2",
         "type": "client",
@@ -566,7 +566,7 @@ def _synthetic_document(doc_id: str, name: str) -> dict:
 
 
 # Canonical-shaped manifest -- the same two planted facts as _SYNTHETIC_FACTS,
-# but expressed as producer wire rows: "myers" is revisited by a second claim
+# but expressed as producer wire rows: "fabrikam" is revisited by a second claim
 # from a different document (dedupe-by-id), and one edge is planted twice
 # from two documents (dedupe-by src+type+dst).
 _SYNTHETIC_GROUND_TRUTH = {
@@ -586,17 +586,17 @@ _SYNTHETIC_GROUND_TRUTH = {
     "nodes": [
         {
             "claim_key": "n1",
-            "id": "client:myers",
+            "id": "client:fabrikam",
             "type": "client",
             "attrs": {},
-            "evidence": [{"doc_id": "document:d1", "quote": "Myers Corp is a client."}],
+            "evidence": [{"doc_id": "document:d1", "quote": "Fabrikam Corp is a client."}],
         },
         {
             "claim_key": "n1b",
-            "id": "client:myers",
+            "id": "client:fabrikam",
             "type": "client",
             "attrs": {"industry": "manufacturing"},
-            "evidence": [{"doc_id": "document:d2", "quote": "Myers Corp operates in manufacturing."}],
+            "evidence": [{"doc_id": "document:d2", "quote": "Fabrikam Corp operates in manufacturing."}],
         },
         {
             "claim_key": "n2",
@@ -609,19 +609,19 @@ _SYNTHETIC_GROUND_TRUTH = {
     "edges": [
         {
             "claim_key": "e1",
-            "src": "client:myers",
+            "src": "client:fabrikam",
             "type": "owned_by",
             "dst": "org:acme-holding",
             "attrs": {},
-            "evidence": [{"doc_id": "document:d1", "quote": "Myers is owned by Acme Holding."}],
+            "evidence": [{"doc_id": "document:d1", "quote": "Fabrikam is owned by Acme Holding."}],
         },
         {
             "claim_key": "e1b",
-            "src": "client:myers",
+            "src": "client:fabrikam",
             "type": "owned_by",
             "dst": "org:acme-holding",
             "attrs": {},
-            "evidence": [{"doc_id": "document:d2", "quote": "Myers Corp, owned by Acme Holding."}],
+            "evidence": [{"doc_id": "document:d2", "quote": "Fabrikam Corp, owned by Acme Holding."}],
         },
     ],
     "prepared_false_claims": [],
@@ -663,10 +663,10 @@ def test_real_planted_corpus_small_validates_against_schema():
 def test_expected_facts_from_manifest_dedupes_by_id():
     facts = metrics.expected_facts_from_manifest(_SYNTHETIC_GROUND_TRUTH)
     by_key = {f["natural_key"]: f for f in facts}
-    assert set(by_key) == {"client:myers", "client:acme"}
-    # the two "myers" claims (from d1 and d2) collapse into one expected fact
-    assert sorted(by_key["client:myers"]["source_doc_ids"]) == ["document:d1", "document:d2"]
-    assert by_key["client:myers"]["type"] == "client"
+    assert set(by_key) == {"client:fabrikam", "client:acme"}
+    # the two "fabrikam" claims (from d1 and d2) collapse into one expected fact
+    assert sorted(by_key["client:fabrikam"]["source_doc_ids"]) == ["document:d1", "document:d2"]
+    assert by_key["client:fabrikam"]["type"] == "client"
 
 
 def test_expected_edges_from_manifest_dedupes_by_src_type_dst():
@@ -674,7 +674,7 @@ def test_expected_edges_from_manifest_dedupes_by_src_type_dst():
     assert len(edges) == 1  # e1/e1b share (src, type, dst)
     edge = edges[0]
     assert (edge["src_natural_key"], edge["type"], edge["dst_natural_key"]) == (
-        "client:myers",
+        "client:fabrikam",
         "owned_by",
         "org:acme-holding",
     )
@@ -695,7 +695,7 @@ def test_expected_facts_and_edges_dedupe_the_real_fixture():
 def test_precision_recall_by_type_on_synthetic_manifest():
     results = metrics.precision_recall_by_type(_SYNTHETIC_FACTS, _SYNTHETIC_ACTUAL_SUBJECTS)
     client = results["client"]
-    assert client.true_positives == 1  # f1 matched myers via alias overlap
+    assert client.true_positives == 1  # f1 matched fabrikam via alias overlap
     assert client.false_positives == 1  # f2 matched nothing planted
     assert client.false_negatives == 1  # acme never matched
     assert client.precision == pytest.approx(0.5)
@@ -710,10 +710,10 @@ def test_precision_recall_counts_a_duplicate_subject_as_a_false_positive():
     second subject for one planted fact is an entity-resolution failure: the
     first is the true positive, the extra one is a false positive (Devin
     Review on #1652)."""
-    planted = [{"type": "client", "natural_key": "client:myers", "aliases": ["client:myers-eps"]}]
+    planted = [{"type": "client", "natural_key": "client:fabrikam", "aliases": ["client:fabrikam-eps"]}]
     actual = [
-        {"type": "client", "id": "s1", "aliases": ["client:myers"]},
-        {"type": "client", "id": "s2", "aliases": ["client:myers-eps"]},  # same planted fact
+        {"type": "client", "id": "s1", "aliases": ["client:fabrikam"]},
+        {"type": "client", "id": "s2", "aliases": ["client:fabrikam-eps"]},  # same planted fact
     ]
     r = metrics.precision_recall_by_type(planted, actual)["client"]
     assert r.true_positives == 1, "one planted fact can be matched at most once"
@@ -742,8 +742,8 @@ def test_precision_recall_prefers_an_unmatched_cluster_over_a_taken_one():
 
 def test_cluster_purity_on_synthetic_manifest():
     purity = metrics.cluster_purity(_SYNTHETIC_FACTS, _SYNTHETIC_ACTUAL_SUBJECTS)
-    # planted alias-instance total = |{myers,myers-eps}| + |{acme}| = 3
-    # best overlap: myers cluster vs f1 = 1, acme cluster vs anything = 0
+    # planted alias-instance total = |{fabrikam,fabrikam-eps}| + |{acme}| = 3
+    # best overlap: fabrikam cluster vs f1 = 1, acme cluster vs anything = 0
     assert purity == pytest.approx(1 / 3)
 
 

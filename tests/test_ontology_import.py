@@ -4,7 +4,7 @@ docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md
 Sec 11 / Sec 16).
 
 Fixture: tests/fixtures/eval/ontology.yaml is the REAL producer ontology
-(Cuesta Star / TCRD-185, v0.2.0), committed verbatim under the scope-note
+(Northwind Star / TCRD-185, v0.2.0), committed verbatim under the scope-note
 waiver at the top of that spec (dated 2026-08-27): "this spec deliberately
 contains customer-specific material ... If this repository ever returns to
 public distribution, the spec must be scrubbed" -- the same waiver covers
@@ -112,7 +112,7 @@ def test_no_customer_vocabulary_in_translator_source():
     own source, only flow through as data."""
     script_path = Path(__file__).parent.parent / "scripts" / "ontology" / "import_ontology.py"
     source = script_path.read_text()
-    for needle in ("engagement", "sponsor", "cuesta", "kohlberg", "myers"):
+    for needle in ("engagement", "sponsor", "northwind", "litware", "fabrikam"):
         assert needle not in source.lower(), f"customer/ontology vocabulary {needle!r} leaked into the script"
 
 
