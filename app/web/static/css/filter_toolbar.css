@@ -76,6 +76,14 @@
 .fbar-filter__btn svg { width: 15px; height: 15px; color: var(--ds-text-secondary); }
 .fbar-filter__btn.is-active { border-color: var(--ds-primary); color: var(--ds-primary); }
 .fbar-filter__btn.is-active svg { color: var(--ds-primary); }
+/* Nothing to filter (every facet needs two values to exist, so a new instance
+   has none) — the control stays in the bar and stops being a door. Muted ink
+   rather than a low opacity: at .5 the border and the glyph fade too, and the
+   button reads as a rendering artefact instead of an unavailable control. The
+   `title` on it carries the reason (see library.html). */
+.fbar-filter__btn:disabled { color: var(--ds-text-muted); cursor: default; }
+.fbar-filter__btn:disabled svg { color: var(--ds-text-muted); }
+.fbar-filter__btn:disabled:hover { border-color: var(--ds-border); }
 .fbar-filter__n { min-width: 18px; height: 18px; padding: 0 5px; display: inline-grid; place-items: center; font-size: 11px; font-weight: 700; color: var(--ds-text-inverse); background: var(--ds-primary); border-radius: var(--ds-radius-pill); }
 
 .fbar-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; width: 264px; max-height: 60vh; overflow-y: auto; background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 12px; box-shadow: var(--ds-shadow-md); padding: 6px; }
@@ -222,6 +230,15 @@
 }
 .fbar--ranked .fbar-filter__btn svg,
 .fbar--ranked .fbar-toggle svg { width: 14px; height: 14px; }
+/* Unavailable, in the ranked row's own vocabulary: one step quieter than the
+   resting utility and no hover response at all. Needed as its own rule because
+   the ranked block above ties with `.fbar-filter__btn:disabled` on specificity
+   and wins on source order — the base rule alone left a disabled control
+   looking exactly like a live one. */
+.fbar--ranked .fbar-filter__btn:disabled,
+.fbar--ranked .fbar-filter__btn:disabled:hover {
+  color: var(--ds-text-muted); background: transparent; border-color: transparent; cursor: default;
+}
 /* A toggle's number is a hint at what pressing it leaves, not a filter badge —
    so it stays muted text rather than gaining a pill. */
 .fbar--ranked .fbar-toggle__n { font-weight: 600; }

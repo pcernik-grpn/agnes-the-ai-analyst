@@ -1398,72 +1398,115 @@
   .lib-empty h3 { margin: 0 0 6px; color: var(--ds-text-primary); font-size: 15px; }
   .lib-empty .cc-btn { margin-top: 12px; }
 
-  /* ── Definitions footer ────────────────────────────────────────────────
-     An adjacent destination under the inventory, not a band of it. Styled
-     unlike anything in the list on purpose: no card fill, no border box, just
-     a hairline above it and a roomy row — a place the page ENDS on rather
-     than a thing that could be mistaken for another kind you own. (It also
-     avoids the notice vocabulary, which says "read this, nothing
-     to do"; this block is somewhere to GO.) */
+  /* ── Definitions ───────────────────────────────────────────────────────
+     A pinned pointer ABOVE the inventory (#1898 item 1), where it is on screen
+     on arrival at any list length. It was a hairline-and-roomy-row footer under
+     the list, which read beautifully and was invisible: a block that only
+     exists after you scroll past everything else does not read as the source of
+     truth it is.
+
+     Two changes make the new position affordable, and both are about size. It
+     is ONE line, not a stacked title-and-paragraph — above the list, height is
+     borrowed from the inventory, so the block may only take what a pointer
+     needs. And it keeps a shape of its own — a quiet inset strip, no card fill
+     and no notice colouring — so it still cannot be mistaken for one of the
+     kinds you own, which is the reason it was never a row. */
   .lib-defs {
     display: flex;
-    align-items: flex-start;
-    gap: 14px;
-    margin: 28px 0 8px;
-    padding: 20px 4px 4px;
-    border-top: 1px solid var(--ds-border);
+    align-items: center;
+    flex-wrap: wrap;
+    column-gap: 11px;
+    row-gap: 5px;
+    /* Stands off the description above it and the tab strip below: with no top
+       margin it read as a continuation of the lede rather than as its own
+       object, and the tabs need clear air to read as the page's navigation. */
+    margin: 16px 0 18px;
+    padding: 9px 12px;
+    border: 1px solid var(--ds-border-light);
+    border-radius: var(--radius-lg);
+    background: var(--ds-surface-dim);
   }
   .lib-defs__icon {
     flex: none;
     display: grid;
     place-items: center;
-    width: 34px;
-    height: 34px;
-    border-radius: 9px;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
     color: var(--ds-kind-data);
     background: var(--ds-kind-data-soft);
   }
-  .lib-defs__icon svg { width: 19px; height: 19px; }
-  .lib-defs__body { flex: 1 1 auto; min-width: 0; }
+  .lib-defs__icon svg { width: 16px; height: 16px; }
+  /* Title and sentence on ONE baseline — they wrap to two lines only where the
+     column genuinely cannot hold them, and the sentence is the half that goes
+     (`.lib-defs__text` below the 900px breakpoint). */
+  .lib-defs__body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+    flex-wrap: wrap;
+  }
   .lib-defs__title {
-    margin: 0 0 3px;
-    font-size: 14px;
+    margin: 0;
+    flex: none;
+    font-size: 13.5px;
     font-weight: 650;
     color: var(--ds-text-primary);
   }
   .lib-defs__text {
     margin: 0;
-    font-size: 13px;
-    line-height: 1.5;
+    min-width: 0;
+    font-size: 12.5px;
+    line-height: 1.45;
     color: var(--ds-text-secondary);
-    max-width: 62ch;
   }
   /* Shown only when the page's search box matches a term inside. This is what
      keeps the block reachable BY CONTENT and not just by scrolling to it. */
   .lib-defs__hit {
-    margin: 8px 0 0;
-    font-size: 13px;
+    margin: 0;
+    flex-basis: 100%;
+    font-size: 12.5px;
     font-weight: 600;
     color: var(--ds-primary);
   }
+  /* The ways in get their OWN line, under the sentence rather than at the end of
+     it. There are up to three of them and the longest is "Browse the semantic
+     layer" — on one row with the label and the sentence they crowd the text and
+     put most of the strip's blue in one place. As a second row they read as what
+     they are: a short list of destinations, aligned under the words they belong
+     to (the indent is the icon's 26px plus the row's 11px gap).
+
+     A row, still not a column — three stacked links would set the strip's height
+     by themselves, which is the footer's problem in a smaller box. */
   .lib-defs__links {
-    flex: none;
+    flex: 0 0 100%;
     display: flex;
-    flex-direction: column;
-    gap: 6px;
-    align-items: flex-end;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    padding-left: 37px;
   }
   .lib-defs__link {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 600;
     color: var(--ds-primary);
     text-decoration: none;
     white-space: nowrap;
   }
   .lib-defs__link:hover { text-decoration: underline; }
+  /* Narrow: the sentence is the first thing to go — the label, the counts and
+     the way in all still work without it, and two lines of explanation above
+     the list is exactly what the old footer's height problem looked like. */
+  @media (max-width: 900px) {
+    .lib-defs__text { display: none; }
+  }
   @media (max-width: 640px) {
-    .lib-defs { flex-wrap: wrap; }
-    .lib-defs__links { width: 100%; flex-direction: row; gap: 16px; align-items: flex-start; }
+    .lib-defs { align-items: flex-start; }
+    /* No indent left to honour once the label is the only thing above them. */
+    .lib-defs__links { padding-left: 0; }
   }
 
   /* ── "More coming soon", beside the item count ──
@@ -1956,6 +1999,71 @@
     </div>
   </div>
 
+  {# ── Definitions — the vocabulary, above BOTH tabs ─────────────────────
+     The organization's agreed vocabulary, pinned at the top of the page (#1898
+     item 1). It used to close the page, below the list, on the reasoning that
+     it is not one of the list's rows — which is true, and it is why this is
+     still an <aside> in its own shape rather than a band of the table. But
+     below a list that grows without bound, "adjacent" turned into "gone": past
+     a handful of items the block was off-screen on arrival and nothing on the
+     page said it existed. For the one thing here positioned as the curated
+     single source of truth, discoverability has to beat tidiness.
+
+     It sits ABOVE the tab strip, not under it, because it belongs to neither
+     tab: the same block renders on Knowledge and on Capabilities, unchanged and
+     unfiltered. Under the tabs it would read as part of whichever tab happened
+     to be open — and switching tabs would leave it sitting there, apparently
+     unaffected by a control it looks subordinate to. Above them it reads as
+     what it is: a fact about the whole page.
+
+     Its own vocabulary is unchanged — not a row, not a card, not a notice — but
+     it is now ONE compact line plus its links, which is what earns it a fixed
+     place in the head: a pointer at a destination, sized like a pointer.
+
+     It renders in BOTH page states — a stocked library and an empty one — and
+     independently of any filter, because it is not part of what the filters
+     filter. `data-defs-search` is read by the block's own script below: the
+     page's search box narrows the list, and when a query matches a metric or
+     term this block says so, which is the only one-step term lookup the rail
+     chrome has (it renders no global search box, by design).
+
+     Absent entirely when the instance has no semantic layer configured — a
+     block advertising "0 metrics · 0 terms" describes the setup, not the
+     content. #}
+  {% if definitions_footer %}
+  {% set _dm = definitions_footer.metric_count %}
+  {% set _dg = definitions_footer.glossary_count %}
+  <aside class="lib-defs" id="lib-defs" data-defs-search="{{ definitions_footer.search }}">
+    <span class="lib-defs__icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 6.5S10 4.8 6.5 4.8c-1 0-1.8.1-2.5.3v13c.7-.2 1.5-.3 2.5-.3C10 17.8 12 19.5 12 19.5s2-1.7 5.5-1.7c1 0 1.8.1 2.5.3v-13c-.7-.2-1.5-.3-2.5-.3C14 5.1 12 6.5 12 6.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 6.5v13" stroke="currentColor" stroke-width="1.6"/></svg>
+    </span>
+    <div class="lib-defs__body">
+      <p class="lib-defs__title">Definitions</p>
+      <p class="lib-defs__text">
+        The words and numbers your organization has agreed on — your agents answer with them.
+      </p>
+      {# Hidden until the search box matches one of the terms inside. #}
+      <p class="lib-defs__hit" id="lib-defs-hit" hidden></p>
+    </div>
+    <div class="lib-defs__links">
+      <a class="lib-defs__link" href="/catalog/semantics#metrics">{{ _dm }} metric{{ '' if _dm == 1 else 's' }} &rarr;</a>
+      <a class="lib-defs__link" href="/catalog/semantics#glossary">{{ _dg }} glossary term{{ '' if _dg == 1 else 's' }} &rarr;</a>
+      {# The stored Ossie document itself — datasets, relationships, AI
+         context, constraints — one layer below the flat metric/glossary
+         projection the two links above open. Shown only when the caller can
+         read at least one model (`has_semantic_models`, the router's
+         `_can_read_model` sweep): a caller with visible metrics but no
+         readable document would otherwise land on the browse page's empty
+         state. No count here (unlike the two above): an exact per-type count
+         is a heavier read than the mere existence check the link needs — see
+         docs/superpowers/specs/2026-08-14-semantic-layer-ui-and-agent-parity-design.md. #}
+      {% if definitions_footer.has_semantic_models %}
+      <a class="lib-defs__link" href="/semantic-layer">Browse the semantic layer &rarr;</a>
+      {% endif %}
+    </div>
+  </aside>
+  {% endif %}
+
   {# ── The two questions this page answers ──────────────────────────────
      "What does this organization know" and "what can my agent do" were one
      flat list, and it served neither: a document sat between a skill and a
@@ -2113,8 +2221,41 @@
          popover on hover/focus (see .fbar-cat in filter_toolbar.css). Type is
          absent by design: items are GROUPED by type into collapsible sections
          below, so the grouping is the type navigation. Only controls that can
-         change the page render — no dead filters. #}
+         change the page render — no dead filters.
+
+         The categories are resolved HERE, above the control, because whether
+         there are any decides what the control is. Every one of them is
+         conditional — a facet with fewer than two values does not render — so on
+         a new or nearly empty instance the whole menu came out empty and the
+         button opened a popover holding nothing but Clear and Done (#1898 item
+         4). "No dead filters" has to include the Filter button itself: with
+         nothing to slice it renders DISABLED, saying so in its tooltip, and the
+         menu is not built at all rather than built empty. It comes back on its
+         own — these are page-load facts, and the next render with two of
+         anything in it has a live control again. #}
+      {% set _cats = [
+         ('tag', 'Tags', library_tags),
+         ('age', 'Added', library_ages),
+         ('ownership', 'Yours or shared', library_ownerships),
+         ('owner', 'Owner', library_owners),
+         ('origin', 'Source', library_origins),
+         ('format', 'File format', library_formats),
+         ('requirement', 'Access', library_requirements),
+       ] %}
+      {% set _has_facets = library_available_count or (_cats | map(attribute=2) | select | list | length) > 0 %}
       <div class="fbar-filter">
+        {% if not _has_facets %}
+        {# Disabled, not hidden: the toolbar keeps its shape, and a control that
+           is visibly unavailable answers "where is the filter" better than an
+           absent one. `aria-disabled` as well as `disabled` — the attribute is
+           what a screen reader announces on a <button> that is also
+           `title`-explained. #}
+        <button type="button" class="fbar-filter__btn" id="lib-filter-btn" disabled aria-disabled="true"
+                title="Nothing to filter yet — filters appear once your library holds a few items">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
+          Filter
+        </button>
+        {% else %}
         <button type="button" class="fbar-filter__btn" id="lib-filter-btn" aria-haspopup="true" aria-expanded="false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
           Filter
@@ -2135,18 +2276,10 @@
           {% if library_available_count %}
           <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not added yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
           {% endif %}
-          {# Ordered by the question each answers, commonest first. A category with
-               fewer than two values does not render at all, so this list is the
+          {# Ordered by the question each answers, commonest first (the list is
+               resolved above the control — see the note there). A category with
+               fewer than two values does not render at all, so that list is the
                menu's ceiling rather than its content. #}
-            {% set _cats = [
-               ('tag', 'Tags', library_tags),
-               ('age', 'Added', library_ages),
-               ('ownership', 'Yours or shared', library_ownerships),
-               ('owner', 'Owner', library_owners),
-               ('origin', 'Source', library_origins),
-               ('format', 'File format', library_formats),
-               ('requirement', 'Access', library_requirements),
-             ] %}
           {% for facet_key, cat_label, options in _cats %}
           {% if options %}
           <div class="fbar-cat" data-cat="{{ facet_key }}">
@@ -2176,6 +2309,7 @@
             <button type="button" data-fbar-done>Done</button>
           </div>
         </div>
+        {% endif %}
       </div>
   
       {# "In stack only" — a binary condition, and the single most consequential
@@ -2531,58 +2665,6 @@
   </div>
   {% endif %}
 
-  {# ── Definitions — an adjacent destination, NOT a row ──────────────────
-     The organization's agreed vocabulary closes the page rather than joining
-     the inventory above it. It is the one thing here nobody owns, shares,
-     installs, drops or edits, so as a table row it had to blank all four
-     columns at once (Owner / Sharing / Stack / Actions) — which is the list
-     telling you the object is not one of its rows. Below the list, outside
-     the frame, it can just say what it is and how big it is.
-
-     It renders in BOTH page states — a stocked library and an empty one — and
-     independently of any filter, because it is not part of what the filters
-     filter. `data-defs-search` is read by the block's own script below: the
-     page's search box narrows the list, and when a query matches a metric or
-     term the footer says so, which is the only one-step term lookup the rail
-     chrome has (it renders no global search box, by design).
-
-     Absent entirely when the instance has no semantic layer configured — a
-     block advertising "0 metrics · 0 terms" describes the setup, not the
-     content. #}
-  {% if definitions_footer %}
-  {% set _dm = definitions_footer.metric_count %}
-  {% set _dg = definitions_footer.glossary_count %}
-  <aside class="lib-defs" id="lib-defs" data-defs-search="{{ definitions_footer.search }}">
-    <span class="lib-defs__icon" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none"><path d="M12 6.5S10 4.8 6.5 4.8c-1 0-1.8.1-2.5.3v13c.7-.2 1.5-.3 2.5-.3C10 17.8 12 19.5 12 19.5s2-1.7 5.5-1.7c1 0 1.8.1 2.5.3v-13c-.7-.2-1.5-.3-2.5-.3C14 5.1 12 6.5 12 6.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 6.5v13" stroke="currentColor" stroke-width="1.6"/></svg>
-    </span>
-    <div class="lib-defs__body">
-      <p class="lib-defs__title">Definitions</p>
-      <p class="lib-defs__text">
-        The words and numbers your organization has agreed on — what counts as revenue,
-        what an active account is. Maintained by your admin; your agent answers with them.
-      </p>
-      {# Hidden until the search box matches one of the terms inside. #}
-      <p class="lib-defs__hit" id="lib-defs-hit" hidden></p>
-    </div>
-    <div class="lib-defs__links">
-      <a class="lib-defs__link" href="/catalog/semantics#metrics">{{ _dm }} metric{{ '' if _dm == 1 else 's' }} &rarr;</a>
-      <a class="lib-defs__link" href="/catalog/semantics#glossary">{{ _dg }} glossary term{{ '' if _dg == 1 else 's' }} &rarr;</a>
-      {# The stored Ossie document itself — datasets, relationships, AI
-         context, constraints — one layer below the flat metric/glossary
-         projection the two links above open. Shown only when the caller can
-         read at least one model (`has_semantic_models`, the router's
-         `_can_read_model` sweep): a caller with visible metrics but no
-         readable document would otherwise land on the browse page's empty
-         state. No count here (unlike the two above): an exact per-type count
-         is a heavier read than the mere existence check the link needs — see
-         docs/superpowers/specs/2026-08-14-semantic-layer-ui-and-agent-parity-design.md. #}
-      {% if definitions_footer.has_semantic_models %}
-      <a class="lib-defs__link" href="/semantic-layer">Browse the semantic layer &rarr;</a>
-      {% endif %}
-    </div>
-  </aside>
-  {% endif %}
   {# The Data apps note used to close this section. It now rides the page head
      with the other page-level notes (see `page_head`) — one place for the
      asides, and one rendering for both states of the page (a stocked Library
@@ -3419,12 +3501,12 @@
   }
 
   // ── "That word is a definition" ───────────────────────────────────────
-  //    The Definitions footer is NOT a row, so the filter engine neither hides
+  //    The Definitions strip is NOT a row, so the filter engine neither hides
   //    nor reveals it — it is always there. What it does do is answer the
   //    search: someone types `MRR` or `active account` looking for a thing
-  //    they half-remember, the list comes back empty, and the block at the
-  //    bottom is the one place that knows the word. Without this, the reader
-  //    concludes Agnes has never heard of it.
+  //    they half-remember, the list comes back empty, and the strip above it is
+  //    the one place that knows the word. Without this, the reader concludes
+  //    Agnes has never heard of it.
   //
   //    Matched against the block's `data-defs-search` — metric names, display
   //    names, synonyms and glossary terms, lowercased, names only. Substring

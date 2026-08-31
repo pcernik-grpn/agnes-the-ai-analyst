@@ -73,7 +73,7 @@ def test_library_has_no_agent_affordance(seeded_app):
 def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
     """Put a metric and/or a glossary term into the semantic layer.
 
-    The Definitions footer only renders when at least one side is populated, so
+    The Definitions strip only renders when at least one side is populated, so
     a test that wants it has to say so — which is the point of the guard.
     """
     from src.repositories import glossary_repo, metric_repo
@@ -91,7 +91,7 @@ def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
         glossary_repo().create(id=f"g{i}", term=f"Term {i}", definition="What it means here.")
 
 
-def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
+def test_library_shows_definitions_as_a_pointer_not_a_row(seeded_app):
     """The semantic layer closes the page; it is NOT part of the inventory.
 
     It shipped briefly as a "Definitions" band holding two rows, and that was
@@ -119,8 +119,8 @@ def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
     assert "lib-browse-semantics" not in r.text
 
 
-def test_library_definitions_footer_carries_its_contents_for_search(seeded_app):
-    """The footer is searchable BY TERM, not just by the word "definitions".
+def test_library_definitions_carry_their_contents_for_search(seeded_app):
+    """The block is searchable BY TERM, not just by the word "definitions".
 
     Someone types "MRR" or "active account" — the term they half-remember —
     the list comes back empty, and the footer is the one thing on the page
@@ -156,7 +156,7 @@ def test_library_definitions_footer_carries_its_contents_for_search(seeded_app):
     assert "paid" not in index
 
 
-def test_library_definitions_footer_counts_are_singular_for_one(seeded_app):
+def test_library_definitions_counts_are_singular_for_one(seeded_app):
     """ "1 metric", not "1 metrics" — the count is read as a sentence."""
     _seed_definitions(metrics=1, terms=1)
     c = seeded_app["client"]
@@ -167,8 +167,8 @@ def test_library_definitions_footer_counts_are_singular_for_one(seeded_app):
     assert "1 glossary terms" not in r.text
 
 
-def test_library_hides_definitions_footer_when_semantic_layer_is_empty(seeded_app):
-    """No metrics AND no glossary -> no footer.
+def test_library_hides_definitions_when_semantic_layer_is_empty(seeded_app):
+    """No metrics AND no glossary -> no block.
 
     A block advertising "0 metrics · 0 glossary terms" describes the instance's
     setup, not its content, and reads as a broken feature rather than an
@@ -181,7 +181,7 @@ def test_library_hides_definitions_footer_when_semantic_layer_is_empty(seeded_ap
     assert "/catalog/semantics" not in r.text
 
 
-def test_library_shows_definitions_footer_when_only_one_side_is_populated(seeded_app):
+def test_library_shows_definitions_when_only_one_side_is_populated(seeded_app):
     """Metrics but no glossary still renders it — "0 glossary terms" is a true
     and useful statement about a semantic layer that exists."""
     _seed_definitions(metrics=1, terms=0)
@@ -192,10 +192,10 @@ def test_library_shows_definitions_footer_when_only_one_side_is_populated(seeded
     assert "0 glossary terms" in r.text
 
 
-def test_library_definitions_footer_is_labeled_in_plain_words(seeded_app):
+def test_library_definitions_are_labeled_in_plain_words(seeded_app):
     """ "Definitions", never "Semantic layer" — that name belongs to
     /admin/semantic-layer, where the reader operates the sync rather than
-    looking a term up. Scoped to the footer because an admin's nav dropdown
+    looking a term up. Scoped to the block because an admin's nav dropdown
     carries the admin link on every page, and that one is correct."""
     _seed_definitions()
     c = seeded_app["client"]
@@ -204,6 +204,75 @@ def test_library_definitions_footer_is_labeled_in_plain_words(seeded_app):
     block = r.text.split('id="lib-defs"', 1)[1].split("</aside>", 1)[0]
     assert "Definitions" in block
     assert "Semantic layer" not in block
+
+
+def test_library_definitions_sit_above_the_inventory(seeded_app):
+    """#1898 item 1 — the block is on screen on ARRIVAL, at any list length.
+
+    It used to close the page, under the item list, on the (correct) reasoning
+    that the organization's vocabulary is not one of the list's rows. The cost
+    was discoverability: past a handful of items it was below the fold on every
+    visit, so the surface positioned as the curated single source of truth was
+    the one thing nobody could find. Position is asserted rather than mere
+    presence, because presence is exactly what the old bug had.
+    """
+    _seed_definitions()
+    for i in range(6):
+        _create(seeded_app, f"Filler {i}")
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    body = r.text
+    defs_at = body.index('id="lib-defs"')
+    # Above the TABS, not merely above the list: the same block renders on
+    # Knowledge and on Capabilities, unfiltered and unchanged, so under the tab
+    # strip it would read as part of whichever tab happens to be open.
+    assert defs_at < body.index('id="lib-tabs"'), "Definitions belongs to neither tab, so it sits above both"
+    assert defs_at < body.index('class="lib-browse"'), "Definitions must precede the toolbar + list"
+    assert defs_at < body.index('class="lib-list"')
+    # Still not inventory, and still not a notice — its own shape above the list.
+    assert body[defs_at - 200 : defs_at].count("<aside") == 1
+
+
+def test_library_filter_is_disabled_when_there_is_nothing_to_filter(seeded_app):
+    """#1898 item 4 — an empty popover is worse than no popover.
+
+    Every facet is conditional (a category with fewer than two values does not
+    render), so on a fresh instance the menu came out holding nothing but its own
+    Clear and Done buttons. "No dead filters" has to cover the Filter button
+    itself: with no facets it is visibly unavailable, says why, and the menu is
+    not built at all rather than built empty.
+    """
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    btn = r.text.split('id="lib-filter-btn"', 1)[1].split(">", 1)[0]
+    assert "disabled" in btn
+    assert 'aria-disabled="true"' in btn
+    assert "title=" in btn, "an unavailable control has to say why"
+    # No popover, so there is no empty one to open.
+    assert 'id="lib-filter-menu"' not in r.text
+    assert "data-fbar-done" not in r.text
+
+
+def test_library_filter_is_live_once_a_facet_exists(seeded_app):
+    """The mirror image, so the disable can never become permanent: two owners is
+    two values of one category, which is a real filter, so the control opens a
+    menu with that category in it."""
+    cid = _create(seeded_app, "Two formats")["id"]
+    assert _upload(seeded_app, cid, "a.csv", b"x,y\n1,2\n", "text/csv").status_code in (200, 201)
+    assert _upload(seeded_app, cid, "b.md", b"# note\n", "text/markdown").status_code in (200, 201)
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    btn = r.text.split('id="lib-filter-btn"', 1)[1].split(">", 1)[0]
+    assert "disabled" not in btn
+    assert 'aria-haspopup="true"' in btn
+    assert 'id="lib-filter-menu"' in r.text
+    assert "data-fbar-done" in r.text
+    # …and the menu is not the empty shell the disabled case exists to prevent.
+    menu = r.text.split('id="lib-filter-menu"', 1)[1].split("</div>", 1)[0]
+    assert "fbar-cat" in r.text.split('id="lib-filter-menu"', 1)[1][:4000] or "fbar-menu__opt" in menu
 
 
 def test_library_detail_renders_for_admin(seeded_app):
