@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import io
 import logging
 import os
 import re
@@ -275,9 +276,17 @@ def _slice_sort_key(url: str) -> list:
     order. Keboola's real slice filenames carry a numeric index (observed:
     `...csv_0_0_0.csv`, `...csv_0_0_1.csv`, ...); sorting by those numbers
     — rather than trusting array order or plain string order, which would
-    incorrectly place `_0_0_12` before `_0_0_2` — guarantees the header
-    slice (index 0) downloads first regardless of manifest ordering. A
+    incorrectly place `_0_0_12` before `_0_0_2` — guarantees slice 0
+    downloads (and concatenates) first regardless of manifest ordering. A
     no-op (returns the same order) when the manifest was already correct.
+
+    Sliced exports never carry a header in ANY slice — see
+    `_download_sliced` for the real contract and how the header is
+    synthesized instead of trusted from the data — so this ordering is no
+    longer about which slice "has the header"; it is about row order. An
+    out-of-order concatenation still scrambles the data, which (before the
+    header was synthesized rather than assumed) is exactly what let a
+    stray data row masquerade as the header above.
 
     Only the URL PATH is keyed on: signed-URL query strings (S3
     `?X-Amz-Signature=...`, Azure SAS) carry their own digit runs that vary
@@ -377,14 +386,45 @@ def check_empty_sliced_manifest(
     )
 
 
+def _declared_export_columns(export_filter: Optional["ExportFilter"], detail: Optional[dict]) -> List[str]:
+    """The column names an export must declare when nothing else names them.
+
+    ``export_filter.columns`` — the caller's projection — wins when set: a
+    non-empty projected export carries only the requested columns, so the
+    resolved list must match rather than silently grow to every declared
+    column. The table's own declared schema is the fallback when no
+    projection was requested.
+
+    Only ``detail["columns"]`` is used for the declared side — Storage API
+    keeps it in table-definition order, which both a synthesized CSV header
+    and an empty artifact's schema must preserve. A ``column_metadata``
+    dict keyed by name is not a safe substitute: dict iteration order is
+    not the same thing as declared table order.
+
+    Shared by two callers: an empty sliced manifest (CSV or parquet) must
+    still declare its schema (`_resolve_empty_sliced_manifest`), and a
+    *non-empty* sliced CSV export must synthesize the header line Storage
+    API never puts in any slice (`_download_sliced` /
+    `_resolve_sliced_header_columns`) — mirroring the logic here instead of
+    duplicating it is what keeps an empty and non-empty export of the same
+    table shaped the same way.
+    """
+    requested = list(export_filter.columns) if export_filter and export_filter.columns else []
+    if requested:
+        return requested
+    return [str(c) for c in ((detail or {}).get("columns") or []) if c is not None]
+
+
 def _write_empty_csv_export(dest_path: Path, columns: List[str]) -> None:
     """Write the CSV a zero-row sliced export would have produced.
 
-    Storage API puts the header in slice 0 and the data rows in slices
-    0..n, so "header, no data rows" is exactly the empty table's export —
-    not a special case downstream. The RFC-4180 dialect matches the one the
-    extractor pins on the read side (`quote='"', escape='"'`), so DuckDB
-    recovers the declared column names with zero rows.
+    A sliced export never carries a header in any slice (see
+    `_download_sliced` for the verified contract and citation), so "header,
+    no data rows" is not a special case downstream — it is the same
+    synthesized-header artifact `_download_sliced` writes for a *non-empty*
+    manifest, just with zero slices to append. The RFC-4180 dialect matches
+    the one the extractor pins on the read side (`quote='"', escape='"'`),
+    so DuckDB recovers the declared column names with zero rows.
 
     With no declared columns to write, an empty file is left instead; the
     extractor's existing "export returned no data" branch then emits its
@@ -808,9 +848,10 @@ class KeboolaStorageClient:
           SDK dependency.
 
         Single-file: stream the signed URL directly, gunzipping if the
-        URL/name ends in `.gz`. Sliced: stream each slice into
-        `dest_path` in order (slice 0 has the CSV header per Storage
-        API contract, subsequent slices are header-less data).
+        URL/name ends in `.gz`. Sliced: stream each slice into `dest_path`
+        in order, prefixed with a CSV header synthesized from the table's
+        declared columns — Storage API never puts a header in any slice
+        (see `_download_sliced`'s docstring for the verified contract).
         """
         url = file_info.get("url")
         if not url:
@@ -1204,15 +1245,67 @@ class KeboolaStorageClient:
             filtered=bool(export_filter and export_filter.is_row_filtered()),
         )
 
-        requested = list(export_filter.columns) if export_filter and export_filter.columns else []
-        declared = [str(c) for c in ((detail or {}).get("columns") or []) if c is not None]
-        columns = requested or declared
+        columns = _declared_export_columns(export_filter, detail)
         logger.info(
             "Writing an empty %s for %s with the declared schema (%d columns).",
             what,
             table_id,
             len(columns),
         )
+        return columns
+
+    def _resolve_sliced_header_columns(
+        self,
+        *,
+        table_id: Optional[str],
+        export_filter: Optional[ExportFilter],
+    ) -> Optional[List[str]]:
+        """Best-effort column list to synthesize the CSV header a sliced
+        export's slices never carry (see `_download_sliced`).
+
+        Returns ``None`` — never an empty list — when the caller must fall
+        back to the pre-fix raw, header-less concatenation instead of
+        writing a header that might not match the data: no ``table_id`` to
+        look up (so no way to ask Storage API), or the table detail lookup
+        itself raised. A resolved-but-empty column list (table detail
+        present, but carrying no ``columns`` field) is treated the same
+        way — writing a zero-column header would be worse than writing
+        none.
+
+        Unlike `_resolve_empty_sliced_manifest`, this never needs
+        ``rowsCount`` — the manifest already has entries, so there is no
+        empty-vs-lost-export ambiguity to arbitrate — which is why an
+        ``export_filter.columns`` projection skips the table detail lookup
+        entirely here (`_declared_export_columns` still handles the
+        requested-or-declared choice; this just decides whether a lookup is
+        needed at all).
+        """
+        if export_filter and export_filter.columns:
+            return list(export_filter.columns)
+        detail: Optional[dict] = None
+        if table_id:
+            try:
+                detail = self.get_table_info(table_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not synthesize a CSV header for sliced export of %s: "
+                    "table detail lookup failed (%s). Writing the raw, "
+                    "header-less slice concatenation instead -- downstream "
+                    "conversion will read the first data row as column names.",
+                    table_id,
+                    exc,
+                )
+                return None
+        columns = _declared_export_columns(export_filter, detail)
+        if not columns:
+            logger.warning(
+                "Could not synthesize a CSV header for sliced export of %s: no "
+                "declared columns available. Writing the raw, header-less "
+                "slice concatenation instead -- downstream conversion will "
+                "read the first data row as column names.",
+                table_id,
+            )
+            return None
         return columns
 
     def _download_sliced(
@@ -1228,11 +1321,22 @@ class KeboolaStorageClient:
     ) -> None:
         """Sliced exports: the file detail's `url` points at a JSON manifest
         whose `entries[].url` lists per-slice locations. Download each slice
-        and concatenate into `dest_path`. The first slice contains the CSV
-        header (Storage API guarantees stable header positioning) — entries
-        are re-sorted by `_slice_sort_key` before download since the
-        manifest's own array order is not independently guaranteed (see
-        that function's docstring).
+        and concatenate into `dest_path`, prefixed with a CSV header line
+        synthesized from the table's declared columns.
+
+        Storage API never puts a header in ANY slice of a sliced export —
+        Keboola's own `kbcstorage` SDK documents this plainly (`tables.py`:
+        "the file containing table export is always without headers... it
+        is always sliced on Snowflake and Redshift") and synthesizes the
+        header from `table_detail['columns']` before writing; this mirrors
+        that. Without it, a header-less concatenation reaches
+        `pd.read_csv(..., dtype=str)` (default `header=0`) and the first
+        *data* row becomes the column names (#1916) — silent, because
+        schema application matches by name and simply misses. Entries are
+        re-sorted by `_slice_sort_key` before download since the manifest's
+        own array order is not independently guaranteed (see that
+        function's docstring) — row order, not header positioning, is what
+        that guards now.
 
         Per-slice URL forms:
         - signed HTTPS (S3 presigned, Azure SAS) — plain GET works.
@@ -1244,7 +1348,11 @@ class KeboolaStorageClient:
         export via the table detail's ``rowsCount``, and ``export_filter``
         says whether that count can arbitrate at all — see
         ``check_empty_sliced_manifest``. Without ``table_id`` the pre-fix
-        behaviour (always an error) stands.
+        behaviour (always an error) stands. The SAME ``table_id`` /
+        ``export_filter`` also drive the header synthesis above via
+        `_resolve_sliced_header_columns`, which degrades to the pre-fix raw
+        concatenation (logging loudly) rather than fail the sync outright
+        when the column list cannot be resolved.
         """
         m = self.session.get(manifest_url, timeout=_DEFAULT_SLICE_DOWNLOAD_TIMEOUT_SEC)
         m.raise_for_status()
@@ -1263,11 +1371,13 @@ class KeboolaStorageClient:
         if sorted_entries != entries:
             logger.warning(
                 "Sliced export manifest entries were not in URL-sorted order "
-                "(%d entries); re-sorted before download so the header slice "
-                "downloads first.",
+                "(%d entries); re-sorted before download so slices concatenate "
+                "in the correct row order.",
                 len(entries),
             )
         entries = sorted_entries
+
+        header_columns = self._resolve_sliced_header_columns(table_id=table_id, export_filter=export_filter)
 
         with tempfile.TemporaryDirectory(
             prefix="kbc-slice-",
@@ -1302,9 +1412,21 @@ class KeboolaStorageClient:
                 )
                 slice_paths.append(sp)
 
-            # Concat. Sliced CSV exports include the header in slice 0 only
-            # (Storage API contract); subsequent slices are header-less.
+            # Concat, prefixed with the synthesized header (see this
+            # method's docstring: no slice ever carries one). `csv.writer`
+            # — not an f-string join — so a column name containing a comma
+            # or a quote is escaped per the same RFC-4180 dialect the
+            # downstream CSV readers expect. `header_columns` is `None`
+            # only when it could not be resolved at all
+            # (`_resolve_sliced_header_columns` already warned loudly in
+            # that case); this keeps the pre-fix raw concatenation rather
+            # than fail the whole sync over a header it can't write
+            # correctly.
             with open(dest_path, "wb") as out:
+                if header_columns:
+                    header_buf = io.StringIO()
+                    csv.writer(header_buf, quoting=csv.QUOTE_MINIMAL).writerow(header_columns)
+                    out.write(header_buf.getvalue().encode("utf-8"))
                 for sp in slice_paths:
                     with open(sp, "rb") as fh:
                         shutil.copyfileobj(fh, out, length=64 * 1024)
@@ -1371,8 +1493,11 @@ class KeboolaStorageClient:
         files into ``dest_dir``. Returns the slice paths in manifest
         order. Use when the slices must be processed individually
         (e.g. parquet — each slice is a complete parquet file with its
-        own footer; concatenation would invalidate it). For CSV where
-        concat-with-header-only-on-first-slice is the right thing,
+        own footer; concatenation would invalidate it). Parquet slices
+        need no synthesized header — the schema lives in each file's own
+        footer, not in a first row — which is why that concern is unique
+        to the CSV entry point. For CSV, where the header is synthesized
+        from the table's declared columns before concatenation,
         ``download_file`` is the correct entry point.
 
         A table that is empty upstream — or a row-filtered export that
@@ -1456,8 +1581,9 @@ class KeboolaStorageClient:
         memory stays bounded regardless of file size.
 
         For CSV the sliced case is handled transparently — slices are
-        concatenated into ``dest_path`` (header in slice 0 only). For
-        **sliced parquet**, callers must use ``prepare_export`` +
+        concatenated into ``dest_path`` behind a header synthesized from
+        the table's declared columns (Storage API puts one in no slice).
+        For **sliced parquet**, callers must use ``prepare_export`` +
         ``download_file_slices`` instead — concatenating parquet slices
         invalidates the per-slice footer. ``export_table`` will raise
         StorageApiError if it sees a sliced parquet, to fail loud.

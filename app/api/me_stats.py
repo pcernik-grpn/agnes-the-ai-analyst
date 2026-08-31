@@ -18,52 +18,39 @@ caller can only see their own data:
   ``audit_log`` rows where action is ``sync.*`` or ``manifest.*``,
   plus the user's ``last_pull_at`` for prominent header rendering.
 
-Username derivation: ``_username_for_stats(user)`` reuses the
-email-local-part rule from ``app.api.me`` so the joins on
-``usage_*`` rows (filesystem-derived OS username) align with what
-the session collector writes.
+Identity key: every self-scoped read filters on ``users.id``. The
+session pipeline writes that id into ``usage_session_summary.user_id``
+while ``username`` holds the display email (since v60,
+``services/session_pipeline/runner.py``) — filtering ``username`` with
+an id matched nothing and rendered zero in every panel. Rows predating
+the v45 ``user_id`` column carry no id and stay out of self-views; they
+remain visible in the admin session browser, which also matches on
+``username``.
 """
+
 from __future__ import annotations
 
 import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, Query
 
 from app.auth.dependencies import _get_db, get_current_user
+from app.services import usage_stats
 
 from src.repositories import (
     audit_repo,
     session_processor_state_repo,
-    usage_repo,
     users_repo,
 )
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/me/stats", tags=["me"])
-
-
-def _username_for_stats(user: dict) -> str:
-    """Return the key that ``usage_session_summary.username`` holds for
-    sessions uploaded by *user*.
-
-    Production convention: ``app/api/upload.py`` writes JSONLs under
-    ``${DATA_DIR}/user_sessions/<user_id>/``; the session-pipeline
-    runner uses the directory name as the ``username`` column when
-    extracting summaries. ``/profile/sessions`` (now redirected to
-    /me/activity) reads the same dir keyed by ``user_id``. The column
-    is historically named ``username`` but its current contents are
-    user_ids — return the matching lookup key.
-
-    v45 schema added a separate ``user_id`` column for RBAC purposes
-    (#293); reading from the legacy ``username`` column still works
-    because it carries the user_id value as the runner-written key.
-    """
-    return user["id"]
 
 
 def _session_data_dir() -> Path:
@@ -72,11 +59,7 @@ def _session_data_dir() -> Path:
     default matches the admin resolver (and the upload API's actual write
     location, ``${DATA_DIR}/user_sessions``) — the old ``/data/sessions``
     default pointed at a directory nothing writes to (#640 review)."""
-    return Path(
-        os.environ.get("SESSION_DATA_DIR")
-        or os.environ.get("AGNES_SESSION_DATA_DIR")
-        or "/data/user_sessions"
-    )
+    return Path(os.environ.get("SESSION_DATA_DIR") or os.environ.get("AGNES_SESSION_DATA_DIR") or "/data/user_sessions")
 
 
 # ---------------------------------------------------------------------------
@@ -108,24 +91,19 @@ def list_self_sessions(
     and a ``download_url`` when the uploaded JSONL exists in
     ``${DATA_DIR}/user_sessions/<user_id>/``.
     """
-    username = _username_for_stats(user)
     user_id: str = user["id"]
     # Both ingestion layouts, same as the admin endpoints (#640): the legacy
     # collector writes under the email LOCAL-PART, the upload API under
     # users.id — scanning one of them hid the other's sessions from the
-    # self-service list until the usage processor indexed them. NOTE:
-    # ``_username_for_stats`` returns the user_id (the summary-table key),
-    # so the legacy dir name must be derived from the email — and the base
+    # self-service list until the usage processor indexed them. The base
     # comes from THIS module's ``_session_data_dir`` (it honors
     # ``AGNES_SESSION_DATA_DIR`` + this endpoint's historical default).
     email_local = (user.get("email") or "").split("@")[0]
     base = _session_data_dir()
-    user_dirs = [
-        base / name for name in dict.fromkeys([email_local, user_id]) if name
-    ]
+    user_dirs = [base / name for name in dict.fromkeys([email_local, user_id]) if name]
 
     try:
-        rows_db = usage_repo().list_sessions_for_user_self(username)
+        rows_db = usage_stats.sessions_for_user(user_id)
     except Exception:
         rows_db = []
 
@@ -143,8 +121,9 @@ def list_self_sessions(
         )
         d["processed"] = True
         # Dedup key: BASENAME of ``session_file``. The session-pipeline
-        # runner writes ``session_file = f"{username}/{filename}"`` while
-        # the filesystem scan below walks bare filenames. Keying by
+        # runner writes ``session_file = f"{dir_name}/{filename}"`` — the
+        # upload directory, i.e. the user_id, NOT the ``username`` column —
+        # while the filesystem scan below walks bare filenames. Keying by
         # basename makes both views agree without normalizing the stored
         # column.
         processed[Path(d["session_file"]).name] = d
@@ -163,24 +142,26 @@ def list_self_sessions(
                 continue
             seen_fs.add(p.name)
             mtime = datetime.fromtimestamp(p.stat().st_mtime).isoformat()
-            all_rows.append({
-                "session_file": p.name,
-                "session_id": p.stem,
-                "started_at": mtime,
-                "ended_at": None,
-                "active_seconds": 0,
-                "wall_seconds": 0,
-                "user_messages": 0,
-                "tool_calls": 0,
-                "tool_errors": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_read_tokens": 0,
-                "cache_creation_tokens": 0,
-                "tokens_total": 0,
-                "primary_model": None,
-                "processed": False,
-            })
+            all_rows.append(
+                {
+                    "session_file": p.name,
+                    "session_id": p.stem,
+                    "started_at": mtime,
+                    "ended_at": None,
+                    "active_seconds": 0,
+                    "wall_seconds": 0,
+                    "user_messages": 0,
+                    "tool_calls": 0,
+                    "tool_errors": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "tokens_total": 0,
+                    "primary_model": None,
+                    "processed": False,
+                }
+            )
 
     # --- Enrich with verification-pipeline status ---
     # State table keys rows by ``<dir>/<filename>`` (the pipeline runner's
@@ -193,9 +174,7 @@ def list_self_sessions(
     state_map: dict[str, dict] = {}
     if state_keys:
         try:
-            state_map = session_processor_state_repo().get_states_for_session_files(
-                "verification", state_keys
-            )
+            state_map = session_processor_state_repo().get_states_for_session_files("verification", state_keys)
         except Exception:
             state_map = {}
     _enrich_pipeline_status(all_rows, user_id, state_map)
@@ -256,9 +235,7 @@ def _enrich_pipeline_status(
         else:
             items = state.get("items_extracted")
             row["items_extracted"] = items
-            row["pipeline_status"] = (
-                "extracted" if items and items > 0 else "processed"
-            )
+            row["pipeline_status"] = "extracted" if items and items > 0 else "processed"
 
 
 # ---------------------------------------------------------------------------
@@ -278,22 +255,22 @@ def get_tokens(
     (lifetime), top-10 biggest sessions (by total tokens, lifetime),
     and the lifetime grand total. Single round-trip via three
     sub-queries — each scans the same per-user partition of
-    ``usage_session_summary`` (filtered on ``username``; no secondary
+    ``usage_session_summary`` (filtered on ``user_id``; no secondary
     index — see ``src/db.py::_v94_to_v95`` for why).
     """
-    username = _username_for_stats(user)
+    user_id: str = user["id"]
 
-    repo = usage_repo()
-    daily_series = repo.tokens_daily_series(username, days)
-    model_breakdown = repo.tokens_by_model(username)
-    top = repo.tokens_top_sessions(username)
-    totals = repo.tokens_totals(username)
+    canonical = usage_stats.token_totals(user_id, None)
+    totals = {
+        key: canonical[key]
+        for key in ("input", "output", "cache_read", "cache_creation", "total", "sessions", "cost_usd")
+    }
 
     return {
         "days": days,
-        "daily": daily_series,
-        "by_model": model_breakdown,
-        "top_sessions": top,
+        "daily": usage_stats.daily_token_series(user_id, days),
+        "by_model": canonical["by_model"],
+        "top_sessions": usage_stats.top_token_sessions(user_id),
         "totals": totals,
     }
 

@@ -126,7 +126,7 @@ def _reconcile_marketplace_tree(ws: Path, export: "Callable[[Path], list[str]]")
     so what lands here is the filtered marketplace TREE, laid out exactly as the
     served ZIP (`app/chat/marketplace_payload.py`). The runner then registers it
     with the sandbox's own CLI (`claude plugin marketplace add <dir>` +
-    `claude plugin install <name>@agnes --scope project`), which is a purely
+    `claude plugin install <name>@agnes --scope user`), which is a purely
     offline operation against a local directory — no network, no PAT.
 
     That is why this exists at all: the previous design ran `agnes
@@ -150,7 +150,7 @@ def _reconcile_marketplace_tree(ws: Path, export: "Callable[[Path], list[str]]")
 def _enable_stack_plugins(ws: Path, names: "list[str]") -> None:
     """Write `enabledPlugins` for the stack into the workspace settings.
 
-    `claude plugin install --scope project` records the install in the CLI's own
+    `claude plugin install --scope user` records the install in the CLI's own
     HOME registry but does NOT enable the plugin for the project, so without
     this every stack plugin loads disabled. Same contract as the analyst-side
     writer (`cli/commands/refresh_marketplace.py::_enable_plugins_in_workspace_

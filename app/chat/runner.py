@@ -467,8 +467,7 @@ class ApprovalGate:
             # draft.
             command=f"{display}({arguments})",
             reason=(
-                f"The MCP tool {display!r} is not declared read-only, so it can change "
-                "state; confirm before it runs."
+                f"The MCP tool {display!r} is not declared read-only, so it can change state; confirm before it runs."
             ),
             # Keyed on tool + arguments, mirroring the Bash path's exact-
             # command key: approving one delete must not pre-approve the
@@ -625,9 +624,7 @@ def _build_pretool_matchers(gate: "ApprovalGate", HookMatcher) -> list:
 
     patterns = ("Bash", _MCP_TOOL_MATCHER)
     try:
-        return [
-            HookMatcher(matcher=p, hooks=[_gate_hook], timeout=gate.timeout_seconds + 30) for p in patterns
-        ]
+        return [HookMatcher(matcher=p, hooks=[_gate_hook], timeout=gate.timeout_seconds + 30) for p in patterns]
     except TypeError:
         gate.disable_unsupported(
             "the installed claude-agent-sdk HookMatcher takes no `timeout`, so the gate "
@@ -1105,7 +1102,7 @@ def _register_workspace_marketplace(workdir: Path) -> None:
     access at all:
 
         claude plugin marketplace add <workspace>/.claude/agnes-marketplace
-        claude plugin install <name>@agnes --scope project
+        claude plugin install <name>@agnes --scope user
 
     Both are needed. ``marketplace add`` records the source in the CLI's HOME
     settings and ``plugin install`` records the install in its HOME registry —
