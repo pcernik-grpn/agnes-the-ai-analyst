@@ -1892,7 +1892,10 @@ class TestRailChatsDestination:
         import app.web.router as _router
 
         _router.templates.env.globals["admin_setup_rail"] = lambda: {
-            "done": 6, "total": 6, "complete": True, "steps": [],
+            "done": 6,
+            "total": 6,
+            "complete": True,
+            "steps": [],
         }
         try:
             rail = self._rail(web_client, admin_cookie)
@@ -2133,7 +2136,7 @@ class TestRailDashboard:
         # existed the whole page was a safe proxy for the hero; it is not any
         # more, and a document-wide assertion would have started failing for a
         # reason unrelated to what it is checking.
-        _hero = text.split('cld-door--setup', 1)[1].split("</section>", 1)[0]
+        _hero = text.split("cld-door--setup", 1)[1].split("</section>", 1)[0]
         assert "Invite people" not in _hero
         assert "/admin/data-sources?add=" in text
         # The composer must not advertise the one thing that cannot work here.
@@ -2829,9 +2832,7 @@ class TestRedesignedPageContracts:
         assert "chat_row_menu.js" in resp.text
         assert 'id="chat-copy-transcript"' in resp.text
 
-    def test_the_analyst_journey_yields_to_an_unfinished_admin_chain(
-        self, web_client, admin_cookie, monkeypatch
-    ):
+    def test_the_analyst_journey_yields_to_an_unfinished_admin_chain(self, web_client, admin_cookie, monkeypatch):
         """Two six-step "setup" journeys must never render together.
 
         The rail's ``railGetStarted`` card is the ANALYST journey (ask a
@@ -2871,12 +2872,8 @@ class TestRedesignedPageContracts:
         from jinja2 import Environment
 
         env = Environment()
-        pill = env.from_string(
-            "{% if not (admin_setup and not admin_setup.complete) %}PILL{% else %}NONE{% endif %}"
-        )
-        flag = env.from_string(
-            "{% if admin_setup and not admin_setup.complete %}FLAG{% else %}NONE{% endif %}"
-        )
+        pill = env.from_string("{% if not (admin_setup and not admin_setup.complete) %}PILL{% else %}NONE{% endif %}")
+        flag = env.from_string("{% if admin_setup and not admin_setup.complete %}FLAG{% else %}NONE{% endif %}")
         # A non-admin never gets `admin_setup` at all.
         assert pill.render() == "PILL"
         assert flag.render() == "NONE"
