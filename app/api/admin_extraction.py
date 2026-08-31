@@ -86,6 +86,23 @@ _STALL_AFTER_S = 1800
 #: resumes" copy). `stalled` is derived at read time and never stored.
 OUTCOME_PRECEDENCE = ("failed", "stalled", "interrupted", "done", "running")
 
+#: Stop reasons (``CrawlStats.report()['interrupted_reason']``) whose run is
+#: resumable BY CONSTRUCTION: the crawl persisted its deltaLinks/cTags on the
+#: way out, so the next run skips what this one already ingested.
+#:
+#: This is deliberately keyed on the REASON, not on the outcome word. A
+#: timeout and a tenant-throttle abort both finalize as ``failed`` — correctly,
+#: because the job did not finish its corpus and an operator should see it —
+#: yet both cost re-work rather than coverage. Gating the "next run resumes"
+#: copy on ``outcome == "interrupted"`` withheld it from exactly the two
+#: cases that have earned it, which is how an operator ends up re-running a
+#: four-hour crawl out of doubt.
+#:
+#: ``"throttled"`` is not yet emitted by the crawl (a 429-budget abort still
+#: records ``"error"``); it is listed ahead of that so the value needs no
+#: change here on the day it lands. An unknown reason claims nothing.
+RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled"})
+
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
     """The connection row, or a 404 — resolved BEFORE any PG-only repo, so
@@ -173,6 +190,25 @@ def _derived_outcome(run: Dict[str, Any], *, now: Optional[datetime] = None) -> 
     return {"outcome": "running", "stored_status": stored, "stale_s": stale_s, "evidence": None}
 
 
+def _is_resumable(run: Dict[str, Any], report: Dict[str, Any]) -> bool:
+    """Whether the next run demonstrably picks up where this one stopped.
+
+    Derived here rather than in the template for the same reason liveness is:
+    it is a RULE about what Agnes may claim, not a rendering choice, and a
+    rule that lives in one testable place cannot be re-derived differently
+    by a second caller.
+
+    Deliberately conservative. A cancellation and a state-persisting stop
+    reason both qualify; a crash does not, because nothing is known about
+    how far the crawl state got before it died — and "your work is safe" is
+    precisely the sentence that must never be guessed.
+    """
+    if str(run.get("status") or "") == "interrupted":
+        return True
+    reason = str(report.get("interrupted_reason") or "").strip().lower()
+    return reason in RESUMABLE_STOP_REASONS
+
+
 def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """One run, in the shape both the history drawer and the status endpoint
     render. Absolute counters only — no fraction, no percentage, no ETA."""
@@ -217,6 +253,13 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         # from a duration — and this is the field that distinguishes "the
         # ceiling did its job" from "something broke".
         "interrupted_reason": report.get("interrupted_reason"),
+        # Whether Agnes can ASSERT the next run picks up where this one
+        # stopped. True for a cancellation, and for a stop reason whose exit
+        # path persists state (see RESUMABLE_STOP_REASONS). False elsewhere —
+        # including a crash, where nothing is known about how far the state
+        # file got, and claiming resumability would be the reassuring kind
+        # of unverified value this whole surface exists to avoid.
+        "resumable": _is_resumable(run, report),
         # `{}` means NO tokens were spent, which is a different claim from
         # "$0.00" — the card must keep the two tellable apart (design §7.2).
         "usage": run.get("usage") or {},

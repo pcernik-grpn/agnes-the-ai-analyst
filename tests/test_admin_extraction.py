@@ -389,6 +389,49 @@ class TestRunProjection:
         )
         assert out["interrupted_reason"] == "timeout"
 
+    def test_a_timeout_is_resumable_even_though_it_finalized_as_failed(self):
+        """The crawl persists deltaLinks/cTags on the way out of a timeout,
+        so the next run costs re-work, not coverage. Keying the reassurance
+        on the outcome WORD withheld it from exactly the case that earned
+        it — an operator then re-runs a four-hour crawl out of doubt."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "failed", "report": {"interrupted_reason": "timeout"}})
+        assert out["outcome"] == "failed"
+        assert out["resumable"] is True
+
+    def test_a_crash_is_never_claimed_resumable(self):
+        """Nothing is known about how far the crawl state got before it
+        died, and "your work is safe" must never be guessed."""
+        from app.api.admin_extraction import _run_out
+
+        for report in ({"interrupted_reason": "error"}, {}, {"interrupted_reason": None}):
+            out = _run_out({"id": "er_1", "status": "failed", "report": report})
+            assert out["resumable"] is False, report
+
+    def test_a_cancelled_run_stays_resumable(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "interrupted", "report": {}})
+        assert out["resumable"] is True
+
+    def test_a_throttle_abort_is_resumable_the_day_the_crawl_emits_it(self):
+        """`"throttled"` is not emitted yet (a 429-budget abort still records
+        `"error"`), but the vocabulary is honored ahead of it so the reason
+        needs no change here on the day it lands."""
+        from app.api.admin_extraction import RESUMABLE_STOP_REASONS, _run_out
+
+        assert "throttled" in RESUMABLE_STOP_REASONS
+        out = _run_out({"id": "er_1", "status": "failed", "report": {"interrupted_reason": "throttled"}})
+        assert out["resumable"] is True
+
+    def test_resumability_matches_the_crawls_own_normalization(self):
+        from app.api.admin_extraction import _run_out
+
+        for spelling in ("timeout", "TIMEOUT", " Timeout "):
+            out = _run_out({"id": "er_1", "status": "failed", "report": {"interrupted_reason": spelling}})
+            assert out["resumable"] is True, spelling
+
     def test_a_run_that_ended_normally_has_no_stop_reason(self):
         from app.api.admin_extraction import _run_out
 

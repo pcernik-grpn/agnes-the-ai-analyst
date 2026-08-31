@@ -305,6 +305,7 @@ class TestRunsDrawer:
                 "files_done": 318,
                 "new": 318,
                 "skips_total": 0,
+                "resumable": True,
                 "error": None,
             },
             {
@@ -376,6 +377,7 @@ class TestRunsDrawer:
                     "duration_s": 3600.0,
                     "files_done": 4102,
                     "interrupted_reason": "timeout",
+                    "resumable": False,
                     "error": "run exceeded extraction.timeout_s",
                 }
             ],
@@ -383,9 +385,53 @@ class TestRunsDrawer:
         }
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
         assert "stopped early — timeout" in html
-        # …and it does NOT borrow the interrupted row's resume reassurance,
-        # which is reserved for the outcome that earns it.
+        # The reason line and the resume line are INDEPENDENT: this fixture
+        # pins a server that did not vouch for resumability, and the drawer
+        # must then stay silent about it even though the reason is one that
+        # usually is resumable. (The resumable-timeout case is its own test.)
         assert "the next run resumes" not in html
+
+    def test_a_resumable_timeout_gets_the_reassurance_despite_being_failed(self):
+        """The copy follows the server's `resumable` verdict, not the outcome
+        word — a timeout persisted its state and costs re-work, not coverage."""
+        runs = {
+            "runs": [
+                {
+                    "id": "er_t",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 3600.0,
+                    "files_done": 4102,
+                    "interrupted_reason": "timeout",
+                    "resumable": True,
+                    "error": "run exceeded extraction.timeout_s",
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        assert "stopped early — timeout" in html
+        assert "the next run resumes from where it stopped" in html
+
+    def test_a_crash_never_gets_the_resume_reassurance(self):
+        runs = {
+            "runs": [
+                {
+                    "id": "er_c",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 4.0,
+                    "files_done": 0,
+                    "interrupted_reason": "error",
+                    "resumable": False,
+                    "error": "RuntimeError: graph exploded",
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        assert "the next run resumes" not in html
+        assert "graph exploded" in html
 
     def test_a_run_with_no_recorded_reason_says_nothing_about_one(self):
         runs = {
