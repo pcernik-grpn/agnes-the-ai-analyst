@@ -18,6 +18,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **The SharePoint source card no longer offers a "Run extraction now" that can only 409.** The card computes the SAME readiness gates the manual trigger and the scheduled sweep check (`extraction.enabled` + a configured producer) and disables the button with an inline, human-readable reason — "Extraction is disabled on this instance" or "No extraction producer is configured" — instead of letting the click land `409 extraction_disabled`/`409 extraction_producer_not_configured`.
+
 ### Removed
 
 ### Internal

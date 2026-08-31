@@ -1416,12 +1416,17 @@ class TestSharePointSourceCard:
             assert schedule["text"] == "external producer · hourly delta"
             # TCRD-226's in-Agnes schedule state is a SEPARATE, additive
             # sub-object — a fresh connection with no scheduled runs reads
-            # honestly off (never a stale/guessed default).
+            # honestly off (never a stale/guessed default). `extraction.
+            # enabled` is off by default -> the honest-UI gate reads
+            # "not ready, extraction_disabled" (the same slug the manual
+            # trigger's 409 would use for this exact instance state).
             assert schedule["in_agnes"] == {
                 "enabled": False,
                 "schedule": None,
                 "last_run_at": None,
                 "next_run_at": None,
+                "extraction_ready": False,
+                "extraction_unready_reason": "extraction_disabled",
             }
         finally:
             source_connections_repo().delete(conn_id)
@@ -1467,6 +1472,46 @@ class TestSharePointSourceCard:
             assert in_agnes["last_run_at"] == last_run_at
             # next_due_at(every 4h, last_run_at) == last_run_at + 4h.
             assert in_agnes["next_run_at"] == "2026-08-29T12:00:00+00:00"
+            # Enabled, but `_fake_get_value` never configures a producer ->
+            # the SECOND readiness gate (not the first) is what blocks the
+            # honest-UI gate here.
+            assert in_agnes["extraction_ready"] is False
+            assert in_agnes["extraction_unready_reason"] == "extraction_producer_not_configured"
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_in_agnes_schedule_is_ready_when_enabled_and_producer_configured(self, seeded_app, monkeypatch):
+        """The honest-UI gate flips to ready only once BOTH gates the
+        manual trigger checks (`_extraction_readiness`) pass — mirrors
+        `test_in_agnes_schedule_reflects_live_config_and_dispatch_state`
+        but with a producer command configured, the state a real "Run
+        extraction now" click needs to actually succeed."""
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "true")
+
+        def _fake_get_value(*keys, default=None):
+            if keys == ("extraction", "producer", "command"):
+                return "python -m fake_producer"
+            return default
+
+        monkeypatch.setattr("app.instance_config.get_value", _fake_get_value)
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+        try:
+            inv = _source_inventory()
+            in_agnes = inv["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
+            assert in_agnes["extraction_ready"] is True
+            assert in_agnes["extraction_unready_reason"] is None
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1683,6 +1728,8 @@ class TestSharePointSourceCardRendering:
                 "function _sharepointFactsHtml(row) {",
                 "const SP_REJECTION_REASON_TEXT = {",
                 "function _spRejectionReasonText(reason) {",
+                "const EXTRACTION_UNREADY_REASON_TEXT = {",
+                "function _extractionUnreadyReasonText(reason) {",
                 "function _spGroupRejectionRows(rows) {",
                 "function _spRejectionRowHtml(r) {",
                 "function toggleFileSourceDrawer(connId, category) {",
@@ -1736,17 +1783,21 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
 
     # -- in-Agnes extraction scheduling + manual trigger (TCRD-226) --------
 
-    def test_run_extraction_now_button_always_renders_and_is_wired(self):
-        """The action is available regardless of whether in-Agnes
-        scheduling is configured — the fixture above carries no
-        `schedule.in_agnes` at all, and the button must still render and
-        call the SAME endpoint."""
+    def test_run_extraction_now_button_always_renders_but_defaults_disabled(self):
+        """The button never disappears — even on an older/degraded cell
+        shape (the fixture above carries no `schedule.in_agnes` at all) it
+        still renders and is wired to the SAME endpoint — but the honest-UI
+        gate (`extraction_ready`) is missing here, which reads as "not
+        ready" (fail closed), so it renders `disabled`. See
+        `test_in_agnes_schedule_ready_enables_the_run_button` for the
+        enabled case."""
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
         html = result["html"]
         assert "Run extraction now" in html
         assert "runSpExtraction('sp-conn-1')" in html
+        assert "disabled" in html
 
-    def test_in_agnes_schedule_renders_last_and_next_run(self):
+    def test_in_agnes_schedule_ready_enables_the_run_button(self):
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
@@ -1755,33 +1806,74 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "schedule": "every 4h",
                 "last_run_at": "2026-08-29T08:00:00+00:00",
                 "next_run_at": "2026-08-29T12:00:00+00:00",
+                "extraction_ready": True,
+                "extraction_unready_reason": None,
             },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        # Never a bare "off" badge when enabled.
-        assert "extraction.enabled is off" not in html
+        # Ready -> no unready badge, and the button carries no `disabled`.
+        assert "Extraction is disabled on this instance" not in html
+        assert "No extraction producer is configured" not in html
+        assert "disabled" not in html
         assert "8/29/2026" in html or "2026" in html  # locale-rendered date, just prove SOME date landed
 
     def test_in_agnes_schedule_never_run_reads_honestly(self):
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
-            "in_agnes": {"enabled": True, "schedule": "every 4h", "last_run_at": None, "next_run_at": None},
+            "in_agnes": {
+                "enabled": True,
+                "schedule": "every 4h",
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": True,
+                "extraction_unready_reason": None,
+            },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         assert "never run" in result["html"].lower()
 
-    def test_in_agnes_schedule_disabled_shows_an_off_badge(self):
+    def test_in_agnes_schedule_disabled_shows_the_reason_and_disables_the_button(self):
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
-            "in_agnes": {"enabled": False, "schedule": None, "last_run_at": None, "next_run_at": None},
+            "in_agnes": {
+                "enabled": False,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": False,
+                "extraction_unready_reason": "extraction_disabled",
+            },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "off" in html.lower()
+        assert "Extraction is disabled on this instance" in html
         assert "no schedule configured" in html.lower()
+        assert "disabled" in html
+
+    def test_in_agnes_schedule_producer_not_configured_shows_the_reason_and_disables_the_button(self):
+        """A DIFFERENT unready reason than the disabled case above — the
+        instance has `extraction.enabled: true` but no producer command/
+        module set, the exact state a click would otherwise 409
+        `extraction_producer_not_configured` for."""
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {
+                "enabled": True,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": False,
+                "extraction_unready_reason": "extraction_producer_not_configured",
+            },
+        }
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "No extraction producer is configured" in html
+        assert "disabled" in html
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
         result = self._run(
