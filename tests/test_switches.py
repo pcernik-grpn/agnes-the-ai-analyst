@@ -242,6 +242,57 @@ class TestExtractionSwitch:
         assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is True
 
 
+class TestAclCadenceSwitches:
+    """2026-08-31 plan, Task 2 — hours-scale ACL cadence switches.
+    `acl_sync_interval_hours` drives the scheduler's `sharepoint-acl` row
+    (see `services/scheduler/__main__.py::_acl_sync_schedule`);
+    `acl_zones` is read by Tasks 3-7's sweep/sync/gate code (not yet wired
+    in this task — the switch exists so those tasks have something to read)."""
+
+    def test_interval_hours_identity(self):
+        s = get_switch("acl_sync_interval_hours")
+        assert s.config_keys == ("acl_sync", "interval_hours")
+        assert s.env_var == "AGNES_ACL_SYNC_INTERVAL_HOURS"
+        assert s.kind == "int"
+        assert s.default == 4
+        assert s.editable is True
+        assert not s.lock_reason.strip()
+
+    def test_zones_identity(self):
+        s = get_switch("acl_zones")
+        assert s.config_keys == ("acl_sync", "zones_enabled")
+        assert s.env_var == "AGNES_ACL_ZONES_ENABLED"
+        assert s.kind == "bool"
+        assert s.default is False
+        assert s.editable is True
+        assert not s.lock_reason.strip()
+
+    def test_sweep_interval_days_default_lowered_to_one(self):
+        """Weekly -> daily sweep cadence (MUST NOT posture): the per-connection
+        self-guard's default must not outlive the scheduler row's own cadence
+        change in the same task."""
+        s = get_switch("acl_sweep_interval_days")
+        assert s.default == 1
+
+    def test_zones_resolves_through_the_registry(self, monkeypatch):
+        import app.switches as sw
+
+        monkeypatch.delenv("AGNES_ACL_ZONES_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert sw.switch_value("acl_zones") is False
+        monkeypatch.setenv("AGNES_ACL_ZONES_ENABLED", "1")
+        assert sw.switch_value("acl_zones") is True
+
+    def test_interval_hours_resolves_through_the_registry(self, monkeypatch):
+        import app.switches as sw
+
+        monkeypatch.delenv("AGNES_ACL_SYNC_INTERVAL_HOURS", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert sw.switch_value("acl_sync_interval_hours") == 4
+        monkeypatch.setenv("AGNES_ACL_SYNC_INTERVAL_HOURS", "2")
+        assert sw.switch_value("acl_sync_interval_hours") == 2
+
+
 class TestGetSwitch:
     def test_returns_the_entry(self):
         assert get_switch("chat").name == "chat"

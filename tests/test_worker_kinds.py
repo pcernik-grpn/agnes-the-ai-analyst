@@ -241,9 +241,7 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
-                (tables, source_type_filter)
-            ),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append((tables, source_type_filter)),
         )
 
         JOB_KINDS["data-refresh"].handler({})
@@ -259,9 +257,7 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
-                (tables, source_type_filter)
-            ),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append((tables, source_type_filter)),
         )
 
         JOB_KINDS["data-refresh"].handler({"tables": ["orders"], "source": "keboola"})
@@ -1384,6 +1380,52 @@ class TestCorpusExtractionHandler:
         payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
         assert payload["collection_ids"] == ["col_anon_1", "col_plain_1"]
 
+    def test_agnes_api_token_collection_ids_include_active_zone_collections(self, monkeypatch):
+        """An ACTIVE permission zone's collection joins the `collection_ids`
+        claim (a dissolved one does not) — the corpus map advertises the zone
+        collection as a routing target, so a token without it would 403 every
+        zone delivery (`producer_corpus_out_of_scope`) and the zone would stay
+        silently empty."""
+        from app.auth.jwt import verify_token
+
+        zoned_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-default-1",
+                    "display_path": "Default site",
+                    "anonymize": False,
+                    "collection_id": "col_default",
+                }
+            ],
+            "acl_zones": [
+                {
+                    "zone_item_id": "zone-item-1",
+                    "parent_scope_id": "scope-default-1",
+                    "display_path": "Default site/Documents/Legal",
+                    "rel_path": "Legal",
+                    "collection_id": "col_zone_active",
+                    "status": "active",
+                },
+                {
+                    "zone_item_id": "zone-item-2",
+                    "parent_scope_id": "scope-default-1",
+                    "display_path": "Default site/Documents/Old",
+                    "rel_path": "Old",
+                    "collection_id": "col_zone_gone",
+                    "status": "dissolved",
+                },
+            ],
+        }
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=zoned_config)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default", "col_zone_active"]
+
     def test_no_scopes_and_no_corpus_id_is_refused_before_any_token_is_minted(self, monkeypatch):
         """The scenario this test used to describe — no confirmed scopes, no
         payload `corpus_id`, token minted with `collection_ids: []` — is not a
@@ -1637,6 +1679,96 @@ class TestCorpusExtractionHandler:
         handler({"connection_id": "conn1"})
 
         assert "AGNES_SP_EXCLUDED_SUBTREE_IDS" not in calls[0]["env"]
+
+    # -- sweep v2: file-kind exclusions + zone corpus-map handoff
+    # (2026-08-31 plan, Task 7) --------------------------------------------
+
+    def test_excluded_subtree_map_includes_file_ids_and_skips_zones(self):
+        """``_excluded_subtree_scope_map`` doesn't filter on ``kind`` — a
+        ``kind="file"`` entry's item id rides the same list as a folder's —
+        and never sees a zoned subtree in the first place, because the
+        sweep's own walk (``connectors.sharepoint.acl_sync
+        ._walk_subtree_sweep``) routes a zone candidate into
+        ``config["acl_zones"]`` instead of ``excluded_subtrees``."""
+        from app.worker.kinds import _excluded_subtree_scope_map
+
+        connection = {
+            "config": {
+                "scopes": [
+                    {
+                        "source_scope_id": "root-1",
+                        "display_path": "Site",
+                        "collection_id": "col_root",
+                        "excluded_subtrees": [
+                            {"item_id": "F", "path": "Site/F.docx", "rel_path": "F.docx", "kind": "file"},
+                            {"item_id": "X", "path": "Site/X", "rel_path": "X", "kind": "folder"},
+                        ],
+                    }
+                ],
+                # The zone itself never appears in `excluded_subtrees` above —
+                # it lives here instead, exactly as the sweep writes it.
+                "acl_zones": [
+                    {
+                        "zone_item_id": "Z",
+                        "parent_scope_id": "root-1",
+                        "display_path": "Site/Z",
+                        "collection_id": "col_zone_z",
+                        "status": "active",
+                    }
+                ],
+            }
+        }
+
+        result = _excluded_subtree_scope_map(connection)
+        assert result == {"root-1": ["F", "X"]}
+        assert "Z" not in result.get("root-1", [])
+
+    def test_corpus_map_includes_active_zone_rows(self, monkeypatch):
+        """``_run_corpus_extraction`` folds this connection's active
+        permission zones into ``AGNES_EXTRACTION_CORPUS_MAP`` as additional,
+        nested keys (2026-08-31 plan, Task 7) — the same source of truth
+        (``connectors.sharepoint.corpus_map.producer_corpus_map``) the admin
+        corpus-map endpoint uses."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        config = {
+            "scopes": [
+                {
+                    "source_scope_id": "root-1",
+                    "display_path": "Site/Documents/Team",
+                    "anonymize": False,
+                    "collection_id": "col_p",
+                }
+            ],
+            "acl_zones": [
+                {
+                    "zone_item_id": "zone-legal",
+                    "parent_scope_id": "root-1",
+                    "display_path": "Site/Documents/Team/Legal",
+                    "collection_id": "col_z",
+                    "status": "active",
+                },
+                {
+                    "zone_item_id": "zone-old",
+                    "parent_scope_id": "root-1",
+                    "display_path": "Site/Documents/Team/Old",
+                    "collection_id": "col_z_old",
+                    "status": "dissolved",
+                },
+            ],
+        }
+        self._stub_connection_and_settings(monkeypatch, config=config)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_EXTRACTION_CORPUS_MAP"]) == {
+            "Site/Team": "col_p",
+            "Site/Team/Legal": "col_z",
+        }
 
 
 class TestExtractionProducerArgvEnvOverride:

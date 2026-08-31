@@ -514,6 +514,52 @@ def _refuse_producer_out_of_scope_documents(body: "FactsIngestRequest", user: An
         )
 
 
+def _refuse_source_acl_excluded_documents(body: "FactsIngestRequest") -> None:
+    """MUST NOT enforcement (2026-08-31 plan, Task 5): a document under an
+    excluded SharePoint subtree/file, or under another collection's active
+    permission zone, is refused even when the producer's claims batch is
+    otherwise in scope. Independent of (and checked alongside) the two gates
+    above — this one keys off ``source_connections_repo()`` state via
+    :mod:`connectors.sharepoint.ingest_gate`, the same server-side
+    enforcement the upload endpoint applies to file bytes, so a producer
+    cannot land claims for content Agnes would have refused to store.
+
+    A no-op for every ``documents[]`` row whose ``corpus_id`` is not a
+    SharePoint mirrored-scope/active-zone collection (``acl_mirroring`` off,
+    or a plain collection) — :func:`source_acl_index_for_collection` returns
+    ``None`` and the row is skipped.
+    """
+    from connectors.sharepoint.ingest_gate import source_acl_index_for_collection, source_acl_refusal
+
+    index_by_corpus: Dict[str, Any] = {}
+    offenders: List[Dict[str, Any]] = []
+    for doc in body.documents or []:
+        corpus_id = doc.get("corpus_id")
+        if not corpus_id:
+            continue
+        if corpus_id not in index_by_corpus:
+            index_by_corpus[corpus_id] = source_acl_index_for_collection(str(corpus_id))
+        index = index_by_corpus[corpus_id]
+        if index is None:
+            continue
+        reason = source_acl_refusal(index, path=doc.get("path"), stable_id=doc.get("stable_id"))
+        if reason:
+            offenders.append({"doc_id": doc.get("doc_id"), "reason": reason})
+
+    if offenders:
+        log_safe(
+            action="sharepoint_acl.ingest_rejected",
+            resource="facts:ingest",
+            params={"count": len(offenders)},
+            result="error",
+            client_kind="api",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "source_acl_excluded_documents", "items": offenders},
+        )
+
+
 class FactsIngestRequest(BaseModel):
     """Wire format accepted verbatim (spec §7.0/§7.2) — ``documents`` are the
     crawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/
@@ -672,10 +718,18 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
     documents-omitted replay flow, and is unaffected by either half.
     ``evidence[].audience`` (Task 10, spec §4.2) is format-validated FIRST,
     before either gate below — see :func:`_validate_evidence_audience`.
+
+    A fourth gate (2026-08-31 plan, Task 5) refuses any ``documents[]`` row
+    whose ``path``/``stable_id`` falls under a SharePoint connection's
+    excluded subtree/file or another collection's active permission zone —
+    server-side MUST NOT enforcement independent of whether the producer
+    honored the crawl-time exclusion list. See
+    :func:`_refuse_source_acl_excluded_documents`.
     """
     _validate_evidence_audience(body)
     _refuse_undeclared_anonymize_marked_corpora(body)
     _refuse_producer_out_of_scope_documents(body, user)
+    _refuse_source_acl_excluded_documents(body)
     try:
         report = facts_repo().ingest_batch(
             documents=body.documents,

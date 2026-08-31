@@ -91,6 +91,17 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 ``.../extract`` above; refuses with
                                                                 ``409 feature_disabled`` when
                                                                 ``acl_mirroring.enabled`` is off.
+  POST   /api/admin/sharepoint/connections/{id}/subtree-sweep  — admin "re-check subtrees now"
+                                                                trigger (2026-08-31 plan, Task 8)
+                                                                for the ``sharepoint-subtree-sweep``
+                                                                job (``connectors/sharepoint/
+                                                                acl_sync.py::run_subtree_sweep``).
+                                                                Identical enqueue/dedup/flag-gate
+                                                                mechanics to ``.../acl-sync``
+                                                                above — the explicit-connection
+                                                                payload bypasses the job's own
+                                                                per-connection due-guard, so this
+                                                                is always a real, immediate sweep.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -130,7 +141,7 @@ from app.auth.public_url import public_base_url
 from app.auth.session_principal import ProducerPrincipal
 from app.resource_types import ResourceType
 from src.audit_helpers import log_safe
-from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, active_zone_rows, zone_rows
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
@@ -520,12 +531,30 @@ def _scope_out(
         "drive_id": scope.get("drive_id"),
         # Broken-inheritance subtree sweep (2026-08-30 plan, Task 7) — the
         # advisory surface's data: how many subtrees the sweep excluded from
-        # the crawl, each as {item_id, path} (never the raw {detected_at}
-        # timestamp — the wizard doesn't need it), plus whether an admin has
-        # overridden the exclusion for this scope (`should_not` mode only).
+        # the crawl, each as {item_id, path, rel_path, kind} (never the raw
+        # {detected_at} timestamp — the wizard doesn't need it), plus
+        # whether an admin has overridden the exclusion for this scope
+        # (`should_not` mode only). `excluded_file_count` (2026-08-31 plan,
+        # Task 8) is the `kind == "file"` slice of the same list — sweep v2
+        # (Task 3) now probes files as well as folders, and a scope with a
+        # lot of excluded folders but a handful of excluded files (or vice
+        # versa) reads very differently to an admin deciding whether to
+        # override. A legacy entry with no `kind` (written before sweep v2)
+        # reads as a folder — never counted here, same "treat-missing-as-
+        # legacy" rule the sweep's own matching uses.
         "excluded_subtree_count": len(scope.get("excluded_subtrees") or []),
+        "excluded_file_count": sum(
+            1
+            for item in (scope.get("excluded_subtrees") or [])
+            if isinstance(item, dict) and item.get("kind") == "file"
+        ),
         "excluded_subtrees": [
-            {"item_id": item.get("item_id"), "path": item.get("path")}
+            {
+                "item_id": item.get("item_id"),
+                "path": item.get("path"),
+                "rel_path": item.get("rel_path"),
+                "kind": item.get("kind") or "folder",
+            }
             for item in (scope.get("excluded_subtrees") or [])
             if isinstance(item, dict)
         ],
@@ -541,6 +570,21 @@ def _scope_out(
     if summary is not None:
         out["acl_sync_last_run"] = summary
     return out
+
+
+def _zone_out(zone: Dict[str, Any]) -> Dict[str, Any]:
+    """Wizard-facing projection of one ``config["acl_zones"]`` row
+    (2026-08-31 plan, Task 3/8 — see ``connectors/sharepoint/acl_sync.py::
+    zone_rows``) — id/route/status bookkeeping only, never the ``rel_path``/
+    ``drive_id``/``parent_scope_id`` internals the sweep and sync need but an
+    admin reading the connection detail does not."""
+    return {
+        "zone_item_id": zone.get("zone_item_id"),
+        "display_path": zone.get("display_path"),
+        "collection_id": zone.get("collection_id"),
+        "status": zone.get("status"),
+        "detected_at": zone.get("detected_at"),
+    }
 
 
 def no_group_warning(group_ids: List[str]) -> bool:
@@ -938,7 +982,11 @@ async def list_scopes(
     user=Depends(require_admin_or_producer_connection("{connection_id}")),
 ):
     """The wizard's step-2/3 source of truth: every confirmed scope row,
-    enriched with its collection and current group grants.
+    enriched with its collection and current group grants, plus this
+    connection's permission zones (2026-08-31 plan, Task 3/8 — ``"zones"``,
+    ACTIVE and DISSOLVED alike so the wizard can show a zone's history
+    rather than have it vanish the moment it dissolves; see :func:`_zone_out`
+    for the exact projection).
 
     Also the corpus-extraction producer's own callback read (TCRD-...):
     a ``ProducerPrincipal`` scoped to THIS connection may call this too
@@ -956,7 +1004,10 @@ async def list_scopes(
             resource=connection_id,
             client_kind="producer",
         )
-    return {"items": [_scope_out(s, declared, row) for s in _scopes(row)]}
+    return {
+        "items": [_scope_out(s, declared, row) for s in _scopes(row)],
+        "zones": [_zone_out(z) for z in zone_rows(row)],
+    }
 
 
 @router.post("/connections/{connection_id}/scopes", status_code=201)
@@ -1178,16 +1229,34 @@ async def remove_scope(
     are explicit exclusions"). Removes the wizard's own bookkeeping row only;
     any collection already created for it is left alone (deleting a
     collection is a separate, deliberate operation, not a side effect of
-    unchecking a wizard row)."""
+    unchecking a wizard row).
+
+    Its ``sharepoint-acl-sync``-owned (sentinel-assigned) grants on that
+    collection do NOT survive, though (2026-08-31 plan, Task 8): with the
+    scope row gone, the sync never reconciles that collection again, so a
+    sentinel-owned grant left behind would dangle forever — indistinguishable
+    from a deliberate, still-maintained grant to anyone reading ``/admin/
+    access``. Same removal loop :func:`confirm_scope` uses for its own
+    ``mirrored`` -> ``manual`` transition; an admin-assigned grant on the
+    same collection is untouched either way.
+    """
     row = _sharepoint_connection_or_404(connection_id)
     scopes = _scopes(row)
-    remaining = [s for s in scopes if s.get("source_scope_id") != source_scope_id]
-    if len(remaining) == len(scopes):
+    removed = next((s for s in scopes if s.get("source_scope_id") == source_scope_id), None)
+    if removed is None:
         raise HTTPException(status_code=404, detail="scope_not_found")
+    remaining = [s for s in scopes if s.get("source_scope_id") != source_scope_id]
     # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
     # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": remaining}
     source_connections_repo().update(connection_id, config=new_config)
+
+    collection_id = removed.get("collection_id")
+    if collection_id:
+        grants = resource_grants_repo()
+        for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
+            if grant.get("resource_id") == collection_id and (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
+                grants.delete(grant["id"])
 
 
 @router.get("/connections/{connection_id}/corpus-map")
@@ -1206,8 +1275,18 @@ async def corpus_map(
     unusable for routing: the resolver matches keys against crawler rows'
     site/path components, which a Graph scope id never equals.
 
-    ``409 corpus_map_ambiguous`` when the confirmed scopes cannot form an
-    unambiguous map (e.g. a site scope plus a drive scope of the same
+    Every ACTIVE permission zone (2026-08-31 plan, Task 3/7 —
+    ``connectors/sharepoint/acl_sync.py``'s ``config["acl_zones"]``) folds in
+    as an ADDITIONAL, NESTED key under its parent scope's own key (a zone's
+    ``display_path`` always extends its parent's) — see
+    ``connectors/sharepoint/corpus_map.py``'s module docstring for why the
+    producer's resolver MUST match these longest-prefix-first, and why a
+    resolver that gets that wrong still fails closed rather than leaking
+    zone content (the ingest gate, 2026-08-31 plan, Task 5). A DISSOLVED
+    zone is never mapped — its content re-homes to the parent scope.
+
+    ``409 corpus_map_ambiguous`` when the confirmed scopes/zones cannot form
+    an unambiguous map (e.g. a site scope plus a drive scope of the same
     site) — never a best-guess map.
 
     Deliberately does NOT carry ``anonymize`` — a producer that needs to
@@ -1225,7 +1304,7 @@ async def corpus_map(
     """
     row = _sharepoint_connection_or_404(connection_id)
     try:
-        mapping = producer_corpus_map(_scopes(row))
+        mapping = producer_corpus_map(_scopes(row), active_zone_rows(row))
     except CorpusMapError as exc:
         raise HTTPException(
             status_code=409,
@@ -1419,6 +1498,66 @@ async def trigger_acl_sync(
         )
 
     logger.info("sharepoint connection %s: acl-sync job %s enqueued (manual trigger)", connection_id, job["id"])
+    return {"job_id": job["id"], "status": job["status"]}
+
+
+def _sweep_idempotency_key(connection_id: str) -> str:
+    """A STABLE per-connection idempotency key for the
+    ``sharepoint-subtree-sweep`` job — mirrors
+    :func:`_acl_sync_idempotency_key`'s shape so a manual "re-check subtrees
+    now" and any other in-flight sweep for the same connection can never
+    both be queued at once."""
+    return f"sharepoint-subtree-sweep:{connection_id}"
+
+
+@router.post("/connections/{connection_id}/subtree-sweep", status_code=202)
+async def trigger_subtree_sweep(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Admin-triggered one-off run of the ``sharepoint-subtree-sweep`` job
+    for this connection (2026-08-31 plan, Task 8's "re-check subtrees now")
+    — enqueues ``connectors.sharepoint.acl_sync.run_subtree_sweep`` (via
+    ``app/worker/kinds.py::_run_sharepoint_subtree_sweep``) with
+    ``{"connection_id": connection_id}``, the SAME mechanics as
+    :func:`trigger_acl_sync`. The explicit-connection payload also bypasses
+    the job's own per-connection ``acl_sync.sweep_interval_days`` due-guard
+    (:func:`connectors.sharepoint.acl_sync._sweep_due`), so this always
+    triggers a real sweep, never a same-day no-op.
+
+    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
+    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
+    .enabled`` is off — same reasoning as :func:`trigger_acl_sync`: the job
+    handler itself would just no-op, but a manual trigger should tell the
+    admin why nothing happened rather than return a 202 for a run that will
+    do nothing.
+
+    Deduped on a STABLE per-connection idempotency key
+    (:func:`_sweep_idempotency_key`) — a second trigger while one is already
+    queued/running for this connection gets ``409 sweep_already_running``
+    instead of a second job.
+    """
+    from app.instance_config import feature_enabled
+
+    _sharepoint_connection_or_404(connection_id)
+
+    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
+        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "sharepoint-subtree-sweep",
+        {"connection_id": connection_id},
+        idempotency_key=_sweep_idempotency_key(connection_id),
+    )
+    if job["deduped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "sweep_already_running", "job_id": job["id"]},
+        )
+
+    logger.info("sharepoint connection %s: subtree-sweep job %s enqueued (manual trigger)", connection_id, job["id"])
     return {"job_id": job["id"], "status": job["status"]}
 
 

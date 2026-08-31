@@ -815,19 +815,52 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="acl_sync_interval_hours",
+        config_keys=("acl_sync", "interval_hours"),
+        env_var="AGNES_ACL_SYNC_INTERVAL_HOURS",
+        kind="int",
+        default=4,
+        effect="restart",
+        category="product",
+        editable=True,
+        description=(
+            "Hours between SharePoint ACL sync runs (scope + zone root permission "
+            "re-reads). The source-side revocation window is at most this long. "
+            "Read by the scheduler sidecar at startup."
+        ),
+    ),
+    Switch(
+        name="acl_zones",
+        config_keys=("acl_sync", "zones_enabled"),
+        env_var="AGNES_ACL_ZONES_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Promote broken-inheritance SharePoint subtrees to their own "
+            "collections with their own mirrored ACLs (permission zones) instead "
+            "of excluding them from the crawl entirely. Requires acl_mirroring."
+        ),
+    ),
+    Switch(
         name="acl_sweep_interval_days",
         config_keys=("acl_sync", "sweep_interval_days"),
         env_var="AGNES_ACL_SWEEP_INTERVAL_DAYS",
         kind="int",
-        default=7,
+        default=1,
         effect="live",
         category="product",
         editable=True,
         description=(
             "Days between full sharepoint-subtree-sweep passes (broken-inheritance "
             "folder detection, spec §3(b)) for one connection's mirrored scopes. The "
-            "scheduler row itself already fires weekly (native cron); this is a "
-            "per-connection self-guard against a restart-refire, not the primary cadence."
+            "scheduler row itself already fires daily (native cron); this is a "
+            "per-connection self-guard against a restart-refire, not the primary "
+            "cadence. Daily by default so a newly broken-inheritance subtree is "
+            "detected within ~a day (MUST NOT posture); raise it if the Graph probe "
+            "budget on a very large tenant becomes a problem."
         ),
     ),
 )
