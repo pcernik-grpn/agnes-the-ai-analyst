@@ -430,12 +430,16 @@ def test_audit_log_carries_the_full_new_command_value(seeded_app, monkeypatch):
     )
     assert resp.status_code == 200, resp.text
 
+    import json
+
     from src.repositories import audit_repo
 
-    rows = audit_repo().list(action="instance_config.update", limit=5)
+    rows, _ = audit_repo().query(action="instance_config.update", limit=5)
+    assert rows, "expected an instance_config.update row"
     row = rows[0]
-    assert row["action"] == "instance_config.update"
-    diff_entries = row["params"]["diff"]
+    params = row.get("params")
+    params = json.loads(params) if isinstance(params, str) else (params or {})
+    diff_entries = params["diff"]
     matching = [d for d in diff_entries if d["path"] == "extraction.producer.command"]
     assert matching, diff_entries
     assert matching[0]["after"] == "python -m my_special_producer --flag"

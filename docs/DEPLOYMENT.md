@@ -664,6 +664,21 @@ and explicit-secrets prerequisites above remain yours to satisfy — on a
 DuckDB app-state instance the app still refuses to boot, naming the
 missing piece.
 
+`extraction.enabled`, `extraction.producer.command`/`.module`/
+`.env_passthrough`, `extraction.schedule` and `extraction.timeout_s` are all
+editable from `/admin/server-config` (or `agnes admin server-config`),
+reversing the switch's original deploy-time-only stance. This does not
+weaken the TF-first posture above: `enabled`, `producer.command` and
+`producer.module` each still honor their env var (`AGNES_EXTRACTION_ENABLED`
+/ `_PRODUCER_COMMAND` / `_PRODUCER_MODULE`) ahead of a web save, exactly the
+resolution order every other switch uses. On a Terraform-provisioned
+instance the panel shows those three leaves as read-only ("set by deployment
+(Terraform)") and a `POST` touching one 409s (`field_locked_by_deployment`)
+rather than persisting a value the running process would never read — clear
+the env var on the deployment side first if you need to hand-edit it here.
+`schedule`/`timeout_s`/`env_passthrough` carry no such override and are
+always plain writable fields, on every deployment shape.
+
 ### Coordination backend
 
 `coordination.backend` (`instance.yaml`) / `AGNES_COORDINATION_BACKEND`
