@@ -28,6 +28,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+
+- The `corpus_file_events` migration was cut as `0086` against `0085_alias_edge_backfill`, but `0086_claims_audience` landed on that parent first — two alembic heads, and `alembic upgrade head` refuses outright. Renumbered to `0087_corpus_file_events` chained onto `0086_claims_audience`. Invisible on this branch alone, which is why CI was green here.
 - **The nightly `docker-e2e` lane is green again.** The wave-2 audit hardening gave `_check_token` a 32-character minimum on the apps-runner shared secret, replacing a plain `!=` compare. `tests/test_chat_docker_provider_daemon.py` had been setting a 17-character fixture token, which the old compare accepted and the floor rejects *before* comparing — so both docker-sandbox tests failed as a flat `401 bad_runner_token` that named neither the length rule nor the fixture. The production floor is correct and unchanged; the fixture token is now long enough to clear it. Only the nightly and `workflow_dispatch` runs see this lane (`docker-e2e` is skipped on pull requests), which is why it went red on `main` without blocking a single PR.
 
 ## [0.94.0] - 2026-08-31

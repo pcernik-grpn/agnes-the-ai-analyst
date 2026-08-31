@@ -24,8 +24,15 @@ best-effort (never allowed to fail the upload/delete they describe) and
 silently no-op on a DuckDB-backed instance, exactly like
 ``facts_ingest_runs``'s own best-effort report write.
 
-Revision ID: 0086_corpus_file_events
-Revises: 0085_alias_edge_backfill
+Renumbered before merge: this was cut as ``0086_corpus_file_events`` against
+``0085_alias_edge_backfill``, but ``0086_claims_audience`` landed on that same
+parent first. Keeping the original id would have left the ladder with two heads
+and broken ``alembic upgrade head`` outright — invisible on this branch alone,
+which is why CI was green. The schema change itself is untouched; only the
+revision id and the parent it chains onto moved.
+
+Revision ID: 0087_corpus_file_events
+Revises: 0086_claims_audience
 Create Date: 2026-08-30
 """
 
@@ -36,8 +43,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0086_corpus_file_events"
-down_revision: Union[str, None] = "0085_alias_edge_backfill"
+revision: str = "0087_corpus_file_events"
+down_revision: Union[str, None] = "0086_claims_audience"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
