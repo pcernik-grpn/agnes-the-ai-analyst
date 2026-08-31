@@ -17,6 +17,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **A hostile `clientState` could turn the SharePoint webhook into the oracle it was written to deny.** `hmac.compare_digest` raises `TypeError` on a `str` that is not ASCII-only, and `clientState` arrives entirely from the caller — so any non-ASCII value became an unhandled 500. Because only a request naming a REAL connection that already has a secret configured ever reaches that comparison, the 500-vs-202 split answered exactly the existence-and-secret question every other path in the receiver returns a flat 202 to hide. Both sides are now compared as UTF-8 bytes: still constant-time, and total over any input.
 
 ### Removed
 

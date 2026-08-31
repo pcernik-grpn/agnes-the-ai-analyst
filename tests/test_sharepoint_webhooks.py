@@ -147,6 +147,43 @@ class TestNotificationDelivery:
         jobs = jobs_repo().list(kind="corpus-extraction")
         assert not any(j["payload_json"] == {"connection_id": conn_id} for j in jobs)
 
+    def test_non_ascii_clientstate_is_dropped_like_any_other_mismatch(self, seeded_app, monkeypatch):
+        """A non-ASCII ``clientState`` must be a silent 202, not a 500.
+
+        ``hmac.compare_digest`` raises TypeError on a str that is not
+        ASCII-only, and ``clientState`` is entirely caller-supplied. Comparing
+        the str directly therefore turned any non-ASCII value into an
+        unhandled 500 — and because only a request against a REAL connection
+        WITH a secret configured ever reaches that comparison, the 500-vs-202
+        split was an existence/secret oracle: exactly the property every other
+        path in this module is written to deny.
+        """
+        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        conn_id, _secret = self._connection_with_secret(seeded_app)
+        r = seeded_app["client"].post(
+            f"{BASE}/{conn_id}",
+            json={"value": [{"clientState": "nopé-\u0161\u010d\u0159", "resourceData": {"id": "x"}}]},
+        )
+        assert r.status_code == 202
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="corpus-extraction")
+        assert not any(j["payload_json"] == {"connection_id": conn_id} for j in jobs)
+
+    def test_non_ascii_clientstate_is_indistinguishable_from_an_unknown_connection(self, seeded_app, monkeypatch):
+        """The oracle closed end to end: the same hostile payload gets the
+        same answer whether the connection exists with a secret or not."""
+        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        conn_id, _secret = self._connection_with_secret(seeded_app)
+        payload = {"value": [{"clientState": "\u00fc\u00f1\u00ee\u00e7\u00f8d\u00e9"}]}
+        real = seeded_app["client"].post(f"{BASE}/{conn_id}", json=payload)
+        missing = seeded_app["client"].post(f"{BASE}/does-not-exist", json=payload)
+        assert real.status_code == missing.status_code == 202
+        assert real.json() == missing.json()
+
     def test_no_secret_configured_yet_returns_202_with_nothing_done(self, seeded_app, monkeypatch):
         monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))

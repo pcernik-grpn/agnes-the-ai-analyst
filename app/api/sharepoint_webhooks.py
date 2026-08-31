@@ -118,7 +118,17 @@ def _verified_notifications(notifications: List[Any], secret: str) -> List[Dict[
         if not isinstance(item, dict):
             continue
         client_state = item.get("clientState")
-        if isinstance(client_state, str) and hmac.compare_digest(client_state, secret):
+        if not isinstance(client_state, str):
+            continue
+        # Compare as BYTES. `hmac.compare_digest` raises TypeError on a str
+        # that is not ASCII-only, and `clientState` is fully caller-supplied
+        # — so comparing the str directly turns any non-ASCII value into an
+        # unhandled 500. That would defeat this module's whole "never an
+        # oracle" property: only a request that reaches this line has a real
+        # connection WITH a secret configured, so a 500-vs-202 split would
+        # answer exactly the question every other path refuses to. Encoding
+        # both sides keeps the comparison constant-time and total.
+        if hmac.compare_digest(client_state.encode("utf-8"), secret.encode("utf-8")):
             verified.append(item)
     return verified
 
