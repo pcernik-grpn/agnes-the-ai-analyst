@@ -261,6 +261,15 @@
         st.apps = []; st.chosen = {}; st.fetched = false; st.err = null; st.skipped = 0;
       },
       sourceId: function () { return o.sourceId; },
+      /* Read-only view of the panel's progress, for a host that renders
+         something ABOUT the catalogue rather than the catalogue itself (the
+         standalone page's Library preview). `chosen()` alone cannot tell "not
+         read yet" from "read, and everything switched off" — both are an empty
+         array — and those need different things said about them. A fresh
+         object each call: the internals stay the panel's. */
+      state: function () {
+        return { fetched: st.fetched, fetching: st.fetching, total: st.apps.length, err: st.err };
+      },
     };
   }
 
