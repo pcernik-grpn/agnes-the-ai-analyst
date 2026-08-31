@@ -629,11 +629,15 @@ class LLMDetector:
         kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": self.max_output_tokens,
-            # The rules ride the system channel and carry the cache
-            # breakpoint: identical for every chunk of every document, so a
-            # crawl pays for them once per cache window rather than once per
-            # call. (Below a model's minimum cacheable prefix the breakpoint
-            # is simply inert — never an error.)
+            # The rules ride the system channel and carry a cache breakpoint:
+            # byte-identical for every chunk of every document, which is the
+            # shape a cache can actually serve. Whether it DOES is model
+            # dependent — a prefix shorter than the model's minimum cacheable
+            # length is silently not cached (inert, never an error), and at
+            # ~650 tokens this prompt is below the Haiku-4.5 minimum. The
+            # breakpoint costs nothing and starts paying the moment either the
+            # prompt grows or an operator pins a model with a lower minimum,
+            # so it is declared rather than left out.
             "system": [
                 {
                     "type": "text",
