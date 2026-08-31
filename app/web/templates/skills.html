@@ -96,8 +96,7 @@
 
   /* ── Step 1: type picker ── */
   .sk-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin: 2px 0 0; padding-bottom: 24px; }
-  .sk-head h1 { font-size: 24px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
-  .sk-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 0; max-width: 64ch; }
+  .sk-head h1 { display: flex; align-items: center; gap: 10px; }
 
   .sk-types { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 14px 0 0; }
   .sk-type { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; padding: 18px; text-align: left; font: inherit; color: inherit; cursor: pointer; display: flex; flex-direction: column; gap: 10px; transition: border-color var(--ds-motion-fast) var(--ds-ease-standard), box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
@@ -459,8 +458,8 @@
   <a class="sk-back" href="/library">← Library</a>
   <div class="sk-head">
     <div>
-      <h1>Builder</h1>
-      <p class="lede">Author a skill, a plugin, or an agent template. Keep it as a draft while you work, then save it to your Library — privately, or published for everyone here.</p>
+      <h1 class="page-title">Builder</h1>
+      <p class="page-lede">Author a skill, a plugin, or an agent template. Keep it as a draft while you work, then save it to your Library — privately, or published for everyone here.</p>
     </div>
   </div>
 </div>

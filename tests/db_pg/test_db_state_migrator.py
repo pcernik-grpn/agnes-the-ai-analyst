@@ -48,6 +48,22 @@ def test_copy_duckdb_to_pg_full_cycle(tmp_path, pg_engine):
     assert row[0] == "alice@example.com"
 
 
+def test_target_has_app_state_probe(tmp_path, pg_engine):
+    """The marker's replaced-target guard: empty schema → False (copy must
+    run), any user row → True (marker may be honored)."""
+    import sqlalchemy as sa
+
+    from scripts.db_state_migrator import alembic_upgrade_head
+    from scripts.migrate_duckdb_to_pg.marker import target_has_app_state
+
+    alembic_upgrade_head(str(pg_engine.url))
+    assert target_has_app_state(pg_engine) is False
+
+    with pg_engine.begin() as conn:
+        conn.execute(sa.text("INSERT INTO users (id, email, name) VALUES ('u1', 'a@x', 'A')"))
+    assert target_has_app_state(pg_engine) is True
+
+
 def test_verify_row_counts_match(tmp_path, pg_engine):
     """After copy, source and target row counts match."""
     import duckdb, sqlalchemy as sa
@@ -131,6 +147,15 @@ def test_main_duckdb_to_side_car_end_to_end(tmp_path, pg_engine, monkeypatch):
     state, url = read_backend_state()
     assert state == BackendState.SIDE_CAR
     assert url == str(pg_engine.url)
+
+    # A completed DuckDB-source migration records completion next to the
+    # source so the compose data-migrate one-shot stops re-copying the now
+    # frozen snapshot (re-copying resurrects rows deleted from PG since).
+    from scripts.migrate_duckdb_to_pg.marker import read_completion_marker
+
+    marker = read_completion_marker(duck_path)
+    assert marker is not None
+    assert marker["source"] == "db_state_migrator"
 
 
 def test_copy_pg_to_pg_idempotent_same_url(tmp_path, pg_engine):
