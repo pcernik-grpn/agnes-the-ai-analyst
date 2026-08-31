@@ -3313,6 +3313,14 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestAclSyncTrigger; not duplicated
     # in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync",
+    # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
+    # subtrees now" trigger for the `sharepoint-subtree-sweep` job. Same
+    # "enqueues into the EXISTING jobs table, no new schema surface"
+    # reasoning as its acl-sync sibling right above; auth matrix, flag-gate
+    # 409, dedup, and the exact payload shape are covered by
+    # tests/test_admin_sharepoint.py::TestSubtreeSweepTrigger; not
+    # duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/subtree-sweep",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

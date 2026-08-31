@@ -1366,10 +1366,27 @@ def _excluded_subtree_scope_map(connection: dict) -> dict[str, list[str]]:
     """``{source_scope_id: [item_id, ...]}`` for every scope THIS
     connection's ``sharepoint-subtree-sweep`` job (2026-08-30 plan, Task 7 —
     ``connectors.sharepoint.acl_sync.run_subtree_sweep``) found at least one
-    broken-inheritance subtree in — the producer handoff for which
-    item-id subtrees it must skip during its own crawl (spec §6.3's division
-    of labor: Agnes detects, the producer decides how to honor it — see
-    :func:`_run_corpus_extraction`'s docstring for the repo-boundary note).
+    broken-inheritance subtree or unique-permission FILE in — the producer
+    handoff for which item ids it must skip during its own crawl (spec
+    §6.3's division of labor: Agnes detects, the producer decides how to
+    honor it — see :func:`_run_corpus_extraction`'s docstring for the
+    repo-boundary note).
+
+    ``kind`` (2026-08-31 plan, Task 3/7 — ``"folder"``/``"file"`` on each
+    ``excluded_subtrees`` entry, absent on a pre-sweep-v2 legacy entry, which
+    reads as ``"folder"``) is NOT filtered on here — a single excluded FILE
+    rides the same env var, same item-id list, as a folder root; the
+    env var's name stays ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` for producer
+    compatibility even though "subtree" now also covers single files.
+
+    A broken-inheritance folder that became an ACTIVE permission zone
+    (``acl_sync.zones_enabled`` on) is intentionally ABSENT here — it was
+    never written into ``excluded_subtrees`` in the first place (the sweep's
+    walk routes a zone candidate into ``config["acl_zones"]`` instead, see
+    ``connectors.sharepoint.acl_sync._walk_subtree_sweep``), because a zone
+    is crawled now, through its own corpus-map key
+    (:func:`connectors.sharepoint.corpus_map.producer_corpus_map`'s ``zones``
+    parameter), not skipped.
 
     A scope carrying ``include_excluded_subtrees=True`` (the ``should_not``
     per-subtree override, ``app/api/admin_sharepoint.py::confirm_scope``) is
@@ -1742,14 +1759,19 @@ def _run_corpus_extraction(payload: dict) -> dict:
     # producer resolver's crawler-row shape (site display name + DRIVE-
     # relative folder path) by the shared helper — see
     # connectors/sharepoint/corpus_map.py for why display_path verbatim
-    # would silently route nothing.
+    # would silently route nothing. Active permission zones (2026-08-31 plan,
+    # Task 7) fold in as additional, nested keys — same helper, same source
+    # of truth as the admin corpus-map endpoint
+    # (app/api/admin_sharepoint.py::corpus_map), so the two surfaces cannot
+    # drift on zone routing either.
+    from connectors.sharepoint.acl_sync import active_zone_rows
     from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 
     scopes = (connection.get("config") or {}).get("scopes")
     scope_rows = scopes if isinstance(scopes, list) else []
     if scope_rows:
         try:
-            scope_map = producer_corpus_map(scope_rows)
+            scope_map = producer_corpus_map(scope_rows, active_zone_rows(connection))
         except CorpusMapError as exc:
             raise RuntimeError(f"corpus-extraction: {exc}") from exc
         child_env["AGNES_EXTRACTION_CORPUS_MAP"] = json.dumps(scope_map, sort_keys=True)

@@ -29,11 +29,37 @@ Scope KIND is decided structurally from the Graph id shape — a composite
 site id contains ``,`` (``<host>,<siteGuid>,<webGuid>``), a drive id starts
 with ``b!``, anything else is a folder/item id. No Graph round-trip: the
 translation must work for scope rows confirmed before this module existed.
+
+**Permission zones (2026-08-31 plan, Task 7).** An ACTIVE zone
+(``connectors.sharepoint.acl_sync.active_zone_rows`` — a broken-inheritance
+subtree promoted to its own collection, see that module) becomes an
+ADDITIONAL, NESTED map key: its ``zone_item_id`` is always a plain Graph
+folder item id (no ``,``, no ``b!``), so it always takes the folder branch
+above regardless of its parent scope's own kind, and its stored
+``display_path`` is always the parent scope's own ``display_path`` extended
+by the zone's folder path — so the resulting key is always a strict
+extension of the parent scope's own key (e.g. parent ``"Site/Team"``, zone
+``"Site/Team/Legal"``).
+
+This means the PRODUCER'S RESOLVER MUST match a document's path against
+these keys longest-prefix-first — a resolver that matches shortest-prefix
+(or picks arbitrarily among several matching keys) would route zone content
+to the wider, less-restricted parent collection instead of the zone's own.
+That ordering is NOT enforced or verified here; a producer that gets it
+wrong fails closed anyway, because the server-side ingest gate (2026-08-31
+plan, Task 5) refuses any document whose source path falls under an active
+zone but was uploaded to a DIFFERENT collection than that zone's own — this
+module's contract is "give the producer an unambiguous, correctly-nested
+map", not "guarantee the producer reads it correctly".
+
+A dissolved zone (``status != "active"``) is never mapped — its content is
+re-homed to the parent scope, so its subtree must route there too.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -73,42 +99,79 @@ def _map_key(source_scope_id: str, display_path: str) -> str:
     return "/".join(segments)
 
 
-def producer_corpus_map(scopes: list) -> dict[str, str]:
-    """``{corpus_for-key: collection_id}`` for every confirmed scope row.
+def _add_row(
+    row_id: object,
+    display_path: object,
+    collection_id: object,
+    out: dict[str, str],
+    owners: dict[str, str],
+    *,
+    what: str,
+) -> None:
+    """Shared per-row logic for both the scope loop and the zone loop of
+    :func:`producer_corpus_map` — one ``_map_key`` call, one ambiguity
+    check, so the two loops cannot silently diverge on what "unambiguous"
+    means. ``what`` (``"scope"``/``"zone"``) only shapes error text."""
+    if not row_id:
+        return
+    if not collection_id or not display_path:
+        raise CorpusMapError(
+            f"{what} {row_id!r} has no "
+            f"{'collection_id' if not collection_id else 'display_path'} — "
+            f"cannot build a corpus map key for it"
+        )
+    key = _map_key(str(row_id), str(display_path))
+    if not key:
+        raise CorpusMapError(f"{what} {row_id!r} produced an empty corpus map key from display_path {display_path!r}")
+    if key in out and out[key] != str(collection_id):
+        raise CorpusMapError(
+            f"corpus map key {key!r} is claimed by two rows with different "
+            f"collections ({owners[key]!r} and {row_id!r}) — remove or "
+            "narrow one of the overlapping scopes/zones"
+        )
+    out[key] = str(collection_id)
+    owners[key] = str(row_id)
+
+
+def producer_corpus_map(scopes: list, zones: Sequence[dict] = ()) -> dict[str, str]:
+    """``{corpus_for-key: collection_id}`` for every confirmed scope row,
+    PLUS one additional nested key per ACTIVE permission zone (2026-08-31
+    plan, Task 7 — see the module docstring's "Permission zones" section for
+    why the producer's own resolver must match these longest-prefix-first).
+    ``zones`` is normally ``connectors.sharepoint.acl_sync.active_zone_rows
+    (connection)`` — a caller may also pass the connection's full,
+    unfiltered ``zone_rows(connection)``; a row with ``status != "active"``
+    (a dissolved zone) is filtered out here regardless, never mapped.
 
     Raises :class:`CorpusMapError` on a row that cannot produce a key
-    (missing ``display_path``/``collection_id``) and on two scopes whose
-    keys collide with DIFFERENT collections (e.g. a site scope plus a drive
-    scope of the same site) — silently routing every row to whichever scope
-    won the dict insert is the silent-loss class this exists to prevent.
+    (missing ``display_path``/``collection_id``) and on two rows (scope or
+    zone, in any combination) whose keys collide with DIFFERENT collections
+    (e.g. a site scope plus a drive scope of the same site) — silently
+    routing every row to whichever one won the dict insert is the
+    silent-loss class this exists to prevent.
     """
     out: dict[str, str] = {}
     owners: dict[str, str] = {}
     for scope in scopes:
         if not isinstance(scope, dict):
             continue
-        source_scope_id = scope.get("source_scope_id")
-        collection_id = scope.get("collection_id")
-        display_path = scope.get("display_path")
-        if not source_scope_id:
+        _add_row(
+            scope.get("source_scope_id"),
+            scope.get("display_path"),
+            scope.get("collection_id"),
+            out,
+            owners,
+            what="scope",
+        )
+    for zone in zones:
+        if not isinstance(zone, dict) or zone.get("status") != "active":
             continue
-        if not collection_id or not display_path:
-            raise CorpusMapError(
-                f"scope {source_scope_id!r} has no "
-                f"{'collection_id' if not collection_id else 'display_path'} — "
-                "cannot build a corpus map key for it; re-confirm the scope in the wizard"
-            )
-        key = _map_key(str(source_scope_id), str(display_path))
-        if not key:
-            raise CorpusMapError(
-                f"scope {source_scope_id!r} produced an empty corpus map key from display_path {display_path!r}"
-            )
-        if key in out and out[key] != str(collection_id):
-            raise CorpusMapError(
-                f"corpus map key {key!r} is claimed by two scopes with different "
-                f"collections ({owners[key]!r} and {source_scope_id!r}) — remove or "
-                "narrow one of the overlapping scopes"
-            )
-        out[key] = str(collection_id)
-        owners[key] = str(source_scope_id)
+        _add_row(
+            zone.get("zone_item_id"),
+            zone.get("display_path"),
+            zone.get("collection_id"),
+            out,
+            owners,
+            what="zone",
+        )
     return out
