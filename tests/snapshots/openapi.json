@@ -4013,6 +4013,28 @@
       },
       "EffectiveAccessItem": {
         "properties": {
+          "href": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Href"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
           "resource_id": {
             "title": "Resource Id",
             "type": "string"
@@ -4020,6 +4042,11 @@
           "resource_type": {
             "title": "Resource Type",
             "type": "string"
+          },
+          "unresolved": {
+            "default": false,
+            "title": "Unresolved",
+            "type": "boolean"
           },
           "via_groups": {
             "items": {
