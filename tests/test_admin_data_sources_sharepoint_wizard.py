@@ -713,3 +713,90 @@ class TestSharePointWizardStep3AdvisorySummary:
         )
         html = result["html"]
         assert "1 of your selected scope" in html
+
+
+class TestCertificateFileUploadMarkup:
+    """A real file picker next to the PEM textarea — pasting a multiline PEM
+    is error-prone, and admins have the material as files. Both credential
+    surfaces get one: wizard step 1 and the source card's rotate row."""
+
+    def test_wizard_has_a_hidden_multi_file_input_and_a_button(self, seeded_app):
+        body = _page(seeded_app)
+        assert 'id="spw-cert-file"' in body
+        tag = body.split('id="spw-cert-file"', 1)[1][:250]
+        assert 'type="file"' in body.split('id="spw-cert-file"', 1)[0][-250:] + tag
+        assert "multiple" in tag
+        assert ".pem" in tag
+        assert "Upload PEM file" in body
+
+    def test_card_rotate_row_has_the_same_picker(self, seeded_app):
+        body = _page(seeded_app)
+        # The card is a JS template literal in the shipped page source.
+        assert "ds-sp-cert-file-" in body
+        card_js = body.split("ds-sp-cert-row-", 1)[1]
+        assert "spCertFilePicked(" in card_js
+
+
+class TestPemFormatCheckAndFilePick:
+    """The SHIPPED client-side format check + file-pick handler under node.
+    Advisory only — the PUT endpoint's `validate_certificate_material` stays
+    the authority — but it answers before any network call."""
+
+    def test_format_check_verdicts(self):
+        cases = _run(
+            """
+            process.stdout.write(JSON.stringify({
+              ok: spPemFormatCheck("-----BEGIN CERTIFICATE-----\\nA\\n-----END CERTIFICATE-----\\n-----BEGIN PRIVATE KEY-----\\nB\\n-----END PRIVATE KEY-----"),
+              missing_key: spPemFormatCheck("-----BEGIN CERTIFICATE-----\\nA\\n-----END CERTIFICATE-----"),
+              missing_cert: spPemFormatCheck("-----BEGIN RSA PRIVATE KEY-----\\nB\\n-----END RSA PRIVATE KEY-----"),
+              garbage: spPemFormatCheck("hello"),
+              encrypted: spPemFormatCheck("-----BEGIN CERTIFICATE-----\\nA\\n-----END CERTIFICATE-----\\n-----BEGIN ENCRYPTED PRIVATE KEY-----\\nB\\n-----END ENCRYPTED PRIVATE KEY-----"),
+            }));
+            """
+        )
+        assert cases["ok"]["ok"] is True
+        assert cases["missing_key"]["ok"] is False
+        assert "PRIVATE KEY" in cases["missing_key"]["message"]
+        assert cases["missing_cert"]["ok"] is False
+        assert "CERTIFICATE" in cases["missing_cert"]["message"]
+        assert cases["garbage"]["ok"] is False
+        assert cases["encrypted"]["ok"] is False
+        assert "unencrypted" in cases["encrypted"]["message"]
+
+    def test_file_pick_concatenates_files_and_fills_the_textarea(self):
+        result = _run(
+            """
+            const input = { files: [
+              { text: async () => "-----BEGIN CERTIFICATE-----\\nA\\n-----END CERTIFICATE-----" },
+              { text: async () => "-----BEGIN PRIVATE KEY-----\\nB\\n-----END PRIVATE KEY-----" },
+            ] };
+            await spCertFilePicked(input, "spw-cert-pem", "spw-cert-status");
+            process.stdout.write(JSON.stringify({
+              value: el("spw-cert-pem").value,
+              status: el("spw-cert-status").textContent,
+              display: el("spw-cert-status").style.display,
+            }));
+            """
+        )
+        assert "BEGIN CERTIFICATE" in result["value"]
+        assert "BEGIN PRIVATE KEY" in result["value"]
+        assert result["display"] != "none"
+        assert "found" in result["status"]
+
+    def test_file_pick_with_only_the_certificate_names_the_missing_key(self):
+        result = _run(
+            """
+            const input = { files: [
+              { text: async () => "-----BEGIN CERTIFICATE-----\\nA\\n-----END CERTIFICATE-----" },
+            ] };
+            await spCertFilePicked(input, "spw-cert-pem", "spw-cert-status");
+            process.stdout.write(JSON.stringify({
+              value: el("spw-cert-pem").value,
+              status: el("spw-cert-status").textContent,
+            }));
+            """
+        )
+        # The textarea still shows what was read — the admin can add the key
+        # file with a second pick; the status names what is missing.
+        assert "BEGIN CERTIFICATE" in result["value"]
+        assert "PRIVATE KEY" in result["status"]

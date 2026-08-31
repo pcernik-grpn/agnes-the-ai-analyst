@@ -233,3 +233,47 @@ def test_vault_set_date_lookup_failure_degrades_to_none(monkeypatch):
 
     assert settings.credential_source == "vault"
     assert settings.credential_set_at is None
+
+
+class TestBase64EnvTransport:
+    """A multiline PEM cannot ride /opt/agnes/.env as-is, so the infra
+    module's `runtime_secret_env_multiline` delivers it base64-encoded in a
+    single line; the env path decodes it. PEM always contains `-----BEGIN`,
+    base64 text never does (no hyphen in its alphabet), so the decode cannot
+    misfire on a raw PEM."""
+
+    def test_base64_encoded_env_value_is_decoded(self, no_vault, monkeypatch):
+        import base64
+
+        encoded = base64.b64encode(PEM_FROM_ENV.encode()).decode()
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, encoded)
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == PEM_FROM_ENV
+
+    def test_raw_pem_env_value_stays_verbatim(self, no_vault, monkeypatch):
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, PEM_FROM_ENV)
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == PEM_FROM_ENV
+
+    def test_non_pem_non_base64_value_is_left_alone(self, no_vault, monkeypatch):
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, "not base64!! and not pem")
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == "not base64!! and not pem"
+
+    def test_base64_of_non_pem_text_is_not_decoded(self, no_vault, monkeypatch):
+        import base64
+
+        encoded = base64.b64encode(b"just some opaque token").decode()
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, encoded)
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == encoded
+
+    def test_vault_value_is_never_decoded(self, monkeypatch):
+        import base64
+
+        encoded = base64.b64encode(PEM_FROM_VAULT.encode()).decode()
+        monkeypatch.setattr(
+            "connectors.sharepoint.settings._vault_secret", lambda connection_id: encoded, raising=False
+        )
+        settings = resolve_sharepoint_settings(_row())
+        assert settings.private_key == encoded
