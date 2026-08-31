@@ -11,6 +11,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+- **The nightly `docker-e2e` lane is green again.** The wave-2 audit hardening gave `_check_token` a 32-character minimum on the apps-runner shared secret, replacing a plain `!=` compare. `tests/test_chat_docker_provider_daemon.py` had been setting a 17-character fixture token, which the old compare accepted and the floor rejects *before* comparing — so both docker-sandbox tests failed as a flat `401 bad_runner_token` that named neither the length rule nor the fixture. The production floor is correct and unchanged; the fixture token is now long enough to clear it. Only the nightly and `workflow_dispatch` runs see this lane (`docker-e2e` is skipped on pull requests), which is why it went red on `main` without blocking a single PR.
+
+## [0.94.0] - 2026-08-31
+
+### Added
 - Cover images can be requested as resized WebP variants with ?w=480 or ?w=960 on the upload, marketplace and store photo routes; other widths serve the original. Variants are generated once on first request and cached on disk.
 
 - **The admin's setup chain is in the sidebar now, on every page — not only on `/chat`.** Members have always had a persistent progress card in the rail; an admin had one nowhere. On admin pages the rail showed no setup card at all (deliberately: the analyst card *"pulls hardest of anything on screen while you are registering a table"*), and on app pages it showed them the **analyst** checklist — ask your first question, explore your Library, put knowledge in your stack — six steps with zero overlap with the admin's actual job. Their own chain (connect a source → choose tables → bundle → invite → share → verify) existed with per-step CTAs and links in `admin_dashboard.resolve_journey()`, and `/chat` was the only page that rendered any of it, keeping just `{done, total, complete}` and throwing the steps away. The rail's get-started slot now holds whichever journey's steps can currently succeed: the chain while it is unfinished — because until a source is connected and shared, "ask your first question" has nothing to answer from — then the analyst journey once it completes, since by then the admin is also a user. This replaces the narrower `/chat`-only suppression added earlier in this release with a truer card in the same slot. The chain row is server-rendered (count, arc and steps) and carries its own ids, so `chat_onboarding.js` — whose every lookup is guarded — finds nothing and cannot write analyst numbers over admin ones; a step whose own check raised renders as "could not check" rather than as an ordinary open step on an apparently healthy chain. `resolve_setup_rail()` memoises for 30s because the chain is instance state, identical for every admin, and six areas of repo reads on every request of every page would otherwise be a sitewide latency regression.
