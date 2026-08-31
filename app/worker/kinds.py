@@ -127,10 +127,15 @@ distribution mirror, and the api-role write conversions) map onto:
   point the producer at the WORKER's own loopback rather than the
   instance's real callback surface, so an unconfigured ``SERVER_URL``/
   ``AGNES_INTERNAL_URL`` there fails the job clean instead of shipping a
-  URL nothing outside that container answers. The producer itself
-  is a separate project the operator supplies, adopted rather than
-  ported into this repo (spec §1 "Out of scope") — see
-  ``_run_corpus_extraction`` below for exactly where that boundary is.
+  URL nothing outside that container answers. Since the owner decision of
+  2026-08-31 that subprocess is no longer the only producer: with
+  ``extraction.producer.mode: builtin`` the handler instead runs the
+  in-repo pipeline (``connectors/sharepoint/crawler.py``) in-process, with
+  no subprocess, no child env, and no callback credential — see
+  ``_run_builtin_corpus_extraction``. External mode remains the default
+  and a fully supported option for operators who supply their own
+  producer; see ``_run_corpus_extraction`` below for exactly where the
+  two branches part.
   Registered UNCONDITIONALLY (its own no-op guard on
   ``extraction.enabled`` makes an accidental claim on a process that
   never opted into the ``extraction`` lane harmless, mirroring
@@ -1228,6 +1233,28 @@ def _extraction_timeout_seconds() -> int:
         return _DEFAULT_EXTRACTION_TIMEOUT_S
 
 
+#: ``extraction.producer.mode`` value selecting the in-repo crawler
+#: (``connectors/sharepoint/crawler.py``) over an external subprocess.
+_PRODUCER_MODE_BUILTIN = "builtin"
+
+
+def _extraction_producer_mode() -> str:
+    """Which producer runs this connection's crawl: ``"builtin"`` (the
+    in-repo pipeline, owner decision 2026-08-31) or ``"external"`` (the
+    operator-supplied subprocess this handler has always shelled out to).
+
+    ``extraction.producer.mode: builtin`` is the ONLY way to select the
+    built-in path; everything else — including an unset value — keeps the
+    external behavior exactly as it was, so no existing instance changes
+    mode because this branch landed. The external mode is not deprecated:
+    an operator with their own producer keeps it by doing nothing.
+    """
+    from app.instance_config import get_value
+
+    raw = str(get_value("extraction", "producer", "mode", default="") or "").strip().lower()
+    return _PRODUCER_MODE_BUILTIN if raw == _PRODUCER_MODE_BUILTIN else "external"
+
+
 def _extraction_producer_argv() -> list[str] | None:
     """Build the producer's argv from ``extraction.producer`` config
     (``config/instance.yaml.example``).
@@ -1494,19 +1521,51 @@ def _agnes_producer_callback_env() -> dict[str, str]:
     return env
 
 
+def _run_builtin_corpus_extraction(payload: dict) -> dict:
+    """``extraction.producer.mode: builtin`` — run the in-repo crawler
+    IN-PROCESS instead of shelling out (owner decision 2026-08-31).
+
+    A thin delegate, exactly like ``_run_sharepoint_acl_sync`` /
+    ``_run_sharepoint_subtree_sweep`` above: the crawl -> convert ->
+    (anonymize) -> ingest body, its Graph transport hardening, its crawl
+    state, and its per-scope -> per-collection routing all live in
+    ``connectors.sharepoint.crawler``. Nothing about credentials changes —
+    the crawler resolves them through the same
+    ``connectors.sharepoint.settings.resolve_sharepoint_settings`` this
+    handler's external branch uses, and no secret is ever put on argv,
+    because there is no argv.
+
+    Deliberately NOT reached through ``_extraction_producer_argv``: the
+    built-in mode has no command line, so "no producer configured" is not a
+    failure state for it — a connection with confirmed scopes is all it
+    needs.
+    """
+    from connectors.sharepoint.crawler import run_builtin_crawl
+
+    return run_builtin_crawl(payload)
+
+
 def _run_corpus_extraction(payload: dict) -> dict:
     """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
     §7.5 / §16 step 7). See the module docstring's entry for the wider
     picture; this is the mechanics.
 
-    THIS HANDLER DOES NOT CRAWL, CONVERT, ANONYMIZE, OR EXTRACT ANYTHING
-    ITSELF — it resolves credentials, builds a command line, runs one
-    subprocess, and reports what happened. The crawl -> convert ->
-    anonymize -> extract -> ingest pipeline behind that subprocess is the
-    external producer (a separate project of the operator's, adopted per spec
-    §7.1); porting its internals into this repo is explicitly out of scope
-    (spec §1 "Out of scope") — this handler is the seam a future producer
-    integration plugs into, not a place to grow pipeline logic.
+    **Two producer modes** (owner decision 2026-08-31, which overrides the
+    original "the producer is never vendored" rule): with
+    ``extraction.producer.mode: builtin`` the whole pipeline runs IN-PROCESS
+    from ``connectors/sharepoint/crawler.py`` (see
+    :func:`_run_builtin_corpus_extraction`); with anything else — including
+    an unset value, i.e. every existing instance — this handler behaves
+    exactly as it always has and shells out to the operator's own producer.
+    The external mode is an option that stays, not a deprecated path.
+
+    In EXTERNAL mode this handler does not crawl, convert, anonymize, or
+    extract anything itself — it resolves credentials, builds a command
+    line, runs one subprocess, and reports what happened. The crawl ->
+    convert -> anonymize -> extract -> ingest pipeline behind that
+    subprocess is the external producer (a separate project of the
+    operator's, adopted per spec §7.1) — this handler is the seam it plugs
+    into, not a place to grow pipeline logic.
 
     ``payload``:
       - ``connection_id`` (required) — a ``source_connections`` row,
@@ -1581,6 +1640,13 @@ def _run_corpus_extraction(payload: dict) -> dict:
 
     if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
         raise RuntimeError("corpus-extraction: extraction.enabled is false — refusing to run")
+
+    # The fork sits AFTER the enabled gate (which governs both modes) and
+    # BEFORE anything subprocess-shaped: the built-in producer has no argv,
+    # no child env, and no callback credential to resolve, so none of that
+    # machinery below should run — or be able to fail — on its behalf.
+    if _extraction_producer_mode() == _PRODUCER_MODE_BUILTIN:
+        return _run_builtin_corpus_extraction(payload)
 
     argv = _extraction_producer_argv()
     if not argv:
