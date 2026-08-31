@@ -132,6 +132,10 @@ def _impacted_files(config: pytest.Config) -> tuple[list[str] | None, str]:
         paths, reason = select(Path(__file__).parent, config.getoption("--lane-base"))
     except Exception as exc:  # a broken selector must not silently narrow the run
         return None, f"selector failed ({exc}) — falling back to the fast lane"
+    # An EMPTY selection collapses to the same `None` as "too broad", and that
+    # is deliberate: running zero tests is a green run that asserted nothing,
+    # which is the one outcome a gate must never produce. The reason string
+    # still distinguishes the two cases for whoever reads the summary line.
     return (paths or None), reason
 
 
@@ -144,7 +148,10 @@ def pytest_collection_modifyitems(
         return
 
     notes: list[str] = []
-    keep: set[str]
+    # Fail open: an unrecognised lane keeps everything rather than deselecting
+    # everything. The `choices=` above makes that unreachable today; it stops a
+    # lane added later from silently emptying the run before anyone notices.
+    keep: set[str] = {item.nodeid for item in items}
 
     if lane == "impacted":
         files, reason = _impacted_files(config)
