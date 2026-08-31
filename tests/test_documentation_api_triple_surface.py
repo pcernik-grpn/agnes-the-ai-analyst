@@ -1062,6 +1062,12 @@ _EXEMPT: dict[str, str] = {
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
         "admin-only, no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/changes": (
+        "observed-changes feed (what changed between two timestamps) derived from the "
+        "connection's own corpus_file_events log — admin-only wizard/ops display "
+        "primitive, no analyst CLI/MCP analogue; the eventual document surface is "
+        "`agnes facts …`, already triple-surface in _COHORT above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/certificate": (
         "read-only certificate metadata (thumbprint/subject/issuer/expiry) for the "
         "wizard's source card, derived at request time from the connection's own "

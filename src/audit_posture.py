@@ -682,6 +682,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sessions/{username}/{session_file}/transcript": "session.transcript_view",
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
+    "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map": "sharepoint_connection.corpus_map_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",

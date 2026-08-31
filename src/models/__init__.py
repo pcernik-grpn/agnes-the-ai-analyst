@@ -23,7 +23,7 @@ from src.models.agents import (
 from src.models.audit import AuditLog
 from src.models.chat import ChatMessage, ChatSession, UserWorkdir
 from src.models.chat_broker_tickets import ChatBrokerTicket
-from src.models.collections import CorpusChunk, CorpusFile, CorpusFileSource, FileCorpus
+from src.models.collections import CorpusChunk, CorpusFile, CorpusFileEvent, CorpusFileSource, FileCorpus
 from src.models.config import GlossaryTerm, InstanceTemplate, MetricDefinition, PersonalAccessToken
 from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
@@ -123,6 +123,7 @@ __all__ = [
     "ConnectionSecret",
     "CorpusChunk",
     "CorpusFile",
+    "CorpusFileEvent",
     "CorpusFileSource",
     "Correction",
     "DataApp",

@@ -29802,6 +29802,137 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/changes": {
+      "get": {
+        "description": "Observed content changes for this connection between ``since`` and\n``until`` \u2014 \"what changed\", for a consumer that would otherwise have to\ndiff the whole corpus by hand or re-read everything on every check.\n\n``observed_at`` is when AGNES learned of the change (the moment its own\nupload/delete handler recorded it), never a live query against\nMicrosoft Graph \u2014 this endpoint never calls SharePoint. A document\nedited at the source but not yet re-crawled therefore does NOT appear\nhere; it will, once a future sync uploads the new content and this\nfeed's window covers that upload's ``observed_at``. Both bounds are\noptional and inclusive; omitting ``since`` reads from the beginning of\nthe log, omitting ``until`` reads to now.\n\nEach item is ``{change, name, path, collection_id, file_id,\nsource_stable_id, source_modified, observed_at, ingest_run_id}``:\n\n* ``change`` \u2014 ``added`` (new document), ``updated`` (same identity,\n  content/``sha256`` differs), ``renamed`` (same identity and content,\n  ``name``/``path`` differs \u2014 detectable ONLY when the upload carried a\n  ``source_stable_id``, since a bare path match has no identity that\n  survives a path change), or ``deleted``.\n* ``source_modified`` \u2014 always ``null`` today: no upload path persists\n  the source's own modified-timestamp yet (see ``document_dates`` in\n  ``app/api/collections.py::upload_files``, accepted but not yet\n  stored). Reserved so a future producer that DOES supply it does not\n  need a contract change.\n* ``ingest_run_id`` \u2014 always ``null`` today: the crawler invokes this\n  connection's upload endpoint out-of-process (spec's producer\n  subprocess), which carries no run identifier through to\n  ``corpus_file_events``. Reserved for the same forward-compatibility\n  reason as ``source_modified``.\n\nOrdering is ``(observed_at, id)`` ascending \u2014 deterministic even when\nseveral events share a timestamp, which pagination depends on:\n``next_cursor`` (``null`` at the end of the window) resumes strictly\nafter the last item's position. A file that changed more than once in\nthe window appears once per transition, in order \u2014 this is an event\nfeed, not a snapshot of current state.\n\nScoped to the connection's OWN collections (every ``collection_id`` any\nof its confirmed scopes maps to, per ``config.scopes`` \u2014 see\n:func:`_scopes`); a connection with no confirmed scopes yet returns an\nempty page rather than an error. Only top-level file upload/delete via\n``/api/collections/{id}/files*`` are tracked \u2014 a member added or removed\nfrom inside an uploaded zip bundle is not (see\n``app/api/collections.py::_purge_children_and_content``).\n\nMalformed ``cursor`` is a typed **400** (``invalid_cursor``), never a\n500 from a bad row-value comparison downstream.",
+        "operationId": "connection_changes_api_admin_sharepoint_connections__connection_id__changes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive lower bound on observed_at (ISO 8601).",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive lower bound on observed_at (ISO 8601).",
+              "title": "Since"
+            }
+          },
+          {
+            "description": "Inclusive upper bound on observed_at (ISO 8601).",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Inclusive upper bound on observed_at (ISO 8601).",
+              "title": "Until"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque token from a prior page's next_cursor.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque token from a prior page's next_cursor.",
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connection Changes",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
         "description": "Producer handoff (spec \u00a713.2 / item 3): the corpus map the external\ncrawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in\nthe producer resolver's OWN shape \u2014 ``\"<site display name>\"`` or\n``\"<site display name>/<drive-relative folder path>\"`` \u2014 built by the\nsame shared translation the in-Agnes ``corpus-extraction`` job handler\nuses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff\n(``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot\ndrift. The earlier flat ``{source_scope_id: collection_id}`` shape was\nunusable for routing: the resolver matches keys against crawler rows'\nsite/path components, which a Graph scope id never equals.\n\n``409 corpus_map_ambiguous`` when the confirmed scopes cannot form an\nunambiguous map (e.g. a site scope plus a drive scope of the same\nsite) \u2014 never a best-guess map.\n\nDeliberately does NOT carry ``anonymize`` \u2014 a producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).\n\nTHIS is the primary callback the corpus-extraction producer itself\ncalls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may\ncall it too (see ``require_admin_or_producer_connection``) \u2014\nself-audited here (``sharepoint_connection.corpus_map_read``,\n``client_kind=\"producer\"``) for the same reason ``list_scopes`` above\nself-audits its own producer branch.",

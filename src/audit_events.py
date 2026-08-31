@@ -957,6 +957,11 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a SharePoint connection's certificate metadata (never the private key).",
     ),
+    "sharepoint_connection.changes_read": AuditEvent(
+        "sharepoint_connection.changes_read",
+        "read",
+        "An admin read a SharePoint connection's observed content-changes feed.",
+    ),
     "sharepoint_connection.corpus_map_read": AuditEvent(
         "sharepoint_connection.corpus_map_read",
         "read",

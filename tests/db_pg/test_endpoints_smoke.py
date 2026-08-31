@@ -3192,6 +3192,13 @@ KNOWN_UNTESTED = {
     # tests/test_sharepoint_webhooks.py; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/webhook",
     "POST /api/webhooks/sharepoint/{connection_id}",
+    # Observed-changes feed (2026-08-30) — NEW schema surface
+    # (corpus_file_events, PG-only, A3 ratchet), so unlike its siblings
+    # above it IS covered per-backend, just not in this file: auth matrix,
+    # 404-before-work, since/until filtering, all four change kinds off a
+    # realistic upload/update/rename/delete fixture, pagination, and the
+    # DuckDB typed-501 are all in tests/db_pg/test_sharepoint_changes_pg.py.
+    "GET /api/admin/sharepoint/connections/{connection_id}/changes",
     # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
     # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
     # EXISTING jobs table, no new schema surface" reasoning as the

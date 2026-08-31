@@ -146,6 +146,7 @@ from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.audit_helpers import log_safe
 from src.repositories import (
+    corpus_file_events_repo,
     file_corpora_repo,
     resource_grants_repo,
     source_connections_repo,
@@ -1342,3 +1343,131 @@ async def run_due_extraction(
             logger.exception("extraction:run-due — connection %s failed; continuing sweep", row.get("id"))
 
     return {"dispatched": dispatched, "count": len(dispatched)}
+
+
+# ---------------------------------------------------------------------------
+# Observed-changes feed (2026-08-30) — own section, appended at the end of
+# the file on purpose to minimize merge conflicts with the rest of this
+# router (see the module's own maintenance note at the top).
+#
+# "What changed between two timestamps" for a SharePoint connection, derived
+# from the append-only ``corpus_file_events`` log
+# (``src/repositories/corpus_file_events_pg.py``) that ``app/api/
+# collections.py``'s upload/delete handlers already write. See that
+# repository's module docstring for why a plain event log is needed here at
+# all rather than deriving purely from ``corpus_files``' own timestamps: a
+# snapshot table cannot answer "was the last touch an update or a rename"
+# after the fact, and a hard-deleted row leaves nothing to snapshot.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a caller-supplied ``since``/``until`` to an aware UTC
+    datetime — a bare ISO string with no offset parses as naive, and this
+    value is about to be compared against Postgres's own tz-aware
+    ``observed_at`` column (mirrors the idiom in ``app/api/collections.py::
+    _is_stale_processing`` / ``app/auth/pat_resolver.py``)."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+@router.get("/connections/{connection_id}/changes")
+async def connection_changes(
+    connection_id: str,
+    since: Optional[datetime] = Query(default=None, description="Inclusive lower bound on observed_at (ISO 8601)."),
+    until: Optional[datetime] = Query(default=None, description="Inclusive upper bound on observed_at (ISO 8601)."),
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque token from a prior page's next_cursor."),
+    _user: dict = Depends(require_admin),
+):
+    """Observed content changes for this connection between ``since`` and
+    ``until`` — "what changed", for a consumer that would otherwise have to
+    diff the whole corpus by hand or re-read everything on every check.
+
+    ``observed_at`` is when AGNES learned of the change (the moment its own
+    upload/delete handler recorded it), never a live query against
+    Microsoft Graph — this endpoint never calls SharePoint. A document
+    edited at the source but not yet re-crawled therefore does NOT appear
+    here; it will, once a future sync uploads the new content and this
+    feed's window covers that upload's ``observed_at``. Both bounds are
+    optional and inclusive; omitting ``since`` reads from the beginning of
+    the log, omitting ``until`` reads to now.
+
+    Each item is ``{change, name, path, collection_id, file_id,
+    source_stable_id, source_modified, observed_at, ingest_run_id}``:
+
+    * ``change`` — ``added`` (new document), ``updated`` (same identity,
+      content/``sha256`` differs), ``renamed`` (same identity and content,
+      ``name``/``path`` differs — detectable ONLY when the upload carried a
+      ``source_stable_id``, since a bare path match has no identity that
+      survives a path change), or ``deleted``.
+    * ``source_modified`` — always ``null`` today: no upload path persists
+      the source's own modified-timestamp yet (see ``document_dates`` in
+      ``app/api/collections.py::upload_files``, accepted but not yet
+      stored). Reserved so a future producer that DOES supply it does not
+      need a contract change.
+    * ``ingest_run_id`` — always ``null`` today: the crawler invokes this
+      connection's upload endpoint out-of-process (spec's producer
+      subprocess), which carries no run identifier through to
+      ``corpus_file_events``. Reserved for the same forward-compatibility
+      reason as ``source_modified``.
+
+    Ordering is ``(observed_at, id)`` ascending — deterministic even when
+    several events share a timestamp, which pagination depends on:
+    ``next_cursor`` (``null`` at the end of the window) resumes strictly
+    after the last item's position. A file that changed more than once in
+    the window appears once per transition, in order — this is an event
+    feed, not a snapshot of current state.
+
+    Scoped to the connection's OWN collections (every ``collection_id`` any
+    of its confirmed scopes maps to, per ``config.scopes`` — see
+    :func:`_scopes`); a connection with no confirmed scopes yet returns an
+    empty page rather than an error. Only top-level file upload/delete via
+    ``/api/collections/{id}/files*`` are tracked — a member added or removed
+    from inside an uploaded zip bundle is not (see
+    ``app/api/collections.py::_purge_children_and_content``).
+
+    Malformed ``cursor`` is a typed **400** (``invalid_cursor``), never a
+    500 from a bad row-value comparison downstream.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    collection_ids = sorted({s["collection_id"] for s in _scopes(row) if s.get("collection_id")})
+
+    since_utc = _ensure_utc(since)
+    until_utc = _ensure_utc(until)
+
+    try:
+        events, next_cursor = corpus_file_events_repo().list_for_corpus_ids(
+            collection_ids,
+            since=since_utc,
+            until=until_utc,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_cursor", "message": str(exc)}) from exc
+
+    items = [
+        {
+            "change": event["change"],
+            "name": event["name"],
+            "path": event.get("path"),
+            "collection_id": event["corpus_id"],
+            "file_id": event.get("file_id"),
+            "source_stable_id": event.get("source_stable_id"),
+            "source_modified": None,
+            "observed_at": event["observed_at"],
+            "ingest_run_id": None,
+        }
+        for event in events
+    ]
+    return {
+        "connection_id": connection_id,
+        "since": since_utc.isoformat() if since_utc else None,
+        "until": until_utc.isoformat() if until_utc else None,
+        "items": items,
+        "next_cursor": next_cursor,
+    }
