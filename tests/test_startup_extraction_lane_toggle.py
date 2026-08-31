@@ -68,6 +68,16 @@ def test_both_object_types_declare_the_fields_default_off():
         assert re.search(r'extraction_worker_cpus\s*=\s*optional\(string,\s*"2.0"\)', block)
     # The image is module-level (like kai_agent_image), not per-VM.
     assert re.search(r'variable\s+"extraction_worker_image"\s*\{', body)
+    # So is the producer command — it ships INSIDE that image, so its
+    # invocation is the same across every VM that runs it. Default points at
+    # the conventional in-image path; a TF flag alone (no per-VM
+    # instance.yaml edit) is enough to activate the corpus-extraction lane.
+    m = re.search(r'variable\s+"extraction_producer_command"\s*\{', body)
+    assert m, "variables.tf must declare a module-level extraction_producer_command variable"
+    block_end = body.index("\n}\n", m.end())
+    assert re.search(r'default\s*=\s*"python /opt/producer/agnes_lane\.py"', body[m.end() : block_end]), (
+        "extraction_producer_command must default to the conventional in-image producer path"
+    )
 
 
 def test_main_tf_forwards_and_validates():
@@ -76,6 +86,7 @@ def test_main_tf_forwards_and_validates():
     assert re.search(r"extraction_worker_image\s*=\s*var\.extraction_worker_image", body)
     assert re.search(r"extraction_worker_mem_limit\s*=\s*each\.value\.extraction_worker_mem_limit", body)
     assert re.search(r"extraction_worker_cpus\s*=\s*each\.value\.extraction_worker_cpus", body)
+    assert re.search(r"extraction_producer_command\s*=\s*var\.extraction_producer_command", body)
     # Plan-time catch: enabled without an image would render an empty
     # `image:` and fail the whole boot at `docker compose up`.
     assert re.search(
@@ -98,6 +109,12 @@ def test_tpl_gates_everything_on_the_flag():
         "AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}",
         "AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}",
         "AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}",
+        # TCRD-259 follow-up: the app-side gates (extraction.enabled + the
+        # producer command) must also ride .env, or the TF flag alone never
+        # activates the corpus-extraction job kind — it would still need the
+        # per-VM instance.yaml SSH edit this env plumbing exists to avoid.
+        "AGNES_EXTRACTION_ENABLED=1",
+        "AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}",
     ):
         idx = body.index(needle)
         # The needle must sit inside SOME extraction_worker_enabled block:

@@ -1327,6 +1327,15 @@ AGNES_REDIS_URL=redis://redis:6379/0
 AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
 AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
+# The app-side gates for the `corpus-extraction` job kind
+# (app/instance_config.py::feature_enabled, app/worker/kinds.py::
+# _extraction_producer_argv) both check an env override before
+# instance.yaml — the SAME env-overrides-yaml posture as
+# AGNES_COORDINATION_BACKEND/AGNES_REDIS_URL above — so these two lines are
+# what makes this flag alone activate the lane end to end, with no
+# applier-owned instance.yaml edit on the VM's data disk.
+AGNES_EXTRACTION_ENABLED=1
+AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}
