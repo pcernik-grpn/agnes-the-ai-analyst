@@ -2466,7 +2466,7 @@ html[data-ui-layout="rail"] .rail-setupchain-note {
     white-space: nowrap;
 }
 
-/* ── Hidden by its own "Hide this checklist" ─────────────────────────────
+/* ── Hidden by its own "Skip setup" ──────────────────────────────────────
    The attribute is written by the inline script in `_app_rail.html`, before
    first paint, and by rail_setupchain.js on the click itself. Two rules, one
    flag: the card goes, and the profile-menu entry that brings it back
