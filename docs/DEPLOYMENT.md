@@ -647,13 +647,42 @@ module-level `extraction_worker_image` (a worker image that carries your
 extraction producer — the plain app image has no producer on PATH, and the
 module refuses the flag without an image at plan time). The module then
 renders the Redis coordination backend, the `.env` coordination
-declaration, and an always-on `extraction-worker` service into the boot
-path. The startup script is under `lifecycle.ignore_changes`, so flipping
-the flag on an existing VM takes effect only through a VM recreate
-(`terraform apply -replace=<vm address>`); the Postgres app-state and
-explicit-secrets prerequisites above remain yours to satisfy — on a
+declaration, an `AGNES_EXTRACTION_ENABLED=1` line, an
+`AGNES_EXTRACTION_PRODUCER_COMMAND` line (module-level
+`extraction_producer_command`, defaulting to the conventional in-image
+path `python /opt/producer/agnes_lane.py` — override only if your
+producer build installs somewhere else), and an always-on
+`extraction-worker` service into the boot path. Because these ride `.env`
+(env overrides `instance.yaml` — the same posture
+`app/coordination/factory.py` already uses for the coordination backend
+itself), the TF flag alone activates `corpus-extraction` end to end — no
+applier-owned edit of `instance.yaml` on the VM's data disk is needed for
+the ordinary case. The startup script is under `lifecycle.ignore_changes`,
+so flipping the flag on an existing VM takes effect only through a VM
+recreate (`terraform apply -replace=<vm address>`); the Postgres app-state
+and explicit-secrets prerequisites above remain yours to satisfy — on a
 DuckDB app-state instance the app still refuses to boot, naming the
 missing piece.
+
+**Scaling the extraction lane.** `extraction.concurrency` (`instance.yaml`)
+/ `AGNES_EXTRACTION_CONCURRENCY` (env, takes precedence) sizes how many
+`corpus-extraction` jobs run at once — default 1, clamped to `[1, 8]`,
+resolved once when the worker process starts (a change needs a worker
+restart, there is no live-reload). This is parallelism ACROSS connections,
+not within one: the per-connection idempotency key still guarantees at
+most one in-flight job per connection, so raising `concurrency` only lets
+*different* connections extract concurrently — it does not shard one large
+connection into parallel chunks (that is a separate, unimplemented
+direction; see the design note in the PR that introduced this setting).
+Each slot is a full producer subprocess (its own crawl workers plus an LLM
+pass), so this is memory/CPU math, not a free lunch: the
+`extraction-worker` compose service's default 4g/2cpu
+(`AGNES_EXTRACTION_WORKER_MEM_LIMIT`/`AGNES_EXTRACTION_WORKER_CPUS`) is
+sized for exactly ONE concurrent producer run. `concurrency: 3` on a
+producer that peaks around 1.2 GiB/run wants roughly `AGNES_EXTRACTION_
+WORKER_MEM_LIMIT=6g` (headroom over the naive 3.6 GiB, not just the raw
+multiple) and `AGNES_EXTRACTION_WORKER_CPUS` raised to match — measure your
+own producer's footprint rather than assuming this example holds.
 
 ### Coordination backend
 

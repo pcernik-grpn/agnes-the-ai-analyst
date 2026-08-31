@@ -1460,9 +1460,14 @@ class TestExtractionTrigger:
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):
-        # AGNES_EXTRACTION_ENABLED wins over the mocked get_value config —
-        # clear it so each test's fake config is what actually decides.
+        # AGNES_EXTRACTION_ENABLED / AGNES_EXTRACTION_PRODUCER_COMMAND /
+        # AGNES_EXTRACTION_PRODUCER_MODULE all win over the mocked
+        # get_value config — clear them so each test's fake config is what
+        # actually decides, except the one test below that sets one on
+        # purpose.
         monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_COMMAND", raising=False)
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_MODULE", raising=False)
 
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(
@@ -1498,6 +1503,17 @@ class TestExtractionTrigger:
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "extraction_producer_not_configured"
+
+    def test_producer_command_env_override_satisfies_readiness(self, seeded_app, monkeypatch):
+        """A deployment that activates extraction purely via env (the
+        Terraform-rendered ``/opt/agnes/.env`` case) needs no
+        ``extraction.producer`` block in ``instance.yaml`` at all."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-env-producer")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
 
     def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))

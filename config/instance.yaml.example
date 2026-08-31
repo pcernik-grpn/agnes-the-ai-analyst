@@ -1244,6 +1244,27 @@ facts:
 # boot the worker container.
 extraction:
   enabled: false
+  # How many `corpus-extraction` jobs the extraction lane runs at once
+  # (Stage 1 of Agnes-owned extraction parallelism — before this, the ONLY
+  # parallelism was inside the external producer's own `--workers` flag;
+  # this made multiple SharePoint CONNECTIONS extract strictly one-at-a-
+  # time). Different connections only — the per-connection idempotency key
+  # (app/api/admin_sharepoint.py::_extraction_idempotency_key) still
+  # prevents two jobs for the SAME connection from ever coexisting,
+  # unaffected by this setting. AGNES_EXTRACTION_CONCURRENCY (env) overrides
+  # this at runtime; either way it is resolved ONCE when the worker process
+  # starts (app/worker/runtime.py::_extraction_concurrency) — changing it
+  # needs a worker restart, not just an admin-panel edit. Invalid or
+  # out-of-[1, 8]-range values are clamped/defaulted with a logged warning,
+  # never a crash.
+  #
+  # SIZING: each slot is a FULL producer subprocess — its own crawl workers
+  # plus an LLM pass — not a lightweight thread. The `extraction-worker`
+  # compose service's default 4g/2cpu (AGNES_EXTRACTION_WORKER_MEM_LIMIT/
+  # _CPUS in docker-compose.yml) assumes exactly ONE concurrent producer
+  # run; raising `concurrency` without raising those two env vars in lock
+  # step risks OOM/CPU starvation under N concurrent producers.
+  concurrency: 1
   producer:
     # Full command line for the producer entrypoint, e.g.:
     #   command: "python -m your_producer.run"
@@ -1252,6 +1273,15 @@ extraction:
     #   module: your_producer.run
     # `command` wins when both are set. Either form MAY be a YAML list
     # instead of a string, taken verbatim (no shell-splitting needed then).
+    #
+    # Both also have an env override — AGNES_EXTRACTION_PRODUCER_COMMAND /
+    # AGNES_EXTRACTION_PRODUCER_MODULE — which wins over the yaml value here,
+    # same env-overrides-instance.yaml posture as `enabled` above. This is
+    # what lets a deploy-time mechanism (e.g. a Terraform module rendering
+    # /opt/agnes/.env) activate the producer without an applier-owned edit
+    # of this file on the VM's data disk. Unlike the yaml key, the env
+    # override for `command` is ALWAYS a plain string split with
+    # `shlex.split` — a YAML/JSON list is not supported via env.
     command: ""
     module: ""
     # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
