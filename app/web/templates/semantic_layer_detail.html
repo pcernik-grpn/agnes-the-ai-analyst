@@ -1,6 +1,9 @@
 {% extends "base_page.html" %}
 
 {% block title %}{{ model_name }} — Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# White sheet, like the Library this page is reached from and like every
+   admin page — see `body.page-sheet` in style-custom.css. #}
+{% block body_attrs %}class="page-sheet"{% endblock %}
 
 {% block head_extra %}
 <style>

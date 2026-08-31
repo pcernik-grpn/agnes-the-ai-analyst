@@ -2,6 +2,9 @@
 {% import "macros/_icon.html" as ico %}
 
 {% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# White sheet, like the Library this page is reached from and like every
+   admin page — see `body.page-sheet` in style-custom.css. #}
+{% block body_attrs %}class="page-sheet"{% endblock %}
 
 {#- Source badge -#}
 {% macro source_badge(source) -%}

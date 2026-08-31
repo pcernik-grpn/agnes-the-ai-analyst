@@ -677,3 +677,76 @@ class TestCatalogSemanticsDoorToTheDocument:
         self._seed_model()
         body = self._body(seeded_app, "analyst_token")
         assert _DOOR not in body
+
+
+class TestSemanticPagesAreWhiteSheets:
+    """The semantic layer and the metrics list are white, like the app around
+    them (#1898).
+
+    Both are reached from the Library's Definitions block, and the Library — like
+    every index page (`.idx`) and every admin page (`.container--full`) — paints
+    its shell `--ds-surface`. These four templates extend a base that does not,
+    so the canvas turned grey on the way in: two products, one journey. They opt
+    into the shared `body.page-sheet` modifier instead of each carrying a page
+    background of its own, which is what the design-system contract forbids and
+    what would drift the moment one of them was edited."""
+
+    TEMPLATES = (
+        "catalog_semantics.html",
+        "semantic_layer_list.html",
+        "semantic_layer_detail.html",
+        "semantic_layer_object.html",
+    )
+
+    def test_every_semantic_page_opts_into_the_sheet(self):
+        from pathlib import Path
+
+        for name in self.TEMPLATES:
+            text = Path("app/web/templates", name).read_text(encoding="utf-8")
+            assert '{% block body_attrs %}class="page-sheet"{% endblock %}' in text, name
+
+    def test_the_modifier_paints_the_body_and_outranks_the_theme(self):
+        """On the BODY, so it is full bleed — painting the padded `.container`
+        would leave grey gutters beside a white column. And with the extra
+        element in the selector, so it beats `[data-theme="paper"] body` (which
+        is what paints the grey) without depending on sheet order."""
+        from pathlib import Path
+
+        css = Path("app/web/static/style-custom.css").read_text(encoding="utf-8")
+        assert "html body.page-sheet,\nhtml body.detail-page { background: var(--ds-surface); }" in css, (
+            "the sheet rule must paint both the opt-in class and the detail-page family"
+        )
+        paper = Path("app/web/static/css/paper-skin.css").read_text(encoding="utf-8")
+        assert '[data-theme="paper"] body {' in paper, (
+            "the rule this one has to outrank has moved — re-check the specificity note"
+        )
+
+    # The app-side detail pages, named rather than globbed: `*_detail.html` also
+    # matches the admin ones (already white via `.container--full`) and the
+    # semantic-layer document page (an opt-in above, since it is not on the
+    # shared detail shell).
+    DETAIL_FAMILY = (
+        "catalog_package_detail.html",
+        "catalog_table_detail.html",
+        "catalog_recipe_detail.html",
+        "marketplace_plugin_detail.html",
+        "marketplace_item_detail.html",
+        "data_app_detail.html",
+        "library_detail.html",
+        "library_file_detail.html",
+        "memory_domain_detail.html",
+    )
+
+    def test_the_detail_page_family_is_on_the_same_rule(self):
+        """These nine already carry `body.detail-page` for their footer treatment,
+        so they join the sheet by that marker rather than by nine separate
+        opt-ins — one selector, and nothing to forget when a tenth is written.
+
+        The assertion is that the marker is still what they all carry: the day one
+        of them drops it, it silently drops back onto the grey canvas."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates")
+        for name in self.DETAIL_FAMILY:
+            text = (tpl / name).read_text(encoding="utf-8")
+            assert 'class="detail-page"' in text, f"{name} lost the class that paints its sheet"

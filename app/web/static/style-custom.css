@@ -263,6 +263,38 @@ body {
 .container--wide   { max-width: var(--width-wide); }     /* 1400px — admin index lists, marketplace grids */
 .container--full   { max-width: none; padding-left: var(--space-4); padding-right: var(--space-4); }
 
+/* ── A content page as a white SHEET ──────────────────────────────────────
+   `.idx` below (index pages) and `.container--full` in admin_page.css (every
+   admin page) both paint their shell `--ds-surface`, and both say why in their
+   own comments: a page left on the app background reads as a different product
+   from the one it was reached from. Content pages on base_page.html /
+   base_ds.html had no way to say the same thing, which is how the semantic
+   layer and the metrics list ended up as the grey stop in a white app — you
+   reach them from the Library's Definitions block, and the canvas changes
+   colour on the way (#1898).
+
+   Opt in per page: `{% block body_attrs %}class="page-sheet"{% endblock %}`.
+
+   FULL BLEED, on the body rather than on `.container`: the container is padded
+   and max-width'd, so painting that would leave grey gutters beside a white
+   column — an oversized card, not a page. This is the same choice `.idx`
+   documents ("no grey gutters beside the centred header either").
+
+   `body.detail-page` is in the same rule rather than opting in template by
+   template: the nine detail pages (data package, table, recipe, plugin,
+   marketplace item, data app, collection, file, memory domain) already carry
+   that class for their footer treatment, so it is the marker for this family
+   and one selector keeps all nine from drifting apart. Cards-on-grey was their
+   look, and cards on a sheet is the look every index page they are reached from
+   already has — the cards keep their own borders either way.
+
+   `html body.…` carries the extra element on purpose: the rule these have to
+   beat is `[data-theme="paper"] body` in paper-skin.css (the sheet that paints
+   the grey), which ties on specificity, and sheet order is not a thing a page
+   should have to reason about. */
+html body.page-sheet,
+html body.detail-page { background: var(--ds-surface); }
+
 /* Index / resource-list page layout (#896 prototype) — used via
    base_index.html by My Stack, Catalog, and similar list pages. The
    header zone (title + description + actions + search + tabs) and the

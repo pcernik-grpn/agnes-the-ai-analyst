@@ -1,6 +1,24 @@
 {% extends "base_page.html" %}
 
 {% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# White sheet, like the Library this page is reached from and like every
+   admin page — see `body.page-sheet` in style-custom.css. #}
+{% block body_attrs %}class="page-sheet"{% endblock %}
+
+{# The way back. This page was a dead end: it is reached from the Library's
+   Definitions block and from /catalog/semantics, and neither the rail (which has
+   no Semantic-layer row — /library is its one browse surface) nor this page
+   offered a route back, so the only way out was the browser's Back button. Same
+   resolver every detail page uses (`router._detail_back`), same 'semantics' key
+   as /catalog/semantics, so both pages return to the Definitions block that
+   sent the reader here rather than to the top of a long Library. #}
+{% block page_prehead %}
+{% set _back = detail_back('semantics', '/library', 'Library') %}
+<a class="slb-back" href="{{ _back.href }}">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  {{ _back.label }}
+</a>
+{% endblock %}
 
 {% set page_hero_eyebrow = "Semantic layer" %}
 {% set page_hero_title = "Semantic layer" %}
@@ -9,6 +27,25 @@
 
 {% block head_extra %}
 <style>
+/* ── Back link ───────────────────────────────────────────────────────────
+   Same rule as semantic_layer_detail.html's, deliberately: the two pages are
+   one flow and the link sits in the same slot on both, so it has to measure the
+   same. `--ds-text-secondary`, not `--ds-text-muted` — muted is 3.67:1 on this
+   page's background, under the 4.5:1 AA floor for 13px text (the same note
+   /catalog/semantics carries). */
+.slb-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: var(--space-6) 0 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ds-text-secondary);
+    text-decoration: none;
+}
+.slb-back:hover { color: var(--ds-text-primary); }
+.slb-back svg { width: 15px; height: 15px; }
+
 /* ── Model cards ─────────────────────────────────────────────────────── */
 .slb-grid {
     display: grid;
