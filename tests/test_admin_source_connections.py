@@ -2200,7 +2200,7 @@ class TestSharePointScopesSurviveOrdinaryEdits:
     with a config that omits ``scopes`` (as the admin form does — it never
     renders that field) used to wipe every confirmed scope's ``anonymize``
     flag, silently disarming the anonymize-in-front pipeline
-    (``app/worker/kinds.py::_anonymize_marked_scope_map`` reads exactly this
+    (``connectors/sharepoint/crawler.py``'s per-scope pipeline reads exactly this
     field). Same "carried forward unless explicitly supplied" contract as
     Keboola's ``project_id``/``project_name`` above.
     """

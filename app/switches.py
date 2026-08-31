@@ -713,21 +713,21 @@ SWITCHES: tuple[Switch, ...] = (
         editable=False,
         lock_reason=(
             "The flag itself is read per request, but the `corpus-extraction` job kind "
-            "it gates needs a configured `extraction.producer` command AND a worker "
-            "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
-            "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
-            "feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
+            "it gates needs the `extraction` optional dependency extra installed AND a "
+            "worker process actually polling the `extraction` lane (AGNES_WORKER_LANES, "
+            "e.g. the `extraction-worker` Compose profile) — enabling this alone surfaces "
+            "a feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
             "(a role split), which makes the deployment multi-process — it ALSO needs "
             "Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET, and "
             "coordination.backend=redis (docs/DEPLOYMENT.md#multi-process), or the "
-            "process refuses to boot. Enable the profile/producer, satisfy those "
-            "multi-process prerequisites, and this flag together."
+            "process refuses to boot. Install the extra, enable the profile, satisfy "
+            "those multi-process prerequisites, and this flag together."
         ),
         description=(
-            "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "
-            "own worker lane — gates the `corpus-extraction` job kind's handler, which "
-            "shells out to the operator-configured `extraction.producer` command/module. "
-            "New feature — off by default."
+            "Document extraction (spec §7.5 'Extraction inside Agnes') as its own worker "
+            "lane — gates the `corpus-extraction` job kind's handler, which runs the "
+            "built-in crawl -> convert -> anonymize -> ingest pipeline "
+            "(connectors/sharepoint/crawler.py) in-process. Off by default."
         ),
     ),
     Switch(

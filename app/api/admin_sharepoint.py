@@ -62,11 +62,10 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 enqueueing (typed 409, never a job
                                                                 that fails 30 minutes later in a
                                                                 worker) when ``extraction.enabled``
-                                                                is off or no producer is configured
-                                                                — the same two gates
-                                                                ``app/worker/kinds.py::
-                                                                _run_corpus_extraction`` itself
-                                                                checks. Deduped on a stable
+                                                                is off or the ``extraction`` extra
+                                                                is not installed — see
+                                                                ``_extraction_readiness``.
+                                                                Deduped on a stable
                                                                 per-connection idempotency key
                                                                 shared with the sweep below.
   POST   /api/admin/sharepoint/extraction/run-due             — scheduler-driven sweep (TCRD-226):
@@ -512,12 +511,20 @@ def _create_scope_collection(*, connection_name: str, display_path: str, source_
 
 
 def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
-    """Whether the ``corpus-extraction`` job kind can actually run right now
-    — the SAME two gates ``app/worker/kinds.py::_run_corpus_extraction``
-    itself checks (``extraction.enabled`` + a configured producer command/
-    module), read here so an admin (or the scheduled sweep below) finds out
-    BEFORE a job is queued rather than 30 minutes later when a worker claims
-    it and the handler raises.
+    """Whether the ``corpus-extraction`` job kind can actually run right now,
+    read here so an admin (or the scheduled sweep below) finds out BEFORE a
+    job is queued rather than 30 minutes later when a worker claims it and
+    the handler raises.
+
+    Two gates. ``extraction.enabled`` is the one
+    ``app/worker/kinds.py::_run_corpus_extraction`` itself checks. The second
+    is the ``extraction`` optional dependency extra: since the built-in
+    pipeline became the only pipeline (owner decision 2026-08-31) the crawl
+    runs IN-PROCESS, so on a server without the converter backends installed
+    every document of a run would fail with the same
+    ``MissingConversionDependency``. ``connectors.sharepoint.convert`` is
+    deliberately importable WITHOUT the extra (its backends are imported
+    lazily), so the probe has to reach past it to the backends themselves.
 
     Returns ``(True, None)`` when usable, or ``(False, {"error": ...,
     "message": ...})`` naming the exact fix.
@@ -530,20 +537,17 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
             "message": "extraction.enabled is false — enable it in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
         }
 
-    from app.worker.kinds import _PRODUCER_MODE_BUILTIN, _extraction_producer_argv, _extraction_producer_mode
+    try:
+        import markitdown  # noqa: F401
+        import pypdfium2  # noqa: F401
 
-    if _extraction_producer_mode() == _PRODUCER_MODE_BUILTIN:
-        # Builtin mode runs the in-process crawler — no external command to
-        # check; the handler resolves its own imports/config and fails clean.
-        return True, None
-
-    if _extraction_producer_argv() is None:
+        import connectors.sharepoint.convert  # noqa: F401
+    except ImportError:
         return False, {
-            "error": "extraction_producer_not_configured",
+            "error": "extraction_dependencies_missing",
             "message": (
-                "No producer configured — set extraction.producer.command or "
-                "extraction.producer.module in instance.yaml (or "
-                "extraction.producer.mode: builtin for the in-process crawler)."
+                "The document converter is not installed — run "
+                "pip install 'agnes[extraction]' on the process that runs the extraction lane."
             ),
         }
 
@@ -1056,14 +1060,12 @@ async def corpus_map(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
-    """Producer handoff (spec §13.2 / item 3): the corpus map the external
-    crawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in
-    the producer resolver's OWN shape — ``"<site display name>"`` or
+    """Scope→collection routing map (spec §13.2 / item 3). Keys are in the
+    crawl resolver's OWN shape — ``"<site display name>"`` or
     ``"<site display name>/<drive-relative folder path>"`` — built by the
-    same shared translation the in-Agnes ``corpus-extraction`` job handler
-    uses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff
-    (``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot
-    drift. The earlier flat ``{source_scope_id: collection_id}`` shape was
+    shared translation in ``connectors/sharepoint/corpus_map.py``, so this
+    endpoint and anything else reasoning about scope routing cannot drift.
+    The earlier flat ``{source_scope_id: collection_id}`` shape was
     unusable for routing: the resolver matches keys against crawler rows'
     site/path components, which a Graph scope id never equals.
 
@@ -1071,11 +1073,10 @@ async def corpus_map(
     unambiguous map (e.g. a site scope plus a drive scope of the same
     site) — never a best-guess map.
 
-    Deliberately does NOT carry ``anonymize`` — a producer that needs to
-    know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
-    row already carries ``anonymize``); Agnes's own ``corpus-extraction``
-    job handler does the equivalent lookup internally
-    (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
+    Deliberately does NOT carry ``anonymize`` — a caller that needs to know
+    WHICH scopes to anonymize reads ``GET .../scopes`` instead (each row
+    already carries ``anonymize``); the built-in crawl reads the same flag
+    off the scope rows directly."""
     row = _sharepoint_connection_or_404(connection_id)
     try:
         return producer_corpus_map(_scopes(row))
@@ -1129,8 +1130,8 @@ async def trigger_extraction(
     Then refuses cleanly (never a job that fails 30 minutes later in a
     worker) when the feature isn't usable: ``409 extraction_disabled``
     (``extraction.enabled`` is false) or ``409
-    extraction_producer_not_configured`` (neither ``extraction.producer
-    .command`` nor ``.module`` is set) — see :func:`_extraction_readiness`.
+    extraction_dependencies_missing`` (the ``extraction`` optional
+    dependency extra is not installed) — see :func:`_extraction_readiness`.
 
     Deduped on the STABLE per-connection idempotency key
     (:func:`_extraction_idempotency_key`) also used by the scheduled sweep
@@ -1237,8 +1238,8 @@ async def run_due_extraction(
     default posture as ``extraction.enabled``).
 
     A clean, typed no-op (never an error) when the feature isn't usable —
-    ``extraction.enabled`` is false, no producer is configured, or no
-    schedule is configured — since this endpoint, once registered, fires
+    ``extraction.enabled`` is false, the ``extraction`` extra is missing, or
+    no schedule is configured — since this endpoint, once registered, fires
     UNCONDITIONALLY on its own cadence; the JOB HANDLER
     (``_run_corpus_extraction``) raises on the same conditions because a
     ``corpus-extraction`` job only ever exists because something explicitly

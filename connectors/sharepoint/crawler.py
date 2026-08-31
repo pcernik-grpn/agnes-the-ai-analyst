@@ -1,13 +1,13 @@
-"""Built-in SharePoint document crawler — the in-process producer.
+"""Built-in SharePoint document crawler — THE extraction pipeline.
 
 Owner decision 2026-08-31 overrides the "the producer is never vendored"
 rule this connector was originally written under: the crawl -> convert ->
-(anonymize) -> ingest pipeline is now a FIRST-CLASS Agnes pipeline, selected
-with ``extraction.producer.mode: builtin``. The external-producer subprocess
-seam (``app/worker/kinds.py::_run_corpus_extraction``) stays exactly as it
-was and remains the default whenever a producer command/module is
-configured — this module is the other branch of that fork, not its
-replacement.
+(anonymize) -> ingest pipeline is a FIRST-CLASS Agnes pipeline, and it is
+the ONLY one. The external-producer subprocess seam that used to sit in
+``app/worker/kinds.py::_run_corpus_extraction`` — with its
+``extraction.producer.*`` config, its curated child env and its Admin-grade
+callback credential — was removed with that decision; that handler is now a
+thin delegate to :func:`run_builtin_crawl` below.
 
 What it does, per confirmed scope of one ``source_connections`` row:
 
@@ -62,10 +62,11 @@ Security posture:
   credential-egress destinations in the sense of the security playbook §8 —
   gated, never trusted because of where they came from.
 * Broken-inheritance subtrees found by ``sharepoint-subtree-sweep`` are
-  HONORED here (the external producer only ever received the list): each
-  excluded root is resolved once to its drive-relative path and every file
-  under that prefix is skipped. Fail-closed — a scope whose exclusion roots
-  cannot be resolved is not crawled at all.
+  HONORED here (the external producer only ever received the list and was
+  trusted to obey it): each excluded root is resolved once to its
+  drive-relative path and every file under that prefix is skipped.
+  Fail-closed — a scope whose exclusion roots cannot be resolved is not
+  crawled at all.
 """
 
 from __future__ import annotations
@@ -143,6 +144,20 @@ class CrawlError(RuntimeError):
 
 class GraphGone(Exception):
     """HTTP 410 — a ``deltaLink`` expired; that drive needs a full resync."""
+
+
+class CrawlTimeout(CrawlError):
+    """The run exceeded ``extraction.timeout_s``.
+
+    v1 has no other stop mechanism — no UI cancel, and (since the external
+    producer was removed) no subprocess to kill — so this bound is the only
+    thing standing between a pathological estate and a worker slot occupied
+    forever. Raised between files and between delta pages, i.e. always at a
+    point where the crawl state on disk is consistent: the run aborts through
+    the same path a :class:`GraphThrottled` abort takes, which persists the
+    state and the (interrupted) report, and the next run resumes from the
+    deltaLink + cTags already written.
+    """
 
 
 class GraphThrottled(CrawlError):
@@ -274,7 +289,13 @@ class CrawlStats:
         self.oversize_largest.sort(key=lambda e: -int(e["size"]))
         del self.oversize_largest[_OVERSIZE_SAMPLE:]
 
-    def report(self, *, max_file_mb: int, interrupted: bool = False) -> Dict[str, Any]:
+    def report(
+        self,
+        *,
+        max_file_mb: int,
+        interrupted: bool = False,
+        interrupted_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
         elapsed = max(time.monotonic() - self.started, 1e-6)
         processed = self.new + self.changed
         return {
@@ -283,6 +304,11 @@ class CrawlStats:
             "finished_at": _now_iso(),
             "duration_s": round(elapsed, 1),
             "interrupted": interrupted,
+            # Why the run stopped early — "timeout" when extraction.timeout_s
+            # expired, "error" for anything else, None on a clean pass. An
+            # operator reading a short report must be able to tell "this is
+            # all there was" from "this is where we ran out of clock".
+            "interrupted_reason": interrupted_reason,
             "scopes": self.scopes,
             "drives": self.drives,
             "new": self.new,
@@ -611,22 +637,51 @@ def convert_to_markdown(path: Path, mime: str) -> Any:
     return _convert(path, mime)
 
 
-def anonymize_markdown(text: str, *, key: bytes) -> Any:
+def anonymize_markdown(text: str, *, key: bytes, detector: Any = None) -> Any:
     """``src.anonymization.anonymize_markdown`` — the seam.
 
     Returns that module's ``AnonymizeResult`` (``.text``, ``.replaced``).
-    Callers treat ANY failure here — ``ImportError`` included — as
-    "this document cannot be anonymized", which for an anonymize-marked
-    scope means it is skipped, never ingested raw.
+    ``detector`` is ``None`` for the deterministic regex tier (the module's
+    own default) or the hybrid regex+LLM detector built by
+    :func:`_entity_detector`. Callers treat ANY failure here — ``ImportError``
+    and the LLM tier's ``DetectionUnavailable`` included — as "this document
+    cannot be anonymized", which for an anonymize-marked scope means it is
+    skipped, never ingested raw.
     """
     from src.anonymization import anonymize_markdown as _anonymize
 
-    return _anonymize(text, key=key)
+    return _anonymize(text, key=key, detector=detector)
 
 
 # --------------------------------------------------------------------------
 # Scope -> drives
 # --------------------------------------------------------------------------
+
+
+class _Deadline:
+    """The run's wall-clock bound (``extraction.timeout_s``).
+
+    Checked at the two points where stopping is free — between files and
+    between delta pages — rather than interrupting mid-download, because the
+    resume guarantee depends on state being written at exactly those
+    boundaries. ``timeout_s <= 0`` means unbounded.
+    """
+
+    def __init__(self, timeout_s: float, *, clock: Optional[Callable[[], float]] = None) -> None:
+        # Resolved through the module attribute at call time, not bound as a
+        # default argument at import time — the same reason every other seam
+        # in this module defers: a test must be able to substitute it.
+        self._clock = clock or (lambda: time.monotonic())
+        self.timeout_s = float(timeout_s or 0)
+        self.expires_at: Optional[float] = self._clock() + self.timeout_s if self.timeout_s > 0 else None
+
+    def expired(self) -> bool:
+        return self.expires_at is not None and self._clock() >= self.expires_at
+
+    def check(self) -> None:
+        """Raise :class:`CrawlTimeout` if the budget is spent."""
+        if self.expired():
+            raise CrawlTimeout(f"extraction.timeout_s ({self.timeout_s:.0f}s) elapsed — stopping; the next run resumes")
 
 
 @dataclass(frozen=True)
@@ -701,8 +756,9 @@ async def _excluded_path_prefixes(transport: GraphTransport, scope: Dict[str, An
     would ingest exactly the content an admin excluded.
 
     A scope carrying ``include_excluded_subtrees`` is exempt — the admin
-    decided that audience may see the content — matching
-    ``app/worker/kinds.py::_excluded_subtree_scope_map``'s own omission.
+    decided that audience may see the content — matching the same override
+    ``app/api/admin_sharepoint.py::confirm_scope`` writes (spec §6.3's
+    ``should_not`` per-subtree override).
     """
     if scope.get("include_excluded_subtrees"):
         return []
@@ -869,6 +925,7 @@ async def _process_item(
     stats: CrawlStats,
     max_file_mb: int,
     anonymization_key: Optional[bytes],
+    detector: Any = None,
 ) -> None:
     """One delta row -> at most one ingested document. Never raises for a
     per-file fault: a locked, vanished, unconvertible, or un-anonymizable
@@ -943,8 +1000,8 @@ async def _process_item(
                 stats.anonymize_failed += 1
                 return
             try:
-                markdown = str(anonymize_markdown(markdown, key=anonymization_key).text)
-            except Exception as exc:  # noqa: BLE001 — incl. ImportError: module not present
+                markdown = str(anonymize_markdown(markdown, key=anonymization_key, detector=detector).text)
+            except Exception as exc:  # noqa: BLE001 — incl. ImportError / DetectionUnavailable
                 stats.anonymize_failed += 1
                 logger.warning("sharepoint crawl: anonymization failed for %s: %s", path, type(exc).__name__)
                 return
@@ -998,6 +1055,8 @@ async def _crawl_drive(
     stats: CrawlStats,
     max_file_mb: int,
     anonymization_key: Optional[bytes],
+    detector: Any = None,
+    deadline: Optional[_Deadline] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``."""
@@ -1008,6 +1067,10 @@ async def _crawl_drive(
     stats.drives += 1
 
     while url:
+        # Between pages: the previous page's rows are ingested and its
+        # deltaLink/cTags are on disk, so stopping here costs nothing.
+        if deadline is not None:
+            deadline.check()
         try:
             page = await transport.get_json(url)
         except GraphGone:
@@ -1048,6 +1111,12 @@ async def _crawl_drive(
         for item in page.get("value", []):
             if not isinstance(item, dict) or not item.get("id"):
                 continue
+            # Between files. The cTag of the item just finished is already in
+            # `state`; the page's deltaLink is not written until the page
+            # completes, so a stop here re-reads this page next run and every
+            # already-ingested item in it upserts to a no-op.
+            if deadline is not None:
+                deadline.check()
             await _process_item(
                 item,
                 target=target,
@@ -1058,6 +1127,7 @@ async def _crawl_drive(
                 stats=stats,
                 max_file_mb=max_file_mb,
                 anonymization_key=anonymization_key,
+                detector=detector,
             )
 
         # Rows first, then the link: the deltaLink is persisted only after
@@ -1094,6 +1164,57 @@ def _max_file_mb() -> int:
         return _DEFAULT_MAX_FILE_MB
 
 
+def _timeout_seconds() -> int:
+    """``extraction.timeout_s`` — the run's wall-clock bound.
+
+    Delegates to ``app.worker.kinds._extraction_timeout_seconds``, the single
+    existing reader of that key (it also derives the job's lease from it, so
+    the two can never disagree about what the ceiling is). Imported lazily,
+    same posture as :func:`_resolve_anonymization_key` below.
+    """
+    from app.worker.kinds import _extraction_timeout_seconds
+
+    return _extraction_timeout_seconds()
+
+
+#: ``extraction.anonymization.detector`` values. ``"regex"`` is the default
+#: and it is a COST decision, not a legacy one: the deterministic tier is
+#: free and runs over every document of every crawl, while ``"llm"`` sends
+#: each document to the instance's model — order ~$5 per 1,000 documents on
+#: the default Haiku-class model. An operator who wants the recall an LLM
+#: reader adds opts into paying for it.
+_DETECTOR_REGEX = "regex"
+_DETECTOR_LLM = "llm"
+
+
+def _entity_detector() -> Any:
+    """The entity detector for this instance's anonymize passes, or ``None``
+    for the anonymizer's own deterministic default.
+
+    ``extraction.anonymization.detector: "llm"`` builds
+    ``hybrid_detector(LLMDetector())`` from :mod:`src.anonymization_ner` —
+    regex first (free, exact by construction), then the LLM adds what only a
+    reader can find. That tier's ``DetectionUnavailable`` deliberately
+    propagates: the caller counts the document in ``anonymize_failed`` and
+    drops it, rather than ingesting a document whose redaction quietly
+    degraded to regex-only. Anything else, including unset, is the regex
+    tier — see :data:`_DETECTOR_REGEX` for why that is the default.
+
+    Built ONCE per run (the detector carries its own client + running token
+    accounting) and imported lazily, so an instance on the regex tier never
+    imports the LLM stack at all.
+    """
+    from app.instance_config import get_value
+
+    choice = str(get_value("extraction", "anonymization", "detector", default="") or "").strip().lower()
+    if choice != _DETECTOR_LLM:
+        return None
+
+    from src.anonymization_ner import LLMDetector, hybrid_detector
+
+    return hybrid_detector(LLMDetector())
+
+
 def _resolve_anonymization_key(scopes: Sequence[Dict[str, Any]]) -> Optional[bytes]:
     """The per-instance anonymization HMAC key, or ``None`` when no scope in
     this run needs one.
@@ -1116,6 +1237,7 @@ async def _run_crawl_async(
     connection: Dict[str, Any],
     *,
     only_scope_ids: Optional[Sequence[str]] = None,
+    timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     scopes = _confirmed_scopes(connection)
@@ -1130,7 +1252,12 @@ async def _run_crawl_async(
 
     settings = resolve_sharepoint_settings(connection)
     anonymization_key = _resolve_anonymization_key(scopes)
+    # Built once per run, and only when something in this run will actually
+    # anonymize — an instance on the regex tier never imports the LLM stack,
+    # and an instance on the LLM tier never pays for a detector no scope uses.
+    detector = _entity_detector() if anonymization_key is not None else None
     max_file_mb = _max_file_mb()
+    deadline = _Deadline(_timeout_seconds() if timeout_s is None else timeout_s)
 
     stats = CrawlStats()
     auth = GraphAuth(
@@ -1174,13 +1301,27 @@ async def _run_crawl_async(
                     stats=stats,
                     max_file_mb=max_file_mb,
                     anonymization_key=anonymization_key,
+                    detector=detector,
+                    deadline=deadline,
                 )
-    except BaseException:
-        # A crashed run still owes the operator its numbers and its state —
-        # the rows are already ingested, so record what got done instead of
-        # losing the pass.
-        state["last_run"] = stats.report(max_file_mb=max_file_mb, interrupted=True)
+    except BaseException as exc:
+        # A crashed — or timed-out — run still owes the operator its numbers
+        # and its state: the rows are already ingested, so record what got
+        # done instead of losing the pass. A CrawlTimeout is not a crash, so
+        # it is named in the report rather than left looking like one.
+        reason = "timeout" if isinstance(exc, CrawlTimeout) else "error"
+        state["last_run"] = stats.report(max_file_mb=max_file_mb, interrupted=True, interrupted_reason=reason)
+        state["last_run"]["connection_id"] = connection_id
+        state["last_run"]["scope_errors"] = scope_errors
         save_state(connection_id, state)
+        if reason == "timeout":
+            logger.warning(
+                "sharepoint crawl: connection %s hit extraction.timeout_s after %d new / %d changed — "
+                "state saved, the next run resumes",
+                connection_id,
+                stats.new,
+                stats.changed,
+            )
         raise
 
     report = stats.report(max_file_mb=max_file_mb)
@@ -1203,8 +1344,16 @@ async def _run_crawl_async(
 
 
 def run_builtin_crawl(payload: dict) -> dict:
-    """Entry point for the ``corpus-extraction`` job kind's ``builtin``
-    producer mode (``extraction.producer.mode: builtin``).
+    """Entry point for the ``corpus-extraction`` job kind
+    (``app/worker/kinds.py::_run_corpus_extraction``, a thin delegate to
+    this).
+
+    Bounded by ``extraction.timeout_s`` — v1's ONLY stop mechanism (no UI
+    cancel, and since the external producer was removed, no subprocess to
+    kill). On expiry the run saves its state, reports
+    ``interrupted_reason="timeout"``, and fails the job; the next run resumes
+    from the persisted deltaLinks and cTags. ``payload["timeout_s"]``
+    overrides the configured value for one run (0 = unbounded).
 
     ``payload``: ``connection_id`` (required — a ``source_connections`` row
     with ``source_type='sharepoint'``) and optionally ``scopes`` (a list of
@@ -1227,7 +1376,13 @@ def run_builtin_crawl(payload: dict) -> dict:
         raise CrawlError(f"sharepoint crawl: connection {connection_id!r} not found or not a sharepoint connection")
 
     try:
-        return asyncio.run(_run_crawl_async(connection, only_scope_ids=payload.get("scopes")))
+        return asyncio.run(
+            _run_crawl_async(
+                connection,
+                only_scope_ids=payload.get("scopes"),
+                timeout_s=payload.get("timeout_s"),
+            )
+        )
     except SharePointSettingsError as exc:
         # Named cause, not a bare traceback — the same typed handling
         # `app/api/admin_sharepoint.py::_resolved_token` gives this error.

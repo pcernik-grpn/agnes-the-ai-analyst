@@ -438,7 +438,9 @@ class TestAnonymizeFailClosed:
 
     def test_anonymized_text_is_what_gets_ingested(self, crawl_env, monkeypatch):
         monkeypatch.setattr(
-            crawler, "anonymize_markdown", lambda text, *, key: AnonymizeResult("PERSON_abc met PERSON_def", 2)
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult("PERSON_abc met PERSON_def", 2),
         )
         _install_graph(monkeypatch, self._handler)
         report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
@@ -447,7 +449,7 @@ class TestAnonymizeFailClosed:
         assert FakeIngestor.instances[-1].ingested[0]["markdown"] == "PERSON_abc met PERSON_def"
 
     def test_a_document_that_cannot_be_anonymized_is_never_ingested_raw(self, crawl_env, monkeypatch):
-        def _boom(text, *, key):
+        def _boom(text, *, key, detector=None):
             raise RuntimeError("anonymizer blew up")
 
         monkeypatch.setattr(crawler, "anonymize_markdown", _boom)
@@ -461,7 +463,7 @@ class TestAnonymizeFailClosed:
         assert _state(crawl_env)["ctags"] == {}
 
     def test_a_missing_anonymization_module_is_treated_as_failure_not_as_pass_through(self, crawl_env, monkeypatch):
-        def _not_landed(text, *, key):
+        def _not_landed(text, *, key, detector=None):
             raise ImportError("No module named 'src.anonymization'")
 
         monkeypatch.setattr(crawler, "anonymize_markdown", _not_landed)
@@ -472,7 +474,9 @@ class TestAnonymizeFailClosed:
         assert FakeIngestor.instances[-1].ingested == []
 
     def test_a_non_anonymized_scope_in_the_same_run_still_ingests(self, crawl_env, monkeypatch):
-        monkeypatch.setattr(crawler, "anonymize_markdown", lambda text, *, key: AnonymizeResult("redacted"))
+        monkeypatch.setattr(
+            crawler, "anonymize_markdown", lambda text, *, key, detector=None: AnonymizeResult("redacted")
+        )
         _install_graph(monkeypatch, self._handler)
         scopes = [
             _drive_scope(anonymize=True, source_scope_id="b!drive1", collection_id="secret"),
@@ -893,7 +897,7 @@ class TestState:
 
 
 # --------------------------------------------------------------------------
-# Entry point / mode selection
+# Entry point / detector choice / run deadline
 # --------------------------------------------------------------------------
 
 
@@ -911,41 +915,166 @@ class TestEntryPoint:
             crawler.run_builtin_crawl({"connection_id": "conn1"})
 
 
-class TestProducerMode:
-    def test_default_stays_external(self, monkeypatch):
-        from app.worker import kinds
+class TestDetectorChoice:
+    """``extraction.anonymization.detector`` — an explicit config choice, not
+    a default that happens to be there. ``regex`` is chosen for COST (the LLM
+    tier bills per document, ~$5/1k), so it must be what an unset value gets,
+    and ``llm`` must be reachable by naming it and nothing else."""
 
-        monkeypatch.setattr(kinds, "_extraction_producer_mode", kinds._extraction_producer_mode)
+    def test_unset_uses_the_deterministic_tier(self, monkeypatch):
         monkeypatch.setattr("app.instance_config.get_value", lambda *keys, default=None: default)
-        assert kinds._extraction_producer_mode() == "external"
+        assert crawler._entity_detector() is None
 
-    def test_builtin_is_selected_only_by_the_explicit_value(self, monkeypatch):
-        from app.worker import kinds
+    def test_regex_is_the_anonymizers_own_default_not_a_wrapper(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *keys, default=None: "regex")
+        # None means "let src.anonymization use RegexDetector" — passing a
+        # hand-built copy here would be a second definition of the default.
+        assert crawler._entity_detector() is None
 
-        values = {"mode": "builtin"}
+    def test_llm_builds_the_hybrid_detector(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *keys, default=None: "LLM")
+
+        built: List[Any] = []
+        monkeypatch.setattr("src.anonymization_ner.LLMDetector", lambda *a, **k: "llm-detector")
         monkeypatch.setattr(
-            "app.instance_config.get_value",
-            lambda *keys, default=None: values.get(keys[-1], default),
-        )
-        assert kinds._extraction_producer_mode() == "builtin"
-
-        values["mode"] = "external"
-        assert kinds._extraction_producer_mode() == "external"
-
-    def test_builtin_mode_delegates_to_the_crawler_without_a_subprocess(self, monkeypatch):
-        from app.worker import kinds
-
-        monkeypatch.setattr(kinds, "_extraction_producer_mode", lambda: "builtin")
-        monkeypatch.setattr("app.instance_config.feature_enabled", lambda *a, **k: True)
-
-        def _boom(*args: Any, **kwargs: Any):
-            raise AssertionError("builtin mode must never spawn a subprocess")
-
-        monkeypatch.setattr(kinds.subprocess, "run", _boom)
-        monkeypatch.setattr(
-            "connectors.sharepoint.crawler.run_builtin_crawl",
-            lambda payload: {"connection_id": payload["connection_id"], "new": 3},
+            "src.anonymization_ner.hybrid_detector",
+            lambda llm: built.append(llm) or "hybrid",
         )
 
-        result = kinds._run_corpus_extraction({"connection_id": "conn1"})
-        assert result == {"connection_id": "conn1", "new": 3}
+        assert crawler._entity_detector() == "hybrid"
+        # Hybrid, never LLM-alone: the free deterministic tier still runs.
+        assert built == ["llm-detector"]
+
+    def test_the_chosen_detector_reaches_the_anonymize_call(self, crawl_env, monkeypatch):
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unit-test-key")
+        monkeypatch.setattr(crawler, "_entity_detector", lambda: "hybrid-sentinel")
+
+        seen: List[Any] = []
+
+        def _anonymize(text, *, key, detector=None):
+            seen.append(detector)
+            return AnonymizeResult("redacted")
+
+        monkeypatch.setattr(crawler, "anonymize_markdown", _anonymize)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert seen == ["hybrid-sentinel"]
+
+    def test_no_detector_is_built_when_nothing_in_the_run_anonymizes(self, crawl_env, monkeypatch):
+        """The LLM tier costs money per document — an instance that has it
+        configured must not construct (or pay for) one on a run whose scopes
+        are all plain."""
+
+        def _boom():
+            raise AssertionError("no scope in this run anonymizes — the detector must not be built")
+
+        monkeypatch.setattr(crawler, "_entity_detector", _boom)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=False)]), monkeypatch)
+
+        assert report["new"] == 1
+
+
+class TestRunDeadline:
+    """``extraction.timeout_s`` — the ONLY stop mechanism this feature has.
+    There is no cancel button and (since the external producer was removed)
+    no subprocess to kill, so an unbounded crawl would hold the extraction
+    lane's single slot indefinitely."""
+
+    def _paged_handler(self) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "nextpage" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("item2", name="b.docx", ctag="ctag-2")],
+                        "@odata.deltaLink": f"{DRIVE_DELTA}?token=NEW",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"value": [_file_item("item1")], "@odata.nextLink": f"{DRIVE_DELTA}?nextpage=1"},
+            )
+
+        return handler
+
+    def test_an_expired_deadline_stops_the_run_and_says_why(self, crawl_env, monkeypatch):
+        _install_graph(monkeypatch, self._paged_handler())
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        with pytest.raises(crawler.CrawlTimeout, match="timeout_s"):
+            # A budget already spent when the crawl starts: the first check,
+            # between pages, fires before a single Graph page is fetched.
+            crawler.run_builtin_crawl({"connection_id": "conn1", "timeout_s": 0.0000001})
+
+        # The run is still accounted for: an operator must be able to tell
+        # "this is where the clock ran out" from an ordinary short report.
+        last_run = _state(crawl_env)["last_run"]
+        assert last_run["interrupted"] is True
+        assert last_run["interrupted_reason"] == "timeout"
+
+    def test_a_timed_out_run_resumes_rather_than_restarting(self, crawl_env, monkeypatch):
+        """Stopping is only free because it happens at a state boundary: the
+        deltaLink/cTags written before the stop are what the next run picks
+        up from."""
+        _install_graph(monkeypatch, self._paged_handler())
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        # Expire at the first check AFTER a document has actually landed —
+        # keyed on the ingest itself rather than on a read count, so the
+        # test still asserts "a stop preserves what was already done" if the
+        # number of clock reads per page ever changes.
+        def _clock() -> float:
+            landed = FakeIngestor.instances and FakeIngestor.instances[-1].ingested
+            return 1_000_000.0 if landed else 0.0
+
+        monkeypatch.setattr(crawler.time, "monotonic", _clock)
+
+        with pytest.raises(crawler.CrawlTimeout):
+            crawler.run_builtin_crawl({"connection_id": "conn1", "timeout_s": 60})
+
+        state = _state(crawl_env)
+        assert state["ctags"], "the item ingested before the stop must be recorded, or the next run re-does it"
+        assert state["last_run"]["interrupted_reason"] == "timeout"
+
+    def test_zero_means_unbounded(self, crawl_env, monkeypatch):
+        _install_graph(monkeypatch, self._paged_handler())
+        report = _run(_connection([_drive_scope()]), monkeypatch)  # crawl_env leaves timeout at its default
+        assert report["interrupted"] is False
+        assert report["interrupted_reason"] is None
+
+        deadline = crawler._Deadline(0)
+        assert deadline.expires_at is None
+        deadline.check()  # must not raise
+
+    def test_the_configured_value_is_what_bounds_a_run(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_timeout_seconds", lambda: 42)
+        assert crawler._Deadline(crawler._timeout_seconds()).timeout_s == 42

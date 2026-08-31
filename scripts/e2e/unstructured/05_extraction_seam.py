@@ -4,12 +4,11 @@
 Exercises the one piece of the pipeline this repo can trigger directly:
 ``POST /api/admin/sharepoint/connections/{id}/extract`` (TCRD-226,
 ``app/api/admin_sharepoint.py::trigger_extraction``), which enqueues the
-``corpus-extraction`` job kind and hands the extraction producer this
-instance's anonymize-scope map + HMAC key (docs/anonymization.md). Everything
-upstream of "run the configured producer command" — the crawl, convert,
-anonymize, extract stages themselves — lives outside this repo (spec §9,
-§7.1) and is not exercised here; this script only proves Agnes's own seam:
-does the job enqueue, does a worker pick it up, does it finish.
+``corpus-extraction`` job kind. That job runs the built-in crawl ->
+convert -> (anonymize) -> ingest pipeline in-process
+(``connectors/sharepoint/crawler.py``); this script does not assert on what
+the crawl found, only on the seam it can see from outside: does the job
+enqueue, does a worker pick it up, does it finish.
 
 SKIPs cleanly (never fails) when:
 

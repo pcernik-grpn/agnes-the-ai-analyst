@@ -643,9 +643,9 @@ On a VM provisioned by the Terraform module
 the startup script owns `.env` and `COMPOSE_FILE`, so hand edits are
 reverted on the next recreate. Instead set the per-instance
 `extraction_worker_enabled = true` (default off) together with the
-module-level `extraction_worker_image` (a worker image that carries your
-extraction producer — the plain app image has no producer on PATH, and the
-module refuses the flag without an image at plan time). The module then
+module-level `extraction_worker_image` (an app image built with the
+`extraction` optional extra — the plain app image carries no document
+converter, and the module refuses the flag without an image at plan time). The module then
 renders the Redis coordination backend, the `.env` coordination
 declaration, and an always-on `extraction-worker` service into the boot
 path. The startup script is under `lifecycle.ignore_changes`, so flipping

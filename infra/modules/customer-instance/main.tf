@@ -690,13 +690,13 @@ resource "google_compute_instance" "vm" {
     # Same plan-time catch for the extraction lane: without a worker image
     # the overlay would pin the `extraction-worker` service to an empty
     # `image:` and `docker compose up` fails the whole boot. The image is
-    # the one thing the module cannot default — the producer-bundled
-    # variant only exists in the operator's own registry (the public app
-    # image deliberately carries no producer; see docker-compose.prod.yml's
-    # extraction-worker comment).
+    # the one thing the module cannot default — the extraction-extra variant
+    # only exists in the operator's own registry (the public app image is
+    # built without it; see docker-compose.prod.yml's extraction-worker
+    # comment).
     precondition {
       condition     = !each.value.extraction_worker_enabled || var.extraction_worker_image != ""
-      error_message = "extraction_worker_enabled=true on instance ${each.value.name} requires extraction_worker_image on the module — the producer-bundled worker image (Dockerfile `worker` target built with EXTRACTION_PRODUCER_INSTALL); the plain app image has no producer and every corpus-extraction job would fail."
+      error_message = "extraction_worker_enabled=true on instance ${each.value.name} requires extraction_worker_image on the module — a worker image built with the `extraction` extra (--build-arg EXTRA_EXTRAS=,extraction); the plain app image has no document converter and every corpus-extraction job would refuse."
     }
   }
 
