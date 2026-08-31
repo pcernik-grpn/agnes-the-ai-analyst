@@ -368,6 +368,7 @@ class TestTheTableListFollowsTheSourceStructure:
         assert "SOURCE_LABELS" in src
         assert "'/api/admin/source-connections'" in src, "project names come from the connections"
 
+
 class TestThePickerKeptWhatTheRetiredDrawerHad:
     """The add-tables drawer this change deleted had the better picker.
 
@@ -442,3 +443,34 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         shell = (STATIC / "js" / "components" / "builder_shell.js").read_text(encoding="utf-8")
         assert "(o.controls || '')" in shell, "the slot must be optional, not required"
 
+
+class TestTheGridsTableStaysInsideThePage:
+    """The five-column package table outgrows its column below ~1400px.
+
+    `.data-table-wrap` is a bare <div> that nine admin templates wrap a table
+    in, and no sheet defines it — so when the table's ~1105px of min-content
+    exceeded the available width it simply ran out of the page: "Shared with"
+    and "Actions" off the right edge, and the whole document scrolling
+    sideways. The wrapper is named for containing exactly this.
+    """
+
+    def test_the_wrapper_scrolls_its_own_overflow(self) -> None:
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        assert ".data-table-wrap { overflow-x: auto; }" in src
+
+    def test_the_narrow_columns_keep_their_floor(self) -> None:
+        """The two cells that were cramped: a nowrap chip rendered narrower
+        than its own text, and a category on two lines."""
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        assert "min-width: 92px" in src and "min-width: 148px" in src
+        # Scoped to a 5-column row, so the 3-column Memory Domains table below
+        # — same classes, no Tables or Category column — is untouched.
+        assert "tr:has(> :nth-child(5))" in src
+
+    def test_the_chip_is_capped_by_its_cell_not_by_a_fraction_of_it(self) -> None:
+        """`max-width: 60%` of a ~100px column was 41px of pill around 58px of
+        text, so the words hung outside their own tint."""
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        chip = src[src.index("  .adp-chip {") : src.index("  .adp-chip svg")]
+        assert "max-width: 100%" in chip
+        assert "max-width: 60%" not in chip

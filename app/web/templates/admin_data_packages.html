@@ -84,6 +84,37 @@
     font-size: 12px; color: var(--ds-text-muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  /* ── The wide table scrolls inside its own box ───────────────────────
+     `.data-table-wrap` is a bare <div> — nine admin templates wrap a table in
+     it and NO sheet defines it, so it contains nothing. Five columns of
+     package facts have a min-content of ~1105px; below roughly a 1400px
+     window that is wider than the column it sits in, and with no overflow
+     rule the table simply ran out of the page — Shared with and Actions off
+     the right edge, and the whole document scrolling sideways.
+
+     `overflow-x: auto` is what the wrapper was named for. Page-local rather
+     than on the shared class: making a scroll container also makes the other
+     axis scrollable (a non-visible overflow on one axis computes the other to
+     `auto`), and some of those other eight tables carry row menus that would
+     start clipping. This table has none — its only control is a link.
+
+     Same fix, same reasoning as `.apd-tablewrap` on the package's own page. */
+  .data-table-wrap { overflow-x: auto; }
+
+  /* ── The floor the narrow columns need ───────────────────────────────
+     `table-layout` is auto here, so a column is only as wide as the browser
+     decides to spare after the Package column's descriptions have taken what
+     they want — and what it spared was 98px for Category ("Customer Insights"
+     on two lines) and 100px for Tables (a nowrap chip hanging outside its own
+     tint). A minimum on the cell is what auto layout honours; the Package
+     column gives up the difference and ellipsises, which its description
+     already does by design.
+
+     Scoped to a 5-column row so the 3-column Memory Domains table below —
+     same classes, no Tables or Category column — is untouched. */
+  .adp-table tr:has(> :nth-child(5)) > :nth-child(2) { min-width: 92px; }
+  .adp-table tr:has(> :nth-child(5)) > :nth-child(3) { min-width: 148px; }
+
   .adp-num { font-variant-numeric: tabular-nums; }
   .adp-none { color: var(--ds-text-muted); }
   .adp-cat { font-size: 12px; color: var(--ds-text-muted); }
@@ -112,10 +143,14 @@
      shows no tier at all rather than a misleading one: it delivers nothing
      however it is shared, and the Tables column beside it already says so in
      the place a reader scanning for emptiness is looking. Same 26px box in
-     every state, so the rows keep one height. */
+     every state, so the rows keep one height.
+
+     `max-width: 100%`, not 60%: the columns are fixed percentages, so 60% of
+     the Tables cell was 41px of pill around 58px of nowrap text — the words
+     hung outside their own tint. The cell is the cap. */
   .adp-chip {
     flex: none; display: inline-flex; align-items: center; gap: 5px;
-    box-sizing: border-box; height: 26px; max-width: 60%; padding: 0 10px;
+    box-sizing: border-box; height: 26px; max-width: 100%; padding: 0 10px;
     border-radius: var(--ds-radius-pill);
     font-size: 12px; font-weight: 600; white-space: nowrap;
     color: var(--ds-text-muted); background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent);
@@ -276,10 +311,13 @@
      put People, Tables and Sources on `.data-table`, which is what this uses
      — the shared admin table, not a private copy of one. #}
   <div class="data-table-wrap">
-    {# Explicit widths, as on the People table: without them the browser sizes
-       from content and one long description takes the outcome columns down to
-       a word each. Percentages only — a px width mixed into `table-layout:
-       fixed` is ADDED to the percentages rather than taken out of them. #}
+    {# These percentages are HINTS, not a grid: `.data-table` never sets
+       `table-layout: fixed`, so the browser still sizes from content and one
+       long description does take the outcome columns down to a word each —
+       which is what cramped the Category cell and squeezed the Tables chip
+       narrower than its own text. What actually holds those columns open is
+       the `min-width` on them in the sheet below; these stay as the
+       proportions to aim for when there IS slack. #}
     <table class="data-table adp-table">
       <colgroup>
         <col style="width: 42%">
