@@ -1299,6 +1299,53 @@ feature isn't usable or no schedule is configured.
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
 
+### `/api/admin/sharepoint/connections/{connection_id}/extraction` — extraction observability (design 2026-08-31)
+
+Read-only surface (`app/api/admin_extraction.py`) behind the SharePoint source
+card's live crawl cell, its run-history drawer and its configuration drawer. No
+new page and no new nav entry — the card is the only client.
+
+- /api/admin/sharepoint/connections/{connection_id}/extraction/status
+- /api/admin/sharepoint/connections/{connection_id}/extraction/runs
+- /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}
+- /api/admin/sharepoint/connections/{connection_id}/extraction/config
+
+`GET …/extraction/status` returns the live run (if any) and the last completed
+one. Liveness is **derived, never trusted**: a worker killed outright finalizes
+nothing, so a run whose last checkpoint is older than 30 minutes comes back as
+`outcome: "stalled"` with its `stale_s`, and a run whose `jobs` row already
+ended comes back as `failed` — the stored `running` is reported separately as
+`stored_status`, so the two can never be confused. Counters are **absolute**
+(files processed, new/changed/unchanged, bytes, elapsed, 429 count and wait):
+there is no fraction, no progress bar and no ETA, because the crawl enumerates
+and processes in lockstep per delta page and `files_per_s` counts only
+new+changed documents. `can_stop` is `false` — v1 has no cooperative cancel
+flag, so no Stop control is drawn.
+
+`GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
+`total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
+stored crawl report and the capped skip list (`{items, listed, total,
+truncated}` — only oversize skips keep a path, so `listed` and `total` differ
+whenever a run also refused documents it cannot name).
+
+All three read `extraction_runs`, a PG-only table (A3 ratchet), so a
+DuckDB-backed instance gets a typed `501 requires_postgres_backend` and the
+card stops polling and says why.
+
+`GET …/extraction/config` is the read-out behind the configuration drawer:
+every effective `extraction.*` value with its `origin` (`env` | `yaml` |
+`default` | `builtin`), the env var's NAME where one applies (never its value),
+and per-leaf `editable` + `lock_reason` read from the switch registry at render
+time. An env-set value is always locked — an admin edit writes YAML, which the
+environment overrides. The whole `extraction` section stays out of
+`_EDITABLE_SECTIONS` (`section_editable: false`): server-config validates the
+section name and then deep-merges, so one editable key would make the section
+that holds a producer command line admin-writable. This endpoint reads no run
+rows and therefore answers on both backends. Audited as
+`sharepoint_connection.extraction_config_read`.
+
+Admin-only display primitives with no analyst CLI/MCP analogue.
+
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 
 Admin-only, behind the `facts` feature flag. The builder shell on

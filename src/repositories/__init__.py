@@ -154,6 +154,8 @@ __all__ = [
     "ontology_drafts_repo",
     "share_requests_repo",
     "facts_ingest_runs_repo",
+    # Built-in extraction run observability (2026-08-31 design §7.1)
+    "extraction_runs_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
     "user_external_identities_repo",
@@ -569,6 +571,13 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "facts_ingest_runs": {
         PG: ("src.repositories.facts_ingest_runs_pg", "FactsIngestRunsPgRepository"),
     },
+    # Built-in extraction run observability (2026-08-31 extraction-
+    # observability-ui design §7.1) — PG-only, A3 ratchet: no DuckDB
+    # backend. Separate from "jobs" (a frozen pair that owns lifecycle and
+    # cannot grow a mutable progress column); `job_id` joins the two.
+    "extraction_runs": {
+        PG: ("src.repositories.extraction_runs_pg", "ExtractionRunsPgRepository"),
+    },
     # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
     # DuckDB backend. The singleton runtime config for the `sso` provider
     # slot and the per-user external identity bindings it captures.
@@ -958,6 +967,14 @@ def facts_ingest_runs_repo() -> Any:
     §7.2/§13.2 source card). PG-only — raises ``RequiresPostgresBackend``
     on a DuckDB-backed instance."""
     return _build("facts_ingest_runs")
+
+
+def extraction_runs_repo() -> Any:
+    """Per-run state for the built-in extraction pipeline (2026-08-31
+    extraction-observability-ui design §7.1) — what is running now, and the
+    last N runs' outcomes. PG-only — raises ``RequiresPostgresBackend`` on a
+    DuckDB-backed instance."""
+    return _build("extraction_runs")
 
 
 def sso_config_repo() -> Any:

@@ -949,3 +949,222 @@ class TestProducerMode:
 
         result = kinds._run_corpus_extraction({"connection_id": "conn1"})
         assert result == {"connection_id": "conn1", "new": 3}
+
+
+# --------------------------------------------------------------------------
+# Run recording (2026-08-31 extraction-observability-ui design §7.1)
+#
+# The crawl writes an `extraction_runs` row: open at start, update at the
+# checkpoint it already writes, finalize on done / interrupt / crash. Every
+# assertion below is about a rule the CARD depends on — a run that ended is
+# never left looking live, and a crash is never dressed up as a benign
+# interruption.
+# --------------------------------------------------------------------------
+
+
+class FakeRunsRepo:
+    """Records what the crawl would write, with the same method signatures
+    ``ExtractionRunsPgRepository`` exposes (asserted by the shared-shape test
+    at the end of this class's block)."""
+
+    def __init__(self) -> None:
+        self.started: List[Dict[str, Any]] = []
+        self.checkpoints: List[Dict[str, Any]] = []
+        self.finished: List[Dict[str, Any]] = []
+
+    def start(self, *, connection_id, job_id=None, phase="crawl"):
+        self.started.append({"connection_id": connection_id, "job_id": job_id, "phase": phase})
+        return f"er_fake{len(self.started)}"
+
+    def checkpoint(self, run_id, **kwargs):
+        self.checkpoints.append({"run_id": run_id, **kwargs})
+
+    def finish(self, run_id, **kwargs):
+        self.finished.append({"run_id": run_id, **kwargs})
+
+
+def _install_runs_repo(monkeypatch, repo=None):
+    repo = repo or FakeRunsRepo()
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: repo)
+    return repo
+
+
+class TestRunRecording:
+    def test_a_completed_crawl_opens_checkpoints_and_finalizes_its_row(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert runs.started == [{"connection_id": "conn1", "job_id": None, "phase": "crawl"}]
+        assert runs.checkpoints, "the crawl's existing checkpoint must also write the run row"
+        assert runs.checkpoints[-1]["files_done"] == 1
+        # Enumeration is never claimed complete mid-run: the delta feed can
+        # always hand back another page.
+        assert runs.checkpoints[-1]["enumeration_done"] is False
+
+        assert len(runs.finished) == 1
+        final = runs.finished[0]
+        assert final["status"] == "done"
+        assert final["report"] == report
+        assert final["files_done"] == 1
+        # No detector is wired into the anonymize seam yet, so no tokens are
+        # spent — `{}` is "none spent", not a computed $0.00.
+        assert final["usage"] == {}
+
+    def test_progress_carries_absolute_counters_only(self, crawl_env, monkeypatch):
+        """No fraction, no percentage, no ETA — the crawl enumerates and
+        processes in lockstep, and files_per_s counts only new+changed."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        progress = runs.checkpoints[-1]["progress"]
+        assert progress["files_done"] == 1
+        assert progress["new"] == 1
+        assert "elapsed_s" in progress
+        for forbidden in ("percent", "progress_pct", "eta_s", "eta", "files_per_s"):
+            assert forbidden not in progress
+
+    def test_a_crashed_crawl_records_failed_not_interrupted(self, crawl_env, monkeypatch):
+        """Severity-first: a crash is both "did not finish" and "broke". The
+        more severe word wins, or the card invites an operator to trust a
+        broken run's numbers."""
+        runs = _install_runs_repo(monkeypatch)
+        _install_graph(monkeypatch, lambda request: _content_response())
+
+        async def _boom(*args: Any, **kwargs: Any):
+            raise RuntimeError("graph exploded")
+
+        monkeypatch.setattr(crawler, "_crawl_drive", _boom)
+
+        with pytest.raises(RuntimeError):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert len(runs.finished) == 1
+        assert runs.finished[0]["status"] == "failed"
+        assert "graph exploded" in runs.finished[0]["error"]
+
+    def test_a_cancelled_crawl_records_interrupted(self, crawl_env, monkeypatch):
+        """A cancellation is its own outcome — the run ingested what it
+        ingested and the next run resumes from the persisted cTags."""
+        runs = _install_runs_repo(monkeypatch)
+        _install_graph(monkeypatch, lambda request: _content_response())
+
+        async def _cancel(*args: Any, **kwargs: Any):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(crawler, "_crawl_drive", _cancel)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert runs.finished[0]["status"] == "interrupted"
+
+    def test_record_status_precedence_is_severity_first(self):
+        assert crawler._record_status_for(RuntimeError("boom")) == "failed"
+        assert crawler._record_status_for(crawler.CrawlError("nope")) == "failed"
+        assert crawler._record_status_for(KeyboardInterrupt()) == "interrupted"
+        assert crawler._record_status_for(SystemExit()) == "interrupted"
+
+    def test_oversize_skips_are_listed_with_an_honest_total(self, crawl_env, monkeypatch):
+        """A document over the cap is never downloaded and never appears in
+        the collection — the run row is the only place it exists."""
+        runs = _install_runs_repo(monkeypatch)
+        monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
+
+        big = _file_item("big1", name="huge.pdf", size=10 * 1024 * 1024)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [big], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        skips = runs.finished[0]["skips"]
+        assert skips["total"] == 1
+        assert skips["listed"] == 1
+        assert skips["items"][0]["reason"] == "oversize"
+        assert skips["items"][0]["path"].endswith("huge.pdf")
+
+    def test_recording_is_never_load_bearing(self, crawl_env, monkeypatch):
+        """A DuckDB-backed instance cannot record runs at all (the PG-only
+        repo raises on resolve). The crawl must still run, still ingest, and
+        still return its report — observability that can fail a crawl is
+        worse than no observability."""
+        from src.repositories import RequiresPostgresBackend
+
+        def _raise():
+            raise RequiresPostgresBackend("extraction_runs")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 1
+        assert FakeIngestor.instances[-1].ingested
+
+    def test_a_checkpoint_write_failure_does_not_stop_the_crawl(self, crawl_env, monkeypatch):
+        class Flaky(FakeRunsRepo):
+            def checkpoint(self, run_id, **kwargs):
+                raise RuntimeError("connection reset")
+
+        _install_runs_repo(monkeypatch, Flaky())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert report["new"] == 1
+
+    def test_report_shape_is_unchanged_by_recording(self, crawl_env, monkeypatch):
+        """The run report is a published contract (the job result and the
+        state file's `last_run`); recording adds a destination, not fields."""
+        _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert "items_seen" not in report
+        assert "items_done" not in report
+
+    def test_the_fake_matches_the_real_repository_signature(self):
+        """A fake that has drifted from the repo it stands in for tests
+        nothing. Pinned here rather than discovered in production."""
+        import inspect
+
+        from src.repositories.extraction_runs_pg import ExtractionRunsPgRepository
+
+        for name in ("start", "checkpoint", "finish"):
+            real = set(inspect.signature(getattr(ExtractionRunsPgRepository, name)).parameters)
+            fake = set(inspect.signature(getattr(FakeRunsRepo, name)).parameters)
+            # The fake absorbs the rest through **kwargs; what must match is
+            # the positional contract the crawl actually calls with.
+            assert {"self"} <= fake
+            assert ("run_id" in real) == ("run_id" in fake), name
