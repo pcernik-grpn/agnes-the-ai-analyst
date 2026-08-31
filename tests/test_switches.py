@@ -214,10 +214,11 @@ class TestDataAppsAllowSameOriginSwitch:
 
 class TestExtractionSwitch:
     """`extraction.enabled` (spec §7.5 / §16 step 7) gates the
-    `corpus-extraction` job kind's handler — locked in the panel because it
-    depends on deployment machinery the settings panel cannot satisfy (a
-    producer bundled into the `worker` image + the `extraction-worker`
-    compose service actually running), same rationale as `data_apps`."""
+    `corpus-extraction` job kind's handler. Editable from `/admin/server-config`
+    (T3: reversing this switch's original deploy-time-only stance) — a
+    deploy-time env var still wins per field ahead of a web save (see
+    `TestExtractionEnvLock` below), so the panel's write path is never
+    silently inert even though the switch itself is no longer locked."""
 
     def test_identity_and_lock(self):
         s = get_switch("extraction")
@@ -225,8 +226,8 @@ class TestExtractionSwitch:
         assert s.env_var == "AGNES_EXTRACTION_ENABLED"
         assert s.kind == "bool"
         assert s.default is False
-        assert s.editable is False
-        assert s.lock_reason.strip()
+        assert s.editable is True
+        assert not s.lock_reason.strip()
 
     def test_handler_gate_reads_the_registry(self, monkeypatch):
         """The `corpus-extraction` handler's enabled-check goes through
