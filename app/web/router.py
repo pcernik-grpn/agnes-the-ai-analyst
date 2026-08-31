@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Optional
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -7516,14 +7516,15 @@ async def admin_data_packages(
     # ── The unpackaged tray — distributable tables no analyst can pull. ──
     # Same fold as the /admin gap card: blank query_mode reads as local,
     # `remote` rows are excluded (they answer server-side without a package).
+    # `internal` rows are packageable now (they carry the seeded `agnes-usage`
+    # package) but their query_mode is `internal`, so this distribution-shaped
+    # tray still passes over them — there is no parquet to pull.
     unpackaged_tables: list[dict] = []
     try:
         packaged_ids: set[str] = set()
         for ids in pkg_repo.list_member_ids_bulk().values():
             packaged_ids.update(ids)
         for t in table_registry_repo().list_all():
-            if (t.get("source_type") or "") == "internal":
-                continue
             if (t.get("query_mode") or "") not in ("", "local", "materialized"):
                 continue
             if t["id"] not in packaged_ids:
@@ -7674,7 +7675,9 @@ async def admin_package_detail(
     # Server-rendered rather than a second fetch: the registry is already read
     # above, and a picker that cannot open because one more request failed is
     # a worse failure than a page that is 30 kB heavier. `internal` rows
-    # (agnes_* bookkeeping tables) are never package material.
+    # (the agnes_* usage tables) ARE package material: they ship in the seeded
+    # `agnes-usage` package, and an admin who wants a different bundle must be
+    # able to see them here.
     #
     # Each row carries what the picker's toolbar filters and sorts ON, because
     # an instance with three hundred registered tables cannot be worked with a
@@ -7694,7 +7697,7 @@ async def admin_package_detail(
 
     candidate_tables = []
     for t in sorted(registry.values(), key=lambda r: (r.get("name") or r["id"]).lower()):
-        if t["id"] in member_set or (t.get("source_type") or "") == "internal":
+        if t["id"] in member_set:
             continue
         st = states.get(t["id"]) or {}
         last = _aware(st.get("last_sync"))

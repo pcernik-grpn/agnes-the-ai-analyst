@@ -1164,10 +1164,22 @@ async def lifespan(app):
     # catalog` on every fresh install. Idempotent — re-applies canonical
     # name + description on every boot so operators can't drift them
     # away from the seed.
+    #
+    # Then seed the `agnes-usage` data package that carries those tables,
+    # so an admin can grant who may query usage data at all. The two run
+    # in this order because the package's table junction has an FK onto
+    # `table_registry`; the returned set is the ids registered for the
+    # FIRST time, which is what makes package membership add-once (a
+    # member an admin removed is never written back). Both are
+    # self-contained and never fatal — see their docstrings.
     try:
-        from connectors.internal.registry import ensure_internal_tables_registered
+        from connectors.internal.registry import (
+            ensure_internal_package_seeded,
+            ensure_internal_tables_registered,
+        )
 
-        ensure_internal_tables_registered()
+        newly_registered_internal = ensure_internal_tables_registered()
+        ensure_internal_package_seeded(newly_registered=newly_registered_internal)
     except Exception:
         logger.exception("internal data-source seed failed; continuing")
 

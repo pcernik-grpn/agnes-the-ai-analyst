@@ -880,6 +880,80 @@ class TestSyncSanitizesTableNames:
         assert report2.updated == 0
         assert set(state2["internal"]) == {"Agnes_audit_log"}
 
+    def test_internal_member_never_reaches_the_manifest(self, server, local_dir, tmp_path, monkeypatch):
+        """The server-side counterpart of the test above.
+
+        Since the ``agnes-usage`` package exists, ``agnes_audit`` IS a package
+        member — and ``_build_data_packages_section`` iterates member rows
+        directly, filtered by neither ``get_accessible_tables`` nor
+        ``sync_state``. Without an explicit filter the internal tables would
+        ride into ``manifest.data_packages[].tables[]`` with an empty hash and
+        ``agnes pull`` would try to materialize every user's audit log, as the
+        test above shows it happily does when handed such a row.
+
+        So: the package is visible to a grantee, and its internal members are
+        not in the manifest — which leaves the CLI with nothing to fetch.
+        """
+        data_dir = tmp_path / "agnes_data"
+        (data_dir / "state").mkdir(parents=True)
+        monkeypatch.setenv("DATA_DIR", str(data_dir))
+        monkeypatch.delenv("STATE_DIR", raising=False)
+
+        from src.db import _ensure_schema, close_system_db, get_system_db
+
+        close_system_db()
+        conn = get_system_db()
+        _ensure_schema(conn)
+        try:
+            from connectors.internal.registry import (
+                USAGE_PACKAGE_SLUG,
+                ensure_internal_package_seeded,
+                ensure_internal_tables_registered,
+            )
+            from src.repositories import data_packages_repo
+            from src.repositories.user_group_members import UserGroupMembersRepository
+            from src.repositories.user_groups import UserGroupsRepository
+            from src.repositories.users import UserRepository
+            from app.api.sync import _build_manifest_for_user
+
+            ensure_internal_package_seeded(newly_registered=ensure_internal_tables_registered())
+            pkg = data_packages_repo().get_by_slug(USAGE_PACKAGE_SLUG)
+            assert pkg is not None
+            assert {t["id"] for t in data_packages_repo().list_tables(pkg["id"])}, "package has internal members"
+
+            UserRepository(conn).create(id="analyst1", email="analyst@example.com", name="Analyst")
+            group = UserGroupsRepository(conn).create(name="UsageGroup", description="", created_by="test")
+            gid = group["id"] if isinstance(group, dict) else group
+            UserGroupMembersRepository(conn).add_member("analyst1", gid, source="test")
+            conn.execute(
+                "INSERT INTO resource_grants(id, group_id, resource_type, resource_id, "
+                "requirement, assigned_at, assigned_by) "
+                "VALUES (?, ?, 'data_package', ?, 'required', CURRENT_TIMESTAMP, 'test')",
+                ["grant-usage-pkg", gid, pkg["id"]],
+            )
+
+            manifest = _build_manifest_for_user(conn, {"id": "analyst1", "email": "analyst@example.com"})
+            sections = [p for p in manifest["data_packages"] if p["slug"] == USAGE_PACKAGE_SLUG]
+            assert sections, "the granted package itself is still surfaced"
+            assert sections[0]["tables"] == [], "no internal member may enter the manifest"
+            assert "agnes_audit" not in manifest["tables"]
+        finally:
+            close_system_db()
+
+        # …and therefore `agnes pull` has nothing to materialize for it.
+        local_data = local_dir / "data"
+        local_data.mkdir(parents=True, exist_ok=True)
+        state, report = sync_data_packages(
+            server_packages=sections,
+            local_data_dir=local_data,
+            prev_state={},
+            fetcher=server.make_fetcher(),
+            md5_of=server.make_md5(),
+        )
+        assert report.added == 0
+        assert server.fetch_calls == []
+        assert not (local_data / USAGE_PACKAGE_SLUG).exists()
+
     def test_one_unnameable_row_does_not_abort_the_rest(self, server, local_dir):
         """A row whose name can't yield any safe segment is skipped, not fatal —
         the remaining tables in the package still sync."""

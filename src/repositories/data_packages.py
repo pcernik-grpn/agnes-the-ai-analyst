@@ -166,9 +166,21 @@ class DataPackagesRepository:
             return None
         return self._decode_row(dict(zip(self._COLS, row)))
 
-    def get_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        row = self.conn.execute("SELECT id FROM data_packages WHERE slug = ?", [slug]).fetchone()
-        return self.get(row[0]) if row else None
+    def get_by_slug(self, slug: str, *, include_deleted: bool = False) -> Optional[Dict[str, Any]]:
+        """Resolve a package by its stable slug. Soft-deleted rows are hidden
+        by default, exactly like :meth:`get`.
+
+        ``include_deleted=True`` is what a *seeder* needs: the slug is UNIQUE
+        across live AND deleted rows, so "no live row" alone cannot tell
+        "never created" from "an admin deleted it" — and re-creating on the
+        latter would resurrect a package the admin deliberately removed.
+        """
+        guard = "" if include_deleted else " AND deleted_at IS NULL"
+        row = self.conn.execute(
+            f"SELECT id FROM data_packages WHERE slug = ?{guard}",
+            [slug],
+        ).fetchone()
+        return self.get(row[0], include_deleted=include_deleted) if row else None
 
     def list(
         self,

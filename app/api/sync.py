@@ -1755,14 +1755,19 @@ def _apply_signed_url(
       server_only ones are deliberately not distributed);
     - the table is not one of the internal row-level-RBAC tables
       (``agnes_sessions`` / ``agnes_telemetry`` / ``agnes_audit`` — see
-      ``connectors.internal.access.is_internal_table``). Those tables are
-      accessible to every user at the table level, but access is scoped
-      per-row via a WHERE clause applied at query time
-      (``src.rbac.get_accessible_tables``, ``connectors/internal/access.py``);
-      a signed URL would serve the *entire* parquet — every user's rows —
-      bypassing that row filter. In practice these tables never reach the
-      sync_state/mirror pipeline today, so this is defense-in-depth against
-      a future change that starts mirroring them;
+      ``connectors.internal.access.is_internal_table``). Access to those is
+      scoped per-row via a WHERE clause applied at query time
+      (``connectors/internal/access.py``); a signed URL would serve the
+      *entire* parquet — every user's rows — bypassing that row filter.
+      **This check is load-bearing, not defense-in-depth.** It was the
+      latter only while internal tables were excluded from every packaging
+      surface; they are package members now (the seeded ``agnes-usage``
+      package), so a member row reaching a manifest builder is a normal
+      state rather than an impossible one. ``_build_data_packages_section``
+      filters them out of the typed section for the same reason — this
+      guard is the second, independent line covering the flat ``tables``
+      dict, and neither may be removed on the assumption that the other
+      makes it unreachable;
     - the table_id is present in *mirror_index* with an md5 that matches
       this entry's own md5 exactly — an absent or stale mirror entry means
       the object either doesn't exist yet or is behind the latest sync, so
@@ -1903,10 +1908,21 @@ def _build_data_packages_section(conn, user, registry_by_name: dict, states_by_t
       as authorized+queryable without fetching its parquet — the same
       listed-but-not-downloaded treatment ``server_only`` already gets
       (#607), reused here rather than inventing a second flag.
+
+    Internal tables (``agnes_sessions`` / ``agnes_telemetry`` /
+    ``agnes_audit``) are skipped. They became package members when the
+    ``agnes-usage`` package was seeded, and this loop reads the junction
+    DIRECTLY — filtered by neither ``get_accessible_tables`` nor
+    ``sync_state`` — so without this skip they would ship as manifest rows
+    with an empty hash and no parquet behind them, and ``agnes pull`` would
+    try to materialize a file that exists only server-side and is row-filtered
+    per caller. The package itself still surfaces (that is what carries the
+    grant); only its internal members are withheld.
     """
     from app.resource_types import ResourceType
     from app.services.stack_resolver import StackResolver
     from app.auth.session_principal import PRINCIPAL_TYPES
+    from connectors.internal.access import is_internal_table
 
     resolver = StackResolver(conn)
     stack_subject = user if isinstance(user, PRINCIPAL_TYPES) else user["id"]
@@ -1925,6 +1941,10 @@ def _build_data_packages_section(conn, user, registry_by_name: dict, states_by_t
         tables_payload: list = []
         total_size_bytes = 0
         for t in table_rows:
+            if is_internal_table(t["id"]):
+                # Not added to `packaged_table_ids` either: that set means
+                # "surfaced via a package", and this one deliberately is not.
+                continue
             packaged_table_ids.add(t["id"])
             # registry_by_name keys on name (unaffected by B1 — `t` is a
             # genuine data_packages junction row, not a sync_state lookup).

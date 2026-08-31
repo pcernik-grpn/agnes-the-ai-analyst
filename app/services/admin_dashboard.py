@@ -290,7 +290,12 @@ def _area_data() -> dict:
         table_registry_repo,
     )
 
-    tables = [t for t in table_registry_repo().list_all() if (t.get("source_type") or "") != "internal"]
+    # `internal` rows (the agnes_* usage tables) are counted like any other
+    # registered table: they are packageable and grantable now, so hiding them
+    # would make this signal disagree with /admin/tables. They are not
+    # distributable (`query_mode='internal'`), so `_is_distributable` still
+    # keeps them out of the `unpackaged` gap count below.
+    tables = table_registry_repo().list_all()
     packages_repo = data_packages_repo()
     member_ids = packages_repo.list_member_ids_bulk()
     packaged: set[str] = set()
