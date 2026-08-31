@@ -20,7 +20,8 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from typing import Any, Callable, MutableMapping
+from collections.abc import Callable, MutableMapping
+from typing import Any
 
 DEFAULT_MAX_OUTPUT_CHARS = 100_000
 MAX_OUTPUT_CHARS_ENV = "AGNES_MCP_MAX_OUTPUT_CHARS"
@@ -107,6 +108,13 @@ def ensure_query_output_size(payload: Any) -> Any:
         "valid": advisory.get("valid"),
         "warnings": warnings[:ADVISORY_KEPT_WARNINGS],
         "locally_executable": advisory.get("locally_executable"),
+        # One small string — keep it even in the shrunk form. Dropping it
+        # here would silently strip the "this is a heuristic, not proof"
+        # disclosure (Issue #1707 finding A18) exactly when payloads are
+        # largest and a caller is least likely to also call
+        # `validate_semantic_query` to see it. Only the full advisory drop
+        # below (rows are the big part) also drops this.
+        "detection": advisory.get("detection"),
         # Say it was cut, so a caller never reads a short list as the whole
         # story.
         "truncated": True,

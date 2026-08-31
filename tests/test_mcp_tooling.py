@@ -161,6 +161,7 @@ class TestEnsureQueryOutputSize:
                 "warnings": [f"w{i} " + "y" * 100 for i in range(warnings)],
                 "violations": [{"name": f"c{i}", "reason": "z" * 200} for i in range(warnings)],
                 "summary": "s" * 400,
+                "detection": "Datasets and metrics were detected by a best-effort text match.",
             },
         }
 
@@ -179,6 +180,18 @@ class TestEnsureQueryOutputSize:
             assert advisory["truncated"] is True
             assert len(advisory["warnings"]) <= 3
             assert "40 warnings total" in advisory["truncated_note"]
+
+    def test_the_detection_note_survives_the_shrink(self, monkeypatch):
+        """The shrunk advisory keeps `detection` — it's one small string, and
+        it's the "this is a heuristic, not proof" disclosure. Only dropping
+        the whole advisory (rows are the big part) should drop it too."""
+        monkeypatch.setenv(MAX_OUTPUT_CHARS_ENV, "4000")
+        rows = [[i, "x" * 40] for i in range(60)]
+        out = ensure_query_output_size(self._payload(rows=rows, warnings=40))
+        advisory = out["semantic_validation"]
+        assert advisory is not None, "this case should shrink, not drop, the advisory"
+        assert advisory["truncated"] is True
+        assert advisory["detection"] == "Datasets and metrics were detected by a best-effort text match."
 
     def test_rows_too_large_on_their_own_still_raise(self, monkeypatch):
         monkeypatch.setenv(MAX_OUTPUT_CHARS_ENV, "2000")

@@ -31,7 +31,7 @@ Expected document shape (fields this module reads; anything else is ignored)::
             {"name": str, "from": <dataset name>, "to": <dataset name>, ...},
             ...
         ],
-        "glossary": [{"term": str, "definition": str, "seeAlso": [...]}, ...],
+        "glossary": [{"term": str, "definition": str, "see_also": [...]}, ...],
         "custom_extensions": [{"vendor_name": str, "data": "<json string>"}, ...],
     }
 
