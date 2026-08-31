@@ -112,8 +112,14 @@ TS=$(date -u +%Y%m%d)
 ROOT=/data/backups/system-duckdb
 DEST=$ROOT/$TS
 mkdir -p "$DEST"
-cp /data/state/system.duckdb "$DEST/system.duckdb"
-[ -f /data/state/system.duckdb.wal ] && cp /data/state/system.duckdb.wal "$DEST/system.duckdb.wal"
+# A Postgres-backend instance may have no system.duckdb at all — born on
+# Postgres, or the frozen post-migration snapshot was retired. Nothing to
+# back up is not a failed backup: skip the copy (and the verify below picks
+# SKIPPED); the pg_dump + restore-canary half still runs.
+if [ -f /data/state/system.duckdb ]; then
+    cp /data/state/system.duckdb "$DEST/system.duckdb"
+    [ -f /data/state/system.duckdb.wal ] && cp /data/state/system.duckdb.wal "$DEST/system.duckdb.wal"
+fi
 # Postgres pg_dump + restore-canary — only when the side-car backend is
 # active; DuckDB-backend and cloud-backend deployments skip this entirely
 # and behave exactly as before. Written into the same $DEST as
@@ -132,7 +138,28 @@ fi
 # inside the app container (where a known-good duckdb is installed).
 chown -R 999:999 "$ROOT"
 
-if docker exec agnes-app-1 python /data/backups/agnes-db-verify.py \
+if [ ! -f "$DEST/system.duckdb" ]; then
+    # No source file was copied above. Whether that is legitimate depends on
+    # the BACKEND, not on the file's absence alone:
+    #
+    #  - Postgres side-car active -> nothing to back up on the DuckDB side
+    #    (born on Postgres, or the frozen post-migration snapshot retired).
+    #    A genuine skip; recorded honestly instead of verifying a file that
+    #    does not exist, which would read FAILED and page every run.
+    #
+    #  - No side-car (DuckDB or cloud backend) -> system.duckdb IS the app
+    #    state, so its absence is the catastrophe this unit exists to catch
+    #    (a deleted file, a broken mount, an unmounted disk). Calling that
+    #    SKIPPED would exit 0 and never fire the webhook, turning the daily
+    #    backup alarm off exactly when it matters.
+    if pg_backend_active; then
+        STATUS=SKIPPED
+    else
+        STATUS=FAILED
+        echo "system.duckdb missing at /data/state/system.duckdb and no Postgres side-car is active" \
+            > "$DEST/verify.log"
+    fi
+elif docker exec agnes-app-1 python /data/backups/agnes-db-verify.py \
         "$DEST/system.duckdb" > "$DEST/verify.log" 2>&1; then
     STATUS=OK
 else
@@ -158,8 +185,13 @@ if { [ "$STATUS" = "FAILED" ] || [ "$PG_STATUS" = "FAILED" ]; } && [ -n "$WEBHOO
         -d "{\"text\": \"$esc\"}" "$WEBHOOK_URL" >/dev/null 2>&1 \
         || logger -t agnes-db-backup "webhook send failed"
 fi
+# SKIPPED counts as success for the exit code: it is the designed outcome
+# for an instance with no DuckDB state, and the systemd unit's failure
+# state should mean "a backup that should exist could not be produced".
 if [ -n "$PG_STATUS" ]; then
-    [ "$STATUS" = "OK" ] && [ "$PG_STATUS" = "OK" ]
+    { [ "$STATUS" = "OK" ] || [ "$STATUS" = "SKIPPED" ]; } && [ "$PG_STATUS" = "OK" ]
 else
+    # No side-car: STATUS can only be OK or FAILED here — the branch above
+    # never records SKIPPED without an active Postgres backend.
     [ "$STATUS" = "OK" ]
 fi

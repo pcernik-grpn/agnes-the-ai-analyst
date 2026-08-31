@@ -59,3 +59,37 @@ async def test_transitive_members_keeps_users_only(monkeypatch):
     monkeypatch.setattr(graph_client, "_http_client", lambda: httpx.AsyncClient(transport=_transport(pages)))
     members = await graph_client.list_group_transitive_members("tok", "g-123")
     assert [m["id"] for m in members] == ["u1"]
+
+
+@pytest.mark.anyio
+async def test_list_item_children_follows_next_link(monkeypatch):
+    pages = {
+        "/drives/d1/items/root-1/children?$skiptoken=p2": {
+            "value": [{"id": "f2", "name": "B", "file": {}}],
+        },
+        "/drives/d1/items/root-1/children": {
+            "value": [{"id": "f1", "name": "A", "folder": {"childCount": 0}}],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/d1/items/root-1/children?$skiptoken=p2",
+        },
+    }
+    monkeypatch.setattr(graph_client, "_http_client", lambda: httpx.AsyncClient(transport=_transport(pages)))
+    items = await graph_client.list_item_children("tok", "d1", "root-1")
+    assert [i["id"] for i in items] == ["f1", "f2"]
+    assert items[0]["is_folder"] is True and items[1]["is_folder"] is False
+
+
+@pytest.mark.anyio
+async def test_list_root_children_follows_next_link(monkeypatch):
+    pages = {
+        "/drives/d1/root/children?$skiptoken=p2": {
+            "value": [{"id": "f2", "name": "B", "file": {}}],
+        },
+        "/drives/d1/root/children": {
+            "value": [{"id": "f1", "name": "A", "folder": {"childCount": 0}}],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/d1/root/children?$skiptoken=p2",
+        },
+    }
+    monkeypatch.setattr(graph_client, "_http_client", lambda: httpx.AsyncClient(transport=_transport(pages)))
+    items = await graph_client.list_root_children("tok", "d1")
+    assert [i["id"] for i in items] == ["f1", "f2"]
+    assert items[0]["is_folder"] is True and items[1]["is_folder"] is False

@@ -121,6 +121,8 @@ class TestFeatureFlagsRegistry:
             "acl_guarantee_mode",
             "acl_max_stale_hours",
             "acl_sweep_interval_days",
+            "acl_sync_interval_hours",
+            "acl_zones",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -335,6 +337,8 @@ class TestServerConfigFeatureFlagsInventory:
             "acl_guarantee_mode",
             "acl_max_stale_hours",
             "acl_sweep_interval_days",
+            "acl_sync_interval_hours",
+            "acl_zones",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"

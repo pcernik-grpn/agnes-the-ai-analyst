@@ -1210,15 +1210,53 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     # -- 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The
     # sweep job itself (connectors/sharepoint/acl_sync.py::run_subtree_sweep)
-    # writes no audit row of its own (state persisted into the connection's
-    # config, no log_safe call) -- only the admin-facing per-subtree
-    # "include anyway" override gets one, since it is a deliberate,
-    # security-relevant decision (spec §3(b)'s should_not-only escape hatch).
+    # originally wrote no audit row of its own (state persisted into the
+    # connection's config, no log_safe call) -- only the admin-facing
+    # per-subtree "include anyway" override got one, since it is a
+    # deliberate, security-relevant decision (spec §3(b)'s should_not-only
+    # escape hatch). The 2026-08-31 plan (sweep v2, Tasks 3/6, below) gave
+    # the sweep job three genuinely new state transitions of its own —
+    # zone creation/dissolution and retroactive content removal — each
+    # security-relevant enough to earn its own audit row.
     "sharepoint_acl.subtree_override": AuditEvent(
         "sharepoint_acl.subtree_override",
         "mutation",
         "An admin overrode a detected broken-inheritance subtree exclusion "
         "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
+    ),
+    # -- 2026-08-31 plan, Tasks 3/6: sweep v2 — permission zones + retroactive
+    # cleanup (connectors/sharepoint/acl_sync.py: _reconcile_zones,
+    # _cleanup_connection_content).
+    "sharepoint_acl.zone_created": AuditEvent(
+        "sharepoint_acl.zone_created",
+        "mutation",
+        "Broken-inheritance subtree promoted to a permission zone with its own collection.",
+    ),
+    "sharepoint_acl.zone_dissolved": AuditEvent(
+        "sharepoint_acl.zone_dissolved",
+        "mutation",
+        "Permission zone dissolved after its folder re-linked inheritance; content re-homes to the parent scope.",
+    ),
+    "sharepoint_acl.content_purged": AuditEvent(
+        "sharepoint_acl.content_purged",
+        "mutation",
+        "Already-ingested content removed because its source subtree/file lost inheritance or a permission zone dissolved.",
+    ),
+    # -- 2026-08-31 plan, Task 5: server-side source-ACL ingest gate
+    # (connectors/sharepoint/ingest_gate.py).
+    "sharepoint_acl.ingest_rejected": AuditEvent(
+        "sharepoint_acl.ingest_rejected",
+        "mutation",
+        "Upload/ingest refused documents under a source-ACL-excluded subtree or a mis-routed permission zone (fail closed).",
+    ),
+    # -- 2026-08-31 plan, Task 8: admin surface for the subtree sweep — the
+    # "re-check subtrees now" trigger, mirroring sync_triggered's own
+    # "handler writes nothing itself; fallback middleware emits this"
+    # posture (src/audit_posture.py).
+    "sharepoint_acl.sweep_triggered": AuditEvent(
+        "sharepoint_acl.sweep_triggered",
+        "mutation",
+        "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
     ),
 }
 
