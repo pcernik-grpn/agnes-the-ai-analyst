@@ -11,8 +11,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- Cover images can be requested as resized WebP variants with ?w=480 or ?w=960 on the upload, marketplace and store photo routes; other widths serve the original. Variants are generated once on first request and cached on disk.
 
 ### Changed
+- The marketplace item page no longer jumps when its content arrives.
+- Grid cover cards now ship a responsive srcset, so phones download a 480-px WebP instead of the full upload; page heroes fetch the 480-px variant directly (their fixed tile size never benefits from a larger one).
+- Flea marketplace plugin and item pages now render the hero cover with the page instead of after a follow-up request, so it starts loading immediately. (The curated shell routes still hydrate the cover via their RBAC-carrying XHR, unchanged.)
+- Cover images on package, memory-domain, marketplace and store pages now declare their size, decode off the main thread and lazy-load below the fold; page heroes are fetched at high priority.
+- Uploaded cover images are now served with a 30-day immutable cache
+  header, so browsers stop re-validating every cover on every page load.
 
 ### Fixed
 
@@ -2278,6 +2285,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Two stale pointers into the retired hero.** `setup_advanced.html` sent readers to `/home § "connect your tools"` for Google Workspace setup — a section that page has never had since the orientation pages were consolidated; it now names the two surfaces that actually do the job (add the plugin from your Library, authorize it under My connections). `tour.js`'s "Connect my AI tools" button justified its destination by pointing at a CTA that no longer exists; the destination was and is right, so only the reason changed.
 
 ### Internal
+- Pillow is now a core dependency: cover-image variants are generated on the server.
+- Fixed the full-suite meta-guard for uploads-mount fetches: it matched the plain substring "seeded_app", which also matches "seeded_app_fresh" -- the very fixture its own failure message recommends -- so any test file using only the fresh fixture still tripped it. Swapped to a regex that excludes the "_fresh" suffix, and moved the three uploads-mount ?w= variant tests into the file that was already all fresh-fixture, so the guard can pass file-by-file.
 
 - **`RequiresPostgresBackend` is read at call time, not at collection time.** `tests/test_requires_postgres_backend.py` matched the exception class and the app's handler by object *identity*, but the backend parity sweeps call `importlib.reload(src.repositories)` (`tests/db_pg/_parity_sweep_util.py`) to re-resolve the factory against the other backend — which rebinds the class, so the symbol imported at collection time is a different object afterwards. `pytest.raises(RequiresPostgresBackend)` then failed to match the exception it had just asked for, and `shared_app.exception_handlers.get(...)` could not find a handler that was still registered and still correct. It only bit when both files landed on the same xdist worker in that order, so it surfaced as an intermittent shard failure rather than a reproducible one. The class is now re-read through the module and the handler matched by name, so the tests say what they mean regardless of who reloaded first.
 

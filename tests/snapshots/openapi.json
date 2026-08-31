@@ -40950,6 +40950,24 @@
             }
           },
           {
+            "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+              "title": "W"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -41247,6 +41265,24 @@
             "schema": {
               "title": "Key",
               "type": "string"
+            }
+          },
+          {
+            "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+              "title": "W"
             }
           },
           {
@@ -50115,6 +50151,24 @@
             "schema": {
               "title": "Entity Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+              "title": "W"
             }
           },
           {

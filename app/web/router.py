@@ -8,7 +8,7 @@ import os
 import secrets
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Final, Optional
 from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
@@ -230,6 +230,42 @@ def _store_display_name(name: str | None) -> str:
 
 
 templates.env.filters["store_display_name"] = _store_display_name
+
+
+_EXTERNAL_URL_PREFIXES: Final = ("http://", "https://", "//", "data:")
+
+
+def has_cover_variant(url: str) -> bool:
+    """True when ``url`` is one of our serving routes and can take a ``?w=`` variant.
+
+    Our own cover-serving routes (the ``/uploads`` static mount, the two
+    curated-marketplace asset routes, the store entity-photo route) are
+    always emitted as relative paths, never absolute or protocol-relative
+    URLs — so an ``http(s)://`` URL, a protocol-relative ``//host/...`` URL
+    (the browser resolves that against the page's own scheme, still a
+    foreign host), or a ``data:`` URL is by definition an external cover
+    with no variant to request. Templates use this to skip emitting
+    ``srcset``/``sizes`` for those (a duplicated URL under two width
+    descriptors would be a lying srcset).
+    """
+    return not url.lower().startswith(_EXTERNAL_URL_PREFIXES)
+
+
+def cover_variant_url(url: str, width: int) -> str:
+    """Point a served cover-image URL at its ``?w=<width>`` WebP variant.
+
+    An external absolute http(s) URL that isn't one of our own serving
+    routes is returned unchanged — it has no variant to request. Every
+    other URL gets the width appended, as ``&w=`` when it already carries
+    a query string (store photo URLs carry ``?v=<version>``).
+    """
+    if not has_cover_variant(url):
+        return url
+    return f"{url}{'&' if '?' in url else '?'}w={width}"
+
+
+templates.env.filters["cover_w"] = cover_variant_url
+templates.env.filters["has_cover_variant"] = has_cover_variant
 
 
 # ---- PostHog template wiring ----
@@ -6310,6 +6346,14 @@ async def marketplace_flea_detail(
         and not entity_has_adverse_verdict(entity.get("id") or "")
     )
 
+    # Hero cover, server-side — same helper the page's own detail XHR
+    # (``flea_detail`` in app/api/marketplace.py) resolves its cover URL
+    # through, so the browser's preload scanner sees the LCP image in the
+    # initial HTML instead of waiting on that follow-up request.
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     # v104 trust strip. `entity_owner_label` resolves the byline the same way
     # the card does (display name → email → username) so the detail page never
     # shows a kebab-case username where the grid showed a real name.
@@ -6343,6 +6387,7 @@ async def marketplace_flea_detail(
         # Where the visitor came from, so the detail page's back link can point
         # home to the right surface (e.g. ?from=skills → the Skill builder).
         from_source=from_source,
+        cover_image_url=cover_image_url,
     )
 
     if entity["type"] == "plugin":
@@ -6483,6 +6528,11 @@ async def marketplace_flea_skill_detail(
     _enforce_visibility(entity, user, conn)
     is_owner = entity.get("owner_user_id") == user.get("id")
     is_admin = is_user_admin(user["id"], conn)
+
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     ctx = _build_context(
         request,
         user=user,
@@ -6494,6 +6544,7 @@ async def marketplace_flea_skill_detail(
         entity=entity,
         is_owner=is_owner,
         is_admin=is_admin,
+        cover_image_url=cover_image_url,
     )
     return templates.TemplateResponse(
         request,
@@ -6526,6 +6577,11 @@ async def marketplace_flea_agent_detail(
     _enforce_visibility(entity, user, conn)
     is_owner = entity.get("owner_user_id") == user.get("id")
     is_admin = is_user_admin(user["id"], conn)
+
+    from app.api.store import entity_cover_url
+
+    cover_image_url = entity_cover_url(entity)
+
     ctx = _build_context(
         request,
         user=user,
@@ -6537,6 +6593,7 @@ async def marketplace_flea_agent_detail(
         entity=entity,
         is_owner=is_owner,
         is_admin=is_admin,
+        cover_image_url=cover_image_url,
     )
     return templates.TemplateResponse(
         request,

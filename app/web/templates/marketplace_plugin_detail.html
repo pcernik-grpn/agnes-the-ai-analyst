@@ -805,6 +805,7 @@
      name_id='hero-name', icon_id='hero-icon', type_label='Plugin',
      trust=(_trust_level if detail.redesign else None), trust_own=is_owner,
      menu=_menu|trim, body_slot=_hero_slot, panel=_hero_panel|trim,
+     cover_image_url=cover_image_url,
      back_href=_back, back_label=_back_label) %}
   {# Three-element install state — see renderInstallState() below. Only one of
      {installBtn} vs {statusPill + removeBtn} is visible at a time. #}
@@ -1081,6 +1082,24 @@
     return String(s ?? '').replace(/[&<>"']/g, ch => (
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   }
+  // JS mirror of app/web/router.py's cover_variant_url/has_cover_variant Jinja
+  // filters — same external-URL rule (an un-mirrored external cover has no
+  // variant, so the inner-card list below must skip srcset/sizes rather
+  // than repeat the same URL under two width descriptors; the hero uses
+  // coverW alone — see its fixed-480 comment). Our own serving routes are
+  // always relative, so any absolute http(s) URL is external — no URL
+  // parsing needed (and none safe: cover_photo_url is often already
+  // relative).
+  function isMirroredCoverUrl(url) {
+    // Absolute (http/https), protocol-relative (//host/...), or data: URLs
+    // are external -- no ?w= variant to request. Mirrors has_cover_variant
+    // in app/web/router.py.
+    return !/^((https?:)?\/\/|data:)/i.test(url);
+  }
+  function coverW(url, w) {
+    if (!isMirroredCoverUrl(url)) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'w=' + w;
+  }
   // Placeholder initials derived from the entity name. Mirrors initialsFor()
   // in marketplace.html: split on any non-alphanumeric separator, take the
   // first letter of the first two words (or first two letters of a single
@@ -1238,11 +1257,20 @@
   // On a 404 (missing internal file or dead external mirror), drop the
   // overlay and revert to the glyph rather than a broken-image icon.
   const iconEl = document.getElementById('hero-icon');
-  if (iconEl && d.cover_photo_url) {
+  if (iconEl && d.cover_photo_url && !iconEl.querySelector('img')) {
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';
-    coverImg.src = d.cover_photo_url;
+    coverImg.fetchPriority = 'high';
+    coverImg.width = 480;
+    coverImg.height = 240;
+    // No srcset: the governing default renders the hero tile at 132x74 CSS
+    // px (macros/_detail.html .detail-hero__icon--cover), 396 device px
+    // even at DPR 3, so the 480 variant is the honest fetch up to DPR 3.6
+    // on its own (the paper theme narrows the tile further, to 108x62,
+    // detail-page.css) — a srcset here only invited a DPR-3 phone to grab
+    // the 960 for zero visible gain.
+    coverImg.src = coverW(d.cover_photo_url, 480);
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
       coverImg.remove();
@@ -1696,8 +1724,11 @@
     // initials from the entity name — same logic as the top-level card grid.
     const cards = items.map(it => {
       const itInitials = deriveInitials(it.name, type);
+      const itMirrored = it.cover_photo_url && isMirroredCoverUrl(it.cover_photo_url);
       const photoMarkup = it.cover_photo_url
-        ? `<div class="photo"><img src="${esc(it.cover_photo_url)}" alt=""
+        ? `<div class="photo"><img src="${esc(coverW(it.cover_photo_url, 480))}" alt="" loading="lazy" decoding="async" width="480" height="240"
+              ${itMirrored ? `srcset="${esc(coverW(it.cover_photo_url, 480))} 480w, ${esc(coverW(it.cover_photo_url, 960))} 960w"
+              sizes="(max-width: 600px) 100vw, 320px"` : ''}
               onerror="this.parentElement.classList.add('photo-failed');
                        this.parentElement.textContent='${itInitials.replace(/'/g, "\\'")}';"></div>`
         : `<div class="photo">${itInitials}</div>`;
