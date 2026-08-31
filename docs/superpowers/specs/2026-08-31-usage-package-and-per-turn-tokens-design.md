@@ -167,12 +167,12 @@ inconsistently surfaced, and in one case simply broken:
 
 ### 4. Cost computed at read time
 
-- A per-model price map (`pricing.models.<model>: {input, output, cache_read,
-  cache_write}`, USD per MTok) in `config/instance.yaml`, with in-code defaults
-  for current provider list prices. One helper module owns the lookup; the chat
-  guardrail's hardcoded constants (`app/chat/manager.py:86-87`, used at `:4505`)
-  migrate onto it. Dashboards render cost computed from stored tokens; nothing
-  persists cost.
+- Cost derives from the built-in per-model price table in `src/llm_pricing.py`
+  (the module the chat spend guardrail already uses), applied to stored tokens
+  at read time. Nothing persists cost, and there is no operator-facing pricing
+  configuration — prices change with releases, in code. (An
+  `instance.yaml` `pricing:` override layer was built and then dropped by
+  explicit product decision, 2026-08-31.)
 
 ### 5. Realtime ingest (event-driven + sweep)
 

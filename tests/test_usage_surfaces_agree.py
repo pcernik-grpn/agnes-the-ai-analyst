@@ -57,7 +57,7 @@ _SESSIONS = [
 EXPECTED = {"input": 107, "output": 211, "cache_read": 313, "cache_creation": 57}
 EXPECTED_TOTAL = sum(EXPECTED.values())
 EXPECTED_COST = cost_usd(
-    MODEL,
+    model=MODEL,
     input_tokens=EXPECTED["input"],
     output_tokens=EXPECTED["output"],
     cache_read_tokens=EXPECTED["cache_read"],

@@ -98,7 +98,7 @@ def price(model: Optional[str], tokens: Dict[str, int]) -> float:
     so every surface prices the same tokens the same way."""
     return round(
         cost_usd(
-            model,
+            model=model,
             input_tokens=tokens["input"],
             output_tokens=tokens["output"],
             cache_read_tokens=tokens["cache_read"],

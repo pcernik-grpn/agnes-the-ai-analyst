@@ -51,7 +51,7 @@ OTHER_TOKENS = {"input": 1000, "output": 2000, "cache_read": 3000, "cache_creati
 EXPECTED = {k: CLI_TOKENS[k] + CHAT_TOKENS[k] for k in CLI_TOKENS}
 EXPECTED_TOTAL = sum(EXPECTED.values())
 EXPECTED_COST = cost_usd(
-    MODEL,
+    model=MODEL,
     input_tokens=EXPECTED["input"],
     output_tokens=EXPECTED["output"],
     cache_read_tokens=EXPECTED["cache_read"],
