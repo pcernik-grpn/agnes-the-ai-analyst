@@ -10,6 +10,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **`/admin/tables` now says when the auto-draft sweep is waiting on you
+  (#1707).** `POST /api/admin/semantic-auto-draft-sweep` runs every 55 minutes,
+  drafts a semantic model for tables with no semantic-layer coverage and files
+  each one in the `authoring_suggestions` moderation queue as the non-admin
+  `semantic-drafter` identity — and nothing on the page about those very tables
+  mentioned it, so the feature worked and was invisible to anyone who did not
+  already know the queue existed. A strip above the table list now states it —
+  "**N** tables await approval of a suggested model" — and links to the queue.
+  Scoped to the drafter's own pending `semantic-layer` rows, so a person's
+  proposal in the same shared queue is never counted as an auto-draft. The
+  link is conditional, not the strip: the queue page redirects home while the
+  Studio surface is off (`studio.enabled`, off by default) and rows filed
+  before it was switched off survive it, so that state announces the count and
+  names the switch rather than offering a door that bounces. An unreadable
+  suggestions store renders no strip instead of failing the page.
 - **The two views of one metric now link to each other (#1707).** The metric
   registry on `/catalog/semantics` (the flat projection) and the semantic
   document browser on `/semantic-layer` render the same metric twice with no
