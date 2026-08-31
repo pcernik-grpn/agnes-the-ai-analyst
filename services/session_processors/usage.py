@@ -16,14 +16,28 @@ from services.session_processors.usage_lib import (
     MarketplaceItemLookup,
     compute_summary,
     iter_events,
+    iter_turn_usage,
 )
 
 from src.repositories import (
     usage_repo,
+    usage_turns_repo,
+    use_pg,
 )
 
 
 logger = logging.getLogger(__name__)
+
+#: One DEBUG line per process when the app-state backend cannot hold turns.
+#: `usage_turns` is PG-only (A3 PG-first ratchet), and the processor runs per
+#: session — logging the skip every time would drown the tick's own output on
+#: a DuckDB instance where the condition is permanent, not an incident.
+_logged_turns_unavailable = False
+
+#: Chat exports. Their turns are written live by the chat manager at message
+#: persist (with cache tokens the export itself does not carry), so emitting
+#: here would mint a second, differently-keyed copy of every one of them.
+_CHAT_SESSION_PREFIX = "chat-"
 
 
 class UsageProcessor:
@@ -102,11 +116,105 @@ class UsageProcessor:
 
         repo = usage_repo()
         n_written = repo.upsert_events(rows, processor_version=USAGE_PROCESSOR_VERSION)
+        # Before the summary write: for a chat session this step is what puts
+        # the cache totals INTO the summary being written.
+        n_turns = self._record_turns(
+            turns,
+            session_key=session_key,
+            session_id=session_id,
+            user_id=user_id,
+            summary=summary,
+        )
         repo.upsert_summary(summary, processor_version=USAGE_PROCESSOR_VERSION)
 
         logger.info(
-            "usage processor: %d events written for session %s",
+            "usage processor: %d events, %d turns written for session %s",
             n_written,
+            n_turns,
             session_key,
         )
         return ProcessorResult(items_count=len(rows))
+
+    def _record_turns(
+        self,
+        turns: list[dict],
+        *,
+        session_key: str,
+        session_id: str,
+        user_id: str | None,
+        summary: dict,
+    ) -> int:
+        """Store one ``usage_turns`` row per assistant turn; return how many
+        were new.
+
+        Three behaviours, in order:
+
+        1. **No Postgres, nothing to do.** ``usage_turns`` is PG-only (A3
+           PG-first ratchet), so on a DuckDB app-state instance the session
+           summary remains the finest grain available. The guard is what keeps
+           ``RequiresPostgresBackend`` from turning a working summary pipeline
+           into a per-session crash.
+        2. **Chat exports emit nothing.** Their turns already exist — written
+           live at message persist, and carrying cache tokens the export
+           itself never had. Instead of duplicating them, the summary being
+           written adopts their cache totals, so ``agnes_sessions`` and
+           ``agnes_turns`` report the same numbers for a chat session.
+        3. **Everything else emits its turns**, idempotently: the unique
+           ``(session_file, turn_uuid)`` key means a re-process of a grown
+           session adds only the turns that are actually new.
+
+        Never raises. A telemetry table that is unreachable (or a schema not
+        yet migrated) must not stop the session summary — the coarser signal
+        every usage surface already depends on — from being written. The next
+        content change, or an operator reprocess, retries the write for free.
+        """
+        global _logged_turns_unavailable
+
+        if not use_pg():
+            if not _logged_turns_unavailable:
+                _logged_turns_unavailable = True
+                logger.debug(
+                    "usage processor: per-turn token rows need the Postgres app-state "
+                    "backend; recording session-grain summaries only"
+                )
+            return 0
+
+        try:
+            repo = usage_turns_repo()
+            basename = session_key.rsplit("/", 1)[-1]
+            if basename.startswith(_CHAT_SESSION_PREFIX):
+                # Look the live rows up by BASENAME, not by session_key: the
+                # chat manager writes its turns as they happen, keyed
+                # `chat-<chat_id>.jsonl`, while this pipeline keys a session by
+                # `<dir_name>/<filename>` because the directory is what carries
+                # the uploading identity. Joining on the pipeline's key would
+                # silently find nothing and leave every chat session reading
+                # zero cache tokens — the exact bug this overlay exists to fix.
+                totals = repo.cache_totals_for_session_file(basename)
+                # Only overlay when live rows exist: an empty result is "no
+                # turns recorded yet", not "this session cached nothing", and
+                # writing its zeros would erase whatever the export carried.
+                if totals["cache_read_tokens"] or totals["cache_creation_tokens"]:
+                    summary["cache_read_tokens"] = totals["cache_read_tokens"]
+                    summary["cache_creation_tokens"] = totals["cache_creation_tokens"]
+                return 0
+
+            rows = [
+                {
+                    **turn,
+                    "session_file": session_key,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "surface": "claude_code",
+                    "processor_version": USAGE_PROCESSOR_VERSION,
+                }
+                for turn in iter_turn_usage(turns)
+            ]
+            return repo.insert_batch(rows)
+        except Exception:
+            logger.warning(
+                "usage processor: could not record per-turn tokens for %s (summary still written)",
+                session_key,
+                exc_info=True,
+            )
+            return 0
