@@ -1974,8 +1974,20 @@
      from `.tab-strip` around them — the same strip People, Access and Data
      use, defined once in components.css. This block used to re-underline the
      pill segmented control page-locally, which is how a fourth copy of one
-     component's styling came to exist. #}
-  <div class="fbar-seg tab-strip lib-tabs" id="lib-tabs" role="radiogroup" aria-label="Library section">
+     component's styling came to exist.
+
+     `.fbar-seg` is NOT on this container, and that is the whole fix: it is
+     the pill control's own CHROME (grey fill, 1px border, 10px radius, 3px
+     padding — filter_toolbar.css), and the strip cannot undo it. Two of the
+     three properties tie on specificity and lose on source order (this page
+     links filter_toolbar.css from `head_extra`, i.e. after components.css),
+     and `border-radius` the strip never sets at all. The result was both
+     looks at once: a bordered grey box with underlined tabs inside it. The
+     container carries the strip alone; only the buttons keep the wire hook,
+     which `.tab-strip .fbar-seg__btn` (two classes) styles as tabs. The
+     segment engine is handed `#lib-tabs` explicitly and queries
+     `.fbar-seg__btn` INSIDE it, so nothing needed the class here. #}
+  <div class="tab-strip lib-tabs" id="lib-tabs" role="radiogroup" aria-label="Library section">
     {% for t in library_tabs %}
     <button type="button" class="fbar-seg__btn{% if t.key == library_active_tab %} is-active{% endif %}"
             data-own="{{ t.key }}" role="radio"
