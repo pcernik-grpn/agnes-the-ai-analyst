@@ -393,6 +393,10 @@ class TestToolRegistration:
             # Triple-surface with POST /api/store/entities/from-markdown +
             # `agnes store publish-md`.
             "store_publish_markdown",
+            # Reading a published document back and writing a new one over
+            # it — the editing pair for what `store_publish_markdown` made.
+            "store_read_markdown",
+            "store_edit_markdown",
             "store_compose_plugin",
             # Maintained digests (K4, #799) — admin CRUD over LLM-regenerated
             # digest documents. Triple-surface with the

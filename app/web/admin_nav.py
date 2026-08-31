@@ -316,14 +316,22 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {
                 "label": "MCP sources",
                 "href": "/admin/mcp-sources",
-                "gloss": "MCP servers whose tools analysts can use",
+                "gloss": "MCP servers whose tools — and apps — analysts can use",
                 "match": ["/admin/mcp-sources", "/admin/mcp-tools"],
             },
+            # Publishing apps is ALSO the last section of the MCP builder, for
+            # the server being connected. This row is the other errand: a
+            # server connected weeks ago, and today's job starting from the app
+            # list rather than from a connection form.
             {
-                "label": "Linked apps",
+                "label": "Publish apps",
                 "href": "/admin/linked-apps",
-                "gloss": "Hosted elsewhere, granted from here",
+                "gloss": "Apps a connected server lists, granted from here",
                 "match": ["/admin/linked-apps"],
+                # Data apps are off by default and the page 404s when they are,
+                # which is the whole reason the retired wizard was an
+                # operator-hostile surface. Gate the row on the same predicate.
+                "when": "can_data_apps",
             },
             # Conditional — the hub is off by default (see the module
             # docstring). `match` stays the bare prefix: Submissions and Store

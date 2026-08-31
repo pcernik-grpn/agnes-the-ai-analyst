@@ -1362,7 +1362,7 @@
         "type": "object"
       },
       "BuilderMessage": {
-        "description": "One turn of the transcript, as the page replays it.",
+        "description": "One turn of the transcript, as the page replays it.\n\n``text`` is TRUNCATED rather than rejected. It used to carry\n``max_length``, which is right for a field the author types and wrong for\none the page replays: a single reply over the cap made every later turn in\nthat conversation 422 \u2014 a conversation with no way out, and the page had\nno idea why. The author's own message is still capped where it is typed\n(``MAX_MESSAGE_CHARS`` on each builder's request model); this cap only\nbounds what the transcript costs to resend.",
         "properties": {
           "role": {
             "maxLength": 16,
@@ -1371,7 +1371,6 @@
           },
           "text": {
             "default": "",
-            "maxLength": 4000,
             "title": "Text",
             "type": "string"
           }
@@ -4138,34 +4137,85 @@
         "type": "object"
       },
       "EntityDraft": {
-        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.",
+        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.\n\nEvery field TRUNCATES rather than rejecting, for the same reason\n``BuilderMessage.text`` does: this is replayed context, not authored\ninput. A body long enough to exceed the cap is legal everywhere else in\nthe product \u2014 the markdown upload takes 512 KB and the store's own\n``skill_md`` is unbounded \u2014 so rejecting it here meant an author could\nwrite something the builder then refused to discuss, with a 422 whose\ntext blamed their last message. The prompt only ever shows a truncated\npanel anyway (see ``panel_prompt_section``).",
         "properties": {
           "body": {
             "default": "",
-            "maxLength": 40000,
             "title": "Body",
             "type": "string"
           },
           "category": {
             "default": "",
-            "maxLength": 120,
             "title": "Category",
             "type": "string"
           },
           "description": {
             "default": "",
-            "maxLength": 4000,
             "title": "Description",
             "type": "string"
           },
           "name": {
             "default": "",
-            "maxLength": 64,
             "title": "Name",
             "type": "string"
           }
         },
         "title": "EntityDraft",
+        "type": "object"
+      },
+      "EntityMarkdownResponse": {
+        "description": "The authored document behind a markdown-first entity, plus the fields\nthe builder edits beside it.",
+        "properties": {
+          "blocked_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocked Reason"
+          },
+          "category": {
+            "default": "",
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "editable": {
+            "default": true,
+            "title": "Editable",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_md": {
+            "title": "Skill Md",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "name",
+          "skill_md"
+        ],
+        "title": "EntityMarkdownResponse",
         "type": "object"
       },
       "EntityRating": {
@@ -11010,6 +11060,47 @@
         "title": "UpdateDataPackageRequest",
         "type": "object"
       },
+      "UpdateFromMarkdownBody": {
+        "description": "The editing sibling of ``CreateFromMarkdownBody``.\n\nDeliberately narrower: type is locked on an edit (``update_entity``\nrefuses a change with 400 ``type_locked``), and access, publisher and the\npre-check token belong to publishing, not to revising.",
+        "properties": {
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_md": {
+            "title": "Skill Md",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "skill_md"
+        ],
+        "title": "UpdateFromMarkdownBody",
+        "type": "object"
+      },
       "UpdateGrantRequirementRequest": {
         "properties": {
           "requirement": {
@@ -12669,7 +12760,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.91.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -13783,6 +13874,65 @@
         ]
       }
     },
+    "/admin/data-packages/{pkg_id}/edit": {
+      "get": {
+        "description": "The same builder page, opened on a package that already exists.\n\nAuthoring one was a workspace and revising it was an overlay on top of\nwhatever page you happened to be on \u2014 the same fields, the same component,\nat two sizes, so the edit read as a smaller and lesser thing than the\ncreate. The drawer keeps the case it was built for (mid-sentence on\n/admin/tables, assigning a table to a package that does not exist yet);\nediting on purpose gets the page.",
+        "operationId": "admin_package_builder_edit_admin_data_packages__pkg_id__edit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pkg_id",
+            "required": true,
+            "schema": {
+              "title": "Pkg Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Package Builder Edit",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/data-sources": {
       "get": {
         "description": "\"Add data source\" wizard (#755): paste a Keboola project's connection\nURL + storage token, validate, then browse buckets/tables and register\nthe ones you want \u2014 no SSH, no config-file edits. Also the home for\nper-project \"Set as default\" and \"Rotate token\" controls \u2014 the single\nplace to manage a Keboola connection end to end.\n\nDistinct from /admin/mcp-sources (MCP tool servers Agnes calls at\nruntime) and from /admin/datasource-credentials (GWS/BQ instance\nsecrets) \u2014 this page owns Keboola project connect/browse/register/\ndefault/rotate. Passes ``vault_key_configured`` so the template can\nrender the same blocking banner as /admin/datasource-credentials when\n``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without\nit).",
@@ -14194,9 +14344,25 @@
     },
     "/admin/linked-apps": {
       "get": {
-        "description": "Guided admin flow for linking externally-hosted (Keboola) data apps:\npick an MCP source \u2192 materialize its data-app lister \u2192 select the ingested\napps and grant them to a group. Wires existing admin APIs (mcp-sources,\nmcp-tools, materialize, data-apps ?kind=linked, access/grants) \u2014 no new\ncontrol-plane surface beyond the page itself.",
+        "description": "Publish apps from a tool server that is already connected.\n\nThe other half of the MCP builder's apps section, and a different errand:\nthere you are connecting a server and its apps are the obvious next move;\nhere the server was connected weeks ago and today's job starts from the\napp list. Routing that through the connection form would ask an admin to\nre-answer questions they answered once.\n\nIt is the same panel in both places (``linked_apps_panel.js``), so \"what\ndoes reading the list write\" cannot have two answers. What the retired\nwizard did wrong is not repeated: the source is CHOSEN from a list rather\nthan detected by elimination, and the empty state hands off to the builder\ninstead of saying \"register one first, then come back\".\n\n``?source=`` preselects a server \u2014 how the builder's \"publish these\nelsewhere\" link and a return trip from connecting one land on the right\nrow instead of an empty picker.",
         "operationId": "admin_linked_apps_page_admin_linked_apps_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -14244,7 +14410,7 @@
     },
     "/admin/linked-apps/new": {
       "get": {
-        "description": "Publish externally-hosted apps into the Library, in the builder shell.\n\n/admin/linked-apps stays as the wizard for now; this is the path the\nLibrary's \"+ Add\" reaches. What it fixes is the two things that made the\nwizard an operator-hostile surface: step 1 asked which MCP source to read\napps from, with a dead end under it (\"Not registered yet? Register one\nfirst, then come back\"), and step 2 asked for a projection map \u2014 which\nresponse field is the app's name, which is its URL.\n\nA projection map is an integration author's artifact. The adapter already\nfalls back to alias guesses (src/data_apps/keboola_adapter.py), so the\nmapping is an escape hatch shown only when a row came back that the aliases\ncould not read, and the source and its lister tool are detected rather than\nchosen.",
+        "description": "The old \"new linked app\" path. There is no separate create step any\nmore \u2014 publishing apps is picking a connected server and reading its list\n\u2014 so this lands on the page that does it.",
         "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
         "parameters": [
           {
@@ -14267,10 +14433,8 @@
         "responses": {
           "200": {
             "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
+              "application/json": {
+                "schema": {}
               }
             },
             "description": "Successful Response"
@@ -14496,6 +14660,65 @@
           }
         },
         "summary": "Admin Mcp Source Detail Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/mcp-sources/{source_id}/edit": {
+      "get": {
+        "description": "The same builder, opened on a source that already exists.\n\nRegistering used to be a builder and revising was a different surface \u2014\nthe detail page's own form \u2014 so the connection, the tool curation and the\ngrants were entered in one vocabulary and changed in another. The detail\npage stays what it is (the operations console: secrets, per-user\nconnections, OAuth registration, classification, materialize); what moved\nhere is the part the builder created, so it is edited where it was made.",
+        "operationId": "admin_mcp_builder_edit_admin_mcp_sources__source_id__edit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Mcp Builder Edit",
         "tags": [
           "web"
         ]
@@ -50058,6 +50281,81 @@
         ]
       }
     },
+    "/api/store/entities/{entity_id}/from-markdown": {
+      "put": {
+        "description": "Revise a markdown-authored entity from its text, as the builder holds it.\n\nThe JSON sibling of ``PUT /entities/{id}``, standing in the same relation\nto it that ``POST /entities/from-markdown`` stands to ``POST /entities``:\nit synthesizes the document into a ZIP and delegates, so versioning,\nguardrails, review, renaming and the block-while-pending rule all apply\nidentically. Nothing about the edit pipeline is reimplemented here.\n\nWhy it has to exist: the builder authors a document, and the only edit\nsurface took a replacement bundle. An author who wanted to change one\nsentence of their own skill had to reconstruct a ``.zip`` by hand.",
+        "operationId": "update_entity_from_markdown_api_store_entities__entity_id__from_markdown_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "title": "Entity Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFromMarkdownBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreEntityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Entity From Markdown",
+        "tags": [
+          "store"
+        ]
+      }
+    },
     "/api/store/entities/{entity_id}/install": {
       "delete": {
         "operationId": "uninstall_entity_api_store_entities__entity_id__install_delete",
@@ -50172,6 +50470,71 @@
           }
         },
         "summary": "Install Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/{entity_id}/markdown": {
+      "get": {
+        "description": "The entity's own markdown, so the builder that wrote it can reopen it.\n\nEditing a saved skill used to mean a different page with a different\nvocabulary that could not touch the body at all: ``/marketplace/flea/\n{id}/edit`` edits metadata and takes a replacement ``.zip``, so the one\nthing the builder authored was the one thing no surface could change.\nReading it back is the missing half of that.\n\nOwner or admin only \u2014 this is the editing path, not a public read, and\nthe 404 mirrors ``_enforce_visibility``'s no-leak refusal rather than\nadmitting the row exists.",
+        "operationId": "get_entity_markdown_api_store_entities__entity_id__markdown_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "title": "Entity Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityMarkdownResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Entity Markdown",
         "tags": [
           "store"
         ]

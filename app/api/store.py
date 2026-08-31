@@ -62,7 +62,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from app.auth.access import is_user_admin, require_admin, required_store_entity_ids
+from app.auth.access import (
+    granted_store_entity_ids,
+    is_user_admin,
+    require_admin,
+    required_store_entity_ids,
+)
 from app.auth.dependencies import _get_db, get_current_user
 from app.services.journey import mark_journey
 from app.instance_config import (
@@ -1543,12 +1548,16 @@ async def list_entities(
     # admins via the existing /admin path. Anyone else only sees approved.
     visibility_filter: Optional[List[str]]
     include_owner_id: Optional[str] = None
+    include_granted: List[str] = []
     is_admin = is_user_admin(user["id"], conn)
     is_self_owner = bool(owner and owner == user["id"])
     if is_admin or is_self_owner:
         visibility_filter = None
     else:
         visibility_filter = ["approved"]
+        # ...and so does a group the entity was granted to: an admin who
+        # shares a private skill with Finance expects Finance to find it.
+        include_granted = sorted(granted_store_entity_ids(user["id"], conn))
         # Owner sees their own non-approved entries in the listing too
         # so they spot what they uploaded that's still under review or
         # quarantined. The card template renders a status badge for
@@ -1584,6 +1593,7 @@ async def list_entities(
         owner_user_id=facet_owner,
         visibility_status=visibility_filter,
         include_owner_id=include_owner_id,
+        include_ids=include_granted,
         publisher_kind=publisher_kind,
         exclude_owner_user_id=exclude_owner_user_id,
         verification_state=verification_states,
@@ -1608,17 +1618,39 @@ async def list_entities(
     )
 
 
+def _is_granted(entity_id: str, user: dict, conn) -> bool:
+    """Whether one of the caller's groups has been granted this entity.
+
+    A ``store_entity`` grant used to be accepted and do nothing: the admin
+    UI wrote the row, the API returned 201, and the group still got 404 on
+    the item, could not see it in a listing, and was refused an install with
+    ``entity_not_approved``. The Required tier built on top of it was worse
+    than nothing — it installed, for every member, something none of them
+    could read.
+
+    So the grant is what it always looked like: private stops meaning "nobody
+    but me" and starts meaning "not everyone".
+    """
+    from app.auth.access import can_access
+    from app.resource_types import ResourceType
+
+    return can_access(user["id"], ResourceType.STORE_ENTITY.value, entity_id, conn)
+
+
 def _enforce_visibility(entity: dict, user: dict, conn) -> None:
     """Refuse asset reads on quarantined entities for non-owner non-admin.
 
     Returns 404 (not 403) so the existence of the entity is not leaked
-    via timing / status-code differences. Owner + admin always pass.
+    via timing / status-code differences. Owner + admin always pass, and so
+    does a group the entity was granted to (see :func:`_is_granted`).
     """
     if entity.get("visibility_status") == "approved":
         return
     if entity.get("owner_user_id") == user.get("id"):
         return
     if is_user_admin(user["id"], conn):
+        return
+    if _is_granted(str(entity.get("id") or ""), user, conn):
         return
     raise HTTPException(status_code=404, detail="entity_not_found")
 
@@ -1640,6 +1672,83 @@ async def get_entity(
         rating=EntityRating(**agg),
         viewer_user_id=user["id"],
         viewer_is_admin=is_user_admin(user["id"], conn),
+    )
+
+
+class EntityMarkdownResponse(BaseModel):
+    """The authored document behind a markdown-first entity, plus the fields
+    the builder edits beside it."""
+
+    id: str
+    type: str
+    name: str
+    description: str = ""
+    category: str = ""
+    skill_md: str
+    editable: bool = True
+    #: Set when a prior version is still under review — the update endpoint
+    #: refuses in that window (409 ``prior_version_pending``), so the builder
+    #: can say so before the author retypes their work.
+    blocked_reason: Optional[str] = None
+
+
+@router.get("/entities/{entity_id}/markdown", response_model=EntityMarkdownResponse)
+async def get_entity_markdown(
+    entity_id: str,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The entity's own markdown, so the builder that wrote it can reopen it.
+
+    Editing a saved skill used to mean a different page with a different
+    vocabulary that could not touch the body at all: ``/marketplace/flea/
+    {id}/edit`` edits metadata and takes a replacement ``.zip``, so the one
+    thing the builder authored was the one thing no surface could change.
+    Reading it back is the missing half of that.
+
+    Owner or admin only — this is the editing path, not a public read, and
+    the 404 mirrors ``_enforce_visibility``'s no-leak refusal rather than
+    admitting the row exists.
+    """
+    entity = store_entities_repo().get(entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="entity_not_found")
+    if entity["owner_user_id"] != user["id"] and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="entity_not_found")
+
+    type_ = str(entity.get("type") or "")
+    plugin_dir = _plugin_dir(entity_id)
+    doc = _find_skill_md(plugin_dir) if type_ == "skill" else _find_agent_md(plugin_dir)
+    if doc is None:
+        # A plugin assembled from a .zip has no single authored document, so
+        # there is nothing for the builder to open. Say which it is rather
+        # than returning an empty body the author would then "edit" into a
+        # replacement for their whole bundle.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_markdown_authored",
+                "message": (
+                    "This entity was published as a bundle, so there is no single document to edit. "
+                    "Upload a new version from its detail page instead."
+                ),
+            },
+        )
+
+    blocked_reason = None
+    latest = store_submissions_repo().latest_for_entity(entity_id)
+    if latest and latest.get("status") in ("pending_inline", "pending_llm"):
+        blocked_reason = "A previous version is still under review. Saving is refused until it resolves."
+
+    return EntityMarkdownResponse(
+        id=str(entity["id"]),
+        type=type_,
+        name=str(entity.get("name") or ""),
+        description=str(entity.get("description") or ""),
+        category=str(entity.get("category") or ""),
+        skill_md=doc.read_text(encoding="utf-8", errors="replace"),
+        editable=blocked_reason is None,
+        blocked_reason=blocked_reason,
     )
 
 
@@ -2376,6 +2485,104 @@ async def create_entity_from_markdown(
     finally:
         _precheck_verdict_ctx.reset(ctx_tok)
     return created
+
+
+class UpdateFromMarkdownBody(BaseModel):
+    """The editing sibling of ``CreateFromMarkdownBody``.
+
+    Deliberately narrower: type is locked on an edit (``update_entity``
+    refuses a change with 400 ``type_locked``), and access, publisher and the
+    pre-check token belong to publishing, not to revising.
+    """
+
+    name: str
+    description: Optional[str] = None
+    category: Optional[str] = None
+    skill_md: str
+
+
+@router.put("/entities/{entity_id}/from-markdown", response_model=StoreEntityResponse)
+async def update_entity_from_markdown(
+    entity_id: str,
+    body: UpdateFromMarkdownBody,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Revise a markdown-authored entity from its text, as the builder holds it.
+
+    The JSON sibling of ``PUT /entities/{id}``, standing in the same relation
+    to it that ``POST /entities/from-markdown`` stands to ``POST /entities``:
+    it synthesizes the document into a ZIP and delegates, so versioning,
+    guardrails, review, renaming and the block-while-pending rule all apply
+    identically. Nothing about the edit pipeline is reimplemented here.
+
+    Why it has to exist: the builder authors a document, and the only edit
+    surface took a replacement bundle. An author who wanted to change one
+    sentence of their own skill had to reconstruct a ``.zip`` by hand.
+    """
+    entity = store_entities_repo().get(entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="entity_not_found")
+    if entity["owner_user_id"] != user["id"] and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="entity_not_found")
+
+    type_ = str(entity.get("type") or "")
+    if type_ not in ("skill", "agent"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_markdown_authored",
+                "message": (
+                    "This entity was published as a bundle, so it cannot be revised from a document. "
+                    "Upload a new version from its detail page instead."
+                ),
+            },
+        )
+
+    name = body.name.strip()
+    if not _NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid_name_format")
+
+    # Same normalization as the create sibling: synthesize frontmatter only
+    # when the author's text does not already carry it, anchored the way
+    # parse_frontmatter anchors.
+    text = body.skill_md.lstrip()
+    if not _FRONTMATTER_RE.match(text):
+        import yaml
+
+        fm = yaml.safe_dump(
+            {"name": name, "description": body.description or ""},
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        text = f"---\n{fm}---\n\n{text}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if type_ == "agent":
+            zf.writestr(f"{name}.md", text)
+        else:
+            zf.writestr(f"{name}/SKILL.md", text)
+    buf.seek(0)
+    upload = UploadFile(file=buf, filename=f"{name}.zip")
+
+    return await update_entity(
+        entity_id,
+        background_tasks,
+        file=upload,
+        name=name,
+        type=None,  # locked server-side; sending it can only earn a 400
+        description=body.description,
+        category=body.category,
+        video_url=None,
+        title=None,
+        tagline=None,
+        photo=None,
+        user=user,
+        conn=conn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4327,6 +4534,15 @@ async def install_entity(
         _status != "approved"
         and not is_own_unflagged_private(entity, user["id"])
         and not is_user_admin(user["id"], conn)
+        # A group the entity was granted to installs it like anyone else. The
+        # same review conditions still apply at the serve chokepoint, which
+        # re-evaluates them on every read — a grant widens who may install,
+        # never what a blocked bundle is allowed to do.
+        and not (
+            _status == "hidden"
+            and _is_granted(entity_id, user, conn)
+            and not _entity_review_blocked(entity_id)
+        )
     ):
         raise HTTPException(status_code=409, detail="entity_not_approved")
     installs = user_store_installs_repo()

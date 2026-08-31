@@ -2734,7 +2734,12 @@ async def library_page(
     except Exception as e:
         _lost("skills, plugins and agent templates", e)
 
-    for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin")):
+    # Agent templates were missing from this tuple, so a published one appeared
+    # in no listing at all — while the error label three lines up, the type
+    # label map, and the builder's own "Open in Library" success action all
+    # said otherwise. The author followed their own success banner to a page
+    # that did not contain their work.
+    for _etype, _type_label in (("skill", "Skill"), ("plugin", "Plugin"), ("agent", "Agent template")):
         try:
             _entities, _total = store_entities_repo().list(
                 type=_etype,
@@ -2811,9 +2816,17 @@ async def library_page(
                     visibility=visibility,
                     visibility_label=visibility_label,
                     meta_text=" · ".join(meta_bits),
-                    # Store visibility, not a group grant — the badge reports the
-                    # model rather than offering a grant nothing would read.
-                    share_type=None,
+                    # The author's OWN item, so the badge is a control. It used
+                    # to be inert here on the grounds that a grant on a store
+                    # entity was read by nothing — true then, false now: a
+                    # granted group can find, open and install a private item.
+                    # An entity already published to everyone has nothing left
+                    # to grant, so only a private one is shareable.
+                    share_type=(
+                        ResourceType.STORE_ENTITY.value
+                        if (s.get("visibility_status") or "") != "approved"
+                        else None
+                    ),
                     tags=[s["category"]] if s.get("category") else [],
                     owner_key=owner_key,
                 )
@@ -3259,13 +3272,22 @@ async def library_page(
     except Exception as e:
         _lost("plugins from your organization", e)
 
-    # Installed AGENTS. Skills and plugins are already covered by the store sweep
-    # above — whether installed or not — so listing them here again would double
-    # every row. Agents are not swept (they have their own surface at /agents),
-    # so an installed one is surfaced here, as it always has been.
+    # Installed AGENT TEMPLATES the sweep did not already list.
+    #
+    # The sweep covers approved entities and the caller's own, of all three
+    # types. This pass exists for the remainder: an entity the caller
+    # installed that the sweep will not show them — someone else's item that
+    # has since been archived, or one shared with them rather than published.
+    # It used to be "agents are never swept", and when they joined the sweep
+    # this loop started listing an installed one a second time. Skipping what
+    # is already on the page is the durable form of that rule: it stays right
+    # whichever types the sweep covers next.
+    _listed_ids = {row.get("id") for row in items}
     try:
         for inst in installed_store.values():
             if (inst.get("type") or "").lower() != "agent":
+                continue
+            if inst["id"] in _listed_ids:
                 continue
             _add_shared_row(
                 item_id=inst["id"],
@@ -3948,16 +3970,37 @@ async def skills_page(
     "submit" CTA, the ``?from=skills`` detail back-link and the tour anchors.
     ``?type=skill|plugin|agent`` deep-links past the picker."""
     from src.store_categories import STORE_CATEGORIES
+    from src.store_naming import sanitize_username
 
     from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
 
+    # The name an author types is not the name their item answers to — the
+    # store appends `-by-<owner>`. /store/new has always shown that; the
+    # builder replaced that page without carrying it over, so the preview
+    # promised a handle the save then changed.
+    try:
+        owner_username = sanitize_username(user.get("email") or "")
+    except ValueError:
+        owner_username = ""
     _guardrails_enabled = get_guardrails_enabled()
     ctx = _build_context(
         request,
         user=user,
         store_categories=list(STORE_CATEGORIES),
+        owner_username=owner_username,
+        # The floors Check and Save actually enforce, so the form can state
+        # them instead of letting the author discover them in a refusal.
+        guardrail=_guardrail_thresholds(),
         guardrails_enabled=_guardrails_enabled,
         guardrails_llm_ready=_guardrails_enabled and get_guardrails_llm_provider_ready(),
+        # Whether the BUILDER's assistant can answer at all — a different
+        # question from the guardrail reviewer's provider above. Resolved
+        # here so the page opens in the right state: it used to find out by
+        # dispatching a turn, which meant greeting the author, taking their
+        # message, and only then withdrawing the offer and discarding what
+        # they wrote. Worse on the edit path, which fires no opening turn, so
+        # the notice waited until they had typed.
+        builder_llm_ready=_builder_llm_ready(),
     )
     return templates.TemplateResponse(request, "skills.html", ctx)
 
@@ -5360,6 +5403,9 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         # Marketplaces, and verification's own switch), so the page was a
         # landing spot for links you can reach directly.
         "can_store_moderation": get_store_moderation_enabled(),
+        # Publishing external apps — off by default, and its page 404s when it
+        # is off, so the row goes with it.
+        "can_data_apps": _data_apps_nav_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -6219,6 +6265,25 @@ async def install_redirect(request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _builder_llm_ready() -> bool:
+    """Whether a builder turn could reach a model, without building a client.
+
+    ``stub_enabled()`` counts as ready: the stub answers every turn, which is
+    what the page needs to know. Never raises — a page must render whatever
+    the config says.
+    """
+    try:
+        from app.api.builder_core import stub_enabled
+
+        if stub_enabled():
+            return True
+        from connectors.llm import llm_configured
+
+        return llm_configured()
+    except Exception:  # noqa: BLE001 - any failure here means "assume not configured"
+        return False
+
+
 def _guardrail_thresholds() -> dict[str, int]:
     """Live admin-configurable thresholds surfaced into the upload UI.
 
@@ -6853,27 +6918,15 @@ async def admin_hub(
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
 
 
-@router.get("/admin/linked-apps/new", response_class=HTMLResponse)
+@router.get("/admin/linked-apps/new")
 async def admin_linked_apps_builder(
     request: Request,
     user: dict = Depends(require_admin),
-):
-    """Publish externally-hosted apps into the Library, in the builder shell.
-
-    /admin/linked-apps stays as the wizard for now; this is the path the
-    Library's "+ Add" reaches. What it fixes is the two things that made the
-    wizard an operator-hostile surface: step 1 asked which MCP source to read
-    apps from, with a dead end under it ("Not registered yet? Register one
-    first, then come back"), and step 2 asked for a projection map — which
-    response field is the app's name, which is its URL.
-
-    A projection map is an integration author's artifact. The adapter already
-    falls back to alias guesses (src/data_apps/keboola_adapter.py), so the
-    mapping is an escape hatch shown only when a row came back that the aliases
-    could not read, and the source and its lister tool are detected rather than
-    chosen.
-    """
-    return templates.TemplateResponse(request, "admin_linked_apps_builder.html", _build_context(request, user=user))
+) -> RedirectResponse:
+    """The old "new linked app" path. There is no separate create step any
+    more — publishing apps is picking a connected server and reading its list
+    — so this lands on the page that does it."""
+    return RedirectResponse("/admin/linked-apps", status_code=302)
 
 
 @router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
@@ -6897,6 +6950,30 @@ async def admin_mcp_builder(
     return templates.TemplateResponse(request, "admin_mcp_builder.html", _build_context(request, user=user))
 
 
+@router.get("/admin/mcp-sources/{source_id}/edit", response_class=HTMLResponse)
+async def admin_mcp_builder_edit(
+    source_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The same builder, opened on a source that already exists.
+
+    Registering used to be a builder and revising was a different surface —
+    the detail page's own form — so the connection, the tool curation and the
+    grants were entered in one vocabulary and changed in another. The detail
+    page stays what it is (the operations console: secrets, per-user
+    connections, OAuth registration, classification, materialize); what moved
+    here is the part the builder created, so it is edited where it was made.
+    """
+    from src.repositories import mcp_sources_repo
+
+    if mcp_sources_repo().get(source_id) is None:
+        raise HTTPException(status_code=404, detail="mcp_source_not_found")
+    ctx = _build_context(request, user=user)
+    ctx["edit_source_id"] = source_id
+    return templates.TemplateResponse(request, "admin_mcp_builder.html", ctx)
+
+
 @router.get("/admin/data-packages/new", response_class=HTMLResponse)
 async def admin_package_builder(
     request: Request,
@@ -6918,6 +6995,30 @@ async def admin_package_builder(
     # theme and the rest of the app chrome. Without it the page renders as a
     # builder floating on nothing.
     return templates.TemplateResponse(request, "admin_package_builder.html", _build_context(request, user=user))
+
+
+@router.get("/admin/data-packages/{pkg_id}/edit", response_class=HTMLResponse)
+async def admin_package_builder_edit(
+    pkg_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The same builder page, opened on a package that already exists.
+
+    Authoring one was a workspace and revising it was an overlay on top of
+    whatever page you happened to be on — the same fields, the same component,
+    at two sizes, so the edit read as a smaller and lesser thing than the
+    create. The drawer keeps the case it was built for (mid-sentence on
+    /admin/tables, assigning a table to a package that does not exist yet);
+    editing on purpose gets the page.
+    """
+    from src.repositories import data_packages_repo
+
+    if data_packages_repo().get(pkg_id) is None:
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+    ctx = _build_context(request, user=user)
+    ctx["edit_pkg_id"] = pkg_id
+    return templates.TemplateResponse(request, "admin_package_builder.html", ctx)
 
 
 @router.get("/admin/data-packages", response_class=HTMLResponse)
@@ -9162,13 +9263,39 @@ async def admin_marketplaces_page(
 async def admin_linked_apps_page(
     request: Request,
     user: dict = Depends(require_admin),
+    source: str | None = None,
 ):
-    """Guided admin flow for linking externally-hosted (Keboola) data apps:
-    pick an MCP source → materialize its data-app lister → select the ingested
-    apps and grant them to a group. Wires existing admin APIs (mcp-sources,
-    mcp-tools, materialize, data-apps ?kind=linked, access/grants) — no new
-    control-plane surface beyond the page itself."""
+    """Publish apps from a tool server that is already connected.
+
+    The other half of the MCP builder's apps section, and a different errand:
+    there you are connecting a server and its apps are the obvious next move;
+    here the server was connected weeks ago and today's job starts from the
+    app list. Routing that through the connection form would ask an admin to
+    re-answer questions they answered once.
+
+    It is the same panel in both places (``linked_apps_panel.js``), so "what
+    does reading the list write" cannot have two answers. What the retired
+    wizard did wrong is not repeated: the source is CHOSEN from a list rather
+    than detected by elimination, and the empty state hands off to the builder
+    instead of saying "register one first, then come back".
+
+    ``?source=`` preselects a server — how the builder's "publish these
+    elsewhere" link and a return trip from connecting one land on the right
+    row instead of an empty picker.
+    """
+    if not _data_apps_nav_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "data_apps_disabled",
+                "message": (
+                    "Linked apps are switched off on this instance. Turn on data_apps.enabled "
+                    "in server config, then come back."
+                ),
+            },
+        )
     ctx = _build_context(request, user=user)
+    ctx["prefer_source_id"] = source
     return templates.TemplateResponse(request, "admin_linked_apps.html", ctx)
 
 

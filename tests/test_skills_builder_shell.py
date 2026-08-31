@@ -202,6 +202,33 @@ class TestTheCreateConversation:
         for key in ("convOpening", "convPlaceholder", "convStarters"):
             assert markup.count(key + ":") == 3, f"{key} is not declared for all three types"
 
+    def test_the_starters_belong_to_the_empty_state_alone(self, markup):
+        """They shipped invisible, and the first fix was too narrow.
+
+        The builder opens the conversation itself, and that turn's model
+        suggestions were assigned over the curated starters — so a first-time
+        author saw three invented scenarios ("Generate a monthly budget
+        variance report") instead of three kinds of skill. Suppressing them on
+        the OPENING turn fixed that screen and left the mirror image: any
+        later turn yielding no usable suggestion put the starters back, so a
+        nearly-finished draft could be offered "How to check a pipeline is
+        healthy" — one click from a fresh brief landing on top of real work.
+
+        The condition is the author, not the turn: starters until they have
+        said something, never after.
+        """
+        chips = re.search(r"chips: (.*?),\n", markup, re.S)
+        assert chips, "the chip selection moved — re-point this guard"
+        assert "startersApply()" in chips.group(1), (
+            "starters must be keyed on whether this is still a blank page"
+        )
+        body = markup
+        assert "function startersApply() { return !authorHasSpoken() && isBlank(); }" in body, (
+            "a RESUMED draft is not a blank page — the transcript is memory-only, so a reload "
+            "makes work-in-progress look like a first visit to anything that asks the conversation"
+        )
+        assert "convStarters" in chips.group(1), "the curated starters are no longer reachable at all"
+
 
 class TestTheLivePreview:
     """Preview means a real session with the thing you are building — for the

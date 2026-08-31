@@ -44,7 +44,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from pydantic import BaseModel, Field
+from fastapi import HTTPException
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +57,26 @@ MAX_MESSAGE_CHARS = 4000
 
 
 class BuilderMessage(BaseModel):
-    """One turn of the transcript, as the page replays it."""
+    """One turn of the transcript, as the page replays it.
+
+    ``text`` is TRUNCATED rather than rejected. It used to carry
+    ``max_length``, which is right for a field the author types and wrong for
+    one the page replays: a single reply over the cap made every later turn in
+    that conversation 422 — a conversation with no way out, and the page had
+    no idea why. The author's own message is still capped where it is typed
+    (``MAX_MESSAGE_CHARS`` on each builder's request model); this cap only
+    bounds what the transcript costs to resend.
+    """
 
     role: str = Field(max_length=16)
-    text: str = Field(default="", max_length=MAX_MESSAGE_CHARS)
+    text: str = Field(default="")
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _clip(cls, v: Any) -> Any:
+        if isinstance(v, str) and len(v) > MAX_MESSAGE_CHARS:
+            return v[:MAX_MESSAGE_CHARS]
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +359,66 @@ def merged_draft(draft: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]
     out = dict(draft)
     out.update(patch or {})
     return out
+
+
+#: How many characters of a provider's own error text reach the page. Enough
+#: for "model X is not enabled for project Y" to arrive whole; short enough
+#: that a provider that answers with a wall of JSON can't fill the panel.
+MAX_PROVIDER_DETAIL_CHARS = 400
+
+
+def turn_failure(exc: Exception, *, label: str) -> HTTPException:
+    """The HTTPException a builder turn raises when the model call failed.
+
+    One shape for all four builders, and — the point of this function —
+    one that NAMES the failure. Every distinguishable cause used to arrive
+    as "The assistant could not answer. Try again.", which is wrong advice
+    for three of the four: a rejected credential, an unavailable model and
+    a refused request shape do not get better on a retry, and an operator
+    reading that sentence has no idea which of them they are looking at.
+
+    The provider's own words ride along in ``detail``. They are operator-
+    facing diagnostics, not secrets: the SDK's error text carries status,
+    message and request id — never the API key, which never leaves the
+    client. It is length-capped all the same.
+    """
+    from connectors.llm.exceptions import (
+        LLMAuthError,
+        LLMModelNotFoundError,
+        LLMRateLimitError,
+        LLMTimeoutError,
+        LLMUnsupportedError,
+    )
+
+    detail = str(exc)[:MAX_PROVIDER_DETAIL_CHARS]
+    if isinstance(exc, LLMAuthError):
+        kind, hint = (
+            "builder_llm_credential_rejected",
+            "The AI provider rejected this instance's credential. An admin needs to check it — retrying will not help.",
+        )
+    elif isinstance(exc, LLMModelNotFoundError):
+        kind, hint = (
+            "builder_llm_model_unavailable",
+            "The AI model this instance is configured for is not available from its provider. "
+            "An admin needs to change it — retrying will not help.",
+        )
+    elif isinstance(exc, LLMRateLimitError):
+        kind, hint = (
+            "builder_llm_rate_limited",
+            "The AI provider is rate-limiting this instance. Wait a moment and try again.",
+        )
+    elif isinstance(exc, LLMTimeoutError):
+        kind, hint = (
+            "builder_llm_unreachable",
+            "The AI provider did not answer in time. Try again.",
+        )
+    elif isinstance(exc, LLMUnsupportedError):
+        kind, hint = (
+            "builder_llm_request_refused",
+            "The AI provider refused this request. An admin needs to look at the instance's model configuration.",
+        )
+    else:
+        kind, hint = ("builder_turn_failed", "The assistant could not answer. Try again.")
+
+    logger.warning("%s: turn failed (%s): %s", label, kind, exc)
+    return HTTPException(status_code=502, detail={"kind": kind, "hint": hint, "detail": detail})

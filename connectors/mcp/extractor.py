@@ -889,4 +889,15 @@ async def introspect_source_async(
     from connectors.mcp.client import list_tools_async  # local import keeps duckdb-free
 
     tools = await list_tools_async(source, caller_user_id=caller_user_id)
-    return [{"name": t.name, "description": t.description, "input_schema": t.input_schema} for t in tools]
+    # `read_only` rides along: the builder maps it onto `tool_registry.mutating`,
+    # and dropping it here is what made every tool the builder registers look
+    # non-mutating — including the ones that delete things upstream.
+    return [
+        {
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.input_schema,
+            "read_only": t.read_only,
+        }
+        for t in tools
+    ]

@@ -134,19 +134,29 @@ def test_your_own_unpublished_skill_is_yours_alone(seeded_app):
     assert "My Draft Skill" not in theirs
 
 
-def test_plugins_are_swept_too_and_agents_are_not(seeded_app):
-    """Skills and plugins are listed whether or not they are installed. Agents
-    keep their own surface at /agents, so an approved one is not swept."""
+def test_all_three_published_types_are_swept(seeded_app):
+    """Skills, plugins AND agent templates are listed whether or not they are
+    installed.
+
+    Agent templates used to be excluded from the sweep, which contradicted two
+    things the product already said: the builder publishes them into "your
+    Library" and offers "Open in Library" on success, and the error beside
+    that listing named them among what it shows. So an author followed their
+    own success banner to a page that did not contain their work. (The live
+    /agents surface is a different thing — an agent PROFILE is not a published
+    template.)
+    """
     _entity(owner="admin", owner_name="admin", etype="plugin", name="Shared Plugin", status="approved")
     _entity(owner="admin", owner_name="admin", etype="agent", name="Shared Agent", status="approved")
 
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     assert _row(text, "Shared Plugin"), "an approved plugin is missing from the Library"
-    assert "Shared Agent" not in text
+    assert _row(text, "Shared Agent"), "an approved agent template is missing from the Library"
 
 
-def test_installed_agent_still_lists(seeded_app):
-    """The one way an agent reaches the Library: the caller installed it."""
+def test_installed_agent_lists_once(seeded_app):
+    """Installed or not, it appears — and only once: the sweep and the
+    installed-items pass must not both list it."""
     eid = _entity(owner="admin", owner_name="admin", etype="agent", name="Installed Agent", status="approved")
     _install(eid, "analyst1")
 
@@ -154,6 +164,7 @@ def test_installed_agent_still_lists(seeded_app):
     row = _row(text, "Installed Agent")
     assert row, "an installed agent is missing from the Library"
     assert 'data-type="agent"' in row
+    assert text.count('data-title="Installed Agent"') == 1
 
 
 def test_an_entity_is_listed_exactly_once_when_installed(seeded_app):

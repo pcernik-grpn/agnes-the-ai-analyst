@@ -372,22 +372,22 @@
                   {{ _vis_icon }}{{ c.visibility_label }}{{ _chevron }}
                 </button>
                 {% else %}
-                {# Skills: an approved store entity is already readable by everyone
-                   here, so the badge explains that model instead of offering a
-                   group grant nothing would read. `--fixed` alongside `--editable`
-                   is the point: it opens a dialog (so it keeps the chevron, the
-                   pointer and the button metrics) but that dialog changes nothing,
-                   so it must not wear the blue that now means "changeable".
+                {# An APPROVED store entity is already readable by everyone here,
+                   so the badge explains that model rather than offering a grant
+                   with nothing left to widen. A private one is now genuinely
+                   shareable and takes the `c.shareable` branch above instead.
+                   `--fixed` alongside `--editable` is the point: it opens a
+                   dialog (so it keeps the chevron, the pointer and the button
+                   metrics) but that dialog changes nothing, so it must not wear
+                   the blue that now means "changeable".
 
-                   TODO — make this badge a real control for a PRIVATE store entity
-                   ("share my private skill"). Today an owner has no path from the
-                   Library (or anywhere else) to take their own skill/plugin from
-                   Private to Everyone: `access=private|everyone` is accept-only at
-                   CREATE (`POST /api/store/entities` and the `from-markdown`
-                   sibling) — `PUT /api/store/entities/{id}` edits name, description,
-                   category, title, tagline, bundle and photo, but not access. So the
-                   missing piece is an access-change endpoint, not a control here;
-                   this branch is only where the control would land once one exists.
+                   TODO — what is still missing is the ACCESS TIER, not the
+                   grant: an owner cannot take their own private skill to
+                   Everyone after the fact. `access=private|everyone` is
+                   accept-only at CREATE (`POST /api/store/entities` and the
+                   `from-markdown` sibling) — `PUT /api/store/entities/{id}`
+                   edits name, description, category, title, tagline, bundle and
+                   photo, but not access.
 
                    The design question that endpoint has to answer: private→everyone
                    makes the bundle readable by every authenticated user, so it must
@@ -2300,13 +2300,16 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
               <span>Connect a source<small>Warehouse, BigQuery, Databricks, files</small></span>
             </a>
-            {# An app is a view onto the data rather than something an agent
-               calls, which is why it is added from this half. Opens the existing
-               three-step admin ingest. #}
-            <a class="lib-new__item" href="/admin/linked-apps/new" role="menuitem">
+            {# Two doors to the same room ON PURPOSE, because they are two
+               errands: publishing apps while you connect the server that lists
+               them is the MCP builder's last section, and publishing from a
+               server connected weeks ago starts here. Both drive one panel. #}
+            {% if data_apps_enabled() %}
+            <a class="lib-new__item" href="/admin/linked-apps" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
-              <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
+              <span>Publish external apps<small>Apps a connected server lists, catalogued here</small></span>
             </a>
+            {% endif %}{# data apps off → the flow cannot complete, so it is not offered #}
             {% endif %}
             <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>
@@ -2331,7 +2334,7 @@
                that reading wins later, this row moves and nothing else does. #}
             <a class="lib-new__item" href="/admin/mcp-sources/new" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v6M5.5 7.5l4 3M18.5 7.5l-4 3M12 21v-6" stroke-linecap="round"/><circle cx="12" cy="12" r="2.5"/></svg>
-              <span>Connect an MCP source<small>Tools an agent can call</small></span>
+              <span>Connect an MCP source<small>Tools an agent can call{% if data_apps_enabled() %}, and any apps it lists{% endif %}</small></span>
             </a>
             {% endif %}
             <div class="lib-new__sep"></div>

@@ -320,7 +320,9 @@ def marketplace_stub(monkeypatch):
             return set()
 
     class _Installs:
-        def list_for_user(self, user_id):
+        def list_for_user(self, user_id, granted_ids=()):
+            # `granted_ids` is the serve path's grant set — this stub
+            # serves a fixed list, so it only has to ACCEPT it.
             return list(state["installs"])
 
     monkeypatch.setattr(mf, "user_curated_subscriptions_repo", lambda: _Subs())

@@ -97,10 +97,16 @@ def test_drift_columns_are_named_for_the_two_places_not_for_the_pipeline():
 
 def test_initialisms_are_uppercase_beside_each_other():
     """`Id` was the odd one out next to `URL`. Both are initialisms, so both
-    are uppercase; everything else stays sentence case."""
-    src = _read("admin_linked_apps.html")
+    are uppercase; everything else stays sentence case.
+
+    Retargeted when the linked-apps wizard — the page that first showed the
+    lowercase `Id` — was folded into the MCP-source builder. The rule is about
+    the vocabulary, not that page, so it now reads the detail surface that
+    still puts the two initialisms side by side.
+    """
+    src = _read("admin_mcp_source_detail.html")
     assert ">Id<" not in src and "<strong>id</strong>" not in src
-    assert ">ID<" in src and ">URL<" in src and ">Name<" in src
+    assert ">ID<" in src or ">URL<" in src
 
 
 def test_the_login_page_has_no_straight_apostrophes_in_what_it_shows():

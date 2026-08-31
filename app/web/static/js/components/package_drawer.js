@@ -178,7 +178,7 @@
       '        <p class="ds-drawer__hint" id="pdw-tables-reach" hidden></p>' +
       '      </div>' +
       '      <details class="ds-drawer__disclose" id="pdw-access">' +
-      '        <summary>Who gets it <span class="ds-drawer__opt">(optional)</span></summary>' +
+      '        <summary>Access <span class="ds-drawer__opt">— nobody until you add a group</span></summary>' +
       '        <p class="ds-drawer__hint" style="margin:8px 0 12px;">' +
       '          <strong>Optional</strong> shows the package in that group’s Library for members to add;' +
       '          <strong>Automatic</strong> puts it in their workspace on the next sync.' +
@@ -208,7 +208,7 @@
       '  <div class="ds-drawer__foot">' +
       '    <span class="ds-drawer__foot-gap"></span>' +
       '    <button type="button" class="btn btn-secondary" data-pdw-close>Cancel</button>' +
-      '    <button type="button" class="btn btn-primary" id="pdw-submit">Create package</button>' +
+      '    <button type="button" class="cc-btn cc-btn--primary" id="pdw-submit">Create package</button>' +
       '  </div>' +
       '</div>';
     document.body.appendChild(root);
@@ -255,11 +255,13 @@
     // an already-open form left the slug empty and the create silently
     // bounced on a required field.)
     els.name.addEventListener('input', function () {
+      syncSubmitGate();   // the gate answers to typing, not only to opening
       if (!st || st.slugTouched) return;
       els.slug.value = slugify(els.name.value);
     });
     els.slug.addEventListener('input', function () {
       if (st) st.slugTouched = true;
+      syncSubmitGate();
     });
     els.name.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); els.submit.click(); }
@@ -726,6 +728,33 @@
      keeps working untouched. */
   var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [], convEngine = null;
 
+  /* Has the author said anything in this transcript? The opening turn is the
+     builder talking to itself, so it does not count. */
+  var llmUnavailable = false;  // latched once a turn says this instance has no model
+
+  function authorHasSpoken() {
+    return conv.some(function (m) { return m.role === 'user'; });
+  }
+  /* Create used to render enabled from the moment the drawer opened and refuse
+     on submit — "A name is required" AFTER the click. The gate is the same
+     predicate the submit handler checks, so the button and the refusal cannot
+     disagree, and it says what it wants while it is dark. */
+  function submitBlocker() {
+    if (!els || !els.name) return '';
+    var name = (els.name.value || '').trim();
+    if (!name) return 'Add a name first — the slug derives from it.';
+    if (!((els.slug.value || '').trim() || slugify(name))) {
+      return 'That name has no URL-safe characters — give the slug a value.';
+    }
+    return '';
+  }
+  function syncSubmitGate() {
+    if (!els || !els.submit) return;
+    var why = submitBlocker();
+    els.submit.disabled = !!why;
+    if (why) els.submit.setAttribute('title', why); else els.submit.removeAttribute('title');
+  }
+
   function enterBuilderLayout() {
     if (!els || els.root.classList.contains('is-builder-built')) return;
     els.root.classList.add('is-builder-built');
@@ -752,7 +781,7 @@
     var work = document.createElement('div');
     work.innerHTML = BuilderShell.workspace({
       left: '<div class="pdw-conv" id="pdw-conv"></div>',
-      cfgTitle: 'Package',
+      cfgTitle: 'Configuration',
       cfgSub: 'what it carries and who gets it, editable by hand',
       cfgBodyId: 'pdw-cfg',
     });
@@ -781,17 +810,43 @@
       // The engine, named. Every turn reports it and this builder used to
       // discard it — see BuilderShell.engineNotice for why that is worse than
       // not having the badge at all.
-      BuilderShell.engineNotice(convEngine) +
+      (llmUnavailable
+        ? BuilderShell.noModelNotice('form on the right')
+        : BuilderShell.engineNotice(convEngine)) +
+      /* What a data package IS. The sentence existed — in the drawer header,
+         which builder.css hides in builder mode, so the full-page builder
+         (the one the Library's "+ Add" reaches) explained least. */
+      '<p class="ag-cfg-blurb pdw-blurb">A data package is how governed tables reach an analyst. Tables are ' +
+      'registered on this instance but reach nobody on their own: a package bundles them, you grant the package ' +
+      'to a group, and its members pull those tables to their laptop. ' +
+      // Name the button that is actually on screen. In edit mode it reads
+      // "Save changes", and telling the admin to press Create was the page
+      // describing a different page.
+      (st && st.mode === 'edit'
+        ? 'Nothing is written until you press Save changes.'
+        : 'Nothing is written until you press Create.') + '</p>' +
       BuilderShell.conversation({
         id: 'pdw-conv-scroll',
-        rows: [{ role: 'assistant', text: OPENING }].concat(conv),
+        // With no model the opening line promises drafting that cannot happen.
+        rows: llmUnavailable ? conv : [{ role: 'assistant', text: opening() }].concat(conv),
         busy: convBusy,
-        err: convErr,
+        err: llmUnavailable ? null : convErr,
       }) +
       BuilderShell.composer({
         kind: 'create', value: convDraft, busy: convBusy,
-        placeholder: 'Describe the package you need…',
-        chips: convBusy ? [] : (convChips.length ? convChips : STARTERS),
+        readOnly: llmUnavailable,
+        placeholder: llmUnavailable
+          ? 'No AI is configured here — fill the form on the right by hand.'
+          : ((st && st.mode === 'edit') ? 'Tell me what should change…' : 'Describe the package you need…'),
+        /* Starters belong to the empty state. Keying on "no chips from the
+           last turn" put them back mid-conversation, so a nearly-finished
+           package could be offered a fresh-start brief — one click from
+           landing on top of real work. */
+        chips: (convBusy || llmUnavailable) ? []
+          : (convChips.length ? convChips
+             // Starters describe a package that does not exist yet. On an
+             // edit they would offer to start over on top of real work.
+             : ((authorHasSpoken() || (st && st.mode === 'edit')) ? [] : STARTERS)),
       });
     var el = els.convHost.querySelector('#pdw-conv-scroll');
     if (el) el.scrollTop = el.scrollHeight;
@@ -799,6 +854,9 @@
 
   var OPENING = 'Tell me what this package should carry and who it is for. ' +
     'I will propose the tables and the groups — you review the access before anything is written.';
+  var OPENING_EDIT = 'This package already exists. Tell me what should change about what it carries or ' +
+    'who gets it — I will propose it, and nothing is written until you save.';
+  function opening() { return (st && st.mode === 'edit') ? OPENING_EDIT : OPENING; }
   var STARTERS = ['Our sales pipeline tables', 'Everything finance needs for invoicing', 'Which tables are not in a package yet?'];
 
   /* One turn. Proposes into the drawer; writes nothing. The reply is inserted
@@ -808,9 +866,15 @@
     conv = conv.concat([{ role: 'user', text: text }]);
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
     renderConv();
-    api(PKG_API + '/builder/turn', {
-      method: 'POST',
-      body: JSON.stringify({
+    /* Through the shell: the message cap, the history trim, the 60s deadline
+       and the typed failure are the same ones every other builder gets. This
+       page had none of them — an over-long paste earned a validation error
+       rendered as "The assistant could not answer", and its own typed
+       failures were discarded by a reader that only understood strings. */
+    BuilderShell.turn({
+      url: PKG_API + '/builder/turn',
+      message: text,
+      body: {
         message: text,
         history: conv.slice(0, -1),
         draft: {
@@ -823,15 +887,23 @@
           // kept re-proposing ones the admin had already accepted.
           groups: chosenGrants().map(function (g) { return g.group_id; }),
         },
-      }),
+      },
     }).then(function (body) {
-      conv = conv.concat([{ role: 'assistant', text: body.reply || '' }]);
+      conv = conv.concat([{ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') }]);
+      conv = BuilderShell.trimHistory(conv);
       convEngine = body.engine || null;
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
       applyPatch(body.patch || {});
     }).catch(function (err) {
       console.error('package drawer: turn failed', err);
+      if (err.kind === 'llm_unavailable') llmUnavailable = true;
       convErr = (err && err.message) || 'The assistant could not answer.';
+      // Hand the message back — it was cleared optimistically and existed
+      // nowhere the admin could retrieve it.
+      if (text) {
+        convDraft = text;
+        if (conv.length && conv[conv.length - 1].role === 'user') conv = conv.slice(0, -1);
+      }
     }).finally(function () {
       convBusy = false;
       renderConv();
@@ -841,11 +913,16 @@
   /* Merge a proposal into the form. Nothing is saved — Create still writes,
      and the admin sees the tables and the access matrix first. */
   function applyPatch(patch) {
-    if (typeof patch.name === 'string' && patch.name) {
+    /* A field the author is typing in belongs to them — the same rule /skills
+       applies to its whole panel. Writing over a focused input took their
+       caret and, for name and description, their words. */
+    function mine(el) { return document.activeElement === el; }
+    if (typeof patch.name === 'string' && patch.name && !mine(els.name)) {
       els.name.value = patch.name;
       if (!st.slugTouched) els.slug.value = slugify(patch.name);
+      syncSubmitGate();
     }
-    if (typeof patch.description === 'string') els.desc.value = patch.description;
+    if (typeof patch.description === 'string' && !mine(els.desc)) els.desc.value = patch.description;
     if (Array.isArray(patch.tables)) {
       patch.tables.forEach(function (id) { st.tablesSelected.add(id); });
       renderTables();
@@ -931,7 +1008,7 @@
     els.access.open = false;
     els.groups.innerHTML = '';
     els.err.hidden = true;
-    els.submit.disabled = false;
+    syncSubmitGate();
     applyMode(mode);
 
     /* PAGE MODE. Given a `mount`, this stops being an overlay: the panel is
@@ -1318,6 +1395,23 @@
         var host = st && st.chipHost;
         var done = (st && st.onCreated) || function () {};
         if (host && host.addChip) host.addChip({ id: pkg.id, name: pkg.name });
+        /* Report a partial failure HERE, before closing, rather than trusting
+           three hosts to remember. One of them did; the other two discarded
+           both counts and redirected, so the admin ticked two groups, saw a
+           page change, and walked away believing they had granted access.
+           The drawer stays open on a partial failure — there is nothing to
+           celebrate and the numbers are the whole message. */
+        if (failures || tableFailures) {
+          var parts = [];
+          if (failures) parts.push(failures + ' group' + (failures > 1 ? 's were' : ' was') + ' not granted');
+          if (tableFailures) parts.push(tableFailures + ' table' + (tableFailures > 1 ? 's were' : ' was') + ' not added');
+          els.submit.textContent = st.mode === 'edit' ? 'Save changes' : 'Create package';
+          els.submit.disabled = false;
+          fail('“' + pkg.name + '” was created, but ' + parts.join(' and ') +
+               '. Fix that on the package’s page — creating it again would only make a duplicate.');
+          try { done(pkg, failures, tableFailures); } catch (_) { /* the caller's problem */ }
+          return;
+        }
         close();
         // The package exists by now, so a caller's own error must not be
         // reported as a failed create on a drawer that has already closed.
