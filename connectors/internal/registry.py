@@ -45,6 +45,41 @@ USAGE_PACKAGE_DESCRIPTION = (
     "telemetry, and the audit trail of actions performed against this "
     "instance. Members see only their own rows; admins see everything."
 )
+# The guidance fields below are what the catalog UI and any LLM (chat agent,
+# local Claude Code) read to decide WHEN and HOW to use these tables — keep
+# them accurate over decorative. Server-side only is the load-bearing fact:
+# these tables never enter `agnes pull` manifests.
+USAGE_PACKAGE_LONG_DESCRIPTION = (
+    "Self-service usage analytics over your own Agnes activity. Four tables: "
+    "`agnes_sessions` (one row per Claude Code or chat session — activity "
+    "counters plus summed input/output/cache tokens), `agnes_turns` (one row "
+    "per assistant turn with exact token usage incl. prompt cache; "
+    "Postgres-backed instances only), `agnes_telemetry` (one row per "
+    "tool/skill/sub-agent/MCP event), and `agnes_audit` (server-side audit "
+    "trail of your actions). Every table is filtered to YOUR rows — admins "
+    "see everyone. All tables are server-side only: query them with "
+    '`agnes query "SELECT …"` (auto-routes to the server); they never '
+    "appear in `agnes pull` and have no local parquet. New activity is "
+    "visible within seconds of a session upload or chat turn."
+)
+USAGE_PACKAGE_WHEN_TO_USE = [
+    "Analyzing your own token spend — by day, model, session, or turn",
+    "Understanding prompt-cache efficiency (cache_read vs fresh input tokens)",
+    "Auditing which tools, skills and MCP servers you actually use, and which fail",
+    "Reviewing your own action history on this instance (agnes_audit)",
+]
+USAGE_PACKAGE_WHEN_NOT_TO_USE = [
+    "Team- or instance-wide reporting — you only see your own rows; admins use /admin/telemetry and /admin/adoption",
+    "Local analysis of these tables via `agnes pull` — they are server-side only; use `agnes query` instead",
+    "Reading conversation content — transcripts are admin-only; these tables hold metadata and token counts",
+]
+USAGE_PACKAGE_EXAMPLE_QUESTIONS = [
+    "How many tokens did I spend this week, split by model?",
+    "Which of my sessions used the most output tokens this month?",
+    "What share of my input tokens was served from the prompt cache?",
+    "Which tools error most often in my sessions?",
+]
+USAGE_PACKAGE_TAGS = ["usage", "tokens", "telemetry", "audit"]
 
 
 def internal_table_available(table_id: str) -> bool:
@@ -254,6 +289,11 @@ def _create_usage_package(repo) -> Optional[str]:
                 created_by="system_seed",
                 status="prod",
                 publisher_kind="organization",
+                long_description=USAGE_PACKAGE_LONG_DESCRIPTION,
+                when_to_use=USAGE_PACKAGE_WHEN_TO_USE,
+                when_not_to_use=USAGE_PACKAGE_WHEN_NOT_TO_USE,
+                example_questions=USAGE_PACKAGE_EXAMPLE_QUESTIONS,
+                tags=USAGE_PACKAGE_TAGS,
             )
         )
     except Exception:

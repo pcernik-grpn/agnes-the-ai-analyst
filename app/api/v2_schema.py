@@ -298,17 +298,28 @@ def build_schema_uncached(
         # parquet/BQ paths the other branches use. Delegate to the
         # connector's own introspector so /api/v2/schema/agnes_sessions
         # returns the same shape as /api/v2/schema/<keboola-table>.
+        from connectors.internal.access import INTERNAL_TABLES_BY_ID
         from connectors.internal.access import get_schema as _get_internal_schema
         from src.db import _get_state_dir
 
         system_db_path = str(_get_state_dir() / "system.duckdb")
         cols = _get_internal_schema(system_db_path, table_id)
+        # Column descriptions are authored on the InternalTable declaration —
+        # the only column documentation an LLM sees before writing SQL.
+        _decl = INTERNAL_TABLES_BY_ID.get(table_id)
+        _col_docs = _decl.column_descriptions if _decl else {}
         payload = {
             "table_id": table_id,
             "source_type": source_type,
             "sql_flavor": "duckdb",
             "columns": [
-                {"name": c["name"], "type": c["type"], "nullable": c["nullable"], "description": ""} for c in cols
+                {
+                    "name": c["name"],
+                    "type": c["type"],
+                    "nullable": c["nullable"],
+                    "description": _col_docs.get(c["name"], ""),
+                }
+                for c in cols
             ],
             "partition_by": None,
             "clustered_by": [],
