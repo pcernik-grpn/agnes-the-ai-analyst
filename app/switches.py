@@ -710,24 +710,26 @@ SWITCHES: tuple[Switch, ...] = (
         default=False,
         effect="live",
         category="product",
-        editable=False,
-        lock_reason=(
-            "The flag itself is read per request, but the `corpus-extraction` job kind "
-            "it gates needs a configured `extraction.producer` command AND a worker "
-            "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
-            "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
-            "feature whose backend is absent. That worker process sets AGNES_ROLE=worker "
-            "(a role split), which makes the deployment multi-process — it ALSO needs "
-            "Postgres app-state, explicit JWT_SECRET_KEY/SESSION_SECRET, and "
-            "coordination.backend=redis (docs/DEPLOYMENT.md#multi-process), or the "
-            "process refuses to boot. Enable the profile/producer, satisfy those "
-            "multi-process prerequisites, and this flag together."
-        ),
+        editable=True,
         description=(
             "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "
             "own worker lane — gates the `corpus-extraction` job kind's handler, which "
             "shells out to the operator-configured `extraction.producer` command/module. "
-            "New feature — off by default."
+            "New feature — off by default. Editable from /admin/server-config (reversing "
+            "this switch's original deploy-time-only stance) alongside "
+            "`extraction.producer.command`/`.module`/`.env_passthrough`, `extraction.schedule` "
+            "and `extraction.timeout_s` — see `app/api/admin.py::_KNOWN_FIELDS['extraction']`. "
+            "Enabling this alone still does not run the worker: a process must actually poll "
+            "the `extraction` lane (`AGNES_WORKER_LANES`, e.g. the `extraction-worker` Compose "
+            "profile), which sets `AGNES_ROLE=worker` (a role split) and so also needs "
+            "Postgres app-state, explicit `JWT_SECRET_KEY`/`SESSION_SECRET`, and "
+            "`coordination.backend=redis` (docs/DEPLOYMENT.md#multi-process) — the panel "
+            "cannot satisfy those, only the flag and the producer config. A Terraform-rendered "
+            "deployment env var (`AGNES_EXTRACTION_ENABLED`/`_PRODUCER_COMMAND`/`_PRODUCER_MODULE`) "
+            "still wins over a web-saved value per field (env > overlay > yaml base, same "
+            "resolution order as every other switch) — the panel shows a pinned field as "
+            "read-only and refuses a write to it with a typed 409 rather than storing a value "
+            "the runtime would never read."
         ),
     ),
     Switch(
