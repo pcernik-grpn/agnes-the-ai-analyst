@@ -240,15 +240,20 @@ def _table_blocks() -> list[Block]:
     """
     from src.repositories import table_registry_repo
 
-    # Filter out source_type='internal' rows (agnes_sessions /
-    # agnes_telemetry / agnes_audit). Their RBAC is row-level, enforced
-    # in the query path; the table-grain `resource_grants` gate is
-    # bypassed for them (see can_access). Surfacing them on
-    # /admin/access would let admins assign grants that do nothing,
-    # which is exactly the confusion this filter prevents.
-    # ``!= 'internal'`` keeps NULL source_type rows (matches the old
-    # ``IS DISTINCT FROM 'internal'`` SQL semantics).
-    rows = [r for r in table_registry_repo().list_all() if r.get("source_type") != "internal"]
+    # ``source_type='internal'`` rows (agnes_sessions / agnes_telemetry /
+    # agnes_audit) used to be filtered out here: they were excluded from
+    # every packaging surface and their table-grain gate was bypassed, so
+    # showing them only invited grants that did nothing.
+    #
+    # They are ordinary registry rows now — members of the seeded
+    # ``agnes-usage`` data package, which is the unit an admin actually
+    # grants. They are listed here for the same reason every other table is:
+    # this projection is the admin's view of what exists to be reasoned
+    # about, and a table that can sit in a package should not be invisible in
+    # it. The row-level filter (``connectors/internal/access.py``) is
+    # unchanged and orthogonal — it decides WHICH rows a reachable table
+    # shows, never whether the table is reachable.
+    rows = table_registry_repo().list_all()
     rows.sort(key=lambda r: ((r.get("bucket") or ""), r.get("name") or ""))
     blocks: dict[str, Block] = {}
     for r in rows:

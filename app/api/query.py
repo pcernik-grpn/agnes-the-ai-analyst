@@ -51,7 +51,7 @@ from src.access_policy import (
 )
 from src.audit_helpers import client_kind_from_user
 from src.db import _open_duckdb, get_analytics_db_readonly
-from src.rbac import get_accessible_tables
+from src.rbac import get_accessible_tables, require_table_access
 from src.remote_engines import (
     SQL_RESERVED_NAMES,
     TABLE_REF_PREFIX_RE,
@@ -1716,6 +1716,23 @@ def execute_query(
     # at all).
     internal_refs = find_internal_refs(request.sql)
     if internal_refs:
+        # ACCESS GATE. This branch returns before `get_accessible_tables`
+        # below is ever consulted, and `_run_internal_query` checks nothing
+        # but `is_user_admin` (to pick the row filter) — so the stack-gating
+        # of internal tables does NOT reach this path by itself. Without the
+        # loop here, `/api/v2/catalog` and `/api/v2/sample` would hide the
+        # tables from an ungranted analyst while `SELECT * FROM
+        # agnes_sessions` kept answering for everyone: the worst of both
+        # states. The MCP `query` tool and the CLI proxy through this same
+        # endpoint, so this is the one place that has to hold.
+        #
+        # Principals are skipped deliberately (spec §2 carve-out — see
+        # `src.rbac.can_access_table`): they have no stack, and
+        # `_run_internal_query` binds them to an identity shim that matches
+        # no user's rows.
+        if not isinstance(user, PRINCIPAL_TYPES):
+            for _rid in internal_refs:
+                require_table_access(user, _rid, conn)
         if (
             BQ_PATH.search(_mask_backticks(request.sql))
             or SF_PATH.search(_mask_backticks(request.sql))

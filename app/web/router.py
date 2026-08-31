@@ -1641,12 +1641,28 @@ async def me_activity_page(
     (Sessions / Token usage / Data access / Sync activity) backed by
     ``/api/me/stats/*`` endpoints.  The Sessions tab merges usage
     metrics with verification-pipeline status and download links.
+
+    ``last_session_upload_at`` is the only server-rendered datum: the Token
+    usage tab's empty state needs to distinguish "this account has never
+    pushed a session HERE" (usually a workspace pointed at another instance)
+    from "pushed, not processed yet", and the tokens API cannot see the audit
+    trail. Best-effort — a failing audit read must not take the page down.
     """
+    last_session_upload_at = None
+    try:
+        rows, _ = audit_repo().query(user_id=user["id"], action="session.upload", limit=1)
+        stamp = rows[0].get("timestamp") if rows else None
+        if stamp is not None:
+            last_session_upload_at = stamp.strftime("%Y-%m-%d %H:%M UTC") if hasattr(stamp, "strftime") else str(stamp)
+    except Exception:
+        logger.debug("could not read last session.upload for %s", user["id"], exc_info=True)
+
     ctx = _build_context(
         request,
         user=user,
         conn=conn,
         is_admin=is_user_admin(user["id"], conn),
+        last_session_upload_at=last_session_upload_at,
     )
     return templates.TemplateResponse(request, "me_activity.html", ctx)
 
@@ -7516,14 +7532,15 @@ async def admin_data_packages(
     # ── The unpackaged tray — distributable tables no analyst can pull. ──
     # Same fold as the /admin gap card: blank query_mode reads as local,
     # `remote` rows are excluded (they answer server-side without a package).
+    # `internal` rows are packageable now (they carry the seeded `agnes-usage`
+    # package) but their query_mode is `internal`, so this distribution-shaped
+    # tray still passes over them — there is no parquet to pull.
     unpackaged_tables: list[dict] = []
     try:
         packaged_ids: set[str] = set()
         for ids in pkg_repo.list_member_ids_bulk().values():
             packaged_ids.update(ids)
         for t in table_registry_repo().list_all():
-            if (t.get("source_type") or "") == "internal":
-                continue
             if (t.get("query_mode") or "") not in ("", "local", "materialized"):
                 continue
             if t["id"] not in packaged_ids:
@@ -7674,7 +7691,9 @@ async def admin_package_detail(
     # Server-rendered rather than a second fetch: the registry is already read
     # above, and a picker that cannot open because one more request failed is
     # a worse failure than a page that is 30 kB heavier. `internal` rows
-    # (agnes_* bookkeeping tables) are never package material.
+    # (the agnes_* usage tables) ARE package material: they ship in the seeded
+    # `agnes-usage` package, and an admin who wants a different bundle must be
+    # able to see them here.
     #
     # Each row carries what the picker's toolbar filters and sorts ON, because
     # an instance with three hundred registered tables cannot be worked with a
@@ -7694,7 +7713,7 @@ async def admin_package_detail(
 
     candidate_tables = []
     for t in sorted(registry.values(), key=lambda r: (r.get("name") or r["id"]).lower()):
-        if t["id"] in member_set or (t.get("source_type") or "") == "internal":
+        if t["id"] in member_set:
             continue
         st = states.get(t["id"]) or {}
         last = _aware(st.get("last_sync"))
