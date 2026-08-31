@@ -103,6 +103,7 @@ from src.models.telemetry import (
     UsageMarketplaceItemWindow,
     UsageSessionSummary,
     UsageToolDaily,
+    UsageTurn,
     UserObservabilityView,
 )
 from src.models.user_journey import UserJourneyState
@@ -204,6 +205,7 @@ __all__ = [
     "UsageMarketplaceItemWindow",
     "UsageSessionSummary",
     "UsageToolDaily",
+    "UsageTurn",
     "User",
     "UserExternalIdentity",
     "UserGroup",

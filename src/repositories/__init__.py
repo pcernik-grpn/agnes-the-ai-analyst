@@ -108,6 +108,8 @@ __all__ = [
     "session_processor_state_repo",
     "observability_views_repo",
     "usage_repo",
+    # Per-turn token usage (incl. prompt cache) — Postgres-only
+    "usage_turns_repo",
     "reports_repo",
     # Store / marketplace
     "marketplace_registry_repo",
@@ -650,6 +652,12 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "semantic_health_mutes": {
         PG: ("src.repositories.semantic_health_mutes_pg", "SemanticHealthMutesPgRepository"),
     },
+    # Per-assistant-turn token usage — POSTGRES-ONLY, same reasoning. Note
+    # the neighbour: "usage" above is the frozen session-grain pair; this is
+    # a separate, finer-grained table, not a second backend for it.
+    "usage_turns": {
+        PG: ("src.repositories.usage_turns_pg", "UsageTurnsPgRepository"),
+    },
 }
 
 
@@ -783,6 +791,15 @@ def observability_views_repo() -> Any:
 
 def usage_repo() -> Any:
     return _build("usage")
+
+
+def usage_turns_repo() -> Any:
+    """Per-assistant-turn token usage incl. prompt cache (finer grain than
+    ``usage_repo``'s session summaries). PG-only — raises
+    ``RequiresPostgresBackend`` on a DuckDB-backed instance, which
+    ``app/main.py`` turns into a typed ``501``; callers on a write path that
+    must not fail over telemetry guard with ``use_pg()`` or catch it."""
+    return _build("usage_turns")
 
 
 def reports_repo() -> Any:
