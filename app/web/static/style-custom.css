@@ -4940,9 +4940,11 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
    drawn around them.
 
    This is the treatment /library, /agents and /chats already run by hand
-   (`.lib-head`, `.ag-head`, `.ch-head` — 24px title, 15px secondary lede
-   capped at 68ch), lifted onto the shared primitive so a page can opt in
-   with one variable (`page_hero_plain`) instead of a fourth private copy.
+   (`.lib-head`, `.ag-head`, `.ch-head` — a 22–24px title over a muted
+   lede capped at 68ch), lifted onto the shared primitive so a page can
+   opt in with one variable (`page_hero_plain`) instead of a fourth
+   private copy. The lede's own type scale is shared too — see
+   `.page-lede` below, which those three heads now ride as well.
 
    Use it where the page is a WORKSPACE the reader stays in — a list they
    filter, a table they act on, a two-pane editor. A gradient (or, under
@@ -4966,12 +4968,59 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
        edge. */
     padding: 0 0 22px;
 }
-.page-header--plain .page-header__title { font-size: 24px; }
+
+/* ── The page title ───────────────────────────────────────────────────
+   The other half of the head, on the same terms as `.page-lede` below:
+   one size, named once, for the `<h1>` a page puts above its lede.
+
+   22px — the /library size, the smaller of the two that were in the
+   tree. It is chosen as a PAIR with the 13px lede rather than on its
+   own: /library sized both together and the result is the head the rest
+   of the app is being matched to. 24px was the majority (the plain
+   header and every hand-built head but one) and is a one-line change
+   here if that ever reverses.
+
+   Only `margin` and `font-size` — weight, tracking and colour stay with
+   the theme's own `h1` rule, the same division the plain variant above
+   keeps. Layout a particular head needs (a flex row for a badge beside
+   the name, `overflow-wrap` for a name that can be one long token)
+   stays page-local: it is that page's anatomy, not the type scale. */
+.page-title,
+.page-header--plain .page-header__title {
+    margin: 0;
+    font-size: 22px;
+    line-height: 1.2;
+}
+
+/* ── The page lede ────────────────────────────────────────────────────
+   ONE type scale for the sentence under a page title, wherever that
+   sentence is written: the shared header's `page_hero_subtitle` on a
+   plain-variant page, or a hand-built head's own `<p>`.
+
+   It is the /library scale — 13px, muted, capped at 68ch — because a
+   lede is orientation the reader needs once and then scrolls past on
+   every later visit, and at body size it competed with the rows the
+   page exists to show. It used to be three sizes: 15px `--ds-text-
+   secondary` here, 15px in `.ag-head`/`.ch-head`, and — on any page
+   that wrote a bare `<p class="lede">` with no rule behind it —
+   whatever the UA gave a paragraph, which was the largest of the
+   three.
+
+   `.page-lede` is the one name — deliberately NOT an alias on the bare
+   `.lede` the hand-built heads used to carry, because /home writes that
+   same class for its marketing hero and would have been dragged down to
+   13px muted with them. A page head opts in by name; nothing opts in by
+   accident.
+
+   No `font-weight`/`font-family` here — a lede inherits the body's, so
+   a mid-page section lede that reaches for this class (e.g.
+   /marketplace/guide) keeps whatever its section gives it. */
+.page-lede,
 .page-header--plain .page-header__subtitle {
-    margin: 8px 0 0;
-    font-size: 15px;
-    line-height: 1.5;
-    color: var(--ds-text-secondary);
+    margin: 4px 0 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ds-text-muted);
     max-width: 68ch;
 }
 .page-header--plain .page-header__eyebrow { color: var(--ds-text-muted); }

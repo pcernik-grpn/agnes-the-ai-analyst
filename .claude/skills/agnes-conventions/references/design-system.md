@@ -115,6 +115,18 @@ active.
    The `--ds-hero-*` family stays DARK under paper (the one "night"
    moment: /home install hero, terminal mockups). Don't hand-build
    heroes; don't assume ink color — use tokens.
+6a. **A page head is `.page-title` over `.page-lede` — one size each,
+   every page.** Both are defined once in `style-custom.css`: the `<h1>`
+   at 22px, the sentence under it at 13px `--ds-text-muted` capped at
+   68ch. A plain-variant header gets both for free through
+   `page_hero_title` / `page_hero_subtitle`; a hand-built head writes
+   `<h1 class="page-title">` and `<p class="page-lede">` — that exact
+   lede class, not the bare `.lede` /home's marketing hero still uses.
+   Never set a head's `font-size`/`color` in a page's own `<style>` —
+   that is exactly how the lede split three ways before. A head's own
+   LAYOUT (flex row for a badge, `overflow-wrap` for a long name) does
+   stay page-local; only the type scale is shared.
+
 6b. **Resource detail pages are ONE template, never a family of
    lookalikes.** Every entity with a detail page — data package, plugin,
    skill, agent, file, collection, upload, memory domain, recipe, table —

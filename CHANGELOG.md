@@ -358,6 +358,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **One type scale for a page head — the title and the sentence under it.**
+  The lede was the worse half: it rendered three different sizes depending on
+  where it was written — 15px on a `page_hero_plain` header (most of
+  `/admin/*`), 15px in the hand-built `/agents` and `/chats` heads, and, on a
+  page that wrote a bare `<p class="lede">` with no rule behind it
+  (`/me/activity`, `/me/connections`, `/semantic-layer`, `/marketplace/guide`,
+  `/library/builder`), whatever the browser gives a paragraph — the largest of
+  the three. The `<h1>` above it was 24px everywhere except `/library`.
+
+  Both halves are now one rule each in `style-custom.css`, at the `/library`
+  sizes because that page sized the two as a pair: `.page-title` at 22px and
+  `.page-lede` at 13px `--ds-text-muted`, capped at 68ch. A plain-variant
+  header picks both up through `page_hero_title` / `page_hero_subtitle`; a
+  hand-built head opts in by class. Every page-scoped copy of the type scale
+  is gone, so a new page inherits the head instead of guessing it — while a
+  head's own LAYOUT (the flex row `/library`, `/agents` and `/library/builder`
+  use for a badge beside the name, `overflow-wrap` on `/profile` and the admin
+  user detail) stays page-local. `/home`'s marketing hero writes the bare
+  `.lede` class and deliberately keeps its own larger type.
+
+
 - **The Library's Definitions footer is now a Semantic models section, and the
   metric/glossary page folded into `/semantic-layer` (#1707).** Three changes
   to one surface:

@@ -94,7 +94,7 @@
   }
   .ud-id-txt { min-width: 0; }
   .ud-name-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .ud-head h1 { font-size: 24px; margin: 0; overflow-wrap: anywhere; }
+  .ud-head h1 { overflow-wrap: anywhere; }
   .ud-mail { font-size: 14px; color: var(--ds-text-secondary); margin: 4px 0 0; word-break: break-all; }
   /* The account's bookkeeping — when it started, when it last pulled data.
      One line of quiet facts under the address, not four rows of a card: each
@@ -308,7 +308,7 @@
           {# The name if there is one, the address if there is not — the same
              rule the people list applies to its name cell, so a row with no
              display name doesn't render an em dash as a title. #}
-          <h1>{{ target_user.name or target_user.email }}</h1>
+          <h1 class="page-title">{{ target_user.name or target_user.email }}</h1>
           {# Server-rendered from the stored row so the state is right on the
              first paint; `renderHeader()` keeps it in step after a toggle. #}
           <span class="ud-state {{ 'is-ok' if target_user.active else 'is-danger' }}"

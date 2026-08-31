@@ -50,7 +50,7 @@
   .pf-id-txt { min-width: 0; }
   .pf-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
   .pf-name-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 2px 0 0; }
-  .pf-head h1 { font-size: 24px; margin: 0; overflow-wrap: anywhere; }
+  .pf-head h1 { overflow-wrap: anywhere; }
   .pf-head-mail { font-size: 14px; color: var(--ds-text-secondary); margin: 4px 0 0; word-break: break-all; }
 
   /* Inline display-name editor. Lives in the head now, on the name it edits
@@ -219,7 +219,7 @@
          name, so the page's only h1 announced as "Jamie Rivera Edit". #}
       <div class="pf-name-row">
         <span class="pf-name-view" id="pf-name-view">
-          <h1 id="pf-name-text">{{ user.name or "—" }}</h1>
+          <h1 class="page-title" id="pf-name-text">{{ user.name or "—" }}</h1>
           <button type="button" class="pf-edit-icon" onclick="pfEditName()"
                   aria-label="Edit display name" title="Edit display name">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
