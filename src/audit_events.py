@@ -1242,6 +1242,13 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "Already-ingested content removed because its source subtree/file lost inheritance or a permission zone dissolved.",
     ),
+    # -- 2026-08-31 plan, Task 5: server-side source-ACL ingest gate
+    # (connectors/sharepoint/ingest_gate.py).
+    "sharepoint_acl.ingest_rejected": AuditEvent(
+        "sharepoint_acl.ingest_rejected",
+        "mutation",
+        "Upload/ingest refused documents under a source-ACL-excluded subtree or a mis-routed permission zone (fail closed).",
+    ),
 }
 
 

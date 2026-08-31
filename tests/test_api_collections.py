@@ -2230,3 +2230,110 @@ class TestProducerUploadAccess:
 
         resp = c.get(f"/api/collections/{corpus_id}", headers=_auth(token))
         assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# SharePoint source-ACL ingest gate (2026-08-31 plan, Task 5 —
+# connectors/sharepoint/ingest_gate.py) wired into this upload endpoint —
+# refuses (before any byte is stored) a file whose `paths` entry sits under a
+# SharePoint connection's excluded subtree.
+# ---------------------------------------------------------------------------
+
+
+def _seed_sharepoint_scope(corpus_id: str, *, connection_id: str) -> None:
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().create(
+        id=connection_id,
+        name=f"SP Gate {connection_id}",
+        source_type="sharepoint",
+        config={
+            "tenant_id": "tenant-1",
+            "client_id": "client-1",
+            "scopes": [
+                {
+                    "source_scope_id": "root-1",
+                    "display_path": "Site/Documents",
+                    "anonymize": False,
+                    "collection_id": corpus_id,
+                    "drive_id": "d1",
+                    "access_mode": "mirrored",
+                    "excluded_subtrees": [
+                        {
+                            "item_id": "X",
+                            "path": "Secret",
+                            "rel_path": "Secret",
+                            "kind": "folder",
+                            "detected_at": "2026-08-31T00:00:00+00:00",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+
+class TestSharePointIngestGateUpload:
+    def test_upload_under_excluded_subtree_is_refused_and_stores_nothing(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": "SP Gate Upload"}, headers=_auth(seeded_app["admin_token"]))
+        corpus_id = cr.json()["id"]
+        _seed_sharepoint_scope(corpus_id, connection_id="conn-gate-1")
+
+        from src.repositories import audit_repo
+
+        before, _ = audit_repo().query(action="sharepoint_acl.ingest_rejected", limit=1000)
+
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("doc.docx", io.BytesIO(b"secret bytes"), "application/octet-stream")),
+                ("files", ("ok.md", io.BytesIO(b"fine"), "text/markdown")),
+            ],
+            data={"paths": ["Secret/doc.docx", "open/ok.md"]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 403, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "source_acl_excluded_paths"
+        assert detail["items"] == [{"index": 0, "path": "Secret/doc.docx", "reason": "source_acl_excluded"}]
+
+        # Nothing was stored — the whole batch is refused before any byte lands.
+        listing = c.get(f"/api/collections/{corpus_id}/files", headers=_auth(seeded_app["admin_token"]))
+        assert listing.json()["files"] == []
+
+        after, _ = audit_repo().query(action="sharepoint_acl.ingest_rejected", limit=1000)
+        assert len(after) - len(before) == 1
+
+    def test_upload_outside_excluded_subtree_is_unaffected(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": "SP Gate Clean Upload"}, headers=_auth(seeded_app["admin_token"]))
+        corpus_id = cr.json()["id"]
+        _seed_sharepoint_scope(corpus_id, connection_id="conn-gate-2")
+
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("ok.md", io.BytesIO(b"fine"), "text/markdown")},
+            data={"paths": "open/ok.md"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+
+    def test_gate_is_a_noop_when_acl_mirroring_is_off(self, seeded_app):
+        """Same excluded-subtree config, but the feature flag stays off — the
+        upload must be byte-identical to a plain collection (strict no-op:
+        `source_acl_index_for_collection` returns `None`)."""
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": "SP Gate Flag Off"}, headers=_auth(seeded_app["admin_token"]))
+        corpus_id = cr.json()["id"]
+        _seed_sharepoint_scope(corpus_id, connection_id="conn-gate-3")
+
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("doc.docx", io.BytesIO(b"secret bytes"), "application/octet-stream")},
+            data={"paths": "Secret/doc.docx"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 201, resp.text
