@@ -263,6 +263,38 @@ body {
 .container--wide   { max-width: var(--width-wide); }     /* 1400px — admin index lists, marketplace grids */
 .container--full   { max-width: none; padding-left: var(--space-4); padding-right: var(--space-4); }
 
+/* ── A content page as a white SHEET ──────────────────────────────────────
+   `.idx` below (index pages) and `.container--full` in admin_page.css (every
+   admin page) both paint their shell `--ds-surface`, and both say why in their
+   own comments: a page left on the app background reads as a different product
+   from the one it was reached from. Content pages on base_page.html /
+   base_ds.html had no way to say the same thing, which is how the semantic
+   layer and the metrics list ended up as the grey stop in a white app — you
+   reach them from the Library's Definitions block, and the canvas changes
+   colour on the way (#1898).
+
+   Opt in per page: `{% block body_attrs %}class="page-sheet"{% endblock %}`.
+
+   FULL BLEED, on the body rather than on `.container`: the container is padded
+   and max-width'd, so painting that would leave grey gutters beside a white
+   column — an oversized card, not a page. This is the same choice `.idx`
+   documents ("no grey gutters beside the centred header either").
+
+   `body.detail-page` is in the same rule rather than opting in template by
+   template: the nine detail pages (data package, table, recipe, plugin,
+   marketplace item, data app, collection, file, memory domain) already carry
+   that class for their footer treatment, so it is the marker for this family
+   and one selector keeps all nine from drifting apart. Cards-on-grey was their
+   look, and cards on a sheet is the look every index page they are reached from
+   already has — the cards keep their own borders either way.
+
+   `html body.…` carries the extra element on purpose: the rule these have to
+   beat is `[data-theme="paper"] body` in paper-skin.css (the sheet that paints
+   the grey), which ties on specificity, and sheet order is not a thing a page
+   should have to reason about. */
+html body.page-sheet,
+html body.detail-page { background: var(--ds-surface); }
+
 /* Index / resource-list page layout (#896 prototype) — used via
    base_index.html by My Stack, Catalog, and similar list pages. The
    header zone (title + description + actions + search + tabs) and the
@@ -5541,6 +5573,44 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
 
 .ds-table--zebra tbody tr:nth-child(even) td {
     background: var(--ds-surface-dim);
+}
+
+/* `.data-table-wrap` — the wrapper ten admin pages put around a `.data-table`
+   (semantic sources, users, sync, marketplaces, mcp_sources,
+   knowledge_digests, linked_apps, initial_workspace, data_apps, tables) so a
+   wide/many-column table scrolls horizontally instead of taking the whole
+   page with it. No CSS rule ever backed the class (#1707 A6), so the
+   overflow silently landed on the page instead of the table.
+   `admin_tables.html` is the odd one out: its wrap holds a JS-hydrated
+   layout host (`#adminTablesLayoutRows`), not a literal `<table
+   class="data-table">` markup — the hydrator injects one once
+   `/api/admin/registry` resolves. It still gets `overflow-x: auto` for
+   free from this same rule once that happens.
+
+   Decision (PR #1823 review): overflow-x: auto makes overflow-y compute to
+   auto too, which turns the wrap into a NEW scrolling ancestor closer than
+   the viewport — so `.data-table thead th`'s `position: sticky` (below)
+   would silently re-target that ancestor instead. The wrap is never given a
+   height cap, so it never actually scrolls vertically, meaning the header
+   would stop sticking at all instead of degrading gracefully, and the same
+   ancestor change is what triggers the well-known "rounded corners vanish
+   under a stuck thead" clipping bug the `.cloud-chat-table-wrap` recipe in
+   chat.css works around for its own tables. Rather than adopt that recipe's
+   border-transfer here too (all ten pages would need touching, and
+   `admin_tables.html`'s wrap would gain a border around its
+   `#adminTablesLayoutRows` "Loading tables…" placeholder even before a
+   real table exists inside it — a visual change out of scope for this
+   fix), sticky is disabled outright for any thead wrapped in
+   `.data-table-wrap`: an unambiguous "off" instead of a silently
+   non-functional "on". A bounded,
+   internally-scrolling table with real in-wrap sticky is a legitimate
+   follow-up for a page that wants it, not a rule that belongs on every
+   consumer of this class today. */
+.data-table-wrap {
+    overflow-x: auto;
+}
+.data-table-wrap thead th {
+    position: static;
 }
 
 /* ─── Badges — accent vocabulary ──────────────────────────────────────

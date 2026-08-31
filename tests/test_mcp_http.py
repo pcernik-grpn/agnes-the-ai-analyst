@@ -16,7 +16,6 @@ import pytest
 
 from src.mcp_tooling import MCPOutputTooLarge
 
-
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 
@@ -60,6 +59,7 @@ class TestAuthMiddleware:
     def test_valid_token_passes_through_to_mcp(self, seeded_app):
         """_AuthMiddleware calls the underlying ASGI app when the token is valid."""
         import asyncio
+
         from app.api.mcp_http import _AuthMiddleware
 
         tok = seeded_app["analyst_token"]
@@ -85,6 +85,7 @@ class TestAuthMiddleware:
         per_user source forwards the caller's own credential), and resets it
         after."""
         import asyncio
+
         from app.api.mcp_http import _AuthMiddleware, _current_user_id
 
         tok = seeded_app["analyst_token"]
@@ -109,6 +110,7 @@ class TestAuthMiddleware:
     def test_query_param_token_passes_through(self, seeded_app):
         """?token= fallback also reaches the inner app when valid."""
         import asyncio
+
         from app.api.mcp_http import _AuthMiddleware
 
         tok = seeded_app["analyst_token"]
@@ -304,7 +306,7 @@ class TestToolRegistration:
             # over canonical Ossie semantic models, RBAC-filtered on the
             # linked Data Package's grant. Triple-surface with GET
             # /api/semantic-models/search + GET /api/semantic-models/{slug}.yaml
-            # + `agnes admin semantic-model list/export`.
+            # + `agnes admin semantic list` / `agnes semantic-model export`.
             "semantic_model_search",
             "semantic_model_get",
             # Query-validation engine wiring (wave 3). Triple-surface with
@@ -357,8 +359,58 @@ class TestToolRegistration:
             "admin_register_table",
             # Why a connected project's metrics are (or aren't) landing.
             # Triple-surface with GET /api/admin/semantic-layer/coverage +
-            # `agnes admin semantic-layer coverage`.
+            # `agnes admin semantic keboola-import`.
             "admin_semantic_layer_coverage",
+            # Source-agnostic zero-coverage check — which registered tables
+            # have NO valid semantic model at all, across every source.
+            # Triple-surface with GET /api/admin/semantic-coverage +
+            # `agnes semantic-model coverage tables`.
+            "admin_semantic_coverage",
+            # What each connected source still lacks across all six domains
+            # (F4.1), and the tags the report cannot derive. Triple-surface
+            # with /api/admin/semantic-model/coverage* + `agnes semantic-model
+            # coverage[ tag| untag]`.
+            "semantic_model_coverage",
+            "semantic_model_coverage_tag",
+            "semantic_model_coverage_untag",
+            # Muting a semantic-layer health check (F4.3) — "I know, it is
+            # deliberate". Triple-surface with /api/admin/semantic-layer/mutes*
+            # + `agnes semantic-model mute|unmute|mutes`.
+            "semantic_mutes_list",
+            "mute_semantic_check",
+            "unmute_semantic_check",
+            # Where documents are synced FROM, taking a model off that sync
+            # path, and which Data Package carries it to non-admin readers
+            # (#1707) — three admin families that had REST + CLI and no MCP.
+            # Triple-surface with /api/admin/semantic-sources* +
+            # /api/admin/semantic-models/{id}/{detach,reattach} +
+            # /api/admin/semantic-models/{slug}/packages* and `agnes admin
+            # semantic source add|list|sync|rm` / `detach` / `reattach` /
+            # `link-package` / `unlink-package`.
+            "semantic_source_add",
+            "semantic_source_list",
+            "semantic_source_sync",
+            "semantic_source_remove",
+            "semantic_model_detach",
+            "semantic_model_reattach",
+            "semantic_model_link_package",
+            "semantic_model_unlink_package",
+            # Is the layer trustworthy right now (F4.2) — sync failures,
+            # disconnected models, invalid documents, static document-quality
+            # checks, F4.1's coverage roll-up, and F4.3's active mutes.
+            # Triple-surface with GET /api/admin/semantic-layer/health +
+            # `agnes admin semantic health`.
+            "semantic_layer_health",
+            # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the
+            # one write here an ordinary caller may make — an agent that cannot
+            # ground its answer is the intended reporter; the other two are the
+            # admin side of the same queue. Triple-surface with
+            # /api/semantic-feedback + /api/admin/semantic-feedback* + `agnes
+            # semantic-model feedback submit` / `agnes admin semantic feedback
+            # list|resolve`.
+            "flag_semantic_issue",
+            "semantic_feedback_list",
+            "semantic_feedback_resolve",
             # Job management for scheduler — list, get, enqueue tasks.
             # Triple-surface with GET /api/jobs + GET /api/jobs/{job_id} +
             # POST /api/jobs + `agnes admin jobs`.

@@ -800,3 +800,13 @@ class TestPemFormatCheckAndFilePick:
         # file with a second pick; the status names what is missing.
         assert "BEGIN CERTIFICATE" in result["value"]
         assert "PRIVATE KEY" in result["status"]
+
+
+class TestClientSecretWizardOption:
+    def test_certificate_choice_offers_client_secret(self, seeded_app):
+        body = _page(seeded_app)
+        assert 'value="secret"' in body
+        assert "Client secret" in body
+        assert 'id="spw-client-secret"' in body
+        secret_tag = body.split('id="spw-client-secret"', 1)[0][-200:] + body.split('id="spw-client-secret"', 1)[1][:200]
+        assert 'type="password"' in secret_tag

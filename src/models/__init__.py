@@ -77,6 +77,9 @@ from src.models.rbac import (
 )
 from src.models.recipes import Recipe
 from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
+from src.models.semantic_coverage import ResourceSourceTag
+from src.models.semantic_feedback import SemanticFeedback
+from src.models.semantic_health_mutes import SemanticHealthMute
 from src.models.share_requests import ShareRequest
 from src.models.sso import SsoConfig, UserExternalIdentity
 from src.models.store import (
@@ -170,7 +173,10 @@ __all__ = [
     "PersonalAccessToken",
     "Recipe",
     "ResourceGrant",
+    "ResourceSourceTag",
     "ScriptRegistry",
+    "SemanticFeedback",
+    "SemanticHealthMute",
     "SemanticModel",
     "SemanticSource",
     "ShareRequest",

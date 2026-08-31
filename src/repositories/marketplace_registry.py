@@ -49,6 +49,15 @@ class MarketplaceRegistryRepository:
         # is_builtin is NOT included in the ON CONFLICT SET — the built-in
         # flag is immutable after the initial seed so re-seeding on upgrade
         # cannot accidentally flip admin-registered rows.
+        #
+        # last_error self-heal: a built-in row has no git remote, so it can
+        # never legitimately fail a sync — any last_error sitting on one is
+        # a fossil from before sync_one() refused built-in rows up front
+        # (see MarketplaceNotSyncable). Clear it on every re-register of a
+        # built-in row (i.e. every boot's seed_builtin_marketplace() call)
+        # so a stale error can't get permanently stuck with no way to clear
+        # it. Non-builtin rows are untouched — an admin edit must not wipe
+        # a real sync failure off the board.
         now = datetime.now(timezone.utc)
         self.conn.execute(
             """INSERT INTO marketplace_registry
@@ -63,7 +72,8 @@ class MarketplaceRegistryRepository:
                 description = excluded.description,
                 curator_name = COALESCE(excluded.curator_name, marketplace_registry.curator_name),
                 curator_email = COALESCE(excluded.curator_email, marketplace_registry.curator_email),
-                ref = excluded.ref""",
+                ref = excluded.ref,
+                last_error = CASE WHEN excluded.is_builtin THEN NULL ELSE marketplace_registry.last_error END""",
             [
                 id,
                 name,

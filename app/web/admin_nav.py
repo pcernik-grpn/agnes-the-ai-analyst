@@ -202,7 +202,10 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         # receives it"), which is the tell that the name was not doing its job:
         # a label needing a gloss should be relabelled, not annotated, and four
         # captions doubled the strip's height to explain four words. So
-        # "Semantic" (an adjective with no noun) became **Semantic layer**, and
+        # "Semantic" (an adjective with no noun) became **Semantic layer**
+        # and, once three pages turned out to share that one name, **Semantic
+        # layer health** — the question the page answers rather than the thing
+        # it reports on (tests/test_semantic_page_names_contract.py). And
         # "Packages" — the word whose meaning nobody could state, which is what
         # started this whole reshape — became **Data packages**, the term the
         # API, the CLI (`agnes stack add data_package`) and the analyst's own
@@ -250,10 +253,23 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             # --metrics` must give ONE answer for "what is MRR"), so it gets a
             # surface of its own. Syncing stays per project.
             {
-                "label": "Semantic layer",
+                "label": "Semantic layer health",
                 "href": "/admin/semantic-layer",
                 "match": ["/admin/semantic-layer"],
                 # No `chain` — see the block comment above the tabs list.
+            },
+            # Semantic layer health (above) answers "is what exists complete and
+            # healthy" — coverage/health/mute/feedback over the DOCUMENTS
+            # already imported. This tab answers the question upstream of
+            # that: where a document comes from in the first place —
+            # every `semantic_source` row, any kind (git/upload/connection)
+            # and any adapter (Keboola, Snowflake, Databricks), with its own
+            # sync-now action. Same "no chain" reasoning: instance-wide, not
+            # a pipeline stage.
+            {
+                "label": "Semantic sources",
+                "href": "/admin/semantic-sources",
+                "match": ["/admin/semantic-sources"],
             },
         ],
     },

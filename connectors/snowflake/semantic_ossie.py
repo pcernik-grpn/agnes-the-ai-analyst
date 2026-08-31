@@ -524,6 +524,37 @@ class SnowflakeSemanticAdapter:
     credential is stored.
     """
 
+    def unconfigured_reason(self, config: Dict[str, Any]) -> Optional[str]:
+        """The optional pre-flight hook (``src/semantic/adapters/__init__.py``):
+        ``None`` when this instance has a Snowflake account to read, a reason
+        when it does not.
+
+        Not a hypothetical twin of the Databricks one: the
+        /admin/data-sources wizard registers a ``snowflake_semantic`` source
+        the moment an admin connects Snowflake with the opt-in ticked, so a
+        later deconfiguration (credentials rotated out, connection removed)
+        leaves a source that can never sync again — importing it would raise
+        :meth:`extract`'s "not configured" on every sweep, forever. The sweep
+        asks this first and skips the row instead, without touching it.
+
+        Deliberately the same zero-argument ``resolve_snowflake_settings()``
+        call :meth:`extract` makes, so this answers "yes" exactly when that
+        one would raise — a pre-check that resolved settings differently
+        could skip a source that would have synced, or let one through that
+        cannot.
+        """
+        # Imported at call time for the same reason `extract` does it below.
+        from connectors.snowflake.settings import resolve_snowflake_settings
+
+        if resolve_snowflake_settings():
+            return None
+        return (
+            "Snowflake is not configured on this instance (a registered Snowflake connection — "
+            "Admin → Data sources — or the legacy data_source.snowflake.* config, plus its "
+            "SNOWFLAKE_PASSWORD / private-key env or vault secret); skipping this source until "
+            "it is configured again"
+        )
+
     def extract(self, config: Dict[str, Any]) -> List[str]:
         # Imported at call time, not module scope, so a test patching the
         # defining module reaches this lookup (same reason as the Keboola
@@ -532,6 +563,9 @@ class SnowflakeSemanticAdapter:
 
         settings = resolve_snowflake_settings()
         if not settings:
+            # Still fatal HERE: a manual `POST /semantic-sources/{id}/sync` an
+            # admin asked for must say why it did nothing, and the pre-flight
+            # hook above is only consulted by the scheduled sweep.
             raise RuntimeError(
                 "Snowflake is not configured (data_source.snowflake.* + SNOWFLAKE_PASSWORD "
                 "env/vault secret); refusing to sync semantic views"

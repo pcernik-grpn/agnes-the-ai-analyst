@@ -241,7 +241,9 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None: calls.append((tables, source_type_filter)),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
+                (tables, source_type_filter)
+            ),
         )
 
         JOB_KINDS["data-refresh"].handler({})
@@ -257,7 +259,9 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None: calls.append((tables, source_type_filter)),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
+                (tables, source_type_filter)
+            ),
         )
 
         JOB_KINDS["data-refresh"].handler({"tables": ["orders"], "source": "keboola"})
@@ -277,7 +281,10 @@ class TestDataRefreshHandler:
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: False)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: False,
+        )
 
         with pytest.raises(RuntimeError):
             JOB_KINDS["data-refresh"].handler({})
@@ -291,9 +298,59 @@ class TestDataRefreshHandler:
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: run_sync_result)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: run_sync_result,
+        )
 
         JOB_KINDS["data-refresh"].handler({})  # must not raise
+
+    def test_returns_result_sink_populated_by_run_sync(self, monkeypatch):
+        """#1620: the handler's return value is what `app/worker/runtime.py`
+        passes to `JobsRepository.complete(..., result=...)` — it must be
+        the exact dict `_run_sync` filled via `result_sink`, not `None`,
+        so a job that "succeeded" but silently skipped every table (the
+        reported bug) is diagnosable via `GET /api/jobs/{id}`."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        fake_summary = {
+            "materialized": {"materialized": [], "skipped": [{"table": "t1", "reason": "due_check"}], "errors": []},
+            "errors": [],
+            "synced_tables": [],
+        }
+
+        def _fake_run_sync(tables=None, source_type_filter=None, result_sink=None):
+            if result_sink is not None:
+                result_sink.update(fake_summary)
+            return True
+
+        monkeypatch.setattr("app.api.sync._run_sync", _fake_run_sync)
+
+        result = JOB_KINDS["data-refresh"].handler({})
+
+        assert result == fake_summary
+
+    def test_returns_none_when_run_sync_is_a_noop(self, monkeypatch):
+        """`_run_sync` returning `None` (lock-contention no-op) never
+        populates `result_sink` — the handler must return `None`, not an
+        empty dict, so `complete()`'s `result is not None` branch (which
+        writes `payload_json["result"]`) is skipped for a call that did
+        nothing."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: None,
+        )
+
+        result = JOB_KINDS["data-refresh"].handler({})
+
+        assert result is None
 
 
 class TestMarketplacesSyncHandler:
@@ -606,7 +663,9 @@ class TestCorpusExtractionHandler:
         with pytest.raises(RuntimeError, match="certificate not configured"):
             handler({"connection_id": "conn1"})
 
-    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material", config=None):
+    def _stub_connection_and_settings(
+        self, monkeypatch, *, private_key="super-secret-pem-material", config=None, **settings_overrides
+    ):
         # Default config carries ONE confirmed scope: since the corpus-map
         # handoff, a scope-less connection with no payload corpus_id refuses
         # to run (see test_no_scopes_and_no_corpus_id_refuses) — tests that
@@ -638,6 +697,7 @@ class TestCorpusExtractionHandler:
             client_id="client-1",
             private_key=private_key,
             credential_source="vault",
+            **settings_overrides,
         )
         monkeypatch.setattr("connectors.sharepoint.settings.resolve_sharepoint_settings", lambda conn: fake_settings)
         return fake_settings
@@ -677,6 +737,36 @@ class TestCorpusExtractionHandler:
         assert call["env"]["AGNES_SHAREPOINT_CLIENT_ID"] == "client-1"
         assert call["env"]["AGNES_SHAREPOINT_PRIVATE_KEY"] == "super-secret-pem-material"
         assert call["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "corpus-9"
+
+    def test_client_secret_connection_forwards_the_secret_not_a_key(self, monkeypatch):
+        """`auth_method="client_secret"` connections hand the producer
+        AGNES_SHAREPOINT_CLIENT_SECRET (+ the method marker) and no empty
+        AGNES_SHAREPOINT_PRIVATE_KEY placeholder."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(
+            monkeypatch, private_key="", auth_method="client_secret", client_secret="app-secret-value"
+        )
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, timeout=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+        handler({"connection_id": "conn1", "corpus_id": "corpus-9"})
+
+        env = calls[0]["env"]
+        assert "app-secret-value" not in " ".join(calls[0]["argv"])
+        assert env["AGNES_SHAREPOINT_CLIENT_SECRET"] == "app-secret-value"
+        assert env["AGNES_SHAREPOINT_AUTH_METHOD"] == "client_secret"
+        assert "AGNES_SHAREPOINT_PRIVATE_KEY" not in env
 
     def test_child_env_does_not_forward_instance_secrets(self, monkeypatch):
         """The producer is an EXTERNAL, admin-configurable binary — it must

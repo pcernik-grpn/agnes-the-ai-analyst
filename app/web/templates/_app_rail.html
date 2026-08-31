@@ -129,7 +129,33 @@
        derivation. #}
     <div class="rail-logo-row">
         <a class="rail-logo" href="{{ home_route or '/dashboard' }}" aria-label="Home">
-            {% if config.LOGO_SVG %}{{ config.LOGO_SVG | safe }}{% else %}
+            {# A custom lockup is ONE element, and the collapsed strip is 40px
+               wide — so the wordmark used to be clipped mid-glyph there (#1898
+               item 5: half of a tenant's wordmark, reading as a rendering bug).
+               The built-in brand never had the problem because it is already two
+               elements: an orb that fits the strip plus a `.rail-logo-txt` span
+               the collapse hides.
+
+               A custom lockup now gets the same two-part treatment. The lockup
+               itself rides `.rail-logo-full` (hidden in the strip, exactly as
+               the wordmark span is), and `.rail-logo-mark` is what the strip
+               shows in its place: the operator's own monogram
+               (`instance.logo_mark_svg`) if they have one, otherwise the brand's
+               initial — a derived mark is not as good as a drawn one, but it is
+               a whole character rather than a cropped word.
+
+               Both are always in the DOM and rail.css cross-fades them, so the
+               swap costs no layout: the mark is absolutely positioned in the
+               logo's own box, which is why nothing here moves when the rail
+               opens (see the `.rail-logo-mark` block in rail.css). #}
+            {% if config.LOGO_SVG %}
+            <span class="rail-logo-full">{{ config.LOGO_SVG | safe }}</span>
+            <span class="rail-logo-mark" aria-hidden="true">
+                {%- if config.LOGO_MARK_SVG %}{{ config.LOGO_MARK_SVG | safe }}
+                {%- else %}<span class="rail-logo-mono">{{ (instance_brand or config.INSTANCE_NAME or 'Agnes') | trim | first | upper }}</span>
+                {%- endif %}
+            </span>
+            {% else %}
             {{ agnes_orb.orb(css_class='rail-orb', size=30) }}
             <span class="rail-logo-txt">{{ instance_brand or config.INSTANCE_NAME or 'Agnes' }}</span>
             {% endif %}
@@ -172,11 +198,12 @@
     <div class="rail-collapsible" id="rail-collapsible">
 
     {% set _home = home_route or '/dashboard' %}
-    {# /catalog/semantics counts as Library here: under the rail the Library's
-       Definitions block is the only way in, and the page carries no rail entry
-       of its own — leaving it unhighlighted made the whole chrome read as
-       "nowhere", which is the same strand this rail already avoids for the
-       surfaces it retired. #}
+    {# The semantic layer counts as Library here: under the rail the Library's
+       Semantic models section is the only way in, and those pages carry no
+       rail entry of their own — leaving them unhighlighted made the whole
+       chrome read as "nowhere", which is the same strand this rail already
+       avoids for the surfaces it retired. `/catalog/semantics` is kept in the
+       list for the 308's brief hop; `/semantic-layer` is where it lands. #}
     {# Every entity detail page the Library links out to also counts: without
        these the rail highlighted NOTHING on /catalog/p/*, /memory/d/*,
        /apps/detail/* and /marketplace/* — the most-visited detail surfaces
@@ -184,6 +211,7 @@
        reached from the Library and return to it. #}
     {% set _on_library = _path.startswith('/library') or _path == '/artefacts'
                          or _path.startswith('/catalog')
+                         or _path.startswith('/semantic-layer')
                          or _path.startswith('/memory/d')
                          or _path.startswith('/apps/detail')
                          or _path.startswith('/marketplace') %}
@@ -299,42 +327,44 @@
            set. Not a second plus (New chat owns that) and not two bubbles,
            which reads as "several people" rather than "your own history".
 
-           On an ADMIN page the modifier is withheld, so the row simply stays:
-           the conversation region is not rendered there at all, so folding this
-           away on peek would leave an admin with no path to /chats — the bug
-           that put a destination row here in the first place.
+           This holds on an ADMIN page too, now that the conversation region
+           renders there as well: the row stands in the 56px strip an admin page
+           starts in, and hands off to the real lists the moment that strip is
+           peeked or pinned open. The modifier used to be withheld there —
+           correctly, while the lists were absent, because folding the row away
+           on peek would have left an admin with no path to /chats at all.
 
            `.on` on /chats and nowhere else: /chat's pre-conversation state
            belongs to New chat above, and an open conversation is marked in the
            list below. #}
-        <a class="rail-i{% if not _admin_page %} rail-i--collapsed-only{% endif %} {% if _path.startswith('/chats') %}on{% endif %}"
+        <a class="rail-i rail-i--collapsed-only {% if _path.startswith('/chats') %}on{% endif %}"
            id="nav-chats" href="/chats">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12a8 8 0 0 1-11.6 7.1L4 20l.9-4.4A8 8 0 1 1 20 12Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
             <span class="rail-i-label">Chats</span>
         </a>
     </div>
 
-    {# NOT rendered on an admin page — the one place in this partial where the
-       item set differs by context, and the difference is deliberate.
+    {# Rendered on EVERY rail page, admin included (#1898 item 6). It used to be
+       withheld from /admin, and that is what made one region read as two
+       different sidebars: Library and Agents showed the conversation list, and
+       navigating to Admin replaced it with a single icon row.
 
-       This region is pure text: two section labels and a list of conversation
-       titles, with no icon form. So it cannot survive the collapse the rail
-       performs by default on /admin, and every attempt to make it survive has
-       been a worse trade. It was omitted from admin pages once already, on the
-       rule that icon mode's item set must be identical collapsed and
-       hover-expanded (a block that materializes on hover shifts every row below
-       it), then restored so that hover-expanding the rail on an admin page could
-       reach back into your work — which is the gesture's whole purpose, and
-       which it could not serve while collapsed anyway. The Chats row above
-       serves it in one click, from either width, and it does so on the page
-       where a caller with no conversations yet is not offered an empty list.
+       The region is pure text — two lists of conversation titles — so it has no
+       icon form and cannot be drawn in the 56px strip an admin page starts
+       collapsed in. That is what the Chats row above is for, and it is the whole
+       answer at that width. The thing the omission also cost, and the reason it
+       is gone: peeking the rail open on an admin page then revealed a void where
+       the lists belong, so the one gesture for reaching back into your work
+       reached nothing. Peeked or pinned open, an admin page is now the standard
+       rail, conversations included.
 
-       The invariant that actually matters is per PAGE: on any single page,
-       collapsed and expanded hold the same set of destinations. Two pages
-       differing is a full repaint nobody perceives as a shift. So: app pages get
-       the lists, admin pages get the Chats row that leads to them, and neither
-       page has content that vanishes when the rail narrows. #}
-    {% if not _admin_page %}
+       Nothing shifts as a result. `.rail-history` is hidden by `visibility`
+       while collapsed (rail.css), not by `display`, so the region holds its box
+       at both widths and the bottom zone — Library, Agents, Admin, the setup
+       card, the profile — sits exactly where it sat before the pointer arrived.
+       The per-PAGE invariant it was written to protect therefore still holds,
+       and now it holds by the same mechanism on every page rather than by an
+       exception on one. #}
     {# Conversations — the caller's chats in TWO sections, Pinned above Recent,
        with the door to the rest at their foot. The rail is a WORKING SET, not
        the whole history: what you have pinned, the handful you touched most
@@ -472,7 +502,6 @@
             <a class="rail-history-all" href="/chats">View all chats</a>
         </div>
     </section>
-    {% endif %}{# /not _admin_page — the conversation lists #}
     {% endif %}{# /can_chat — end of zone 1 #}
 
     {# ── Zone 2 (bottom): browse destinations, then Admin behind a divider ──
@@ -1037,17 +1066,18 @@
 <script src="{{ static_url('js/rail_toggle.js') }}" defer></script>
 {# Fills the Pinned + Chats lists on every page EXCEPT /chat (where chat.js owns
    the rows), and owns the two sections' collapse state + counts on ALL rail
-   pages, /chat included — AND the onboarding card's popover open/click/Escape
-   wiring (see the "Onboarding card popover" block in rail_history.js), which
-   still applies on an admin page even though the conversation list itself
-   does not render there. Self-guards on body.chat-page-body, so loading it
-   globally is safe. Only needed when the caller can chat. #}
+   pages, /chat and /admin included — AND the onboarding card's popover
+   open/click/Escape wiring (see the "Onboarding card popover" block in
+   rail_history.js). Self-guards on body.chat-page-body, so loading it globally
+   is safe. Only needed when the caller can chat. #}
 {# window.chatRowMenu — the shared "⋮" row menu (Pin/Unpin · Rename · Delete)
    both history renderers use. Must be defined before a row is BUILT, not before
    this file's scripts parse: rows are built after an async sessions fetch, so
    `defer` is enough regardless of tag order. Self-guards against the duplicate
-   load on a rail /chat page (chat.html loads it too). Skipped on an admin
-   page — there are no conversation rows there for it to menu. #}
+   load on a rail /chat page (chat.html loads it too). Loaded on an admin page
+   too, now that the conversation region renders there: those are the standard
+   rail's rows, so they get the standard rail's per-row menu rather than a
+   degraded copy. #}
 {# The rail's two launcher cards — the analyst onboarding card and the admin
    setup chain — share one popover behaviour (click to pin, outside-click and
    Escape to close, hover suppression while deliberately closed). It used to be
@@ -1059,9 +1089,6 @@
    `can_chat` is false and rail_history.js never loads. #}
 <script src="{{ static_url('js/rail_popover.js') }}" defer></script>
 {% if can_chat %}
-{# Loaded on admin pages too, now that the conversation region renders there:
-   the rows are the standard rail's rows, so they get the standard rail's
-   per-row "⋮" menu rather than a degraded copy. #}
 <script src="{{ static_url('js/components/chat_row_menu.js') }}" defer></script>
 <script src="{{ static_url('js/rail_history.js') }}" defer></script>
 {% endif %}

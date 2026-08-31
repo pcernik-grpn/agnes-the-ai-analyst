@@ -66,6 +66,12 @@ from typing import Any
 # until those imports are migrated to call the factory directly.
 from src.db import get_analytics_db, get_system_db
 
+# Re-exported, not defined here: exception handling is keyed on class identity
+# and several test harnesses ``importlib.reload`` this module, which would mint
+# a new class and silently unbind the app-wide 501 handler. See
+# ``src/repository_errors.py``.
+from src.repository_errors import RequiresPostgresBackend
+
 __all__ = [
     "get_system_db",
     "get_analytics_db",
@@ -178,6 +184,12 @@ __all__ = [
     "agent_memories_repo",
     # Agent schedules (v119, agent schedules)
     "agent_schedules_repo",
+    # Cross-domain semantic coverage (F4.1) — Postgres-only
+    "resource_source_tags_repo",
+    # Semantic-layer feedback queue (F4.5) — Postgres-only
+    "semantic_feedback_repo",
+    # Muted semantic-layer health checks (F4.3) — Postgres-only
+    "semantic_health_mutes_repo",
 ]
 
 
@@ -223,29 +235,6 @@ def _pg_engine() -> Any:
     from src.db_pg import get_engine
 
     return get_engine()
-
-
-class RequiresPostgresBackend(RuntimeError):
-    """Raised when a Postgres-only repository is resolved on an instance
-    still running the frozen DuckDB app-state backend.
-
-    A3 PG-first ratchet (see CLAUDE.md -> "Dual-backend discipline"): new
-    app-state repos registered after the ratchet flipped carry only a ``PG``
-    entry in :data:`_REGISTRY` — there is no DuckDB implementation to fall
-    back to. Route handlers that can reach such a repo must let this
-    exception surface rather than catching it and improvising; the app-wide
-    handler in ``app/main.py`` translates it to a clean ``501`` instead of an
-    unhandled ``500``.
-    """
-
-    def __init__(self, feature: str):
-        self.feature = feature
-        super().__init__(
-            f"{feature!r} requires the Postgres app-state backend. This feature "
-            "was added after the PG-first ratchet (DuckDB app-state is frozen — "
-            "see CLAUDE.md -> 'Dual-backend discipline'); migrate this instance "
-            "to Postgres to use it — see docs/migrations.md."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +631,24 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "agent_schedules": {
         DUCKDB: ("src.repositories.agent_schedules", "AgentSchedulesRepository"),
         PG: ("src.repositories.agent_schedules_pg", "AgentSchedulesPgRepository"),
+    },
+    # Cross-domain semantic coverage (F4.1) — POSTGRES-ONLY, the first entry
+    # registered under the A3 PG-first ratchet. No DUCKDB key by design: the
+    # DuckDB app-state backend is frozen, so resolving this on a DuckDB
+    # instance raises RequiresPostgresBackend (translated to a typed 501 by
+    # app/main.py) instead of silently reading a table that does not exist.
+    "resource_source_tags": {
+        PG: ("src.repositories.resource_source_tags_pg", "ResourceSourceTagsPgRepository"),
+    },
+    # Semantic-layer feedback queue (F4.5) — POSTGRES-ONLY, same reasoning as
+    # the entry above.
+    "semantic_feedback": {
+        PG: ("src.repositories.semantic_feedback_pg", "SemanticFeedbackPgRepository"),
+    },
+    # Muted semantic-layer health checks (F4.3) — POSTGRES-ONLY, same
+    # reasoning as the two entries above.
+    "semantic_health_mutes": {
+        PG: ("src.repositories.semantic_health_mutes_pg", "SemanticHealthMutesPgRepository"),
     },
 }
 
@@ -1040,3 +1047,21 @@ def agent_memories_repo() -> Any:
 # Agent schedules (v119, agent schedules)
 def agent_schedules_repo() -> Any:
     return _build("agent_schedules")
+
+
+# Cross-domain semantic coverage (F4.1) — POSTGRES-ONLY. Raises
+# RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
+def resource_source_tags_repo() -> Any:
+    return _build("resource_source_tags")
+
+
+# Semantic-layer feedback queue (F4.5) — POSTGRES-ONLY. Raises
+# RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
+def semantic_feedback_repo() -> Any:
+    return _build("semantic_feedback")
+
+
+# Muted semantic-layer health checks (F4.3) — POSTGRES-ONLY. Raises
+# RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
+def semantic_health_mutes_repo() -> Any:
+    return _build("semantic_health_mutes")

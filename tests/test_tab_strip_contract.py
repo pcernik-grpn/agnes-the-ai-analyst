@@ -140,3 +140,61 @@ class TestEveryStripUsesIt:
             ".lib-head .lib-tabs .fbar-seg__btn.is-active {",
         ):
             assert gone not in src, f"library.html restyles the tab again: {gone}"
+
+
+class TestActiveStateAttributeIsMaintained:
+    """The attributes the active rule STYLES on must be the attributes the
+    engine WRITES — the divergence #1898 item 2 survived on.
+
+    `.tab-strip`'s active rule keys on the class and on `[aria-checked="true"]`,
+    because the Library's and /chats' strips are radiogroups rather than
+    tablists. `filter_toolbar.js` wrote only `aria-selected`, so the
+    server-rendered `aria-checked="true"` stayed on the DEFAULT segment for the
+    life of the page: pick the second tab and both matched the active rule, both
+    went blue, and the strip stopped saying where you were. Removing the pill
+    chrome (the earlier half of this fix) made the tabs look right and left this
+    untouched.
+
+    Asserted as a relationship rather than as one literal, so the next
+    attribute added to either side has to be added to both."""
+
+    JS = CSS / "js" / "filter_toolbar.js"
+
+    def _set_segment(self) -> str:
+        """`setSegment`'s body, CODE ONLY.
+
+        Sliced to the next section comment rather than to the next `function `,
+        because the body contains a callback of its own and splitting on that cut
+        the body off at its first line. Line comments are then stripped, which is
+        not fussiness: the first version of this test passed while the bug was
+        reintroduced, because the comment explaining the bug says
+        `aria-checked` and a grep cannot tell prose from code."""
+        js = self.JS.read_text(encoding="utf-8")
+        body = js.split("function setSegment", 1)[1].split("// ──", 1)[0]
+        return "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+
+    def test_every_styled_state_attribute_is_written_by_the_engine(self):
+        css = COMPONENTS.read_text(encoding="utf-8")
+        blocks = _blocks(css, ".tab-strip .fbar-seg__btn")
+        styled = set()
+        for b in blocks:
+            styled.update(re.findall(r'\[(aria-[a-z]+)="true"\]', b.split("{", 1)[0]))
+        assert styled, "the active rule no longer keys on any aria attribute — re-read this test"
+
+        seg = self._set_segment()
+        for attr in sorted(styled):
+            assert attr in seg, (
+                f"components.css styles a tab active off [{attr}] but setSegment never writes it — "
+                "the server-rendered value will stay on the default segment and two tabs will read active"
+            )
+
+    def test_a_radio_gets_aria_checked_not_aria_selected(self):
+        """`aria-selected` is for tabs and options; on `role="radio"` it means
+        nothing, and every caller of this engine is a radiogroup."""
+        seg = self._set_segment()
+        assert "'radio'" in seg and "aria-checked" in seg, seg
+
+        for name in ("library.html", "chats.html"):
+            markup = (TEMPLATES / name).read_text(encoding="utf-8")
+            strip = markup[markup.index('role="radiogroup"'):]
+            assert 'role="radio"' in strip[:2000], f"{name}: the segments are no longer radios"

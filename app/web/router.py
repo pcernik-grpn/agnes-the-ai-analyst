@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -35,6 +35,7 @@ from app.instance_config import (
     get_privacy_policy_url,
     get_workspace_dir_name,
     get_workspace_launcher_word,
+    get_instance_logo_mark_svg,
     get_instance_logo_svg,
     get_instance_favicon,
     get_instance_overview,
@@ -510,11 +511,12 @@ _RAIL_DETAIL_BACK: dict[str, tuple[str, str]] = {
     "skill": ("/library?section=skill", "All skills"),
     "agent": ("/library?section=agent", "All agents"),
     "files": ("/library?section=files", "Library"),
-    # /catalog/semantics is not a `type_key`: the Definitions block is an
-    # adjacent destination BELOW the inventory, not one of the bands, so it
-    # has no `?section=` to open. It gets an anchor instead — without one the
-    # bare /library the fallback returns lands the reader at the top of the
-    # page, with the whole inventory between them and the block they clicked.
+    # The flat metric/glossary registries are not a `type_key`: they are a
+    # destination the Semantic models band links OUT to, not one of the
+    # Library's bands, so they have no `?section=` to open. They get the
+    # band's own anchor instead — without one the bare /library the fallback
+    # returns lands the reader at the top of the page, with the whole
+    # inventory between them and the section they clicked.
     # `#lib-defs` exists exactly when that block rendered (library.html emits
     # it under `if definitions_footer`, set only when the caller can see at
     # least one metric or glossary term); when it did not, the anchor is inert
@@ -810,6 +812,9 @@ def _config_proxy() -> type:
         # because the partial renders on chromes whose builders don't set it.
         INSTANCE_BRAND = get_instance_brand()
         LOGO_SVG = get_instance_logo_svg()
+        # The mark for slots a lockup does not fit (the rail's collapsed
+        # strip). Only read where LOGO_SVG is set — see the resolver.
+        LOGO_MARK_SVG = get_instance_logo_mark_svg()
         INSTANCE_OVERVIEW = get_instance_overview()
         INSTANCE_SUPPORT = get_instance_support()
         HIDE_LOGIN_FEATURES = get_hidden_login_features()
@@ -2293,7 +2298,32 @@ def _library_row_base(
     }
 
 
-def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
+def _readable_semantic_model_rows(user: dict, conn, *, surface: str) -> list[dict]:
+    """Every ``semantic_models`` row this caller can read — the ONE
+    ``_can_read_model`` sweep a request is allowed to pay for.
+
+    ``_can_read_model`` resolves a model's Data Packages per row, so the sweep
+    is O(models) repository reads: a page that ran it twice (the browse-link
+    gate and the per-metric deep-link map, #1707) doubled that for an answer it
+    already had. Callers that need both take this list once and derive both
+    from it; nothing here is cached beyond the request, since a grant revoked
+    mid-session must take effect on the next page load.
+
+    Best-effort by contract: every caller renders LINKS off this, so a
+    ``semantic_models`` read failure degrades to "no readable rows" and leaves
+    the rest of the page intact rather than 500ing it. ``surface`` only labels
+    the log.
+    """
+    try:
+        from app.api.semantic_models import _can_read_model
+
+        return [row for row in semantic_model_repo().list_all() if _can_read_model(user, row, conn)]
+    except Exception as e:  # noqa: BLE001 - the links are best-effort
+        logger.warning("%s: semantic-model existence check failed: %s", surface, e)
+        return []
+
+
+def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Optional[list[dict]] = None) -> bool:
     """Whether to offer this caller the ``/semantic-layer`` browse pages.
 
     The same ``_can_read_model`` gate those pages apply, so a caller who can
@@ -2307,18 +2337,41 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
     ``semantic_models`` read failure must degrade to "no link" and leave the
     rest of the page intact rather than 500 it. ``surface`` only labels the log.
 
-    Shared by ``/library``'s Definitions footer and ``/catalog/semantics``'
-    header + empty state. One reader, because the two disagreeing is exactly
-    how the standalone page came to claim "no metrics registered yet" on an
-    instance whose Library was already offering the document next door.
+    Shared by ``/library``'s Semantic models section and the model list's own
+    empty states. One reader, because the two disagreeing is exactly how the
+    flat page came to claim "no metrics registered yet" on an instance whose
+    Library was already offering the document next door.
+
+    ``rows`` passes in a sweep the caller already did this request (see
+    :func:`_readable_semantic_model_rows`) — same answer, no second sweep.
+    """
+    if rows is None:
+        rows = _readable_semantic_model_rows(user, conn, surface=surface)
+    return bool(rows)
+
+
+def _library_type_map(user: dict) -> list[dict]:
+    """Node types with caller-scoped counts for the Knowledge tab's head.
+
+    Fails soft on every axis, because this is a decoration on a page that
+    must render without it: the `facts` feature can be off, the app-state
+    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
+    and the graph can simply be empty. Any of those renders the Library
+    exactly as it does today, with no type map — never a 500 on the
+    caller's main inventory page.
     """
     try:
-        from app.api.semantic_models import _can_read_model
+        from app.instance_config import feature_enabled
 
-        return any(_can_read_model(user, row, conn) for row in semantic_model_repo().list_all())
-    except Exception as e:  # noqa: BLE001 - the link is best-effort
-        logger.warning("%s: semantic-model existence check failed: %s", surface, e)
-        return False
+        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+            return []
+        from src.repositories import facts_repo
+
+        counts = facts_repo().count_visible_facts_by_type(user)
+    except Exception:  # noqa: BLE001 - decoration must never break the page
+        logger.debug("library: type map unavailable", exc_info=True)
+        return []
+    return [{"type": t, "count": n} for t, n in counts.items()]
 
 
 def _library_type_map(user: dict) -> list[dict]:
@@ -2823,9 +2876,7 @@ async def library_page(
                     # An entity already published to everyone has nothing left
                     # to grant, so only a private one is shareable.
                     share_type=(
-                        ResourceType.STORE_ENTITY.value
-                        if (s.get("visibility_status") or "") != "approved"
-                        else None
+                        ResourceType.STORE_ENTITY.value if (s.get("visibility_status") or "") != "approved" else None
                     ),
                     tags=[s["category"]] if s.get("category") else [],
                     owner_key=owner_key,
@@ -3250,6 +3301,9 @@ async def library_page(
                 # (`curated_install` / `curated_uninstall`). The Library's toggle
                 # is kind-agnostic — it POSTs/DELETEs whatever the row names.
                 row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
+                # Same verb as a store entity, and for the same reason.
+                row["stack_action"] = "Install"
+                row["stack_undo"] = "Uninstall"
                 # Droppable unless an admin pinned it globally (`is_system`) or
                 # required-tier-granted it to one of the caller's groups. Those
                 # are precisely the two cases `curated_uninstall` answers 409
@@ -3440,25 +3494,30 @@ async def library_page(
         except Exception as e:
             _lost("apps", e)
 
-    # ── Definitions — the semantic layer, as a page FOOTER ────────────────
-    # Deliberately NOT rows in the list above. Metrics and glossary terms are
-    # the one thing here nobody owns, shares, installs, drops or edits: they
-    # are the organization's agreed vocabulary, maintained by an admin and
-    # readable by everyone unconditionally. Modelled as inventory they had to
-    # neuter all four of the table's columns at once — Owner said "Your
-    # workspace" (true of nothing in particular), Sharing said "Workspace" but
-    # refused to change, Stack said "In stack" but locked, Actions was empty —
-    # and four special-cased columns is the table saying the object is not one
-    # of its rows. A data package looks similar but is genuinely different:
-    # access to it VARIES per caller, which is what makes it "what I have".
-    # Everyone has the whole glossary, so there is no having involved.
+    # ── The semantic layer — a SECTION, and its two flat projections ──────
+    # This closed the page as a footer aside for one good reason and one bad
+    # one. The good one still holds: a METRIC or a glossary term is not a row
+    # here — it is the organization's agreed vocabulary, which nobody owns,
+    # shares, installs or drops, so as a row it had to neuter all four of the
+    # table's columns at once (Owner / Sharing / Stack / Actions), and four
+    # special-cased columns is the table saying the object is not one of its
+    # rows.
     #
-    # So it closes the page instead: an adjacent destination under the
-    # inventory, carrying its two counts and a door into each tab. The counts
-    # are computed here (RBAC-filtered on the metric side exactly as
-    # /catalog/semantics filters it, so the page never advertises definitions
-    # the caller cannot open); the glossary is deliberately ungated there
-    # (business vocabulary, not data), so its count is instance-wide.
+    # The bad one was treating the MODEL like the metric. A semantic model
+    # answers every one of those columns honestly — it has a source, it
+    # reaches you through a grant exactly as a Data Package does, your agents
+    # do read it, and it has a detail page — so the thing that could not be a
+    # row was never the document, only its projection. #1707 N3: the models
+    # are rows in a NAMED section at a fixed slot in the order above, and the
+    # two flat projections ride that section's band as links into their tabs
+    # on /semantic-layer (they were `/catalog/semantics#metrics` and
+    # `#glossary`; that page is now a 308 onto the same two tabs).
+    #
+    # The counts are computed here — RBAC-filtered on the metric side by the
+    # same `_first_inaccessible_table` predicate those tabs apply, so the
+    # section never advertises definitions the caller cannot open; the
+    # glossary is deliberately ungated (business vocabulary, not data), so its
+    # count is instance-wide.
     definitions_footer: dict = {}
     try:
         from app.api.metrics import _first_inaccessible_table
@@ -3505,7 +3564,50 @@ async def library_page(
         # hide the one thing this UI exists to browse. Read in its own guard so
         # a semantic_models failure leaves the metric/glossary footer already
         # computed above intact instead of suppressing it.
-        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+        #
+        # ONE `_can_read_model` sweep (the #1850 memo): the same list answers
+        # the browse gate below AND supplies the section's rows. The check
+        # resolves a model's Data Packages per row, so a second sweep would
+        # double this page's semantic-layer cost for an answer it already had.
+        _readable_models = _readable_semantic_model_rows(user, conn, surface="/library")
+        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library", rows=_readable_models)
+
+        # One row per SLUG — the newest readable row, matching what
+        # `/semantic-layer/{slug}` resolves to. Two models can share a slug
+        # (unique only per source/source_ref), and a second row would link to
+        # the same page as the first (Devin #1398).
+        _newest_by_slug: dict = {}
+        for _m in _readable_models:
+            _cur = _newest_by_slug.get(_m.get("slug"))
+            if _cur is None or str(_m.get("updated_at") or "") > str(_cur.get("updated_at") or ""):
+                _newest_by_slug[_m.get("slug")] = _m
+        for _slug, _m in sorted(_newest_by_slug.items(), key=lambda kv: str(kv[0])):
+            from app.web.semantic_layer_view import model_of, object_counts, source_label
+
+            try:
+                _counts = object_counts(model_of(_m))
+            except Exception:  # noqa: BLE001 - a stale document costs the meta line, not the row
+                _counts = {}
+            _meta = " · ".join(
+                f"{_counts[k]} {lbl}{'' if _counts[k] == 1 else 's'}"
+                for k, lbl in (("datasets", "dataset"), ("metrics", "metric"), ("glossary", "glossary term"))
+                if _counts.get(k)
+            )
+            _add_shared_row(
+                item_id=_m["id"],
+                title=_m.get("name") or _slug,
+                description=_m.get("description") or "",
+                href=f"/semantic-layer/{quote(str(_slug))}",
+                glyph="data",
+                type_key="semantic_model",
+                type_label="Semantic model",
+                origin="granted",
+                origin_label="Shared with you",
+                added=None,
+                meta_text=_meta,
+                owner_label=source_label(_m.get("source")),
+                owner_key=str(_m.get("source") or "manual"),
+            )
 
         if _visible_metrics or _glossary_terms or _has_readable_model:
             definitions_footer = {
@@ -3646,6 +3748,13 @@ async def library_page(
     # Unlisted types fall to the end, alphabetically.
     _SECTION_ORDER = [
         "data_package",
+        # Directly under the governed data, because it is what that data
+        # MEANS: the reader who has just seen "Data packages" is one line away
+        # from the definitions those tables are queried through. A FIXED slot,
+        # never the tail of the page — this was a footer aside below an
+        # unbounded list, i.e. after every row, which is where a reader stops
+        # looking (#1707 N3).
+        "semantic_model",
         "plugin",
         "skill",
         "agent",
@@ -3668,6 +3777,7 @@ async def library_page(
     _TAB_CAPABILITIES = "capabilities"
     _SECTION_TAB = {
         "data_package": _TAB_KNOWLEDGE,
+        "semantic_model": _TAB_KNOWLEDGE,
         "data_app": _TAB_KNOWLEDGE,
         "recipe": _TAB_KNOWLEDGE,
         "files": _TAB_KNOWLEDGE,
@@ -3710,6 +3820,12 @@ async def library_page(
         "agent": "Agent templates",
         "recipe": "Recipes",
         "data_package": "Data packages",
+        # The name this surface carries everywhere — the /semantic-layer page's
+        # own title, the nav label, this section (#1844). "Definitions" was the
+        # footer aside's name and is retired with it: it named the CONTENTS
+        # (metrics, terms) while the section holds the documents those are
+        # projected from.
+        "semantic_model": "Semantic models",
         "data_app": "Apps",
         "memory_domain": "Memory",
     }
@@ -3726,6 +3842,7 @@ async def library_page(
         "agent": "Assistants you installed.",
         "recipe": "Prepared analyses you can run.",
         "data_package": "Governed data you can query.",
+        "semantic_model": "What your data means — your agents answer with these.",
         "data_app": "Hosted apps running next to your data.",
         "memory_domain": "Curated organizational knowledge.",
     }
@@ -3753,6 +3870,11 @@ async def library_page(
         "agent": ("agent", "agent"),
         "recipe": ("recipe", "recipes"),
         "data_package": ("data", "data"),
+        # The `data` accent, deliberately shared with Data packages rather than
+        # given a `--ds-kind-semantic` of its own: a semantic model is a
+        # statement ABOUT the governed data, and the model cards on
+        # /semantic-layer already wear this kind (semantic_layer_list.html).
+        "semantic_model": ("data", "data"),
         "data_app": ("app", "app"),
         "memory_domain": ("memory", "memory"),
     }
@@ -3775,6 +3897,15 @@ async def library_page(
         loose = [r for r in rows if not r.get("is_folder")]
         return folders + loose
 
+    # The semantic layer is the one section that can exist with NO rows: a
+    # caller may have visible metrics and glossary terms yet no readable
+    # DOCUMENT, and the two flat projections are still theirs to open. Given
+    # its own empty band rather than dropped, because dropping it is how the
+    # footer aside's whole failure mode returns — the definitions become
+    # unreachable from the page that is supposed to inventory them.
+    if definitions_footer and "semantic_model" not in grouped:
+        grouped["semantic_model"] = []
+
     library_sections = []
     for key, rows in sorted(grouped.items(), key=lambda kv: _section_rank(kv[0])):
         kind, glyph = _SECTION_KINDS.get(key, ("library", "doc"))
@@ -3789,6 +3920,12 @@ async def library_page(
                 "rows": _section_rows(key, rows),
                 "kind": kind,
                 "glyph": glyph,
+                # Links carried by the section's own BAND rather than by any
+                # row — the flat metric/glossary projections are a destination,
+                # not inventory (see the note where `definitions_footer` is
+                # built). Only this section supplies them; every other renders
+                # its band exactly as before.
+                "defs": definitions_footer if key == "semantic_model" else None,
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
                 "count": len(rows),
@@ -4005,107 +4142,141 @@ async def skills_page(
     return templates.TemplateResponse(request, "skills.html", ctx)
 
 
-@router.get("/catalog/semantics", response_class=HTMLResponse)
-async def catalog_semantics(
-    request: Request,
-    user: dict = Depends(get_current_user),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
-    """Read-only browser for the semantic layer — business metrics
-    (`metric_definitions`) and the glossary (`glossary_terms`) in one page
-    (issue #853 + the Keboola glossary import, #920).
+def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
+    """``{metric_definitions id: object-page URL}`` for every metric of every
+    semantic model the caller can read (#1707).
 
-    Analyst-facing tier: ``get_current_user``, no admin gate and no
-    per-resource grant — matches the RBAC tier of the underlying
-    ``GET /api/metrics`` / ``GET /api/glossary*`` endpoints this page reuses,
-    and mirrors /catalog's own gate.
+    The two views of one metric — the flat registry (the model list's "All
+    metrics" tab) and the document object at
+    ``/semantic-layer/{slug}/metric:{name}`` — had
+    no link between them. The join is the projector's own id formula
+    (``app/web/semantic_layer_view.py::projected_metric_ids`` →
+    ``src/semantic/projection.py::projected_metric_id``): a row whose id is a
+    key here came out of a document object and gets the link, a hand-authored
+    or ``yaml_import`` row has no object and gets none.
 
-    Metrics are RBAC-filtered the same way ``GET /api/metrics`` is (#953):
-    a metric whose ``table_name``/``tables`` reference a table outside the
-    caller's Data Package stack is omitted before grouping, so a category
-    left with zero visible metrics never renders its header either. Glossary
-    is intentionally NOT gated this way (business vocabulary, not data).
+    ``readable_rows`` is the caller's own ``_readable_semantic_model_rows``
+    sweep — taken as an argument rather than re-swept here, because the pages
+    that want these links also want the browse-link gate off the same list.
 
-    Metrics are server-rendered (grouped by category, same reading order as
-    ``agnes catalog --metrics``) — the scale is tens-to-low-hundreds so a
-    client-side substring filter over the rendered rows is enough; no new
-    search endpoint. Glossary starts empty and is populated client-side via
-    the existing ``GET /api/glossary`` / ``GET /api/glossary/search``.
+    Built from the NEWEST readable row per slug — the row
+    ``_readable_model_by_slug`` resolves the link to — so a link this map
+    offers cannot land on a different row than the one it was computed from
+    (the same same-slug hazard the model list dedupes for, Devin #1398).
+
+    Best-effort by contract, like ``_has_readable_semantic_model``: every
+    caller renders LINKS off this, so a document that will not parse must
+    degrade to "no links" rather than 500 the page.
     """
-    from app.api.metrics import _first_inaccessible_table, stores_html
-    from app.markdown_render import render_plain, render_safe
-    from src.rbac import get_accessible_tables
+    from urllib.parse import quote
 
-    accessible_ids = get_accessible_tables(user, conn)
-    allowed = None if accessible_ids is None else set(accessible_ids)
-    metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
+    try:
+        from app.web.semantic_layer_view import object_id, projected_metric_ids
 
-    def _variants(raw) -> dict:
-        """``sql_variants`` as a mapping the template can iterate.
+        newest_by_slug: dict[str, dict] = {}
+        for row in readable_rows:
+            current = newest_by_slug.get(row["slug"])
+            if current is None or str(row.get("updated_at") or "") > str(current.get("updated_at") or ""):
+                newest_by_slug[row["slug"]] = row
 
-        The repository serializes this column on write but does not
-        deserialize on read, so it arrives as a JSON *string* — on which
-        ``.items()`` silently yields nothing in Jinja, which is how the
-        variants stayed invisible. Parsed here rather than in the repo:
-        changing the read shape there would ripple through both backends and
-        their contract tests. Anything that is not an object is dropped,
-        since the template renders one labelled block per key.
-        """
-        if isinstance(raw, str):
-            try:
-                raw = _json.loads(raw)
-            except ValueError:
-                return {}
-        return raw if isinstance(raw, dict) else {}
+        hrefs: dict[str, str] = {}
+        for slug, row in newest_by_slug.items():
+            for metric_id, metric_name in projected_metric_ids(row).items():
+                # The NAME is percent-encoded, the `<type>:` prefix is not —
+                # the route splits `object_id` on its first literal colon, so
+                # encoding the composed segment whole would 404.
+                hrefs[metric_id] = f"/semantic-layer/{quote(slug)}/{object_id('metric', quote(metric_name))}"
+        return hrefs
+    except Exception as e:  # noqa: BLE001 - the links are best-effort
+        logger.warning("/semantic-layer: metric → document link resolution failed: %s", e)
+        return {}
 
-    # Two projections of the description: sanitized HTML for the expanded
-    # detail, plain text for the one-line row preview and the client-side
-    # filter index. Metric descriptions carry the business definition; the
-    # detail must show it, not just the SQL.
-    #
-    # This column holds two dialects, and ``stores_html`` decides per row which
-    # renderer applies (keyed on the writer recorded in ``source``, never on
-    # what the text looks like — see its docstring). Rendered as pure markdown,
-    # an HTML-dialect description escaped into entities and then unescaped back
-    # into visible `<p><strong>` characters in both projections.
-    metrics = [
-        {
-            **m,
-            "description_html": render_safe(m.get("description"), html_source=stores_html(m)),
-            "description_text": render_plain(m.get("description"), html_source=stores_html(m)),
-            "sql_variants": _variants(m.get("sql_variants")),
-        }
-        for m in metrics
-    ]
-    by_category: dict[str, list[dict]] = {}
-    for m in metrics:
-        by_category.setdefault(m.get("category") or "uncategorized", []).append(m)
-    metric_categories = [
-        {"name": cat, "metrics": sorted(items, key=lambda m: m.get("name") or "")}
-        for cat, items in sorted(by_category.items())
-    ]
 
-    # Total glossary count for the tab label. GlossaryRepository.list() has
-    # no unlimited mode (deliberately, to bound a full-table scan) — 500 is
-    # the endpoint's own max `limit` (app/api/glossary.py), comfortably above
-    # the "tens-to-low-hundreds" scale this feature targets, so it's an
-    # exact count in practice rather than a true cap.
-    glossary_count = len(glossary_repo().list(limit=500))
+def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> Optional[str]:
+    """The flat-registry URL that lands on this document metric's projected
+    row — the model list's "All metrics" tab — or ``None`` when the metric
+    has no row this caller would see there (#1707).
 
-    ctx = _build_context(
-        request,
-        user=user,
-        metric_categories=metric_categories,
-        metric_count=len(metrics),
-        glossary_count=glossary_count,
-        # The door to /semantic-layer. Both pages are titled "Semantic layer"
-        # and this is the reachable one, so without the link a document with
-        # datasets and relationships but no metrics rendered as "there is no
-        # semantic layer here". Same gate /library's Definitions footer uses —
-        # a readable document, never this page's own metric/glossary counts.
-        has_semantic_models=_has_readable_semantic_model(user, conn, surface="/catalog/semantics"),
-    )
-    return templates.TemplateResponse(request, "catalog_semantics.html", ctx)
+    The return leg of ``_document_metric_hrefs``, resolved the same way: the
+    id the projector would have written for this ``(row, metric)`` either
+    exists in ``metric_definitions`` or it does not. Skipped metrics (no
+    usable expression, unresolvable binding) legitimately have no row, and a
+    link into a filter that matches nothing is worse than no link.
+
+    The row must also survive the metric RBAC filter that page applies
+    (``_first_inaccessible_table``, #953) — a caller whose Data Package stack
+    hides the projected metric's tables would land on an empty filter.
+    Nothing is leaked either way: they are already reading the metric's own
+    object page.
+
+    Best-effort for the same reason as the forward map: a repository failure
+    must cost the link, not the page.
+    """
+    from urllib.parse import quote
+
+    try:
+        from app.api.metrics import _first_inaccessible_table
+        from app.web.semantic_layer_view import projected_metric_ids
+        from src.rbac import get_accessible_tables
+
+        expected = sorted(mid for mid, name in projected_metric_ids(row).items() if name == metric_name)
+        rows = [r for r in (metric_repo().get(mid) for mid in expected) if r]
+        if not rows:
+            return None
+        accessible_ids = get_accessible_tables(user, conn)
+        allowed = None if accessible_ids is None else set(accessible_ids)
+        visible = [r for r in rows if _first_inaccessible_table(r, allowed) is None]
+        if not visible:
+            return None
+        # The filter term is the REGISTRY row's own `name`, not the document's
+        # — identical today (the projector writes one from the other), but the
+        # row can be renamed through `POST /api/admin/metrics` under the same
+        # id, and this link has to match what the All-metrics tab indexes.
+        # `expected` is sorted so a document declaring the same metric name in
+        # two models resolves to the same row on every render.
+        #
+        # The CANONICAL target since the fold (#1707 N5): the flat registry is
+        # the model list's "All metrics" tab, and the term rides `q` in the
+        # query string rather than a `#metrics` fragment — a fragment never
+        # reaches the server, so it could never have chosen the tab. The old
+        # `/catalog/semantics?q=…#metrics` shape still lands, through the 308
+        # on that route; this emitter names where the page now IS.
+        return f"/semantic-layer?tab=all_metrics&q={quote(str(visible[0].get('name') or metric_name))}"
+    except Exception as e:  # noqa: BLE001 - the link is best-effort
+        logger.warning("/semantic-layer: registry back-link resolution failed: %s", e)
+        return None
+
+
+@router.get("/catalog/semantics", response_class=HTMLResponse)
+async def catalog_semantics(request: Request, user: dict = Depends(get_current_user)):
+    """Retired page — a 308 onto the model list's "All metrics" tab (#1707 N5).
+
+    Agnes shipped two pages over one semantic layer: this flat
+    ``metric_definitions`` / ``glossary_terms`` projection, and
+    ``/semantic-layer``'s stored documents. The split was never a distinction
+    a reader could make BEFORE arriving — "metrics" lived here, "the model
+    those metrics came from" lived there, and each page's way to the other
+    was one line of prose. The projection is now two tabs of the model list
+    (``?tab=all_metrics`` / ``?tab=all_glossary``), rendered from the same two
+    tables this page read.
+
+    A 308 rather than a deletion, and a 308 rather than a 302: the method and
+    body must not be rewritten, and every bookmark, chat citation, skill
+    reference and #1850 back link keeps landing. The redirect PRESERVES the
+    query string, which is what makes the old deep links survive — they carry
+    the filter term as ``?q=<name>`` and the tab as a ``#metrics`` fragment,
+    and a fragment never reaches the server. So the tab is supplied here (the
+    metrics one, which is where every `q`-carrying link meant to go) and the
+    caller's own ``tab`` wins when they named one. The stale fragment rides
+    along untouched — the browser re-appends it — and the destination page
+    reads it only to correct ``#glossary`` onto the glossary tab.
+
+    Still behind ``get_current_user``: the destination is authenticated, and
+    an anonymous 308 into it would only move the login bounce one hop later.
+    """
+    params: list[tuple[str, str]] = [("tab", request.query_params.get("tab") or "all_metrics")]
+    params += [(k, v) for k, v in request.query_params.multi_items() if k != "tab"]
+    return RedirectResponse(url="/semantic-layer?" + urlencode(params), status_code=308)
 
 
 # ---------------------------------------------------------------------------
@@ -4160,22 +4331,69 @@ def _readable_model_by_slug(slug: str, user: dict, conn) -> Optional[dict]:
     return candidates[0]
 
 
+#: The model-list level's tabs (#1707 N5). ``models`` is the card view this
+#: page has always been; ``all_metrics`` and ``all_glossary`` are the flat
+#: ``metric_definitions`` / ``glossary_terms`` projections folded in from the
+#: retired ``/catalog/semantics``.
+#:
+#: "All", not "Metrics"/"Glossary": ONE model's tabs already carry those two
+#: names a level down (``_SEMANTIC_LAYER_TABS``), and these are a different
+#: collection — every row in the instance, including the many written by hand,
+#: by ``yaml_import`` or by a connector with no Ossie document behind them.
+#: Those rows appear on no model card, which is why folding the page in could
+#: not be deleting it.
+_SEMANTIC_LAYER_LIST_TABS = ("models", "all_metrics", "all_glossary")
+
+_SEMANTIC_LAYER_LIST_TAB_LABELS = {
+    "models": "Models",
+    "all_metrics": "All metrics",
+    "all_glossary": "All glossary",
+}
+
+
+def _glossary_terms_count() -> int:
+    """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
+    unbounded mode (it bounds a full-table scan) — comfortably above the
+    tens-to-low-hundreds scale this feature targets, so an exact count in
+    practice rather than a true cap."""
+    return len(glossary_repo().list(limit=500))
+
+
 @router.get("/semantic-layer", response_class=HTMLResponse)
 async def semantic_layer_list(
     request: Request,
+    tab: str = Query("models"),
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Level 1 — every semantic model the caller can read, with its object
-    counts, SQL dialect(s) and validation status.
+    """Level 1 — the semantic layer's front door, in three tabs.
 
-    A ``status='invalid'`` row still lists (an invalid import must be
-    visible, not silent) and renders its stored ``validation_errors``
-    instead of object counts, since an invalid document's ``document_json``
-    may be stale or absent.
+    **Models** (default) — every semantic model the caller can read, with its
+    object counts, SQL dialect(s) and validation status. A ``status='invalid'``
+    row still lists (an invalid import must be visible, not silent) and renders
+    its stored ``validation_errors`` instead of object counts, since an invalid
+    document's ``document_json`` may be stale or absent.
+
+    **All metrics** / **All glossary** — the flat ``metric_definitions`` and
+    ``glossary_terms`` projections, folded in from ``/catalog/semantics``
+    (#1707 N5, which is now a 308 onto this page). They are the SAME two
+    tables that page read, filtered by the SAME row predicate, and they hold
+    rows no model card can show.
+
+    ``q`` is the deep link's filter term, carried in the query string because
+    the fragment the old links used (``#metrics``) never reaches the server.
+    It is applied client-side over the rendered rows, exactly as it was on the
+    flat page — the scale is tens-to-low-hundreds and there is no search
+    endpoint to add.
+
+    ONE ``_can_read_model`` sweep serves all three tabs (the #1850 memo): the
+    model cards, the per-metric "Open in the model" links and the browse gate
+    are three answers off one list. The check resolves a model's Data Packages
+    per row, so a second sweep doubles the page's cost for an answer it has.
     """
-    from app.api.semantic_models import _can_read_model
     from app.web.semantic_layer_view import is_imported, model_dialects, model_of, object_counts, source_label
+
+    active_tab = tab if tab in _SEMANTIC_LAYER_LIST_TABS else "models"
 
     # One card per slug — the newest readable row, matching what the
     # drill-down (`_readable_model_by_slug`) resolves to. Two models can share
@@ -4185,10 +4403,9 @@ async def semantic_layer_list(
     # reachability — the older row is unreachable from this UI either way — and
     # removes the misleading card. Full disambiguation (both reachable) needs a
     # unique-per-row URL, the follow-up noted on `_readable_model_by_slug`.
+    readable_rows = _readable_semantic_model_rows(user, conn, surface="/semantic-layer")
     newest_by_slug: dict[str, dict] = {}
-    for row in semantic_model_repo().list_all():
-        if not _can_read_model(user, row, conn):
-            continue
+    for row in readable_rows:
         current = newest_by_slug.get(row["slug"])
         if current is None or str(row.get("updated_at") or "") > str(current.get("updated_at") or ""):
             newest_by_slug[row["slug"]] = row
@@ -4218,7 +4435,112 @@ async def semantic_layer_list(
             }
         )
 
-    ctx = _build_context(request, user=user, models=models)
+    # Both flat counts are resolved on EVERY tab, because they are the tab
+    # strip's own labels: a tab that only knows its size once you are standing
+    # on it cannot tell you whether it is worth opening. Two bounded reads, the
+    # same pair the Library's own semantic section pays for.
+    #
+    # ``_first_inaccessible_table`` (#953) is the SAME predicate the retired
+    # ``/catalog/semantics`` applied and the same one ``GET /api/metrics``
+    # applies — reused, never re-derived: a metric bound to a table outside
+    # the caller's Data Package stack is dropped before anything is grouped
+    # or counted, so a category left with zero visible metrics never renders
+    # a header either. The glossary is deliberately NOT gated this way
+    # (business vocabulary, not data), so its count is instance-wide.
+    from app.api.metrics import _first_inaccessible_table
+    from src.rbac import get_accessible_tables
+
+    accessible_ids = get_accessible_tables(user, conn)
+    allowed = None if accessible_ids is None else set(accessible_ids)
+    visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
+    glossary_count = _glossary_terms_count()
+
+    # The per-row rendering (markdown, SQL variants, document links) is paid
+    # for only by the tab that shows the rows.
+    metric_categories: list[dict] = []
+    if active_tab == "all_metrics":
+        from app.api.metrics import stores_html
+        from app.markdown_render import render_plain, render_safe
+
+        def _variants(raw) -> dict:
+            """``sql_variants`` as a mapping the template can iterate.
+
+            The repository serializes this column on write but does not
+            deserialize on read, so it arrives as a JSON *string* — on which
+            ``.items()`` silently yields nothing in Jinja, which is how the
+            variants stayed invisible. Parsed here rather than in the repo:
+            changing the read shape there would ripple through both backends
+            and their contract tests. Anything that is not an object is
+            dropped, since the template renders one labelled block per key.
+            """
+            if isinstance(raw, str):
+                try:
+                    raw = _json.loads(raw)
+                except ValueError:
+                    return {}
+            return raw if isinstance(raw, dict) else {}
+
+        # Two projections of the description: sanitized HTML for the expanded
+        # detail, plain text for the one-line row preview and the client-side
+        # filter index. Metric descriptions carry the business definition; the
+        # detail must show it, not just the SQL.
+        #
+        # This column holds two dialects, and ``stores_html`` decides per row
+        # which renderer applies (keyed on the writer recorded in ``source``,
+        # never on what the text looks like — see its docstring). Rendered as
+        # pure markdown, an HTML-dialect description escaped into entities and
+        # then unescaped back into visible `<p><strong>` characters in both
+        # projections.
+        #
+        # `model_href` is the per-row door into the document browser: set only
+        # for a row projected from a document object this caller can read,
+        # absent for a hand-authored or yaml_import metric that has no such
+        # object.
+        document_hrefs = _document_metric_hrefs(readable_rows)
+        rendered = [
+            {
+                **m,
+                "description_html": render_safe(m.get("description"), html_source=stores_html(m)),
+                "description_text": render_plain(m.get("description"), html_source=stores_html(m)),
+                "sql_variants": _variants(m.get("sql_variants")),
+                "model_href": document_hrefs.get(m.get("id")),
+            }
+            for m in visible_metrics
+        ]
+        by_category: dict[str, list[dict]] = {}
+        for m in rendered:
+            by_category.setdefault(m.get("category") or "uncategorized", []).append(m)
+        metric_categories = [
+            {"name": cat, "metrics": sorted(items, key=lambda m: m.get("name") or "")}
+            for cat, items in sorted(by_category.items())
+        ]
+
+    tab_counts = {
+        "models": len(models),
+        "all_metrics": len(visible_metrics),
+        "all_glossary": glossary_count,
+    }
+    tabs = [
+        {
+            "label": f"{_SEMANTIC_LAYER_LIST_TAB_LABELS[key]} ({tab_counts[key]})",
+            # The default tab keeps the BARE URL — one canonical address for
+            # the page, so a link to it and a click on its own tab agree.
+            "href": "/semantic-layer" if key == "models" else f"/semantic-layer?tab={key}",
+            "active": key == active_tab,
+        }
+        for key in _SEMANTIC_LAYER_LIST_TABS
+    ]
+
+    ctx = _build_context(
+        request,
+        user=user,
+        models=models,
+        active_tab=active_tab,
+        tabs=tabs,
+        metric_categories=metric_categories,
+        metric_count=len(visible_metrics),
+        glossary_count=glossary_count,
+    )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
 
 
@@ -4249,6 +4571,7 @@ async def semantic_layer_detail(
         source_label,
         warehouse_only_metric_count,
     )
+    from src.repositories import use_pg
 
     row = _readable_model_by_slug(slug, user, conn)
     if row is None:
@@ -4354,8 +4677,20 @@ async def semantic_layer_detail(
         source=row.get("source"),
         source_label=source_label(row.get("source")),
         is_imported=is_imported(row.get("source")),
+        # F3: detach/re-attach toolbar. `.get()` — these columns don't exist
+        # on a DuckDB-backed instance (A3 ratchet), so every row reads back
+        # as "synced" there, which is the correct fail-quiet UI state (the
+        # detach/reattach endpoints themselves 501 on that backend).
+        sync_mode=row.get("sync_mode") or "synced",
+        detached_at=row.get("detached_at"),
+        source_missing_since=row.get("source_missing_since"),
+        # NULL source_content_hash means no sync has run since detach yet —
+        # "unknown", not "changed" (a bare `!=` would misreport that).
+        source_changed_since_detach=row.get("source_content_hash") is not None
+        and row.get("source_content_hash") != row.get("detach_base_hash"),
         status=row.get("status"),
         validation_errors=row.get("validation_errors") or [],
+        pg_backend=use_pg(),
         active_tab=active_tab,
         tabs=tabs,
         q=q,
@@ -4367,7 +4702,20 @@ async def semantic_layer_detail(
         counts=object_counts(model),
         warehouse_only_metric_count=warehouse_only_metric_count(model),
     )
-    return templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
+    # F3: the detach/re-attach toolbar buttons POST via fetch(). Their
+    # targets are `/api/admin/**` JSON routes, so the CSRF defense that
+    # actually applies to them is the global `CsrfOriginMiddleware`
+    # (app/middleware/csrf_origin.py), which refuses a cookie-authenticated
+    # unsafe-method request that reports itself cross-origin — NOT the
+    # `_web_csrf_ok` double-submit check, which only the `/admin/**` Form
+    # handlers call. The token is minted and sent as `X-CSRF-Token` anyway so
+    # the pair keeps working if either button is ever re-pointed at a Form
+    # handler; nothing on the `/api` side reads it today.
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx["csrf_token"] = csrf_token
+    response = templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
 
 
 @router.get("/semantic-layer/{slug}/{object_id:path}", response_class=HTMLResponse)
@@ -4426,6 +4774,17 @@ async def semantic_layer_object(
         ai_instructions_and_examples(obj) if object_type in ("dataset", "metric", "relationship") else (None, [])
     )
 
+    # The way back to the flat registry (#1707): this page renders the
+    # document object, the All-metrics tab renders the projected row (the
+    # composed SQL, synonyms, source badge). Offered only when the metric
+    # actually projected — the projector skips a metric with no usable
+    # expression or an unresolvable binding, and a link to a registry that
+    # never received the row lands on an empty filter. `?q=` is the filter
+    # prefill that page's client-side search reads; `#metrics` selects the tab.
+    registry_href = None
+    if object_type == "metric":
+        registry_href = _registry_href_for_metric(row, obj.get("name") or object_name, user, conn)
+
     # Keyed case-insensitively to match find_object's resolution — otherwise a
     # relationship spelling a dataset with different casing renders as unlinked
     # text even though its target page resolves fine (Devin #1398).
@@ -4440,6 +4799,13 @@ async def semantic_layer_object(
         model_name=row.get("name") or model.get("name") or slug,
         is_imported=is_imported(row.get("source")),
         source_label=source_label(row.get("source")),
+        # A5 (#1707): this page renders through the shared detail scaffold, so
+        # the model's provenance sits in the right rail the way every other
+        # detail page carries its facts. `sync_mode` is a Postgres-only column
+        # (A3 ratchet) — a DuckDB-backed instance reads back as "synced", the
+        # same fail-quiet state the model detail page settles on.
+        source_ref=row.get("source_ref"),
+        sync_mode=row.get("sync_mode") or "synced",
         object_type=object_type,
         object_type_label=OBJECT_TYPE_LABELS[object_type],
         back_tab=OBJECT_TYPE_TAB[object_type],
@@ -4450,6 +4816,7 @@ async def semantic_layer_object(
         ai_instructions=instructions,
         ai_examples=examples,
         expressions=metric_expressions(obj) if object_type == "metric" else None,
+        registry_href=registry_href,
         from_dataset=datasets_by_name.get(str(obj.get("from") or "").casefold())
         if object_type == "relationship"
         else None,
@@ -7720,6 +8087,63 @@ def _connected_sources() -> list[str]:
     return sorted(types)
 
 
+#: How many pending auto-drafts the /admin/tables strip will count before it
+#: stops counting and says "more". A badge does not need an exact number past
+#: this point, and the page should not pay for one.
+_DRAFT_BADGE_CAP = 99
+
+
+def _pending_semantic_draft_count() -> tuple[int, bool]:
+    """How many semantic models the auto-draft sweep has proposed and nobody
+    has decided yet.
+
+    ``POST /api/admin/semantic-auto-draft-sweep`` (scheduler-driven, every 55
+    minutes) drafts a model for tables with no semantic-layer coverage and
+    files each one in the shared ``authoring_suggestions`` moderation queue as
+    the non-admin ``semantic-drafter`` identity. /admin/tables — the page whose
+    tables those are — said nothing about it, so the sweep worked and was
+    invisible unless the admin already knew the queue existed.
+
+    Scoped to the DRAFTER's own pending ``semantic-layer`` rows: a person's
+    proposal sitting in the same queue is not a table awaiting an
+    automatically suggested model, and counting it would make the strip's
+    sentence untrue.
+
+    Counted by listing rather than by a new repo method — the sweep itself
+    already reads this exact set the same way (``_pending_count`` in
+    ``app/api/semantic_models.py``), and a filtered ``count_pending`` would be
+    a new method on a frozen DuckDB↔PG pair for the sake of a strip.
+
+    CAPPED at :data:`_DRAFT_BADGE_CAP`, because a list is not a count: the
+    sweep's own call asks for 100k rows, which is fine for a job that is
+    about to spawn a chat session per row and wrong for a page render that
+    only needs a number. One row past the cap is enough to know there are
+    "more than the cap", and the strip says so.
+
+    Returns ``(count, overflowed)``. Never raises: an unreadable queue means
+    the page says nothing, not a 500.
+    """
+    try:
+        from app.auth.system_users import SEMANTIC_DRAFTER_USER_EMAIL
+        from src.repositories import authoring_suggestions_repo
+
+        rows = authoring_suggestions_repo().list(
+            status="pending",
+            domain="semantic-layer",
+            created_by=SEMANTIC_DRAFTER_USER_EMAIL,
+            # One past the cap: enough to distinguish "exactly the cap" from
+            # "more than we are willing to load for a badge".
+            limit=_DRAFT_BADGE_CAP + 1,
+        )
+    except Exception as e:  # noqa: BLE001 — an unreadable queue is not a page failure
+        logger.warning("admin tables: could not count pending semantic auto-drafts: %s", e)
+        return 0, False
+
+    if len(rows) > _DRAFT_BADGE_CAP:
+        return _DRAFT_BADGE_CAP, True
+    return len(rows), False
+
+
 @router.get("/admin/tables", response_class=HTMLResponse)
 async def admin_tables(
     request: Request,
@@ -7731,6 +8155,7 @@ async def admin_tables(
     # Branch the register-modal layout server-side so the JS doesn't have
     # to round-trip /api/admin/server-config to learn the source type.
     data_source_type = get_data_source_type() or "keboola"
+    _draft_badge = _pending_semantic_draft_count()
     ctx = _build_context(
         request,
         user=user,
@@ -7756,6 +8181,14 @@ async def admin_tables(
         # sentinel) + instance-level credential probes. See
         # `_connected_sources()`.
         connected_sources=_connected_sources(),
+        # The auto-draft sweep's queued proposals, announced on the page whose
+        # tables they describe. `studio_enabled` decides whether the strip may
+        # LINK to the moderation queue: that page redirects home when the
+        # Studio surface is off, and a call to action that bounces is worse
+        # than the sentence alone. See `_pending_semantic_draft_count`.
+        semantic_draft_pending_count=_draft_badge[0],
+        semantic_draft_pending_overflow=_draft_badge[1],
+        studio_enabled=get_studio_enabled(),
     )
     return templates.TemplateResponse(request, "admin_tables.html", ctx)
 
@@ -7958,7 +8391,7 @@ def _source_inventory(user: dict | None = None) -> dict:
     different table and the client would otherwise need four more round-trips
     per card. The strip is what makes a source card answer "is this project
     healthy AND is anyone getting its data", which previously took four pages
-    (Data sources, Tables, Sync, Semantic layer) to assemble by hand.
+    (Data sources, Tables, Sync, Semantic layer health) to assemble by hand.
 
     Per-connector by construction rather than a fixed four: the semantic cell
     is Keboola-only (the Metastore is a Keboola API) and the cost cell is
@@ -8522,17 +8955,23 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             "origin": settings.credential_source,
             "env_name": settings.credential_env,
             "set_at": settings.credential_set_at.isoformat() if settings.credential_set_at else None,
+            "auth_method": settings.auth_method,
             "error": None,
         }
-        meta = certificate_metadata(settings.private_key)
-        if meta["certificate"] is not None:
-            cert_cell.update(meta["certificate"])
+        if settings.auth_method == "client_secret":
+            # A client secret has no certificate to describe — the card
+            # renders the method label instead of thumbprint/expiry rows.
+            pass
         else:
-            # A resolvable-but-unusable certificate (no CERTIFICATE PEM
-            # block, or one that fails to parse) — distinct from `error`
-            # above, which is a settings-RESOLUTION failure, not a content
-            # one.
-            cert_cell["metadata_reason"] = meta["reason"]
+            meta = certificate_metadata(settings.private_key)
+            if meta["certificate"] is not None:
+                cert_cell.update(meta["certificate"])
+            else:
+                # A resolvable-but-unusable certificate (no CERTIFICATE PEM
+                # block, or one that fails to parse) — distinct from `error`
+                # above, which is a settings-RESOLUTION failure, not a content
+                # one.
+                cert_cell["metadata_reason"] = meta["reason"]
         cell["certificate"] = cert_cell
     except Exception as e:
         # Logged, not just rendered: this block swallowed a real type bug
@@ -8757,31 +9196,28 @@ def _keboola_credentialed() -> bool:
     return value is not None
 
 
-def _orphan_reason(connection_id: str) -> str:
-    """Why this connection dropped out of the semantic-layer sync.
+# The in-page lenses of /admin/semantic-layer: "coverage" (F4.1), "health"
+# (F4.2), "mute" (F4.3) and "feedback" (F4.5) — all four are fully built.
+_SEMANTIC_LAYER_ADMIN_TABS = ("coverage", "health", "mute", "feedback")
 
-    `_enumerate_master_sources()` skips a connection for THREE different
-    reasons, and the page reported all of them as "master token missing" — so
-    an admin whose connection was missing a stack URL, or whose token the
-    server could no longer decrypt, was sent to re-add a token that was
-    already there, and the rows still did not refresh.
-    (Devin Review on this PR.)
-    """
-    from app.api.admin_source_connections import master_secret_key
-    from src.repositories import connection_secrets_repo, source_connections_repo
+_SEMANTIC_LAYER_ADMIN_TAB_LABELS = {
+    "coverage": "Coverage",
+    "health": "Health",
+    "mute": "Mute",
+    "feedback": "Feedback",
+}
 
-    row = source_connections_repo().get(connection_id)
-    if row is None:
-        return "the connection no longer exists"
-    if not ((row.get("config") or {}).get("stack_url") or ""):
-        return "no connection URL on this project — add one at"
-    try:
-        token = connection_secrets_repo().get(master_secret_key(connection_id)) or ""
-    except Exception:  # noqa: BLE001 — an unreadable secret is itself the answer
-        return "its master token cannot be read (vault key changed?) — re-add it at"
-    if not token:
-        return "master token missing — add it at"
-    return "it did not sync on the last run — check its status at"
+# Column headers for the cross-domain grid, in the report's own order
+# (src.semantic.coverage.DOMAINS). The keys travel to the client as-is; only
+# the labels differ.
+_COVERAGE_DOMAIN_LABELS = {
+    "semantic": "Semantic",
+    "metrics": "Metrics",
+    "glossary": "Glossary",
+    "skill": "Skill",
+    "agent": "Agent",
+    "knowledge_base": "Knowledge base",
+}
 
 
 @router.get("/admin/semantic-layer", response_class=HTMLResponse)
@@ -8789,189 +9225,151 @@ async def admin_semantic_layer_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
-    """Per-source breakdown for the Keboola semantic-layer sync (#853/#920/
-    #953, task 7): one row per connection enumerated by
-    ``_enumerate_master_sources()`` (master-token Keboola projects), each
-    with its own metric/glossary counts and the last sync's per-source
-    result. NULL ``source_ref`` rows (legacy, pre-provenance) fold into the
-    default connection's row since that's the only connection legacy rows
-    can belong to. Rows whose ``source_ref`` no longer matches any
-    enumerated source (connection deleted/rotated away) surface separately
-    as "orphaned" rather than silently vanishing.
+    """Cross-source, cross-domain completeness for the semantic layer.
 
-    Master tokens are never put into the template context — only
-    name/id/stack_url leave ``_enumerate_master_sources()``.
+    REBUILT in F4.1. This was a Keboola sync-ops page — one row per
+    master-token Keboola connection, with hand-computed "connections without a
+    master token", "orphaned rows" and "legacy / unattributed" sections
+    alongside. Every one of those is gone, replaced by ONE report that asks
+    the same questions of EVERY connected source
+    (``src.semantic.coverage.compute_cross_domain_coverage``), which is why
+    this handler is now smaller than the page it replaces rather than larger:
+
+    * a Keboola connection with no owner token is a ROW in that report (the
+      wrapper fills the hole K0.5 leaves) instead of a list underneath it;
+    * the connection-scoped "orphaned" count measured stale flat
+      ``metric_definitions`` rows — projections of the canonical document, not
+      the truth — and its successor is F4.2's source-agnostic
+      "disconnected models" check over the document itself;
+    * the "legacy / unattributed" bucket is the report's synthetic
+      ``__local__`` source.
+
+    The grid itself is fetched after paint, not rendered here: the report's
+    Keboola provider makes upstream Metastore calls (the retired page already
+    refused to block on those), and the report is Postgres-only, so a DuckDB
+    instance gets an inline explanation instead of a page that will not load.
+
+    What this handler still renders server-side is what the client cannot ask
+    for: the tab shell, the Keboola sync strip, and the tagging form's
+    options — the latter straight off ``app/resource_types.py``'s
+    ``list_blocks`` delegates, the same projection /admin/access renders, so
+    the two can never disagree about what is taggable.
+
+    The Feedback tab (F4.5) is the same shape one layer down: the report queue
+    is fetched after paint (also Postgres-only, and its status filter re-queries
+    without a reload), so all this handler renders for it is the filter's
+    vocabulary — read from the API's own ``FEEDBACK_STATUSES`` rather than
+    re-typed, since a status the select offers but the endpoint rejects would
+    400 on click.
+
+    The Mute tab (F4.3) follows the same rule once more: the list of silenced
+    checks is fetched after paint, and what this handler renders is the scope
+    vocabulary the form composes from — the report's own ``DOMAINS`` and the
+    connected sources, so a scope the picker offers is always a scope something
+    is actually scored on.
     """
-    from app.api.keboola_semantic_layer_refresh import get_last_refresh_summary
-    from connectors.keboola.semantic_layer import _default_keboola_connection, _enumerate_master_sources
+    from app.api.semantic_sources_refresh import get_sync_status_summary
+    from app.resource_types import RESOURCE_TYPES, ResourceType
+    from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
+    from src.semantic.coverage import DOMAINS, LOCAL_BUCKET_ID, LOCAL_BUCKET_NAME, TAG_RESOURCE_TYPE_BY_DOMAIN
 
     ctx = _build_context(request, user=user)
 
-    metrics = metric_repo().list()
-    terms = glossary_repo().list(limit=100000)
+    requested = (request.query_params.get("tab") or "").strip().lower()
+    active_tab = requested if requested in _SEMANTIC_LAYER_ADMIN_TABS else "coverage"
 
-    def _counts(ref: Optional[str]) -> tuple[int, int]:
-        m = sum(1 for x in metrics if x.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and x.get("source_ref") == ref)
-        g = sum(1 for x in terms if x.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and x.get("source_ref") == ref)
-        return m, g
+    ctx["lens_tabs"] = [
+        {
+            "key": tab,
+            "label": _SEMANTIC_LAYER_ADMIN_TAB_LABELS[tab],
+            "href": f"/admin/semantic-layer?tab={tab}",
+            "active": tab == active_tab,
+        }
+        for tab in _SEMANTIC_LAYER_ADMIN_TABS
+    ]
+    ctx["active_tab"] = active_tab
+    ctx["coverage_domains"] = [{"key": key, "label": _COVERAGE_DOMAIN_LABELS[key]} for key in DOMAINS]
+    # The Feedback tab's filter reads the API's own vocabulary rather than a
+    # hand-typed copy: a status the select offers but the endpoint rejects
+    # would 400 on click, and one it drops would hide reports.
+    ctx["feedback_statuses"] = list(FEEDBACK_STATUSES)
 
-    raw_sources = _enumerate_master_sources()  # names/ids/stack_url only — token stripped below
-    default_conn = _default_keboola_connection()
-    default_id = default_conn["id"] if default_conn else None
-
-    summary = get_last_refresh_summary()
-    last_result = summary.get("last_result")
-    last_by_ref: dict[Any, dict] = {}
-    if isinstance(last_result, dict) and isinstance(last_result.get("sources"), list):
-        for entry in last_result["sources"]:
-            last_by_ref[entry.get("connection_id")] = entry
-
-    sources = []
-    null_absorbed = False
-    for source in raw_sources:
-        connection_id = source["connection_id"]
-        metric_count, glossary_count = _counts(connection_id)
-        if connection_id == default_id:
-            null_metric_count, null_glossary_count = _counts(None)
-            metric_count += null_metric_count
-            glossary_count += null_glossary_count
-            null_absorbed = True
-        stack_url = source["stack_url"]
-        # The stack host alone does not identify anything: several projects on
-        # one stack render as the same string, so a page listing two sources
-        # gave no way to tell which project each row's metrics came from. The
-        # project id is the only unambiguous handle Keboola offers.
-        host = urlsplit(stack_url).netloc or stack_url
-        project_id = source.get("project_id")
-        detail = host
-        if project_id is not None:
-            project_name = source.get("project_name") or "unnamed"
-            detail = f"{project_name} (project {project_id}) · {host}"
-        sources.append(
+    # The tagging form: one option group per taggable resource type, each
+    # projected by the SAME `list_blocks` delegate the RBAC grant form uses.
+    # Ordered as the report's columns are, so the picker and the grid read in
+    # the same direction.
+    tag_types = []
+    for domain in ("skill", "agent", "knowledge_base"):
+        resource_type = TAG_RESOURCE_TYPE_BY_DOMAIN[domain]
+        spec = RESOURCE_TYPES[ResourceType(resource_type)]
+        items = []
+        for block in spec.list_blocks():
+            for item in block.get("items") or []:
+                items.append(
+                    {
+                        "resource_id": item.get("resource_id"),
+                        "label": f"{block.get('name')} · {item.get('name')}" if block.get("name") else item.get("name"),
+                    }
+                )
+        tag_types.append(
             {
-                "connection_id": connection_id,
-                "label": source["name"],
-                "detail": detail,
-                "project_id": project_id,
-                "metric_count": metric_count,
-                "glossary_count": glossary_count,
-                "last": last_by_ref.get(connection_id),
+                "key": resource_type,
+                "label": spec.display_name,
+                "id_format": spec.id_format,
+                # NOT "items": Jinja resolves `tag_type.items` on a dict to
+                # dict.items (the METHOD), so the template would iterate a
+                # bound builtin and blow up at render time.
+                "resources": items,
             }
         )
+    ctx["tag_types"] = tag_types
+    ctx["tag_sources"] = [
+        {"id": c["id"], "name": c.get("name") or c["id"], "source_type": c.get("source_type") or ""}
+        for c in source_connections_repo().list()
+    ]
+    ctx["prefill_tag_source"] = request.query_params.get("tag_source") or ""
+    ctx["prefill_tag_type"] = request.query_params.get("tag_type") or ""
 
-    known_ids = {s["connection_id"] for s in raw_sources}
+    # The Mute tab's scope picker. Two selects — source and domain, each with
+    # an "any" option — compose all three scope forms (`domain:<d>`,
+    # `source:<s>`, `source:<s>:domain:<d>`) without asking the admin to learn
+    # the string grammar. The domain list is the report's own, so the picker
+    # cannot offer a domain nothing is scored on; the source list adds the
+    # synthetic local bucket, which IS a row in the report even though it is
+    # not a connection.
+    ctx["mute_domains"] = [{"key": key, "label": _COVERAGE_DOMAIN_LABELS[key]} for key in DOMAINS]
+    ctx["mute_sources"] = [{"id": LOCAL_BUCKET_ID, "label": LOCAL_BUCKET_NAME}] + [
+        {"id": source["id"], "label": source["name"] + (f" ({source['source_type']})" if source["source_type"] else "")}
+        for source in ctx["tag_sources"]
+    ]
 
-    # Every Keboola connection that exists but holds no master token. Without
-    # this the page could only say "no projects have a master token yet",
-    # which reads as "no project is connected" to an admin looking at a
-    # working Keboola connection — the state every wizard-connected instance
-    # starts in, since the master token is a SEPARATE slot from the storage
-    # token the wizard fills.
-    #
-    # Each carries WHY it isn't syncing, because "no master token" is only one
-    # of three reasons `_enumerate_master_sources()` skips a connection, and
-    # telling an admin to add a token they already added — while the real
-    # cause is a missing stack URL or a token no longer decryptable under the
-    # current AGNES_VAULT_KEY — sends them to fix the wrong thing entirely
-    # (Devin Review on #1242). `has()` is an existence check, so naming the
-    # reason costs no decrypt.
-    from app.api.admin_source_connections import master_secret_key
-    from src.repositories import connection_secrets_repo
-
-    keboola_connections = source_connections_repo().list(source_type="keboola")
-    secrets = connection_secrets_repo()
-    connections_without_master = []
-    for c in keboola_connections:
-        if c["id"] in known_ids:
-            continue
-        try:
-            has_master = secrets.has(master_secret_key(c["id"]))
-        except Exception:
-            has_master = False
-        if not has_master:
-            reason = "no master (owner) token"
-        elif not ((c.get("config") or {}).get("stack_url") or "").strip():
-            reason = "master token set, but the connection has no stack URL"
-        else:
-            reason = "master token set, but it cannot be read — AGNES_VAULT_KEY changed since it was stored"
-        connections_without_master.append({"id": c["id"], "name": c.get("name") or c["id"], "reason": reason})
-    connection_names = {c["id"]: (c.get("name") or c["id"]) for c in keboola_connections}
-
-    all_refs = {
-        m.get("source_ref")
-        for m in metrics
-        if m.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and m.get("source_ref")
-    }
-    all_refs |= {
-        t.get("source_ref") for t in terms if t.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and t.get("source_ref")
-    }
-    orphaned = []
-    for ref in sorted(all_refs - known_ids):
-        metric_count, glossary_count = _counts(ref)
-        # A ref that still names a live connection is not a mystery UUID — it
-        # is "this project lost its master token", which is both the common
-        # case and the one with an obvious next step. Only a ref with no
-        # connection left behind it stays an opaque id.
-        orphaned.append(
-            {
-                "source_ref": ref,
-                "label": connection_names.get(ref, ref),
-                "connection_exists": ref in connection_names,
-                "reason": _orphan_reason(ref) if ref in connection_names else None,
-                "metric_count": metric_count,
-                "glossary_count": glossary_count,
-            }
-        )
-
-    # NULL-source_ref rows (legacy, pre-provenance) normally fold into the
-    # default connection's row above. When the default connection has no
-    # master token — so it's never enumerated by `_enumerate_master_sources()`
-    # and never appears in `sources` — those rows would otherwise be counted
-    # nowhere: the truthy `source_ref` filter above excludes them from
-    # `all_refs` too. Surface them here instead, so they're never invisible.
-    if not null_absorbed:
-        null_metric_count, null_glossary_count = _counts(None)
-        if null_metric_count or null_glossary_count:
-            orphaned.append(
-                {
-                    "source_ref": None,
-                    "label": "legacy / unattributed",
-                    "metric_count": null_metric_count,
-                    "glossary_count": null_glossary_count,
-                }
-            )
-
-    # Datasets whose Keboola table isn't registered here, deduped across
-    # sources. Every metric hanging off one is dropped as
-    # `skipped_unresolved_table`, and until now that count went nowhere the
-    # admin could see: a sync reporting "9 glossary, 0 metrics" gave no hint
-    # that 50 metrics died on 12 unregistered tables.
-    unresolved_tables: list[str] = []
-    for entry in last_by_ref.values():
-        for tid in entry.get("unresolved_tables") or []:
-            if tid not in unresolved_tables:
-                unresolved_tables.append(tid)
-
-    ctx["sources"] = sources
-    ctx["orphaned"] = orphaned
-    ctx["connections_without_master"] = connections_without_master
-    ctx["unresolved_tables"] = sorted(unresolved_tables)
-    # Whether the list above is a SUBSET — deliberately a boolean, not a count.
-    # The list is de-duplicated across projects (two projects can report the
-    # same table) while any total would be summed per project, so the two do
-    # not measure the same thing: a table reported twice made the page claim
-    # tables were hidden when none were. And a true union total is not
-    # available, because each project's list is already capped before it gets
-    # here. So the page says a subset is shown, without a number it cannot
-    # compute honestly. (Devin Review on this PR.)
-    ctx["unresolved_tables_truncated"] = any(
-        int(e.get("unresolved_tables_total") or 0) > len(e.get("unresolved_tables") or []) for e in last_by_ref.values()
-    )
-    ctx["skipped_unresolved_total"] = sum(int(e.get("skipped_unresolved_table") or 0) for e in last_by_ref.values())
-    ctx["default_connection_id"] = default_id
-    ctx["semantic_refresh_summary"] = summary
+    # The whole-sweep status the strip renders, and what its "Sync now"
+    # button triggers: since #1707 Block 3 step 4 there is ONE scheduled
+    # semantic refresh over every registered source, not a per-connector one.
+    # Composed, not raw: the sweep summary is in-memory and therefore empty
+    # after every redeploy, so this carries a durable fallback derived from
+    # the sources' own `last_sync_at` for the strip to label as what it is.
+    ctx["semantic_refresh_summary"] = get_sync_status_summary()
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
+
+
+# Shell-only route — every dynamic bit (list/add/sync/delete) is client-fetched
+# against the existing /api/admin/semantic-sources* REST API
+# (app/api/semantic_models.py), same pattern as /admin/mcp-sources above. This
+# is upstream of /admin/semantic-layer: that page reports whether what was
+# IMPORTED is complete and healthy (cross-domain coverage/health/mute/
+# feedback); this one manages WHERE it comes from — `semantic_source` rows of
+# any kind (git/upload/connection) and any registered adapter (native/
+# keboola_metastore/snowflake_semantic/databricks_metric_views).
+@router.get("/admin/semantic-sources", response_class=HTMLResponse)
+async def admin_semantic_sources_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """List page for registered semantic sources."""
+    ctx = _build_context(request, user=user)
+    return templates.TemplateResponse(request, "admin_semantic_sources.html", ctx)
 
 
 @router.get("/admin/ontology", response_class=HTMLResponse)

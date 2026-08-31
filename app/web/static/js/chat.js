@@ -4081,7 +4081,10 @@ function _renderToolResultPreview(result, toolName) {
 
   // Already-tabular JSON shapes — render a real <table> preview.
   const table = _coerceToTablePreview(result);
-  if (table) return table;
+  if (table) {
+    _appendSemanticValidationNotice(table, result);
+    return table;
+  }
 
   // String result. Most agnes CLI tool output is Markdown-ish; let
   // marked.parse() try to render it.
@@ -4124,6 +4127,17 @@ function _renderToolResultPreview(result, toolName) {
       det.appendChild(full);
       wrap.appendChild(det);
     }
+    // `agnes query`'s real stdout is exactly this: JSON text on a Bash tool
+    // call, never pre-parsed into an object the way an MCP tool's result
+    // is — so the object-shaped check above never sees it, and this is the
+    // path most turns actually take (the workspace prompt teaches `agnes
+    // query "<SQL>"` over Bash first). Parse defensively; anything that
+    // isn't the query response shape leaves this a no-op.
+    try {
+      _appendSemanticValidationNotice(wrap, JSON.parse(result));
+    } catch (_) {
+      // Not JSON (the common case for ordinary CLI text output) — fine.
+    }
     return wrap;
   }
 
@@ -4134,7 +4148,32 @@ function _renderToolResultPreview(result, toolName) {
   const wrap = document.createElement("div");
   wrap.className = "cloud-chat-tool-result is-json";
   wrap.appendChild(_jsonPanel("Result", result, "cloud-chat-tool-json"));
+  _appendSemanticValidationNotice(wrap, result);
   return wrap;
+}
+
+/** Append a small advisory note to `wrap` when `result.semantic_validation`
+ *  carries a soft-enforce warning (`POST /api/query` and `POST /api/query
+ *  /hybrid` both set this field — see `app/api/semantic_models.py::
+ *  semantic_validation_for_query`). CLI (stderr) and the MCP tool result
+ *  already surface this; the web chat UI had no visual element for it at
+ *  all. Deliberately unobtrusive — advisory, not an error: the query
+ *  already succeeded and its rows are unaffected. No-op when the field is
+ *  absent/null/has no warnings, so a clean query renders exactly as before
+ *  this existed. */
+function _appendSemanticValidationNotice(wrap, result) {
+  if (!result || typeof result !== "object") return;
+  const sv = result.semantic_validation;
+  const warnings = sv && Array.isArray(sv.warnings) ? sv.warnings : [];
+  if (!warnings.length) return;
+
+  const note = document.createElement("div");
+  note.className = "cloud-chat-tool-result-advisory";
+  note.appendChild(iconEl("circle-alert"));
+  const text = document.createElement("span");
+  text.textContent = warnings.join(" ");
+  note.appendChild(text);
+  wrap.appendChild(note);
 }
 
 /** Try to coerce a tool result into a [{col: val}…] shape and render
@@ -4303,7 +4342,7 @@ const _PREVIEW_TOOL_NAMES = new Set([
 // claim provenance that may not exist. Citing the specific definition an
 // answer used (rather than noting that one was consulted) is issue #1134.
 const _DEFINITION_LOOKUP_TOOLS = {
-  glossary_search: { text: "Checked your organization's glossary", href: "/catalog/semantics#glossary" },
+  glossary_search: { text: "Checked your organization's glossary", href: "/semantic-layer?tab=all_glossary" },
 };
 
 function _definitionLookupLabel(toolName) {

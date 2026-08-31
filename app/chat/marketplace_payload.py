@@ -153,6 +153,19 @@ _COMPONENT_DIRS = {
 #: Where a flattened skill lands.
 _SKILLS_DEST = ".claude/skills"
 
+#: MCP server names a plugin may not supply. ``agnes`` is the name Agnes'
+#: own MCP server registers under everywhere it is configured
+#: (``app/chat/runner.py::_AGNES_MCP_SERVER_NAME``,
+#: ``app/api/cowork_bundle.py``), and a plugin that took the name would both
+#: shadow the real server — the merge below is last-wins — and inherit its
+#: standing: the chat approval gate's read-only allowlist is keyed on
+#: ``(server, tool)``, and ``app/api/kai.py`` pre-approves every server Agnes
+#: put in the flattened ``.mcp.json`` into ``enabledMcpjsonServers``. Marketplace
+#: content is admin-registered but authored elsewhere, so the name is reserved
+#: here rather than trusted. Pinned to the runner's constant by
+#: ``tests/test_chat_marketplace_payload.py``.
+RESERVED_MCP_SERVER_NAMES = frozenset({"agnes"})
+
 
 def materialize_plugin_components(
     conn: duckdb.DuckDBPyConnection,
@@ -171,7 +184,8 @@ def materialize_plugin_components(
     - ``hooks`` is the merged ``hooks`` mapping from every plugin's
       ``hooks/hooks.json``, ready to write into a settings file.
     - ``mcp_servers`` is the merged ``mcpServers`` mapping from every plugin's
-      ``.mcp.json``.
+      ``.mcp.json``, minus any entry claiming a name in
+      :data:`RESERVED_MCP_SERVER_NAMES`.
 
     Name clashes resolve last-wins in the resolver's deterministic order, the
     same rule ``merged_skills`` applies to the menu, so what the composer offers
@@ -213,7 +227,13 @@ def materialize_plugin_components(
             for name, _description, skill_md in plugin_skill_entries(root):
                 files.update(_skill_files(name, skill_md, root, bases))
             _merge_json_block(root / "hooks" / "hooks.json", "hooks", hooks, plugin)
-            _merge_json_block(root / ".mcp.json", "mcpServers", mcp_servers, plugin)
+            _merge_json_block(
+                root / ".mcp.json",
+                "mcpServers",
+                mcp_servers,
+                plugin,
+                reserved=RESERVED_MCP_SERVER_NAMES,
+            )
 
     return files, hooks, mcp_servers
 
@@ -252,11 +272,21 @@ def _plugin_roots(plugin: dict) -> Iterable[Optional[Path]]:
     return [plugin.get("plugin_dir")]
 
 
-def _merge_json_block(path: Path, key: str, into: dict, plugin: dict) -> None:
+def _merge_json_block(
+    path: Path,
+    key: str,
+    into: dict,
+    plugin: dict,
+    *,
+    reserved: "frozenset[str]" = frozenset(),
+) -> None:
     """Merge ``path``'s ``key`` object into ``into``, skipping what cannot work.
 
     Unreadable or malformed JSON is a curator's bug in one plugin; it must not
     cost the caller every other plugin's content, so it is logged and skipped.
+    An entry named in ``reserved`` is skipped for a different reason: the name
+    belongs to Agnes (see :data:`RESERVED_MCP_SERVER_NAMES`), and one plugin
+    entry losing its name must not cost the plugin its other entries either.
     """
     if not path.is_file():
         return
@@ -268,6 +298,14 @@ def _merge_json_block(path: Path, key: str, into: dict, plugin: dict) -> None:
     if not isinstance(block, dict):
         return
     for name, value in block.items():
+        if name in reserved:
+            logger.warning(
+                "marketplace payload: dropping %s entry %r from %s — that name is reserved for Agnes",
+                key,
+                name,
+                plugin.get("manifest_name"),
+            )
+            continue
         if "CLAUDE_PLUGIN_ROOT" in json.dumps(value):
             logger.warning(
                 "marketplace payload: dropping %s entry %r from %s — it needs an installed plugin root",

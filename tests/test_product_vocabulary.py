@@ -16,8 +16,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
 T = Path("app/web/templates")
 
 
@@ -30,7 +28,7 @@ def _read(name: str) -> str:
 # carry no marker of their own, so a per-line filter reports the middle of a
 # comment as rendered copy — which is exactly the false positive that would
 # teach the next author to ignore this file.
-_COMMENTS = re.compile(r"\{#.*?#\}|<!--.*?-->|/\*.*?\*/", re.S)
+_COMMENTS = re.compile(r"\{#.*?#\}|<!--.*?-->|/\*.*?\*/", re.DOTALL)
 
 
 def _rendered_lines(src: str) -> list[str]:
@@ -75,21 +73,40 @@ def test_the_connection_pills_state_a_state_and_nothing_else():
 
 def test_the_semantic_layer_token_is_referred_to_by_its_real_label():
     """The row was already renamed to `Semantic-layer token` — with the right
-    reasoning, in a comment on the row itself. This cross-reference still
-    pointed at the old label, which is worse than a collision: it sends a
-    reader looking for a row that does not exist."""
-    src = _read("admin_semantic_layer.html")
-    assert "Master token (semantic layer)" not in src
-    assert "Semantic-layer token" in src
+    reasoning, in a comment on the row itself. A cross-reference to the old
+    label is worse than a collision: it sends a reader looking for a row that
+    does not exist.
+
+    Pinned on the page that RENDERS the row (`/admin/data-sources`) rather
+    than on a page that merely pointed at it. The #1707 rebuild of
+    `/admin/semantic-layer` dropped the Keboola-specific Sources section that
+    carried the cross-reference, so the original positive assertion had no
+    copy left to hold; the decision itself is unchanged and is now pinned
+    where it is actually shown. The ban stays on both pages, so the retired
+    label cannot come back on either.
+    """
+    rendered = "\n".join(_rendered_lines(_read("admin_data_sources.html")))
+    assert "Master token (semantic layer)" not in rendered
+    assert "Semantic-layer token" in rendered
+    assert "Master token (semantic layer)" not in _read("admin_semantic_layer.html")
 
 
 def test_drift_columns_are_named_for_the_two_places_not_for_the_pipeline():
-    """This is the headline signal on the page whose whole job is reporting
-    drift. 'upstream' is a pipeline word; the reader is thinking about their
-    own system, which has a name."""
-    src = _read("admin_semantic_layer.html")
-    assert "stored / upstream" not in src
-    assert "in Agnes / in source" in src
+    """'upstream' is a pipeline word; the reader is thinking about their own
+    system, which has a name.
+
+    The columns this decision renamed lived in the per-project Sources table
+    on `/admin/semantic-layer`, which the #1707 rebuild removed outright (the
+    page is now Coverage · Health · Mute · Feedback, and no surface reports
+    per-source metric/glossary drift). There is therefore no positive copy
+    left to assert. What survives — and is what this guard was for — is the
+    ban, widened from that one page to every template's RENDERED copy: the
+    decision was that this phrasing is wrong for users anywhere, and the
+    rebuild must not be a way for it to reappear on a different page.
+    """
+    for path in sorted(T.glob("*.html")):
+        rendered = "\n".join(_rendered_lines(path.read_text(encoding="utf-8")))
+        assert "stored / upstream" not in rendered, f"{path.name} uses the retired drift-column wording"
 
 
 # ── casing and typography ──────────────────────────────────────────────────
@@ -113,8 +130,6 @@ def test_the_login_page_has_no_straight_apostrophes_in_what_it_shows():
     """One character, on the first screen anyone sees, in a repo that is
     otherwise consistently typographic."""
     offenders = [
-        line.strip()[:90]
-        for line in _rendered_lines(_read("login.html"))
-        if re.search(r"[A-Za-z]'[a-z]", line)
+        line.strip()[:90] for line in _rendered_lines(_read("login.html")) if re.search(r"[A-Za-z]'[a-z]", line)
     ]
     assert not offenders, "straight apostrophes in rendered login copy: " + "; ".join(offenders)

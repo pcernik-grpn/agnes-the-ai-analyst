@@ -851,15 +851,15 @@ class TestRailCollapsePreference:
         for anchor in ('class="rail-orb"', 'id="new-chat"', 'href="/library"', 'id="userMenuTrigger"'):
             assert anchor in text, f"collapsed rail is missing {anchor}"
 
-    def test_admin_pages_carry_the_chats_destination_not_the_conversation_region(self, seeded_app, monkeypatch) -> None:
-        """The region is NOT rendered on an admin page — its rows are text and
-        have no icon form, so the collapsed rail (the /admin default) cannot show
-        them, and both previous answers to that were worse: omitting it left the
-        hover-expanded rail with no conversations in it, rendering it left the way
-        to /chats inside a block CSS had hidden.
+    def test_admin_pages_carry_the_same_conversation_region_as_app_pages(self, seeded_app, monkeypatch) -> None:
+        """An admin page is the standard rail, collapsed (#1898 item 6).
 
-        What an admin gets instead is the Chats DESTINATION row, which has a glyph
-        and therefore survives the collapse. Contract owner:
+        The region used to be withheld here, which read as two different
+        sidebars — the conversation list on Library and Agents, a lone icon row
+        on Admin — and left a peeked rail on an admin page showing a void where
+        the lists belong. Both forms are in the markup on both pages now and the
+        rail's WIDTH picks one: the glyph row in the 56px strip, the lists once it
+        is peeked or pinned open. Contract owner:
         tests/test_ui_layout_theme.py::TestRailChatsDestination.
 
         Chat is explicitly enabled+granted (`_enable_chat`) so this is a real
@@ -868,15 +868,14 @@ class TestRailCollapsePreference:
         self._enable_chat(seeded_app)
         c = seeded_app["client"]
         admin_text = c.get("/admin/users", headers=self._auth(seeded_app["admin_token"])).text
-        assert 'id="rail-history"' not in admin_text
-        assert 'id="nav-chats"' in admin_text, "an admin must still be able to reach their conversations"
-
-        # Same caller, same grant, a non-admin rail page: the lists are there, and
-        # so are the standard rail's per-row menus (Pin/Rename/Delete).
         lib_text = c.get("/library", headers=self._auth(seeded_app["admin_token"])).text
-        assert 'id="rail-history"' in lib_text
-        assert 'id="nav-chats"' in lib_text
-        assert "js/components/chat_row_menu.js" in lib_text
+        for text in (admin_text, lib_text):
+            assert 'id="rail-history"' in text
+            assert 'id="nav-chats"' in text, "an admin must still be able to reach their conversations"
+            # The rows are the standard rail's rows, so the standard rail's
+            # per-row menu (Pin/Rename/Delete) ships with them.
+            assert "js/components/chat_row_menu.js" in text
+            assert "js/rail_history.js" in text
 
     def test_the_analyst_onboarding_row_is_not_on_admin_pages(self, seeded_app, monkeypatch) -> None:
         """It measures the ANALYST's journey, and it is the only element in the
@@ -1333,9 +1332,13 @@ class TestDataLensFlowStrip:
         """ "Semantic" is an adjective with no noun, and "Packages" collides
         with the marketplace's plugin packages — both shipped with a caption
         under them explaining what they meant, which is the tell that the name
-        was doing too little. The names carry it now; there are no captions."""
+        was doing too little. The names carry it now; there are no captions.
+
+        The tab is "Semantic layer health" rather than plain "Semantic layer"
+        because three pages wore the latter at once — see
+        tests/test_semantic_page_names_contract.py."""
         tabs = self._data_tabs()
-        semantic = next(t for t in tabs if t["label"] == "Semantic layer")
+        semantic = next(t for t in tabs if t["label"] == "Semantic layer health")
         assert semantic["chain"] is False
 
     def test_no_tab_carries_a_purpose_caption(self) -> None:

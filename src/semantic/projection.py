@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from src.repositories import column_metadata_repo, glossary_repo, metric_repo
 from src.semantic.dialect import resolve_expression_any
@@ -95,27 +95,261 @@ def _agnes_payload(obj: dict) -> dict:
     return merged
 
 
-def _table_binder():
-    """Return ``resolve(table_id) -> view_name | None`` over the registered
-    Keboola tables, or ``None`` when nothing is registered.
+def _resolve_keboola_table_row(table_ref: str, lookup: dict) -> dict | None:
+    """The ``table_registry`` row a raw Keboola tableId (``bucket.table``)
+    resolves to, via the ``(bucket, table) -> view name`` ``lookup``
+    (:func:`connectors.keboola.semantic_layer.table_lookup_from_registry`).
 
-    The binding path is Keboola-shaped today by construction: the metastore
-    adapter is the only one that writes a `dataset` key, and its value is a
-    Keboola tableId. Imported lazily and behind this one seam so the core
-    projector keeps no import-time dependency on a connector, and so a second
-    adapter can be given its own resolver here rather than at every callsite.
-    Never raises: an instance with no Keboola tables simply binds nothing.
+    The one place that turns a Keboola tableId match into the row a caller
+    needs — shared by :func:`resolve_dataset_table` (a one-off caller, which
+    builds ``lookup`` fresh per call) and :func:`_table_binder`'s per-metric
+    closure (which builds ``lookup`` ONCE for the whole
+    :func:`project_document` call and reuses it here), so there is exactly
+    one Keboola dataset-resolution implementation, not two.
     """
-    try:
-        from connectors.keboola.semantic_layer import resolve_table_name, table_lookup_from_registry
-        from src.repositories import table_registry_repo
+    from connectors.keboola.semantic_layer import resolve_table_name
+    from src.repositories import table_registry_repo
 
-        lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola"))
+    view_name = resolve_table_name(table_ref, lookup)
+    if not view_name:
+        return None
+    return table_registry_repo().get_by_name(view_name)
+
+
+def _generic_table_lookup() -> dict[tuple[str, str], str]:
+    """``{(bucket, source_table): agnes_view_name}`` built from EVERY
+    registered table, any ``source_type`` — the generic, non-Keboola sibling
+    of :func:`connectors.keboola.semantic_layer.table_lookup_from_registry`
+    (which is scoped to ``source_type == "keboola"`` and normalizes
+    ``source_table`` against a Keboola-only wizard quirk).
+
+    Keys are case-folded: ``--bucket``/``--source-table``
+    (``cli/commands/admin.py``) are source-type-agnostic labels stored
+    verbatim at registration time, but a Snowflake dataset's ``source`` is
+    composed from its information-schema identifiers
+    (``connectors/snowflake/semantic_ossie.py::_compose_dataset``), which
+    Snowflake emits UPPERCASE unless the object was created quoted. A
+    registered row and the document's identifier can disagree in case for
+    the very same table, so the comparison must fold both sides rather than
+    assume either preserves a particular case. Built fresh once per
+    :func:`project_document` call, same cost posture as the Keboola lookup
+    it sits alongside.
+    """
+    from src.repositories import table_registry_repo
+
+    lookup: dict[tuple[str, str], str] = {}
+    for row in table_registry_repo().list_all():
+        bucket = row.get("bucket")
+        source_table = row.get("source_table")
+        name = row.get("name")
+        if bucket and source_table and name:
+            lookup.setdefault((bucket.casefold(), source_table.casefold()), name)
+    return lookup
+
+
+def _resolve_generic_table_row(table_ref: str, lookup: dict) -> dict | None:
+    """The ``table_registry`` row a table identifier resolves to via a
+    generic LAST-TWO-SEGMENTS split — the Snowflake/Databricks-shaped
+    sibling of :func:`_resolve_keboola_table_row`.
+
+    Unlike a Keboola tableId (``bucket.table``, where ``bucket`` itself may
+    contain dots and so must be split on the LAST dot only), a
+    Snowflake/Databricks identifier is ``database.schema.table`` (3+
+    segments, no embedded dots within a segment) — so the right split here
+    is the two segments closest to the table, not the first dot. E.g.
+    ``ESHOP_DEMO.RAW.ORDERS`` matches a row registered with
+    ``bucket="RAW"``, ``source_table="ORDERS"``, ignoring the leading
+    ``ESHOP_DEMO`` database/catalog segment. A 1-segment identifier (no dot
+    at all) never matches, mirroring :func:`resolve_table_name`'s own guard.
+    The split segments are case-folded before the lookup, matching
+    :func:`_generic_table_lookup`'s case-folded keys.
+    """
+    from src.repositories import table_registry_repo
+
+    parts = table_ref.split(".")
+    if len(parts) < 2:
+        return None
+    bucket, source_table = parts[-2], parts[-1]
+    name = lookup.get((bucket.casefold(), source_table.casefold()))
+    if not name:
+        return None
+    return table_registry_repo().get_by_name(name)
+
+
+def resolve_dataset_table(dataset: dict, source: str, conn=None) -> str | None:
+    """The ``table_registry.id`` a dataset resolves to, or ``None`` when it
+    can't be resolved — source-agnostic, used by both the metric-binding
+    leg of :func:`project_document` (via :func:`_table_binder`) and
+    :func:`src.semantic_coverage.tables_without_semantic_coverage`.
+
+    ``source`` is the document's own provenance (``semantic_models.source``,
+    e.g. ``"keboola_metastore"``, ``"manual"``, ``"ossie_git"``):
+
+    - ``source == "keboola_metastore"``: the Keboola metastore adapter
+      composes a dataset's ``source`` field as the raw Keboola tableId
+      (``bucket.table`` — see ``connectors/keboola/semantic_ossie.py::
+      _compose_dataset``), never the registered Agnes name. Resolved via
+      the existing ``table_lookup_from_registry()`` ->
+      ``resolve_table_name()`` chain (see :func:`_resolve_keboola_table_row`).
+    - every other source: tried in order —
+
+      1. ``dataset.source`` (falling back to ``dataset.name``) matched
+         LITERALLY against ``table_registry.id`` then ``table_registry.name``
+         — correct for a genuinely-Agnes-native identifier (see the module
+         docstring note near ``_MANUAL_DOCUMENT_SOURCE``: a manual dataset's
+         ``source`` IS an Agnes table id in that case).
+      2. When step 1 misses: the same generic multi-segment fallback
+         :func:`_table_binder` uses (:func:`_generic_table_lookup` +
+         :func:`_resolve_generic_table_row`) — a Snowflake/Databricks-shaped
+         identifier (``schema.table`` or ``database.schema.table``) matched
+         against EVERY registered table's ``(bucket, source_table)``,
+         regardless of ``source_type``. This is what lets a hand-authored/
+         uploaded model's dataset (e.g. ``ESHOP_DEMO.RAW.ORDERS``) resolve to
+         a table registered via ``agnes admin register-table --bucket RAW
+         --source-table ORDERS``.
+
+      The Keboola path above and the ``dataset.source``-before-``.name``
+      priority are both unchanged by this fallback.
+
+    ``conn`` is accepted for signature stability (mirrors
+    ``app.auth.scheduler_token.ensure_scheduler_user``) — actual repo access
+    goes through the ``*_repo()`` factory, never a raw connection, so a
+    Postgres-backed instance resolves correctly too.
+    """
+    del conn
+    table_ref = dataset.get("source") or dataset.get("name") or ""
+    if not table_ref:
+        return None
+
+    from src.repositories import table_registry_repo
+
+    if source == "keboola_metastore":
+        try:
+            from connectors.keboola.semantic_layer import table_lookup_from_registry
+
+            lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola"))
+        except Exception:  # pragma: no cover - a registry read failure must not raise
+            return None
+        if not lookup:
+            return None
+        row = _resolve_keboola_table_row(table_ref, lookup)
+        return row["id"] if row else None
+
+    row = table_registry_repo().get(table_ref) or table_registry_repo().get_by_name(table_ref)
+    if row:
+        return row["id"]
+
+    # Generic fallback: this is a one-off, single-dataset call (unlike
+    # _table_binder's per-metric closure reusing one lookup across a whole
+    # project_document() call), so the lookup is built fresh here, on miss
+    # only — the same cost posture the keboola_metastore branch above
+    # already has (it also builds its lookup fresh per call). Callers of
+    # resolve_dataset_table walk one dataset at a time (per model, per
+    # coverage/autodraft pass), not a routine per-row sync, so an extra
+    # registry scan per unresolved dataset is an acceptable cost here.
+    try:
+        generic_lookup = _generic_table_lookup()
+    except Exception:  # pragma: no cover - a registry read failure must not raise
+        return None
+    if not generic_lookup:
+        return None
+    row = _resolve_generic_table_row(table_ref, generic_lookup)
+    return row["id"] if row else None
+
+
+def _column_table_id(dataset: dict, source: str) -> str:
+    """The ``column_metadata`` table-id key one dataset's fields write
+    under — :func:`resolve_dataset_table`'s result, falling back to the raw
+    ``dataset.source``/``.name`` on a miss, EXCEPT for ``source == 'manual'``
+    (never resolved).
+
+    A manual dataset's ``source`` is already an Agnes table id by
+    convention (see :data:`_MANUAL_DOCUMENT_SOURCE`'s note near the top of
+    this module) — running it through resolution anyway can silently shift
+    the key it lands under (``table_registry.id`` is derived from ``name``,
+    e.g. ``request.name.strip().lower().replace(" ", "_")`` in
+    ``app/api/admin.py``, so the two diverge whenever a table's display name
+    has spaces/uppercase) or, on a literal-match miss, match an unrelated
+    table via the generic multi-segment fallback that manual documents never
+    went through before this helper existed — orphaning existing rows under
+    the old raw key either way. The three callers that key ``column_
+    metadata`` (the write leg of :func:`project_document`, :func:`prune_model`,
+    :func:`_sibling_column_claims`) must all agree on this key, so they share
+    this one function rather than repeating the ``source``-gated ternary.
+
+    TODO(perf, Devin PR #1673): each call rebuilds `resolve_dataset_table`'s
+    whole table-registry lookup from scratch (`list_by_source()` for
+    Keboola, `_generic_table_lookup()` otherwise) — this function is called
+    once per dataset, so one `project_document`/`prune_model` call over N
+    models × M datasets does O(N*M) full registry scans instead of the ONE
+    the metric leg's `_table_binder()` gets away with by building its lookup
+    once and reusing it. Not a correctness bug (registries are small; a
+    routine sync stays well within one request), but the fix is to build the
+    lookup(s) once per outer call and thread them through here, in
+    `prune_model`, and in `_sibling_column_claims`, mirroring `_table_binder`.
+    """
+    raw_table_id = dataset.get("source") or dataset.get("name") or ""
+    if source == _MANUAL_DOCUMENT_SOURCE:
+        return raw_table_id
+    return resolve_dataset_table(dataset, source) or raw_table_id
+
+
+def _table_binder():
+    """Return ``resolve(table_id) -> view_name | None`` over every registered
+    table this instance knows how to bind against, or ``None`` when nothing
+    is registered.
+
+    Two identifier shapes, tried in order, so an existing Keboola binding
+    can never regress:
+
+    1. **Keboola tableId** (``bucket.table``, ``bucket`` itself possibly
+       dotted — e.g. ``in.c-shop.orders``): resolved via
+       :func:`_resolve_keboola_table_row` against tables registered with
+       ``source_type='keboola'``, exactly as before this function grew a
+       second path. The metastore adapter is still the only writer that
+       composes a `dataset` key this way.
+    2. **Generic multi-segment identifier** (``schema.table`` or
+       ``database.schema.table`` — Snowflake/Databricks shape, e.g.
+       ``ESHOP_DEMO.RAW.ORDERS``): tried only when the Keboola path above
+       didn't resolve, via :func:`_resolve_generic_table_row` against EVERY
+       registered table regardless of ``source_type`` (a hand-authored/
+       uploaded model has no adapter-known provenance to route on ahead of
+       time).
+
+    Imported lazily and behind this one seam so the core projector keeps no
+    import-time dependency on a connector. Never raises: an instance with no
+    registered tables at all simply binds nothing.
+
+    Both lookup dicts are built ONCE here (not per metric), so a routine sync
+    of a few hundred metrics stays two registry scans, not hundreds; each
+    metric's ``resolve(table_id)`` call then costs at most one extra indexed
+    ``table_registry`` point-lookup (name -> row) per attempted shape.
+    """
+    from src.repositories import table_registry_repo
+
+    kb_lookup = None
+    try:
+        from connectors.keboola.semantic_layer import table_lookup_from_registry
+
+        kb_lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola")) or None
     except Exception:  # pragma: no cover - a registry read failure must not lose metrics
+        kb_lookup = None
+
+    try:
+        generic_lookup = _generic_table_lookup() or None
+    except Exception:  # pragma: no cover - a registry read failure must not lose metrics
+        generic_lookup = None
+
+    if not kb_lookup and not generic_lookup:
         return None
-    if not lookup:
-        return None
-    return lambda table_id: resolve_table_name(table_id, lookup)
+
+    def resolve(table_id: str) -> str | None:
+        row = _resolve_keboola_table_row(table_id, kb_lookup) if kb_lookup else None
+        if row is None and generic_lookup:
+            row = _resolve_generic_table_row(table_id, generic_lookup)
+        return row["name"] if row else None
+
+    return resolve
 
 
 def _keboola_lookups():
@@ -161,7 +395,7 @@ def _relationship_lookup_from_model(model: dict) -> dict:
 
 def _bind_metric(
     fragment: str, table_id: str, binder, kb_lookups, rel_lookup: dict
-) -> Optional[tuple[str, Optional[str], Optional[list]]]:
+) -> tuple[str, str | None, list | None] | None:
     """Resolve one metric's SQL against its declared table binding.
 
     Returns ``(sql, table_name, tables)`` or ``None`` (caller SKIPS). Four
@@ -205,7 +439,7 @@ def _bind_metric(
     return compose_sql(fragment, table_name), table_name, None
 
 
-def _constraints_for(metric_name: str, constraints: list) -> Optional[dict]:
+def _constraints_for(metric_name: str, constraints: list) -> dict | None:
     """The `validation` payload for one metric — the constraints whose
     `metrics[]` names it. Mirrors the legacy importer's `merge_constraints`
     output shape, which `agnes catalog --metrics --show` already renders."""
@@ -222,6 +456,45 @@ def _constraints_for(metric_name: str, constraints: list) -> Optional[dict]:
     return {"rules": rules} if rules else None
 
 
+def _check_name_collision(metric_name: str, metric_id: str, source: str, source_ref: str | None) -> bool:
+    """True when ``metric_name`` is already held by a DIFFERENT metric id
+    from a DIFFERENT (source, source_ref) scope — logged as a WARN, never a
+    skip.
+
+    ``metric_definitions.name`` has no unique constraint (unlike ``id``, its
+    primary key): two writers describing a metric with the same display name
+    both get their own row. That is a pre-existing gap this projector does
+    not close (closing it needs a product decision — which writer wins, or
+    whether both should even be allowed — out of scope here); this is the
+    "don't over-build it" minimum: a same-transaction check that surfaces the
+    collision instead of the write silently proceeding unremarked, so an
+    operator investigating an ambiguous `agnes catalog --metrics` lookup by
+    name has a log line pointing at both ids involved. Scoped on
+    ``(source, source_ref)``, not ``source`` alone: two source_refs of the
+    SAME source (e.g. two Keboola projects) are two independent writers too —
+    each owns its own prune scope and its own metric id — so a name they both
+    happen to use is exactly as ambiguous as one shared across sources.
+    """
+    existing = metric_repo().find_by_name(metric_name)
+    if existing is None or existing.get("id") == metric_id:
+        return False
+    if (existing.get("source") or "") == source and (existing.get("source_ref") or "") == (source_ref or ""):
+        return False
+    logger.warning(
+        "Semantic projection (%s/%s): metric name %r is already used by metric id %r from source %r "
+        "(source_ref=%r); writing %r as a separate row — metric_definitions.name has no uniqueness "
+        "constraint, so both rows will exist and a name-only lookup may be ambiguous.",
+        source,
+        source_ref,
+        metric_name,
+        existing["id"],
+        existing.get("source"),
+        existing.get("source_ref"),
+        metric_id,
+    )
+    return True
+
+
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -232,7 +505,7 @@ def _slugify(text: str) -> str:
     return _NON_ALNUM_RE.sub("_", text.lower()).strip("_")
 
 
-def _scoped_id(source: str, source_ref: Optional[str], *parts: str) -> str:
+def _scoped_id(source: str, source_ref: str | None, *parts: str) -> str:
     """A stable id unique per (source, source_ref, *parts) — re-projecting the
     same document produces the same ids (upsert, not duplicate); two
     source_refs of the same source never collide even when their models or
@@ -266,6 +539,22 @@ def _model_key(model: dict) -> str:
     return model.get("name") or ""
 
 
+def projected_metric_id(source: str, source_ref: str | None, model: dict, metric_name: str) -> str:
+    """The ``metric_definitions.id`` :func:`project_document` writes for
+    ``metric_name`` of ``model`` — the writer's own formula, exposed so a
+    READER can map a flat row back to the document object it came from.
+
+    The stored id is ``<source>/<source_ref or '_'>/<model key>/<name>``, and
+    every one of those parts may itself contain a ``/`` (a metric name, a
+    Keboola-style source_ref), so splitting a stored id apart is ambiguous.
+    Recomputing it from the document is not: the UI deep link
+    (the All-metrics tab → ``/semantic-layer/{slug}/metric:{name}``) asks
+    this function for the id it would expect and matches on equality, which
+    keeps the link tied to the writer rather than to a parse of its output.
+    """
+    return _scoped_id(source, source_ref, _model_key(model), metric_name)
+
+
 @dataclass
 class ProjectionReport:
     metrics_written: int = 0
@@ -273,6 +562,13 @@ class ProjectionReport:
     columns_written: int = 0
     metrics_pruned: int = 0
     glossary_pruned: int = 0
+    # A written metric's NAME already belonged to a different id under a
+    # different source (see `_check_name_collision`) — `metric_definitions
+    # .name` has no uniqueness constraint (Task: "don't over-build this"), so
+    # this is a same-transaction, non-blocking check: the metric is still
+    # written under its own id, both rows exist, and this only counts how
+    # often that happened this pass.
+    name_collisions: int = 0
     skipped: list[dict] = field(default_factory=list)
     # Metrics that DID project (they're in `metric_definitions`, counted in
     # `metrics_written` too) but whose only declared expression is a
@@ -293,7 +589,7 @@ def _synonyms_of(ai_context: Any) -> list[str]:
     return []
 
 
-def _model_synonyms(model: dict) -> Optional[list[str]]:
+def _model_synonyms(model: dict) -> list[str] | None:
     """Model-level and dataset-level `ai_context.synonyms`, combined onto
     every metric of the model.
 
@@ -349,7 +645,7 @@ def project_document(
     document_json: dict,
     *,
     source: str,
-    source_ref: Optional[str],
+    source_ref: str | None,
     safe_prune: bool = False,
     partial: bool = False,
 ) -> ProjectionReport:
@@ -458,7 +754,7 @@ def project_document(
             # into a runnable `SELECT ... FROM ...` (or a JOIN). The legacy
             # composer stored this alongside the composed `sql` as
             # `metric_definitions.expression`; kept here so the "Expression"
-            # block in catalog_semantics.html still has something to render.
+            # block on the model list's All-metrics tab still has something to render.
             fragment = sql
             table_id = _agnes_payload(metric).get("dataset") or ""
             if locally_runnable:
@@ -489,7 +785,12 @@ def project_document(
                     "(remote query or a materialized row) on the source warehouse."
                 ]
                 report.warehouse_only.append({"kind": "metric", "name": metric_name, "dialect": dialect_name})
-            metric_id = _scoped_id(source, source_ref, model_key, metric_name)
+            # Through the public helper, not `_scoped_id` inline: the readers
+            # that map a flat row back to its document object call the same
+            # function, so the two cannot drift.
+            metric_id = projected_metric_id(source, source_ref, model, metric_name)
+            if _check_name_collision(metric_name, metric_id, source, source_ref):
+                report.name_collisions += 1
             metric_repo().create(
                 id=metric_id,
                 name=metric_name,
@@ -510,44 +811,46 @@ def project_document(
             report.metrics_written += 1
 
         for dataset in model.get("datasets") or []:
-            # Deliberately NOT resolved through the table binder to the Agnes
-            # view name (unlike the metric leg above). `column_metadata` is
-            # keyed `(table_id, column_name)` with a single `source` column —
-            # no source dimension — so writing under the view name collides
-            # with rows the profiler / import_proposal / admin already own
-            # there: Keboola fields frequently have `description=None`, so
-            # every sync would blank a previously-authored description and
-            # re-stamp `source='keboola_metastore'`, and `_prune_columns` then
-            # deletes it outright. Surfacing Keboola per-column descriptions
-            # under the view name is deferred pending an ownership-aware
-            # design for that key; for now this write is inert for Keboola
-            # (nothing reads the raw tableId) but harmless.
-            table_id = dataset.get("source") or dataset.get("name") or ""
+            # `_column_table_id` keys this the same way `prune_model` and
+            # `_sibling_column_claims` do — see its docstring for why
+            # `source == 'manual'` is never resolved.
+            table_id = _column_table_id(dataset, source)
             field_names = written_columns_by_table.setdefault(table_id, set())
             for column in dataset.get("fields") or []:
                 column_name = column.get("name")
                 if not column_name:
                     continue
-                if column_source != source:
-                    # Manual path only (`_column_source` remapped it): a
-                    # manual dataset's `source` is an Agnes table id, i.e.
-                    # the SAME `(table_id, column_name)` key the admin
-                    # metadata API, the profiler and ai_enrichment write.
-                    # A row any of those already owns wins — the upsert
-                    # would otherwise silently overwrite an admin-authored
-                    # description (frequently blanking it, since model
-                    # fields often carry none). Skipped rows are also out
-                    # of `_prune_columns`'s reach, which is scoped to
-                    # `column_source`.
-                    existing = column_metadata_repo().get(table_id, column_name)
-                    if existing is not None and (existing.get("source") or "") != column_source:
-                        continue
+                # An existing row owned by a DIFFERENT writer (profiler, the
+                # admin metadata API, ai_enrichment, or another semantic-layer
+                # source) always wins over this projection's write. This used
+                # to be gated to the manual path only (whose raw dataset id
+                # was already a live Agnes table id, `_column_source`
+                # remapped), but resolving `table_id` above now lets ANY
+                # source's projection land on an id another writer already
+                # owns — so the guard runs unconditionally. Without it, a
+                # Keboola field with `description=None` (the common case)
+                # would silently blank a previously-authored description on
+                # every sync, and `_prune_columns` would then delete it
+                # outright. Skipped rows are also out of `_prune_columns`'s
+                # reach, which is scoped to `column_source`.
+                existing = column_metadata_repo().get(table_id, column_name)
+                if existing is not None and (existing.get("source") or "") != column_source:
+                    continue
                 column_metadata_repo().save(
                     table_id=table_id,
                     column_name=column_name,
                     basetype=column.get("datatype"),
                     description=column.get("description"),
                     source=column_source,
+                    # Recorded here since the column was added; `_prune_columns`
+                    # additionally SCOPES on it, on Postgres only (DuckDB's
+                    # frozen app-state schema has no such column) — see its
+                    # docstring. The precedence guard above still compares
+                    # `source` alone: it decides ownership between DIFFERENT
+                    # writer kinds (profiler vs. this projection), a question
+                    # `source_ref` (which only distinguishes two instances of
+                    # the SAME writer kind) does not answer.
+                    source_ref=source_ref,
                 )
                 field_names.add(column_name)
                 report.columns_written += 1
@@ -612,9 +915,9 @@ def project_document(
                 source_ref,
             )
         else:
-            _prune_columns(column_source, written_columns_by_table, keep_by_table=sibling_claims)
+            _prune_columns(column_source, written_columns_by_table, keep_by_table=sibling_claims, source_ref=source_ref)
     else:
-        _prune_columns(column_source, written_columns_by_table)
+        _prune_columns(column_source, written_columns_by_table, source_ref=source_ref)
 
     if report.glossary_written or report.glossary_pruned:
         glossary_repo().refresh_search_index()
@@ -622,7 +925,7 @@ def project_document(
     return report
 
 
-def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) -> ProjectionReport:
+def prune_model(document_json: dict, *, source: str, source_ref: str | None) -> ProjectionReport:
     """Delete everything :func:`project_document` previously wrote for the
     model(s) declared in ``document_json`` — the write path's inverse, for
     when the document ITSELF is being deleted (not merely re-projected
@@ -668,7 +971,7 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
         report.glossary_pruned += _prune_glossary(source, source_ref, set(), scope_prefixes={prefix})
 
         written_by_table = {
-            (dataset.get("source") or dataset.get("name") or ""): set()
+            _column_table_id(dataset, source): set()
             for dataset in model.get("datasets") or []
             if isinstance(dataset, dict)
         }
@@ -677,7 +980,9 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
             # model's rows live under `MANUAL_MODEL_COLUMN_SOURCE`, so this
             # prune deletes exactly what `project_document` wrote and can
             # never reach an admin-authored `source='manual'` row.
-            _prune_columns(_column_source(source), written_by_table, keep_by_table=sibling_claims)
+            _prune_columns(
+                _column_source(source), written_by_table, keep_by_table=sibling_claims, source_ref=source_ref
+            )
 
     if report.glossary_pruned:
         glossary_repo().refresh_search_index()
@@ -686,8 +991,8 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
 
 
 def _sibling_column_claims(
-    source: str, source_ref: Optional[str], exclude_model_keys: set[str]
-) -> Optional[dict[str, set[str]]]:
+    source: str, source_ref: str | None, exclude_model_keys: set[str]
+) -> dict[str, set[str]] | None:
     """``table_id -> field names`` still claimed by the OTHER currently-stored
     valid models of this ``(source, source_ref)`` scope — the column prune's
     analogue of the ``model_prefixes`` narrowing the metric/glossary prunes
@@ -737,7 +1042,7 @@ def _sibling_column_claims(
             for dataset in model.get("datasets") or []:
                 if not isinstance(dataset, dict):
                     continue
-                table_id = dataset.get("source") or dataset.get("name") or ""
+                table_id = _column_table_id(dataset, source)
                 names = claims.setdefault(table_id, set())
                 for column in dataset.get("fields") or []:
                     if isinstance(column, dict) and column.get("name"):
@@ -745,7 +1050,7 @@ def _sibling_column_claims(
     return claims
 
 
-def _in_prune_scope(row_id: str, scope_prefixes: Optional[set[str]]) -> bool:
+def _in_prune_scope(row_id: str, scope_prefixes: set[str] | None) -> bool:
     """Whether an in-(source, source_ref) row is also inside the narrowed
     prune scope. ``None`` means "no narrowing" — the whole (source,
     source_ref), which is what reclaims a model deleted upstream. A set of id
@@ -758,11 +1063,11 @@ def _in_prune_scope(row_id: str, scope_prefixes: Optional[set[str]]) -> bool:
 
 def _prune_metrics(
     source: str,
-    source_ref: Optional[str],
+    source_ref: str | None,
     written: set[str],
     *,
     safe_prune: bool = False,
-    scope_prefixes: Optional[set[str]] = None,
+    scope_prefixes: set[str] | None = None,
 ) -> int:
     repo = metric_repo()
     in_scope = {
@@ -794,11 +1099,11 @@ def _prune_metrics(
 
 def _prune_glossary(
     source: str,
-    source_ref: Optional[str],
+    source_ref: str | None,
     written: set[str],
     *,
     safe_prune: bool = False,
-    scope_prefixes: Optional[set[str]] = None,
+    scope_prefixes: set[str] | None = None,
 ) -> int:
     repo = glossary_repo()
     # No list_all(): list(limit=...) with a high ceiling is the established
@@ -829,20 +1134,39 @@ def _prune_glossary(
 def _prune_columns(
     source: str,
     written_by_table: dict[str, set[str]],
-    keep_by_table: Optional[dict[str, set[str]]] = None,
+    keep_by_table: dict[str, set[str]] | None = None,
+    *,
+    source_ref: str | None = None,
 ) -> None:
     """Prune fields dropped from a table this document still mentions.
 
-    ``column_metadata`` has no ``source_ref`` column (schema predates this
-    task and Task 7 does not migrate it), so this can only scope on
-    ``(table_id, source)`` — the finest boundary the current schema
-    supports. Two source_refs of the same ``source`` describing the exact
-    same ``table_id`` can still prune each other's fields here; that gap
-    pre-dates this task and needs a schema change to close, not a projector
-    change. It also only prunes tables the document still lists — a dataset
-    dropped from the document entirely (not just emptied of fields) leaves
-    its old columns in place, since there is no ``column_metadata`` read
-    that enumerates "every table a given source has ever written to".
+    Scoped on ``(table_id, source)`` on DuckDB, and ``(table_id, source,
+    source_ref)`` on Postgres. The two backends genuinely differ here rather
+    than one being a stricter version of the other: the frozen DuckDB
+    app-state schema (A3) has no ``column_metadata.source_ref`` column and
+    cannot gain one, so a ``source_ref``-scoped prune only exists on
+    Postgres (``migrations/versions/0085_column_meta_source_ref.py``);
+    ``use_pg()`` selects the read at call time rather than the caller
+    choosing.
+
+    The collision this closes on Postgres, verified against this code: two
+    writers sharing a ``source`` value but not a ``source_ref`` — two
+    registered ``semantic_sources`` of the same kind (both ``ossie_git``,
+    ``src/semantic/transports.py``) or two Keboola connections (both
+    ``keboola_metastore``, ``connectors/keboola/semantic_layer.py``) — whose
+    documents describe datasets resolving to the SAME ``table_id`` used to
+    delete each other's field rows on every sync. Same-source_ref sibling
+    models are already spared (:func:`_sibling_column_claims`); this was the
+    cross-source_ref case that a bare ``source`` read could not see. DuckDB
+    keeps the pre-existing, coarser ``(table_id, source)`` scoping — that is
+    unchanged, not a regression: the schema simply has nowhere to record a
+    ``source_ref`` to scope on.
+
+    ``keep_by_table`` aside, this also only prunes tables the document
+    still lists — a dataset dropped from the document entirely (not just
+    emptied of fields) leaves its old columns in place, since there is no
+    ``column_metadata`` read that enumerates "every table a given source
+    has ever written to".
 
     ``keep_by_table`` spares additional columns per table — the claims of
     SIBLING models sharing this scope (:func:`_sibling_column_claims`),
@@ -850,11 +1174,16 @@ def _prune_columns(
     carries the whole scope": everything in-source not written here is
     genuinely stale.
     """
+    from src.repositories import use_pg
+
+    scope_by_ref = use_pg()
     repo = column_metadata_repo()
     for table_id, field_names in written_by_table.items():
         keep = field_names | (keep_by_table or {}).get(table_id, set())
         for existing in repo.list_for_table(table_id):
             if (existing.get("source") or "") != source:
+                continue
+            if scope_by_ref and (existing.get("source_ref") or "") != (source_ref or ""):
                 continue
             if existing["column_name"] not in keep:
                 repo.delete(table_id, existing["column_name"])

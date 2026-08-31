@@ -2,7 +2,7 @@
 // every page EXCEPT /chat.
 //
 // The rail (html[data-ui-layout="rail"]) renders the chat list
-// (_app_rail.html → .rail-history) on every page EXCEPT an /admin one, directly
+// (_app_rail.html → .rail-history) on every rail page, /admin included, directly
 // under the New chat + Chats rows. On /chat, chat.js owns that same
 // <ul id="chat-list"> — it renders live, highlights the active row, and handles
 // open/delete in place — so this script MUST stay out of its way there. On every

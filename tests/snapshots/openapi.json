@@ -2121,6 +2121,29 @@
         "title": "ConsentBody",
         "type": "object"
       },
+      "CoverageTagCreate": {
+        "properties": {
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "resource_type": {
+            "title": "Resource Type",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_type",
+          "resource_id",
+          "source_id"
+        ],
+        "title": "CoverageTagCreate",
+        "type": "object"
+      },
       "CreateAgentRequest": {
         "properties": {
           "description": {
@@ -3938,6 +3961,17 @@
         "title": "DeployScriptRequest",
         "type": "object"
       },
+      "DetachRequest": {
+        "properties": {
+          "confirm_detach": {
+            "default": false,
+            "title": "Confirm Detach",
+            "type": "boolean"
+          }
+        },
+        "title": "DetachRequest",
+        "type": "object"
+      },
       "DisablePluginRequest": {
         "description": "Optional body of the disable endpoint.\n\n``revoke_grants=True`` turns the disable into a one-action retirement:\nevery ``marketplace_plugin`` grant on the plugin is deleted in the same\ncall. Without it (or with no body at all \u2014 the pre-existing call shape)\ngrants are left intact, so a later re-enable restores the plugin for the\nsame groups.",
         "properties": {
@@ -4646,6 +4680,87 @@
           }
         },
         "title": "FactsSearchRequest",
+        "type": "object"
+      },
+      "FeedbackCreate": {
+        "description": "One report. Only the question is required.\n\nThe caps are the point of declaring these at all: the columns are ``TEXT``,\nthe submitter is any signed-in caller, and an uncapped field is an\ninvitation to store a megabyte of paste per row. They are generous enough\nthat no genuine report hits them.",
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "metric_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Id"
+          },
+          "model_content_hash": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Content Hash"
+          },
+          "question": {
+            "maxLength": 4000,
+            "title": "Question",
+            "type": "string"
+          },
+          "sql": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "FeedbackCreate",
+        "type": "object"
+      },
+      "FeedbackResolve": {
+        "properties": {
+          "resolution_note": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Note"
+          }
+        },
+        "title": "FeedbackResolve",
         "type": "object"
       },
       "FileEntry": {
@@ -6828,6 +6943,45 @@
         "title": "MoveFileBody",
         "type": "object"
       },
+      "MuteCreate": {
+        "description": "One mute. ``muted_by`` is deliberately NOT a field \u2014 it is taken from the\nauthenticated caller, because a signature you can address to somebody else\nis not a signature.\n\nThe caps matter for the same reason they do on feedback: the columns are\n``TEXT``/``VARCHAR`` and generous enough that no genuine mute hits them.",
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "scope": {
+            "maxLength": 200,
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "title": "MuteCreate",
+        "type": "object"
+      },
       "MySecretBody": {
         "properties": {
           "value": {
@@ -8578,6 +8732,18 @@
             "title": "Rows",
             "type": "array"
           },
+          "semantic_validation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semantic Validation"
+          },
           "truncated": {
             "default": false,
             "title": "Truncated",
@@ -8603,6 +8769,17 @@
           "vote"
         ],
         "title": "RateRequest",
+        "type": "object"
+      },
+      "ReattachRequest": {
+        "properties": {
+          "confirm_reattach": {
+            "default": false,
+            "title": "Confirm Reattach",
+            "type": "boolean"
+          }
+        },
+        "title": "ReattachRequest",
         "type": "object"
       },
       "RefreshGroupsResponse": {
@@ -9304,6 +9481,35 @@
           "document"
         ],
         "title": "SemanticModelCreate",
+        "type": "object"
+      },
+      "SemanticModelPackageIds": {
+        "properties": {
+          "package_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Package Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "package_ids"
+        ],
+        "title": "SemanticModelPackageIds",
+        "type": "object"
+      },
+      "SemanticModelPackageLink": {
+        "properties": {
+          "package_id": {
+            "title": "Package Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "package_id"
+        ],
+        "title": "SemanticModelPackageLink",
         "type": "object"
       },
       "SemanticModelUpdate": {
@@ -11844,6 +12050,18 @@
               }
             ],
             "title": "Bucket"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pin this table to a named source connection (source_connections.id). NULL uses the default connection for the row's source_type. The referenced connection must exist; an unknown id returns 400.",
+            "title": "Connection Id"
           },
           "description": {
             "anyOf": [
@@ -15162,7 +15380,7 @@
     },
     "/admin/semantic-layer": {
       "get": {
-        "description": "Per-source breakdown for the Keboola semantic-layer sync (#853/#920/\n#953, task 7): one row per connection enumerated by\n``_enumerate_master_sources()`` (master-token Keboola projects), each\nwith its own metric/glossary counts and the last sync's per-source\nresult. NULL ``source_ref`` rows (legacy, pre-provenance) fold into the\ndefault connection's row since that's the only connection legacy rows\ncan belong to. Rows whose ``source_ref`` no longer matches any\nenumerated source (connection deleted/rotated away) surface separately\nas \"orphaned\" rather than silently vanishing.\n\nMaster tokens are never put into the template context \u2014 only\nname/id/stack_url leave ``_enumerate_master_sources()``.",
+        "description": "Cross-source, cross-domain completeness for the semantic layer.\n\nREBUILT in F4.1. This was a Keboola sync-ops page \u2014 one row per\nmaster-token Keboola connection, with hand-computed \"connections without a\nmaster token\", \"orphaned rows\" and \"legacy / unattributed\" sections\nalongside. Every one of those is gone, replaced by ONE report that asks\nthe same questions of EVERY connected source\n(``src.semantic.coverage.compute_cross_domain_coverage``), which is why\nthis handler is now smaller than the page it replaces rather than larger:\n\n* a Keboola connection with no owner token is a ROW in that report (the\n  wrapper fills the hole K0.5 leaves) instead of a list underneath it;\n* the connection-scoped \"orphaned\" count measured stale flat\n  ``metric_definitions`` rows \u2014 projections of the canonical document, not\n  the truth \u2014 and its successor is F4.2's source-agnostic\n  \"disconnected models\" check over the document itself;\n* the \"legacy / unattributed\" bucket is the report's synthetic\n  ``__local__`` source.\n\nThe grid itself is fetched after paint, not rendered here: the report's\nKeboola provider makes upstream Metastore calls (the retired page already\nrefused to block on those), and the report is Postgres-only, so a DuckDB\ninstance gets an inline explanation instead of a page that will not load.\n\nWhat this handler still renders server-side is what the client cannot ask\nfor: the tab shell, the Keboola sync strip, and the tagging form's\noptions \u2014 the latter straight off ``app/resource_types.py``'s\n``list_blocks`` delegates, the same projection /admin/access renders, so\nthe two can never disagree about what is taggable.\n\nThe Feedback tab (F4.5) is the same shape one layer down: the report queue\nis fetched after paint (also Postgres-only, and its status filter re-queries\nwithout a reload), so all this handler renders for it is the filter's\nvocabulary \u2014 read from the API's own ``FEEDBACK_STATUSES`` rather than\nre-typed, since a status the select offers but the endpoint rejects would\n400 on click.\n\nThe Mute tab (F4.3) follows the same rule once more: the list of silenced\nchecks is fetched after paint, and what this handler renders is the scope\nvocabulary the form composes from \u2014 the report's own ``DOMAINS`` and the\nconnected sources, so a scope the picker offers is always a scope something\nis actually scored on.",
         "operationId": "admin_semantic_layer_page_admin_semantic_layer_get",
         "parameters": [
           {
@@ -15205,6 +15423,56 @@
           }
         },
         "summary": "Admin Semantic Layer Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/semantic-sources": {
+      "get": {
+        "description": "List page for registered semantic sources.",
+        "operationId": "admin_semantic_sources_page_admin_semantic_sources_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Semantic Sources Page",
         "tags": [
           "web"
         ]
@@ -26780,7 +27048,7 @@
     },
     "/api/admin/registry/{table_id}": {
       "delete": {
-        "description": "Unregister a table from the system.\n\nFor BQ rows, schedules a background rebuild so the dropped row's\nmaster view is removed from analytics.duckdb (rather than hanging\naround until the next scheduled sync).\n\nFor materialized rows, also removes the canonical parquet at\n`${DATA_DIR}/extracts/<source_type>/data/<id>.parquet` and clears\nthe matching `sync_state` row. Without these two cleanups, the\nmanifest endpoint kept advertising the dropped table to `agnes pull`\n(sync_state-driven) and the orchestrator's next rebuild could\nresurrect a master view from the leftover parquet (E2E sub-agent\nfinding 2026-05-01).",
+        "description": "Unregister a table from the system.\n\nFor BQ rows, schedules a background rebuild so the dropped row's\nmaster view is removed from analytics.duckdb (rather than hanging\naround until the next scheduled sync).\n\nFor materialized rows, also removes the canonical parquet at\n`${DATA_DIR}/extracts/<source_type>/data/<id>.parquet` and clears\nthe matching `sync_state` row. Without these two cleanups, the\nmanifest endpoint kept advertising the dropped table to `agnes pull`\n(sync_state-driven) and the orchestrator's next rebuild could\nresurrect a master view from the leftover parquet (E2E sub-agent\nfinding 2026-05-01).\n\nThe table's `data_package_tables` memberships and `resource_grants`\nrows go with it \u2014 cleared inside `TableRegistryRepository.unregister`\non both backends, since a DELETE that leaves them behind means\nsomething different on DuckDB (a foreign-key violation surfacing as a\nraw 500) than on Postgres (an orphan junction row). See that repo\nmethod's docstring.\n\nHow many of each went with it is recorded in the audit row\n(`package_memberships_removed` / `grants_revoked`, both always present\neven at zero \u2014 same shape as the plugin-disable precedent in\n`app/api/marketplaces.py`). Revoking grants is an access-control\nchange, and without the counts the audit log cannot answer \"who lost\naccess to what\" for the event that caused it.",
         "operationId": "unregister_table_api_admin_registry__table_id__delete",
         "parameters": [
           {
@@ -27549,57 +27817,6 @@
         ]
       }
     },
-    "/api/admin/run-databricks-semantic-layer-refresh": {
-      "post": {
-        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto the semantic layer. See connectors/databricks/semantic_ossie.py for\nthe composition logic and connectors/databricks/semantic_layer.py for\nconnection resolution + the legacy-provenance cutover.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 when the upstream is unreachable, answers\n5xx, or the sync fails for any other reason.",
-        "operationId": "run_databricks_semantic_layer_refresh_api_admin_run_databricks_semantic_layer_refresh_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Run Databricks Semantic Layer Refresh"
-      }
-    },
     "/api/admin/run-jira-consistency-check": {
       "post": {
         "description": "Validate Jira parquet against the Jira API and backfill small gaps.\n\nCompares three sources: Jira API (ground truth), raw JSON, and\nparquet. Auto-fixes small webhook-loss gaps (\u226410 issues); larger\ngaps are reported and require manual review.\n\nCadence: every 30 min by default (SCHEDULER_JIRA_CONSISTENCY_INTERVAL).\nDefault ``max_age_days=30`` keeps the routine cost bounded; an\noperator triggering a deeper validation passes a larger value.",
@@ -27726,57 +27943,6 @@
         "tags": [
           "admin"
         ]
-      }
-    },
-    "/api/admin/run-keboola-semantic-layer-refresh": {
-      "post": {
-        "description": "Sync the configured Keboola project's semantic layer into\nmetric_definitions. See connectors/keboola/semantic_layer.py for the\nmapping/prune logic.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 no Keboola credentials configured, or a token the\nStorage/Metastore API refuses (4xx). 502 only when the upstream is\nunreachable or answers 5xx.",
-        "operationId": "run_keboola_semantic_layer_refresh_api_admin_run_keboola_semantic_layer_refresh_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Run Keboola Semantic Layer Refresh"
       }
     },
     "/api/admin/run-knowledge-digests": {
@@ -28049,6 +28215,57 @@
         ]
       }
     },
+    "/api/admin/run-semantic-sources-refresh": {
+      "post": {
+        "description": "Sync every enabled ``semantic_sources`` row through the shared\ngit/upload/connection import pipeline. Disabled sources are skipped and\ncounted, never synced \u2014 manually or on this schedule. See the module\ndocstring for scope versus the legacy Keboola/Databricks endpoints.\n\n409 if a sweep is already in flight.",
+        "operationId": "run_semantic_sources_refresh_api_admin_run_semantic_sources_refresh_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Semantic Sources Refresh"
+      }
+    },
     "/api/admin/run-session-collector": {
       "post": {
         "description": "Trigger the session-collector job from the scheduler.\n\nWalks /home/*/user/sessions/*.jsonl and copies new files into\n/data/user_sessions/<user>/. Idempotent \u2014 already-collected files\nare skipped.",
@@ -28168,6 +28385,257 @@
         ]
       }
     },
+    "/api/admin/semantic-auto-draft-sweep": {
+      "post": {
+        "description": "Draft a semantic model for tables with zero semantic-layer coverage.\n\nScheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)\n\u2014 admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``\nuncovered, eligible tables (``tables_without_semantic_coverage`` narrowed\nand ordered by :func:`_sweep_candidates`), runs a headless\n``semantic-model-builder`` chat session (``app.chat.headless.\nrun_one_shot``) authenticated as the non-admin ``semantic-drafter``\nsystem identity (``app.auth.system_users``) \u2014 so every draft it\nproduces lands in the ``authoring_suggestions`` moderation queue\nexactly like a human-submitted proposal, never applied directly.\n\nDedup: each selected table's ``semantic_draft_pending_at`` is stamped\nBEFORE its session is invoked, not after \u2014 a concurrent or overlapping\nsweep tick can then never pick up the same table twice. The flag\nclears when an admin resolves the resulting suggestion, approve or\nreject alike (``app/api/authoring_suggestions.py``).\n\nRe-eligibility is by stamp AGE, not by clearing the stamp on the way\nout of a tick that filed nothing: a stamp older than\n``_SWEEP_STAMP_RETRY_AFTER_S`` (7 days) makes the table a candidate\nagain, and never-stamped tables sort ahead of stale-stamped ones. That\nis what keeps two things true at once \u2014 a slow session's table is not\nre-drafted while its sandbox is still working on the turn, and a table\nthe drafter keeps declining does not sit at the head of every batch\nforever. See the constant's own comment for the two bugs an immediate\nclear caused.\n\nA session hitting the chat manager's per-user concurrency cap\n(``ConcurrencyCapHit``) is counted and skipped, never raised as a\n500 \u2014 and its dedup flag IS cleared again on the way out, so the\ntable is eligible on the very next tick rather than in a week. That\nun-stamping is safe here and nowhere else: the cap is enforced inside\n``ChatManager.create_session``, before the prompt is ever sent, so a\ncapped table's session provably never started and cannot file anything\nin the background.\n\nANY other failure from a table's session is treated the same way\n(counted in ``errored``): the table is un-stamped, logged, and the\nsweep moves on rather than letting one transient broker/LLM/spawn\nerror 500 the whole tick and abandon the rest of the batch. Un-stamping\non an error the session may have survived can at worst cost a duplicate\ndraft \u2014 one extra queued suggestion an admin rejects \u2014 and unlike the\ntimeout case it is not the routine outcome, so paying for a fast retry\nis the right trade.\n\nReturns ``{\"triggered\": N, \"applied\": A, \"no_apply_call\": X,\n\"timed_out\": T, \"skipped_cap\": M, \"errored\": E, \"remaining\": R}``.\n``applied`` counts a table whose session produced a NEW\n``authoring_suggestions`` row before this call's wait ended, detected\nby diffing the semantic-drafter's pending suggestion count immediately\nbefore and after each session (sessions run strictly in order, one at a\ntime, so the diff cannot be confused by another table's suggestion).\n``timed_out`` counts a session whose wait hit ``_SWEEP_SESSION_TIMEOUT_S``\nwith nothing filed yet \u2014 ``run_one_shot`` reports that by RETURNING\n``timed_out=True`` rather than raising, and the sandbox keeps\nprocessing the turn after it returns, so the table keeps its stamp and\na suggestion may still arrive. ``no_apply_call`` is a session that\ngenuinely finished and chose to file nothing; it keeps its stamp too\nand comes back via the TTL. ``remaining`` is how many eligible tables\nwere left over after this tick's batch.\n\nA3 PG-first ratchet: the dedup flag this sweep relies on\n(``table_registry.mark_semantic_draft_pending`` /\n``clear_semantic_draft_pending``) is a Postgres-only capability \u2014 the\nDuckDB app-state ladder is frozen at v124 and never gained the backing\ncolumn. On a DuckDB-backend instance this raises\n:class:`~src.repositories.RequiresPostgresBackend`, translated by the\napp-wide handler in ``app/main.py`` into a clean ``501`` naming the\nfeature, before any real work (no chat session, no table scan) runs.",
+        "operationId": "semantic_auto_draft_sweep_api_admin_semantic_auto_draft_sweep_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Auto Draft Sweep",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-coverage": {
+      "get": {
+        "description": "Registered tables with NO valid semantic model describing them.\n\nSource-agnostic \u2014 unlike ``GET /api/admin/semantic-layer/coverage``\n(Keboola-only, predicts live against one connected project's Metastore),\nthis reads what is already stored in ``semantic_models`` regardless of\nsource (Keboola, git, manual, upload, connection) and answers a\nnarrower question: does a registered table appear in ANY valid model's\ndatasets at all. See ``src.semantic_coverage.tables_without_semantic_\ncoverage`` for the resolution rules.\n\nReturns ``{\"tables\": [...]}`` \u2014 full ``table_registry`` rows.",
+        "operationId": "get_semantic_coverage_api_admin_semantic_coverage_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Semantic Coverage",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-feedback": {
+      "get": {
+        "description": "The report queue, newest first (admin only).\n\n``?status=open`` is the working view. An unrecognized status is a 400\nrather than an empty list: \"nothing to do\" is the opposite of the truth\nwhen the filter itself was a typo.",
+        "operationId": "list_semantic_feedback_api_admin_semantic_feedback_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Semantic Feedback",
+        "tags": [
+          "semantic-feedback"
+        ]
+      }
+    },
+    "/api/admin/semantic-feedback/{feedback_id}/resolve": {
+      "post": {
+        "description": "Close one report, recording who closed it and what was done.\n\n404 when it does not exist; 409 when somebody already resolved it \u2014 the\nrepository's guarded transition refuses to overwrite the first admin's\nnote, so the queue never loses who actually fixed the thing.",
+        "operationId": "resolve_semantic_feedback_api_admin_semantic_feedback__feedback_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "feedback_id",
+            "required": true,
+            "schema": {
+              "title": "Feedback Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackResolve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Semantic Feedback",
+        "tags": [
+          "semantic-feedback"
+        ]
+      }
+    },
     "/api/admin/semantic-layer/coverage": {
       "get": {
         "description": "How much of each connected Keboola project's semantic layer actually\nreaches Agnes, recomputed live (see\n``connectors.keboola.semantic_layer.compute_semantic_coverage``).\n\nRead-only and stateless \u2014 it does not touch metric_definitions and does not\nread the last sync's counters, which live in a process-local dict that\nempties on restart. Two conditions are worth acting on and are surfaced as\n``warnings[]``: a connection whose storage and master tokens point at\ndifferent projects, and a project none of whose metrics can bind to a\nregistered table. Tables the instance simply does not register are reported\nas a plain count, never as pending work.\n\n``?warnings_only=true`` answers with the token-identity checks alone and\nskips the Metastore enumeration \u2014 two `verify_token` calls per connection\ninstead of every project's whole semantic model. The Data sources page\ndraws its warning strip from that: it uses only the mismatch messages, and\npulling the full report on every page view was work nobody asked for.\nCounts are zeroed in that mode. (Devin Review on this PR.)\n\nUpstream calls run off the event loop \u2014 one project's Metastore being slow\nmust not stall every other request in the process.",
@@ -28227,6 +28695,415 @@
           }
         },
         "summary": "Get Semantic Layer Coverage"
+      }
+    },
+    "/api/admin/semantic-layer/health": {
+      "get": {
+        "description": "Is the semantic layer trustworthy right now (admin only)?\n\nSync failures, models whose source was deleted or renamed away from under\nthem, documents that failed validation, three cheap static quality checks\n(a metric with no description, one name defined twice with a different\nformula, a cross-dataset metric with no declared relationship between the\ndatasets it touches), a roll-up of F4.1's coverage counts, and every\nactive mute (F4.3) \u2014 one report for the admin banner, the CLI, and MCP.\n\n``mutes_repo`` is resolved as a dependency for the same reason the\ncoverage/tags routes are: on a DuckDB-backed instance this must answer\nthe typed ``501`` before any work runs, not a partial report missing the\none field (which findings are silenced) F4.3 exists to keep visible.",
+        "operationId": "get_semantic_layer_health_api_admin_semantic_layer_health_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Semantic Layer Health"
+      }
+    },
+    "/api/admin/semantic-layer/mutes": {
+      "get": {
+        "description": "Every check currently silenced, and by whom (admin only).\n\nIts own route rather than a corner of the health report: this is the answer\nto \"what are we not being told about\", and an admin auditing that should\nnot have to fetch (and re-compute) the whole health roll-up to read it.\nF4.2's health response includes the same rows \u2014 the list is deliberately\nreachable from both.\n\n``?include_expired=true`` adds the lapsed ones. The silence ends at the\nexpiry; the record of who chose it does not.",
+        "operationId": "list_mutes_api_admin_semantic_layer_mutes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_expired",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Expired",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Mutes"
+      },
+      "post": {
+        "description": "Silence one check, on the record (admin only).\n\nReturns the stored row \u2014 ``muted_by``, ``muted_at``, ``reason`` and all \u2014\nso the caller sees the signature it just left rather than a bare ``201``.\n\n409 when an ACTIVE mute already covers the scope: two rows for one check\nread as two independent judgements when it is one, and unmuting either\nwould leave the check silent with no visible reason why. 404 when the scope\nnames a source connection that does not exist \u2014 a mute pointing at nothing\nsilences nothing, forever, while looking like it works.",
+        "operationId": "create_mute_api_admin_semantic_layer_mutes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MuteCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Mute"
+      }
+    },
+    "/api/admin/semantic-layer/mutes/{mute_id}": {
+      "delete": {
+        "description": "Unmute \u2014 the check starts reporting again (admin only).\n\n404 when the mute does not exist, so an admin never reads a success for an\nunmute that unmuted nothing and then wonders why the warning is still\nquiet.",
+        "operationId": "delete_mute_api_admin_semantic_layer_mutes__mute_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mute_id",
+            "required": true,
+            "schema": {
+              "title": "Mute Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Mute"
+      }
+    },
+    "/api/admin/semantic-model/coverage": {
+      "get": {
+        "description": "Coverage of every connected data source, per domain (admin only).\n\nEach source carries one entry per domain with ``status``\n(``ok`` | ``partial`` | ``missing`` | ``not_applicable``), a\none-sentence ``detail``, an optional ``action`` naming the create flow\nthat fills it, and a ``raw`` payload as deep as that source type's\nconnector can compute (rich for Keboola, thin elsewhere \u2014 see\n``src/semantic/coverage.py``).\n\n``?source=<id>`` narrows to one source; ``__local__`` is the synthetic\nbucket for registered tables belonging to no connection.\n\nRecomputed live, never cached: the Keboola provider makes upstream calls,\nso the work runs off the event loop \u2014 one slow project must not stall\nevery other request in the process.",
+        "operationId": "get_cross_domain_coverage_api_admin_semantic_model_coverage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cross Domain Coverage"
+      }
+    },
+    "/api/admin/semantic-model/coverage/tags": {
+      "post": {
+        "description": "Record that a skill / agent / knowledge domain is about a data source.\n\n409 when the same triple is already tagged \u2014 \"already recorded\" is\ninformation the admin asked for, not something to swallow into a second\nidentical row that would make the roll-up count one skill twice.",
+        "operationId": "create_coverage_tag_api_admin_semantic_model_coverage_tags_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoverageTagCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Coverage Tag"
+      }
+    },
+    "/api/admin/semantic-model/coverage/tags/{tag_id}": {
+      "delete": {
+        "description": "Remove one source tag. 404 when it does not exist, so an admin never\nreads a success for a deletion that removed nothing.",
+        "operationId": "delete_coverage_tag_api_admin_semantic_model_coverage_tags__tag_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag_id",
+            "required": true,
+            "schema": {
+              "title": "Tag Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Coverage Tag"
       }
     },
     "/api/admin/semantic-models": {
@@ -28315,7 +29192,7 @@
         ]
       },
       "post": {
-        "description": "Create (or replace) a hand-authored (``source='manual'``) model from\na pasted Ossie document. Invalid input 422s with the schema errors \u2014\nnever stored half-valid.",
+        "description": "Create (or replace) a hand-authored (``source='manual'``) model from\na pasted Ossie document. Invalid input 422s with the schema errors \u2014\nnever stored half-valid.\n\nA slug colliding with an existing source-owned model 409s ``source_owned``\n(``_is_source_owned``, shared with PUT/DELETE/``_check_apply``) instead of\ncreating a shadow ``manual/_/<slug>`` row next to the imported one \u2014 two\nrows sharing a slug would leave ``get_by_slug`` (``ORDER BY updated_at\nDESC LIMIT 1``) to resolve the collision nondeterministically. A slug\nmatching a DETACHED source-owned row is exempt from that 409 (F3), but\nstill can't take the plain upsert path below: that row already owns the\nslug, so writing a second, new ``manual/_/<slug>`` id next to it would\nrecreate the exact same collision this guard exists to prevent. It's\nupdated in place instead \u2014 same handling ``apply_manual_model`` already\ngives this case.",
         "operationId": "create_semantic_model_api_admin_semantic_models_post",
         "parameters": [
           {
@@ -28564,8 +29441,304 @@
         ]
       }
     },
+    "/api/admin/semantic-models/{model_id}/detach": {
+      "post": {
+        "description": "F3: danger-flow escape hatch out of the flat ``409 source_owned``\nguard \u2014 copies nothing, flips ``sync_mode`` on the SAME row in place.\nFrom here on, sync tracks drift (``source_content_hash``) instead of\noverwriting; the admin edits freely through ``PUT``/``/apply``.",
+        "operationId": "detach_semantic_model_api_admin_semantic_models__model_id__detach_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DetachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Detach Semantic Model",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{model_id}/reattach": {
+      "post": {
+        "description": "F3: return a detached model to the sync path. Without confirmation,\nreturns a staleness preview instead of acting \u2014 has the source changed\nsince detach, and when was it detached. Confirming flips\n``sync_mode='synced'``; the NEXT sync run is what actually rewrites\n``document`` back onto the model (this endpoint doesn't fabricate that\ncontent itself \u2014 the importer is the only place that knows how to\nassemble it).",
+        "operationId": "reattach_semantic_model_api_admin_semantic_models__model_id__reattach_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReattachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reattach Semantic Model",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{slug}/packages": {
+      "post": {
+        "description": "Link a semantic model to a Data Package, giving it that package's\nvisibility to non-admin readers (see the module docstring's \"A model\nwith no linked package is reachable by admins only\").\n\nNot gated by the ownership rule: the link lives in the\n``data_package_semantic_models`` junction, not in the model's document\nor its ``semantic_models`` row, so a source re-sync (which only rewrites\nthose) can never revert it \u2014 the exact concern the ownership rule\nguards against does not apply here. An admin may link ANY model,\nhand-authored or source-owned, the same way a direct ``semantic_model``\nresource grant already applies regardless of a model's ``source``\n(``_can_read_model`` above has no ownership check either).\n\nIdempotent (``link_package`` itself is delete-then-insert). 404s if\n``slug`` or ``package_id`` doesn't resolve to an existing row.",
+        "operationId": "link_semantic_model_package_api_admin_semantic_models__slug__packages_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticModelPackageLink"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SemanticModelPackageIds"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Semantic Model Package",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{slug}/packages/{package_id}": {
+      "delete": {
+        "description": "Unlink a semantic model from a Data Package.\n\nIdempotent on an already-unlinked pair or an unknown ``package_id`` \u2014\nthe junction delete is a no-op either way, mirroring\n``remove_table_from_package``'s junction-row semantics\n(``app/api/data_packages.py``). Only ``slug`` 404s.\n\nDeliberately returns 200 with the remaining ``package_ids`` rather than\n204 (see ``_DELETE_200_WITH_BODY_ALLOWLIST`` in\n``tests/test_api_design_rules.py``) \u2014 symmetric with the linking POST\nabove, and the CLI's ``unlink-package`` echoes the remaining packages\nwithout a follow-up GET.",
+        "operationId": "unlink_semantic_model_package_api_admin_semantic_models__slug__packages__package_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SemanticModelPackageIds"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Semantic Model Package",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/admin/semantic-sources": {
       "get": {
+        "description": "Every registered source, each with the number of semantic models it\nOWNS (``owned_model_count``) and what it SCANS (``scan_scope``).\n\nBoth are derived, never stored (``src/semantic/ownership.py``,\n``src/semantic/scan_scope.py``). ``last_sync_status='ok'`` answers \"did\nthe fetch work\", not \"did it bring anything back\", so a source scoped at\nan upstream with nothing in it is otherwise indistinguishable from a\nhealthy one (#1707); and a count of 0 alone still cannot separate \"there\nis nothing upstream\" from \"the role I connect as cannot see it\", which is\nwhy the scope names the database/schema/role (or project, catalog,\nrepository) the sync actually looked at. ``owned_model_count: null`` means\nthe source's provenance could not be resolved \u2014 \"cannot say\", not \"owns\nnone\"; ``scan_scope: null`` means no scope could be derived from this\nsource's config.",
         "operationId": "list_semantic_sources_api_admin_semantic_sources_get",
         "parameters": [
           {
@@ -28745,6 +29918,7 @@
         ]
       },
       "get": {
+        "description": "One source, same shape as the list row \u2014 ``owned_model_count``,\n``scan_scope`` and all.",
         "operationId": "get_semantic_source_api_admin_semantic_sources__source_id__get",
         "parameters": [
           {
@@ -31051,7 +32225,7 @@
     },
     "/api/admin/source-connections/{connection_id}": {
       "delete": {
-        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.",
+        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.\n\nSuccess carries an ``X-Agnes-Semantic-References`` header \u2014 the number\nof semantic sources/models tied to this connection (Block 5 of #1707).\nA header, not a body field: the response is ``204 No Content`` (pinned\nby ``test_delete_returns_204``), and this is informational only \u2014 it\nnever blocks the delete, unlike the pinned-tables 409 above.",
         "operationId": "delete_connection_api_admin_source_connections__connection_id__delete",
         "parameters": [
           {
@@ -31436,7 +32610,7 @@
         ]
       },
       "put": {
-        "description": "Store (or rotate) the vault secret for a connection token.\n\n``kind=\"storage\"`` (default): the plain Storage API token used for pulls.\nFor a Keboola connection it is preflighted like the master token, and the\nproject it opens (``owner.id``/``owner.name``) is recorded on the\nconnection \u2014 that identity is what later tokens are checked against.\n400 ``project_mismatch`` if the token opens a different project than the\none this connection is already bound to; a connection is one project.\n``kind=\"master\"``: a *separate* slot for a Keboola master (owner) Storage\nAPI token, required by the semantic-layer sync (Metastore API rejects\nnon-master tokens). 400 if the connection isn't ``source_type=\"keboola\"``,\nif the token fails a live ``verify_token`` preflight (not a master token),\nor if the Storage API refuses the token outright (4xx \u2014 an invalid or\nexpired token is the admin's to fix, not a gateway failure). 502 only when\nthe Storage API is unreachable or answers 5xx.\n\n409 if AGNES_VAULT_KEY is not configured on the server \u2014 checked FIRST, so\nan instance that cannot store secrets says so instead of spending an\nupstream round-trip and reporting a token problem it never had.",
+        "description": "Store (or rotate) the vault secret for a connection token.\n\n``kind=\"storage\"`` (default): the plain Storage API token used for pulls.\nFor a Keboola connection it is preflighted like the master token, and the\nproject it opens (``owner.id``/``owner.name``) is recorded on the\nconnection \u2014 that identity is what later tokens are checked against.\n400 ``project_mismatch`` if the token opens a different project than the\none this connection is already bound to; a connection is one project.\n``kind=\"master\"``: a *separate* slot for a Keboola master (owner) Storage\nAPI token, required by the semantic-layer sync (Metastore API rejects\nnon-master tokens). 400 if the connection isn't ``source_type=\"keboola\"``,\nif the token fails a live ``verify_token`` preflight (not a master token),\nor if the Storage API refuses the token outright (an expired, revoked or\nwrong-stack token is the admin's to fix, not a gateway failure). 502 only\nwhen the Storage API is unreachable or answers 5xx for a reason that is\nnot a refusal.\n\n``detail`` is a plain string on every branch EXCEPT that refusal, which\nanswers the structured ``{error, message, upstream}`` shape: ``message``\nis the sentence to show a human, ``upstream`` the raw wire text kept for\nlogs and bug reports and shown to nobody (``_detail_text`` server-side,\n``detailMessage()`` on the page, ``_fail`` in the CLI). Readers must\nhandle both shapes \u2014 see :func:`_preflight_error`.\n\n409 if AGNES_VAULT_KEY is not configured on the server \u2014 checked FIRST, so\nan instance that cannot store secrets says so instead of spending an\nupstream round-trip and reporting a token problem it never had.",
         "operationId": "set_connection_secret_api_admin_source_connections__connection_id__secret_put",
         "parameters": [
           {
@@ -31567,7 +32741,7 @@
     },
     "/api/admin/source-connections/{connection_id}/test": {
       "post": {
-        "description": "Verify connectivity for the connection.\n\nResolves the stack URL and token from the connection row (token_env \u2192\nenvironment lookup, or vault secret), then calls\n``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.\n\nReturns ``{ok: true, project_name: \"\u2026\"}`` on success or\n``{ok: false, error: \"\u2026\"}`` on failure.\n\nIt used to probe ``/v2/storage?exclude=components``, which measured\nverified live (2026-08-10): that endpoint is the unauthenticated stack\nindex \u2014 it answers **200 with no token at all** and carries no ``owner``\nblock. So \"Test\" reported OK for any token, including a garbage one, and\nthe ``project_name`` it returned was always the empty string. Verifying\nthe token is the only probe that answers the question the button asks,\nand it is what makes the project identity below readable at all.",
+        "description": "Verify connectivity for the connection \u2014 per source type.\n\n- ``keboola``: resolves the stack URL and token from the row (token_env\n  \u2192 environment lookup, or vault secret) and calls\n  ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.\n- ``snowflake``: opens a session against the account and reads one row\n  of metadata (:func:`_test_snowflake_connection`).\n- anything else: ``{ok: false, status: \"unsupported\", detail: \"\u2026\"}``\n  naming the type. This branch exists because the handler used to be\n  Keboola-shaped for EVERY row \u2014 it demanded a ``stack_url`` a Snowflake\n  or Databricks connection does not have, so \"Test\" on one of those\n  failed with a message about a field that source type has no concept\n  of, for a connection that may be perfectly healthy. An honest \"not\n  implemented for this type yet\" is a better answer than a confident\n  wrong one.\n\nReturns ``{ok: true, project_name: \"\u2026\"}`` on success or\n``{ok: false, error: \"\u2026\"}`` on failure. Failure is HTTP 200 throughout \u2014\nonly an unknown connection is a status code (404) \u2014 so the unsupported\nanswer keeps that convention rather than minting a new one for its own\ncallers to special-case.\n\nThe Keboola probe used to be ``/v2/storage?exclude=components``, which\nmeasured verified live (2026-08-10): that endpoint is the\nunauthenticated stack index \u2014 it answers **200 with no token at all**\nand carries no ``owner`` block. So \"Test\" reported OK for any token,\nincluding a garbage one, and the ``project_name`` it returned was always\nthe empty string. Verifying the token is the only probe that answers the\nquestion the button asks, and it is what makes the project identity\nbelow readable at all.",
         "operationId": "test_connection_api_admin_source_connections__connection_id__test_post",
         "parameters": [
           {
@@ -31623,6 +32797,60 @@
           }
         },
         "summary": "Test Connection",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/source-pipelines": {
+      "get": {
+        "description": "The per-source pipeline strip \u2014 tables \u2192 sync \u2192 semantic \u2192 feeds.\n\nRead-only, and deliberately no new data: it returns exactly the dict\n``/admin/data-sources`` inlines into its own HTML (``SOURCE_PIPELINES``),\nfrom the same ``_source_pipelines()`` fold. The page needs it because\neverything on it \u2014 the Add-tables wizard, package creation, token\nsaves \u2014 happens over fetch, so a strip baked at render time kept\nreporting \"Add the first tables \u2192 / Never synced / 0 packages\" long\nafter the admin had registered two dozen tables. Same admin gate as the\npage, so this exposes nothing the caller could not already read there.\n\n``user`` is threaded through for the one caller-scoped cell (a\nSharePoint source's facts/edges counts); every other cell is\ncaller-independent.",
+        "operationId": "get_source_pipelines_api_admin_source_pipelines_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Source Pipelines",
         "tags": [
           "admin"
         ]
@@ -32918,6 +34146,104 @@
           }
         },
         "summary": "Ask Usage",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
+    "/api/admin/telemetry/chat-cost": {
+      "get": {
+        "description": "Measured cost of chat sessions, split by cached vs uncached tokens.\n\nThe point of this route is that it MEASURES rather than models. A cost\ncomparison between two agent workflows (say, one that loads business\ndefinitions from a governed semantic layer once per session against one\nthat carries them by hand) turns almost entirely on how a re-read of a\nlarge cached prefix is priced: at the full input rate it dominates the\nbill, at the real cached rate (~0.1x) it nearly vanishes. Both figures\ncome from ``chat_messages`` here, per model, so nobody has to guess.\n\n``cache_accounting`` per row, and ``notes`` overall, say out loud when a\nzero is not a measurement: rows written before migration 0092 carry no\ncache figures at all, and a \"0 cached tokens\" that means \"unrecorded\" is\nexactly the mistake this route exists to stop.",
+        "operationId": "chat_cost_api_admin_telemetry_chat_cost_get",
+        "parameters": [
+          {
+            "description": "1d|7d|30d|all",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "1d|7d|30d|all",
+              "title": "Window",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Restrict to one session owner's email.",
+            "in": "query",
+            "name": "user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Restrict to one session owner's email.",
+              "title": "User"
+            }
+          },
+          {
+            "description": "Max (session, model) rows.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Max (session, model) rows.",
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat Cost",
         "tags": [
           "admin-telemetry"
         ]
@@ -48243,6 +49569,70 @@
         ]
       }
     },
+    "/api/semantic-feedback": {
+      "post": {
+        "description": "File a report that an answer looked wrong (any signed-in caller).\n\nDeliberately NOT ``require_admin``: the analyst who ran the analysis and\nthe agent that could not ground its answer are the two callers most likely\nto notice, and neither is an admin. The report lands ``status='open'`` in\nthe admin queue.",
+        "operationId": "submit_semantic_feedback_api_semantic_feedback_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Semantic Feedback",
+        "tags": [
+          "semantic-feedback"
+        ]
+      }
+    },
     "/api/semantic-models/apply": {
       "post": {
         "description": "Apply a hand-authored Ossie document \u2014 the one semantic-layer write\nsurface for chat, CLI, and the studio builder.\n\nWhat \"apply\" means depends on the caller's authority, and the response\nlabels the outcome so callers (human or agent) never have to guess:\n\n- **admin** \u2192 the document is validated, stored as a ``source='manual'``\n  model (create-or-replace by slug), and projected into the flat tables.\n  Response: ``{\"outcome\": \"applied\", \"model\": {...}}``.\n- **non-admin** \u2192 the document is validated, then queued as an\n  ``authoring_suggestions`` row (domain ``semantic-layer``) for admin\n  moderation \u2014 it never touches ``semantic_models`` before approval.\n  Response: ``{\"outcome\": \"submitted_for_review\", \"suggestion_id\": ...}``.\n\nShared guards, both roles: schema-invalid documents 422; a slug owned by\nan imported source 409 ``source_owned``; a supplied\n``expected_content_hash`` that no longer matches 409 ``stale_document``.\nThe non-admin branch additionally 409s ``duplicate_pending`` while an\nearlier proposal for the same slug awaits review, and 403s\n``studio_disabled`` when the instance-level Studio toggle is off (the\nadmin branch is a plain admin write, not Studio-gated).",
@@ -48307,9 +49697,63 @@
         ]
       }
     },
+    "/api/semantic-models/bundle": {
+      "get": {
+        "description": "RBAC-scoped bundle of every accessible ``status='valid'`` semantic\nmodel, consumed by ``agnes pull`` to render the read-only local cache\nunder ``<workspace>/semantic/<slug>/\u2026`` (F\u00e1ze 1 \u2014 \"distribuce jako\nfyzick\u00e1 cache s TTL\"; ``src/semantic/cache_render.py`` does the actual\nrendering, client-side, from this response).\n\nSame delivery-channel shape and same non-interactive posture as\n``/api/memory/bundle`` and ``/api/knowledge/digests/{digest_id}/\ncontent`` \u2014 one GET the CLI calls on every pull, never an agent tool\n(see the triple-surface ``_EXEMPT`` entry). Same RBAC tier as search/\nexport/context (``_can_read_model``): admin, a grant on the model\nitself, or a grant on a Data Package it's linked to.\n\nEach model entry carries its own ``content_hash`` (the same\n``semantic_models.content_hash`` every other surface reads \u2014 never\nrecomputed) and the full ``document_json`` the renderer needs; the\ntop-level ``ttl_seconds`` is the value the CLI stamps into every\nrendered file's header and the TTL an agent's local-cache trust policy\n(``config/claude_md_template.txt``) is written against.",
+        "operationId": "semantic_models_bundle_api_semantic_models_bundle_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Models Bundle",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/semantic-models/context": {
       "get": {
-        "description": "Typed context lookup over the caller's accessible semantic models \u2014\nthe ``get_semantic_context`` parity tool.\n\nWraps the pure ``src.semantic_context.get_semantic_context`` over the\nsame ``_accessible_valid_documents`` RBAC tier as search/export/\nvalidate-query. An empty result (no accessible model, or no object of\nthe requested type/id) is not an error \u2014 this endpoint has no\nmisleading \"all clear\" to gate against, unlike ``validate-query``.",
+        "description": "Typed context lookup over the caller's accessible semantic models \u2014\nthe ``get_semantic_context`` parity tool.\n\nWraps the pure ``src.semantic_context.get_semantic_context`` over the\nsame ``_accessible_valid_documents`` RBAC tier as search/export/\nvalidate-query. An empty result (no accessible model, or no object of\nthe requested type/id) is not an error \u2014 this endpoint has no\nmisleading \"all clear\" to gate against, unlike ``validate-query``.\n\nThe response also carries ``model_hashes`` \u2014 ``{slug: content_hash}``\nfor every accessible model (not narrowed by ``model_ids``, unlike\n``results``) \u2014 so a caller re-verifying an expired local semantic cache\n(F\u00e1ze 1 physical distribution, ``config/claude_md_template.txt``'s TTL\npolicy) can compare the cache file's own header ``content_hash`` against\nthe live value without a second round trip.",
         "operationId": "get_semantic_context_endpoint_api_semantic_models_context_get",
         "parameters": [
           {
@@ -48463,17 +49907,17 @@
     },
     "/api/semantic-models/search": {
       "get": {
-        "description": "Case-insensitive substring search over slug/name/description, RBAC\nfiltered to models linked to a Data Package the caller can access\n(admins see everything).",
+        "description": "Case-insensitive substring search over slug/name/description, RBAC\nfiltered to models linked to a Data Package the caller can access\n(admins see everything).\n\nAn empty ``q`` lists everything readable rather than 422-ing: default\nscope is everything and a term NARROWS it (command-UX standard), so a\ncaller who wants the whole list should not have to invent a substring\nthat matches it. (``/api/semantic-models/bundle`` also enumerates the\naccessible set, but it renders the pull cache payload \u2014 this stays the\nlightweight find surface.)\n\n``truncated`` says out loud when ``limit`` cut the list short: a partial\nresult that reads as complete is a silent cap, which the same standard\nforbids.",
         "operationId": "search_semantic_models_api_semantic_models_search_get",
         "parameters": [
           {
-            "description": "Search query",
+            "description": "Search query. Empty lists every model you can read.",
             "in": "query",
             "name": "q",
-            "required": true,
+            "required": false,
             "schema": {
-              "description": "Search query",
-              "minLength": 1,
+              "default": "",
+              "description": "Search query. Empty lists every model you can read.",
               "title": "Q",
               "type": "string"
             }
@@ -58045,7 +59489,7 @@
     },
     "/catalog/semantics": {
       "get": {
-        "description": "Read-only browser for the semantic layer \u2014 business metrics\n(`metric_definitions`) and the glossary (`glossary_terms`) in one page\n(issue #853 + the Keboola glossary import, #920).\n\nAnalyst-facing tier: ``get_current_user``, no admin gate and no\nper-resource grant \u2014 matches the RBAC tier of the underlying\n``GET /api/metrics`` / ``GET /api/glossary*`` endpoints this page reuses,\nand mirrors /catalog's own gate.\n\nMetrics are RBAC-filtered the same way ``GET /api/metrics`` is (#953):\na metric whose ``table_name``/``tables`` reference a table outside the\ncaller's Data Package stack is omitted before grouping, so a category\nleft with zero visible metrics never renders its header either. Glossary\nis intentionally NOT gated this way (business vocabulary, not data).\n\nMetrics are server-rendered (grouped by category, same reading order as\n``agnes catalog --metrics``) \u2014 the scale is tens-to-low-hundreds so a\nclient-side substring filter over the rendered rows is enough; no new\nsearch endpoint. Glossary starts empty and is populated client-side via\nthe existing ``GET /api/glossary`` / ``GET /api/glossary/search``.",
+        "description": "Retired page \u2014 a 308 onto the model list's \"All metrics\" tab (#1707 N5).\n\nAgnes shipped two pages over one semantic layer: this flat\n``metric_definitions`` / ``glossary_terms`` projection, and\n``/semantic-layer``'s stored documents. The split was never a distinction\na reader could make BEFORE arriving \u2014 \"metrics\" lived here, \"the model\nthose metrics came from\" lived there, and each page's way to the other\nwas one line of prose. The projection is now two tabs of the model list\n(``?tab=all_metrics`` / ``?tab=all_glossary``), rendered from the same two\ntables this page read.\n\nA 308 rather than a deletion, and a 308 rather than a 302: the method and\nbody must not be rewritten, and every bookmark, chat citation, skill\nreference and #1850 back link keeps landing. The redirect PRESERVES the\nquery string, which is what makes the old deep links survive \u2014 they carry\nthe filter term as ``?q=<name>`` and the tab as a ``#metrics`` fragment,\nand a fragment never reaches the server. So the tab is supplied here (the\nmetrics one, which is where every `q`-carrying link meant to go) and the\ncaller's own ``tab`` wins when they named one. The stale fragment rides\nalong untouched \u2014 the browser re-appends it \u2014 and the destination page\nreads it only to correct ``#glossary`` onto the glossary tab.\n\nStill behind ``get_current_user``: the destination is authenticated, and\nan anonymous 308 into it would only move the login bounce one hop later.",
         "operationId": "catalog_semantics_catalog_semantics_get",
         "parameters": [
           {
@@ -60805,9 +62249,19 @@
     },
     "/semantic-layer": {
       "get": {
-        "description": "Level 1 \u2014 every semantic model the caller can read, with its object\ncounts, SQL dialect(s) and validation status.\n\nA ``status='invalid'`` row still lists (an invalid import must be\nvisible, not silent) and renders its stored ``validation_errors``\ninstead of object counts, since an invalid document's ``document_json``\nmay be stale or absent.",
+        "description": "Level 1 \u2014 the semantic layer's front door, in three tabs.\n\n**Models** (default) \u2014 every semantic model the caller can read, with its\nobject counts, SQL dialect(s) and validation status. A ``status='invalid'``\nrow still lists (an invalid import must be visible, not silent) and renders\nits stored ``validation_errors`` instead of object counts, since an invalid\ndocument's ``document_json`` may be stale or absent.\n\n**All metrics** / **All glossary** \u2014 the flat ``metric_definitions`` and\n``glossary_terms`` projections, folded in from ``/catalog/semantics``\n(#1707 N5, which is now a 308 onto this page). They are the SAME two\ntables that page read, filtered by the SAME row predicate, and they hold\nrows no model card can show.\n\n``q`` is the deep link's filter term, carried in the query string because\nthe fragment the old links used (``#metrics``) never reaches the server.\nIt is applied client-side over the rendered rows, exactly as it was on the\nflat page \u2014 the scale is tens-to-low-hundreds and there is no search\nendpoint to add.\n\nONE ``_can_read_model`` sweep serves all three tabs (the #1850 memo): the\nmodel cards, the per-metric \"Open in the model\" links and the browse gate\nare three answers off one list. The check resolves a model's Data Packages\nper row, so a second sweep doubles the page's cost for an answer it has.",
         "operationId": "semantic_layer_list_semantic_layer_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "tab",
+            "required": false,
+            "schema": {
+              "default": "models",
+              "title": "Tab",
+              "type": "string"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",

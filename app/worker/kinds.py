@@ -227,9 +227,9 @@ import shlex
 import subprocess
 import tempfile
 import time
-from typing import Optional
+from datetime import UTC
 
-from app.worker.registry import JOB_KINDS, EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
+from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind, register_kind
 from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
@@ -322,7 +322,7 @@ def _sp_sweep_lease_seconds() -> int:
         return _DEFAULT_SP_SWEEP_LEASE_S
 
 
-def _run_data_refresh(payload: dict) -> None:
+def _run_data_refresh(payload: dict) -> dict | None:
     """Wrap ``app.api.sync._run_sync`` — same defaults as the HTTP trigger
     path (``tables=None`` syncs every registered table). ``payload`` may
     carry ``tables`` (list[str]) and/or ``source`` (source_type filter),
@@ -358,10 +358,25 @@ def _run_data_refresh(payload: dict) -> None:
     uncaught exception into ``jobs_repo().fail(..., retry_in_seconds=...)``,
     so this is the sole mechanism needed for the job to record `failed`
     and retry.
+
+    Result exposure (#1620): passes a sink dict into ``_run_sync``'s
+    ``result_sink`` kwarg and returns it (the ``JobKind.handler`` contract
+    already supports an ``Optional[dict]`` return — see ``app/worker/
+    registry.py``'s ``JobKind`` docstring; ``agent_response`` was the
+    first kind to use it) so ``GET /api/jobs/{id}``'s stored
+    ``payload_json["result"]`` shows exactly which tables were
+    materialized/skipped (and why — e.g. ``due_check``, ``not_in_target``)
+    vs. errored on THIS run. Only reaches ``JobsRepository.complete(...,
+    result=...)`` on the success path below — a raised ``RuntimeError``
+    (the ``ok is False`` branch) still fails the job via ``.fail(...)``,
+    which has no equivalent result slot; the per-table detail for a
+    failed run remains visible in server logs and ``sync_state`` as
+    before this change.
     """
     from app.api.sync import _run_sync
 
-    ok = _run_sync(payload.get("tables"), payload.get("source"))
+    result: dict = {}
+    ok = _run_sync(payload.get("tables"), payload.get("source"), result_sink=result)
     if ok is False:
         raise RuntimeError("data-refresh sync failed — see server logs and sync_state for per-table errors")
     if ok:
@@ -372,6 +387,7 @@ def _run_data_refresh(payload: dict) -> None:
         # sync may still be in flight elsewhere, and mirroring now could
         # read a half-written parquet.
         _maybe_enqueue_distribution_mirror()
+    return result or None
 
 
 def _run_analytics_rebuild(payload: dict) -> None:
@@ -652,7 +668,7 @@ def _record_ducklake_snapshot_age(conn) -> None:
     ``app/observability/metrics.py``.
     """
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from app.observability.metrics import record_ducklake_snapshot_age
 
@@ -661,10 +677,10 @@ def _record_ducklake_snapshot_age(conn) -> None:
             return
         snapshot_time = row[0]
         if snapshot_time.tzinfo is None:
-            snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+            snapshot_time = snapshot_time.replace(tzinfo=UTC)
         else:
-            snapshot_time = snapshot_time.astimezone(timezone.utc)
-        age_seconds = max((datetime.now(timezone.utc) - snapshot_time).total_seconds(), 0.0)
+            snapshot_time = snapshot_time.astimezone(UTC)
+        age_seconds = max((datetime.now(UTC) - snapshot_time).total_seconds(), 0.0)
         record_ducklake_snapshot_age(age_seconds)
     except Exception:
         logger.exception("ducklake-maintenance: failed to record snapshot-age metric (non-fatal)")
@@ -1695,8 +1711,17 @@ def _run_corpus_extraction(payload: dict) -> dict:
         **_extraction_producer_env(),
         "AGNES_SHAREPOINT_TENANT_ID": settings.tenant_id,
         "AGNES_SHAREPOINT_CLIENT_ID": settings.client_id,
-        "AGNES_SHAREPOINT_PRIVATE_KEY": settings.private_key,
     }
+    # Exactly one credential key, matching the connection's auth_method — an
+    # empty AGNES_SHAREPOINT_PRIVATE_KEY placeholder next to a client secret
+    # would read as "certificate configured but blank" to the producer. The
+    # method marker keeps the producer's dispatch explicit rather than
+    # inferred from which variable happens to be set.
+    child_env["AGNES_SHAREPOINT_AUTH_METHOD"] = settings.auth_method
+    if settings.auth_method == "client_secret":
+        child_env["AGNES_SHAREPOINT_CLIENT_SECRET"] = settings.client_secret
+    else:
+        child_env["AGNES_SHAREPOINT_PRIVATE_KEY"] = settings.private_key
     if corpus_id:
         child_env["AGNES_EXTRACTION_CORPUS_ID"] = str(corpus_id)
 
@@ -1826,7 +1851,7 @@ def _run_sharepoint_subtree_sweep(payload: dict) -> dict:
     return run_subtree_sweep(payload)
 
 
-def dispatch_job(job: dict) -> Optional[dict]:
+def dispatch_job(job: dict) -> dict | None:
     """THE single dispatch-level entry point for running one claimed job's
     handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
     up in the process-wide ``JOB_KINDS`` registry, runs its handler, and

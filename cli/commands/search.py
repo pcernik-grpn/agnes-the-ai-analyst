@@ -4,7 +4,7 @@ One query fans out server-side over document Collections (hybrid
 lexical+vector), the corporate-memory knowledge base (fulltext), the
 table catalog (lexical cards), business metrics, and the glossary.
 Table hits carry a pivot hint — query them with SQL via `agnes query`.
-Metric hits link to /catalog/semantics; glossary hits show the term
+Metric hits link to /semantic-layer?tab=all_metrics; glossary hits show the term
 definition inline.
 """
 

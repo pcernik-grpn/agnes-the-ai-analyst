@@ -243,7 +243,7 @@ class TestLoadBearingFields:
         """`expression` is the bare aggregation fragment `resolve_expression`
         returns, captured BEFORE `_bind_metric` composes it into `sql` — the
         legacy composer stored the same fragment alongside its composed sql,
-        and `catalog_semantics.html`'s "Expression" block is gated on it."""
+        and the All-metrics tab of `semantic_layer_list.html` gates its "Expression" block on it."""
         metastore, _ = synced
         assert metastore["total_revenue"]["expression"] == 'SUM("amount")'
         assert metastore["order_count"]["expression"] == "COUNT(*)"

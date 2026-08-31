@@ -13,7 +13,7 @@ the layer that *reaches Agnes* can diverge — a dataset's source table may
 never have been registered here.
 
 ```
-agnes admin semantic-layer coverage [--json]
+agnes admin semantic keboola-import [--json]
 ```
 
 Per connection, this reports how many published metrics bind to a
@@ -40,11 +40,16 @@ skipped the CLI's validate step. Re-check any document you're about to rely
 on or extend:
 
 ```
-agnes admin semantic-model export <slug> -o /tmp/model.yaml
-agnes admin semantic-model validate /tmp/model.yaml
+agnes semantic-model export <slug> -o /tmp/model.yaml
+agnes semantic-model validate /tmp/model.yaml
 ```
 
-`agnes admin semantic-model list` surfaces `status` per model —
+Neither needs an admin: `export` reads the public, resource-gated endpoint and
+`validate` never contacts a server at all.
+
+`agnes admin semantic list` surfaces `status` per model (an admin read — it is
+the only listing that also shows invalid and draft documents; `agnes
+semantic-model search <term>` is the any-user one) —
 `status='invalid'` on a synced (non-`manual`) model means the last sync
 wrote something that failed schema validation; fix it at the source and
 resync, never by hand-patching the stored document (an import-owned model
@@ -74,6 +79,17 @@ recent queries — confirm with whoever owns the upstream source (for a
 synced model) or the team that authored it (for a `manual` model) before
 removing something that might be used seasonally or by a report outside
 Agnes's visibility.
+
+## Two neighbouring reports that answer different questions
+
+`keboola-import` above predicts what a *live Keboola project* would import.
+Two others read what is already stored, and are worth running alongside it:
+
+```
+agnes admin semantic coverage [--source <id>] [--json]   # per SOURCE × six domains
+agnes admin semantic coverage tables [--limit N]         # per TABLE: no model at all
+agnes admin semantic health [--json]                     # sync failures, orphans, invalid docs
+```
 
 ## Cadence
 
