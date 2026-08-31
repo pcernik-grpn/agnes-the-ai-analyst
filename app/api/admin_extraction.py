@@ -211,6 +211,12 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         "skips_listed": skips.get("listed"),
         "oversize_files": (report.get("skipped_oversize") or {}).get("files", progress.get("oversize_files")),
         "error": run.get("error"),
+        # WHY a run stopped early, when the crawl recorded a cause (today:
+        # `"timeout"`, from the run-timeout ceiling). A run that ended short
+        # should name its exit rather than leave an operator inferring one
+        # from a duration — and this is the field that distinguishes "the
+        # ceiling did its job" from "something broke".
+        "interrupted_reason": report.get("interrupted_reason"),
         # `{}` means NO tokens were spent, which is a different claim from
         # "$0.00" — the card must keep the two tellable apart (design §7.2).
         "usage": run.get("usage") or {},
@@ -442,6 +448,53 @@ def _ner_model_row() -> Dict[str, Any]:
     return row
 
 
+#: What each `extraction.anonymization.detector` value actually costs and
+#: catches. The note is chosen by the EFFECTIVE value, never written as if
+#: one of them were always in force: a drawer that explains `regex` while
+#: the instance is set to `llm` describes a pipeline nobody is running.
+_DETECTOR_NOTES = {
+    "regex": (
+        "the deterministic detector alone — exact on emails, phones and ids, blind to "
+        "names. No LLM call and no tokens spent, which is a different claim from a $0.00 cost."
+    ),
+    "llm": (
+        "the deterministic detector AND an LLM pass over the same text, unioned — the regex "
+        "tier is not swapped out, it is added to. Spends tokens per document."
+    ),
+}
+
+
+def _detector_row() -> Dict[str, Any]:
+    """The NER detector row, annotated for the value actually in force.
+
+    Matching lowercases and strips, because the RUNTIME does
+    (``crawler._entity_detector`` compares a normalized value against
+    ``"llm"``) — a drawer that read ``"LLM"`` as unrecognized would disagree
+    with the engine it is describing.
+
+    An unrecognized value is not an error at runtime: anything that is not
+    ``llm`` resolves to the deterministic tier, deliberately, because a typo
+    hard-failing every extraction run is worse than quietly running the
+    free, safe tier. So the note says BOTH things — the value is wrong, and
+    here is what actually executes. Naming only the first would leave an
+    operator guessing whether anything ran at all.
+    """
+    row = _config_row("NER detector", ("extraction", "anonymization", "detector"), default="regex")
+    key = str(row["value"]).strip().lower() if row["value"] is not None else ""
+    if not key:
+        # Empty/unset resolves to the deterministic tier, same as the
+        # default — the row already renders the value itself as "not set".
+        key = "regex"
+    note = _DETECTOR_NOTES.get(key)
+    if note is None:
+        note = (
+            f"unrecognized value — anything but `llm` runs the regex tier, so this instance uses "
+            f"{_DETECTOR_NOTES['regex']} Fix the value or remove the key."
+        )
+    row["note"] = note
+    return row
+
+
 def _extraction_config_rows() -> List[Dict[str, Any]]:
     """The effective ``extraction`` block, one row per leaf (design §6.2).
 
@@ -464,7 +517,9 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
             ("extraction", "timeout_s"),
             default=3600,
             note=(
-                "external-producer mode only — the built-in crawl is not a subprocess and is not killed by this value"
+                "a real ceiling on one run: at expiry the crawl stops, persists its state and the "
+                "job fails. Nothing already ingested is lost and the next run resumes from the "
+                "persisted deltaLinks/cTags, so a timeout costs re-work, never coverage. 0 = unbounded."
             ),
         ),
         _config_row(
@@ -476,15 +531,7 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
                 "appears in the collection — it is counted in the run's skips, and nowhere else"
             ),
         ),
-        _config_row(
-            "NER detector",
-            ("extraction", "anonymization", "detector"),
-            default="regex",
-            note=(
-                "regex = the deterministic detector only, no LLM call and no tokens spent — "
-                "which is a different claim from a $0.00 cost"
-            ),
-        ),
+        _detector_row(),
         _ner_model_row(),
         _config_row(
             "Anonymization key",
@@ -539,18 +586,21 @@ async def extraction_config(
     except Exception as exc:  # noqa: BLE001 — one block degrades, the drawer still opens
         logger.warning("extraction config: per-scope rows unavailable for %s: %s", connection_id, exc)
 
+    # Read from the registry at render time, never asserted (UX review M5):
+    # the section became admin-editable once the producer command line — the
+    # one security reason to keep it read-only — was removed with external
+    # mode. Per-leaf env pins still lock their own rows above.
+    from app.api.admin import _EDITABLE_SECTIONS
+
+    section_editable = "extraction" in _EDITABLE_SECTIONS
+
     return {
         "connection_id": connection_id,
         "effective": _extraction_config_rows(),
         "scopes": scopes,
-        # Stated once, at the top of the drawer: the whole section is
-        # deploy-time by design, and the reason is a security one.
-        "section_editable": False,
-        "section_lock_reason": (
-            "The `extraction` section is not admin-writable. Making one key editable makes the "
-            "WHOLE section editable (server-config validates the section name, then deep-merges), "
-            "and this section is where a producer command line lives — that is a security "
-            "decision, not a UX one."
-        ),
+        "section_editable": section_editable,
+        "section_lock_reason": None
+        if section_editable
+        else "The `extraction` section is not admin-writable on this instance.",
         "as_of": datetime.now(timezone.utc).isoformat(),
     }

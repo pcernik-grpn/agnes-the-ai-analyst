@@ -500,27 +500,22 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
         )
 
 
-# --- extraction.* admin-editable producer config (T3) -----------------------
+# --- extraction.* admin-editable config (T3) --------------------------------
 #
-# Three leaves — `enabled`, `producer.command`, `producer.module` — carry a
-# deploy-time env override rendered by the Terraform customer-instance module
-# (`AGNES_EXTRACTION_ENABLED` / `AGNES_EXTRACTION_PRODUCER_COMMAND` /
-# `AGNES_EXTRACTION_PRODUCER_MODULE` — see app/switches.py's `extraction`
-# switch and app/worker/kinds.py::_extraction_producer_argv). Every reader
-# already resolves env-first, so a web save under an active pin would be
-# accepted and then silently never read — worse than refusing outright.
+# `enabled` carries a deploy-time env override rendered by the Terraform
+# customer-instance module (`AGNES_EXTRACTION_ENABLED` — see app/switches.py's
+# `extraction` switch). Every reader already resolves env-first, so a web
+# save under an active pin would be accepted and then silently never read —
+# worse than refusing outright.
 # `_path` is relative to the `extraction` section's OWN patch dict (i.e.
 # excludes the leading "extraction" segment), matching how
 # `_validate_extraction_section` and `_known_fields_resolved` both walk it.
 _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("enabled",), "AGNES_EXTRACTION_ENABLED"),
-    (("producer", "command"), "AGNES_EXTRACTION_PRODUCER_COMMAND"),
-    (("producer", "module"), "AGNES_EXTRACTION_PRODUCER_MODULE"),
 )
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
-_EXTRACTION_ENV_PASSTHROUGH_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -578,28 +573,6 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
     if "enabled" in patch and not isinstance(patch["enabled"], bool):
         raise HTTPException(status_code=422, detail="extraction.enabled must be a boolean")
 
-    producer = patch.get("producer")
-    if isinstance(producer, dict):
-        for key in ("command", "module"):
-            val = producer.get(key)
-            if val is not None and not isinstance(val, str):
-                raise HTTPException(status_code=422, detail=f"extraction.producer.{key} must be a string")
-        passthrough = producer.get("env_passthrough")
-        if passthrough is not None:
-            if not isinstance(passthrough, list) or not all(isinstance(v, str) for v in passthrough):
-                raise HTTPException(
-                    status_code=422,
-                    detail="extraction.producer.env_passthrough must be a list of strings",
-                )
-            bad = [v for v in passthrough if not _EXTRACTION_ENV_PASSTHROUGH_NAME_RE.match(v)]
-            if bad:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "extraction.producer.env_passthrough entries must be valid env var "
-                        f"NAMES matching ^[A-Z][A-Z0-9_]*$, got: {bad!r}"
-                    ),
-                )
 
     schedule = patch.get("schedule")
     if schedule is not None:
@@ -650,16 +623,6 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     if enabled_env is not None:
         extraction["enabled"] = coerce_flag_value(enabled_env, False)
 
-    command_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_COMMAND")
-    module_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_MODULE")
-    if command_env is not None or module_env is not None:
-        producer = extraction.get("producer")
-        producer = dict(producer) if isinstance(producer, dict) else {}
-        if command_env is not None:
-            producer["command"] = command_env
-        if module_env is not None:
-            producer["module"] = module_env
-        extraction["producer"] = producer
 
 
 def _apply_extraction_env_locks(fields: Dict[str, Any]) -> None:
@@ -776,7 +739,7 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "extraction_webhook": "live",  # matches its switch — no other known key under this section
     "acl_mirroring": "live",  # matches its switch — no other known key under this section
     "acl_sync": "live",  # matches both switches under it (guarantee_mode/max_stale_hours)
-    "extraction": "live",  # every leaf is read per call: feature_enabled() (enabled), app/worker/kinds.py's _extraction_producer_argv/_extraction_producer_env_passthrough/_extraction_timeout_seconds (producer.*/timeout_s), app/api/admin_sharepoint.py's _extraction_schedule_config (schedule) — none are cached at boot
+    "extraction": "live",  # every leaf is read per call: feature_enabled() (enabled), app/worker/kinds.py's _extraction_timeout_seconds (timeout_s), app/api/admin_sharepoint.py's _extraction_schedule_config (schedule) — none are cached at boot
     # --- restart: something under the section is built once at boot and
     # never rebuilt from a later save.
     "chat": "restart",  # app.state.chat_config is built once in create_app() (matches both switches under it)
@@ -1067,55 +1030,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "which always wins over a value saved here — the field renders read-only "
                 "when that env var is present (see env_locked below)."
             ),
-        },
-        "producer": {
-            "kind": "object",
-            "hint": (
-                "How to invoke the operator-supplied extraction producer (Agnes does not "
-                "ship one — see docs/DEPLOYMENT.md#multi-process). command wins over module "
-                "when both are set."
-            ),
-            "fields": {
-                "command": {
-                    "kind": "string",
-                    "default": "",
-                    "hint": (
-                        "Full command line for the producer entrypoint, e.g. "
-                        "'python -m your_producer.run'. This command is executed by the "
-                        "extraction worker process on the server. A Terraform-rendered "
-                        "deployment sets this via AGNES_EXTRACTION_PRODUCER_COMMAND, which "
-                        "always wins over this value — the field renders read-only when "
-                        "that env var is present."
-                    ),
-                },
-                "module": {
-                    "kind": "string",
-                    "default": "",
-                    "hint": (
-                        "python -m <module> shorthand for a producer the worker image "
-                        "installed as a package (EXTRACTION_PRODUCER_INSTALL build-arg). "
-                        "Ignored when command is set. A Terraform-rendered deployment sets "
-                        "this via AGNES_EXTRACTION_PRODUCER_MODULE, which always wins over "
-                        "this value — the field renders read-only when that env var is "
-                        "present."
-                    ),
-                },
-                "env_passthrough": {
-                    "kind": "array",
-                    "item_kind": "string",
-                    "default": [],
-                    "hint": (
-                        "Extra env var NAMES (e.g. HTTP_PROXY_EXTRA) to forward to the "
-                        "producer subprocess from this process's own environment, beyond "
-                        "the curated non-secret allowlist (PATH/locale/timezone/tempdir/TLS/"
-                        "proxy vars). Each entry must be a valid env var name "
-                        "(^[A-Z][A-Z0-9_]*$) — not a way back to forwarding the whole "
-                        "environment, and never a place for a secret name: the producer "
-                        "still never receives this instance's credentials just because a "
-                        "name happens to be listed here."
-                    ),
-                },
-            },
         },
         "schedule": {
             "kind": "string",

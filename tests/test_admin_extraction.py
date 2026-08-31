@@ -124,8 +124,11 @@ class TestExtractionConfig:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["connection_id"] == conn_id
-        assert body["section_editable"] is False
-        assert body["section_lock_reason"]
+        # Editability is read from the registry at render time (UX review
+        # M5): with the producer command line gone, the section is
+        # admin-editable and the drawer must not claim otherwise.
+        assert body["section_editable"] is True
+        assert body["section_lock_reason"] is None
         assert body["as_of"]
 
     def test_every_row_names_its_origin_and_lock_state(self, seeded_app):
@@ -158,7 +161,77 @@ class TestExtractionConfig:
         detector = by_key["extraction.anonymization.detector"]
         assert detector["value"] == "regex"
         assert detector["origin"] == "default"
-        assert "no LLM call" in (detector["note"] or "")
+        assert "No LLM call" in (detector["note"] or "")
+
+    def test_the_detector_note_describes_the_value_actually_in_force(self, monkeypatch):
+        """A drawer that explains `regex` while the instance is set to `llm`
+        describes a pipeline nobody is running. The note follows the value."""
+        import app.api.admin_extraction as mod
+
+        def _row_for(value):
+            monkeypatch.setattr(mod, "_config_row", lambda *a, **k: {"value": value, "note": None})
+            return mod._detector_row()
+
+        assert "No LLM call" in _row_for("regex")["note"]
+
+        llm = _row_for("llm")["note"]
+        # The llm setting ADDS the LLM tier to the regex one; saying it
+        # replaces regex would understate what still runs deterministically.
+        assert "not swapped out" in llm
+        assert "Spends tokens" in llm
+
+        # An unrecognized value is NOT an error at runtime: anything but
+        # `llm` runs the regex tier. The note has to say both — the value is
+        # wrong, AND here is what actually executes — or an operator is left
+        # guessing whether anything ran at all.
+        unknown = _row_for("magic")["note"]
+        assert "unrecognized value" in unknown
+        assert "runs the regex tier" in unknown
+        assert "No LLM call" in unknown
+
+    def test_the_detector_note_matches_the_way_the_runtime_normalizes(self):
+        """`crawler._entity_detector` lowercases and strips before comparing
+        against "llm". A drawer that read "LLM" as unrecognized would
+        disagree with the engine it is describing."""
+        import app.api.admin_extraction as mod
+
+        def _row_for(value):
+            import unittest.mock as m
+
+            with m.patch.object(mod, "_config_row", lambda *a, **k: {"value": value, "note": None}):
+                return mod._detector_row()
+
+        for spelling in ("llm", "LLM", " llm ", "Llm"):
+            assert "not swapped out" in _row_for(spelling)["note"], spelling
+
+    def test_an_unset_detector_reads_as_the_deterministic_tier(self):
+        """An empty value resolves to the regex tier at runtime, so it must
+        not be reported as an unrecognized one."""
+        import app.api.admin_extraction as mod
+
+        def _row_for(value):
+            import unittest.mock as m
+
+            with m.patch.object(mod, "_config_row", lambda *a, **k: {"value": value, "note": None}):
+                return mod._detector_row()
+
+        for empty in ("", "   ", None):
+            note = _row_for(empty)["note"]
+            assert "No LLM call" in note, empty
+            assert "unrecognized" not in note, empty
+
+    def test_the_timeout_row_describes_the_in_process_ceiling(self, seeded_app):
+        """It used to be a subprocess kill that did not apply to the built-in
+        crawl; it now genuinely bounds the run. A note still saying the old
+        thing would tell an operator a cap they set does nothing."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-timeout")
+        rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
+        by_key = {r["key"]: r for r in rows if r["key"]}
+        note = by_key["extraction.timeout_s"]["note"]
+        assert "not a subprocess" not in note
+        assert "resumes" in note
+        assert "0 = unbounded" in note
 
     def test_a_code_constant_and_an_unset_env_knob_are_told_apart(self):
         """ "built in" means there is nothing to set; "default" means nobody
@@ -301,3 +374,23 @@ class TestRunProjection:
 
         out = _run_out({"id": "er_1", "status": "done", "report": {}, "usage": {}})
         assert out["usage"] == {}
+
+    def test_a_recorded_stop_reason_is_surfaced(self):
+        """A run that hit the timeout ceiling names its exit; an operator
+        should never have to infer "it ended short" from a duration."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "failed",
+                "report": {"interrupted": True, "interrupted_reason": "timeout", "duration_s": 3600.0},
+            }
+        )
+        assert out["interrupted_reason"] == "timeout"
+
+    def test_a_run_that_ended_normally_has_no_stop_reason(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
+        assert out["interrupted_reason"] is None

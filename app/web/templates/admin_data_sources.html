@@ -2497,18 +2497,17 @@ function _spRejectionReasonText(reason) {
    (`app/api/admin_sharepoint.py::_extraction_readiness`); this maps it to
    the sentence the card shows instead of letting the click 409.
 
-   The two sentences name BOTH configuration sources, because both gates
-   honour a deploy-time env override ahead of instance.yaml
-   (AGNES_EXTRACTION_ENABLED, AGNES_EXTRACTION_PRODUCER_COMMAND /
-   AGNES_EXTRACTION_PRODUCER_MODULE). An admin on an env-configured
-   instance told to edit instance.yaml would edit a file that is not
-   deciding this — the API's own 409 messages say both, and this copy is
-   the same sentence one layer up. */
+   The enabled sentence names BOTH configuration sources, because the gate
+   honours a deploy-time env override ahead of instance.yaml
+   (AGNES_EXTRACTION_ENABLED). An admin on an env-configured instance told
+   to edit instance.yaml would edit a file that is not deciding this — the
+   API's own 409 message says both, and this copy is the same sentence one
+   layer up. */
 const EXTRACTION_UNREADY_REASON_TEXT = {
   extraction_disabled:
     "Extraction is disabled on this instance — set extraction.enabled: true in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
-  extraction_producer_not_configured:
-    "No extraction producer is configured — set extraction.producer.command or extraction.producer.module in instance.yaml (or AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE).",
+  extraction_dependencies_missing:
+    "The extraction dependencies are not installed on this instance — install the extra (pip install 'agnes[extraction]') and restart.",
 };
 function _extractionUnreadyReasonText(reason) {
   return EXTRACTION_UNREADY_REASON_TEXT[reason] || "Extraction is not ready on this instance.";
@@ -7296,6 +7295,14 @@ function _extRunsHtml(body) {
       detail += `<div class="ext-sub ext-warn">${_extNum(run.skips_total)} not indexed${_extEsc(listed)}</div>`;
     }
     if (run.http_429) detail += _extThrottleLine(run);
+    // A run that stopped early NAMES its exit when the crawl recorded one
+    // (today: the run-timeout ceiling), so "ended short" is never something
+    // an operator has to infer from a duration. Rendered for a failed run
+    // too: "the ceiling did its job" and "something broke" are different
+    // facts, and the reason is what tells them apart.
+    if (run.interrupted_reason) {
+      detail += `<div class="ext-sub ext-warn">stopped early — ${_extEsc(run.interrupted_reason)}</div>`;
+    }
     // An interrupted run ingested what it ingested and the next run resumes
     // from the persisted cTags. A FAILED run gets no such reassurance.
     if (run.outcome === "interrupted") {

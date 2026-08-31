@@ -364,6 +364,45 @@ class TestRunsDrawer:
         assert "9 not indexed" in out["html"]
         assert "7 listed by name" in out["html"]
 
+    def test_a_timed_out_run_names_its_exit(self):
+        """ "the ceiling did its job" and "something broke" both render as a
+        failed run — the recorded reason is what tells them apart."""
+        runs = {
+            "runs": [
+                {
+                    "id": "er_t",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 3600.0,
+                    "files_done": 4102,
+                    "interrupted_reason": "timeout",
+                    "error": "run exceeded extraction.timeout_s",
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        assert "stopped early — timeout" in html
+        # …and it does NOT borrow the interrupted row's resume reassurance,
+        # which is reserved for the outcome that earns it.
+        assert "the next run resumes" not in html
+
+    def test_a_run_with_no_recorded_reason_says_nothing_about_one(self):
+        runs = {
+            "runs": [
+                {
+                    "id": "er_n",
+                    "outcome": "done",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 12.0,
+                    "files_done": 5,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        assert "stopped early" not in html
+
     def test_no_runs_is_an_empty_state_not_a_blank_drawer(self):
         out = _run_js("console.log(JSON.stringify({html: _extRunsHtml({runs: [], total: 0})}));")
         assert "No extraction runs recorded yet" in out["html"]
