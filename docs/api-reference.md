@@ -1283,9 +1283,11 @@ must_not_forbids_subtree_override` under the `must_not` guarantee mode
 acl_sync_already_running` when one is already queued/running for this
 connection.
 
-`GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
-collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
-crawling moves inside Agnes.
+`GET …/corpus-map` is the scope→collection routing map for this
+connection, in the crawler resolver's own key shape (`"<site>"` or
+`"<site>/<drive-relative folder path>"` → `collection_id`); `409
+corpus_map_ambiguous` rather than a best-guess map when two scopes collapse
+to one key with different collections.
 
 `GET …/certificate` returns read-only certificate metadata — the thumbprint
 the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`
@@ -1307,8 +1309,9 @@ admin trigger for the existing `corpus-extraction` job kind
 {"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
 any other work; refuses cleanly (never a job that fails 30 minutes later in
 a worker) with `409 extraction_disabled` (`extraction.enabled` is false) or
-`409 extraction_producer_not_configured` (no `extraction.producer.command`/
-`.module` set); a run already queued/running for the same connection is
+`409 extraction_dependencies_missing` (the `extraction` optional dependency
+extra is not installed on this process); a run already queued/running for
+the same connection is
 `409 extraction_already_running` — deduped on a stable per-connection
 idempotency key shared with the sweep below.
 

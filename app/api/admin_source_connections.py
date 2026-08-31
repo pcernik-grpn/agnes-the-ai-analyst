@@ -1136,8 +1136,8 @@ async def update_connection(
             # through that form (a rename, a certificate change) silently
             # wiped whichever of them wasn't carried forward — first
             # `scopes` (which is the ONLY place the anonymize-in-front
-            # pipeline's opt-in lives, see
-            # `app/worker/kinds.py::_anonymize_marked_scope_map` — the
+            # pipeline's opt-in lives — the built-in crawl reads
+            # `config.scopes[].anonymize` off this row, see the
             # anonymize-fail-closed report, 2026-08-29), then `extraction`
             # (TCRD-226, merged hours later the SAME day — the identical bug,
             # one key over, with no test to catch it).

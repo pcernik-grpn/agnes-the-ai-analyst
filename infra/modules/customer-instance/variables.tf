@@ -201,9 +201,9 @@ variable "prod_instance" {
     # kai_agent_mem_limit above (TF fields, not .env hand-edits — the startup
     # script rewrites .env from scratch on every boot). Defaults mirror the
     # base compose's own AGNES_EXTRACTION_WORKER_MEM_LIMIT/_CPUS fallbacks
-    # (docker-compose.yml) — the worker runs the extraction producer as a
-    # subprocess (document conversion + LLM calls), hence beefier than the
-    # kai engine's.
+    # (docker-compose.yml) — the worker runs the extraction pipeline
+    # in-process (document download + conversion + LLM calls), hence beefier
+    # than the kai engine's.
     extraction_worker_mem_limit = optional(string, "4g")
     extraction_worker_cpus      = optional(string, "2.0")
     # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
@@ -890,20 +890,20 @@ variable "kai_agent_env" {
 
 variable "extraction_worker_image" {
   description = <<-EOT
-    Full image ref (with tag) of the extraction-worker image — the app image's
-    `worker` Dockerfile target built WITH the operator's extraction producer
-    baked in via the EXTRACTION_PRODUCER_INSTALL build-arg (this public repo
-    does not vendor a producer; the operator's own infra builds and publishes
-    the variant, mirroring the `-rich` tag pattern). Pin an immutable tag —
-    the agnes-auto-upgrade tick re-pulls it every cycle.
+    Full image ref (with tag) of the extraction-worker image — an app image
+    built WITH the `extraction` optional extra (`--build-arg
+    EXTRA_EXTRAS=,extraction`), which carries the document-converter backends
+    the built-in extraction pipeline needs. The operator's own infra builds
+    and publishes the variant, mirroring the `-rich` tag pattern. Pin an
+    immutable tag — the agnes-auto-upgrade tick re-pulls it every cycle.
 
     Why a separate variable instead of the app image: docker-compose.prod.yml
     deliberately pins the `extraction-worker` compose service to the plain app
-    image (source-less prod VMs cannot `build:`), which bypasses the build-arg
-    entirely — a worker started from it has the lane wired up but no producer
-    on PATH, so every `corpus-extraction` job fails clean. The module overlay
-    re-pins the service to THIS image, which is the only place the producer
-    can come from on a VM.
+    image (source-less prod VMs cannot `build:`), which is built without that
+    extra — a worker started from it has the lane wired up but no converter,
+    so `corpus-extraction` refuses up front with
+    `extraction_dependencies_missing`. The module overlay re-pins the service
+    to THIS image.
 
     Registry access: same rule as kai_agent_image — `gcloud auth
     configure-docker` is run for a *-docker.pkg.dev host, any other private

@@ -738,34 +738,34 @@ and `corporate-memory` (light lane), among others. Each handler is a thin adapte
 the function already backing the equivalent HTTP endpoint — no logic is
 duplicated between the queued and HTTP-triggered call sites.
 
-**Extraction lane** (spec §7.5 "Extraction inside Agnes (later)" / §16
+**Extraction lane** (spec §7.5 "Extraction inside Agnes" / §16
 step 7 of `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
 design.md`): a lane of its own, not sharing heavy, because a corpus
 re-extraction sitting in heavy's concurrency-1 slot would block every
-table sync for its whole duration. Its one kind, `corpus-extraction`, is
-the producer-invocation seam — it does not crawl/convert/anonymize/
-extract itself; it resolves a `sharepoint` connection's credentials the
-same way the admin UI does (`connectors.sharepoint.settings
-.resolve_sharepoint_settings`, vault-first then the server's
-`SHAREPOINT_CERT_PRIVATE_KEY` env var) and shells out to the
-operator-configured `extraction.producer.command`/`.module`
-(`instance.yaml`, off by default via `extraction.enabled` — a registered
-switch, `AGNES_EXTRACTION_ENABLED`) under a bounded timeout, with the
-resolved credentials reaching the subprocess only via its child
-environment — never argv, never logged. That child env is a curated
-non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus
-any operator-opted-in `extraction.producer.env_passthrough`, plus the
-three named SharePoint credentials and the corpus id — never the full
-parent environment, so no other instance secret (vault key, LLM API key,
-DB DSN, ...) reaches an external, admin-configurable binary. The producer
-itself (the operator's own producer, adopted per spec §7.1) is not
-vendored into this repo. Off by default and additive: an instance that
-never sets `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
+table sync for its whole duration. Its one kind, `corpus-extraction`, is a
+thin delegate to `connectors.sharepoint.crawler.run_builtin_crawl`, the
+built-in pipeline (owner decision 2026-08-31 — one pipeline, no dual
+modes; the former external-producer subprocess and its
+`extraction.producer.*` config were removed with that decision). It
+crawls, converts, anonymizes where a scope asks for it, and ingests
+through the same internal path a wizard upload takes, all in-process. A
+`sharepoint` connection's credentials are resolved the same way the admin
+UI does (`connectors.sharepoint.settings.resolve_sharepoint_settings`,
+vault-first then the server's `SHAREPOINT_CERT_PRIVATE_KEY` env var) and
+never reach a command line, because there is none. The run is bounded by
+`extraction.timeout_s` — checked between files and between delta pages,
+and on expiry the crawl persists its resumable state and fails the job
+with `interrupted_reason: "timeout"`; that is the only stop mechanism v1
+has. Off by default (`extraction.enabled` — a registered switch,
+`AGNES_EXTRACTION_ENABLED`) and additive: an instance that never sets
+`extraction.enabled`/`AGNES_WORKER_LANES` is unaffected. The converter
+backends ship as the `extraction` optional extra; the admin trigger
+refuses with `409 extraction_dependencies_missing` when it is absent.
 
-Deployment: the `worker` Dockerfile build target (an extension point,
-`EXTRACTION_PRODUCER_INSTALL` build-arg, for bundling a producer's runtime
-deps — never built by default; `docker build .` with no `--target` still
-produces the ordinary `app` image) and the `extraction-worker` compose
+Deployment: the `worker` Dockerfile build target (the plain app image —
+`docker build .` with no `--target` still produces the ordinary `app`
+image; build it with `--build-arg EXTRA_EXTRAS=,extraction` so the lane
+has its converters) and the `extraction-worker` compose
 service (`docker-compose.yml`, profile-gated, `AGNES_WORKER_LANES
 =extraction`) let a deployment run extraction in its own process/container
 instead of adding it to the main `app` service's lanes. That service sets

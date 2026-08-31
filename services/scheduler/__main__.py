@@ -362,8 +362,8 @@ def _extraction_schedule() -> Optional[str]:
     ``POST /api/admin/sharepoint/extraction/run-due``.
 
     Off by default — unlike :func:`_iw_sync_schedule` above, there is no
-    sensible default cadence to fall back to for a producer-dependent
-    feature that is itself off by default (``extraction.enabled``), so
+    sensible default cadence to fall back to for a feature that is itself
+    off by default (``extraction.enabled``), so
     absent/null/empty/invalid all mean "disabled" and ``build_jobs()``
     omits the scheduler row entirely.
     """

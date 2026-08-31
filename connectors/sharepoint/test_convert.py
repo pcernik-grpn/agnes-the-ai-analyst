@@ -490,10 +490,13 @@ def test_no_agpl_dependency_is_imported_by_the_converter():
     assert {"markitdown", "pypdfium2"} <= imported
 
 
-def test_structure_pass_failure_degrades_to_plain_extraction(tmp_path, monkeypatch):
-    """The structure-first PDF route must never be load-bearing: when
-    ``pdf_structure.reconstruct_pdf`` raises, ``_convert_pdf`` falls back to
-    the plain reading-order loop (single-newline joins, no block spacing)."""
+def test_structure_pass_failure_raises_conversion_error(tmp_path, monkeypatch):
+    """``pdf_structure.reconstruct_pdf`` is the ONLY PDF route (owner
+    decision 2026-08-31 — one pipeline, no dual modes). It already degrades
+    per page inside itself, so an exception escaping it means the FILE is not
+    convertible: that surfaces as a ``ConversionError`` naming the file, which
+    the crawler counts in ``convert_failed`` and walks past — never a silent
+    second attempt through a parallel plain-text implementation."""
     from connectors.sharepoint import pdf_structure
 
     def _boom(path, max_pages=None):
@@ -504,7 +507,8 @@ def test_structure_pass_failure_degrades_to_plain_extraction(tmp_path, monkeypat
     path = tmp_path / "fallback.pdf"
     path.write_bytes(_build_pdf([[("Hello Agnes", 72, 700), ("Second line", 72, 660)]]))
 
-    result = convert_to_markdown(path, "application/pdf")
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/pdf")
 
-    assert result.engine == "pypdfium2"
-    assert result.markdown == "Hello Agnes\nSecond line"
+    assert excinfo.value.filename == "fallback.pdf"
+    assert excinfo.value.engine == "pypdfium2"

@@ -10,6 +10,7 @@ but invisible") warning, and the producer-handoff corpus-map endpoint.
 from __future__ import annotations
 
 import datetime
+import sys
 
 import httpx
 import pytest
@@ -1649,9 +1650,9 @@ class TestChangesFeedFailsCleanOnDuckDB:
 
 # ---------------------------------------------------------------------------
 # Extraction enqueue wiring (TCRD-226) — the admin trigger + the scheduled
-# sweep. Neither test class launches a real producer subprocess; they cover
-# the endpoints' OWN responsibilities: 404-before-work, the feature-usable
-# gate, duplicate-run dedup, and the exact payload shape enqueued for
+# sweep. Neither test class runs a crawl; they cover the endpoints' OWN
+# responsibilities: 404-before-work, the feature-usable gate, duplicate-run
+# dedup, and the exact payload shape enqueued for
 # app/worker/kinds.py::_run_corpus_extraction to pick up.
 # ---------------------------------------------------------------------------
 
@@ -1674,13 +1675,7 @@ def _config_get_value(config: dict):
     return _get
 
 
-_ENABLED_EXTRACTION_CONFIG = {
-    "extraction": {
-        "enabled": True,
-        "producer": {"command": "python -m fake_producer"},
-        "timeout_s": 60,
-    }
-}
+_ENABLED_EXTRACTION_CONFIG = {"extraction": {"enabled": True, "timeout_s": 60}}
 
 
 class TestExtractionTrigger:
@@ -1727,13 +1722,21 @@ class TestExtractionTrigger:
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "extraction_disabled"
 
-    def test_refuses_when_no_producer_configured(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+    def test_refuses_when_the_extraction_extra_is_not_installed(self, seeded_app, monkeypatch):
+        """The pipeline runs IN-PROCESS now, so a server without the
+        converter backends would crawl and then fail on every single file.
+        Refused up front instead, naming the exact install command."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        # `None` in sys.modules makes the import raise ImportError — what an
+        # uninstalled extra actually looks like.
+        monkeypatch.setitem(sys.modules, "pypdfium2", None)
         c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-producer")
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-extra")
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 409, r.text
-        assert r.json()["detail"]["error"] == "extraction_producer_not_configured"
+        detail = r.json()["detail"]
+        assert detail["error"] == "extraction_dependencies_missing"
+        assert "agnes[extraction]" in detail["message"]
 
     def test_producer_command_env_override_satisfies_readiness(self, seeded_app, monkeypatch):
         """A deployment that activates extraction purely via env (the

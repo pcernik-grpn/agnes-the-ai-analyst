@@ -1,8 +1,7 @@
-"""Producer corpus-map construction — ONE implementation for both handoffs.
+"""Corpus-map construction — scope rows to the routing keys a crawl matches.
 
-The external extraction producer routes each crawled row to a collection
-with its ``corpusmap.corpus_for()`` resolver, whose keys are matched
-against the crawler's OWN row shape:
+A crawled row is routed to a collection by a ``corpus_for()``-style
+resolver whose keys are matched against the crawler's OWN row shape:
 
     "<site display name>"                   every row of the site
     "<site display name>/<folder path>"     rows whose drive-relative path
@@ -19,11 +18,10 @@ Two facts make the wizard's stored ``display_path`` unusable verbatim:
    "Site / Documents" (spaces around the slash) poison matching unless
    segments are stripped.
 
-This module owns the translation. Both the ``corpus-extraction`` job
-handler (``AGNES_EXTRACTION_CORPUS_MAP`` child-env handoff,
-``app/worker/kinds.py``) and the pull handoff (``GET
-/api/admin/sharepoint/connections/{id}/corpus-map``) go through it, so the
-two surfaces cannot drift.
+This module owns the translation, and ``GET /api/admin/sharepoint/
+connections/{id}/corpus-map`` serves exactly what it produces — so a
+consumer of that endpoint and anything else reasoning about scope routing
+cannot drift on the key shape.
 
 Scope KIND is decided structurally from the Graph id shape — a composite
 site id contains ``,`` (``<host>,<siteGuid>,<webGuid>``), a drive id starts

@@ -35,16 +35,13 @@ subclass, so a caller that only catches ``ConversionError`` still survives) and
 names the extra to install; the imports are lazy so importing this module on a
 server that never converts anything costs nothing and cannot fail.
 
-v1 scope limits (deliberate, documented)
-----------------------------------------
-The PDF route extracts *text in reading order*. It does **not** reconstruct
-headings, tables, lists, or any other markdown structure — a PDF converts to
-plain paragraphs separated by blank lines, with pages separated by
-``\\n\\n---\\n\\n``. Reading order is recovered by sorting text rectangles
-top-to-bottom then left-to-right *only when PDFium's own order is already
-scrambled*; a multi-column PDF whose native order is column-major but not
-globally monotone will therefore be re-ordered row-wise, interleaving the
-columns. Both are known v1 limits, not bugs.
+The PDF route is :mod:`connectors.sharepoint.pdf_structure` and nothing else
+(owner decision 2026-08-31 — one pipeline, no dual modes). It reconstructs
+headings and tables from glyph positions and degrades *per page*, inside
+itself, to that page's plain reading-order text whenever the block structure
+is ambiguous — a wrong table being worse than no table — so there is no
+second, whole-document plain route out here for a failure to fall back to.
+Pages are separated by ``\\n\\n---\\n\\n``.
 
 A PDF with no text layer at all (a scan) is **not** an error: it returns
 ``engine="empty"`` with empty markdown. Transcribing scans is a separate
@@ -53,13 +50,8 @@ feature with its own cost surface — this module never calls a model.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Sequence
-
-
-logger = logging.getLogger(__name__)
 
 
 #: Suffixes read straight off disk. Kept identical to the crawler's historical
@@ -101,10 +93,6 @@ ENGINE_MARKITDOWN = "markitdown"
 ENGINE_PYPDFIUM2 = "pypdfium2"
 ENGINE_PASSTHROUGH = "passthrough"
 ENGINE_EMPTY = "empty"
-
-#: Vertical slack, in PDF points, within which two text rectangles count as
-#: sitting on the same line.
-_LINE_TOLERANCE_PT = 3.0
 
 
 class ConversionError(RuntimeError):
@@ -199,7 +187,7 @@ def convert_to_markdown(
         text = _read_text(path, filename, max_chars)
         engine = ENGINE_PASSTHROUGH
     elif suffix == ".pdf" or (not suffix and declared in _PDF_MIMES):
-        text = _convert_pdf(path, filename, max_chars)
+        text = _convert_pdf(path, filename)
         engine = ENGINE_PYPDFIUM2
     else:
         text = _convert_markitdown(path, filename)
@@ -272,184 +260,47 @@ def _convert_markitdown(path: Path, filename: str) -> str:
 # ---------------------------------------------------------------------- pdf
 
 
-def _convert_pdf(path: Path, filename: str, max_chars: int) -> str:
-    """PDF → markdown: structure pass first, plain reading-order as fallback.
+def _convert_pdf(path: Path, filename: str) -> str:
+    """PDF → markdown through the structure pass, and only through it.
 
-    The default path is :func:`connectors.sharepoint.pdf_structure.reconstruct_pdf`
-    (headings + tables from glyph positions; it degrades per page to the same
-    reading-order text this module's plain loop produces, so it is never
-    worse). The plain loop below remains the fallback when the structure pass
-    itself fails. Pages are separated by :data:`PAGE_BREAK`; a page with no
-    text contributes nothing but still consumes a separator, so page
-    numbering stays meaningful.
+    :func:`connectors.sharepoint.pdf_structure.reconstruct_pdf` is the ONE
+    PDF route (owner decision 2026-08-31 — one pipeline, no dual modes). It
+    already degrades *internally*, per page: a page whose blocks are
+    ambiguous falls back to that page's plain reading-order text and is
+    counted in the run's ``degraded_pages``, and a page pdfium cannot load at
+    all contributes an empty chunk so the ``---`` separators stay aligned
+    with the real page numbers. So there is nothing a second, whole-document
+    plain loop out here could rescue — a structure-pass exception means the
+    FILE could not be opened as a PDF, which is a :class:`ConversionError`
+    the crawler counts in ``convert_failed`` and walks past.
+
+    Takes no ``max_chars``: the cap is applied once, by the caller
+    (:func:`convert_to_markdown`'s :func:`_truncate`), for every route.
     """
     try:
-        import pypdfium2 as pdfium  # type: ignore[import-untyped]
+        # Presence probe for the typed error below: `reconstruct_pdf` imports
+        # pypdfium2 lazily too, and an uninstalled extra must surface as
+        # MissingConversionDependency naming `agnes[extraction]`, never as a
+        # bare ImportError from three frames down.
+        import pypdfium2  # noqa: F401
     except ImportError as exc:
         raise MissingConversionDependency(filename, "pypdfium2", engine=ENGINE_PYPDFIUM2) from exc
 
-    try:
-        from connectors.sharepoint.pdf_structure import reconstruct_pdf
+    from connectors.sharepoint.pdf_structure import reconstruct_pdf
 
+    try:
         structured = str(reconstruct_pdf(path)).strip()
-    except Exception as exc:  # noqa: BLE001 — degrade to plain extraction below
-        logger.warning(
-            "sharepoint.convert: structure pass failed for %s (%s); using plain extraction",
-            filename,
-            type(exc).__name__,
-        )
-    else:
-        # Same no-text-layer contract as the plain path: near-empty means a
-        # scan (engine="empty" upstream), never a different engine.
-        return structured if len(structured) >= MIN_PDF_TEXT_CHARS else ""
-
-    try:
-        document = pdfium.PdfDocument(str(path))
     except Exception as exc:
         raise ConversionError(
             filename,
-            f"could not open PDF ({type(exc).__name__})",
+            f"could not convert PDF ({type(exc).__name__})",
             engine=ENGINE_PYPDFIUM2,
         ) from exc
 
-    pages: List[str] = []
-    total = 0
-    try:
-        for index in range(len(document)):
-            try:
-                page = document[index]
-                page_text = _extract_page_text(page)
-            except Exception as exc:
-                # One damaged page does not invalidate the rest of the
-                # document; record the gap and carry on.
-                logger.warning(
-                    "sharepoint.convert: skipping unreadable page %d of %s (%s)",
-                    index + 1,
-                    filename,
-                    type(exc).__name__,
-                )
-                page_text = ""
-            pages.append(page_text)
-            total += len(page_text)
-            if total > max_chars:
-                break
-    except Exception as exc:  # malformed page tree — len()/indexing itself fails
-        raise ConversionError(
-            filename,
-            f"corrupt PDF structure ({type(exc).__name__})",
-            engine=ENGINE_PYPDFIUM2,
-        ) from exc
-    finally:
-        try:
-            document.close()
-        except Exception:  # pragma: no cover - defensive
-            pass
-
-    text = PAGE_BREAK.join(pages).strip()
-    if len(text.strip()) < MIN_PDF_TEXT_CHARS:
-        # No usable text layer: a scan, or a PDF of pure vector art. Signalled
-        # by returning empty so convert_to_markdown reports engine="empty".
-        return ""
-    return text
-
-
-@dataclass(frozen=True)
-class _Segment:
-    """One text rectangle on a page, in PDF user space (origin bottom-left)."""
-
-    top: float
-    left: float
-    text: str
-
-
-def _extract_page_text(page: Any) -> str:
-    """Text of a single page, in reading order."""
-    textpage = page.get_textpage()
-    try:
-        segments = _page_segments(textpage)
-        if not segments:
-            return _normalize_newlines(textpage.get_text_range()).strip()
-        if not _is_reading_order(segments):
-            segments = _sorted_reading_order(segments)
-        return _render_lines(segments)
-    finally:
-        try:
-            textpage.close()
-        except Exception:  # pragma: no cover - defensive
-            pass
-
-
-def _page_segments(textpage: Any) -> List[_Segment]:
-    """Text rectangles of a page, in PDFium's own order."""
-    try:
-        count = textpage.count_rects()
-    except Exception:  # pragma: no cover - PDFium refused the page
-        return []
-    segments: List[_Segment] = []
-    for index in range(max(count, 0)):
-        left, bottom, right, top = textpage.get_rect(index)
-        text = textpage.get_text_bounded(left=left, bottom=bottom, right=right, top=top)
-        text = _normalize_newlines(text or "").strip()
-        if text:
-            segments.append(_Segment(top=float(top), left=float(left), text=text))
-    return segments
-
-
-def _is_reading_order(segments: Sequence[_Segment]) -> bool:
-    """Is PDFium's native order already top-to-bottom, left-to-right?
-
-    Native order usually *is* reading order — it follows the content stream,
-    which authoring tools emit in reading order — and it handles multi-column
-    layouts that a naive geometric sort would interleave. So it is kept unless
-    it is demonstrably scrambled.
-    """
-    for previous, current in zip(segments, segments[1:]):
-        if current.top > previous.top + _LINE_TOLERANCE_PT:
-            return False  # jumped back up the page
-        same_line = abs(current.top - previous.top) <= _LINE_TOLERANCE_PT
-        if same_line and current.left < previous.left:
-            return False  # jumped back left within a line
-    return True
-
-
-def _sorted_reading_order(segments: Sequence[_Segment]) -> List[_Segment]:
-    """Sort scrambled segments into lines: top-to-bottom, then left-to-right.
-
-    Lines are clustered rather than sorted on a rounded key, so two rectangles
-    a hair apart vertically cannot land in different lines just because a
-    bucket boundary happens to fall between them.
-    """
-    by_height = sorted(segments, key=lambda segment: -segment.top)
-    ordered: List[_Segment] = []
-    line: List[_Segment] = []
-    line_top: float | None = None
-    for segment in by_height:
-        if line_top is None or abs(segment.top - line_top) <= _LINE_TOLERANCE_PT:
-            if line_top is None:
-                line_top = segment.top
-            line.append(segment)
-            continue
-        ordered.extend(sorted(line, key=lambda item: item.left))
-        line = [segment]
-        line_top = segment.top
-    ordered.extend(sorted(line, key=lambda item: item.left))
-    return ordered
-
-
-def _render_lines(segments: Sequence[_Segment]) -> str:
-    """Join ordered segments, breaking a line where the baseline drops."""
-    lines: List[str] = []
-    current: List[str] = []
-    line_top: float | None = None
-    for segment in segments:
-        if line_top is not None and abs(segment.top - line_top) > _LINE_TOLERANCE_PT:
-            lines.append(" ".join(current))
-            current = []
-        current.append(segment.text)
-        line_top = segment.top
-    if current:
-        lines.append(" ".join(current))
-    return "\n".join(line for line in lines if line.strip()).strip()
+    # Near-empty means no usable text layer — a scan, or pure vector art.
+    # Signalled by returning empty so convert_to_markdown reports
+    # engine="empty"; not an error, and never a different engine.
+    return structured if len(structured) >= MIN_PDF_TEXT_CHARS else ""
 
 
 # ------------------------------------------------------------------ helpers

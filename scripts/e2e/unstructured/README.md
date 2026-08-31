@@ -100,13 +100,15 @@ pass before you spend time chasing a false failure.
   Agnes does not resurface on any Agnes-side reader surface (facts search,
   a bounded sample of claims, collections search, and optionally a named
   collection's document preview/raw endpoints). **This does not prove the
-  producer's anonymizer ran or ran correctly** — that stage is external to
-  this repo. A PASS means Agnes did not re-expose an already-anonymized
-  batch; it is not proof the batch was anonymized in the first place.
-- **05** — the one seam Agnes owns end-to-end: triggering `corpus-
-  extraction` for a SharePoint connection enqueues a job, a worker claims
-  it, and it reaches a terminal state. Everything upstream of "run the
-  configured producer command" is out of scope (external pipeline).
+  anonymizer ran or ran correctly** on a batch pushed in through
+  `POST /api/facts/ingest` by something other than the built-in crawl. A
+  PASS means Agnes did not re-expose an already-anonymized batch; it is not
+  proof the batch was anonymized in the first place.
+- **05** — triggering `corpus-extraction` for a SharePoint connection
+  enqueues a job, a worker claims it, and it reaches a terminal state. The
+  pipeline behind it is now in-repo (`connectors/sharepoint/crawler.py`), so
+  a terminal state here also means the crawl itself ran; a run that outlives
+  this script's patience is a timeout of the POLL, not of the crawl.
 
 ## Triage table
 
@@ -117,10 +119,10 @@ pass before you spend time chasing a false failure.
 | `501 requires_postgres_backend` on any facts endpoint | The instance is DuckDB-backed | Facts is PG-only by design (A3 ratchet) — point the pack at a PG-backed instance, or expect 02/03/04's facts-dependent checks to SKIP/fail clean, never crash |
 | `404` on every `/api/facts/*` call | `facts.enabled` is off | Check via 01's flag report, or `POST /api/admin/server-config` with `{"facts": {"enabled": true}}` |
 | 05 SKIPs with "extraction.enabled is off" | Feature flag off by default | `instance.yaml`'s `extraction:` block, or `AGNES_EXTRACTION_ENABLED=1` |
-| 05 fails with `extraction_producer_not_configured` | `extraction.enabled` is on but no producer command/module is set | `instance.yaml`'s `extraction.producer.command`/`.module` |
+| 05 fails with `extraction_dependencies_missing` | `extraction.enabled` is on but the `extraction` optional extra is not installed on this process | `pip install 'agnes[extraction]'` (or an image built with `--build-arg EXTRA_EXTRAS=,extraction`) |
 | 03 SKIPs "full plant-based probes" | `AGNES_E2E_GROUP_A` not set | Only the baseline 404-parity check runs; set the group id for full S1/S2/S3 coverage |
 | 03's setup step times out waiting for indexing | Ingestion pipeline (chunking) is stalled or slow on this instance | Check worker logs / job queue depth; retry with a longer wait by editing `_INDEX_TIMEOUT_SECONDS` locally, or investigate the instance directly |
-| 04 reports a leak | A real finding — the planted string reached an Agnes surface | Confirm which surface (facts claims / collections search / preview / raw) from the check's detail column, then trace whether the producer's anonymizer actually ran on that document, or whether an un-anonymized upload bypassed the connect-wizard scope entirely |
+| 04 reports a leak | A real finding — the planted string reached an Agnes surface | Confirm which surface (facts claims / collections search / preview / raw) from the check's detail column, then trace whether the anonymize pass actually ran on that document, or whether an un-anonymized upload bypassed the connect-wizard scope entirely |
 
 ## Adding a new script
 

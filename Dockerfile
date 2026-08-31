@@ -157,43 +157,28 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-
 # ---------------------------------------------------------------------------
 # worker — extraction worker lane image (spec §7.5 / §16 step 7)
 # ---------------------------------------------------------------------------
-# Same image as `base`/`app` above, plus an EXTENSION POINT for bundling an
-# extraction producer's runtime deps (crawl/convert/anonymize/extract —
-# adopted from the operator's own producer repository per spec §7.1, NEVER vendored into
-# this repo). The entrypoint is IDENTICAL to `app` — one-image,
-# one-entrypoint still holds; `AGNES_ROLE=worker` + `AGNES_WORKER_LANES
-# =extraction` (set by the `extraction-worker` compose service, not baked
-# into the image) select the behavior at runtime, not a different CMD here.
+# Byte-for-byte the same image as `base`/`app` above. The extraction
+# pipeline is IN-REPO (owner decision 2026-08-31 — connectors/sharepoint/
+# crawler.py, one pipeline, no dual modes), so there is nothing left to bake
+# in: the former `EXTRACTION_PRODUCER_INSTALL` build-arg, which existed only
+# to install an operator's external producer command, was removed with the
+# external mode itself.
 #
-# The `corpus-extraction` job kind (app/worker/kinds.py) shells out to
-# whatever `extraction.producer.command`/`.module` names in instance.yaml —
-# this stage is where a deployment that wants that command to actually
-# exist bakes it in, via:
+# The stage is kept because `docker-compose.yml`'s `extraction-worker`
+# service names it as its build target, and because the split is where an
+# operator would add lane-specific runtime deps if they ever needed them.
+# The entrypoint is IDENTICAL to `app` — one-image, one-entrypoint still
+# holds; `AGNES_ROLE=worker` + `AGNES_WORKER_LANES=extraction` (set by the
+# compose service, not baked into the image) select the behavior at runtime,
+# not a different CMD here.
 #
-#   docker build --target worker \
-#     --build-arg EXTRACTION_PRODUCER_INSTALL="uv pip install --system git+https://github.com/<org>/<producer-repo>@<ref>" \
-#     -t agnes-extraction-worker .
-#
-# Left empty by default — building this target with no build-arg produces a
-# worker image with the extraction LANE wired up but no producer to invoke;
-# `corpus-extraction` fails clean (a config error, not a crash) until the
-# operator either sets the build-arg above or points `extraction.producer`
-# at a command already on PATH some other way.
+# The converter backends the lane needs (markitdown, pypdfium2) come from
+# the `extraction` optional extra — add it to the EXTRA_EXTRAS build-arg
+# above (`--build-arg EXTRA_EXTRAS=,extraction`) for an image that can
+# actually convert documents; without it `corpus-extraction` refuses up
+# front with a typed "not installed" error rather than crawling and then
+# failing on every file.
 FROM base AS worker
-
-ARG EXTRACTION_PRODUCER_INSTALL=""
-# Root only for this install step — `base` already dropped to the non-root
-# `agnes` user, and most producer runtime deps (apt packages, pip installs
-# writing outside `/app`) need root to install. Re-drops to `agnes`
-# immediately after, same posture as `base`'s own `USER agnes` (C13).
-USER root
-RUN if [ -n "$EXTRACTION_PRODUCER_INSTALL" ]; then \
-        echo "worker: installing extraction producer runtime: $EXTRACTION_PRODUCER_INSTALL" && \
-        sh -c "$EXTRACTION_PRODUCER_INSTALL"; \
-    else \
-        echo "worker: EXTRACTION_PRODUCER_INSTALL not set — building the lane with no producer bundled"; \
-    fi
-USER agnes
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
