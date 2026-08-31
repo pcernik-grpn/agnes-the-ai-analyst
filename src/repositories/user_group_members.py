@@ -215,6 +215,41 @@ class UserGroupMembersRepository:
         if last_err is not None:
             raise last_err
 
+    def replace_group_members_for_source(self, group_id: str, user_ids: List[str], source: str, added_by: str) -> None:
+        """Authoritative refresh of this GROUP's ``source``-tagged membership —
+        the group-oriented transpose of :meth:`replace_synced_groups` for
+        resource-driven syncs (one connection sweep computes one group's full
+        member set; the user-oriented primitive would clobber concurrent
+        connections' rows for shared users). Same source-segregation invariant,
+        same single-transaction atomicity, same conflict-retry loop."""
+        last_err: Optional[duckdb.Error] = None
+        for attempt in range(_SYNC_CONFLICT_RETRIES):
+            try:
+                self.conn.execute("BEGIN")
+                self.conn.execute(
+                    "DELETE FROM user_group_members WHERE group_id = ? AND source = ?",
+                    [group_id, source],
+                )
+                for user_id in user_ids:
+                    self.conn.execute(
+                        """INSERT INTO user_group_members
+                           (user_id, group_id, source, added_by)
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT (user_id, group_id) DO NOTHING""",
+                        [user_id, group_id, source, added_by],
+                    )
+                self.conn.execute("COMMIT")
+                return
+            except duckdb.TransactionException as e:
+                self._safe_rollback()
+                last_err = e
+                time.sleep(_SYNC_CONFLICT_BACKOFF_S * (attempt + 1))
+            except Exception:
+                self._safe_rollback()
+                raise
+        if last_err is not None:
+            raise last_err
+
     def replace_google_sync_groups(
         self,
         user_id: str,

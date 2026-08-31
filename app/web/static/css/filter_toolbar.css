@@ -164,13 +164,116 @@
 .fbar-view__btn svg { width: 17px; height: 17px; }
 
 /* =====================================================================
+   .fbar--ranked — the control row with rank
+   =====================================================================
+   Opt-in on the `.fbar` itself. Used by /library and /chats, which are the two
+   pages whose bar sits directly on a long list; /stack keeps the flat default.
+
+   The problem it fixes was never the structure, it was that every control
+   shared ONE treatment — 38px tall, 1px border, 9px radius, on `--ds-surface`.
+   Search, Filter, the toggles, the view switcher and the primary were equal
+   boxes, so nothing in the row had rank and the row read as leftovers rather
+   than as a system. Search made it worse by being the only flex-grow child
+   (`flex: 1 1 220px`), so at desktop width it swallowed the free space and
+   became the loudest thing on a page whose subject is a list.
+
+   The fix is rank, not new components:
+     search   — a FIELD, not a button: quiet fill, no resting border, fixed
+                width, so it reads as somewhere to type;
+     Filter · toggles · view — utilities: borderless, muted, tinting only on
+                hover and when on;
+     the primary — the only filled control, therefore the only primary.
+   Everything drops 38px → 32px so the controls sit lighter than the rows they
+   act on.
+
+   It lives HERE rather than in either page's sheet because both pages render
+   the same row and a page-scoped copy is how the two drift. It was
+   `.library-page …` in library.html for one release; /chats then moved onto
+   the same layout and would have had to duplicate the block to match. */
+.fbar--ranked { gap: 6px; margin: 0; }
+
+/* Search stops growing: a fixed, modest field. */
+.fbar--ranked .fbar__search { flex: 0 1 300px; }
+.fbar--ranked .fbar__search input {
+  height: 32px; font-size: 13px; padding: 0 10px 0 30px;
+  background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
+  border-color: transparent;
+}
+.fbar--ranked .fbar__search input:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
+.fbar--ranked .fbar__search input:focus { background: var(--ds-surface); border-color: var(--ds-primary); }
+.fbar--ranked .fbar__search svg { left: 9px; width: 15px; height: 15px; }
+
+/* The utility cluster — quiet until used. */
+.fbar--ranked .fbar-filter__btn,
+.fbar--ranked .fbar-toggle {
+  height: 32px; padding: 0 9px; font-size: 12.5px; font-weight: 500;
+  color: var(--ds-text-secondary); background: transparent; border-color: transparent;
+}
+.fbar--ranked .fbar-filter__btn:hover,
+.fbar--ranked .fbar-toggle:hover {
+  color: var(--ds-text-primary);
+  background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent);
+  border-color: transparent;
+}
+/* On = a tint, not an outline. An outline here competed with the primary. */
+.fbar--ranked .fbar-filter__btn.is-active,
+.fbar--ranked .fbar-toggle.is-active {
+  color: var(--ds-primary); background: var(--ds-primary-light); border-color: transparent;
+}
+.fbar--ranked .fbar-filter__btn svg,
+.fbar--ranked .fbar-toggle svg { width: 14px; height: 14px; }
+/* A toggle's number is a hint at what pressing it leaves, not a filter badge —
+   so it stays muted text rather than gaining a pill. */
+.fbar--ranked .fbar-toggle__n { font-weight: 600; }
+.fbar--ranked .fbar-filter__n { min-width: 16px; height: 16px; font-size: 10.5px; }
+
+/* Sort is the design system's `ds-dropdown` (the native <select> beside it is
+   the accessible source of truth and is visually hidden), so the height that
+   matters is the BUTTON's, not the select's. `min-width: 180px` goes too: a
+   sort label does not need a 180px slot in a row of content-sized controls. */
+.fbar--ranked .fbar-select .ds-dropdown-btn {
+  height: 32px; min-width: 0; font-size: 12.5px; padding: 0 8px 0 10px;
+  background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
+  border-color: transparent;
+}
+.fbar--ranked .fbar-select .ds-dropdown-btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
+
+/* View switcher: same weight as its neighbours, no box of its own. */
+.fbar--ranked .fbar-view { border: 0; border-radius: 8px; overflow: hidden; }
+.fbar--ranked .fbar-view__btn { width: 30px; height: 32px; background: transparent; }
+.fbar--ranked .fbar-view__btn + .fbar-view__btn { border-left: 0; }
+.fbar--ranked .fbar-view__btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent); }
+.fbar--ranked .fbar-view__btn svg { width: 16px; height: 16px; }
+
+/* Narrow viewports: search goes back to growing rather than being squeezed to a
+   slot too small to type in. The fixed 300px above buys rank on a wide row; at
+   this width there is no free space for it to have been swallowing. */
+@media (max-width: 900px) {
+  .fbar--ranked .fbar__search { flex: 1 1 180px; }
+}
+
+/* =====================================================================
    .fbar-dock — the floating toolbar dock
    =====================================================================
-   The toolbar pinned to the bottom of the viewport rather than a strip in the
-   flow. Used by /library and /chats; /stack still renders the plain in-flow
-   bar, which is why everything here is opt-in markup.
+   NOT CURRENTLY USED BY ANY PAGE. /library moved its toolbar to the head of
+   the list (#1751) and /chats followed (TCRD-280), which were the only two
+   callers; /stack always rendered the plain in-flow bar. Kept rather than
+   deleted because the veil below is the non-obvious part — a three-layer
+   progressive blur whose derivation is worth more than the lines cost — and
+   because a page that genuinely wants a bottom dock should find it here
+   instead of rebuilding it. If nothing has claimed it by the next sweep of
+   this file, delete the whole section including `body:has(.fbar-dock) footer`.
 
-   Two reasons a scrolling index wants this. The controls that narrow a list
+   Why both pages left: the dock floats over the FOOT of the page, so it cost
+   the last rows on every screen and put the controls below the list they
+   narrow. The reason it was bought — controls reachable at row 200 as much as
+   at row 1 — is real, and both pages gave it up knowingly rather than replacing
+   it: their toolbars sit in the flow and scroll away. The judgement is that
+   narrowing happens on arrival, so the controls belong where a caller first
+   reaches for them, and scrolling up is cheaper than every screen losing its
+   last rows.
+
+   Two reasons a scrolling index wanted this. The controls that narrow a list
    are wanted at row 200 as much as at row 1, and a bar parked under the header
    scrolls away exactly when the list is long enough to need it. And on a page
    whose group bands are already sticky, a second sticky layer at the top edge

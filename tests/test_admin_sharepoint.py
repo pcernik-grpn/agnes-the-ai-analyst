@@ -25,6 +25,16 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _audit_params(row: dict) -> dict:
+    """``audit_repo().query()`` returns ``params`` as the raw stored JSON
+    string, not a parsed dict — decode it here so tests can assert on the
+    structured fields (same helper as ``tests/test_agent_memory_write_api.py``)."""
+    import json
+
+    v = row.get("params")
+    return json.loads(v) if isinstance(v, str) else (v or {})
+
+
 def _self_signed_pem() -> str:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agnes-test")])
@@ -1010,6 +1020,258 @@ class TestNoGroupWarning:
         assert r.json()["detail"]["error"] == "invalid_group_id"
 
 
+# ---------------------------------------------------------------------------
+# SharePoint ACL mirroring (2026-08-30 plan, Task 5) — access_mode, drive_id,
+# mirrored (sentinel-owned) grants staying read-only through the wizard's
+# own share-step checkboxes, and the admin "sync now" trigger.
+# ---------------------------------------------------------------------------
+
+
+class TestAccessModeAndDriveId:
+    def test_access_mode_defaults_to_manual_and_drive_id_defaults_to_none(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-default")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:am1", "display_path": "Manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["access_mode"] == "manual"
+        assert r.json()["drive_id"] is None
+
+    def test_mirrored_without_drive_id_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-missing-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:am2", "display_path": "Mirrored", "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "missing_drive_id"
+
+    def test_mirrored_with_drive_id_round_trips_through_list_and_confirm(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-mirrored")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:am3",
+                "display_path": "Mirrored",
+                "access_mode": "mirrored",
+                "drive_id": "drive-abc123",
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["access_mode"] == "mirrored"
+        assert body["drive_id"] == "drive-abc123"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["access_mode"] == "mirrored"
+        assert listed["drive_id"] == "drive-abc123"
+
+    def test_malformed_drive_id_is_422_not_a_500(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-bad-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:am4",
+                "display_path": "Mirrored",
+                "access_mode": "mirrored",
+                "drive_id": "not/a-valid-id",
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_manual_scope_may_omit_drive_id(self, seeded_app):
+        """The obligation's other half: a manual scope never needs one."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="am-manual-no-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:am5", "display_path": "Manual", "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["drive_id"] is None
+
+
+class TestMirroredGrantsSurviveTheShareStep:
+    """A sentinel-owned (``assigned_by='system:sharepoint-acl-sync'``) grant
+    is the ``sharepoint-acl-sync`` job's own bookkeeping — the wizard's
+    share-step checkboxes (``group_ids``) must never delete it, even when
+    every OTHER group is unticked. "Stop mirroring" is ``access_mode``, not
+    this checkbox (spec §2.3/§2.5)."""
+
+    def _confirm_with_sentinel_grant(self, c, token, conn_id, *, source_scope_id, admin_group_id):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": source_scope_id, "display_path": "Sentinel", "group_ids": [admin_group_id]},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        # A sentinel-owned group+grant, written the way `run_acl_sync` would.
+        sentinel_group = user_groups_repo().ensure(name=f"entra:{source_scope_id}", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+        return collection_id, sentinel_group["id"]
+
+    def test_unticking_every_group_deletes_the_admin_grant_not_the_sentinel_one(self, seeded_app):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sentinel-guard")
+        admin_group_id = c.post("/api/admin/groups", json={"name": "sp-admin-grant"}, headers=_auth(token)).json()["id"]
+
+        collection_id, sentinel_group_id = self._confirm_with_sentinel_grant(
+            c, token, conn_id, source_scope_id="drive:sentinel", admin_group_id=admin_group_id
+        )
+
+        # Untick everything through the share step.
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sentinel", "display_path": "Sentinel", "group_ids": []},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        # The admin grant is gone; the sentinel one is the only survivor —
+        # NOT an empty list, since the row is still (mirror-)granted.
+        assert r.json()["group_ids"] == [sentinel_group_id]
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert len(remaining) == 1
+        assert remaining[0]["group_id"] == sentinel_group_id
+        assert remaining[0]["assigned_by"] == ACL_SYNC_SENTINEL
+
+    def test_switching_mirrored_to_manual_deletes_the_sentinel_grant(self, seeded_app):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-switch")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:switch",
+                "display_path": "Switching",
+                "access_mode": "mirrored",
+                "drive_id": "drive-switch",
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(name="entra:switch-oid", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:switch", "display_path": "Switching", "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["access_mode"] == "manual"
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert remaining == []
+
+
+class TestAclSyncTrigger:
+    """``POST /connections/{connection_id}/acl-sync`` — admin "sync now"
+    trigger for the ``sharepoint-acl-sync`` job (spec §5.1)."""
+
+    ACL_SYNC = "{base}/{cid}/acl-sync"
+
+    @pytest.fixture(autouse=True)
+    def _clear_acl_mirroring_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            self.ACL_SYNC.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(self.ACL_SYNC.format(base=BASE, cid="nope"))
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        r = seeded_app["client"].post(
+            self.ACL_SYNC.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-flag-off")
+        r = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-happy")
+        r = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["job_id"]
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(body["job_id"])
+        assert job["kind"] == "sharepoint-acl-sync"
+        assert job["payload_json"] == {"connection_id": conn_id}
+
+    def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-dup")
+        first = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert first.status_code == 202, first.text
+        second = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "acl_sync_already_running"
+        assert second.json()["detail"]["job_id"] == first.json()["job_id"]
+
+
 class TestCertificateMetadata:
     """`GET /connections/{id}/certificate` — read-only certificate metadata
     for the source card / an admin's own comparison against the identity
@@ -1081,28 +1343,69 @@ class TestCertificateMetadata:
 
 
 class TestCorpusMap:
-    def test_corpus_map_is_the_flat_scope_to_collection_mapping(self, seeded_app):
+    def test_corpus_map_keys_are_producer_resolver_shaped(self, seeded_app):
+        """Keys must be what the producer's corpus_for() resolver matches
+        against crawler rows: the site display name, with the document-
+        library segment DROPPED for folder scopes — never the raw scope id
+        (which matches no row) and never display_path verbatim."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="map-conn")
 
+        # Folder scope (item id): breadcrumb carries the library segment.
         r1 = c.post(
             f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:a", "display_path": "A"},
+            json={
+                "source_scope_id": "01SO3DIHVJLOMDRMYCA5B37XU577X4KL57",
+                "display_path": "Site One/Documents/Project Kemp",
+            },
             headers=_auth(token),
         )
+        # Site scope (composite id): bare site name is the key.
         r2 = c.post(
             f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:b", "display_path": "B"},
+            json={
+                "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
+                "display_path": "Site Two",
+            },
             headers=_auth(token),
         )
 
         mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
         assert mapping.status_code == 200
         assert mapping.json() == {
-            "drive:a": r1.json()["collection_id"],
-            "drive:b": r2.json()["collection_id"],
+            "Site One/Project Kemp": r1.json()["collection_id"],
+            "Site Two": r2.json()["collection_id"],
         }
+
+    def test_corpus_map_ambiguous_scopes_are_409(self, seeded_app):
+        """A site scope plus a drive scope of the same site collapse to the
+        same key with different collections — a typed 409, never a
+        best-guess map."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="map-ambiguous-conn")
+
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
+                "display_path": "Site One",
+            },
+            headers=_auth(token),
+        )
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
+                "display_path": "Site One / Documents",
+            },
+            headers=_auth(token),
+        )
+
+        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert mapping.status_code == 409, mapping.text
+        assert mapping.json()["detail"]["error"] == "corpus_map_ambiguous"
 
     def test_corpus_map_empty_for_connection_with_no_scopes(self, seeded_app):
         c = seeded_app["client"]
@@ -1348,7 +1651,9 @@ class TestProducerCallbackAccess:
         token = _producer_token(conn_id)
         r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
         assert r.status_code == 200, r.text
-        assert r.json() == {"drive:a": confirm.json()["collection_id"]}
+        # Keys are the producer resolver's crawler-row shape, not the raw
+        # source_scope_id — see connectors/sharepoint/corpus_map.py::_map_key.
+        assert r.json() == {"A": confirm.json()["collection_id"]}
 
     def test_scopes_accepts_producer_for_its_own_connection(self, seeded_app):
         c = seeded_app["client"]
@@ -1398,3 +1703,346 @@ class TestProducerCallbackAccess:
         token = _producer_token(conn_id)
         r = c.get(f"{BASE}/{conn_id}/tree", headers=_auth(token))
         assert r.status_code == 403
+
+
+class TestExcludedSubtreeAdvisory:
+    """``_scope_out``'s advisory surface for the ``sharepoint-subtree-sweep``
+    job's findings (2026-08-30 plan, Task 7) — ``excluded_subtree_count`` and
+    ``excluded_subtrees`` (id + path only, never the raw ``detected_at``)."""
+
+    def test_scope_out_reports_zero_when_no_sweep_has_run(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sweep-advisory-empty")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sweep1", "display_path": "Sweep"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["excluded_subtree_count"] == 0
+        assert r.json()["excluded_subtrees"] == []
+        assert r.json()["include_excluded_subtrees"] is False
+
+    def test_scope_out_surfaces_excluded_subtrees_written_by_the_sweep(self, seeded_app):
+        """Simulates the sweep job's own write (connectors/sharepoint/
+        acl_sync.py::_sweep_connection persists into config.scopes[*]
+        .excluded_subtrees) and asserts the wizard's read path (_scope_out)
+        projects only {item_id, path} — never the raw detected_at
+        timestamp."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sweep-advisory-populated")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:sweep2", "display_path": "Sweep"},
+            headers=_auth(token),
+        )
+
+        from src.repositories import source_connections_repo
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        scopes = row["config"]["scopes"]
+        scopes[0]["excluded_subtrees"] = [
+            {"item_id": "item-A", "path": "Sweep/A", "detected_at": "2026-08-30T00:00:00+00:00"},
+        ]
+        repo.update(conn_id, config={**row["config"], "scopes": scopes})
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["excluded_subtree_count"] == 1
+        assert listed["excluded_subtrees"] == [{"item_id": "item-A", "path": "Sweep/A"}]
+
+
+class TestSubtreeOverride:
+    """``ConfirmScopeBody.include_excluded_subtrees`` — the ``should_not``-only
+    per-subtree "include anyway" escape hatch (2026-08-30 plan, Task 7, spec
+    §3(b)/§1.2)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_guarantee_mode_env(self, monkeypatch):
+        monkeypatch.delenv("AGNES_ACL_GUARANTEE_MODE", raising=False)
+
+    def test_must_not_refuses_the_override(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "must_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-must-not")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:override1",
+                "display_path": "Override",
+                "include_excluded_subtrees": True,
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "must_not_forbids_subtree_override"
+
+    def test_should_not_accepts_and_audits_the_override(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "should_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-should-not")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:override2",
+                "display_path": "Override",
+                "include_excluded_subtrees": True,
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["include_excluded_subtrees"] is True
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_acl.subtree_override", limit=50)
+        assert len(rows) == 1
+        assert _audit_params(rows[0])["source_scope_id"] == "drive:override2"
+
+    def test_reconfirming_an_active_override_does_not_re_audit(self, seeded_app, monkeypatch):
+        """Only the FALSE -> TRUE transition is audited — a re-confirm that
+        resends an already-active override must not spam the audit log."""
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "should_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-idempotent")
+        body = {
+            "source_scope_id": "drive:override3",
+            "display_path": "Override",
+            "include_excluded_subtrees": True,
+        }
+        c.post(f"{BASE}/{conn_id}/scopes", json=body, headers=_auth(token))
+        r = c.post(f"{BASE}/{conn_id}/scopes", json=body, headers=_auth(token))
+        assert r.status_code == 201, r.text
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_acl.subtree_override", limit=50)
+        assert len(rows) == 1
+
+    def test_default_false_never_triggers_the_guard(self, seeded_app, monkeypatch):
+        """A plain confirm (no override requested) must succeed under
+        must_not too — the guard only fires on an explicit True."""
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "must_not")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="override-default-false")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:override4", "display_path": "Plain"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["include_excluded_subtrees"] is False
+
+
+# ---------------------------------------------------------------------------
+# SharePoint ACL mirroring (2026-08-30 plan, Task 8) — per-scope
+# audience-class mapping (wizard data): ConfirmScopeBody.audience_classes,
+# _scope_out's audience_classes/tiered, and src.audience_classes' runtime
+# read path.
+# ---------------------------------------------------------------------------
+
+
+class TestAudienceClasses:
+    """``ConfirmScopeBody.audience_classes`` / ``_scope_out``'s
+    ``audience_classes``+``tiered`` fields (spec §4.1-4.3)."""
+
+    def test_round_trip_preserves_order_and_sets_tiered(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-conn")
+        full = c.post("/api/admin/groups", json={"name": "aud-full"}, headers=_auth(token)).json()["id"]
+        redacted = c.post("/api/admin/groups", json={"name": "aud-redacted"}, headers=_auth(token)).json()["id"]
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud1",
+                "display_path": "Aud",
+                "audience_classes": [
+                    {"name": "full", "group_ids": [full]},
+                    {"name": "redacted", "group_ids": [redacted]},
+                ],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == [
+            {"name": "full", "group_ids": [full]},
+            {"name": "redacted", "group_ids": [redacted]},
+        ]
+        assert r.json()["tiered"] is True
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["audience_classes"] == r.json()["audience_classes"]
+        assert listed["tiered"] is True
+
+    def test_defaults_to_empty_and_not_tiered(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-default")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud2", "display_path": "Aud"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == []
+        assert r.json()["tiered"] is False
+
+    def test_omitting_leaves_existing_mapping_untouched(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-omit")
+        gid = c.post("/api/admin/groups", json={"name": "aud-omit-group"}, headers=_auth(token)).json()["id"]
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud3",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "full", "group_ids": [gid]}],
+            },
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud3", "display_path": "Renamed"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == [{"name": "full", "group_ids": [gid]}]
+        assert r.json()["tiered"] is True
+        assert r.json()["display_path"] == "Renamed"
+
+    def test_empty_list_clears_the_mapping(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-clear")
+        gid = c.post("/api/admin/groups", json={"name": "aud-clear-group"}, headers=_auth(token)).json()["id"]
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud4",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "full", "group_ids": [gid]}],
+            },
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud4", "display_path": "Aud", "audience_classes": []},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["audience_classes"] == []
+        assert r.json()["tiered"] is False
+
+    def test_unknown_group_id_in_audience_class_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-bad-group")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud5",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "full", "group_ids": ["does-not-exist"]}],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_group_id"
+
+    def test_duplicate_class_names_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-dup")
+        gid = c.post("/api/admin/groups", json={"name": "aud-dup-group"}, headers=_auth(token)).json()["id"]
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud6",
+                "display_path": "Aud",
+                "audience_classes": [
+                    {"name": "full", "group_ids": [gid]},
+                    {"name": "full", "group_ids": []},
+                ],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "duplicate_audience_class"
+
+    def test_bad_class_name_pattern_is_422(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-bad-name")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud7",
+                "display_path": "Aud",
+                "audience_classes": [{"name": "Full Detail!", "group_ids": []}],
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+
+class TestAudienceClassMap:
+    """``src.audience_classes`` — Slice 4a's runtime read path (Task 8),
+    consumed by Tasks 9-11. Exercised here (not ``test_audience_classes.py``,
+    which Task 9 owns) because it reads back the exact wizard-persisted shape
+    this file's other tests write through the API."""
+
+    def test_reflects_stored_scopes_in_privilege_order(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-map-conn")
+        full = c.post("/api/admin/groups", json={"name": "aud-map-full"}, headers=_auth(token)).json()["id"]
+        redacted = c.post("/api/admin/groups", json={"name": "aud-map-redacted"}, headers=_auth(token)).json()["id"]
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:aud-map1",
+                "display_path": "Map",
+                "audience_classes": [
+                    {"name": "full", "group_ids": [full]},
+                    {"name": "redacted", "group_ids": [redacted]},
+                ],
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        from src.audience_classes import audience_class_map, tiered_collection_ids
+
+        mapping = audience_class_map()
+        assert mapping[collection_id] == [
+            ("full", frozenset({full})),
+            ("redacted", frozenset({redacted})),
+        ]
+        assert collection_id in tiered_collection_ids()
+
+    def test_non_tiered_scope_is_absent(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="aud-map-plain")
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:aud-map2", "display_path": "Plain"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        from src.audience_classes import audience_class_map, tiered_collection_ids
+
+        assert collection_id not in audience_class_map()
+        assert collection_id not in tiered_collection_ids()

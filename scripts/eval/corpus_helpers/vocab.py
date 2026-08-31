@@ -4,9 +4,10 @@ Everything here is fictional. No name below refers to a real company, real
 PE firm, or real person; the shapes (SOW/deliverable/proposal language,
 engagement titles, sponsor relationships) are drawn from
 tests/fixtures/eval/ontology.yaml's node/edge *types*, never from its own
-worked examples (the ontology fixture's docstrings mention a real customer's
-naming by design; the generator must not echo it back into fabricated
-content — see the module docstring in corpus_gen.py).
+worked examples. (Those examples used to carry a real customer's naming;
+they were scrubbed to a fictional cast, but the rule stands either way —
+the generator derives from the ontology's TYPES, never from whatever names
+its examples happen to use.)
 """
 
 from __future__ import annotations

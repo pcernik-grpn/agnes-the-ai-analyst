@@ -547,6 +547,7 @@ class StoreEntitiesPgRepository:
         owner_user_id: Optional[str] = None,
         visibility_status: Optional[List[str]] = None,
         include_owner_id: Optional[str] = None,
+        include_ids: Optional[List[str]] = None,
         publisher_kind: Optional[str] = None,
         exclude_owner_user_id: Optional[str] = None,
         verification_state: Optional[List[str]] = None,
@@ -595,11 +596,21 @@ class StoreEntitiesPgRepository:
                 vs_keys.append(f":{k}")
                 params[k] = v
             vs_in = f"visibility_status IN ({','.join(vs_keys)})"
+            # Granted entities — see the DuckDB sibling's docstring.
+            granted_sql = ""
+            for i, gid in enumerate(include_ids or []):
+                params[f"gi_{i}"] = str(gid)
+            if include_ids:
+                keys = ",".join(f":gi_{i}" for i in range(len(include_ids)))
+                granted_sql = f" OR (id IN ({keys}) AND visibility_status != 'archived')"
             if include_owner_id:
-                clauses.append(f"({vs_in} OR (owner_user_id = :include_owner_id AND visibility_status != 'archived'))")
+                clauses.append(
+                    f"({vs_in} OR (owner_user_id = :include_owner_id AND visibility_status != 'archived')"
+                    f"{granted_sql})"
+                )
                 params["include_owner_id"] = include_owner_id
             else:
-                clauses.append(vs_in)
+                clauses.append(f"({vs_in}{granted_sql})")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         with self._engine.connect() as conn:

@@ -11,16 +11,20 @@ it") that answers for it.
 
 What this suite pins:
 
-  * each card states who can use the package, from the same `resource_grants`
+  * each ROW states who can use the package, from the same `resource_grants`
     rows the group-side editor writes, and names the tier when one is
     Automatic;
   * an ungranted package says so out loud ("Not shared"), because that state
     is the one that strands analysts and was previously invisible;
-  * the card carries no sharing CONTROL — no grants endpoint, no editor — and
+  * the row carries no sharing CONTROL — no grants endpoint, no editor — and
     points at the page that does;
-  * the card is the Library's `.fbar-card`, not an admin-only card, so a
-    package the admin publishes and the package an analyst receives look like
-    one object;
+  * the packages render as the shared admin `.data-table`, the same object
+    People, Tables and Sources use. They were cards, and the questions this
+    page answers are comparative — which packages carry nothing, which are
+    shared with nobody, which are Automatic for someone. A card puts each
+    package in its own box, so answering any of those means reading N boxes
+    and holding the answers in your head; a column answers it down the page
+    in one pass;
   * the unpackaged tray applies the same distributable fold as the /admin
     gap card (blank → local; `remote` excluded);
   * the audit contract this page already had is untouched — every package
@@ -73,15 +77,15 @@ def _stock(pkg_id: str) -> str:
     return tid
 
 
-def _card_of(body: str, pkg_id: str) -> str:
-    """The rendered card for one package.
+def _row_of(body: str, pkg_id: str) -> str:
+    """The rendered table row for one package.
 
-    Anchored on the card's own `data-pkg-id` hook rather than on a name match,
+    Anchored on the row's own `data-pkg-id` hook rather than on a name match,
     so a slice can never accidentally span into a neighbour's markup.
     """
     start = body.index(f'data-pkg-id="{pkg_id}"')
-    end = body.find("</article>", start)
-    assert end > start, "package card is not a closed <article> — did the card macro change?"
+    end = body.find("</tr>", start)
+    assert end > start, "package row is not a closed <tr> — did the table markup change?"
     return body[start:end]
 
 
@@ -92,8 +96,8 @@ class TestSharingReadOut:
         pkg_id = _mk_pkg("share-none", "Share None Pkg")
         c = seeded_app["client"]
         body = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-        card = _card_of(body, pkg_id)
-        assert "Not shared" in card
+        row = _row_of(body, pkg_id)
+        assert "Not shared" in row
 
     def test_granted_package_names_the_group_and_tier(self, seeded_app):
         from src.repositories import resource_grants_repo, user_groups_repo
@@ -111,14 +115,19 @@ class TestSharingReadOut:
         try:
             c = seeded_app["client"]
             body = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-            card = _card_of(body, pkg_id)
+            row = _row_of(body, pkg_id)
             # A single grant is NAMED (a count of one says less than the name);
             # the tier is worded Automatic, with the API's own word in the
             # title attribute so the CLI/API vocabulary stays learnable.
-            assert "Everyone" in card
-            assert "Automatic" in card
-            assert "required" in card
-            assert "Not shared" not in card
+            # The GROUP is named; the tier is not. It is per-grant, so a single
+            # value beside a list of groups is false for some of them — see
+            # `test_the_tier_is_a_filter_and_appears_nowhere_in_the_table`. The
+            # wire word `required` still travels, on the row's `data-tier` set,
+            # translated to the label the filter menu offers.
+            assert "Everyone" in row
+            assert "Not shared" not in row
+            assert 'data-tier="Automatic"' in row
+            assert "<span>Automatic</span>" not in row, "the tier is stated on the row again"
         finally:
             from src.repositories import data_packages_repo, table_registry_repo
 
@@ -140,32 +149,171 @@ class TestSharingReadOut:
         assert "Share…" not in body
 
 
-class TestTheCardIsTheLibrarysCard:
-    def test_packages_render_the_shared_fbar_card(self, seeded_app):
-        """One card component across the product: what the admin publishes and
-        what the analyst receives must not look like two different objects.
-        `.fbar-card` is filter_toolbar.css's, rendered here through
-        macros/_fbar_card.html — the same DOM the Library's grid builds."""
+class TestTheRowIsTheSharedAdminTable:
+    def test_packages_render_the_shared_admin_table(self, seeded_app):
+        """One table component across the admin: this is an index of every
+        package on the instance, and People, Tables and Sources — the other
+        three indexes — are all `.data-table`.
+
+        They were `.fbar-card` grids, on the argument that a package the admin
+        publishes and a package an analyst receives should look like one
+        object. That argument was about the analyst's Library, which is itself
+        a table; the cards matched a projection of it rather than the thing.
+        What an index has to support is comparison down a column, which a grid
+        of boxes cannot do at any size.
+        """
         pkg_id = _mk_pkg("card-shape", "Card Shape Pkg")
         c = seeded_app["client"]
         body = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-        card = _card_of(body, pkg_id)
-        for cls in ("fbar-card__head", "fbar-card__body", "fbar-card__meta", "fbar-card__foot"):
-            assert cls in card, f"card no longer carries {cls}"
-        # …and NOT the banner-and-initials card it replaced.
+        assert 'class="data-table adp-table"' in body, "packages are not on the shared admin table"
+        row = _row_of(body, pkg_id)
+        assert "<td>" in row, "the row has no cells"
+        # …and NOT either card it replaced.
         assert "stack-card__photo" not in body
+        assert "fbar-card__foot" not in body, "a card footer is still being rendered"
 
-    def test_the_meta_line_leads_with_what_is_in_the_package(self, seeded_app):
+    def test_the_table_gives_what_is_in_the_package_its_own_column(self, seeded_app):
         """An admin scanning packages needs the count first — it is the fact
-        that says whether the package delivers anything at all."""
+        that says whether the package delivers anything at all.
+
+        On a card that meant "lead the meta line with it"; in a table it gets a
+        column, which is strictly better for the same reason the table is: the
+        counts line up, so an empty package is visible without reading any of
+        the names beside it.
+        """
         pkg_id = _mk_pkg("card-meta", "Card Meta Pkg")
         c = seeded_app["client"]
         body = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-        card = _card_of(body, pkg_id)
-        assert "0 tables" in card
-        # An empty package delivers nothing however it is shared, so that
-        # alarm outranks the tier in the footer's action slot.
-        assert "No tables" in card
+        assert "<th>Tables</th>" in body or ">Tables</th>" in body
+        row = _row_of(body, pkg_id)
+        # An empty package delivers nothing however it is shared, so the count
+        # cell raises it rather than printing a bare 0…
+        assert "adp-chip--warn" in row
+        assert "/admin/tables?assign_to=" in row, "the alarm is not a door to the fix"
+        # …and the Access cell shows no tier at all, rather than one that would
+        # promise delivery this package cannot make.
+        assert "Automatic" not in row and "Optional" not in row
+
+
+class TestTheToolbarIsTheSharedOne:
+    """Two lists, two toolbars, one engine.
+
+    The page had no search and no filter at all: on an instance with forty
+    packages the only way to answer "which of these reaches nobody" was to
+    read every row. Both lists now carry the shared `.fbar` — the same
+    component and the same `filter_toolbar.js` the Library, My Stack and the
+    package builder's picker run on.
+    """
+
+    def test_each_list_has_its_own_toolbar_and_engine(self, seeded_app):
+        """Two instances, not one spanning both. A single engine would let a
+        Category chosen for packages hide memory domains, which never had a
+        category to match — filtering one list by another list's vocabulary.
+
+        A package is created first because the toolbar renders WITH its list
+        and not beside it: a search box over an empty page is a control that
+        can only disappoint, and the empty state is the right thing there."""
+        _mk_pkg("toolbar", "Toolbar Pkg")
+        body = seeded_app["client"].get(
+            "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+        ).text
+        assert 'id="adp-pkg-search"' in body and 'id="adp-dom-search"' in body
+        assert 'id="adp-pkg-filter-menu"' in body and 'id="adp-dom-filter-menu"' in body
+        assert "js/filter_toolbar.js" in body, "the shared engine is not loaded"
+        # TWO inits — one per list. That is the assertion this test exists to
+        # make: one engine spanning both tbodies would apply every facet to
+        # every row.
+        assert body.count("FilterToolbar.init(") == 2, "expected one engine per list"
+        assert "#adp-pkg-rows tr" in body and "#adp-dom-rows tr" in body
+
+    def test_the_rows_carry_what_the_facets_read(self, seeded_app):
+        """The engine reads facet values off `data-*`. A facet whose attribute
+        is missing from the rows silently matches nothing, which looks exactly
+        like "no packages are shared" — so the attributes are pinned here
+        rather than trusted to stay in step with the menu."""
+        pkg_id = _mk_pkg("facet-attrs", "Facet Attrs Pkg")
+        body = seeded_app["client"].get(
+            "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+        ).text
+        row = _row_of(body, pkg_id)
+        for attr in ("data-search", "data-shared", "data-contents", "data-tier", "data-cat"):
+            assert attr in row, f"rows do not carry {attr}, so its facet matches nothing"
+        # Unshared and empty, so: no tier at all. An empty value is deliberate —
+        # a third token would put "None" in the Access menu meaning "unshared",
+        # which the Sharing category already says, better.
+        assert 'data-shared="Not shared"' in row
+        assert 'data-contents="Empty"' in row
+        assert 'data-tier=""' in row
+
+    def test_the_tier_is_a_filter_and_appears_nowhere_in_the_table(self, seeded_app):
+        """The tier is PER-GRANT, and every attempt to show it on a package row
+        was the same lie in a different slot.
+
+        First a column, then a chip inside "Shared with": both printed
+        `any(required)` as though it described the row. It does not — a package
+        is routinely Automatic for one group and Optional for another, so any
+        single value shown beside a list of groups is false for some of them.
+        The per-group truth lives in the Edit drawer and on the package's own
+        page, which are the surfaces that can show it per group AND change it.
+
+        It survives as a filter because there the subject is the package, not
+        the groups: "is this automatic for anybody?" is a real question with
+        one true answer.
+        """
+        _mk_pkg("tier-col", "Tier Col Pkg")
+        body = seeded_app["client"].get(
+            "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+        ).text
+        # Anchored on the PACKAGES table. The first `<thead>` on this page is
+        # whichever table renders first, and with no packages seeded that is
+        # Memory Domains — so a bare `body.index("<thead>")` asserted against
+        # the wrong table and passed for the wrong reason.
+        pkg_tbody = body.index('id="adp-pkg-rows"')
+        head = body[body.rindex("<thead>", 0, pkg_tbody) : body.index("</thead>", 0, pkg_tbody)]
+        assert "Access" not in head, "Access is a column again"
+        assert "Shared with" in head
+        # Not in any row either — the chip was the column's second life.
+        rows = body[pkg_tbody : body.index("</tbody>", pkg_tbody)]
+        assert "adp-chip--auto" not in rows, "the tier chip is back in the package rows"
+        for word in ("Automatic", "Optional"):
+            assert f"<span>{word}</span>" not in rows, f"{word} is stated on a row again"
+        assert 'data-facet="tier"' in body, "…and it is no longer offered as a filter either"
+
+    def test_a_mixed_tier_package_carries_both_values(self, seeded_app):
+        """The case that took the tier out of the table, pinned.
+
+        A package granted `required` to one group and `available` to another is
+        BOTH, so `data-tier` is a pipe-joined set read with `multi: true` — it
+        matches either filter rather than being forced to one word. A single
+        value here would resurrect the bug in the filter after removing it from
+        the row.
+        """
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        pkg_id = _mk_pkg("mixed-tier", "Mixed Tier Pkg")
+        grants = resource_grants_repo()
+        groups = user_groups_repo()
+        everyone = groups.get_by_name("Everyone")
+        admin_g = groups.get_by_name("Admin")
+        a = grants.create(
+            group_id=everyone["id"], resource_type="data_package",
+            resource_id=pkg_id, requirement="available",
+        )
+        b = grants.create(
+            group_id=admin_g["id"], resource_type="data_package",
+            resource_id=pkg_id, requirement="required",
+        )
+        try:
+            body = seeded_app["client"].get(
+                "/admin/data-packages", headers=_auth(seeded_app["admin_token"])
+            ).text
+            row = _row_of(body, pkg_id)
+            m = re.search(r'data-tier="([^"]*)"', row)
+            assert m, "the row carries no data-tier"
+            assert set(m.group(1).split("|")) == {"Automatic", "Optional"}
+        finally:
+            grants.delete(a if isinstance(a, str) else a["id"])
+            grants.delete(b if isinstance(b, str) else b["id"])
 
 
 class TestUnpackagedTray:

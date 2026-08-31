@@ -1179,6 +1179,7 @@ for a DIFFERENT connection 403s.
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
+- /api/admin/sharepoint/connections/{connection_id}/acl-sync
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1228,16 +1229,35 @@ search to a site or folder, or narrow the pattern") when `truncated` is
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
-collection_id}` inside the connection's own `config.scopes` (no new table).
-`POST` confirms a scope: creates its collection on first confirmation and
-reuses the same collection on every re-confirmation of the same
-`source_scope_id` (idempotent — a rename/move in the source updates
-`display_path` in place rather than forking a second collection), and
-optionally applies group grants (ordinary `resource_grants` rows on the
-collection — never duplicated onto the scope row itself). The response's
-`no_group_warning` flags a collection with no granted group ("indexed but
-invisible"). `DELETE` (`?source_scope_id=`) unselects a scope — an explicit
-exclusion — without touching its already-created collection.
+access_mode, drive_id, collection_id}` inside the connection's own
+`config.scopes` (no new table). `POST` confirms a scope: creates its
+collection on first confirmation and reuses the same collection on every
+re-confirmation of the same `source_scope_id` (idempotent — a rename/move in
+the source updates `display_path` in place rather than forking a second
+collection), and optionally applies group grants (ordinary `resource_grants`
+rows on the collection — never duplicated onto the scope row itself). The
+response's `no_group_warning` flags a collection with no granted group
+("indexed but invisible"). `DELETE` (`?source_scope_id=`) unselects a scope —
+an explicit exclusion — without touching its already-created collection.
+
+`access_mode: "manual"|"mirrored"` (2026-08-30 plan, Task 5) opts a scope into
+the `sharepoint-acl-sync` job's group/grant reconciliation; `mirrored`
+requires `drive_id` (`400 missing_drive_id` otherwise). The response also
+carries the `sharepoint-subtree-sweep` job's own findings (Task 7):
+`excluded_subtree_count` and `excluded_subtrees` (`[{item_id, path}]`) — the
+broken-inheritance folders that job excluded from the crawl by default
+(spec §3(b)). `include_excluded_subtrees: true` on `POST` asks to "include
+anyway" a detected subtree — refused with `409
+must_not_forbids_subtree_override` under the `must_not` guarantee mode
+(`acl_sync.guarantee_mode`, default), accepted and audited
+(`sharepoint_acl.subtree_override`) under `should_not`.
+
+`POST …/acl-sync` is the admin "sync now" trigger for the
+`sharepoint-acl-sync` job (spec §5.1) — enqueues
+`{"connection_id": connection_id}` and returns `202 {"job_id", "status"}`;
+`409 feature_disabled` when `acl_mirroring.enabled` is off, `409
+acl_sync_already_running` when one is already queued/running for this
+connection.
 
 `GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
 collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
@@ -2360,7 +2380,9 @@ reason.
 - /api/store/entities/{entity_id}
 - /api/store/entities/{entity_id}/docs/{filename}
 - /api/store/entities/{entity_id}/files
+- /api/store/entities/{entity_id}/from-markdown
 - /api/store/entities/{entity_id}/install
+- /api/store/entities/{entity_id}/markdown
 - /api/store/entities/{entity_id}/photo
 - /api/store/entities/{entity_id}/publisher
 - /api/store/entities/{entity_id}/rate

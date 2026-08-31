@@ -7,7 +7,7 @@ Agnes code, the producer repo, evaluation workbook v0.2, licences/services, UI)
 the producer repo's main at `753be22`, `eval_scoring_workbook_v0.2.xlsx`
 (FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
 **Scope note:** this spec deliberately contains customer-specific material
-(the evaluation workbook, Kantata, personas, TCRD ticket ids, the 1P vault
+(the evaluation workbook, Woodgrove PSA, personas, TCRD ticket ids, the 1P vault
 name) by owner decision of 2026-08-27 — concentrated in §14–§17 but also
 present in §1, §5, §7 and §8. If this repository ever returns to public
 distribution, the spec must be scrubbed or moved to a private repo as a
@@ -145,7 +145,7 @@ write into it through the contract in §7.
   hardening backlog (§7.1), never rewritten;
 - the extraction pass (`extract.py` + `skills/kg-builder-agent.md`) — a
   producer against §7's contract;
-- the structured lane (Kantata for prompt X1) — a normal connector/table
+- the structured lane (Woodgrove PSA for prompt X1) — a normal connector/table
   concern, a dependency of the evaluation only (§14.5);
 - second document sources (Drive, S3), non-document facts, multi-language
   corpora, and load testing at corpus scale (§15.6 names them so absence is a
@@ -214,7 +214,7 @@ facts        id TEXT PK                    -- 'f_' + token_hex(8); opaque, never
 
 fact_aliases fact_id TEXT NOT NULL FK→facts ON DELETE CASCADE
              type TEXT NOT NULL            -- denormalized from facts, like corpus_id on claims
-             natural_key TEXT NOT NULL     -- producer slug, e.g. 'myers-emergency-power-systems'
+             natural_key TEXT NOT NULL     -- producer slug, e.g. 'fabrikam-emergency-power-systems'
              UNIQUE (type, natural_key)
 
 fact_alias_sources                         -- NEW PG-only table (§4/§5, S9, 2026-08-29):
@@ -1298,7 +1298,7 @@ corpus).
 
 ## 14. Evaluation — workbook v0.2, the only standard
 
-`eval_scoring_workbook_v0.2.xlsx`, owner Shan Wang, **FROZEN 2026-08-27**:
+`eval_scoring_workbook_v0.2.xlsx`, owner A. Rivera, **FROZEN 2026-08-27**:
 "prompt set, weights, and decision thresholds locked … Do not edit … without
 versioning as v0.3 and re-grading R0 under the new version." Where any
 earlier material disagrees, the workbook wins — with one pin: the operative
@@ -1337,21 +1337,21 @@ client-facing use even at a high mean"); Consistency is scored once per
 arm+prompt across the three runs.
 
 Ten prompts, frozen (Prompts sheet, all built by S. Wang 2026-08-27): **X1**
-(structured — utilization by BU, **live Kantata**, "an unstructured-only
+(structured — utilization by BU, **live Woodgrove PSA**, "an unstructured-only
 system has no path to a correct answer"; fabricating a figure = gate fail);
-**P1** (precedent join: engagement type + industry + recency; traps: Myers
+**P1** (precedent join: engagement type + industry + recency; traps: Fabrikam
 Diligence vs AIVB folders, Rapid-Roadmap engagements never saying "AIVB",
-PolyVision still a pursuit); **P2** (scenario-to-precedent within Rapid
-Roadmap: Forte/Greenfiber/York, methodology-difference flag); **T1**
+Clearpane still a pursuit); **P2** (scenario-to-precedent within Rapid
+Roadmap: Forte/Everleaf Insulation/York, methodology-difference flag); **T1**
 (cross-engagement synthesis, no single source document); **T2** (feedback
-embedded in `Mickey_Week 2.pptx`, no standalone artifact; no invented
+embedded in `AdventureWorks_Week 2.pptx`, no standalone artifact; no invented
 quotes); **A1** (ambiguity: "Show me our manufacturing work" — name the
 ambiguity, state the interpretation, then answer); **L1** (honest sourcing of
-an inference — CCS industry from debrief filenames, not a formal record);
-**N1** (honest refusal — no retail/banking client; Schellman is the
+an inference — VDS industry from debrief filenames, not a formal record);
+**N1** (honest refusal — no retail/banking client; Certwise is the
 closest-but-not-matching trap); **G1** (two-step aggregation: top sponsor,
 then de-duplicated industry list — "the question the knowledge-graph
-architecture argument exists to win"); **G2** (entity resolution: ARCO
+architecture argument exists to win"); **G2** (entity resolution: Proseware
 Innovations vs N.B. Handy — a real parent with four operating companies,
 not a yes/no).
 
@@ -1392,7 +1392,7 @@ half and you miss leaks.
 - **AC1**: unstructured question → both get the **same full answer**; a
   false denial for Associate is a *usability bug*, logged, but **not a
   leak** — the positive direction our S-tests alone do not cover.
-- **AC2**: structured question (X1/Kantata) → Principal gets the real
+- **AC2**: structured question (X1/Woodgrove PSA) → Principal gets the real
   figure; Associate is **correctly denied — "must say access is restricted,
   not guess"**; a fabricated plausible figure = leak, no partial credit.
 - **AC3**: mixed question → Associate answers from unstructured sources
@@ -1431,7 +1431,7 @@ half and you miss leaks.
   the real rounds.
 - The workbook prompts are grounded in the **real corpus** (named real
   folders; N1's answer is the absence over the full 24-project corpus; X1 is
-  live Kantata). **They cannot be graded against a planted tenant** — §15.5
+  live Woodgrove PSA). **They cannot be graded against a planted tenant** — §15.5
   separates the two runs.
 
 ### 14.6 Token accounting (per-arm methods are in the workbook)
@@ -1576,7 +1576,7 @@ compares against Claude holding the context, a different question). Spec-side
 diagnostic, labeled as such, not a workbook row. Machine-readable record per
 step; blind grading not required.
 
-**Rounds R0–R3+ — the workbook, real corpus + live Kantata:**
+**Rounds R0–R3+ — the workbook, real corpus + live Woodgrove PSA:**
 
 1. **R0 first, before ingestion** (§14.5) — A0/A1/A2 (+A3 iff seed pack
    ready).
@@ -1707,7 +1707,7 @@ overclaim).
   §14.6).
 - **O4 — seed-pack packaging owner** (§11): deliberately **deferred**
   (owner, 2026-08-27) — must be assigned before the first A3 round runs.
-  **Leonard's persona confirmation and the Kantata integration are likewise
+  **Leonard's persona confirmation and the Woodgrove PSA integration are likewise
   deferred** (same decision): the substrate build is unblocked, but the
   evaluation cannot complete without them — AC2/X1 have no answer and
   Decision #5 cannot be scored until both land.

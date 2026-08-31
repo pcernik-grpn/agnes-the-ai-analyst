@@ -177,9 +177,16 @@
   <div class="src-card">
     <div class="src-card-head">
       <h3>Configuration</h3>
+      {# Editing the connection, the tool curation and the grants happens in
+         the builder that created them — this page kept its own form for all
+         three, so the same three decisions were entered in one vocabulary and
+         changed in another. What stays here is what the builder does not own:
+         the env map, the connect hint, the enabled flag and the scope. #}
       <div style="display:flex; gap:8px;">
         {{ ds.button('Test connection', variant='secondary', id='test-btn') }}
-        {{ ds.button('Edit', variant='secondary', id='edit-toggle-btn') }}
+        {{ ds.button('Advanced settings', variant='secondary', id='edit-toggle-btn') }}
+        {{ ds.button('Edit in builder', variant='primary',
+                     href='/admin/mcp-sources/' ~ source_id ~ '/edit') }}
       </div>
     </div>
     <div class="src-card-body">

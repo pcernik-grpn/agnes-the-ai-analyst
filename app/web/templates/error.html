@@ -6,22 +6,34 @@
 {# ds.button (Go home / Back) is auto-imported by base_ds. #}
 {# Two distinct-detail cases turn a machine 403 into a door (the pattern
    `admin_elevation_paused` established below):
-   - `package_not_shared:<name>` — the caller found data that EXISTS but is
-     not granted to any of their groups. The raw token must not print; the
-     name it carries feeds the copy + the request-access action.
+   - `not_shared:<kind>:<name>` — the caller found something that EXISTS but
+     is not granted to any of their groups. The raw token must not print; the
+     kind and name it carries feed the copy + the request-access action.
+     `package_not_shared:<name>` is the original, package-only spelling, kept
+     as an alias so a bookmarked or cached 403 still reads as language.
+
+     Every route that reached here used to be the package one, and the other
+     three — table, memory domain, data app — raised a bare `access_denied`
+     that printed verbatim. They are the SAME situation for the reader (it
+     exists, an admin can share it, here is the sentence to send them), so
+     they are the same page; only the noun differs.
    - `bridge` (context from _render_error) — a non-admin opened an admin
      entity URL; the page it bridges to does its own grant check. #}
-{% set _not_shared = message and message.startswith('package_not_shared:') %}
-{% set _pkg_name = message.split(':', 1)[1] if _not_shared else None %}
+{% set _generic_ns = message and message.startswith('not_shared:') %}
+{% set _legacy_ns = message and message.startswith('package_not_shared:') %}
+{% set _not_shared = _generic_ns or _legacy_ns %}
+{% set _ns_parts = message.split(':', 2) if _generic_ns else None %}
+{% set _pkg_kind = _ns_parts[1] if _generic_ns else 'data package' %}
+{% set _pkg_name = (_ns_parts[2] if _generic_ns else (message.split(':', 1)[1] if _legacy_ns else None)) %}
 <div class="error-container">
     <div class="error-card">
         <div class="error-code">{{ code }}</div>
         <h2 class="error-title">{% if _not_shared %}Not shared with you yet{% else %}{{ title }}{% endif %}</h2>
         {% if _not_shared %}
         <p class="error-message">
-            The data package <b>{{ _pkg_name }}</b> exists, but isn’t shared with
-            any of your groups. Your workspace admins can share it — it takes one
-            grant.
+            The {{ _pkg_kind }} <b>{{ _pkg_name }}</b> exists, but isn’t shared
+            with any of your groups. Your workspace admins can share it — it
+            takes one grant.
         </p>
         {% elif bridge %}
         <p class="error-message">
@@ -67,8 +79,20 @@
             {{ ds.button('Go home', variant='secondary',
                          href=url_for('index')) }}
             {% elif _not_shared %}
+            {# Every fragment is marked safe INDIVIDUALLY, and the values are
+               escaped before they are. Jinja's `~` joins through markup_join,
+               which escapes any plain-string operand as soon as ONE operand is
+               Markup — and `| e` makes one. So the innocuous-looking
+               `'id="x" data-y="' ~ (v | e) ~ '"'` escaped its own quotes, and
+               the button shipped as `id=&#34;copy-access-request&#34;`: no id,
+               so the copy script never bound and the primary action on this
+               page did nothing. It had been that way since the page was
+               written — the test asserted the literal `copy-access-request`
+               appeared in the body, which it did, escaped. Only the browser
+               showed it. #}
             {{ ds.button('Copy request for your admin', variant='primary',
-                         attrs='id="copy-access-request" data-pkg-name="' ~ (_pkg_name | e) ~ '"') }}
+                         id='copy-access-request',
+                         attrs=('data-pkg-name="' | safe) ~ (_pkg_name | e) ~ ('" data-pkg-kind="' | safe) ~ (_pkg_kind | e) ~ ('"' | safe)) }}
             {{ ds.button('Back to Library', variant='secondary', href='/library') }}
             {% elif bridge %}
             {{ ds.button('Open ' ~ bridge.name ~ ' →', variant='primary', href=bridge.href) }}
@@ -90,8 +114,9 @@
   var btn = document.getElementById('copy-access-request');
   if (!btn) return;
   btn.addEventListener('click', function () {
-    var name = btn.getAttribute('data-pkg-name') || 'this data package';
-    var text = 'Hi! Could you share the "' + name + '" data package with me in Agnes? ' +
+    var kind = btn.getAttribute('data-pkg-kind') || 'data package';
+    var name = btn.getAttribute('data-pkg-name') || ('this ' + kind);
+    var text = 'Hi! Could you share the "' + name + '" ' + kind + ' with me in Agnes? ' +
                'I hit its page but it isn’t granted to any of my groups yet.';
     function done() {
       var t = btn.textContent;

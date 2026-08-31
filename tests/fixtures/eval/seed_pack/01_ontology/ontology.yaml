@@ -1,5 +1,5 @@
-# Cuesta Star knowledge-graph ontology
-# TCRD-185 · owner: jordan.burger@keboola.com
+# Northwind Star knowledge-graph ontology
+# TCRD-185
 version: 0.2.0   # 0.2.0 (2026-08-26 eve): + uses_technology (client -> tool).
                  # Found by eval-question writing: "which clients run UKG?" was
                  # unrepresentable — used_tool covers delivery tooling only.
@@ -11,7 +11,7 @@ purpose: >
   Designed backwards from the eval prompts the demo must win — above all
   the relational pair G1 (sponsor aggregation + de-duplicated industry
   enumeration) and G2 (entity resolution: parent/subsidiary structures) —
-  prompt IDs from Cuesta's eval scoring workbook v0.2 (FROZEN 2026-08-27);
+  prompt IDs from the eval scoring workbook v0.2 (FROZEN 2026-08-27);
   full text in eval/questions.yaml. (v0.1 called this pair M1/S1; staffing
   prompts were dropped in v0.2.) Store-agnostic: everything serializes to JSONL
   (nodes + edges) and loads into whichever fact store TCRD-182 lands on
@@ -27,7 +27,7 @@ conventions:
     rule: >
       Every edge MUST carry evidence: a list of {doc_id, quote} where quote is
       VERBATIM from the source document — never paraphrased. (Paraphrase skews
-      and compounds errors down the relation chain — T. Fejfar, 2026-08-26.)
+      and compounds errors down the relation chain.)
       Nodes SHOULD carry evidence for any non-obvious attribute.
     shape: [{doc_id: string, quote: string}]
   entity_resolution: >
@@ -38,10 +38,10 @@ conventions:
 node_types:
 
   person:
-    description: Anyone named in the corpus — Cuesta staff, client staff, sponsor contacts.
+    description: Anyone named in the corpus — consultancy staff, client staff, sponsor contacts.
     attrs:
       name: {type: string, required: true}
-      org: {type: string}              # e.g. Cuesta Partners, Riveron, client name
+      org: {type: string}              # e.g. the consultancy, a partner firm, client name
       title: {type: string}
       availability_note: {type: string}  # serves S2 ("starting in three weeks")
 
@@ -86,7 +86,7 @@ node_types:
     description: The kind of work. P1 filters on it ("sell-side IT due diligence"),
       R1 assembles a proposal of one type, A1 needs it to disambiguate.
     attrs:
-      name: {type: string, required: true}   # e.g. AI Value Backlog, IOP (Industrial Opportunity Partners) AI Assessment,
+      name: {type: string, required: true}   # e.g. AI Value Backlog, SIP (Summit Industrial Partners) AI Assessment,
                                              # Sell-side IT DD, Data Platform Build
 
   skill:

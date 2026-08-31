@@ -965,6 +965,28 @@
   }
   /* ── + Add row ───────────────────────────────────────────────────────
      One way in, sitting at the foot of the list it adds to. */
+  /* The kind's caveat, inline on its run header. Clamped to one line: these
+     are registry sentences written for an API reader, and the tag's tooltip
+     carries the full text — this is the tell that a caveat EXISTS, not the
+     place to read it. */
+  .ax-kindcaveat {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: min(52ch, 100%); font-weight: 400;
+  }
+  /* Reaches this group via Everyone. Present, because the page's question is
+     what the group can use — but visibly not one of its own grants, because
+     it cannot be revoked from here. */
+  /* Keyed off the attribute, not a class in the class list: the row element
+     itself must stay byte-identical between the group and bundle views —
+     TestRowsAndTheirHandlerAgree counts the literal, and that guard is what
+     keeps the two lenses from drifting into separate implementations. */
+  .ax-r[data-inherited] { background: color-mix(in srgb, var(--ds-text-primary) 3%, transparent); }
+  .ax-inherit {
+    font-size: 12px; color: var(--ds-text-muted); text-decoration: none;
+    white-space: nowrap;
+  }
+  .ax-inherit:hover { color: var(--ds-primary); text-decoration: underline; }
+
   .ax-add {
     display: flex; align-items: baseline; gap: 8px; width: 100%;
     margin-top: 14px; padding: 10px 2px; text-align: left;
@@ -1823,12 +1845,11 @@
      filter is a segment beside the search (it narrows what you are looking
      at). Two different jobs, two different controls — they had been the same
      control, which is why switching view and filtering felt alike. */
-  .ax-by { margin: 0; border-bottom: 0; gap: 2px; }
-  .ax-by__n {
-    margin-left: 5px; font-size: 11px; font-weight: 600;
-    color: var(--ds-text-muted); font-variant-numeric: tabular-nums;
-  }
-  .ax-by .is-active .ax-by__n { color: var(--ds-text-link); }
+  /* Placement only. How a tab and its count LOOK is `.tab-strip`'s, in
+     components.css — this page carried its own copy of both, which is why
+     its tabs did not match Data's while using the same component. */
+  .ax-by { margin: 0 0 14px; }
+  .ax-by__n { font-variant-numeric: tabular-nums; }
   .ax-kindfilter { flex: 0 0 auto; flex-wrap: wrap; }
   .ax-kindfilter[hidden] { display: none; }
 
@@ -2318,15 +2339,15 @@
   <nav class="tab-strip ax-by" id="ax-by" role="tablist" aria-label="How to read these grants">
     <button type="button" role="tab" id="ax-tab-group" class="tab-strip__item is-active"
             data-by="group" aria-selected="true" aria-controls="ax-pane-edit">
-      By group <span class="ax-by__n" data-by-n="group"></span>
+      By group <span class="tab-strip__n ax-by__n" data-by-n="group"></span>
     </button>
     <button type="button" role="tab" id="ax-tab-bundle" class="tab-strip__item"
-            data-by="bundle" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
-      By bundle <span class="ax-by__n" data-by-n="bundle"></span>
+            data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
+      By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span>
     </button>
     <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item"
             data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1">
-      By person <span class="ax-by__n" data-by-n="person"></span>
+      By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span>
     </button>
   </nav>
   {# The shared toolbar component, the same one the Library's browsing block
@@ -2345,7 +2366,7 @@
          toolbar job, sitting between the reader and the two cards. #}
       <div class="fbar__search ax-glist__find" role="search">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16.5 16.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-        <input type="search" id="ax-group-find" placeholder="Search groups, bundles or people…" autocomplete="off" aria-label="Search groups, bundles or people">
+        <input type="search" id="ax-group-find" placeholder="Search groups, resources or people…" autocomplete="off" aria-label="Search groups, resources or people">
       </div>
       {# The list's own filter. Search answers "where is X"; this answers
          "show me only the packages" — the auditing question, which until now
@@ -2491,14 +2512,13 @@
             <span class="dsec-act">
               <span class="ax-tip">
                 <span class="ax-tip__btn" tabindex="0" role="img"
-                      aria-label="What Available and Required mean"
+                      aria-label="What Automatic and Optional mean"
                       aria-describedby="ax-tierkey-body">i</span>
                 <span class="ax-tip__body" id="ax-tierkey-body" role="tooltip">
                   The grant already gave access — everyone in this group can query it
-                  now. This only decides the copy: <b>Required</b> is permanent and
-                  always downloaded; <b>Available</b> leaves the person one choice,
-                  keep a local copy or not. Admins can always reach everything regardless
-                  of grants.
+                  now. This only decides the copy: <b>Automatic</b> keeps one on every
+                  pull and only an admin changes that; <b>Optional</b> leaves the person
+                  the choice. Admins can always reach everything regardless of grants.
                 </span>
               </span>
             </span>
@@ -2600,6 +2620,16 @@
   //: link restores the whole view rather than just the lens — see `syncUrl()`.
   //: This has to be declared before any of them reads it (`const` is in the
   //: temporal dead zone until its own line).
+  /* The lens the URL asks for, or "" for anything this page does not know.
+     `bundle` was the old name for the resource lens — a word that named no
+     entity in the system and had to be inferred from the shape of the rows.
+     It stays readable here, and only here, because it is in shared links and
+     bookmarks: everything the page WRITES is the new name. */
+  function _normalizeBy(raw) {
+    const v = raw === "bundle" ? "resource" : raw;
+    return ["resource", "person", "group"].includes(v) ? v : "";
+  }
+
   const _q0 = new URLSearchParams(window.location.search);
   //: The list's kind filter — "" is every kind.
   let listKind = _q0.get("kind") || "";
@@ -2610,7 +2640,7 @@
      A user id names a person, and the person lens is where a person is
      shown, so it implies the lens. */
   let viewMode = _q0.get("lens") === "simulate" ? "person"
-    : (["bundle", "person"].includes(_q0.get("by")) ? _q0.get("by") : (_q0.get("user") ? "person" : "group"));
+    : (_normalizeBy(_q0.get("by")) || (_q0.get("user") ? "person" : "group"));
   let users = [];        // Simulate's picker only — never the member search
 
   const el = (id) => document.getElementById(id);
@@ -2708,10 +2738,47 @@
      The server's `grant_count` is `COUNT(*) WHERE group_id = ?` over the
      same table `grants` is listed from, so this is the identical number —
      just one source instead of two. */
-  const grantCountOf = (groupId) => grantsFor(groupId).length;
+  // DIRECT only, deliberately. This feeds the group row's count and the
+  // delete-group confirmation ("N people lose the M things granted through
+  // this group") — deleting a group does not revoke Everyone's grants, so
+  // counting inherited ones here would overstate the blast radius of a
+  // destructive action. It also keeps matching the server's
+  // `COUNT(*) WHERE group_id = ?`, as the comment above says.
+  const grantCountOf = (groupId) => grantsFor(groupId, { directOnly: true }).length;
 
-  function grantsFor(groupId) {
-    return (overview.grants || []).filter((g) => g.group_id === groupId);
+  //: The `Everyone` group's id, or null if this instance has none. Everyone
+  //  is auto-membership: every active account is in it, so a grant written
+  //  against it reaches the members of every other group too.
+  function everyoneGroupId() {
+    const g = (overview.groups || []).find((x) => x.is_everyone);
+    return g ? g.id : null;
+  }
+
+  /* Grants a group's members can actually use — DIRECT grants plus the ones
+     inherited from Everyone.
+
+     This filtered on `group_id === groupId` alone, which answers "what was
+     written against this group" and not "what can this group see". Since
+     every account is in Everyone, a company-wide grant reaches Finance's
+     members too — and filtering to Finance hid it, so the page's own
+     question ("what each one can use") had an incomplete answer, and an
+     admin checking whether Finance could reach something had to remember to
+     go and look at Everyone as well.
+
+     Inherited rows are TAGGED, never silently merged: they are not this
+     group's to revoke, and the controls key off `inherited` to say so. */
+  function grantsFor(groupId, opts) {
+    const direct = (overview.grants || []).filter((g) => g.group_id === groupId);
+    if (opts && opts.directOnly) return direct;
+    const evId = everyoneGroupId();
+    if (!evId || groupId === evId) return direct;
+    const held = new Set(direct.map((g) => `${g.resource_type}:${g.resource_id}`));
+    const inherited = (overview.grants || [])
+      // A direct grant WINS: it may carry a different tier, and it is the one
+      // this group's row can actually edit.
+      .filter((g) => g.group_id === evId && !held.has(`${g.resource_type}:${g.resource_id}`))
+      .map((g) => Object.assign({}, g, { inherited: true, inherited_from: "Everyone" }));
+    return direct.concat(inherited);
   }
   function grantOf(groupId, type, resourceId) {
     return grantsFor(groupId).find((g) => g.resource_type === type && g.resource_id === resourceId);
@@ -2842,8 +2909,8 @@
      `tests/test_access_vocabulary.py` pins this to a single definition. */
   const tierControl = (tier, granted) => `
     <span class="fbar-seg ax-tier" ${granted ? "" : 'aria-disabled="true"'} role="group" aria-label="Access tier">
-      <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>
-      <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">Required</button>
+      <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">{{ words.tier_optional }}</button>
+      <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">{{ words.tier_automatic }}</button>
     </span>`;
 
   //: Which kinds actually carry the Required/Available tier.
@@ -2869,9 +2936,9 @@
       ? tierControl(tier, true)
       : `<span class="fbar-seg ax-tier" aria-disabled="true" role="group"
               aria-label="Access tier — not applicable to this kind"
-              data-tip="This kind has no Available/Required choice — there is no local copy to keep.">
-           <button type="button" class="fbar-seg__btn is-active" disabled>Available</button>
-           <button type="button" class="fbar-seg__btn" disabled>Required</button>
+              data-tip="This kind has no Automatic/Optional choice — there is no local copy to keep.">
+           <button type="button" class="fbar-seg__btn is-active" disabled>{{ words.tier_optional }}</button>
+           <button type="button" class="fbar-seg__btn" disabled>{{ words.tier_automatic }}</button>
          </span>`;
     return `<span class="ax-ctl">${tierPart}
       <button type="button" class="ax-revoke" data-revoke>Revoke</button>
@@ -2925,7 +2992,15 @@
   const kindTag = (t) => {
     const k = kindToken(t);
     const glyph = window.AgnesKindGlyph ? window.AgnesKindGlyph.get(k) : "";
-    return `<span class="ax-r__kd ds-kindtag" data-kind="${esc(k)}">${glyph}<span>${esc(kindWord(t))}</span></span>`;
+    // `type_description` is the registry's own caveat for this kind — that a
+    // table grant does NOT give an analyst visibility, that an MCP source
+    // grant is ANDed with per-tool grants, that a memory-domain grant is
+    // additive. The API has shipped it since the type registry existed
+    // (app/api/access.py) and nothing rendered it, so the picker offered
+    // Tables beside Data packages looking identical and behaving nothing
+    // alike. At minimum it is the tag's tooltip, everywhere a tag appears.
+    const caveat = t.type_description ? ` title="${esc(t.type_description)}"` : "";
+    return `<span class="ax-r__kd ds-kindtag" data-kind="${esc(k)}"${caveat}>${glyph}<span>${esc(kindWord(t))}</span></span>`;
   };
 
   /* Who wrote this grant. Two writers, two shapes: the admin API records an
@@ -3279,11 +3354,16 @@
     // much of everything grantable this group actually holds. The same two
     // numbers label the scope segments, so the control says what picking it
     // would show before you pick it.
-    const held = grantsFor(selectedGroup).length;
+    const direct = grantsFor(selectedGroup, { directOnly: true }).length;
+    const viaEveryone = grantsFor(selectedGroup).length - direct;
     // "7 of 25" counted the instance's whole grantable surface — a
     // denominator this list stopped showing when it became the holding.
-    // What it holds is the number.
-    setAccessHead(`${held} granted`);
+    // What it holds is the number. The inherited count rides alongside
+    // rather than being folded in: "10 granted" for a group with 7 of its
+    // own would be a different claim than the one the rows support.
+    setAccessHead(viaEveryone
+      ? `${direct} granted · ${viaEveryone} via Everyone`
+      : `${direct} granted`);
 
     const types = (overview.resources || []).slice().sort((a, b) => {
       const al = a.type_key === LEAD_TYPE ? 0 : 1;
@@ -3314,7 +3394,14 @@
       corpus_file: (id) => `/library/d/${encodeURIComponent(id)}`,
       data_app: (id) => `/apps/${encodeURIComponent(id)}`,
       agent: (id) => `/agents?agent=${encodeURIComponent(id)}`,
-      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`,
+      // Carries the group out with it. The person lens already round-trips
+      // (`?from=simulate&user=`) so a package page opened from an audit says
+      // whose audit and offers the way back; the group lens did not, so the
+      // same page fell through to its hard-coded "← Packages" and rendered
+      // every group the package is shared with — you filtered to one group
+      // and it showed you all of them.
+      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`
+        + (selectedGroup ? `?from=access&group=${encodeURIComponent(selectedGroup)}` : ""),
       table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
     };
 
@@ -3331,11 +3418,18 @@
       const name = esc(itemName(i));
       const nameHtml = hrefFn ? `<a href="${hrefFn(i.resource_id)}">${name}</a>` : name;
       const who = whoGranted(grant);
-      const control = controlCell(t.type_key, tier, {
-        href: owned && hrefFn ? hrefFn(i.resource_id) : "",
-      });
+      // An inherited row is NOT this group's to change: the tier control and
+      // Revoke both act on the Everyone grant, so offering them here would
+      // let an admin quietly alter a company-wide grant while looking at one
+      // group. Say where it comes from and send them there instead.
+      const control = grant.inherited
+        ? `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
+              title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`
+        : controlCell(t.type_key, tier, {
+            href: owned && hrefFn ? hrefFn(i.resource_id) : "",
+          });
       return `
-      <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
+      <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
         ${kindTag(t)}
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
           <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
@@ -3944,6 +4038,23 @@
 
   async function addMember(email) {
     if (!email) return;
+    // Admin is a god-mode short-circuit on every authorization check, so the
+    // usual toast — "they now get everything granted to this group" — is
+    // materially wrong for it: the grants are not the point, the bypass is.
+    // /admin/users/{id} already confirms this correctly, so the two surfaces
+    // disagreed about the most consequential membership on the instance.
+    const grp = (overview.groups || []).find((g) => g.id === selectedGroup);
+    const isAdminGroup = grp && (grp.is_admin === true || grp.name === "Admin");
+    if (isAdminGroup) {
+      const ok = await window.confirmModal({
+        title: `Add ${email} to Admin?`,
+        message: `Admin is not an ordinary group: it grants full access to all `
+          + `data and every admin action on this instance, regardless of what is `
+          + `granted to it. Reversible — you can remove them again.`,
+        confirmText: "Add to Admin",
+      });
+      if (!ok) return;
+    }
     const r = await fetch(`/api/admin/groups/${encodeURIComponent(selectedGroup)}/members`, {
       method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json" },
@@ -3957,7 +4068,9 @@
       return;
     }
     membersCache.delete(selectedGroup);
-    toast(`${email} added — they now get everything granted to this group.`, true);
+    toast(isAdminGroup
+      ? `${email} added to Admin — they now reach everything on this instance.`
+      : `${email} added — they now get everything granted to this group.`, true);
     await afterMembershipChange();
   }
 
@@ -4047,7 +4160,7 @@
     const before = selectedGroup;
     syncQuery();
     if (viewMode === "person") return;
-    if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
+    if (viewMode === "resource") { renderBundles(); bindFind(); return; }
     renderGroups();
     if (selectedGroup !== before) await renderMembers();
     bindFind();
@@ -4142,13 +4255,13 @@
      now says what THIS lens searches. */
   const FIND_PLACEHOLDER = {
     group: "Search groups, what they hold, or people in them…",
-    bundle: "Search bundles by name, id or block…",
-    person: "Search groups, bundles or people…",
+    resource: "Search resources by name, id or block…",
+    person: "Search groups, resources or people…",
   };
   const LEDE = {
     group: "Every group you can write a grant against, and what each one can reach.",
-    bundle: "One thing at a time — a data package, a memory domain, a plugin, an agent — "
-          + "and which groups can reach it. The mirror of By group.",
+    resource: "One thing at a time — a data package, a memory domain, a plugin, an agent — "
+            + "and which groups can reach it. The mirror of By group.",
   };
   function setLede(mode) {
     const l = el("ax-lede");
@@ -4210,7 +4323,7 @@
        "Marketplace plugins 5" produced "2 of 24 bundles", and "Agents 3"
        produced "12 of 24". Each lens now counts the thing it lists. */
     const counts = new Map();
-    if (viewMode === "bundle") {
+    if (viewMode === "resource") {
       // Bundles of that kind, counted exactly as `bundleTotal()` counts.
       for (const t of (overview.resources || [])) {
         if (!BUNDLE_LEAD.has(t.type_key)) continue;
@@ -4328,7 +4441,7 @@
   function paintCount(shown, total) {
     const countEl = el("ax-count");
     if (!countEl) return;
-    const noun = viewMode === "bundle" ? "bundle" : "group";
+    const noun = viewMode === "resource" ? "resource" : "group";
     const plural = (n) => `${n} ${n === 1 ? noun : noun + "s"}`;
     countEl.textContent = shown < total
       ? `${shown} of ${plural(total)}`
@@ -4369,7 +4482,7 @@
   });
 
   function paintTabCounts() {
-    const NOUN = { group: "groups", bundle: "bundles", person: "people" };
+    const NOUN = { group: "groups", resource: "resources", person: "people" };
     const set = (k, n) => {
       const el2 = document.querySelector(`[data-by-n="${k}"]`);
       if (!el2) return;
@@ -4383,7 +4496,7 @@
        distinct grant rows of every type — so the badge said 9 over a list of
        23, and neither number explained the other. Same source as the list and
        its "N of M" count now. */
-    set("bundle", bundleTotal());
+    set("resource", bundleTotal());
     /* This computed a number and then threw it away — `? null : null` —
        so the badge rendered as an empty box beside "By group 5" and "By
        bundle 24", which reads as a count still loading. It is the number of
@@ -4400,7 +4513,7 @@
     paintKindFilter();
     if (viewMode === "person") { showPane("person"); return; }
     syncQuery();
-    if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
+    if (viewMode === "resource") { renderBundles(); bindFind(); return; }
     renderGroups();
     await renderMembers();
     bindFind();
@@ -4446,7 +4559,7 @@
   }
 
   function repaintView() {
-    if (viewMode === "bundle") { renderBundles(); return; }
+    if (viewMode === "resource") { renderBundles(); return; }
     renderResources();
     renderGroups();
   }
@@ -4510,7 +4623,7 @@
         ${listKind
           ? `Only ${esc(String(kindName || listKind).toLowerCase())} were searched —
              <button type="button" class="ax-linkbtn" data-chip-clear>search every kind</button>.`
-          : "Every bundle on the instance was searched."}</div>`;
+          : "Every resource on the instance was searched."}</div>`;
       paintCount(0, bundleTotal());
       return;
     }
@@ -4552,9 +4665,22 @@
     const section = (r) => {
       const reach = reachOf(r.held.map((g) => g.group_id));
       const nobody = !r.held.length;
+      // NAME the groups, don't just count them. "1 group · 1 person" made the
+      // reader expand every row to learn the one thing the lens exists to
+      // answer — who can see this — and "1 group" reads identically whether
+      // that group is Everyone (the whole company) or a two-person team. Up
+      // to three are named inline; beyond that the count is the readable
+      // summary and the rows below carry the detail.
+      const heldNames = r.held
+        .map((g) => (overview.groups || []).find((x) => x.id === g.group_id))
+        .filter(Boolean)
+        .map((g) => g.name);
+      const who = heldNames.length && heldNames.length <= 3
+        ? heldNames.join(", ")
+        : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"}`;
       const meta = nobody
         ? "granted to nobody"
-        : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`;
+        : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
       <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}" data-bb="${esc(bkey)}"${
@@ -4665,6 +4791,7 @@
                <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
                <span class="fbar-group__title">${esc(r.t.type_display)}</span>
                <span class="fbar-group__n">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>
+               ${r.t.type_description ? `<span class="fbar-group__hint ax-kindcaveat">${esc(r.t.type_description)}</span>` : ""}
              </button>`
           : "";
         lastKind = r.t.type_key;
@@ -4899,7 +5026,7 @@
 
     const byBtn = e.target.closest("[data-by]");
     if (byBtn) {
-      const next = ["bundle", "person"].includes(byBtn.dataset.by) ? byBtn.dataset.by : "group";
+      const next = _normalizeBy(byBtn.dataset.by) || "group";
       if (next !== viewMode) {
         viewMode = next;
         // The view rides the URL, so a link can hand someone the direction
@@ -5657,10 +5784,10 @@
     const bands = preview.sections.map((sec) => {
       const rows = (sec.items || []).map((it) => {
         const state = it.requirement === "required"
-          ? `<span class="ax-chip ok" title="Required — permanent and always downloaded; only an admin changes this">Required by your admin</span>`
+          ? `<span class="ax-chip ok" title="{{ words.tier_automatic_help }}">Automatic — set by you</span>`
           : it.in_stack
             ? `<span class="ax-chip ok" title="${it.materialized ? "In their Library, and downloaded on their next pull" : "In their Library"}">In their Library</span>`
-            : `<span class="ax-chip info" title="Available — granted, and they have not kept a local copy">Available, no local copy yet</span>`;
+            : `<span class="ax-chip info" title="{{ words.tier_optional_help }}">Optional — no local copy yet</span>`;
         const href = previewHref(sec.kind, it);
         const name = href ? `<a href="${esc(href)}">${esc(it.name)}</a>` : esc(it.name);
         return `<li class="ax-preview__row"><span class="ax-preview__name">${name}</span>${state}</li>`;
@@ -5933,7 +6060,7 @@
   window.addEventListener("popstate", async () => {
     const params = new URLSearchParams(window.location.search);
     const by = params.get("lens") === "simulate" ? "person"
-      : (["bundle", "person"].includes(params.get("by")) ? params.get("by") : "group");
+      : (_normalizeBy(params.get("by")) || "group");
     viewMode = by;
     groupFilter = params.get("q") || "";
     listKind = params.get("kind") || "";

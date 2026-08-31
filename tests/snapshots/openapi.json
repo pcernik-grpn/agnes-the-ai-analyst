@@ -506,6 +506,29 @@
         "title": "ArchiveSessionBody",
         "type": "object"
       },
+      "AudienceClassIn": {
+        "description": "One per-scope audience-class row (2026-08-30 plan, Task 8; spec\n\u00a74.1-4.3) \u2014 ``name`` is the tag Slice 4b's ``claims.audience`` column\nwill carry (same identifier pattern that column's ingest validation\nuses), ``group_ids`` is the set of Agnes groups whose membership defines\n\"holds this class\". Order carries no ordinal field of its own \u2014 position\nin ``ConfirmScopeBody.audience_classes``'s list IS the privilege rank.",
+        "properties": {
+          "group_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Group Ids",
+            "type": "array"
+          },
+          "name": {
+            "minLength": 1,
+            "pattern": "^[a-z0-9_-]{1,64}$",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "AudienceClassIn",
+        "type": "object"
+      },
       "AuditEventIn": {
         "properties": {
           "action": {
@@ -1362,7 +1385,7 @@
         "type": "object"
       },
       "BuilderMessage": {
-        "description": "One turn of the transcript, as the page replays it.",
+        "description": "One turn of the transcript, as the page replays it.\n\n``text`` is TRUNCATED rather than rejected. It used to carry\n``max_length``, which is right for a field the author types and wrong for\none the page replays: a single reply over the cap made every later turn in\nthat conversation 422 \u2014 a conversation with no way out, and the page had\nno idea why. The author's own message is still capped where it is typed\n(``MAX_MESSAGE_CHARS`` on each builder's request model); this cap only\nbounds what the transcript costs to resend.",
         "properties": {
           "role": {
             "maxLength": 16,
@@ -1371,7 +1394,6 @@
           },
           "text": {
             "default": "",
-            "maxLength": 4000,
             "title": "Text",
             "type": "string"
           }
@@ -1857,15 +1879,49 @@
       },
       "ConfirmScopeBody": {
         "properties": {
+          "access_mode": {
+            "default": "manual",
+            "enum": [
+              "manual",
+              "mirrored"
+            ],
+            "title": "Access Mode",
+            "type": "string"
+          },
           "anonymize": {
             "default": false,
             "title": "Anonymize",
             "type": "boolean"
           },
+          "audience_classes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AudienceClassIn"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audience Classes"
+          },
           "display_path": {
             "minLength": 1,
             "title": "Display Path",
             "type": "string"
+          },
+          "drive_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drive Id"
           },
           "group_ids": {
             "anyOf": [
@@ -1880,6 +1936,11 @@
               }
             ],
             "title": "Group Ids"
+          },
+          "include_excluded_subtrees": {
+            "default": false,
+            "title": "Include Excluded Subtrees",
+            "type": "boolean"
           },
           "source_scope_id": {
             "minLength": 1,
@@ -4013,6 +4074,28 @@
       },
       "EffectiveAccessItem": {
         "properties": {
+          "href": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Href"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
           "resource_id": {
             "title": "Resource Id",
             "type": "string"
@@ -4020,6 +4103,11 @@
           "resource_type": {
             "title": "Resource Type",
             "type": "string"
+          },
+          "unresolved": {
+            "default": false,
+            "title": "Unresolved",
+            "type": "boolean"
           },
           "via_groups": {
             "items": {
@@ -4111,34 +4199,85 @@
         "type": "object"
       },
       "EntityDraft": {
-        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.",
+        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.\n\nEvery field TRUNCATES rather than rejecting, for the same reason\n``BuilderMessage.text`` does: this is replayed context, not authored\ninput. A body long enough to exceed the cap is legal everywhere else in\nthe product \u2014 the markdown upload takes 512 KB and the store's own\n``skill_md`` is unbounded \u2014 so rejecting it here meant an author could\nwrite something the builder then refused to discuss, with a 422 whose\ntext blamed their last message. The prompt only ever shows a truncated\npanel anyway (see ``panel_prompt_section``).",
         "properties": {
           "body": {
             "default": "",
-            "maxLength": 40000,
             "title": "Body",
             "type": "string"
           },
           "category": {
             "default": "",
-            "maxLength": 120,
             "title": "Category",
             "type": "string"
           },
           "description": {
             "default": "",
-            "maxLength": 4000,
             "title": "Description",
             "type": "string"
           },
           "name": {
             "default": "",
-            "maxLength": 64,
             "title": "Name",
             "type": "string"
           }
         },
         "title": "EntityDraft",
+        "type": "object"
+      },
+      "EntityMarkdownResponse": {
+        "description": "The authored document behind a markdown-first entity, plus the fields\nthe builder edits beside it.",
+        "properties": {
+          "blocked_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocked Reason"
+          },
+          "category": {
+            "default": "",
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "editable": {
+            "default": true,
+            "title": "Editable",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_md": {
+            "title": "Skill Md",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "name",
+          "skill_md"
+        ],
+        "title": "EntityMarkdownResponse",
         "type": "object"
       },
       "EntityRating": {
@@ -4261,7 +4400,7 @@
         "type": "object"
       },
       "FactsIngestRequest": {
-        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.\n\n``anonymization`` is the one exception: a small, OPTIONAL, strictly\ntyped block (spec \u00a79.2) \u2014 malformed input there is a real protocol\nerror (422), not tolerated crawler noise.",
+        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote,\naudience?}]}``. Deliberately plain ``Dict[str, Any]`` items rather than a\nstrict nested schema \u2014 the producer contract explicitly tolerates\nunknown fields (underscore-prefixed crawler internals are stripped\nserver-side, not rejected), so a rigid Pydantic model would reject valid\nproducer input on every crawler-side field addition.\n\n``anonymization`` is one exception: a small, OPTIONAL, strictly typed\nblock (spec \u00a79.2) \u2014 malformed input there is a real protocol error\n(422), not tolerated crawler noise. ``evidence[].audience`` (Task 10,\nspec \u00a74.2) is the other: an OPTIONAL index-time variant tag, format-\nchecked against ``_AUDIENCE_PATTERN`` by :func:`_validate_evidence_audience`\nbefore this batch ever reaches :meth:`FactsPgRepository.ingest_batch`.",
         "properties": {
           "anonymization": {
             "anyOf": [
@@ -9354,6 +9493,20 @@
       },
       "SetScopeRequest": {
         "properties": {
+          "audience_class": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audience Class"
+          },
           "items": {
             "default": [],
             "items": {
@@ -10983,6 +11136,47 @@
         "title": "UpdateDataPackageRequest",
         "type": "object"
       },
+      "UpdateFromMarkdownBody": {
+        "description": "The editing sibling of ``CreateFromMarkdownBody``.\n\nDeliberately narrower: type is locked on an edit (``update_entity``\nrefuses a change with 400 ``type_locked``), and access, publisher and the\npre-check token belong to publishing, not to revising.",
+        "properties": {
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_md": {
+            "title": "Skill Md",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "skill_md"
+        ],
+        "title": "UpdateFromMarkdownBody",
+        "type": "object"
+      },
       "UpdateGrantRequirementRequest": {
         "properties": {
           "requirement": {
@@ -12064,6 +12258,17 @@
             ],
             "title": "Deactivated At"
           },
+          "domain_warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Warning"
+          },
           "email": {
             "title": "Email",
             "type": "string"
@@ -12631,7 +12836,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.91.0"
+    "version": "0.92.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -13745,6 +13950,65 @@
         ]
       }
     },
+    "/admin/data-packages/{pkg_id}/edit": {
+      "get": {
+        "description": "The same builder page, opened on a package that already exists.\n\nAuthoring one was a workspace and revising it was an overlay on top of\nwhatever page you happened to be on \u2014 the same fields, the same component,\nat two sizes, so the edit read as a smaller and lesser thing than the\ncreate. The drawer keeps the case it was built for (mid-sentence on\n/admin/tables, assigning a table to a package that does not exist yet);\nediting on purpose gets the page.",
+        "operationId": "admin_package_builder_edit_admin_data_packages__pkg_id__edit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pkg_id",
+            "required": true,
+            "schema": {
+              "title": "Pkg Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Package Builder Edit",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/data-sources": {
       "get": {
         "description": "\"Add data source\" wizard (#755): paste a Keboola project's connection\nURL + storage token, validate, then browse buckets/tables and register\nthe ones you want \u2014 no SSH, no config-file edits. Also the home for\nper-project \"Set as default\" and \"Rotate token\" controls \u2014 the single\nplace to manage a Keboola connection end to end.\n\nDistinct from /admin/mcp-sources (MCP tool servers Agnes calls at\nruntime) and from /admin/datasource-credentials (GWS/BQ instance\nsecrets) \u2014 this page owns Keboola project connect/browse/register/\ndefault/rotate. Passes ``vault_key_configured`` so the template can\nrender the same blocking banner as /admin/datasource-credentials when\n``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without\nit).",
@@ -14156,9 +14420,25 @@
     },
     "/admin/linked-apps": {
       "get": {
-        "description": "Guided admin flow for linking externally-hosted (Keboola) data apps:\npick an MCP source \u2192 materialize its data-app lister \u2192 select the ingested\napps and grant them to a group. Wires existing admin APIs (mcp-sources,\nmcp-tools, materialize, data-apps ?kind=linked, access/grants) \u2014 no new\ncontrol-plane surface beyond the page itself.",
+        "description": "Publish apps from a tool server that is already connected.\n\nThe other half of the MCP builder's apps section, and a different errand:\nthere you are connecting a server and its apps are the obvious next move;\nhere the server was connected weeks ago and today's job starts from the\napp list. Routing that through the connection form would ask an admin to\nre-answer questions they answered once.\n\nIt is the same panel in both places (``linked_apps_panel.js``), so \"what\ndoes reading the list write\" cannot have two answers. What the retired\nwizard did wrong is not repeated: the source is CHOSEN from a list rather\nthan detected by elimination, and the empty state hands off to the builder\ninstead of saying \"register one first, then come back\".\n\n``?source=`` preselects a server \u2014 how the builder's \"publish these\nelsewhere\" link and a return trip from connecting one land on the right\nrow instead of an empty picker.",
         "operationId": "admin_linked_apps_page_admin_linked_apps_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -14206,7 +14486,7 @@
     },
     "/admin/linked-apps/new": {
       "get": {
-        "description": "Publish externally-hosted apps into the Library, in the builder shell.\n\n/admin/linked-apps stays as the wizard for now; this is the path the\nLibrary's \"+ Add\" reaches. What it fixes is the two things that made the\nwizard an operator-hostile surface: step 1 asked which MCP source to read\napps from, with a dead end under it (\"Not registered yet? Register one\nfirst, then come back\"), and step 2 asked for a projection map \u2014 which\nresponse field is the app's name, which is its URL.\n\nA projection map is an integration author's artifact. The adapter already\nfalls back to alias guesses (src/data_apps/keboola_adapter.py), so the\nmapping is an escape hatch shown only when a row came back that the aliases\ncould not read, and the source and its lister tool are detected rather than\nchosen.",
+        "description": "The old \"new linked app\" path. There is no separate create step any\nmore \u2014 publishing apps is picking a connected server and reading its list\n\u2014 so this lands on the page that does it.",
         "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
         "parameters": [
           {
@@ -14229,10 +14509,8 @@
         "responses": {
           "200": {
             "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
+              "application/json": {
+                "schema": {}
               }
             },
             "description": "Successful Response"
@@ -14458,6 +14736,65 @@
           }
         },
         "summary": "Admin Mcp Source Detail Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/mcp-sources/{source_id}/edit": {
+      "get": {
+        "description": "The same builder, opened on a source that already exists.\n\nRegistering used to be a builder and revising was a different surface \u2014\nthe detail page's own form \u2014 so the connection, the tool curation and the\ngrants were entered in one vocabulary and changed in another. The detail\npage stays what it is (the operations console: secrets, per-user\nconnections, OAuth registration, classification, materialize); what moved\nhere is the part the builder created, so it is edited where it was made.",
+        "operationId": "admin_mcp_builder_edit_admin_mcp_sources__source_id__edit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Mcp Builder Edit",
         "tags": [
           "web"
         ]
@@ -29339,6 +29676,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/acl-sync": {
+      "post": {
+        "description": "Admin-triggered one-off run of the ``sharepoint-acl-sync`` job for\nthis connection (spec \u00a75.1's \"sync now\" action; 2026-08-30 plan, Task\n5) \u2014 enqueues ``connectors.sharepoint.acl_sync.run_acl_sync`` (via\n``app/worker/kinds.py::_run_sharepoint_acl_sync``) with\n``{\"connection_id\": connection_id}``, the SAME mechanics as\n:func:`trigger_extraction`.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work. Then\nrefuses cleanly with ``409 feature_disabled`` when ``acl_mirroring\n.enabled`` is off \u2014 the job handler itself would just no-op (spec \u00a75.1\n\"the scheduler enqueues this kind unconditionally\"), but a manual\ntrigger should tell the admin why nothing happened rather than return a\n202 for a run that will do nothing.\n\nDeduped on a STABLE per-connection idempotency key\n(:func:`_acl_sync_idempotency_key`) \u2014 a second trigger while one is\nalready queued/running for this connection gets ``409\nacl_sync_already_running`` instead of a second job.",
+        "operationId": "trigger_acl_sync_api_admin_sharepoint_connections__connection_id__acl_sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Acl Sync",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/certificate": {
       "get": {
         "description": "Read-only certificate metadata for the connection's already-stored\nPEM \u2014 thumbprint (the ``x5t`` value the client actually presents, plus\nthe conventional uppercase-hex fingerprint), subject/issuer, validity\nwindow, and a derived ``ok``/``expiring_soon``/``expired`` status. Two\nreal failure modes this closes: a registered certificate that does not\nmatch what the connection actually presents (opaque provider auth\nerror), and a certificate expiring silently (crawl/sync fails with no\nwarning).\n\nNever the private key \u2014 only :func:`connectors.sharepoint.graph_client.\ncertificate_metadata`'s CERTIFICATE-block parse reaches the response.\nNo certificate configured, or a certificate that fails to resolve or\nparse, is a typed absence (``certificate: null`` plus ``reason``) \u2014\nnever a 500.",
@@ -29404,7 +29804,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
-        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.\n\nDeliberately does NOT carry ``anonymize`` \u2014 that would break this\nendpoint's flat, backward-compatible shape. A producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).\n\nTHIS is the primary callback the corpus-extraction producer itself\ncalls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may\ncall it too (see ``require_admin_or_producer_connection``) \u2014\nself-audited here (``sharepoint_connection.corpus_map_read``,\n``client_kind=\"producer\"``) for the same reason ``list_scopes`` above\nself-audits its own producer branch.",
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the corpus map the external\ncrawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in\nthe producer resolver's OWN shape \u2014 ``\"<site display name>\"`` or\n``\"<site display name>/<drive-relative folder path>\"`` \u2014 built by the\nsame shared translation the in-Agnes ``corpus-extraction`` job handler\nuses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff\n(``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot\ndrift. The earlier flat ``{source_scope_id: collection_id}`` shape was\nunusable for routing: the resolver matches keys against crawler rows'\nsite/path components, which a Graph scope id never equals.\n\n``409 corpus_map_ambiguous`` when the confirmed scopes cannot form an\nunambiguous map (e.g. a site scope plus a drive scope of the same\nsite) \u2014 never a best-guess map.\n\nDeliberately does NOT carry ``anonymize`` \u2014 a producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).\n\nTHIS is the primary callback the corpus-extraction producer itself\ncalls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may\ncall it too (see ``require_admin_or_producer_connection``) \u2014\nself-audited here (``sharepoint_connection.corpus_map_read``,\n``client_kind=\"producer\"``) for the same reason ``list_scopes`` above\nself-audits its own producer branch.",
         "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
         "parameters": [
           {
@@ -29656,7 +30056,7 @@
         ]
       },
       "post": {
-        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, **if the field is present**, is the complete\nset of groups for this collection (step 3): listed groups are granted,\nand any other group's grant on this collection is revoked. The wizard's\ncheckboxes are pre-checked from the grants that exist and its row warns\nthe moment the last one is unticked, so the screen already promises that\nunticking removes access \u2014 making the handler additive-only meant the\nadmin was shown a revocation that never happened. Omitting the field\ntouches no grant at all, which is what keeps a rename or an anonymize\ntoggle from stripping access as a side effect.",
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize``/``access_mode``/``drive_id`` in place \u2014 a\nrename or move in the source does not fork a second collection (\u00a76\napplied to the wizard's own bookkeeping). ``group_ids``, **if the field\nis present**, is the complete set of groups for this collection (step\n3): listed groups are granted, and any other group's grant on this\ncollection is revoked \u2014 EXCEPT a mirrored (sentinel-owned) grant, which\nthis checkbox can never touch (see the revoke loop below); \"stop\nmirroring\" is ``access_mode``, not a checkbox. The wizard's checkboxes\nare pre-checked from the grants that exist and its row warns the moment\nthe last one is unticked, so the screen already promises that unticking\nremoves access \u2014 making the handler additive-only meant the admin was\nshown a revocation that never happened. Omitting the field touches no\ngrant at all, which is what keeps a rename or an anonymize toggle from\nstripping access as a side effect.\n\n``access_mode='mirrored'`` (spec \u00a72.5) opts this scope into the\n``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``\n(``400 missing_drive_id`` otherwise \u2014 the sync needs both a drive id and\nan item id to address the scope root on Graph). Switching an already-\nmirrored scope back to ``manual`` deletes the sync's own sentinel-owned\ngrants for this collection and converts nothing \u2014 the admin re-grants\nmanually, same as any other scope that was never mirrored.\n\n``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to\n\"include anyway\" a broken-inheritance subtree the\n``sharepoint-subtree-sweep`` job detected on this scope and excluded from\nthe crawl by default (spec \u00a73(b)). Refused with ``409\nmust_not_forbids_subtree_override`` under the ``must_not`` guarantee mode\n(the fail-closed default \u2014 \u00a71.2 disqualifies this override outright);\naccepted and audited (``sharepoint_acl.subtree_override``) under\n``should_not``. This handler writes that ONE audit row INSTEAD of\nrelying on the route's declared fallback action\n(``sharepoint_connection.scope_confirm``) for a request that turns the\noverride on \u2014 see the audit playbook's \"never write both for the same\nevent\" rule; every other confirm (no override transition) is still\ncovered by the fallback, unchanged.",
         "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
         "parameters": [
           {
@@ -30481,7 +30881,7 @@
         ]
       },
       "put": {
-        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.\n\nSharePoint connections: ``config.scopes`` (the connect wizard's\nserver-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and\n``config.extraction`` (the in-Agnes extraction schedule's own\n``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried\nforward when the request's ``config`` omits the key \u2014 the same\n\"explicit wins\" contract as Keboola's ``project_id``/``project_name``\nabove \u2014 since this endpoint's wholesale ``config`` replace would\notherwise let an ordinary edit through the generic connection editor\n(which renders neither field) silently erase every confirmed scope's\n``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or\nreset the extraction schedule's clock. An explicit ``scopes: []`` (or\n``extraction: null``) in the request still clears it deliberately. The\nfull set of keys is ``app.api.admin_sharepoint.\nSHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by\n``tests/test_sharepoint_config_carry_forward_ratchet.py``.",
+        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.\n\nSharePoint connections: ``config.scopes`` (the connect wizard's\nserver-written confirmed-scope rows, ``app/api/admin_sharepoint.py``) and\n``config.extraction`` (the in-Agnes extraction schedule's own\n``last_run_at``/``last_job_id`` bookkeeping, TCRD-226) are each carried\nforward when the request's ``config`` omits the key \u2014 the same\n\"explicit wins\" contract as Keboola's ``project_id``/``project_name``\nabove \u2014 since this endpoint's wholesale ``config`` replace would\notherwise let an ordinary edit through the generic connection editor\n(which renders neither field) silently erase every confirmed scope's\n``anonymize`` flag (anonymize-fail-closed hardening, 2026-08-29) or\nreset the extraction schedule's clock. An explicit ``scopes: []`` (or\n``extraction: null``) in the request still clears it deliberately. The\nfull set of keys is ``app.api.admin_sharepoint.\nSHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by\n``tests/test_sharepoint_config_carry_forward_ratchet.py``. Two more keys\n\u2014 ``config.acl_sync_last_run``/``config.acl_sync_last_success_at``,\nwritten by the ``sharepoint-acl-sync`` WORKER JOB rather than an\n``admin_sharepoint.py`` endpoint (``connectors.sharepoint.acl_sync\n.ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``) \u2014 get the same carry-forward\ntreatment just below, kept as a separate hand-maintained list because\nthat ratchet's static scan is deliberately scoped to one file and\ncannot see a different module's writes.",
         "operationId": "update_connection_api_admin_source_connections__connection_id__put",
         "parameters": [
           {
@@ -39175,7 +39575,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token, admin PAT,\nor a corpus-extraction producer credential (``ProducerPrincipal``, see\n``app.auth.producer_token``) scoped to a set of collections.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.\n\nProducer scope gate: a ``ProducerPrincipal`` caller additionally has\nevery ``documents[]`` row's ``corpus_id`` checked against its own\n``collection_ids`` claim \u2014 any row naming a corpus outside that set is\nREJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,\nitemizing the offending corpus ids), an authorization boundary\nindependent of the ``ambiguous_cross_collection_doc_id`` data-integrity\nrule above. See :func:`_refuse_producer_out_of_scope_documents`. A\nhuman admin (or the scheduler token) has no such claim and is\nunaffected.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token, admin PAT,\nor a corpus-extraction producer credential (``ProducerPrincipal``, see\n``app.auth.producer_token``) scoped to a set of collections.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.\n\nProducer scope gate: a ``ProducerPrincipal`` caller additionally has\nevery ``documents[]`` row's ``corpus_id`` checked against its own\n``collection_ids`` claim \u2014 any row naming a corpus outside that set is\nREJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,\nitemizing the offending corpus ids), an authorization boundary\nindependent of the ``ambiguous_cross_collection_doc_id`` data-integrity\nrule above. See :func:`_refuse_producer_out_of_scope_documents`. A\nhuman admin (or the scheduler token) has no such claim and is\nunaffected.\n``evidence[].audience`` (Task 10, spec \u00a74.2) is format-validated FIRST,\nbefore either gate below \u2014 see :func:`_validate_evidence_audience`.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -40950,6 +41350,24 @@
             }
           },
           {
+            "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+              "title": "W"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -41247,6 +41665,24 @@
             "schema": {
               "title": "Key",
               "type": "string"
+            }
+          },
+          {
+            "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+              "title": "W"
             }
           },
           {
@@ -49984,6 +50420,81 @@
         ]
       }
     },
+    "/api/store/entities/{entity_id}/from-markdown": {
+      "put": {
+        "description": "Revise a markdown-authored entity from its text, as the builder holds it.\n\nThe JSON sibling of ``PUT /entities/{id}``, standing in the same relation\nto it that ``POST /entities/from-markdown`` stands to ``POST /entities``:\nit synthesizes the document into a ZIP and delegates, so versioning,\nguardrails, review, renaming and the block-while-pending rule all apply\nidentically. Nothing about the edit pipeline is reimplemented here.\n\nWhy it has to exist: the builder authors a document, and the only edit\nsurface took a replacement bundle. An author who wanted to change one\nsentence of their own skill had to reconstruct a ``.zip`` by hand.",
+        "operationId": "update_entity_from_markdown_api_store_entities__entity_id__from_markdown_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "title": "Entity Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFromMarkdownBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreEntityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Entity From Markdown",
+        "tags": [
+          "store"
+        ]
+      }
+    },
     "/api/store/entities/{entity_id}/install": {
       "delete": {
         "operationId": "uninstall_entity_api_store_entities__entity_id__install_delete",
@@ -50103,6 +50614,71 @@
         ]
       }
     },
+    "/api/store/entities/{entity_id}/markdown": {
+      "get": {
+        "description": "The entity's own markdown, so the builder that wrote it can reopen it.\n\nEditing a saved skill used to mean a different page with a different\nvocabulary that could not touch the body at all: ``/marketplace/flea/\n{id}/edit`` edits metadata and takes a replacement ``.zip``, so the one\nthing the builder authored was the one thing no surface could change.\nReading it back is the missing half of that.\n\nOwner or admin only \u2014 this is the editing path, not a public read, and\nthe 404 mirrors ``_enforce_visibility``'s no-leak refusal rather than\nadmitting the row exists.",
+        "operationId": "get_entity_markdown_api_store_entities__entity_id__markdown_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "title": "Entity Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityMarkdownResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Entity Markdown",
+        "tags": [
+          "store"
+        ]
+      }
+    },
     "/api/store/entities/{entity_id}/photo": {
       "get": {
         "description": "Serve a flea-market entity's cover photo.\n\n**Auth model: login-only, no per-entity visibility check.** Cover\nphotos are uploader-designed showcase images \u2014 they exist to be seen\nand carry no PII / source / secrets. The previous\n``_enforce_visibility`` check serialized every request through a DB\njoin (same ``_system_db_lock`` rationale as\n``app/api/marketplace.py:curated_asset``). Login still required.\n\nCache: bytes change exactly when ``store_entities.version_no`` bumps,\nand listing endpoints append ``?v=<version_no>`` to the photo URL,\nso a 30-day ``immutable`` cache is safe \u2014 a re-upload generates a\nnew URL fingerprint that the browser refetches.",
@@ -50115,6 +50691,24 @@
             "schema": {
               "title": "Entity Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a resized WebP variant (480 or 960); any other value serves the original",
+              "title": "W"
             }
           },
           {

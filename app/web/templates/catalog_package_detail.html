@@ -232,17 +232,19 @@
      The legacy path keeps all three as buttons. #}
   {% if detail.redesign %}
     {% if not in_stack %}
-      {# "Add to stack" — the Stack is the noun the whole product uses for
-         "the things my agents can reach", and it is what this button changes;
-         "Download locally" described the mechanism (`agnes pull` fetching
-         parquets) rather than the outcome. The rail's Availability block is
-         where the download state itself is spelled out. #}
-      {{ ds.button('Add to stack', variant='primary', type='button', id='pkg-add-btn') }}
+      {# NOT "Add to my agents": under auto-membership the admin's grant has
+         already put this package in reach, so a button promising to give the
+         caller's agents access would claim to do something that is already
+         done. What it actually decides is whether `agnes pull` writes a local
+         copy — a speed question, not an access one — and the undo next door
+         has always been worded that way. "Download locally" named the
+         mechanism instead of the outcome, which is why it lost the slot. #}
+      {{ ds.button(words.keep_local, variant='primary', type='button', id='pkg-add-btn') }}
     {% endif %}
   {% elif effective_requirement == 'required' %}
-    <button class="btn btn-required" disabled title="Required by your organization">Always downloaded (required)</button>
+    <button class="btn btn-required" disabled title="{{ words.tier_automatic_help }}">{{ words.tier_automatic }} — always downloaded</button>
   {% elif in_stack %}
-    {{ ds.button('Remove local copy', variant='danger', type='button', id='pkg-remove-btn') }}
+    {{ ds.button(words.drop_local, variant='danger', type='button', id='pkg-remove-btn') }}
   {% else %}
     {{ ds.button('Download locally', variant='primary', type='button', id='pkg-add-btn') }}
   {% endif %}
@@ -436,7 +438,7 @@
 {{ detail.side_open('Availability', icon='stack') }}
   {% if effective_requirement == 'required' %}
     {{ detail.side_panel_open('ok') }}
-      {{ detail.status('Always downloaded', 'ok') }}
+      {{ detail.status(words.tier_automatic ~ ' — always downloaded', 'ok') }}
       <p class="detail-side__note">
         Set to Automatic for your groups, so <code>agnes pull</code> always
         keeps a local copy.

@@ -148,6 +148,10 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
+    # trigger. Handler writes nothing itself; the fallback middleware emits
+    # this cataloged action on its behalf (src/audit_events.py CATALOG).
+    "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync": "sharepoint_acl.sync_triggered",
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
@@ -490,6 +494,7 @@ POSTURE: dict[str, str] = {
     "POST /api/store/entities/{entity_id}/versions/{version_no}/restore": "store.entity.restore",
     "POST /api/store/import-bundle": "store.bundle.import",
     "PUT /api/store/entities/{entity_id}": "store.entity.update",
+    "PUT /api/store/entities/{entity_id}/from-markdown": "store.entity.update",
     "PUT /api/store/entities/{entity_id}/publisher": "store.entity.publisher",
     "PUT /api/store/entities/{entity_id}/verification": "store.entity.verification",
     # -- app.api.store_lint_admin ----------------------------------------------
@@ -957,6 +962,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/store/entities/{entity_id}": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/docs/{filename}": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/files": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}/markdown": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/photo": "exempt:static",
     "GET /api/store/entities/{entity_id}/status": "exempt:ui_support",
     "GET /api/store/owners": "exempt:ui_support",
@@ -1047,6 +1053,8 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/marketplaces": "exempt:ui_support",
     "GET /admin/mcp-sources": "exempt:ui_support",
     "GET /admin/mcp-sources/new": "exempt:ui_support",
+    "GET /admin/mcp-sources/{source_id}/edit": "exempt:ui_support",
+    "GET /admin/data-packages/{pkg_id}/edit": "exempt:ui_support",
     "GET /admin/mcp-sources/{source_id}": "exempt:ui_support",
     "GET /admin/mcp-tools/{tool_id}/grants": "exempt:ui_support",
     "GET /admin/news": "exempt:ui_support",
@@ -1318,6 +1326,15 @@ JOB_POSTURE: dict[str, str] = {
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
+    # Both of these ALSO write their own more-specific rows internally
+    # (connectors/sharepoint/acl_sync.py -- e.g. sharepoint_acl.sync_completed/
+    # sync_failed for the sync job; the sweep job persists state without a
+    # log_safe call of its own) -- per the "Names a more specific action"
+    # bullet above, the generic `job.run` row still fires too (no dedup
+    # across these three transports), so `job.run` remains the correct
+    # declaration here.
+    "sharepoint-acl-sync": "job.run",
+    "sharepoint-subtree-sweep": "job.run",
     # Conditionally registered (only on a process hosting a live ChatManager
     # -- see register_all_kinds()'s docstring) but still a real, enumerable
     # kind name when it IS registered, so it still needs an entry here.
@@ -1372,6 +1389,10 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "store_rate": "store.entity.rate",
     "store_status": "exempt:ui_support",
     "store_publish_markdown": "store.entity.create",
+    # Reading a document back is an owner-scoped read, like store_status.
+    "store_read_markdown": "exempt:ui_support",
+    # Writing one over an entity is the same act the REST sibling audits.
+    "store_edit_markdown": "store.entity.update",
     "store_compose_plugin": "store.entity.create",
     "marketplace_search": "exempt:ui_support",
     "marketplace_detail": "exempt:ui_support",

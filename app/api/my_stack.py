@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.auth.dependencies import _get_db, get_current_user
-from src.marketplace_filter import required_plugin_keys, resolve_allowed_plugins
+from src.marketplace_filter import granted_store_entity_keys, required_plugin_keys, resolve_allowed_plugins
 from src.repositories import (
     audit_repo,
     marketplace_plugins_repo,
@@ -154,18 +154,16 @@ async def get_my_stack(
             )
         )
 
-    installs = user_store_installs_repo().list_for_user(user["id"])
+    # Granted entities are served too — see `granted_store_entity_ids`.
+    installs = user_store_installs_repo().list_for_user(
+        user["id"], sorted(granted_store_entity_keys(conn, user["id"]))
+    )
     store_items: List[StoreInstallEntry] = []
+    from app.api.store import entity_cover_url
     from src.store_naming import strip_archive_suffix
 
     for row in installs:
-        photo_url = (
-            # ``?v=`` cache-busting fingerprint via ``version_no`` — see
-            # ``app/api/store.py:get_entity_photo`` for the cache-header
-            # contract. Bumps on every re-upload, so the URL refresh
-            # forces a browser refetch exactly when the bytes change.
-            f"/api/store/entities/{row['id']}/photo?v={row.get('version_no', 1)}" if row.get("photo_path") else None
-        )
+        photo_url = entity_cover_url(row)
         # Display name strips the archive-rename suffix so the user
         # sees their installed plugin's original label even after the
         # owner archived (and renamed) it. The served ``invocation_name``

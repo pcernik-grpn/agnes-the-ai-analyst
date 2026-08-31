@@ -27,17 +27,21 @@
 
 /* The call to action at the end of the controls row — the house primary button
    (`.cc-btn--primary`, catalog_card.css) with nothing added but the icon gap.
-   Deliberately NO palette override of its own: the toolbar's treatment is the
-   shared component's business (`.fbar-dock__card`, filter_toolbar.css), and a
-   page sheet pre-empting it is how the two docks would drift apart. */
-.ch-new { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+   Deliberately NO palette override of its own: the row's treatment is the
+   shared component's business (`.fbar--ranked`, filter_toolbar.css), and a page
+   sheet pre-empting it is how the two rows would drift apart.
+
+   `margin-left: auto` is the page's own call, not the component's: it is where
+   THIS page's primary sits. `.fbar--ranked` stops search from growing, so the
+   free space that used to push New chat to the right end is gone with it. */
+.ch-new { flex: 0 0 auto; margin-left: auto; height: 32px; font-size: 13px; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .ch-new svg { width: 15px; height: 15px; }
 
 /* ── Toolbar ──────────────────────────────────────────────────────────
-   The shared component (`.fbar-dock` + `.fbar-dock__card` wrapping a `.fbar`,
-   filter_toolbar.css) — the frame, the card, the control palette and the menu
-   placement all come from there, so /library and /chats render ONE toolbar
-   instead of two drifting copies. Only the page's own control geometry is here. */
+   The shared component (`.fbar` + `.fbar--ranked`, filter_toolbar.css) — the
+   control palette, the rank treatment and the menu placement all come from
+   there, so /library and /chats render ONE toolbar instead of two drifting
+   copies. Only the page's own control geometry is here. */
 
 @media (max-width: 760px) {
   .ch-fbar { flex-wrap: wrap; justify-content: center; }
@@ -97,26 +101,37 @@
 .ch-filter__view[hidden] { display: none; }
 .ch-filter__view::before { content: "· "; color: var(--fbar-ink-3, var(--ds-text-muted)); }
 
-/* The dock and the bulk bar are the same spot, deliberately: "narrow the list"
-   and "act on the selection" are different jobs, and two floating cards stacked
-   on top of each other is what a caller reads as clutter. Selection wins while
-   it lasts. */
-.ch-section.has-selection .fbar-dock { display: none; }
-
 /* Room under the list for the bulk bar, which is fixed to the foot of the
    viewport while a selection lasts — so the last row is never the one hiding
    beneath it. Reserved unconditionally rather than only under `.has-selection`:
    adding 76px of padding at the moment a row is ticked would shift the list
-   under the pointer that ticked it. End-of-page clearance for the DOCK is not
-   this rule's job — that lives on the footer, via the shared component's
-   `body:has(.fbar-dock) footer` margin. */
+   under the pointer that ticked it.
+
+   The toolbar used to contend for this same spot (`.has-selection .fbar-dock
+   { display: none }`), because two floating cards stacked at the foot read as
+   clutter. It sits at the head of the list now, so there is nothing to hide:
+   "narrow the list" and "act on the selection" are still different jobs, but
+   they are no longer in the same place. */
 .ch-section { padding-bottom: 88px; }
 
-/* ── The line above the list ──────────────────────────────────────────
-   The select-all control and the count, both in the quiet muted-uppercase voice
-   of list metadata rather than reading as a heading. Select-all lives here
-   because the list has no header row to put it in. */
-.ch-listhead { display: flex; align-items: center; gap: 9px; margin: 18px 0 4px; padding: 0 12px; min-height: 22px; }
+/* ── The browsing block ───────────────────────────────────────────────
+   One row of controls, then one line stating what they did, then the list —
+   `.lib-browse` on /library is the same block. */
+.ch-browse { margin: 0 0 10px; }
+
+/* ── The line under the controls ──────────────────────────────────────
+   The select-all control, the count and the applied-facet chips, all in the
+   quiet muted-uppercase voice of list metadata rather than reading as a
+   heading. Select-all lives here because the list has no header row to put it
+   in. The chips join it because the count and the chips are one sentence —
+   "4 of 31, because Agent is Revenue Analyst" — and they read as that only
+   when they are on one line. */
+.ch-listhead { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 9px; margin: 10px 0 4px; padding: 0 12px; min-height: 22px; }
+/* The chips carried their own margins for the dock's stacked row; on this line
+   the flex gap does that job. They wrap within the line rather than centring,
+   so they read as a continuation of the count beside them. */
+.ch-listhead #ch-chips { margin: 0; justify-content: flex-start; }
+.ch-listhead .fbar-chip { height: 22px; }
 .ch-count { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-text-muted); }
 /* Same fixed 16px slot as every row's `.ch-row__sel`, so the header box sits
    exactly above the column it selects — that alignment is the label. */
@@ -295,9 +310,12 @@
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   max-width: 100%;
   padding: 9px 12px 9px 16px;
-  /* The same off-white surface + defined hairline as `.fbar-dock__card`
-     (filter_toolbar.css) — this bar takes the dock's spot while a selection
-     lasts, and two whites alternating in one position read as a flicker. */
+  /* An off-white surface + a defined hairline, not plain `--ds-surface`: this
+     card floats over rows that are themselves white, so it needs to separate
+     from what is passing beneath it. The values came from the retired
+     `.fbar-dock__card`, which shared this spot and therefore this problem; it
+     is the only floating card on the page now, and the treatment is what makes
+     it read as one. */
   background: color-mix(in srgb, var(--ds-bg) 30%, var(--ds-surface));
   border: 1px solid color-mix(in srgb, var(--ds-text-muted) 9%, var(--ds-border));
   border-radius: 999px;

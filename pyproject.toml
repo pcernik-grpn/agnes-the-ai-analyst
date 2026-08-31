@@ -1,6 +1,6 @@
 [project]
 name = "agnes-the-ai-analyst"
-version = "0.93.0"
+version = "0.94.0"
 description = "Agnes — self-hosted AI harness for organizations: governed data access, agents as an API, skills marketplace, corporate memory, hosted data apps, and agent surfaces (web chat, Slack, MCP, CLI)"
 requires-python = ">=3.11,<3.14"
 license = {file = "LICENSE"}
@@ -94,6 +94,11 @@ dependencies = [
     # imports both at module scope, so a missing jsonschema fails app boot,
     # not just a code path. Pure-Python, no compiled extensions.
     "jsonschema>=4.0.0",
+    # Image variants for cover photos are generated on the server at serve time
+    # (resize + WebP encode). The serving code lives in `app/web/cover_files.py`
+    # and `src/images/`. Pillow was marked test-only when the vision ingest
+    # path never imported PIL; it now generates production assets.
+    "pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
@@ -297,12 +302,6 @@ dev = [
     # Balanced by the committed `.test_durations` file.
     "pytest-split>=0.9.0",
     "faker>=24.0.0",
-    # Pillow — test-only: tests/test_ingest_vision.py synthesizes a throwaway
-    # image (`PIL.Image.new(...)`) to exercise the vision ingest path; the
-    # `src/ingest/vision.py` runtime never imports PIL. It used to arrive
-    # transitively via matplotlib (a core dep); matplotlib moved to the
-    # `telegram` extra, so declare pillow here for the `[dev]` test run.
-    "pillow>=10.0.0",
     # jsonschema is a core dependency now (see [project].dependencies —
     # app/chat/structured_output.py needs it in production), so no separate
     # dev-extra entry here. It also covers the corporate-memory

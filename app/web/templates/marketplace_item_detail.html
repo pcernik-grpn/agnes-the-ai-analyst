@@ -569,6 +569,16 @@
     color: var(--text-secondary); font-size: 13px; font-style: italic;
     text-align: center; padding: 32px 16px;
   }
+
+  /* CLS fix (this page only — the plugin detail page's server shell is
+     already tall enough and measures 0.026, so it's left alone): measured
+     layout shift 0.468, sources DIV.detail-cols + FOOTER.site-footer — the
+     server renders a short shell, the detail XHR lands, .detail-cols grows
+     and shoves the footer down through the viewport. CLS only scores
+     elements visible in the viewport before or after they move, so
+     reserving enough height up front to push the footer below the first
+     viewport keeps that growth off-screen and out of the score. */
+  .item-detail .detail-cols { min-height: 100vh; }
 </style>
 {% endblock %}
 
@@ -701,12 +711,13 @@
      name_id='hero-name', icon_id='hero-icon', type_label=kind|capitalize,
      trust=(_trust_level if detail.redesign else None), trust_own=is_owner,
      menu=_menu|trim, body_slot=_hero_slot, panel=_hero_panel|trim,
+     cover_image_url=cover_image_url,
      back_href=_back, back_label=_back_label) %}
   <div class="actions-row" id="hero-actions"></div>
   <div class="helper" id="hero-helper" hidden></div>
   <div class="stack-hint" id="stack-hint" hidden>
     <div class="head">
-      <span class="title" id="stack-hint-title">✓ Added to your stack</span>
+      <span class="title" id="stack-hint-title">✓ Added to your agents</span>
       <button class="dismiss" id="stack-hint-dismiss" type="button">Don’t show again</button>
     </div>
     <div>Run in Claude Code:</div>
@@ -1199,6 +1210,23 @@
     return String(s ?? '').replace(/[&<>"']/g, ch => (
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   }
+  // JS mirror of app/web/router.py's cover_variant_url/has_cover_variant Jinja
+  // filters — same external-URL rule (coverW skips the ?w= append for an
+  // un-mirrored external cover, which has no variant to request). Our own
+  // serving routes are always relative, so any absolute http(s) URL is
+  // external — no URL parsing needed (and none safe: cover_photo_url is
+  // often already relative). This page's hero is the only cover site here
+  // and fetches a fixed 480 — see its no-srcset comment below.
+  function isMirroredCoverUrl(url) {
+    // Absolute (http/https), protocol-relative (//host/...), or data: URLs
+    // are external -- no ?w= variant to request. Mirrors has_cover_variant
+    // in app/web/router.py.
+    return !/^((https?:)?\/\/|data:)/i.test(url);
+  }
+  function coverW(url, w) {
+    if (!isMirroredCoverUrl(url)) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'w=' + w;
+  }
   // Placeholder initials derived from the entity name. Mirrors initialsFor()
   // in marketplace.html (the card grid) so the detail hero shows the same
   // name-derived glyph ("Sales Dashboard" → "SD") instead of a generic
@@ -1306,11 +1334,20 @@
   // overlay the curator cover when present (widening the tile via `--cover`,
   // mirroring the detail.hero() macro), reverting to the glyph on a 404.
   const iconEl = document.getElementById('hero-icon');
-  if (iconEl && d.cover_photo_url) {
+  if (iconEl && d.cover_photo_url && !iconEl.querySelector('img')) {
     iconEl.classList.add('detail-hero__icon--cover');
     const coverImg = document.createElement('img');
     coverImg.alt = '';
-    coverImg.src = d.cover_photo_url;
+    coverImg.fetchPriority = 'high';
+    coverImg.width = 480;
+    coverImg.height = 240;
+    // No srcset: the governing default renders the hero tile at 132x74 CSS
+    // px (macros/_detail.html .detail-hero__icon--cover), 396 device px
+    // even at DPR 3, so the 480 variant is the honest fetch up to DPR 3.6
+    // on its own (the paper theme narrows the tile further, to 108x62,
+    // detail-page.css) — a srcset here only invited a DPR-3 phone to grab
+    // the 960 for zero visible gain.
+    coverImg.src = coverW(d.cover_photo_url, 480);
     coverImg.onerror = () => {
       iconEl.classList.remove('detail-hero__icon--cover');
       coverImg.remove();
@@ -1433,17 +1470,17 @@
     const t = document.getElementById('stack-hint-title');
     if (!t) return;
     t.textContent = kind === 'removed'
-      ? '✓ Removed from your stack'
-      : '✓ Added to your stack';
+      ? '✓ Removed from your agents'
+      : '✓ Added to your agents';
   }
   function renderInstallActionsHtml(installed) {
     if (installed) {
       return `
-        <span class="status-pill" id="status-pill">✓ In your stack</span>
+        <span class="status-pill" id="status-pill">✓ Agents can use this</span>
         <button class="btn-remove" id="remove-btn" type="button">✕ Remove from stack</button>
       `;
     }
-    return `<button class="btn primary" id="install-btn" type="button">+ Add to my stack</button>`;
+    return `<button class="btn primary" id="install-btn" type="button">+ Add to my agents</button>`;
   }
   // The rail's Availability block — the reader's own state, in the same
   // position and the same tinted callout every other detail page uses for it.
@@ -1461,10 +1498,10 @@
       panel.classList.add(installed ? 'detail-side__panel--ok' : 'detail-side__panel--warn');
     }
     chip.innerHTML = `<span class="detail-status detail-status--${installed ? 'ok' : 'warn'}">`
-      + (installed ? 'In your stack' : 'Not in your stack') + '</span>';
+      + (installed ? 'Agents can use this' : 'Not added yet') + '</span>';
     note.textContent = installed
       ? 'Run /update-agnes-plugins in Claude Code to pick up the latest version.'
-      : 'Add it to your stack to use it in Claude Code.';
+      : 'Add it to your agents to use it in Claude Code.';
     block.hidden = false;
   }
   // Wires whichever of {install-btn, remove-btn} is currently in the
@@ -1518,7 +1555,7 @@
     const helperEl = document.getElementById('hero-helper');
     helperEl.innerHTML = `
       This ${esc(kind === 'skill' ? 'skill' : 'agent')} is part of <strong>${esc(parentLabel)}</strong>.<br>
-      Add the bundle to your stack to use it.`;
+      Add the plugin to your agents to use it.`;
     helperEl.hidden = false;
   } else {
     // v32+ quarantine: when the entity is non-approved (only owner +
@@ -1539,7 +1576,7 @@
       actions.innerHTML = `<button class="btn primary" type="button" disabled
         title="This submission is not approved yet — install is disabled until checks pass."
         style="background:var(--ds-surface-sunken);color:var(--ds-text-muted);cursor:not-allowed;border:1px solid var(--ds-border);">
-          + Add to my stack (unavailable while ${stateLabel})
+          + Add to my agents (unavailable while ${stateLabel})
         </button>`;
     } else {
       // Two-element installed state — inline status label BEFORE the

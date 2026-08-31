@@ -3,6 +3,7 @@
 import contextlib as _contextlib
 import hashlib as _hashlib
 import logging
+import atexit
 import os
 import re as _re
 import shutil as _shutil
@@ -124,6 +125,116 @@ if _TEST_DUCKDB_BLOCK_SIZE != "0" and not getattr(duckdb.connect, "_agnes_small_
 
     _connect_with_small_blocks._agnes_small_blocks = True  # type: ignore[attr-defined]
     duckdb.connect = _connect_with_small_blocks
+
+
+# ---------------------------------------------------------------------------
+# Seeded-schema template for per-test system.duckdb
+# ---------------------------------------------------------------------------
+# Building `system.duckdb` from nothing runs the whole `_SYSTEM_SCHEMA` DDL plus
+# the v1..vN migration ladder: ~150 ms on a warm laptop, ~280 ms on a CI runner
+# (the 16 KiB-block change above already took it down from ~950 ms). Almost
+# every test in the suite pays it, because `e2e_env` and friends point DATA_DIR
+# at a fresh `tmp_path` and the first `get_system_db()` builds a database from
+# scratch — measured at roughly two thirds of the suite's total CPU.
+#
+# The database that DDL produces is the same every time. So build it ONCE per
+# pytest process, then hand every later fresh DATA_DIR a byte copy (~3 ms) and
+# let `_ensure_schema` take its `current == SCHEMA_VERSION` fast path.
+#
+# The hook is `src.db._try_open_system_db` — the function `get_system_db()`
+# uses — and deliberately NOT the `duckdb.connect` wrapper above, even though
+# that is the broader choke point. The difference is the whole correctness
+# argument: a test that hand-builds an OLD-schema database to watch the
+# migration ladder run (tests/test_db.py, test_schema_v24_*, test_user_management,
+# test_ingest_bundle, ...) calls `duckdb.connect(path)` directly and then issues
+# its own `CREATE TABLE schema_version`. Seeding from the connect wrapper put a
+# current-schema database under those tests and broke 36 of them with
+# "Table with name schema_version already exists". Bound to
+# `_try_open_system_db`, the template reaches exactly the callers that were
+# about to ask `_ensure_schema` to build the same thing from scratch, and no
+# one else. Production code is untouched either way.
+#
+# `AGNES_TEST_DB_TEMPLATE=0` disables it — for bisecting a suspected
+# template-staleness bug.
+_TEMPLATE_ENABLED = os.environ.get("AGNES_TEST_DB_TEMPLATE", "1") != "0"
+_template_path: Path | None = None
+_template_state: str = "unbuilt"  # unbuilt | building | ready | failed
+
+
+def _system_db_template() -> Path | None:
+    """Path to a freshly-migrated `system.duckdb` to copy, or None.
+
+    Built lazily on first use with a PRIVATE connection — never through
+    `get_system_db()`, whose module-global cached connection would be left
+    pointing at the template and whose file would still be open (and possibly
+    un-checkpointed) when we tried to copy it.
+    """
+    global _template_path, _template_state
+    if _template_state == "ready":
+        return _template_path
+    if _template_state in ("building", "failed"):
+        # Re-entrant call from inside the build itself, or a build that already
+        # failed: fall through to the normal from-scratch path.
+        return None
+
+    _template_state = "building"
+    try:
+        import tempfile
+
+        from src.db import _apply_memory_caps, _ensure_schema  # noqa: PLC0415
+
+        template_dir = Path(tempfile.mkdtemp(prefix="agnes-system-template-"))
+        # ~7 MB per pytest PROCESS, and `-n auto` means six of them per run.
+        # This repo has a history of test scratch filling disks (see the
+        # pre-flight disk guard below); an optimisation must not add to it.
+        atexit.register(_shutil.rmtree, template_dir, ignore_errors=True)
+        target = template_dir / "system.duckdb"
+        conn = duckdb.connect(str(target))
+        try:
+            _apply_memory_caps(conn, _SYSTEM_DB_TEMPLATE_MEMORY_LIMIT, label="system_db_template")
+            _ensure_schema(conn)
+            conn.execute("CHECKPOINT")
+        finally:
+            conn.close()  # clean close → WAL flushed, safe to copy
+        _template_path = target
+        _template_state = "ready"
+        return target
+    except Exception:
+        # A template is an optimisation. If it cannot be built — a schema change
+        # mid-refactor, a read-only tmpdir — every test still builds its own.
+        _template_state = "failed"
+        _template_path = None
+        return None
+
+
+if _TEMPLATE_ENABLED:
+    import src.db as _src_db  # noqa: E402  (must follow the duckdb.connect patch above)
+
+    _orig_try_open_system_db = _src_db._try_open_system_db
+
+    def _try_open_system_db_from_template(db_path: str):
+        """Seed a missing `system.duckdb` from the template, then open normally.
+
+        Only fires on the create path (`not exists`); an existing database —
+        including one a test wrote itself — is opened untouched.
+        """
+        target = Path(db_path)
+        if not target.exists():
+            template = _system_db_template()
+            if template is not None and template.exists():
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    _shutil.copyfile(template, target)
+                except OSError:
+                    # Losing the copy costs time, never correctness — the
+                    # from-scratch build below produces the same database.
+                    pass
+        return _orig_try_open_system_db(db_path)
+
+    _src_db._try_open_system_db = _try_open_system_db_from_template
+
+
+_SYSTEM_DB_TEMPLATE_MEMORY_LIMIT = "1GB"
 
 # Real-home shell configs that `agnes init` (cli/lib/shortcut.py) can append
 # launcher blocks to. Resolved at import time — before any test monkeypatches

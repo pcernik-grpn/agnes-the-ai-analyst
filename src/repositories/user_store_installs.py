@@ -6,7 +6,7 @@ served Claude Code marketplace by ``src/marketplace_filter.py``.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import duckdb
 
@@ -81,7 +81,7 @@ class UserStoreInstallsRepository:
                 created += 1
         return created
 
-    def list_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+    def list_for_user(self, user_id: str, granted_ids: Sequence[str] = ()) -> List[Dict[str, Any]]:
         """Joins store_entities so a single round-trip returns everything the
         UI / marketplace builder needs.
 
@@ -92,6 +92,13 @@ class UserStoreInstallsRepository:
           that previously-installed users keep getting served. Pulling
           them from the marketplace.zip would silently break a user's
           existing setup; archive intentionally preserves the install.
+
+        * **hidden and granted to one of the caller's groups, never blocked by
+          review** — ``granted_ids`` is that set, resolved by the caller (this
+          layer does not read grants). Without it a ``store_entity`` grant was
+          accepted and meant nothing: the row was written and the group was
+          still served nothing. Passing an empty sequence is the old
+          behaviour exactly.
 
         * **hidden, owned by the caller, never blocked by review** — an
           entity kept Private on purpose (``access='private'`` on upload, or
@@ -111,6 +118,17 @@ class UserStoreInstallsRepository:
         the entity's history rather than only the latest one, so the safe
         direction wins on an ambiguous chain.
         """
+        # Parameterized one-per-id, never interpolated: these arrive from a
+        # grant table but they are still values in a query.
+        granted = [str(g) for g in (granted_ids or [])]
+        granted_sql = (
+            " OR (se.visibility_status = 'hidden' AND se.id IN ("
+            + ",".join("?" for _ in granted)
+            + ") AND NOT EXISTS (SELECT 1 FROM store_submissions ss2 WHERE ss2.entity_id = se.id"
+            + f" AND ss2.status IN ({BLOCKING_SUBMISSION_STATUS_SQL})))"
+            if granted
+            else ""
+        )
         rows = self.conn.execute(
             f"""SELECT
                    se.id, se.owner_user_id, se.owner_username, se.type,
@@ -134,9 +152,10 @@ class UserStoreInstallsRepository:
                          AND ss.status IN ({BLOCKING_SUBMISSION_STATUS_SQL})
                      )
                    )
+                   {granted_sql}
                  )
                ORDER BY usi.installed_at DESC, se.id""",
-            [user_id, user_id],
+            [user_id, user_id] + granted,
         ).fetchall()
         if not rows:
             return []

@@ -224,7 +224,9 @@ class TestChatsPage:
         # The views come FIRST, above the optional refinements.
         assert menu.index('id="ch-seg"') < menu.index("fbar-menu__foot")
         # ...and there is no segmented control left on the bar itself.
-        bar = html.split('class="fbar ch-fbar"', 1)[1].split('id="ch-filter-menu"', 1)[0]
+        # Anchored on the bar's aria-label, not its class list: the class list
+        # carries opt-in modifiers (`fbar--ranked`) that this test has no view on.
+        bar = html.split('aria-label="Search, filter and sort chats"', 1)[1].split('id="ch-filter-menu"', 1)[0]
         assert "fbar-seg__btn" not in bar
         # The active view is named on the Filter button, which is the one thing the
         # tabs said at rest.
@@ -254,23 +256,38 @@ class TestChatsPage:
         assert 'id="ch-bulk"' in html and "hidden" in html.split('id="ch-bulk"')[1][:40]
 
     def test_toolbar_is_the_shared_component_with_librarys_placement(self, web_client, admin_cookie, monkeypatch):
-        """One toolbar, not a lookalike: the page wraps the SHARED component
-        (`.fbar-dock` → `.fbar-dock__card` → `.fbar`, filter_toolbar.css) that
-        /library renders, and places its two page-level controls the way /library
-        does — search at the LEFT end of the controls row, the primary action at
-        the RIGHT end, with the narrowing controls between them. The header is
-        the page's name and nothing else; a header scrolls away, and the two
-        controls a caller reaches for most must not live in the one place that
-        leaves the screen."""
+        """One toolbar, not a lookalike: the page renders the SHARED component
+        /library renders — the same `.fbar`, opted into the same `.fbar--ranked`
+        rank treatment (filter_toolbar.css) — in a browsing block at the head of
+        its list, and places its two page-level controls the way /library does:
+        search at the LEFT end of the controls row, the primary action at the
+        RIGHT end, with the narrowing controls between them. The header is the
+        page's name and nothing else.
+
+        This asserted the floating `.fbar-dock` until TCRD-280. The dock was
+        bought for a real property — controls reachable at row 200 as much as at
+        row 1 — but it floats over the FOOT of the page, so it covered the last
+        rows on every screen and put the controls below the list they narrow.
+        /library left it in #1751 and /chats was the only caller still on it.
+        The assertion is INVERTED rather than deleted: the dock must not come
+        back to this page by accident, and the two pages must not drift apart
+        again."""
         _enable_chat(web_client, monkeypatch)
         _seed(web_client, title="Something")
         html = web_client.get("/chats", cookies=admin_cookie).text
-        assert 'class="fbar-dock"' in html
-        assert 'class="fbar-dock__card"' in html
-        bar = html.split('class="fbar ch-fbar"', 1)[1].split("</div>\n  </div></div>", 1)[0]
+        assert "fbar-dock" not in html, "the toolbar heads the list; it does not float over its foot"
+        assert 'class="ch-browse"' in html
+        assert "fbar--ranked" in html, "the shared rank treatment, not a page-local copy of it"
+        # Bounded by the state line, which is the next landmark after the row.
+        bar = html.split('aria-label="Search, filter and sort chats"', 1)[1].split('class="ch-listhead"', 1)[0]
         assert 'id="ch-search"' in bar, "search rides the toolbar, not the header"
         assert 'class="cc-btn cc-btn--primary ch-new"' in bar, "the primary action closes the row"
         assert bar.index('id="ch-search"') < bar.index('id="ch-seg"') < bar.index("ch-new")
+        # The state line is BELOW the controls, against the list it describes —
+        # the dock had the chips ABOVE the bar, which was right only while the
+        # bar itself sat under the list.
+        assert html.index('id="ch-count"') > html.index('id="ch-search"')
+        assert html.index('id="ch-chips"') > html.index('id="ch-count"')
         head = html.split('class="ch-head"', 1)[1].split("</div>", 2)[0]
         assert "ch-search" not in head and "ch-new" not in head
 

@@ -39,7 +39,13 @@ IMAGE = os.environ.get("AGNES_DOCKER_TEST_IMAGE", "python:3.13-slim")
 #: the same shape as the runner's JSONL protocol, minus the JSON.
 ECHO_PROGRAM = 'echo ready; while IFS= read -r line; do echo "echo: $line"; done'
 
-RUNNER_TOKEN = "daemon-test-token"
+#: Long enough to clear the 32-character floor `_check_token` enforces on
+#: both sides of this channel (`RUNNER_TOKEN_MIN_LENGTH` in
+#: services/apps_runner/api.py and app/api/data_apps.py). The floor arrived
+#: with the wave-2 audit hardening, which replaced a plain `!=` compare; a
+#: shorter fixture token had matched fine until then and afterwards was
+#: rejected before any comparison, as a flat `401 bad_runner_token`.
+RUNNER_TOKEN = "daemon-test-token-daemon-test-token"
 
 
 def _docker_or_skip():

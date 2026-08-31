@@ -1927,6 +1927,45 @@ async function openSession(chatId, wsUrlOverride) {
   };
 }
 
+// Plain-language copy for a failed turn. Chat pasted `frame.kind` +
+// `frame.message` straight into the stream, so the product's core action
+// failed with "Something went wrong: engine_error — engine turn failed:
+// 503: kai_integration_not_configured" — no cause a non-technical reader can
+// act on, no next step, and a second truncated copy in a toast.
+//
+// The same error families already have written copy in
+// components/builder_preview.js (`errorCopy`), which the preview surface has
+// been using all along. This is that mapping, worded for chat: same families,
+// same order, so the two surfaces cannot describe one failure differently.
+function chatErrorCopy(raw, kind) {
+  const msg = String(raw == null ? "" : raw).trim();
+  const k = String(kind == null ? "" : kind).trim();
+  const both = `${k} ${msg}`;
+  if (/not_configured|no_provider|provider_unavailable|integration/i.test(both)) {
+    return "Agnes needs a chat engine to answer, and none is configured on this " +
+      "instance yet. An admin sets that up — your message was not lost.";
+  }
+  if (/concurrency_cap/i.test(both)) {
+    return "Too many conversations are running right now. Try again in a moment.";
+  }
+  if (/budget|429/i.test(both)) {
+    return "This instance has used its message budget for the month. An admin can raise it.";
+  }
+  if (/runner_not_ready|did not become ready/i.test(both)) {
+    return "The chat engine did not start in time. The first conversation after a restart " +
+      "is the slow one, so trying again usually works — if it keeps failing, ask an admin " +
+      "to check the chat engine.";
+  }
+  if (/timeout|timed out/i.test(both)) {
+    return "That took too long and was stopped. Try a narrower question, or ask again.";
+  }
+  // Unrecognised: say plainly that it failed and keep the detail visible
+  // rather than inventing a cause we do not know.
+  return msg
+    ? `Agnes could not finish that answer. The engine reported: ${msg}`
+    : "Agnes could not finish that answer. Try again, or ask an admin to check the chat engine.";
+}
+
 function handleFrame(frame) {
   // Track last-seen seq per session (wave-2F task 2/3 — see
   // lastSeenSeqByChat above). Additive/back-compat: a frame with no `seq`
@@ -2081,10 +2120,10 @@ function handleFrame(frame) {
       break;
     case "error":
       _flushStreamingTail();
-      renderSystemNote(
-        `Something went wrong: ${frame.kind || "error"}${frame.message ? ` — ${frame.message}` : ""}`,
-        "error",
-      );
+      renderSystemNote(chatErrorCopy(frame.message, frame.kind), "error");
+      // The status line keeps the raw pair: it is the one place a developer
+      // or an admin reading over a shoulder can still see `frame.kind`, and
+      // it is not the sentence the user is being asked to act on.
       setStatus(`Error: ${frame.kind} (${frame.message || ""})`, "error");
       $("cancel-btn").hidden = true;
       clearThinkingPlaceholder();
