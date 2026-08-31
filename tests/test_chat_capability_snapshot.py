@@ -26,6 +26,62 @@ def _register(table_id: str, name: str, source_type: str = "keboola") -> None:
         conn.close()
 
 
+def _grant_plugin_to_analyst(
+    marketplace_id: str,
+    plugin_name: str,
+    *,
+    requirement: str = "available",
+    subscribe: bool = False,
+) -> None:
+    """Register ``marketplace_id/plugin_name`` and grant it to a group
+    ``analyst1`` is an explicit member of.
+
+    ``seeded_app`` only seeds admin1 into the Admin group (see
+    ``tests/conftest.py::_seed_users_and_mint_tokens``); every other
+    membership needs its own row (``app.auth.access._user_group_ids`` has
+    no implicit "everyone is in Everyone" fallback), so this reuses the
+    seeded ``Everyone`` group with an explicit membership row, mirroring
+    ``tests/test_web_chat_empty_state.py::_grant``.
+    """
+    from src.db import get_system_db
+    from src.repositories import (
+        marketplace_plugins_repo,
+        marketplace_registry_repo,
+        resource_grants_repo,
+        user_curated_subscriptions_repo,
+        user_groups_repo,
+    )
+    from src.repositories.user_group_members import UserGroupMembersRepository
+
+    conn = get_system_db()
+    try:
+        marketplace_registry_repo().register(
+            id=marketplace_id,
+            name=marketplace_id,
+            url=f"https://example.test/{marketplace_id}.git",
+        )
+        marketplace_plugins_repo().replace_for_marketplace(
+            marketplace_id,
+            [{"name": plugin_name, "version": "1.0", "description": "d"}],
+        )
+        everyone = user_groups_repo().get_by_name("Everyone")
+        assert everyone is not None, "system groups are seeded by _ensure_schema"
+        try:
+            UserGroupMembersRepository(conn).add_member("analyst1", everyone["id"], source="test")
+        except Exception:
+            pass  # already a member from an earlier call in the same test
+        resource_grants_repo().create(
+            group_id=everyone["id"],
+            resource_type="marketplace_plugin",
+            resource_id=f"{marketplace_id}/{plugin_name}",
+            requirement=requirement,
+        )
+        if subscribe:
+            user_curated_subscriptions_repo().subscribe("analyst1", marketplace_id, plugin_name)
+    finally:
+        conn.close()
+
+
 def test_admin_snapshot_counts_all_registered_tables(seeded_app):
     """Admin (``get_accessible_tables`` -> None) counts every registered table."""
     from app.web import router
@@ -154,3 +210,65 @@ def test_the_zero_data_override_keeps_is_admin(seeded_app):
         "the zero-data override must spread the snapshot, not rebuild it — "
         "rebuilding drops is_admin and sends admins the member starters"
     )
+
+
+# --- Plugin set matches the sandbox's effective stack, not grant-only (#1913) ---
+
+
+def test_granted_but_unsubscribed_plugin_is_excluded_from_snapshot(seeded_app):
+    """A plugin an admin merely made AVAILABLE (grant-only) is only
+    ELIGIBILITY under Model B (v28+) — ``resolve_user_marketplace`` (what the
+    sandbox actually installs from) additionally requires an explicit
+    subscription or a ``required``-tier grant before serving it. The panel
+    must agree, or it claims a plugin is "installed" that the sandbox never
+    loaded."""
+    from app.web import router
+    from src.db import get_system_db
+
+    _grant_plugin_to_analyst("cap-mp-unsub", "cap-plugin-unsub", requirement="available", subscribe=False)
+
+    conn = get_system_db()
+    try:
+        snap = router._chat_capability_snapshot(conn, {"id": "analyst1"})
+    finally:
+        conn.close()
+
+    assert snap["plugins"] == []
+    assert snap["marketplace_count"] == 0
+
+
+def test_granted_and_subscribed_plugin_counts_in_snapshot(seeded_app):
+    """The other half of the same grant: once the caller actually subscribes,
+    the plugin enters their served set and the panel must show it."""
+    from app.web import router
+    from src.db import get_system_db
+
+    _grant_plugin_to_analyst("cap-mp-sub", "cap-plugin-sub", requirement="available", subscribe=True)
+
+    conn = get_system_db()
+    try:
+        snap = router._chat_capability_snapshot(conn, {"id": "analyst1"})
+    finally:
+        conn.close()
+
+    assert [p["name"] for p in snap["plugins"]] == ["cap-plugin-sub"]
+    assert snap["marketplace_count"] == 1
+
+
+def test_granted_at_required_tier_counts_without_a_subscription(seeded_app):
+    """A ``required``-tier grant is always-in-stack — the same union every
+    other stack surface (StackResolver, ``resolve_user_marketplace``)
+    honors — so it must count even with no explicit subscription row."""
+    from app.web import router
+    from src.db import get_system_db
+
+    _grant_plugin_to_analyst("cap-mp-req", "cap-plugin-req", requirement="required", subscribe=False)
+
+    conn = get_system_db()
+    try:
+        snap = router._chat_capability_snapshot(conn, {"id": "analyst1"})
+    finally:
+        conn.close()
+
+    assert [p["name"] for p in snap["plugins"]] == ["cap-plugin-req"]
+    assert snap["marketplace_count"] == 1
