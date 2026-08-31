@@ -87,6 +87,8 @@ def _seed_summary(
     cache_creation_tokens=0,
     tool_calls=0,
     tool_errors=0,
+    mcp_calls=0,
+    subagent_dispatches=0,
     user_messages=0,
 ):
     repo.upsert_summary(
@@ -102,6 +104,8 @@ def _seed_summary(
             "user_messages": user_messages,
             "tool_calls": tool_calls,
             "tool_errors": tool_errors,
+            "mcp_calls": mcp_calls,
+            "subagent_dispatches": subagent_dispatches,
             "primary_model": primary_model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -335,7 +339,7 @@ def test_list_sessions_for_user_admin_filters_on_user_id_or_username(usage_repo)
     rows = repo.list_sessions_for_user_admin(user_id="uid-1", username="carol")
     files = {r["session_file"] for r in rows}
     assert files == {"u/s1.jsonl", "u/s2.jsonl"}
-    # 9-column shape.
+    # 11-column shape.
     assert set(rows[0].keys()) == {
         "session_file",
         "session_id",
@@ -345,6 +349,8 @@ def test_list_sessions_for_user_admin_filters_on_user_id_or_username(usage_repo)
         "wall_seconds",
         "tool_calls",
         "tool_errors",
+        "mcp_calls",
+        "subagent_dispatches",
         "primary_model",
     }
 
@@ -359,7 +365,7 @@ def test_list_sessions_for_user_self_filters_on_username_only(usage_repo):
     rows = repo.list_sessions_for_user_self("dave")
     files = {r["session_file"] for r in rows}
     assert files == {"d/s1.jsonl"}
-    # 14-column shape.
+    # 16-column shape.
     assert set(rows[0].keys()) == {
         "session_file",
         "session_id",
@@ -370,6 +376,8 @@ def test_list_sessions_for_user_self_filters_on_username_only(usage_repo):
         "user_messages",
         "tool_calls",
         "tool_errors",
+        "mcp_calls",
+        "subagent_dispatches",
         "input_tokens",
         "output_tokens",
         "cache_read_tokens",
@@ -405,6 +413,65 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
     assert row["output_tokens"] == 200
     assert row["cache_read_tokens"] == 300
     assert row["cache_creation_tokens"] == 400
+
+
+def test_tool_call_totals_include_mcp_and_subagent_on_both_backends(usage_repo):
+    """A session whose work is mostly MCP tools used to render as
+    "Tool calls: 2, Errors: 15" — `tool_calls` counts only native tool_use
+    events while `tool_errors` counts `is_error` across ALL call kinds. Every
+    admin read surface now reports the full call count (native + MCP +
+    subagent): the detail projection carries the breakdown columns, the KPI
+    total and the `tool_calls` sort key sum all three.
+    """
+    repo, _, _ = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_summary(
+        repo,
+        session_file="mc/s1.jsonl",
+        username="mcp-heavy",
+        started_at=now,
+        tool_calls=2,
+        mcp_calls=18,
+        subagent_dispatches=1,
+        tool_errors=15,
+    )
+    _seed_summary(
+        repo,
+        session_file="mc/s2.jsonl",
+        username="native-only",
+        started_at=now,
+        tool_calls=5,
+    )
+
+    row = repo.get_session_summary("mc/s1.jsonl")
+    assert row is not None
+    assert row["tool_calls"] == 2
+    assert row["mcp_calls"] == 18
+    assert row["subagent_dispatches"] == 1
+
+    kpis = repo.sessions_kpis({"since": now - timedelta(days=1)})
+    assert kpis["tool_calls_total"] == 2 + 18 + 1 + 5
+    assert kpis["tool_errors_total"] == 15
+
+    # Sorting by "tool_calls" orders by the TOTAL (21 vs 5), not the
+    # native-only count (2 vs 5).
+    rows = repo.sessions_list(
+        {"since": now - timedelta(days=1)},
+        sort_col="tool_calls",
+        direction="DESC",
+        limit=10,
+        offset=0,
+    )
+    files = [r["session_file"] for r in rows]
+    assert files.index("mc/s1.jsonl") < files.index("mc/s2.jsonl")
+
+    # The per-user admin/self listings carry the breakdown columns too.
+    admin_rows = repo.list_sessions_for_user_admin(user_id="none", username="mcp-heavy")
+    assert admin_rows and admin_rows[0]["mcp_calls"] == 18
+    assert admin_rows[0]["subagent_dispatches"] == 1
+    self_rows = repo.list_sessions_for_user_self("mcp-heavy")
+    assert self_rows and self_rows[0]["mcp_calls"] == 18
+    assert self_rows[0]["subagent_dispatches"] == 1
 
 
 def test_sessions_listing_carries_the_token_counters_on_both_backends(usage_repo):
@@ -1190,14 +1257,20 @@ def test_upsert_summary_uploaded_at_first_arrival_wins(usage_repo):
     repo.upsert_summary(dict(base), processor_version=1)
     rows = repo.sessions_list(
         {"since": datetime(2000, 1, 1, tzinfo=timezone.utc), "anchor": "uploaded"},
-        sort_col="uploaded_at", direction="desc", limit=10, offset=0,
+        sort_col="uploaded_at",
+        direction="desc",
+        limit=10,
+        offset=0,
     )
     first = next(r for r in rows if r["session_id"] == "arr")["uploaded_at"]
     assert first is not None
     repo.upsert_summary(dict(base), processor_version=2)
     rows = repo.sessions_list(
         {"since": datetime(2000, 1, 1, tzinfo=timezone.utc), "anchor": "uploaded"},
-        sort_col="uploaded_at", direction="desc", limit=10, offset=0,
+        sort_col="uploaded_at",
+        direction="desc",
+        limit=10,
+        offset=0,
     )
     second = next(r for r in rows if r["session_id"] == "arr")["uploaded_at"]
     assert second == first
@@ -1251,8 +1324,11 @@ def _seed_query_audit(repo, backend, conn, rows):
     if backend == "duckdb":
         for r in rows:
             conn.execute(
-                stmt.replace(":id", "?").replace(":ts", "?").replace(":action", "?")
-                    .replace(":resource", "?").replace(":result", "?"),
+                stmt.replace(":id", "?")
+                .replace(":ts", "?")
+                .replace(":action", "?")
+                .replace(":resource", "?")
+                .replace(":result", "?"),
                 [r["id"], r["ts"], r["action"], r["resource"], r["result"]],
             )
     else:

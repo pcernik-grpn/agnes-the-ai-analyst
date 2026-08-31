@@ -130,11 +130,36 @@
         '<div><i>Summary not extracted yet (UsageProcessor hasn\'t run).</i></div>';
       return;
     }
+    // "Tool calls" totals every agent-initiated call — native tool_use +
+    // MCP tools + subagent dispatches — because `tool_errors` counts
+    // `is_error` across all of them. Rendering the native count alone made
+    // an MCP-heavy session read "Tool calls: 2, Errors: 15".
+    const nativeCalls = s.tool_calls;
+    const mcpCalls = s.mcp_calls ?? 0;
+    const subagentCalls = s.subagent_dispatches ?? 0;
+    const totalCalls = nativeCalls == null ? null : nativeCalls + mcpCalls + subagentCalls;
+    const parts = [(nativeCalls || 0) + ' native'];
+    if (mcpCalls) parts.push(mcpCalls + ' MCP');
+    if (subagentCalls) parts.push(subagentCalls + ' subagent');
+    const callsHtml = totalCalls == null
+      ? '<div><b>Tool calls:</b> —</div>'
+      : '<div><b>Tool calls:</b> ' + escapeHtml(String(totalCalls))
+        + (parts.length > 1
+            ? ' <span title="native tools · MCP tools · subagent dispatches">('
+              + escapeHtml(parts.join(' · ')) + ')</span>'
+            : '')
+        + '</div>';
+    const errorsHtml = '<div><b>Errors:</b> ' + escapeHtml(String(s.tool_errors ?? '—'))
+      + (totalCalls != null && s.tool_errors != null
+          ? ' <span title="errored results across all call kinds">of '
+            + escapeHtml(String(totalCalls)) + ' calls</span>'
+          : '')
+      + '</div>';
     metaRoot.innerHTML =
       '<div><b>Started:</b> ' + escapeHtml(s.started_at || '—') + '</div>' +
       '<div><b>Active:</b> ' + escapeHtml(fmtDuration(s.active_seconds)) + '</div>' +
-      '<div><b>Tool calls:</b> ' + escapeHtml(String(s.tool_calls ?? '—')) + '</div>' +
-      '<div><b>Errors:</b> ' + escapeHtml(String(s.tool_errors ?? '—')) + '</div>' +
+      callsHtml +
+      errorsHtml +
       '<div><b>Model:</b> ' + escapeHtml(s.primary_model || '—') + '</div>' +
       tokensHtml;
   }
