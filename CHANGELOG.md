@@ -19,6 +19,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+
+- **The weekly `.test_durations` PR no longer runs CI twice on the same commit.** `ci.yml`'s push filter carried `ci/update-test-durations-*`, added so those auto-created PRs would get checks. It never did that job: on every such PR traced (#1350, #1812, #1906) the bot's own push produced a `pull_request` run and no `push` run at all — a push made with the default `GITHUB_TOKEN` does not create a workflow run, which is the very thing the workaround was reaching around. What it did instead was duplicate, because the `main` merge a human has to push to clear `strict` branch protection matched both that filter and `pull_request`: one commit, the 12-job matrix twice, visible as two `test` check-runs on the same head. Removed; the `pull_request` event covers these branches as it always did.
 - **The nightly `docker-e2e` lane is green again.** The wave-2 audit hardening gave `_check_token` a 32-character minimum on the apps-runner shared secret, replacing a plain `!=` compare. `tests/test_chat_docker_provider_daemon.py` had been setting a 17-character fixture token, which the old compare accepted and the floor rejects *before* comparing — so both docker-sandbox tests failed as a flat `401 bad_runner_token` that named neither the length rule nor the fixture. The production floor is correct and unchanged; the fixture token is now long enough to clear it. Only the nightly and `workflow_dispatch` runs see this lane (`docker-e2e` is skipped on pull requests), which is why it went red on `main` without blocking a single PR.
 
 ## [0.94.0] - 2026-08-31

@@ -6,7 +6,21 @@ on:
     # into before anything reaches `main`. It needs the same push-side gate
     # as `main`: the merge commit itself must be tested, not just each PR
     # in isolation.
-    branches: [main, integration, "feature/**", "ci/update-test-durations-*"]
+    # `ci/update-test-durations-*` used to be listed here, to "run CI on push
+    # to ci/update-test-durations-* branches so auto-created PRs get checks"
+    # (56d39524b). It never did that: on every such PR traced (#1350, #1812,
+    # #1906) the bot's own push produced a `pull_request` run and NO `push`
+    # run — a push made with the default `GITHUB_TOKEN` does not create a
+    # workflow run, which is the very reason the workaround was reached for.
+    # The `pull_request` event was always what covered the bot's commit.
+    #
+    # What the entry DID do is duplicate: a HUMAN push to such a branch (the
+    # `main` merge needed to clear `strict` branch protection) matched both
+    # this filter and `pull_request`, so one commit ran the 12-job matrix
+    # twice — visible as two `test` check-runs on the same head on all three
+    # of those PRs. Removing it halves CI for the weekly durations PR and
+    # loses no coverage.
+    branches: [main, integration, "feature/**"]
   pull_request:
     # NO branch filter, deliberately (#1636). A `branches:` list here means
     # GitHub fires no workflow at all for a PR whose base is not on it — and
