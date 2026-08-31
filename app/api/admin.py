@@ -1050,6 +1050,37 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "successful sync rewrites them)."
             ),
         },
+        "interval_hours": {
+            "kind": "int",
+            "default": _switch_default_path(("acl_sync", "interval_hours"), 4),
+            "hint": (
+                "Hours between SharePoint ACL sync runs (scope + zone root "
+                "permission re-reads). The source-side revocation window is at "
+                "most this long. Read by the scheduler sidecar at startup — "
+                "effective after a restart."
+            ),
+        },
+        "zones_enabled": {
+            "kind": "bool",
+            "default": _flag_default_path(("acl_sync", "zones_enabled"), False),
+            "hint": (
+                "Promote broken-inheritance SharePoint subtrees to their own "
+                "collections with their own mirrored ACLs (permission zones) "
+                "instead of excluding them from the crawl entirely. Requires "
+                "acl_mirroring."
+            ),
+        },
+        "sweep_interval_days": {
+            "kind": "int",
+            "default": _switch_default_path(("acl_sync", "sweep_interval_days"), 1),
+            "hint": (
+                "Days between full sharepoint-subtree-sweep passes "
+                "(broken-inheritance folder detection) for one connection's "
+                "mirrored scopes. The scheduler row itself already fires daily "
+                "(native cron); this is a per-connection self-guard against a "
+                "restart-refire, not the primary cadence."
+            ),
+        },
     },
     "extraction": {
         "enabled": {

@@ -376,6 +376,13 @@ def _map_children(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Shared item shape for :func:`list_root_children` and
     :func:`list_item_children` — the same ``{id, name, is_folder,
     child_count}`` mapping regardless of which Graph path produced it."""
+    return _map_child_rows(body.get("value", []))
+
+
+def _map_child_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Row-level twin of :func:`_map_children` for callers that already
+    collected pages themselves (e.g. via :func:`_graph_get_all_pages`) — same
+    ``{id, name, is_folder, child_count}`` shape."""
     return [
         {
             "id": item["id"],
@@ -383,18 +390,24 @@ def _map_children(body: Dict[str, Any]) -> List[Dict[str, Any]]:
             "is_folder": "folder" in item,
             "child_count": (item.get("folder") or {}).get("childCount"),
         }
-        for item in body.get("value", [])
+        for item in rows
     ]
 
 
 async def list_root_children(access_token: str, drive_id: str) -> List[Dict[str, Any]]:
-    """Root-level items of one drive."""
-    body = await _graph_get(
+    """Root-level items of one drive.
+
+    Pages the full ``@odata.nextLink`` chain — Graph's default `/children`
+    page size is ~200, and a drive root with more items than that must be
+    completely listed for callers (notably the ACL subtree sweep) not to
+    silently skip a broken-inheritance folder past the first page.
+    """
+    rows = await _graph_get_all_pages(
         access_token,
         f"/drives/{drive_id}/root/children",
-        params={"$select": "id,name,folder,file"},
+        params={"$select": "id,name,folder,file", "$top": "999"},
     )
-    return _map_children(body)
+    return _map_child_rows(rows)
 
 
 async def list_item_children(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
@@ -406,13 +419,17 @@ async def list_item_children(access_token: str, drive_id: str, item_id: str) -> 
     callers must structurally validate them first (see
     ``app.api.admin_sharepoint._validate_graph_id``); this function never
     builds a filesystem path from either.
+
+    Pages the full ``@odata.nextLink`` chain (see :func:`list_root_children`)
+    — completeness here matters to the ACL subtree sweep, which otherwise
+    only partially probes a large folder for broken permission inheritance.
     """
-    body = await _graph_get(
+    rows = await _graph_get_all_pages(
         access_token,
         f"/drives/{drive_id}/items/{item_id}/children",
-        params={"$select": "id,name,folder,file"},
+        params={"$select": "id,name,folder,file", "$top": "999"},
     )
-    return _map_children(body)
+    return _map_child_rows(rows)
 
 
 async def _list_children(access_token: str, drive_id: str, item_id: Optional[str]) -> List[Dict[str, Any]]:
