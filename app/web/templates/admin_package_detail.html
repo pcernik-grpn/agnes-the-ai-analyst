@@ -61,6 +61,11 @@
    package index. #}
 {% if preview_ctx %}
 <a class="apg-back" href="{{ preview_ctx.back_href }}"><span aria-hidden="true">&larr;</span> Back to preview: {{ preview_ctx.name }}</a>
+{% elif group_ctx %}
+{# Arrived from the group lens. Same reasoning as the person branch above:
+   "← Packages" would drop the admin on the full index having thrown away
+   the group they had narrowed to, which is the state they will want back. #}
+<a class="apg-back" href="{{ group_ctx.back_href }}"><span aria-hidden="true">&larr;</span> Back to {{ group_ctx.name }}</a>
 {% else %}
 <a class="apg-back" href="/admin/data-packages"><span aria-hidden="true">&larr;</span> Packages</a>
 {% endif %}
@@ -187,6 +192,13 @@
   }
   .apd-share-row:last-of-type { border-bottom: none; }
   .apd-share-row__txt { min-width: 0; }
+  /* The row the admin arrived from. A tint and a quiet label, not a border:
+     the row already carries a control, and an outline here competed with it. */
+  .apd-share-row.is-from { background: var(--ds-primary-light); }
+  .apd-g-from {
+    font-weight: 500; font-size: 11px; letter-spacing: .02em;
+    color: var(--ds-primary); margin-left: 6px;
+  }
   /* The group mark, not initials: "BM" beside "Board Materials" said the
      name twice and said nothing about what kind of name it was. Shape from
      the one shared set (js/kind_glyph.js). */
@@ -317,6 +329,19 @@
   </span>
   <span class="apg-strip__end">
     <a class="btn btn-secondary btn-sm" href="{{ preview_ctx.back_href }}">Re-check {{ preview_ctx.name }} &rarr;</a>
+  </span>
+</div>
+{% elif group_ctx %}
+{# The group lens's orientation strip. Names the group whose access the admin
+   was reading, so the Sharing block below reads as "and here is where that
+   group sits" rather than an undifferentiated list of everyone. #}
+<div class="apg-strip" id="apd-group-note">
+  <span>
+    Opened from <b>{{ group_ctx.name }}</b>'s access. Sharing below shows every
+    group this package reaches; {{ group_ctx.name }} is marked.
+  </span>
+  <span class="apg-strip__end">
+    <a class="btn btn-secondary btn-sm" href="{{ group_ctx.back_href }}">Back to {{ group_ctx.name }} &rarr;</a>
   </span>
 </div>
 {% endif %}
@@ -840,17 +865,28 @@
         "Shared with nobody — no analyst can see this package yet." +
         "</p>";
     } else {
-      host.innerHTML = SHARING.map((s) => {
+      // The group the admin arrived from leads the list and is marked, so
+      // the block answers "where does Finance sit here" first and "who else
+      // reaches this" second. Without it the page threw away the filter the
+      // admin had applied and showed an undifferentiated list.
+      const fromGroup = {{ (group_ctx.group_id | tojson) if group_ctx else "null" }};
+      const ordered = fromGroup
+        ? SHARING.slice().sort((a, b) =>
+            (b.group_id === fromGroup ? 1 : 0) - (a.group_id === fromGroup ? 1 : 0))
+        : SHARING;
+      host.innerHTML = ordered.map((s) => {
         const auto = s.requirement === "required";
+        const isFrom = fromGroup && s.group_id === fromGroup;
         const sub = s.is_everyone
           ? "the whole company — every account, automatically"
           : plural(s.member_count || 0, "member", "members");
         return `
-        <div class="apd-share-row" data-share-group="${esc(s.group_id)}">
+        <div class="apd-share-row${isFrom ? " is-from" : ""}" data-share-group="${esc(s.group_id)}">
           <div class="apd-ava ${s.is_everyone ? "is-everyone" : ""}"
                role="img" aria-label="Group">${AgnesKindGlyph.get("group")}</div>
           <div class="apd-share-row__txt">
-            <div class="apd-g-name">${esc(s.group_name)}</div>
+            <div class="apd-g-name">${esc(s.group_name)}${
+              isFrom ? ` <span class="apd-g-from">you came from here</span>` : ""}</div>
             <div class="apd-g-sub">${esc(sub)}</div>
           </div>
           <div class="apd-tier" role="group" aria-label="Access tier for ${esc(s.group_name)}">
@@ -900,6 +936,15 @@
         lines.push(['none',
           `<b>${optCount}</b> group${optCount === 1 ? " can" : "s can"} add it themselves.`]);
       }
+    } else if (DELIVERY.nothing_to_deliver) {
+      // Nothing in this package has ever synced, so there is nothing on the
+      // server for anyone to pull. Reporting "not yet delivered" here blamed
+      // the analyst for the server's state; the fix the admin needs is on
+      // the source, not on the person.
+      lines.push(['stale',
+        `Nothing to deliver yet — <b>no table in this package has ever synced</b>. Grants are in place; the data is not.`]);
+      lines.push(['none',
+        `<a href="/admin/sync">Check the sync →</a>`]);
     } else if (DELIVERY.withheld) {
       // A lifecycle status overrides the grant arithmetic. `draft` is hidden
       // from analysts and `coming-soon` is undeliverable (both enforced in
@@ -1312,8 +1357,24 @@
     if (e.key === "Escape" && drawerOpen()) closeDrawers();
   });
 
-  renderShareRows();
-  renderRowSelection();
+  // Deferred to DOMContentLoaded on purpose. This inline block lives in the
+  // page's content, and `_app_scripts.html` — which loads
+  // static/js/kind_glyph.js, the source of `window.AgnesKindGlyph` — is
+  // included at the END of the body by base_ds.html. Calling straight through
+  // therefore threw `ReferenceError: AgnesKindGlyph is not defined` on the
+  // first row, and because `renderDelivery()` is invoked from INSIDE
+  // `renderShareRows()`, one missing glyph silently took out the Sharing
+  // list, the "Shared with N groups" fact, the delivery read-out and row
+  // selection — while the sidebar (server-rendered) kept saying "Shared with
+  // 3 groups". The page contradicted itself on one screen.
+  //
+  // It only reproduced on a package that IS shared: the throw is inside
+  // `SHARING.map`, so an unshared package rendered fine and the empty state's
+  // "Shared with nobody" was mistaken for the truth.
+  document.addEventListener("DOMContentLoaded", () => {
+    renderShareRows();
+    renderRowSelection();
+  });
 })();
 </script>
 {% endblock %}

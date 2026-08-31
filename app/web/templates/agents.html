@@ -371,7 +371,7 @@
         '<div class="ag-empty">' +
           '<span class="ag-ava">' + AVA_SVG + '</span>' +
           '<h3>No agents yet</h3>' +
-          '<p>Build your first agent — pick what it knows from your stack, what it can do from your plugins, and where it runs.</p>' +
+          '<p>Build your first agent — pick what it knows from what you have, what it can do from your plugins, and where it runs.</p>' +
           '<button type="button" class="cc-btn cc-btn--primary" data-ag-new>+ Build an agent</button>' +
         '</div>';
       return;
@@ -617,13 +617,28 @@
     '</div>';
   }
 
-  /* An attached id with nothing in the pool to describe it — see the callers. */
+  /* An attached id with nothing in the pool to describe it — see the callers.
+
+     Deliberately NOT resolved to a name, even though the id→name projection
+     exists and every other surface now uses it. The pool IS what this caller
+     can currently see, so an id missing from it names something they cannot
+     reach — and looking it up would print the name of a resource that has been
+     un-shared from them, on their own page, as a side effect of an old
+     attachment. The id they attached themselves is the most this row can
+     honestly say.
+
+     What it CAN do is name the two things that put a row here, because they
+     take opposite actions: the resource was deleted (remove the row) or it was
+     un-shared from you (ask an admin, and removing it loses the attachment).
+     Without that the row was a dead end with one button on it. */
   function unknownRow(id, attr) {
     return '<div class="ag-row">' +
       '<div class="ag-row-body">' +
         '<div class="ag-row-name"><code>' + esc(id) + '</code>' +
           '<span class="ag-kind ag-kind--unknown">Unavailable</span></div>' +
-        '<div class="ag-row-desc">Attached, but not in what you can currently see.</div>' +
+        '<div class="ag-row-desc">Attached, but not in what you can currently see — it was either ' +
+          'deleted, or it is no longer shared with you. Your agent cannot use it either way. If you ' +
+          'still need it, ask an admin to share it back before you remove it here.</div>' +
       '</div>' +
       '<button type="button" class="ag-tglbtn ag-tglbtn--rm" ' + attr + '="' + esc(id) + '">Remove</button>' +
     '</div>';
@@ -702,7 +717,7 @@
       '<div class="ag-row-body">' +
         '<div class="ag-row-name">' + esc(p.name) +
           '<span class="ag-kind ag-kind--' + esc(type) + '">' + esc(TYPE_LABEL[type] || type) + '</span>' +
-          (mode === 'pick' && p.installed ? '<span class="ag-instack">In your stack</span>' : '') +
+          (mode === 'pick' && p.installed ? '<span class="ag-instack">Agents can use this</span>' : '') +
           (p.category ? '<span class="ag-row-meta">' + esc(p.category) + '</span>' : '') + '</div>' +
         '<div class="ag-row-desc">' + esc(p.description || '') + '</div>' +
       '</div>' +
@@ -766,7 +781,7 @@
     },
     capabilities: {
       title: 'Add a plugin or skill',
-      sub: 'Any plugin or skill available to you — not only what is in your stack.',
+      sub: 'Any plugin or skill available to you — not only the ones your agents already use.',
       search: 'Search plugins & skills…',
       foot: 'Browse the full set in the <a href="/catalog?kind=plugins">Catalog</a>.'
     }

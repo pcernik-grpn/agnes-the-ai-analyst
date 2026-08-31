@@ -19,6 +19,7 @@ import duckdb
 import jinja2
 
 from app.auth.access import is_user_admin, require_admin
+from app.web import vocabulary
 from app.web.studio import STUDIO_DOMAINS, get_domain as get_studio_domain
 from app.auth.dependencies import get_current_user, get_optional_user, _get_db
 from app.instance_config import (
@@ -357,6 +358,33 @@ def _data_apps_nav_enabled() -> bool:
         return False
 
 
+def _admin_setup_rail() -> object:
+    """The admin's setup chain for the rail, or None.
+
+    Registered as a Jinja global for the same reason as `data_apps_enabled`
+    above: `_app_rail.html` is shared by both context builders, and the chain
+    now has to reach EVERY page rather than only `/chat`. Threading it through
+    every route would have meant touching each one and forgetting the next.
+
+    The admin gate is the TEMPLATE's (`session.user.is_admin and dev_preview
+    != 'member'`), not this function's: the rail already holds that fact, and
+    the same expression is what decides the Admin badge two rows down, so
+    reading it in one place keeps a member-preview from showing the chain
+    while the badge beside it says member. This returns instance state — the
+    chain is identical for every admin — and None when it cannot be resolved,
+    which leaves the analyst row rendering exactly as before rather than a
+    chain claiming zero progress.
+    """
+    try:
+        from app.services.admin_dashboard import resolve_setup_rail
+
+        return resolve_setup_rail()
+    except Exception:
+        logger.warning("rail: admin setup chain unavailable", exc_info=True)
+        return None
+
+
+templates.env.globals["admin_setup_rail"] = _admin_setup_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
 
 
@@ -395,6 +423,7 @@ from app.web.admin_nav import (  # noqa: E402
     resolve_section_tabs,
 )
 
+vocabulary.install(templates.env)
 templates.env.globals["admin_nav_sections"] = ADMIN_NAV_SECTIONS
 templates.env.globals["admin_nav_docs"] = ADMIN_NAV_DOCS
 templates.env.globals["admin_nav_home"] = ADMIN_NAV_HOME
@@ -1746,8 +1775,8 @@ def _data_package_entry_dict(
     (subscribe = keep a local copy), not stack membership.
     """
     description = entry.description or (
-        f"Bundle of {table_count} table{'s' if table_count != 1 else ''}. "
-        f"Download locally so `agnes pull` syncs the data to your workspace."
+        f"{table_count} table{'s' if table_count != 1 else ''}. "
+        f"Keep a local copy so `agnes pull` syncs the data to your workspace."
     )
     out = {
         "id": entry.id,
@@ -2147,19 +2176,16 @@ _GRANTED_STACK_TOOLTIP = (
 #: what the server does and left the reader to infer what they get. Named
 #: once, because this column has already collected four spellings of one
 #: state and every extra literal is how a fifth arrives.
-_AGENT_ADD = "Add to my agents"
-_AGENT_REMOVE = "Remove"
+_AGENT_ADD = vocabulary.ADD
+_AGENT_REMOVE = vocabulary.REMOVE
 # The resting states drop the possessive the ACTION keeps ("Add to my
 # agents"): the action is a sentence about you, the state is a fact about the
 # row, and repeating "your agents" on every line both clipped the 142px cell
 # and said nothing the lede above the list has not already said.
-_AGENT_HAS = "Agents can use this"
-_AGENT_CAN_QUERY = "Agents can query this"
-_AGENT_ADD_TOOLTIP = "You can reach this, but your agents cannot use it until you add it."
-_AGENT_HAS_TOOLTIP = (
-    "Your agents can use this — click to remove it. An agent with a narrowed scope still only "
-    "sees what that scope allows."
-)
+_AGENT_HAS = vocabulary.HAS
+_AGENT_CAN_QUERY = vocabulary.CAN_QUERY
+_AGENT_ADD_TOOLTIP = vocabulary.ADD_TOOLTIP
+_AGENT_HAS_TOOLTIP = vocabulary.HAS_TOOLTIP
 
 
 def _library_row_base(
@@ -2853,6 +2879,40 @@ async def library_page(
             logger.warning("/library: could not resolve %s grants: %s", rt, e)
             return set()
 
+    # Why the caller has a granted row, cached per resource type. The row
+    # already said WHAT it is and that an admin put it there; the one thing a
+    # member could not learn anywhere in the product was through WHICH of
+    # their groups — which is also the only part they can act on, because it
+    # is what they ask their admin to change.
+    _via_cache: dict[str, dict[str, list[str]]] = {}
+
+    def _granted_via(rt: str) -> dict[str, list[str]]:
+        if rt not in _via_cache:
+            try:
+                _via_cache[rt] = resolver.granting_groups(uid, ResourceType(rt))
+            except Exception as e:
+                logger.warning("/library: could not resolve %s grant groups: %s", rt, e)
+                _via_cache[rt] = {}
+        return _via_cache[rt]
+
+    def _because_of(type_key: str, item_id: str) -> str:
+        """The trailing clause naming the caller's granting groups.
+
+        Appended to the membership tooltip rather than replacing it, because
+        the existing sentence answers "can I remove this" and this answers a
+        different question. Capped at three names — past that the list stops
+        being a fact a person holds in their head and the count is the more
+        useful shape.
+        """
+        names = _granted_via(type_key).get(item_id) or []
+        if not names:
+            return ""
+        if len(names) == 1:
+            return f" You have it because you are in {names[0]}."
+        if len(names) <= 3:
+            return " You have it because you are in " + ", ".join(names[:-1]) + f" and {names[-1]}."
+        return f" You have it through {len(names)} of your groups, including {names[0]} and {names[1]}."
+
     def _add_shared_row(
         *,
         item_id,
@@ -2949,10 +3009,11 @@ async def library_page(
             # and in the Access facet.
             items[-1]["stack_pill"] = _AGENT_CAN_QUERY
             items[-1]["stack_locked"] = True
+            _why = _because_of(type_key, item_id)
             if requirement == "required":
-                items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
+                items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP + _why
             else:
-                items[-1]["stack_title"] = _GRANTED_STACK_TOOLTIP
+                items[-1]["stack_title"] = _GRANTED_STACK_TOOLTIP + _why
         else:
             # Classic non-member: a real Add control, not a dead pill (Devin
             # Review on #1199, round 4). The generic subscribe endpoint takes
@@ -3176,9 +3237,6 @@ async def library_page(
                 # (`curated_install` / `curated_uninstall`). The Library's toggle
                 # is kind-agnostic — it POSTs/DELETEs whatever the row names.
                 row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
-                # Same verb as a store entity, and for the same reason.
-                row["stack_action"] = "Install"
-                row["stack_undo"] = "Uninstall"
                 # Droppable unless an admin pinned it globally (`is_system`) or
                 # required-tier-granted it to one of the caller's groups. Those
                 # are precisely the two cases `curated_uninstall` answers 409
@@ -4380,6 +4438,18 @@ async def catalog_package_detail(
     if not pkg:
         raise HTTPException(status_code=404, detail="data_package_not_found")
 
+    # A draft is hidden from every member-facing list (StackResolver's
+    # HIDDEN_STATUSES, applied in _fetch_entries), so its detail page has to be
+    # hidden too — otherwise the page an admin has not published yet is one
+    # guessed slug away from any member with a grant, and it reads as shipped.
+    # 404, not 403: browse behaves as though it does not exist, and a 403 would
+    # confirm the name of an unpublished package. Admins author drafts, so
+    # theirs still opens.
+    from app.services.stack_resolver import HIDDEN_STATUSES
+
+    if (pkg.get("status") or "prod") in HIDDEN_STATUSES and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=404, detail="data_package_not_found")
+
     # Admin bypass via is_user_admin; otherwise require a grant (any tier).
     # The detail token is DISTINCT (same pattern as admin_elevation_paused)
     # so error.html can answer with language and a request-access action
@@ -4390,7 +4460,7 @@ async def catalog_package_detail(
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.DATA_PACKAGE.value, pkg["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail=f"package_not_shared:{pkg['name']}")
+        raise HTTPException(status_code=403, detail=f"not_shared:data package:{pkg['name']}")
 
     # Telemetry: emit data_package.view (Section 9.2). source=browse|my-stack
     # passed as ?source=…; default 'direct' for typed/bookmarked navigation.
@@ -4681,7 +4751,10 @@ async def catalog_table_detail(
     except Exception:
         logger.warning("could not enumerate parent packages for %s", table_id, exc_info=True)
     if not (is_admin or has_grant):
-        raise HTTPException(status_code=403, detail="access_denied")
+        # Same door the package 403 opens, same reason: the route 404s a table
+        # that does not exist, so a 403 already confirms existence and naming
+        # it leaks nothing while making the request-access copy worth sending.
+        raise HTTPException(status_code=403, detail=f"not_shared:table:{table.get('name') or table_id}")
 
     # Resolve any pairs_well_with ids to (id, name) pairs the template
     # can render as links. Unknown ids (deleted tables) silently dropped.
@@ -5102,7 +5175,7 @@ async def memory_domain_detail(
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.MEMORY_DOMAIN.value, domain["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail="access_denied")
+        raise HTTPException(status_code=403, detail=f"not_shared:memory domain:{domain['name']}")
 
     source_hint = request.query_params.get("source", "direct")
     try:
@@ -5456,7 +5529,7 @@ async def data_app_detail_page(
     if not row or row.get("state") == "linked_hidden":
         raise HTTPException(status_code=404, detail="data_app_not_found")
     if not _can_view(user, row):
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise HTTPException(status_code=403, detail=f"not_shared:data app:{row.get('name') or slug}")
 
     is_admin = is_user_admin(user["id"])
     is_owner = user["id"] == row["owner_user_id"]
@@ -5649,6 +5722,40 @@ def _simulate_preview_ctx(request: Request) -> dict | None:
         "name": person.get("name") or person.get("email") or uid,
         "groups": [g for g in groups if g],
         "back_href": f"/admin/access?lens=simulate&user={uid}",
+    }
+
+
+def _access_group_ctx(request: Request) -> dict | None:
+    """Which group the admin was reading, when they arrived from Access.
+
+    The sibling of :func:`_simulate_preview_ctx` for the *group* lens. That
+    one closes the loop for a person — "← Back to preview: Jane" plus a
+    "Re-check Jane →" return link — and the group lens had no equivalent, so
+    a package opened while filtered to one group fell through to the
+    hard-coded "← Packages" back link and rendered its Sharing block for
+    every group the package reaches. The admin had narrowed to one group and
+    the page showed them three.
+
+    Same contract as its sibling: resolved server-side to a name so the
+    banner can say "Finance" rather than echoing a uuid, and an unknown or
+    garbage id resolves to None so the page renders normally — the banner is
+    chrome, never a 500.
+    """
+    if request.query_params.get("from") != "access":
+        return None
+    gid = request.query_params.get("group") or ""
+    if not gid:
+        return None
+    try:
+        group = user_groups_repo().get(gid)
+    except Exception:  # noqa: BLE001
+        group = None
+    if not group:
+        return None
+    return {
+        "group_id": gid,
+        "name": group.get("name") or gid,
+        "back_href": f"/admin/access?group={gid}",
     }
 
 
@@ -7249,8 +7356,20 @@ async def admin_package_detail(
         delivery["withheld"] = None
     delivery["withheld_status"] = _pkg_status if delivery["withheld"] else None
 
+    # A second veto, and the one the audit caught: the panel reported
+    # "N has not pulled since — shared, not yet delivered" while the manifest
+    # was empty, because the manifest is built from `sync_state`
+    # (app/api/sync.py) and no table in the package had ever synced. There
+    # was nothing to pull, so blaming the analyst for not pulling is exactly
+    # backwards. The real blocker rendered as a grey "never synced" fact in
+    # the sidebar while the loud strips were reserved for other states.
+    delivery["nothing_to_deliver"] = bool(member_ids) and newest_sync is None
+
     # ── Arrival context (?from=simulate&user=) ───────────────────────────
     preview_ctx = _simulate_preview_ctx(request)
+    # The group lens's equivalent. Both are chrome: at most one is set, and
+    # the template prefers the person banner when somehow both are.
+    group_ctx = _access_group_ctx(request)
 
     ctx = _build_context(
         request,
@@ -7264,6 +7383,7 @@ async def admin_package_detail(
         all_groups=all_groups,
         delivery=delivery,
         preview_ctx=preview_ctx,
+        group_ctx=group_ctx,
         newest_sync=newest_sync.isoformat() if newest_sync else None,
         newest_sync_age_minutes=(int((now - newest_sync).total_seconds() // 60) if newest_sync else None),
     )
@@ -7581,7 +7701,15 @@ async def admin_datasource_credentials_page(
     here — the JS loads presence/source status from
     ``GET /api/admin/datasource-secrets`` and writes via PUT/DELETE.
     """
-    from app.secrets_vault import vault_key_configured
+    # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
+    # guards on the former (app/api/admin_source_connections.py), and the
+    # latter is the narrower "is a real key set" question that answers False
+    # in LOCAL_DEV_MODE where the write in fact succeeds. Using the narrow one
+    # here rendered a blocking "Vault key not configured" banner and a
+    # disabled "+ Add source" on an instance whose API would have accepted the
+    # credential — the UI refusing what the server allows. `secrets_vault`'s
+    # own docstring flags the distinction.
+    from app.secrets_vault import can_store_secrets as vault_key_configured
 
     ctx = _build_context(request, user=user)
     ctx["vault_key_configured"] = vault_key_configured()
@@ -7607,7 +7735,15 @@ async def admin_data_sources_page(
     ``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without
     it).
     """
-    from app.secrets_vault import vault_key_configured
+    # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
+    # guards on the former (app/api/admin_source_connections.py), and the
+    # latter is the narrower "is a real key set" question that answers False
+    # in LOCAL_DEV_MODE where the write in fact succeeds. Using the narrow one
+    # here rendered a blocking "Vault key not configured" banner and a
+    # disabled "+ Add source" on an instance whose API would have accepted the
+    # credential — the UI refusing what the server allows. `secrets_vault`'s
+    # own docstring flags the distinction.
+    from app.secrets_vault import can_store_secrets as vault_key_configured
 
     ctx = _build_context(request, user=user)
     ctx["vault_key_configured"] = vault_key_configured()

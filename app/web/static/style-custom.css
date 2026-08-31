@@ -5047,41 +5047,14 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
 .page-header--compact .page-header__title { font-size: 18px; }
 
 /* Tab strip — the secondary row pattern used by /marketplace?tab=… and
-   similar tabbed pages. Sits below the .page-header (or inside it on
-   hero-variant pages). */
-.tab-strip {
-    display: flex;
-    gap: var(--space-1);
-    align-items: center;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: var(--space-5);
-}
+   similar tabbed pages.
 
-.tab-strip__item {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-1);
-    padding: var(--space-2) var(--space-3);
-    font-family: var(--font-primary);
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--text-secondary);
-    text-decoration: none;
-    background: transparent;
-    border: 0;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-    cursor: pointer;
-    transition: color var(--transition-fast), border-color var(--transition-fast);
-}
-
-.tab-strip__item:hover { color: var(--text-primary); }
-
-.tab-strip__item.is-active,
-.tab-strip__item[aria-selected="true"] {
-    color: var(--primary);
-    border-bottom-color: var(--primary);
-}
+   Its rules moved to css/components.css, where the flow variant (Data's
+   pipeline) and the Library's strip could join them: four copies of one look
+   had drifted onto two token sets, and this was the copy on the legacy ones
+   (`--primary`, `--text-secondary`, `--border`), which is why People and
+   Access did not match Data. Nothing here now — the selector is defined once,
+   on --ds- tokens, in the global component sheet. */
 
 /* =====================================================
    Data display + feedback primitives (Task 7)

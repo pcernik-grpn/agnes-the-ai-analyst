@@ -326,8 +326,12 @@ def _empty_search_hint(searched: int, corpus_id: Optional[str]) -> str:
         )
     scope = "the selected collection" if corpus_id else f"{searched} accessible collection(s)"
     return (
-        f"Searched {scope} and found no match. You DO have access — this is a wording "
-        "miss, not an access problem. Note: matching is whole word (`test` will not find "
+        f"Searched {scope} and found no match. Everything shared with this account "
+        "was searched, so an empty result is NOT evidence that access is missing — "
+        "far more often it is the wording. (This cannot speak for anything that "
+        "has not been shared with you: a term naming that will not match here "
+        "either.) "
+        "Note: matching is whole word (`test` will not find "
         "`Testovaci`) and there is no wildcard (`*` and an empty query return nothing). "
         "File names are searched too, as a fallback when no document body matches — so "
         "nothing here matched either. Try a distinctive word you expect inside the "

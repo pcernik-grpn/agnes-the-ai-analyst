@@ -364,3 +364,57 @@ class TestLifecycleStatusGating:
         finally:
             sp.PRINCIPAL_TYPES = original
         assert "pkg_sales" not in {e.id for e in entries}
+
+
+class TestSubscribeHonoursStatus:
+    """The gate above hides a status from every READ. Subscribing is the write
+    that was left behind, and it was the one a member could actually reach.
+
+    A subscription is a request for a local copy, and ``stack()`` — which
+    builds the pull manifest — refuses to carry a hidden or undeliverable
+    status. So the write returned ``{"subscribed": true}`` for a download that
+    could never arrive: no error, no row in the manifest, and nothing on any
+    screen to explain the silence. Refusing in ``add_to_stack`` rather than in
+    the endpoint is what makes it true of all four surfaces at once (Library,
+    chat, CLI, MCP), since every one of them subscribes through this method.
+    """
+
+    def test_subscribe_to_a_draft_is_a_404(self, conn):
+        """404, not 403 — every read behaves as though a draft is not there,
+        and the write has no business being the one surface that admits it
+        exists."""
+        import pytest
+        from fastapi import HTTPException
+
+        conn.execute("UPDATE data_packages SET status = 'draft' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "available")
+        with pytest.raises(HTTPException) as exc:
+            StackResolver(conn).add_to_stack("u1", ResourceType.DATA_PACKAGE, "pkg_sales")
+        assert exc.value.status_code == 404
+
+    def test_subscribe_to_coming_soon_is_a_409(self, conn):
+        """'Visible but not usable yet' is a different answer from 'not there':
+        the caller found a real thing and asked too early, so the refusal says
+        so and the id stays namable."""
+        import pytest
+        from fastapi import HTTPException
+
+        conn.execute("UPDATE data_packages SET status = 'coming-soon' WHERE id = 'pkg_sales'")
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "available")
+        with pytest.raises(HTTPException) as exc:
+            StackResolver(conn).add_to_stack("u1", ResourceType.DATA_PACKAGE, "pkg_sales")
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "not_available_yet"
+
+    def test_prod_still_subscribes(self, conn):
+        """The gate is narrow — the ordinary path must be untouched."""
+        _grant(conn, "g_sales", "data_package", "pkg_sales", "available")
+        StackResolver(conn).add_to_stack("u1", ResourceType.DATA_PACKAGE, "pkg_sales")
+        entries = StackResolver(conn).stack("u1", ResourceType.DATA_PACKAGE)
+        assert next(e for e in entries if e.id == "pkg_sales").materialized is True
+
+    def test_a_type_without_a_status_is_not_blocked(self, conn):
+        """Only packages and domains carry a status. Every other type must
+        subscribe as before rather than trip a lookup that does not apply."""
+        _grant(conn, "g_sales", "collection", "col_1", "available")
+        StackResolver(conn).add_to_stack("u1", ResourceType.COLLECTION, "col_1")

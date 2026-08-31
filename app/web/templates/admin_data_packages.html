@@ -60,27 +60,63 @@
      same row, count and type scale People, Access and Sources carry. */
   .adp-section + .adp-section { margin-top: 28px; }
 
-  /* The grid is `.fbar-grid`'s, with one difference: the Library's is a fixed
-     three columns because it lives in a centred reading column, and this page
-     runs full-bleed (`container--full`) where three 700px cards would each be
-     a banner. Auto-fill against the card's own comfortable measure instead, so
-     the count follows the monitor. */
-  .adp-grid { grid-template-columns: repeat(auto-fill, minmax(292px, 1fr)); }
+  /* ── Rows ─────────────────────────────────────────────────────────────
+     `.data-table` (css/admin.css) carries the frame, the header rule and the
+     zebra; everything here is the two cells it has no opinion about — the
+     name cell and the status chips. Nothing below restyles the shared table
+     itself, per the admin-page shell's contract. */
+  .adp-row__name {
+    display: flex; align-items: flex-start; gap: 10px;
+    color: inherit; text-decoration: none; min-width: 0;
+  }
+  .adp-row__name:hover b { text-decoration: underline; }
+  .adp-row__glyph {
+    flex: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 7px; margin-top: 1px;
+  }
+  .adp-row__glyph svg { width: 15px; height: 15px; }
+  /* The same two tints the cards used, so the kinds stay distinguishable at a
+     glance now that they are two tables rather than two grids. */
+  .adp-row__glyph--data { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); }
+  .adp-row__glyph--memory { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
+  .adp-row__text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  /* One line, ellipsised. A description is context for the name above it, not
+     the row's subject — letting it wrap would make row heights follow how
+     talkative each package's author was, and the column of names stops being
+     scannable, which is the whole reason this is a table. */
+  .adp-row__desc {
+    font-size: 12px; color: var(--ds-text-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .adp-num { font-variant-numeric: tabular-nums; }
+  .adp-none { color: var(--ds-text-muted); }
+  .adp-cat { font-size: 12px; color: var(--ds-text-muted); }
+  .adp-cell--act { text-align: right; }
 
-  /* ── The footer's two slots ──────────────────────────────────────────
-     LEFT — who can use this, as a fact, in the shared read-only access
-     vocabulary (`.fbar-card__access--fixed`: bare text, no box, no chevron,
-     which is exactly what "a state you cannot change from here" looks like on
-     the Library card). Only the unshared state takes a colour: it is the one
-     that strands analysts, and a package nobody can see is worth spotting
-     from across a grid of forty. */
+  /* Toolbars: one per list, each directly above the table it filters. The
+     bar itself is `.fbar` (filter_toolbar.css) — nothing here restyles it,
+     only the two page-local slots it leaves open. */
+  .adp-section .fbar { margin: 0 0 10px; }
+  .adp-section .fbar-chips { margin: 0 0 10px; }
+  .fbar__end { margin-left: auto; }
+  .fbar__count { font-size: 12.5px; color: var(--ds-text-muted); white-space: nowrap; }
+  .adp-noresults { padding: 22px 14px; text-align: center; color: var(--ds-text-muted); font-size: 13px; }
+
+  /* ── The two status cells ────────────────────────────────────────────
+     WHO CAN USE THIS — a fact, in the shared read-only access vocabulary
+     (`.fbar-card__access--fixed`: bare text, no box, no chevron, which is
+     exactly what "a state you cannot change from here" looks like on the
+     Library row). Only the unshared state takes a colour: it is the one that
+     strands analysts, and a package nobody can see is worth spotting down a
+     column of forty. */
   .adp-share--none { color: var(--ds-accent-warn-ink); font-weight: 600; }
   .adp-share--none svg { color: currentColor; }
 
-  /* RIGHT — one chip, for the one thing worth acting on. `Empty` outranks the
-     tier: a package with no tables delivers nothing however it is shared, so
-     naming its tier first would answer the wrong question. Same 26px box in
-     both states, so the footer is one height across the grid. */
+  /* ACCESS — one chip, for the one thing worth acting on. An empty package
+     shows no tier at all rather than a misleading one: it delivers nothing
+     however it is shared, and the Tables column beside it already says so in
+     the place a reader scanning for emptiness is looking. Same 26px box in
+     every state, so the rows keep one height. */
   .adp-chip {
     flex: none; display: inline-flex; align-items: center; gap: 5px;
     box-sizing: border-box; height: 26px; max-width: 60%; padding: 0 10px;
@@ -182,57 +218,171 @@
     </span>
   </div>
   {% if package_cards %}
-  <div class="fbar-grid adp-grid">
-    {% for entry in package_cards %}
-    {% set shares = pkg_sharing.get(entry.id, []) %}
-    {% set n_tables = entry.table_count | default(0) %}
-    {# The meta line, in the order an admin reads a package: how much is in
-       it, what it is filed under, whose it is. One line, ellipsised. #}
-    {% set meta_parts = [n_tables ~ ' table' ~ ('' if n_tables == 1 else 's')] %}
-    {% if entry.category %}{% set _ = meta_parts.append(entry.category) %}{% endif %}
-    {% if entry.owner_name %}{% set _ = meta_parts.append(entry.owner_name) %}{% endif %}
-    {% call fbar_card({
-         'kind': 'data',
-         'title': entry.name,
-         'href': entry.drilldown_url,
-         'description': entry.description,
-         'meta': meta_parts | join(' · '),
-         'tags': entry.tags,
-         'attrs': 'data-pkg-id="' ~ entry.id ~ '"',
-       }) %}
-      {{ share_readout(shares) }}
-      {% if n_tables == 0 %}
-      {# Outranks the tier deliberately: an empty package delivers nothing
-         however it is shared. The link is the fix, one click away. #}
-      <a class="adp-chip adp-chip--warn" href="/admin/tables?assign_to={{ entry.id }}"
-         title="This package carries no tables — nothing is delivered until it does">
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4.5 21 19.5H3L12 4.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 10v3.5M12 16.4v.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-        <span>No tables</span>
-      </a>
-      {% elif shares | selectattr('requirement', 'equalto', 'required') | list %}
-      <span class="adp-chip adp-chip--auto" title="required — lands in members' workspaces on their next sync">
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 19h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
-        <span>Automatic</span>
-      </span>
-      {% elif shares %}
-      <span class="adp-chip" title="available — members add it themselves from their Library">
-        <span>Optional</span>
-      </span>
-      {% endif %}
-      {# Edit in place — the same shared drawer the detail page opens, so a
-         rename does not cost a navigation. The foot's right slot is the
-         control slot by contract (see _fbar_card.html). #}
-      <button type="button" class="btn btn-secondary btn-sm" data-adp-edit-package="{{ entry.id }}"
-              title="Edit name, description, category and tables in place">Edit</button>
-    {% endcall %}
-    {% endfor %}
+  {# Facet vocabularies, built from the rows themselves so the menu can never
+     offer a filter that matches nothing — the same rule the package builder's
+     picker follows. #}
+  {% set _pkg_cats = package_cards | map(attribute='category') | select | unique | sort | list %}
+  <div class="fbar" role="group" aria-label="Search and filter data packages">
+    <div class="fbar__search" role="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+      <input type="search" id="adp-pkg-search" placeholder="Search packages…" autocomplete="off"
+             aria-label="Search data packages">
+    </div>
+    {# Search answers "where is X". These answer the two auditing questions
+       this page exists for — which packages reach nobody, and which carry
+       nothing — neither of which was answerable except by reading every row. #}
+    <div class="fbar-filter">
+      <button type="button" class="fbar-filter__btn" id="adp-pkg-filter-btn" aria-haspopup="true" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
+        Filter
+        <span class="fbar-filter__n" hidden>0</span>
+      </button>
+      <div class="fbar-menu fbar-menu--cats" id="adp-pkg-filter-menu" role="menu" aria-label="Filter data packages" hidden>
+        {% for cat_key, cat_label, options in [
+             ('shared', 'Sharing', ['Shared', 'Not shared']),
+             ('contents', 'Contents', ['Has tables', 'Empty']),
+             ('tier', 'Access for any group', ['Automatic', 'Optional']),
+             ('cat', 'Category', _pkg_cats),
+           ] %}
+        {% if options %}
+        <div class="fbar-cat" data-cat="{{ cat_key }}">
+          <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
+            <span class="fbar-cat__label">{{ cat_label }}</span>
+            <span class="fbar-cat__end">
+              <span class="fbar-cat__n" data-cat-count="{{ cat_key }}" hidden>0</span>
+              <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+          </button>
+          <div class="fbar-cat__pop" hidden>
+            {% for value in options %}
+            <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ cat_key }}" value="{{ value }}"><span class="fbar-menu__opt-text">{{ value }}</span></label>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+        {% endfor %}
+        <div class="fbar-menu__foot">
+          <button type="button" data-fbar-clear>Clear</button>
+          <button type="button" data-fbar-done>Done</button>
+        </div>
+      </div>
+    </div>
+    <span class="fbar__end"><span class="fbar__count" id="adp-pkg-count"></span></span>
+  </div>
+  <div class="fbar-chips" id="adp-pkg-chips" hidden></div>
+
+  {# A TABLE, not a card grid. This is the admin's index of every package on
+     the instance, and the questions it answers are comparative — which ones
+     carry nothing, which are shared with nobody, which are Automatic for
+     someone. A card puts each package in its own box, so answering any of
+     those means reading N boxes and holding the answers in your head; a
+     column answers it down the page in one pass. The same reasoning already
+     put People, Tables and Sources on `.data-table`, which is what this uses
+     — the shared admin table, not a private copy of one. #}
+  <div class="data-table-wrap">
+    {# Explicit widths, as on the People table: without them the browser sizes
+       from content and one long description takes the outcome columns down to
+       a word each. Percentages only — a px width mixed into `table-layout:
+       fixed` is ADDED to the percentages rather than taken out of them. #}
+    <table class="data-table adp-table">
+      <colgroup>
+        <col style="width: 42%">
+        <col style="width: 10%">
+        <col style="width: 15%">
+        <col style="width: 24%">
+        <col style="width: 9%">
+      </colgroup>
+      <thead>
+        {# There is no Access column. The tier is an attribute OF the sharing,
+           not a second axis beside it — a package can be Automatic for one
+           group and Optional for another, which a single cell cannot say — and
+           as its own column it was blank on every row that is unshared or
+           empty, which on a young instance is nearly all of them. It reads
+           inside "Shared with", where it belongs; it survives as a FILTER,
+           where a column that is mostly blank is exactly what you want. #}
+        <tr>
+          <th>Package</th>
+          <th title="Tables assigned to this package — a package with none delivers nothing">Tables</th>
+          <th>Category</th>
+          <th title="Groups this package is granted to, and what it does in their workspace">Shared with</th>
+          <th class="adp-cell--act">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="adp-pkg-rows">
+        {% for entry in package_cards %}
+        {% set shares = pkg_sharing.get(entry.id, []) %}
+        {% set n_tables = entry.table_count | default(0) %}
+        <tr class="adp-row" data-pkg-id="{{ entry.id }}"
+            data-search="{{ (entry.name ~ ' ' ~ (entry.description or '') ~ ' ' ~ (entry.category or '')) | lower }}"
+            data-name="{{ entry.name }}"
+            data-shared="{{ 'Shared' if shares else 'Not shared' }}"
+            data-contents="{{ 'Has tables' if n_tables else 'Empty' }}"
+            {# A SET, pipe-joined, because a package can be Automatic for one
+               group and Optional for another — the fact that took the tier out
+               of the table above. Read with `multi: true`, so selecting
+               Automatic keeps every package that is automatic for SOMEBODY,
+               which is the only true reading of a per-grant value at package
+               scope. Empty when unshared: a third token would put a filter in
+               the menu meaning "unshared", which Sharing already says better. #}
+            data-tier="{{ shares | map(attribute='requirement') | unique | sort
+                          | map('replace', 'required', words.tier_automatic)
+                          | map('replace', 'available', words.tier_optional)
+                          | join('|') }}"
+            data-cat="{{ entry.category or '' }}">
+          <td>
+            <a class="adp-row__name" href="{{ entry.drilldown_url }}">
+              <span class="adp-row__glyph adp-row__glyph--data" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none"><ellipse cx="12" cy="6" rx="7.5" ry="3" stroke="currentColor" stroke-width="1.7"/><path d="M4.5 6v12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3V6" stroke="currentColor" stroke-width="1.7"/><path d="M4.5 12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3" stroke="currentColor" stroke-width="1.7"/></svg>
+              </span>
+              <span class="adp-row__text">
+                <b>{{ entry.name }}</b>
+                {% if entry.description %}<span class="adp-row__desc">{{ entry.description }}</span>{% endif %}
+              </span>
+            </a>
+          </td>
+          <td>
+            {% if n_tables == 0 %}
+            {# Outranks the tier deliberately: an empty package delivers
+               nothing however it is shared, and the link is the fix. #}
+            <a class="adp-chip adp-chip--warn" href="/admin/tables?assign_to={{ entry.id }}"
+               title="This package carries no tables — nothing is delivered until it does">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4.5 21 19.5H3L12 4.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 10v3.5M12 16.4v.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+              <span>None</span>
+            </a>
+            {% else %}
+            <span class="adp-num">{{ n_tables }}</span>
+            {% endif %}
+          </td>
+          <td>{% if entry.category %}<span class="adp-cat">{{ entry.category }}</span>{% else %}<span class="adp-none">&mdash;</span>{% endif %}</td>
+          {# Groups only. The TIER is per-grant — a package is routinely
+             Automatic for one group and Optional for another — so any single
+             value here is false for some of the groups named beside it. It
+             was a column, then a chip in this cell, and both were the same
+             collapse: `any(required)` printed as though it described the
+             whole row. The per-group truth is in the Edit drawer and on the
+             package's own page, which is where it can be shown per group and
+             changed. It survives as a FILTER, where the question is about the
+             package ("is this automatic for anybody?") rather than about a
+             row of groups. #}
+          <td>{{ share_readout(shares) }}</td>
+          <td class="adp-cell--act">
+            {# Edit in place — the same shared drawer the detail page opens, so
+               a rename does not cost a navigation. #}
+            <button type="button" class="btn btn-secondary btn-sm" data-adp-edit-package="{{ entry.id }}"
+                    title="Edit name, description, category and tables in place">Edit</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="adp-noresults" id="adp-pkg-none" hidden>No packages match these filters.</div>
   </div>
   {% else %}
   <div class="empty-state">
     <h3>No Data Packages yet</h3>
     <p>
-      A package is the unit an analyst receives — bundle related tables, share the
-      bundle with a group, and it lands in their workspace.
+      A package is the unit an analyst receives — group related tables, share the
+      package with a team, and it lands in their workspace.
     </p>
     <p>
       <button type="button" class="btn btn-primary btn-sm" data-adp-new-package>
@@ -249,37 +399,108 @@
     <span class="apg-sechead__count">{{ domain_cards|length }} domain{{ '' if domain_cards|length == 1 else 's' }}</span>
   </div>
   {% if domain_cards %}
-  {# The same card, one kind along. The two grids sit on one page and answer
-     the same question about two resource types; drawing them differently
-     would say they were different KINDS of answer. #}
-  <div class="fbar-grid adp-grid">
-    {% for entry in domain_cards %}
-    {% set shares = dom_sharing.get(entry.id, []) %}
-    {% set n_items = entry.items_count | default(0) %}
-    {% call fbar_card({
-         'kind': 'memory',
-         'title': entry.name,
-         'href': entry.drilldown_url,
-         'description': entry.description,
-         'meta': entry.meta,
-         'attrs': 'data-domain-id="' ~ entry.id ~ '"',
-       }) %}
-      {{ share_readout(shares) }}
-      {% if n_items == 0 %}
-      <span class="adp-chip adp-chip--warn" title="This domain holds no memory items yet">
-        <span>Empty</span>
-      </span>
-      {% elif shares | selectattr('requirement', 'equalto', 'required') | list %}
-      <span class="adp-chip adp-chip--auto" title="required — lands in members' workspaces on their next sync">
-        <span>Automatic</span>
-      </span>
-      {% elif shares %}
-      <span class="adp-chip" title="available — members add it themselves from their Library">
-        <span>Optional</span>
-      </span>
-      {% endif %}
-    {% endcall %}
-    {% endfor %}
+  <div class="fbar" role="group" aria-label="Search and filter memory domains">
+    <div class="fbar__search" role="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+      <input type="search" id="adp-dom-search" placeholder="Search memory domains…" autocomplete="off"
+             aria-label="Search memory domains">
+    </div>
+    <div class="fbar-filter">
+      <button type="button" class="fbar-filter__btn" id="adp-dom-filter-btn" aria-haspopup="true" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
+        Filter
+        <span class="fbar-filter__n" hidden>0</span>
+      </button>
+      <div class="fbar-menu fbar-menu--cats" id="adp-dom-filter-menu" role="menu" aria-label="Filter memory domains" hidden>
+        {% for cat_key, cat_label, options in [
+             ('shared', 'Sharing', ['Shared', 'Not shared']),
+             ('contents', 'Contents', ['Has items', 'Empty']),
+             ('tier', 'Access for any group', ['Automatic', 'Optional']),
+           ] %}
+        <div class="fbar-cat" data-cat="{{ cat_key }}">
+          <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
+            <span class="fbar-cat__label">{{ cat_label }}</span>
+            <span class="fbar-cat__end">
+              <span class="fbar-cat__n" data-cat-count="{{ cat_key }}" hidden>0</span>
+              <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+          </button>
+          <div class="fbar-cat__pop" hidden>
+            {% for value in options %}
+            <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ cat_key }}" value="{{ value }}"><span class="fbar-menu__opt-text">{{ value }}</span></label>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        <div class="fbar-menu__foot">
+          <button type="button" data-fbar-clear>Clear</button>
+          <button type="button" data-fbar-done>Done</button>
+        </div>
+      </div>
+    </div>
+    <span class="fbar__end"><span class="fbar__count" id="adp-dom-count"></span></span>
+  </div>
+  <div class="fbar-chips" id="adp-dom-chips" hidden></div>
+
+  {# The same table, one kind along. The two sit on one page and answer the
+     same question about two resource types; drawing them differently would
+     say they were different KINDS of answer. Its columns are the package
+     table's minus the two that do not exist here — a domain has no tables and
+     no category — so a reader moving between them is reading one layout. #}
+  <div class="data-table-wrap">
+    <table class="data-table adp-table">
+      <colgroup>
+        <col style="width: 52%">
+        <col style="width: 14%">
+        <col style="width: 34%">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th title="Memory items in this domain — a domain with none delivers nothing">Items</th>
+          <th title="Groups this domain is granted to, and what it does in their workspace">Shared with</th>
+        </tr>
+      </thead>
+      <tbody id="adp-dom-rows">
+        {% for entry in domain_cards %}
+        {% set shares = dom_sharing.get(entry.id, []) %}
+        {% set n_items = entry.items_count | default(0) %}
+        <tr class="adp-row" data-domain-id="{{ entry.id }}"
+            data-search="{{ (entry.name ~ ' ' ~ (entry.description or '')) | lower }}"
+            data-name="{{ entry.name }}"
+            data-shared="{{ 'Shared' if shares else 'Not shared' }}"
+            data-contents="{{ 'Has items' if n_items else 'Empty' }}"
+            {# The set, as above. #}
+            data-tier="{{ shares | map(attribute='requirement') | unique | sort
+                          | map('replace', 'required', words.tier_automatic)
+                          | map('replace', 'available', words.tier_optional)
+                          | join('|') }}">
+          <td>
+            <a class="adp-row__name" href="{{ entry.drilldown_url }}">
+              <span class="adp-row__glyph adp-row__glyph--memory" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 4c-2 0-3.5 1.4-3.5 3.2 0 .3 0 .6.1.9C7.2 8.6 6.3 9.8 6.3 11.3c0 1 .4 1.9 1.1 2.5-.2.4-.3.9-.3 1.4 0 1.8 1.5 3.2 3.4 3.2.6 0 1.1-.1 1.5-.4V4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 4c2 0 3.5 1.4 3.5 3.2 0 .3 0 .6-.1.9 1.4.5 2.3 1.7 2.3 3.2 0 1-.4 1.9-1.1 2.5.2.4.3.9.3 1.4 0 1.8-1.5 3.2-3.4 3.2-.6 0-1.1-.1-1.5-.4" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+              </span>
+              <span class="adp-row__text">
+                <b>{{ entry.name }}</b>
+                {% if entry.description %}<span class="adp-row__desc">{{ entry.description }}</span>{% endif %}
+              </span>
+            </a>
+          </td>
+          <td>
+            {% if n_items == 0 %}
+            <span class="adp-chip adp-chip--warn" title="This domain holds no memory items yet"><span>None</span></span>
+            {% else %}
+            <span class="adp-num">{{ n_items }}</span>
+            {% endif %}
+          </td>
+          {# Groups only — see the package table above for why the tier is not
+             here. #}
+          <td>{{ share_readout(shares) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="adp-noresults" id="adp-dom-none" hidden>No memory domains match these filters.</div>
   </div>
   {% else %}
   <div class="empty-state">
@@ -297,6 +518,54 @@
    after a grant change, and for the same reason. #}
 {# package_drawer builds the shared builder workspace when opened
    from "+ New", so the shell has to be defined before it runs. #}
+{# The shared filter engine — the same one the Library, My Stack and the
+   package builder's picker run on. Two instances, one per list: they filter
+   different rows against different vocabularies, and a single engine spanning
+   both would let a Category chosen for packages hide memory domains that
+   never had a category to match. #}
+<script src="{{ static_url('js/filter_toolbar.js') }}"></script>
+<script>
+(function () {
+  'use strict';
+  if (!window.FilterToolbar) return;
+  // `tier` is a facet and NOT a column. As a column it was blank on every row
+  // that is unshared or empty — nearly all of them on a young instance — and
+  // it said one thing about a package that can be Automatic for one group and
+  // Optional for another. As a filter, a mostly-blank axis is exactly what you
+  // want: "show me what lands in people's workspaces without them asking".
+  var COMMON = [
+    { key: 'shared', attr: 'data-shared', label: 'Sharing' },
+    { key: 'contents', attr: 'data-contents', label: 'Contents' },
+    // `multi` because the attribute is a SET: a package Automatic for one
+    // group and Optional for another carries both, and matches either filter.
+    { key: 'tier', attr: 'data-tier', label: 'Access for any group', multi: true },
+  ];
+  if (document.getElementById('adp-pkg-rows')) {
+    window.FilterToolbar.init({
+      rows: '#adp-pkg-rows tr',
+      search: { el: '#adp-pkg-search', attr: 'data-search' },
+      facets: COMMON.concat([{ key: 'cat', attr: 'data-cat', label: 'Category' }]),
+      filterBtn: '#adp-pkg-filter-btn',
+      menu: '#adp-pkg-filter-menu',
+      chips: '#adp-pkg-chips',
+      count: { el: '#adp-pkg-count', noun: 'package' },
+      noResults: '#adp-pkg-none',
+    });
+  }
+  if (document.getElementById('adp-dom-rows')) {
+    window.FilterToolbar.init({
+      rows: '#adp-dom-rows tr',
+      search: { el: '#adp-dom-search', attr: 'data-search' },
+      facets: COMMON,
+      filterBtn: '#adp-dom-filter-btn',
+      menu: '#adp-dom-filter-menu',
+      chips: '#adp-dom-chips',
+      count: { el: '#adp-dom-count', noun: 'domain' },
+      noResults: '#adp-dom-none',
+    });
+  }
+})();
+</script>
 <script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}" defer></script>
 <script>

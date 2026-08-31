@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import pytest
 
+from app.web import vocabulary
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -36,13 +38,29 @@ class TestTheTierSaysWhatItDoes:
         assert 'data-tier="available"' in page
         assert 'data-tier="required"' in page
 
-    def test_the_labels_are_the_library_s_words(self, page):
-        assert ">Available<" in page
-        assert ">Required<" in page
+    def test_the_labels_are_automatic_and_optional(self, page):
+        """Reversed from Required / Available on 2026-08-30 (TCRD-208; the
+        reversal note is section 2 of the access-page spec).
 
-    @pytest.mark.parametrize("retired", ["Optional", "Automatic"])
-    def test_the_retired_labels_are_gone(self, page, retired):
-        """They named neither state and matched nothing the person sees."""
+        The rule did not change — the Library's words win — but the Library's
+        words moved: *In stack* / *Add to stack* became **Keep a local copy**,
+        so "Required by your admin" stopped being the sentence this control
+        mirrors. What was left was *Available*'s own flaw, which the first pass
+        did not weigh: BOTH tiers are available. Both are granted, both are
+        reachable, both are queryable the moment the grant exists — the
+        tooltip two tests down says exactly that. Offering *Available* as the
+        opposite of *Required* draws a distinction the system does not make.
+        """
+        assert ">{}<".format(vocabulary.TIER_AUTOMATIC) in page
+        assert ">{}<".format(vocabulary.TIER_OPTIONAL) in page
+
+    @pytest.mark.parametrize("retired", ["Available"])
+    def test_the_retired_label_is_gone(self, page, retired):
+        """`>Required<` is deliberately NOT checked here. A memory item's
+        `is_required` means *required reading* — the agent must always load it
+        — a different axis that shares only the word, and one this page may
+        legitimately name. Banning the substring would have renamed those
+        badges too and said something false about downloads."""
         assert f">{retired}<" not in page
 
     def test_the_tooltip_stops_calling_it_an_access_control(self, page):
