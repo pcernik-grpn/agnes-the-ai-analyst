@@ -1664,11 +1664,11 @@ class TestSharePointSourceCard:
             assert in_agnes["last_run_at"] == last_run_at
             # next_due_at(every 4h, last_run_at) == last_run_at + 4h.
             assert in_agnes["next_run_at"] == "2026-08-29T12:00:00+00:00"
-            # Enabled, but `_fake_get_value` never configures a producer ->
-            # the SECOND readiness gate (not the first) is what blocks the
-            # honest-UI gate here.
-            assert in_agnes["extraction_ready"] is False
-            assert in_agnes["extraction_unready_reason"] == "extraction_producer_not_configured"
+            # Builtin-only world: no producer to configure. With the
+            # `extraction` extra installed (the test venv has it), enabled
+            # means ready — the second gate is only the dependency probe.
+            assert in_agnes["extraction_ready"] is True
+            assert in_agnes["extraction_unready_reason"] is None
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -2045,11 +2045,11 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "no schedule configured" in html.lower()
         assert "disabled" in html
 
-    def test_in_agnes_schedule_producer_not_configured_shows_the_reason_and_disables_the_button(self):
+    def test_in_agnes_schedule_missing_deps_shows_the_reason_and_disables_the_button(self):
         """A DIFFERENT unready reason than the disabled case above — the
-        instance has `extraction.enabled: true` but no producer command/
-        module set, the exact state a click would otherwise 409
-        `extraction_producer_not_configured` for."""
+        instance has `extraction.enabled: true` but the `extraction` extra
+        is not installed, the exact state a click would otherwise 409
+        `extraction_dependencies_missing` for."""
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
@@ -2059,12 +2059,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "last_run_at": None,
                 "next_run_at": None,
                 "extraction_ready": False,
-                "extraction_unready_reason": "extraction_producer_not_configured",
+                "extraction_unready_reason": "extraction_dependencies_missing",
             },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "No extraction producer is configured" in html
+        assert "extraction dependencies are not installed" in html.lower() or "agnes[extraction]" in html
         assert "disabled" in html
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):

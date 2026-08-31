@@ -1,4 +1,4 @@
-"""``extraction.*`` — admin-editable producer config (T3), reversing the
+"""``extraction.*`` — admin-editable extraction config (builtin-only, post-T3; the
 `extraction` switch's original deploy-time-only stance from #1652/T2.
 
 Precedence after this change: env (Terraform-rendered, T2) > admin
@@ -74,12 +74,6 @@ def test_get_returns_extraction_known_fields(seeded_app, monkeypatch):
     fields = resp.json()["known_fields"]["extraction"]
     assert fields["enabled"]["kind"] == "bool"
     assert fields["enabled"]["default"] is False
-    producer = fields["producer"]
-    assert producer["kind"] == "object"
-    assert producer["fields"]["command"]["kind"] == "string"
-    assert producer["fields"]["module"]["kind"] == "string"
-    assert producer["fields"]["env_passthrough"]["kind"] == "array"
-    assert producer["fields"]["env_passthrough"]["item_kind"] == "string"
     assert fields["schedule"]["kind"] == "string"
     assert fields["timeout_s"]["kind"] == "int"
     assert fields["timeout_s"]["default"] == 3600
@@ -111,10 +105,6 @@ def test_post_updates_extraction_and_get_reflects_it(seeded_app, monkeypatch):
             "sections": {
                 "extraction": {
                     "enabled": True,
-                    "producer": {
-                        "command": "python -m fake_producer",
-                        "env_passthrough": ["MY_CUSTOM_VAR"],
-                    },
                     "schedule": "every 30m",
                     "timeout_s": 1800,
                 }
@@ -128,15 +118,12 @@ def test_post_updates_extraction_and_get_reflects_it(seeded_app, monkeypatch):
 
     loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
     assert loaded["extraction"]["enabled"] is True
-    assert loaded["extraction"]["producer"]["command"] == "python -m fake_producer"
     assert loaded["extraction"]["schedule"] == "every 30m"
     assert loaded["extraction"]["timeout_s"] == 1800
 
     resp2 = client.get("/api/admin/server-config", headers=headers)
     section = resp2.json()["sections"]["extraction"]
     assert section["enabled"] is True
-    assert section["producer"]["command"] == "python -m fake_producer"
-    assert section["producer"]["env_passthrough"] == ["MY_CUSTOM_VAR"]
     assert section["schedule"] == "every 30m"
     assert section["timeout_s"] == 1800
 
@@ -170,40 +157,6 @@ def test_enabled_must_be_bool(seeded_app, monkeypatch):
         headers=_auth(seeded_app["admin_token"]),
     )
     assert resp.status_code == 422, resp.text
-
-
-def test_producer_command_must_be_string(seeded_app, monkeypatch):
-    _clear_extraction_env(monkeypatch)
-    client = seeded_app["client"]
-    resp = client.post(
-        "/api/admin/server-config",
-        json={"sections": {"extraction": {"producer": {"command": 123}}}},
-        headers=_auth(seeded_app["admin_token"]),
-    )
-    assert resp.status_code == 422, resp.text
-
-
-def test_env_passthrough_rejects_invalid_names(seeded_app, monkeypatch):
-    _clear_extraction_env(monkeypatch)
-    client = seeded_app["client"]
-    resp = client.post(
-        "/api/admin/server-config",
-        json={"sections": {"extraction": {"producer": {"env_passthrough": ["not_upper", "OK_NAME"]}}}},
-        headers=_auth(seeded_app["admin_token"]),
-    )
-    assert resp.status_code == 422, resp.text
-    assert "not_upper" in resp.text
-
-
-def test_env_passthrough_accepts_valid_names(seeded_app, monkeypatch):
-    _clear_extraction_env(monkeypatch)
-    client = seeded_app["client"]
-    resp = client.post(
-        "/api/admin/server-config",
-        json={"sections": {"extraction": {"producer": {"env_passthrough": ["HTTP_PROXY_EXTRA", "MY_VAR2"]}}}},
-        headers=_auth(seeded_app["admin_token"]),
-    )
-    assert resp.status_code == 200, resp.text
 
 
 def test_schedule_rejects_invalid_value(seeded_app, monkeypatch):
@@ -298,31 +251,9 @@ class TestEnvLockHonesty:
         assert spec["env_locked"] is False
         assert spec["env_var"] == "AGNES_EXTRACTION_ENABLED"
 
-    def test_producer_command_locked_when_env_var_present(self, seeded_app, monkeypatch):
-        _clear_extraction_env(monkeypatch)
-        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
-        client = seeded_app["client"]
-        resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
-        body = resp.json()
-        spec = body["known_fields"]["extraction"]["producer"]["fields"]["command"]
-        assert spec["env_locked"] is True
-        assert spec["env_var"] == "AGNES_EXTRACTION_PRODUCER_COMMAND"
-        assert body["sections"]["extraction"]["producer"]["command"] == "python /opt/producer/agnes_lane.py"
-
-    def test_producer_module_locked_when_env_var_present(self, seeded_app, monkeypatch):
-        _clear_extraction_env(monkeypatch)
-        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_MODULE", "your_producer.run")
-        client = seeded_app["client"]
-        resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
-        body = resp.json()
-        spec = body["known_fields"]["extraction"]["producer"]["fields"]["module"]
-        assert spec["env_locked"] is True
-        assert body["sections"]["extraction"]["producer"]["module"] == "your_producer.run"
-
     def test_schedule_and_timeout_are_never_env_locked(self, seeded_app, monkeypatch):
-        """Only the three T2 env carriers lock a field — schedule/timeout_s/
-        env_passthrough carry no such deploy-time env var and must stay
-        plain editable fields regardless of any of the three being set."""
+        """Only `enabled` carries a deploy-time env var (builtin-only world) —
+        schedule/timeout_s must stay plain editable fields regardless."""
         _clear_extraction_env(monkeypatch)
         monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "1")
         client = seeded_app["client"]
@@ -330,7 +261,6 @@ class TestEnvLockHonesty:
         fields = resp.json()["known_fields"]["extraction"]
         assert "env_locked" not in fields["schedule"]
         assert "env_locked" not in fields["timeout_s"]
-        assert "env_locked" not in fields["producer"]["fields"]["env_passthrough"]
 
     def test_post_enabled_refused_with_409_when_env_locked(self, seeded_app, monkeypatch):
         _clear_extraction_env(monkeypatch)
@@ -346,32 +276,6 @@ class TestEnvLockHonesty:
         assert detail["error"] == "field_locked_by_deployment"
         assert detail["field"] == "enabled"
         assert detail["env_var"] == "AGNES_EXTRACTION_ENABLED"
-
-    def test_post_producer_command_refused_with_409_when_env_locked(self, seeded_app, monkeypatch):
-        _clear_extraction_env(monkeypatch)
-        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
-        client = seeded_app["client"]
-        resp = client.post(
-            "/api/admin/server-config",
-            json={"sections": {"extraction": {"producer": {"command": "python -m evil"}}}},
-            headers=_auth(seeded_app["admin_token"]),
-        )
-        assert resp.status_code == 409, resp.text
-        detail = resp.json()["detail"]
-        assert detail["error"] == "field_locked_by_deployment"
-        assert detail["field"] == "producer.command"
-
-    def test_post_producer_module_refused_with_409_when_env_locked(self, seeded_app, monkeypatch):
-        _clear_extraction_env(monkeypatch)
-        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_MODULE", "your_producer.run")
-        client = seeded_app["client"]
-        resp = client.post(
-            "/api/admin/server-config",
-            json={"sections": {"extraction": {"producer": {"module": "evil.run"}}}},
-            headers=_auth(seeded_app["admin_token"]),
-        )
-        assert resp.status_code == 409, resp.text
-        assert resp.json()["detail"]["field"] == "producer.module"
 
     def test_locked_leaf_touched_alongside_an_unlocked_one_still_refuses(self, seeded_app, monkeypatch):
         """A patch that touches BOTH a locked leaf and an unlocked one (e.g.

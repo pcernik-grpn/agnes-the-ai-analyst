@@ -1286,7 +1286,8 @@ extraction:
   # enforced inside the crawl: the deadline is checked between files and
   # between delta pages, and on expiry the run persists its state, reports
   # `interrupted_reason: "timeout"` and fails the job. Nothing is lost: the
-  # next run resumes from the persisted deltaLinks and cTags. The job's own
+  # next run resumes from the persisted deltaLinks and cTags. (An exhausted
+  # 429 budget stops a run the same way, as `"throttled"`.) The job's own
   # lease is derived from this value plus a margin. 0 = unbounded (a
   # deliberate choice for an operator who would rather a first full crawl
   # of a large estate finish than restart).

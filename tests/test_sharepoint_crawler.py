@@ -1065,6 +1065,68 @@ class TestRunDeadline:
         assert state["ctags"], "the item ingested before the stop must be recorded, or the next run re-does it"
         assert state["last_run"]["interrupted_reason"] == "timeout"
 
+    def test_a_throttle_abort_is_named_not_left_looking_like_a_crash(self, crawl_env, monkeypatch):
+        """An exhausted 429 budget stops the run at the same consistent point
+        a timeout does, so it gets its own reason rather than "error" — a
+        reader may only promise "the next run resumes" for stops that leave
+        the state file describing exactly what was ingested."""
+
+        _install_graph(monkeypatch, lambda request: httpx.Response(429, headers={"Retry-After": "300"}, json={}))
+
+        # The 429 policy's own bound is what ends this run; the sleeps it
+        # would spend getting there are stubbed out, exactly as
+        # `test_429_budget_exhaustion_raises_instead_of_sleeping_forever`
+        # above does.
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        with pytest.raises(crawler.GraphThrottled):
+            crawler.run_builtin_crawl({"connection_id": "conn1"})
+
+        last_run = _state(crawl_env)["last_run"]
+        assert last_run["interrupted"] is True
+        assert last_run["interrupted_reason"] == "throttled"
+
+    def test_an_unexpected_crash_is_never_reported_as_resumable(self, crawl_env, monkeypatch):
+        """The other half of the contract: after an exception nobody planned
+        for, nothing is known about how far the state file got, so the reason
+        stays "error" and no reader may vouch for the state."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise RuntimeError("something nobody planned for")
+
+        _install_graph(monkeypatch, handler)
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        with pytest.raises(BaseException):
+            crawler.run_builtin_crawl({"connection_id": "conn1"})
+
+        assert _state(crawl_env)["last_run"]["interrupted_reason"] == "error"
+
+    def test_stop_reason_is_decided_by_isinstance_so_subclasses_inherit_it(self):
+        """`_STOP_REASONS` is matched with isinstance, not an exact type
+        lookup, so a future subclass of either stop keeps its reason instead
+        of silently degrading to the un-vouched-for "error"."""
+
+        class _LaterTimeout(crawler.CrawlTimeout):
+            pass
+
+        class _LaterThrottle(crawler.GraphThrottled):
+            pass
+
+        assert crawler._stop_reason(_LaterTimeout("x")) == "timeout"
+        assert crawler._stop_reason(_LaterThrottle("x")) == "throttled"
+        assert crawler._stop_reason(RuntimeError("x")) == "error"
+
     def test_zero_means_unbounded(self, crawl_env, monkeypatch):
         _install_graph(monkeypatch, self._paged_handler())
         report = _run(_connection([_drive_scope()]), monkeypatch)  # crawl_env leaves timeout at its default

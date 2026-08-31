@@ -164,6 +164,28 @@ class GraphThrottled(CrawlError):
     """429s exceeded this request's attempt / total-wait budget."""
 
 
+#: ``interrupted_reason`` for a run that stopped early at a KNOWN-CONSISTENT
+#: point — the deltaLink/cTag state on disk describes exactly what was
+#: ingested, so a caller may tell the operator the next run resumes from
+#: there. Anything else records ``"error"``: after an unexpected exception
+#: nothing is known about how far the state file got, and "your work is safe"
+#: must never be guessed.
+#:
+#: Order is irrelevant (the two classes are disjoint siblings), but the
+#: mapping is a tuple rather than a dict because ``isinstance`` — not an
+#: exact type lookup — is what has to decide, so a future subclass of either
+#: inherits the right reason instead of silently falling through to "error".
+_STOP_REASONS: tuple[tuple[type[BaseException], str], ...] = (
+    (CrawlTimeout, "timeout"),
+    (GraphThrottled, "throttled"),
+)
+
+
+def _stop_reason(exc: BaseException) -> str:
+    """``"timeout"`` / ``"throttled"`` / ``"error"`` for an aborted run."""
+    return next((reason for cls, reason in _STOP_REASONS if isinstance(exc, cls)), "error")
+
+
 # --------------------------------------------------------------------------
 # Crawl state (per connection): the per-drive deltaLink + per-item cTag map.
 #
@@ -477,10 +499,14 @@ class CrawlStats:
             "finished_at": _now_iso(),
             "duration_s": round(elapsed, 1),
             "interrupted": interrupted,
-            # Why the run stopped early — "timeout" when extraction.timeout_s
-            # expired, "error" for anything else, None on a clean pass. An
-            # operator reading a short report must be able to tell "this is
-            # all there was" from "this is where we ran out of clock".
+            # Why the run stopped early: one of `_STOP_REASONS`' values
+            # ("timeout" when extraction.timeout_s expired, "throttled" when
+            # the tenant's 429 budget ran out), "error" for anything else, or
+            # None on a clean pass. An operator reading a short report must be
+            # able to tell "this is all there was" from "this is where we ran
+            # out of clock". The named reasons are exactly the stops that
+            # leave consistent state on disk, so a reader may say "the next
+            # run resumes" for them and must not for "error".
             "interrupted_reason": interrupted_reason,
             "scopes": self.scopes,
             "drives": self.drives,
@@ -1496,21 +1522,23 @@ async def _run_crawl_async(
                     deadline=deadline,
                 )
     except BaseException as exc:
-        # A crashed — or timed-out — run still owes the operator its numbers
-        # and its state: the rows are already ingested, so record what got
-        # done instead of losing the pass. A CrawlTimeout is not a crash, so
-        # it is named in the report rather than left looking like one.
-        reason = "timeout" if isinstance(exc, CrawlTimeout) else "error"
+        # A crashed — or deliberately stopped — run still owes the operator
+        # its numbers and its state: the rows are already ingested, so record
+        # what got done instead of losing the pass. A timeout and a throttle
+        # abort are not crashes, so each is NAMED in the report rather than
+        # left looking like one (see `_STOP_REASONS`).
+        reason = _stop_reason(exc)
         interrupted_report = stats.report(max_file_mb=max_file_mb, interrupted=True, interrupted_reason=reason)
         interrupted_report["connection_id"] = connection_id
         interrupted_report["scope_errors"] = scope_errors
         state["last_run"] = interrupted_report
         save_state(connection_id, state)
-        if reason == "timeout":
+        if reason != "error":
             logger.warning(
-                "sharepoint crawl: connection %s hit extraction.timeout_s after %d new / %d changed — "
+                "sharepoint crawl: connection %s stopped early (%s) after %d new / %d changed — "
                 "state saved, the next run resumes",
                 connection_id,
+                reason,
                 stats.new,
                 stats.changed,
             )
@@ -1519,7 +1547,7 @@ async def _run_crawl_async(
         # `_record_status_for` so a crash can never dress up as benign.
         recorder.finish(
             stats,
-            status="interrupted" if reason == "timeout" else _record_status_for(exc),
+            status="interrupted" if reason in {r for _, r in _STOP_REASONS} else _record_status_for(exc),
             report=interrupted_report,
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -1550,12 +1578,17 @@ def run_builtin_crawl(payload: dict) -> dict:
     (``app/worker/kinds.py::_run_corpus_extraction``, a thin delegate to
     this).
 
-    Bounded by ``extraction.timeout_s`` — v1's ONLY stop mechanism (no UI
-    cancel, and since the external producer was removed, no subprocess to
-    kill). On expiry the run saves its state, reports
+    Bounded by ``extraction.timeout_s`` — v1's ONLY deliberate stop mechanism
+    (no UI cancel, and since the external producer was removed, no subprocess
+    to kill). On expiry the run saves its state, reports
     ``interrupted_reason="timeout"``, and fails the job; the next run resumes
     from the persisted deltaLinks and cTags. ``payload["timeout_s"]``
     overrides the configured value for one run (0 = unbounded).
+
+    An exhausted 429 budget stops a run the same way, reporting
+    ``interrupted_reason="throttled"`` — see :data:`_STOP_REASONS` for why
+    those two, and only those two, license a caller to tell the operator the
+    next run picks up where this one stopped.
 
     ``payload``: ``connection_id`` (required — a ``source_connections`` row
     with ``source_type='sharepoint'``) and optionally ``scopes`` (a list of

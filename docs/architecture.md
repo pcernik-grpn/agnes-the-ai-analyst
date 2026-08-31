@@ -755,8 +755,11 @@ vault-first then the server's `SHAREPOINT_CERT_PRIVATE_KEY` env var) and
 never reach a command line, because there is none. The run is bounded by
 `extraction.timeout_s` — checked between files and between delta pages,
 and on expiry the crawl persists its resumable state and fails the job
-with `interrupted_reason: "timeout"`; that is the only stop mechanism v1
-has. Off by default (`extraction.enabled` — a registered switch,
+with `interrupted_reason: "timeout"`; that is the only deliberate stop
+mechanism v1 has. An exhausted 429 budget stops a run the same way, as
+`interrupted_reason: "throttled"` — those two reasons, and only those two,
+mean the persisted state describes exactly what was ingested, so a reader
+may promise that the next run resumes. Off by default (`extraction.enabled` — a registered switch,
 `AGNES_EXTRACTION_ENABLED`) and additive: an instance that never sets
 `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected. The converter
 backends ship as the `extraction` optional extra; the admin trigger

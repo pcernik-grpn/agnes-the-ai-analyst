@@ -193,5 +193,5 @@ def test_config_answers_on_postgres_too(tmp_path, monkeypatch, pg_engine):
     conn_id = _connection(client, token)
 
     body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
-    assert body["section_editable"] is False
+    assert body["section_editable"] is True  # registry-driven since producer.command was removed
     assert any(row["key"] == "extraction.enabled" for row in body["effective"])
