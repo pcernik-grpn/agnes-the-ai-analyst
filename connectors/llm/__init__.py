@@ -10,6 +10,7 @@ from .factory import (
     create_extractor,
     create_extractor_from_env_or_config,
     create_vertex_extractor,
+    llm_configured,
     vertex_config_or_none,
 )
 from .vertex_provider import to_vertex_model_id
@@ -19,6 +20,7 @@ __all__ = [
     "create_extractor",
     "create_extractor_from_env_or_config",
     "create_vertex_extractor",
+    "llm_configured",
     "to_vertex_model_id",
     "vertex_config_or_none",
 ]

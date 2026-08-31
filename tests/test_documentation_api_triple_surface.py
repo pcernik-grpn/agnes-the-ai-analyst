@@ -56,6 +56,14 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Markdown-first skill publish (studio Skill Builder direct-publish flow,
     # issue #688). CLI: `store publish-md`. MCP: `store_publish_markdown`.
     "/api/store/entities/from-markdown": ("store publish-md", "store_publish_markdown"),
+    # The editing half of the pair above. The builder authors a document and
+    # the only edit surface took a replacement .zip, so the one thing the
+    # builder wrote was the one thing nothing could change; reading it back
+    # and writing it back are one feature and land on all three surfaces
+    # together. (GET → `agnes store show-md` / `store_read_markdown`; PUT →
+    # `agnes store edit-md` / `store_edit_markdown`.)
+    "/api/store/entities/{entity_id}/markdown": ("store show-md", "store_read_markdown"),
+    "/api/store/entities/{entity_id}/from-markdown": ("store edit-md", "store_edit_markdown"),
     # The composed sibling of from-markdown: same JSON-create shape, so it takes
     # the same three surfaces. The .zip upload path stays _EXEMPT (binary).
     "/api/store/entities/from-components": ("store compose", "store_compose_plugin"),

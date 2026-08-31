@@ -161,12 +161,19 @@
       }).join('') + '</div>';
     }
     var off = o.busy ? ' disabled' : '';
+    /* `readOnly` is the "you cannot send, but this is still your text" state:
+       a DISABLED textarea is not selectable in Chrome, so a message restored
+       into one after a failure is visible and impossible to copy back out.
+       Send is disabled either way. */
+    var ro = o.readOnly && !o.busy;
     return (
       '<div class="ag-comp"><div class="ag-comp-in">' + chips +
         '<div class="ag-comp-box">' +
           '<textarea rows="1" data-ag-comp="' + esc(o.kind) + '" ' +
-            'placeholder="' + esc(o.placeholder) + '"' + off + '>' + esc(o.value || '') + '</textarea>' +
-          '<button type="button" class="ag-send" data-ag-send="' + esc(o.kind) + '"' + off + '>' +
+            'placeholder="' + esc(o.placeholder) + '"' + off + (ro ? ' readonly' : '') + '>' +
+            esc(o.value || '') + '</textarea>' +
+          '<button type="button" class="ag-send" data-ag-send="' + esc(o.kind) + '"' +
+            (off || (ro ? ' disabled' : '')) + '>' +
             'Send <span aria-hidden="true">→</span></button>' +
         '</div>' +
       '</div></div>'
@@ -195,15 +202,25 @@
      "+ Add" menu already answered was the least useful card in the most
      valuable slot. Optional, so the agent builder is unaffected. */
   function head(o) {
+    /* `titleHtml` REPLACES the heading block, rather than filling the <h2> —
+       /skills hangs a menu off its title, and the <h2> clips its own overflow
+       to ellipsise a long name, which swallowed the popup. A host that wants
+       a control there owns the whole block; pages that pass only `title` get
+       the plain heading. */
+    var titleBlock = o.titleHtml || '<h2 id="' + esc(o.titleId) + '">' + esc(o.title) + '</h2>';
     return (
       '<div class="ag-build-head">' +
         '<button type="button" class="ag-back" data-ag-back>← ' + esc(o.backLabel) + '</button>' +
         (o.badge ? '<div class="ag-build-badge">' + o.badge + '</div>' : '') +
-        '<div style="min-width:0;flex:1">' +
-          '<h2 id="' + esc(o.titleId) + '">' + esc(o.title) + '</h2>' +
-        '</div>' +
+        '<div style="min-width:0;flex:1">' + titleBlock + '</div>' +
         '<div class="ag-build-actions" id="' + esc(o.actionsId) + '">' + (o.actions || '') + '</div>' +
-      '</div>'
+      '</div>' +
+      /* One alert region, directly under the header and above the workspace.
+         Refusals landed in three different places across the builders — one of
+         them the bottom of a scrolling form, while the button that caused it
+         had been moved to the header. Pre-built HTML, host-owned; a page that
+         passes no `alertsId` renders nothing. */
+      (o.alertsId ? '<div class="ag-alerts" id="' + esc(o.alertsId) + '">' + (o.alerts || '') + '</div>' : '')
     );
   }
 
@@ -215,8 +232,17 @@
       '<div class="ag-work">' +
         '<div class="ag-pane">' + (o.left || '') + '</div>' +
         '<div class="ag-pane ag-pane--cfg">' +
-          '<div class="ag-cfg-head"><h3>' + esc(o.cfgTitle) + '</h3>' +
-            '<p>' + esc(o.cfgSub) + '</p></div>' +
+          /* `cfgAside` is a second line under the title — for the one thing a
+             builder has to say ABOUT the configuration rather than in it:
+             how much of it is still open. It rode inside the body as a boxed
+             card, which made the first thing in the column a status widget
+             instead of the first field. Optional and pre-built; a pane that
+             passes none renders exactly as before. */
+          '<div class="ag-cfg-head">' +
+            '<div class="ag-cfg-head-main"><h3>' + esc(o.cfgTitle) + '</h3>' +
+              '<p>' + esc(o.cfgSub) + '</p></div>' +
+            (o.cfgAside || '') +
+          '</div>' +
           '<div class="ag-cfg-body" id="' + esc(o.cfgBodyId) + '">' + (o.cfg || '') + '</div>' +
         '</div>' +
       '</div>'
@@ -263,9 +289,139 @@
     );
   }
 
+  /* ── One turn, for every builder that has a conversation ──────────────
+     The shell said it "cannot enforce anything… that contract lives in the
+     pages and in their tests", and four pages then proved it: two capped the
+     message and trimmed the transcript and two did not, two restored a failed
+     message and two lost it, two latched a no-model state and two kept
+     inviting. Every one of those is POLICY, not markup, and none of it needs
+     the DOM — so it can live here without the shell growing state.
+
+     This function still reads no page state and touches no DOM. It takes the
+     turn, applies the caps the endpoint enforces, and either resolves with the
+     body or rejects with an error already carrying `kind` and a sentence the
+     page can show. What to DO about each kind — restore the composer, latch a
+     banner, pop the optimistic row — stays with the page, because that is
+     state.
+
+     `MAX_*` mirror app/api/builder_core.py. The mirror tests pin them. */
+  var MAX_MSG_CHARS = 4000;
+  var MAX_HISTORY = 40;
+  var TURN_TIMEOUT_MS = 60000;
+
+  function clipMsg(t) {
+    t = t || '';
+    return t.length > MAX_MSG_CHARS ? t.slice(0, MAX_MSG_CHARS) : t;
+  }
+
+  /* Trim a transcript to what the server will actually replay. A page that
+     uploads everything while the prompt reads the last N leaves the model
+     silently missing the start of a conversation still on screen — which
+     reads as the assistant being careless rather than as a limit. */
+  function trimHistory(rows) {
+    var list = rows || [];
+    return list.length > MAX_HISTORY ? list.slice(-MAX_HISTORY) : list;
+  }
+
+  function turnError(kind, message) {
+    var e = new Error(message);
+    e.kind = kind;
+    return e;
+  }
+
+  function turn(o) {
+    var text = o.message || '';
+    /* Refused HERE, with the author's text still in their hands. Sending it
+       earned a validation error whose `detail` is an ARRAY, so `hint`/`kind`
+       were both undefined and the page blamed the assistant for a paste. */
+    if (text.length > MAX_MSG_CHARS) {
+      return Promise.reject(turnError(
+        'too_long',
+        'That message is ' + text.length + ' characters and the limit is ' + MAX_MSG_CHARS +
+        '. Shorten it, or put the long part in the configuration on the right.'
+      ));
+    }
+
+    var ctl = window.AbortController ? new window.AbortController() : null;
+    var timedOut = false;
+    var ms = o.timeoutMs || TURN_TIMEOUT_MS;
+    var timer = window.setTimeout(function () { timedOut = true; if (ctl) ctl.abort(); }, ms);
+
+    var body = o.body || {};
+    if (body.history) body.history = trimHistory(body.history);
+
+    return window.fetch(o.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      signal: ctl ? ctl.signal : undefined,
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (payload) {
+        if (r.ok) return payload;
+        var d = (payload && payload.detail) || {};
+        if (r.status === 422 || Array.isArray(d)) {
+          throw turnError('too_long',
+            'This conversation carries more text than one turn can send. Shorten your last ' +
+            'message, or start a fresh one — the configuration keeps your work.');
+        }
+        if (d.kind === 'builder_llm_unavailable') {
+          throw turnError('llm_unavailable', d.hint || 'No AI credential is configured on this instance.');
+        }
+        throw turnError(d.kind || 'http',
+          d.hint || d.message || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
+      });
+    }).catch(function (e) {
+      if (timedOut) {
+        throw turnError('timeout',
+          'That turn took longer than ' + Math.round(ms / 1000) + ' seconds and was given up on. Try again.');
+      }
+      throw (e && e.kind) ? e : turnError('http', (e && e.message) || 'The assistant could not answer.');
+    }).then(function (payload) {
+      window.clearTimeout(timer);
+      return payload;
+    }, function (e) {
+      window.clearTimeout(timer);
+      throw e;
+    });
+  }
+
+  /* The standing notice a builder shows once it knows this instance has no
+     model — in place of a greeting, a red error under it, and a live composer
+     that all fail the same way. */
+  function noModelNotice(what) {
+    return (
+      '<div class="ag-note ag-note--warn">No AI credential is configured on this instance, so the ' +
+      'assistant cannot draft anything. The ' + esc(what || 'configuration on the right') +
+      ' is editable by hand and saving works normally — or ask an admin to set a model up.</div>'
+    );
+  }
+
+  /* A primary action that says what it is waiting for. `blocked` is a sentence
+     or empty; when set the button is disabled and carries it as its title and
+     accessible name, so a dark button and its explanation cannot drift apart. */
+  function action(o) {
+    var blocked = o.blocked || '';
+    var busy = !!o.busy;
+    var attrs = ' id="' + esc(o.id) + '"';
+    if (busy || blocked) attrs += ' disabled';
+    if (blocked && !busy) {
+      attrs += ' title="' + esc(blocked) + '" aria-label="' + esc(o.label + ' — ' + blocked) + '"';
+    }
+    return '<button type="button" class="cc-btn' + (o.primary ? ' cc-btn--primary' : '') + '"' + attrs + '>' +
+      esc(busy && o.busyLabel ? o.busyLabel : o.label) + '</button>';
+  }
+
   window.BuilderShell = {
     esc: esc,
     engineNotice: engineNotice,
+    noModelNotice: noModelNotice,
+    action: action,
+    turn: turn,
+    clipMsg: clipMsg,
+    trimHistory: trimHistory,
+    MAX_MSG_CHARS: MAX_MSG_CHARS,
+    MAX_HISTORY: MAX_HISTORY,
     section: section,
     toolbar: toolbar,
     message: message,

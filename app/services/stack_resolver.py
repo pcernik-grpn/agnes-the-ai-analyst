@@ -54,12 +54,15 @@ override the global ``knowledge_items.is_required`` flag. See the
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import HTTPException
 
 from app.resource_types import ResourceType
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +265,41 @@ class StackResolver:
         available_ids -= required_ids
         return required_ids, available_ids
 
+    def granting_groups(self, user_id: str, resource_type: ResourceType) -> Dict[str, List[str]]:
+        """``resource_id`` -> the names of the caller's groups that grant it.
+
+        Answers the one question a member's Library row could not: *why do I
+        have this?* The grant rows :meth:`_grants` already reads carry
+        ``group_id``; it discards them into id sets because membership is all
+        it needs. Nothing else has to be fetched to name the reason — this
+        composes the same two repo calls plus a name lookup, which is why it
+        lives here rather than as a new repository method on a frozen
+        DuckDB/Postgres pair.
+
+        Empty dict on any failure: the reason clause is an addition to a
+        tooltip that already reads correctly without it, so it must never be
+        the thing that takes a Library row down.
+        """
+        try:
+            group_ids = self._user_group_ids(user_id)
+            if not group_ids:
+                return {}
+            rows = self._grants_repo().list_for_groups(list(group_ids), str(resource_type))
+            if not rows:
+                return {}
+            names = {g["id"]: g.get("name") or g["id"] for g in self._groups_repo().list_all()}
+            out: Dict[str, set] = {}
+            for r in rows:
+                gid = r.get("group_id")
+                rid = r.get("resource_id")
+                if not gid or not rid:
+                    continue
+                out.setdefault(rid, set()).add(names.get(gid, gid))
+            return {rid: sorted(gs) for rid, gs in out.items()}
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("granting_groups(%s) failed: %s", resource_type, e)
+            return {}
+
     def _subscribed_ids(self, user_id: str, resource_type: ResourceType) -> set:
         return set(self._subscriptions_repo().list_for_user(user_id, str(resource_type)))
 
@@ -445,7 +483,38 @@ class StackResolver:
         """
         if self.is_required(user_id, resource_type, resource_id):
             raise HTTPException(status_code=400, detail="already_required")
+        # A subscription is a request for a LOCAL COPY, and stack() refuses to
+        # put a hidden or undeliverable status in the pull manifest — so
+        # accepting one here returned {"subscribed": true} for a download that
+        # would never arrive, on every surface at once (Library, chat, CLI,
+        # MCP). Refusing at this chokepoint rather than in the endpoint is what
+        # makes that true of all four.
+        status = self._status_of(resource_type, resource_id)
+        if status in HIDDEN_STATUSES:
+            raise HTTPException(status_code=404, detail="not_found")
+        if status in UNDELIVERABLE_STATUSES:
+            raise HTTPException(status_code=409, detail="not_available_yet")
         self._subscriptions_repo().subscribe(user_id, str(resource_type), resource_id)
+
+    def _status_of(self, resource_type: ResourceType, resource_id: str) -> Optional[str]:
+        """Lifecycle status of a resource, or None for a type that has none.
+
+        Only data packages and memory domains carry a status; every other
+        resource type is always deliverable, and returning None for those
+        keeps the caller's check a plain membership test rather than a
+        per-type branch.
+        """
+        try:
+            if resource_type == ResourceType.DATA_PACKAGE:
+                row = self._data_packages_repo().get(resource_id)
+            elif resource_type == ResourceType.MEMORY_DOMAIN:
+                row = self._memory_domains_repo().get(resource_id)
+            else:
+                return None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("status lookup failed for %s/%s: %s", resource_type, resource_id, e)
+            return None
+        return (row or {}).get("status") or "prod"
 
     def remove_from_stack(
         self,

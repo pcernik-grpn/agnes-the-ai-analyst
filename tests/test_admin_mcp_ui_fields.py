@@ -15,13 +15,16 @@ def _read(name):
     return (TPL / name).read_text()
 
 
-def test_create_form_has_env_and_scope_and_legacy_label():
+def test_the_listing_page_no_longer_carries_a_create_form():
+    """It used to hold a modal with the same eleven fields as the builder, and
+    no connection check — so the route the admin nav leads to was the one that
+    could register a server nothing had ever reached. The fields below are the
+    detail page's job now (see the test underneath); creation is
+    /admin/mcp-sources/new."""
     html = _read("admin_mcp_sources.html")
-    assert 'id="new-env"' in html  # env KEY=VALUE textarea
-    assert 'id="new-scope"' in html  # scope selector
-    assert "legacy" in html.lower()  # auth_secret_env relabelled as legacy/advanced
-    # the misleading claim is gone
-    assert "value itself is not stored in the db" not in html.lower()
+    for dead in ('id="new-env"', 'id="new-scope"', 'id="new-transport"', 'id="confirm-create-btn"'):
+        assert dead not in html, f"the create modal is back on the listing page: {dead}"
+    assert "/admin/mcp-sources/new" in html, "the listing page links to no creation path at all"
 
 
 def test_detail_form_has_env_scope_and_vault_secret_controls():
@@ -95,5 +98,8 @@ def test_auth_method_selects_offer_oauth():
     select without the option silently coerces an oauth source to '' on
     save, flipping auth away from oauth and (by design) purging everyone's
     tokens (Devin Review on #1130)."""
-    for name in ("admin_mcp_sources.html", "admin_mcp_source_detail.html"):
-        assert 'value="oauth"' in _read(name), name
+    # The listing page's own create form is gone (see above), so the two forms
+    # that can still write auth_method are the builder and the detail page.
+    assert 'value="oauth"' in _read("admin_mcp_source_detail.html")
+    builder = Path("app/web/static/js/components/mcp_builder.js").read_text(encoding="utf-8")
+    assert "{ id: 'oauth', label: 'OAuth' }" in builder

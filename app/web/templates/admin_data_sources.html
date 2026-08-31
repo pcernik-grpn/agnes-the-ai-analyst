@@ -501,6 +501,31 @@
     background: color-mix(in srgb, var(--ds-agnes) 18%, var(--ds-surface));
   }
   .ds-wexisting[hidden] { display: none; }
+  /* Raw upstream text: available, not shouted. Genuinely useful to whoever
+     escalates it, useless noise to the admin who needs to retype a token. */
+  .ds-errdetail { margin-top: 8px; }
+  .ds-errdetail summary { cursor: pointer; font-size: 12px; color: var(--ds-text-muted); }
+  .ds-errdetail pre {
+    margin: 6px 0 0; padding: 8px 10px; overflow-x: auto;
+    background: var(--ds-surface-dim); border: 1px solid var(--ds-border-light);
+    border-radius: 6px; font-size: 11.5px; white-space: pre-wrap; word-break: break-word;
+  }
+  /* Registered but not usable. The default panel is a success shape — a soft
+     brand fill and a forward CTA — and wearing it for a connection with no
+     token is what let "Keboola is already connected" sit above a dead end.
+     The blocked variant keeps the layout and drops the success signals. */
+  .ds-wexisting.is-blocked {
+    background: var(--ds-accent-warning-bg, #fdf6e3);
+    border: 1px solid var(--ds-accent-warning-ink, #8a5a00);
+  }
+  /* Nothing in this state is selectable, so the picker goes with the CTA —
+     emptying the <select> alone left a working-looking dropdown with no
+     options in it, which reads as a control that failed to load. */
+  .ds-wexisting.is-blocked .ds-wexisting__act { display: none; }
+  .ds-wexisting.is-blocked .ds-wexisting__tile {
+    background: color-mix(in srgb, var(--ds-accent-warning-ink, #8a5a00) 14%, transparent);
+    color: var(--ds-accent-warning-ink, #8a5a00);
+  }
   /* The connector's own mark, in the connector's own PAIR of tokens — the
      same `-soft` fill under the same ink the picker's Keboola tile above it
      uses. A lifted white tile (the `.cbn-bar-icon` look) would have been
@@ -991,7 +1016,9 @@
       Set <code>AGNES_VAULT_KEY</code> on the server to add data sources here — storage tokens
       are stored in the encrypted server vault. Generate one with:
       <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code>
-      then add <code>AGNES_VAULT_KEY=&lt;value&gt;</code> to your <code>.env</code>.
+      then add <code>AGNES_VAULT_KEY=&lt;value&gt;</code> to your <code>.env</code>
+      and <strong>restart the server</strong> — the key is read at startup, so
+      nothing changes here until it is.
     </div>
   </div>
   {% endif %}
@@ -1171,7 +1198,7 @@
                it. Saying "N Keboola projects" here would also re-plant the
                exact phrase this page was rebuilt to stop using — the guard in
                TestSourcesIsEveryConnector reads the whole body. #}
-            <div class="ds-wexisting__title">Keboola is already connected.</div>
+            <div class="ds-wexisting__title" id="ds-wexisting-title">Keboola is already connected.</div>
             <p class="ds-wexisting__copy" id="ds-wexisting-copy">Go straight to its tables — no URL, no token to paste again.</p>
           </div>
           <div class="ds-wexisting__act">
@@ -1352,6 +1379,15 @@
             <p>Upload documents (PDF, Markdown, CSV, …) into a <strong>Collection</strong> in the
                <a href="/library">Library</a> — {{ instance_brand or 'Agnes' }} ingests them per file and analysts search them with citations.
                A Collection is honest about being a snapshot: when the content changes, a person re-uploads.</p>
+            {# A CSV or spreadsheet is the exception, and the pane used to
+               bury it: `src/ingest/tabular.py` registers an uploaded tabular
+               file as a real queryable table, so an instance with no
+               warehouse behind it is NOT tableless — which is exactly the
+               conclusion an admin drew from the heading above. #}
+            <p><strong>A CSV or Excel file is also a table.</strong> Upload one to a Collection and
+               {{ instance_brand or 'Agnes' }} registers it as a queryable table you can bundle into a
+               data package and share, the same as a warehouse table — so an instance with no
+               warehouse behind it still has tables.</p>
             <p>If the file is an <em>export of a live system</em>, that system is the source — connect it
                (Keboola or BigQuery) and let a data package carry the tables, or the copy starts drifting
                the moment it lands. The trade-offs: <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/admin/collections-vs-data-packages.md" rel="noopener">Collections vs. data packages</a>.</p>
@@ -4058,7 +4094,17 @@ function openWizard(connector) {
   // picker against an id the API has never heard of.
   const existing = document.getElementById("ds-wexisting");
   const orRule = document.getElementById("ds-wor");
-  const browsable = _connections.filter((c) => !c.derived && c.source_type === "keboola");
+  // A connection can only be BROWSED if it holds a credential. This filter
+  // checked `source_type` and nothing else, so a connection whose token
+  // failed validation was offered under "Keboola is already connected — no
+  // token to paste again", and Choose tables then dead-ended on
+  // "no token available (vault empty, token_env unset)" with a green tick on
+  // the step behind it. Same predicate the source card and the setup
+  // checklist use, so the three cannot disagree about what "connected" means.
+  const _hasCredential = (c) => c.has_secret === true || !!(c.token_env || "").trim();
+  const keboolaConns = _connections.filter((c) => !c.derived && c.source_type === "keboola");
+  const browsable = keboolaConns.filter(_hasCredential);
+  const needsToken = keboolaConns.filter((c) => !_hasCredential(c));
   if (browsable.length) {
     // The option carries what the project already holds. "Keboola AI" alone
     // does not say whether picking it is worth anything; "· 3 tables" does,
@@ -4072,10 +4118,42 @@ function openWizard(connector) {
       })
       .join("");
     _syncDropdownRebuild(wexistingSel);
-    document.getElementById("ds-wexisting-copy").textContent = browsable.length === 1
+    const alsoBroken = needsToken.length
+      ? ` ${needsToken.length} other project${needsToken.length === 1 ? "" : "s"} still need${needsToken.length === 1 ? "s" : ""} a token.`
+      : "";
+    document.getElementById("ds-wexisting-copy").textContent = (browsable.length === 1
       ? "Go straight to its tables — no URL, no token to paste again."
-      : `Pick one of your ${browsable.length} connected projects and go straight to its tables.`;
+      : `Pick one of your ${browsable.length} connected projects and go straight to its tables.`) + alsoBroken;
+    existing.classList.remove("is-blocked");
+    document.getElementById("ds-wexisting-title").textContent = "Keboola is already connected.";
+    document.getElementById("ds-wexisting-btn").hidden = false;
     existing.hidden = false;
+    orRule.hidden = false;
+  } else if (needsToken.length) {
+    // Connections exist but none can be read. Saying nothing here sent the
+    // admin to "connect a new project" while the half-finished one sat on
+    // the page behind the drawer; claiming they were connected sent them
+    // into the dead end. Name the state and where it is fixed.
+    const one = needsToken.length === 1;
+    document.getElementById("ds-wexisting-copy").textContent = one
+      ? `“${needsToken[0].name || needsToken[0].id}” is registered but has no token stored, so its tables cannot be listed. `
+        + `Add a token on its card below, or connect a new project.`
+      : `${needsToken.length} projects are registered but have no token stored, so their tables cannot be listed. `
+        + `Add a token on their cards below, or connect a new project.`;
+    document.getElementById("ds-wexisting-title").textContent = one
+      ? "A Keboola project is registered, but not usable yet."
+      // Deliberately does not name the connector in the plural: that phrasing
+      // is banned outright by TestSourcesIsEveryConnector, which reads the
+      // whole served body (comments included), because it re-plants the
+      // single-connector framing this page was rebuilt to drop.
+      : "None of the registered projects are usable yet.";
+    document.getElementById("ds-wexisting-select").innerHTML = "";
+    _syncDropdownRebuild(document.getElementById("ds-wexisting-select"));
+    // No "Choose tables" — that button led straight to
+    // "Failed to list tables: no token available".
+    document.getElementById("ds-wexisting-btn").hidden = true;
+    existing.hidden = false;
+    existing.classList.add("is-blocked");
     orRule.hidden = false;
   } else {
     existing.hidden = true;
@@ -4098,6 +4176,35 @@ function openWizard(connector) {
 function closeWizard() {
   document.getElementById("ds-wizard-overlay").classList.remove("show");
   document.body.style.overflow = "";
+}
+
+// A connector failure reaches the admin as whatever the upstream API said —
+// "storage_api_error: GET https://…/tokens/verify -> HTTP 401: {'error':
+// 'Invalid access token', 'exceptionId': 'kbc-us-east-1-…'}". That is the
+// single most likely first-run outcome, and it is presented as a stack trace:
+// the one actionable fact (the token is wrong) is never stated, and a vendor
+// exception hash reads as "something is deeply broken" rather than "retype
+// the token". Name the cause; keep the raw text for whoever needs it.
+function _connErrorCopy(detail) {
+  const d = String(detail == null ? "" : detail);
+  let plain;
+  if (/tokenInvalid|Invalid access token|401|unauthor/i.test(d)) {
+    plain = "That token was rejected. Check you copied a Storage API token for the right project — not an expired one, and not a token for a different stack.";
+  } else if (/403|forbidden|permission/i.test(d)) {
+    plain = "That token was accepted but is not allowed to read this project. It likely lacks the permissions Agnes needs, or belongs to another project.";
+  } else if (/ENOTFOUND|getaddrinfo|Name or service not known/i.test(d)) {
+    plain = "That host could not be found. Check the connection URL.";
+  } else if (/timeout|timed out|ETIMEDOUT/i.test(d)) {
+    plain = "The connection timed out. The host may be unreachable from this instance.";
+  } else if (/50\d|internal server error|bad gateway/i.test(d)) {
+    plain = "The upstream service returned an error. This is usually temporary — try again shortly.";
+  } else {
+    plain = "The connection could not be verified.";
+  }
+  const raw = d.trim()
+    ? '<details class="ds-errdetail"><summary>Technical details</summary><pre>' + _esc(d) + '</pre></details>'
+    : "";
+  return { plain, raw };
 }
 
 async function connectAndValidate() {
@@ -4190,9 +4297,11 @@ async function connectAndValidate() {
     });
     if (!secretResp.ok && secretResp.status !== 204) {
       const sb = await secretResp.json().catch(() => ({}));
-      errEl.innerHTML = "Connection saved but storing the token failed: " + _esc(sb.detail || "unknown error") +
-        `. Fix the token and retry — this connection is reused, not duplicated — or ` +
-        `<a href="#" onclick="deleteConn('${connId}'); closeWizard(); return false;">discard it</a>.`;
+      const ec = _connErrorCopy(sb.detail || "");
+      errEl.innerHTML = ec.plain +
+        ` Retry above — this connection is reused, not duplicated — or ` +
+        `<a href="#" onclick="deleteConn('${connId}'); closeWizard(); return false;">discard it</a>.` +
+        ec.raw;
       errEl.style.display = "block";
       return;
     }
@@ -4201,8 +4310,11 @@ async function connectAndValidate() {
     const testResp = await fetch(`${API_CONNECTIONS}/${connId}/test`, { method: "POST", credentials: "include" });
     const testData = await testResp.json().catch(() => ({}));
     if (!testResp.ok || !testData.ok) {
-      errEl.innerHTML = "Connection test failed: " + _esc(testData.error || testData.detail || "unknown error") +
-        `. The connection was saved — fix the URL/token and retry, or <a href="#" onclick="deleteConn('${connId}'); closeWizard(); return false;">discard it</a>.`;
+      const tc = _connErrorCopy(testData.error || testData.detail || "");
+      errEl.innerHTML = tc.plain +
+        ` The connection was saved — fix the URL or token above and retry, or ` +
+        `<a href="#" onclick="deleteConn('${connId}'); closeWizard(); return false;">discard it</a>.` +
+        tc.raw;
       errEl.style.display = "block";
       return;
     }
@@ -5491,7 +5603,21 @@ document.addEventListener("keydown", function (e) {
 // "already connected" shortcut, and racing it hid the strip on exactly the
 // entry path that needs it most.
 loadConnections().then(() => {
-  if (new URLSearchParams(window.location.search).has("add")) openWizard();
+  // Honour the same precondition as `#ds-add-btn`, which is `disabled` when
+  // no vault key is configured. This deep link is the Overview checklist's
+  // CTA, and it opened the wizard unconditionally — so an admin on an
+  // instance that cannot store a secret filled in the whole form behind a
+  // banner that had already told them it would fail, and the attempt left a
+  // credential-less connection row behind.
+  if (new URLSearchParams(window.location.search).has("add")) {
+    const addBtn = document.getElementById("ds-add-btn");
+    if (addBtn && addBtn.disabled) {
+      const strip = document.querySelector(".apg-strip--warn[role='alert']");
+      if (strip) strip.scrollIntoView({ block: "center", behavior: "smooth" });
+    } else {
+      openWizard();
+    }
+  }
 });
 </script>
 

@@ -74,16 +74,39 @@ guard into decoration. Confirm on a clean tree (`git stash`) and note it.
 
 ## Gate 3 — the tests for the behavior you changed
 
-Run the tests covering the code you touched, then the full suite — the same
-command CI runs:
+Two lanes, in order. **Neither of them is the full suite** — CI runs that on the
+push, across 12 parallel jobs, and running it locally as well is what turns a
+two-line fix into a two-hour merge.
 
 ```bash
-.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
+.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q
+.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q
 ```
+
+- **`--lane impacted`** runs only the test files your branch's diff plausibly
+  touches (it always includes test files you edited). When the diff is too broad
+  to target — a merge magnet like `src/db.py`, or a match set covering more than
+  a quarter of the suite's runtime — it says so and degrades to `fast` rather
+  than quietly expanding to 24 000 tests. `python3 scripts/dev/impacted_tests.py --json`
+  shows the selection and the reason without running anything.
+- **`--lane fast`** (2:57 for 12 989 tests; 1:59 with `AGNES_TEST_MAX_WORKERS=10`) is everything under the ~150 ms floor
+  a test pays the moment it builds a `system.duckdb`, **plus every test with no
+  recorded duration** — so the test you just wrote is always in the lane, even
+  if it is slow.
+
+Both print the lane in the pytest header and a kept/deselected line in the
+summary. Quote that line, not just "green": a lane passing is a different claim
+from the suite passing, and the difference is the whole point of the gate.
 
 Failures in code you touched: fix before pushing. Failures unrelated to your
 diff: confirm with `git stash` that they reproduce on a clean branch, note them
 in the PR body, do not block on them.
+
+**Run the full suite locally only when** you touched a merge magnet
+(`src/db.py`, `src/repositories/__init__.py`, `tests/conftest.py`,
+`app/main.py`, `pyproject.toml`), or CI is red and the failure will not
+reproduce under a narrower lane. "I want to be sure" is not a reason — CI is
+already computing that answer, in parallel, for free.
 
 ## Gate 4 — review (judgment only)
 

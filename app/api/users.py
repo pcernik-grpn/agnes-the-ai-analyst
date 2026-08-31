@@ -96,6 +96,9 @@ class UserResponse(BaseModel):
     deactivated_at: Optional[str] = None
     invite_url: Optional[str] = None
     invite_email_sent: Optional[bool] = None
+    #: Set when the address is outside `auth.allowed_domain`. Advisory, never
+    #: a refusal — see `create_user`.
+    domain_warning: Optional[str] = None
     # ── Outcome fields (admin People lens). Both answer the question an
     # admin actually has about a row — "does this person get data, and is it
     # reaching them?" — which account plumbing (created/deactivated) cannot.
@@ -228,6 +231,7 @@ def _to_response(
     invite_url: Optional[str] = None,
     invite_email_sent: Optional[bool] = None,
     pkg_grants: Optional[dict] = None,
+    domain_warning: Optional[str] = None,
 ) -> UserResponse:
     groups = _user_groups(u["id"])
     # See UserResponse for why this is derived rather than stored, and why an
@@ -238,6 +242,7 @@ def _to_response(
     for g in groups:
         reachable |= pkg_grants.get(g.id, set())
     return UserResponse(
+        domain_warning=domain_warning,
         id=u["id"],
         email=u["email"],
         name=u.get("name"),
@@ -330,6 +335,28 @@ async def create_user(
         raise HTTPException(status_code=422, detail="A valid email address is required")
     if repo.get_by_email_ci(email):
         raise HTTPException(status_code=409, detail="User with this email already exists")
+    # Outside the sign-in allowlist? Say so, but do NOT refuse. Google,
+    # Microsoft and the magic-link provider all enforce `auth.allowed_domain`,
+    # so such an account cannot sign in through any of them — but the keboola,
+    # password and sso providers do not check it, so an out-of-domain account
+    # is legitimate on an instance offering one of those. Refusing here would
+    # break that configuration; saying nothing is how an admin completes the
+    # whole invite flow, ticks the checklist, and creates an account that can
+    # never authenticate.
+    domain_warning = None
+    try:
+        from app.instance_config import get_allowed_domains
+
+        allowed = get_allowed_domains()
+        if allowed and domain.lower() not in allowed:
+            domain_warning = (
+                f"{email} is outside this instance's sign-in domains "
+                f"({', '.join(allowed)}). They will not be able to sign in with "
+                f"Google, Microsoft or a magic link — only with a provider that "
+                f"does not check the domain."
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("allowed-domain check failed for %s", email)
     import secrets
 
     user_id = str(uuid.uuid4())
@@ -378,7 +405,13 @@ async def create_user(
         _audit(conn, user["id"], "user.invite", user_id, {"email": email, "email_sent": invite_email_sent})
 
     created = repo.get_by_id(user_id)
-    return _to_response(created, conn, invite_url=invite_url, invite_email_sent=invite_email_sent)
+    return _to_response(
+        created,
+        conn,
+        invite_url=invite_url,
+        invite_email_sent=invite_email_sent,
+        domain_warning=domain_warning,
+    )
 
 
 @router.patch("/{user_id}", response_model=UserResponse)

@@ -12,9 +12,11 @@ from typing import Any
 from .exceptions import (
     LLMAuthError,
     LLMFormatError,
+    LLMModelNotFoundError,
     LLMRateLimitError,
     LLMRefusalError,
     LLMTimeoutError,
+    LLMUnsupportedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,8 @@ class AnthropicExtractor:
 
         Raises:
             LLMAuthError: Invalid API key.
+            LLMModelNotFoundError: Model unknown to this provider/deployment.
+            LLMUnsupportedError: The provider rejected the request as built.
             LLMRateLimitError: Rate limited after all retries.
             LLMTimeoutError: Timeout/connection error after all retries.
             LLMFormatError: Response is not valid JSON.
@@ -224,6 +228,20 @@ class AnthropicExtractor:
             raise LLMRateLimitError("Anthropic rate limited") from e
         except (anthropic.APITimeoutError, anthropic.APIConnectionError) as e:
             raise LLMTimeoutError(f"Anthropic connection error ({type(e).__name__})") from e
+        except anthropic.NotFoundError as e:
+            # 404: the deployment has never heard of this model. On Vertex that
+            # usually means it is enabled in Model Garden for a different
+            # project/region than the configured pair. Permanent, and only an
+            # operator can fix it — so it is typed rather than left to escape
+            # as a bare SDK exception the callers can only call "unknown".
+            raise LLMModelNotFoundError(
+                f"model {self._model!r} not available for this provider/deployment: {e}"
+            ) from e
+        except anthropic.BadRequestError as e:
+            # 400: this deployment rejected the request as built. Carries the
+            # provider's own words, which are the only thing that says WHICH
+            # part it disliked.
+            raise LLMUnsupportedError(f"request rejected by the provider: {e}") from e
 
         # Check for truncation - raise and let outer retry loop handle it
         if response.stop_reason == "max_tokens":

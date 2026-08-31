@@ -953,10 +953,7 @@ class TestEditPageBanner:
         # Edit must reflect the in-flight review (locked). The blue theme spells
         # it in the button label; the default paper look disables the store-menu
         # row and puts the reason in its title.
-        assert (
-            "review in flight" in r.text
-            or "Wait for the in-flight review to finish before editing." in r.text
-        )
+        assert "review in flight" in r.text or "Wait for the in-flight review to finish before editing." in r.text
 
 
 class TestAuditLogPerVersion:
@@ -3131,3 +3128,83 @@ class TestDetailHeroOrdering:
         r = web_client.get(f"/marketplace/flea/{eid}", cookies=owner_cookies)
         assert r.status_code == 200
         self._assert_order(r.text)
+
+
+class TestServerSideCoverHero:
+    """Perf: the detail-hero cover image renders in the initial HTML instead
+    of being injected by JS after the page's own detail XHR resolves it
+    (router.marketplace_flea_detail / _flea_skill_detail / _flea_agent_detail
+    computing ``cover_image_url`` via ``app.api.store.entity_cover_url``, the
+    same helper the JSON endpoint's ``cover_photo_url`` uses)."""
+
+    # Minimal 1x1 transparent PNG -- big enough to exercise the upload path,
+    # far under the pre-commit 500 KB fixture cap.
+    _TINY_PNG = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    def _upload_with_photo(self, client, cookies, *, entity_type, name):
+        r = client.post(
+            "/api/store/entities",
+            files={
+                "file": (
+                    "s.zip",
+                    _make_plugin_zip(name) if entity_type == "plugin" else _make_skill_zip(name),
+                    "application/zip",
+                ),
+                "photo": ("cover.png", self._TINY_PNG, "image/png"),
+            },
+            data={"type": entity_type, "description": _OK_DESC},
+            cookies=cookies,
+        )
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    def test_skill_hero_carries_cover_img_server_side(self, web_client):
+        _, cookies = _create_user(web_client, "coverskill@x.com")
+        eid = self._upload_with_photo(web_client, cookies, entity_type="skill", name="coverskill")
+        r = web_client.get(f"/marketplace/flea/{eid}", cookies=cookies)
+        assert r.status_code == 200
+        # &w=480 is the responsive-srcset variant request (cover_w filter);
+        # a bare ?v=1 src would now be the pre-srcset shape.
+        assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
+        assert 'fetchpriority="high"' in r.text
+
+    def test_plugin_hero_carries_cover_img_server_side(self, web_client):
+        _, cookies = _create_user(web_client, "coverplugin@x.com")
+        eid = self._upload_with_photo(web_client, cookies, entity_type="plugin", name="coverplugin")
+        r = web_client.get(f"/marketplace/flea/{eid}", cookies=cookies)
+        assert r.status_code == 200
+        assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
+        # The hero <img> comes from the shared detail.hero() macro: eager
+        # (no ``loading``), fixed 480 variant with intrinsic size, and no
+        # srcset — the tile is a fixed CSS-px box, a 960 can't show a gain.
+        img_start = r.text.index(f'<img src="/api/store/entities/{eid}/photo')
+        hero_img = r.text[img_start : r.text.index(">", img_start) + 1]
+        assert 'fetchpriority="high"' in hero_img
+        assert "loading=" not in hero_img
+        assert "srcset=" not in hero_img
+        assert 'width="480"' in hero_img
+        assert 'height="240"' in hero_img
+
+    def test_inner_skill_hero_carries_cover_img_server_side(self, web_client):
+        """The nested flea skill page (marketplace_flea_skill_detail) resolves
+        the cover from the parent plugin entity — the handler that was missed
+        on the first pass, so it gets its own regression test."""
+        _, cookies = _create_user(web_client, "coverinner@x.com")
+        eid = self._upload_with_photo(web_client, cookies, entity_type="plugin", name="coverinner")
+        r = web_client.get(f"/marketplace/flea/{eid}/skill/dummy", cookies=cookies)
+        assert r.status_code == 200
+        assert f'src="/api/store/entities/{eid}/photo?v=1&amp;w=480"' in r.text
+        assert 'fetchpriority="high"' in r.text
+
+    def test_no_photo_no_cover_img(self, web_client):
+        """PROOF-BEFORE contract: an entity with no cover renders no <img>
+        in the hero-icon tile at all."""
+        _, cookies = _create_user(web_client, "nocover@x.com")
+        eid = _upload_clean(web_client, cookies, name="nocover")
+        r = web_client.get(f"/marketplace/flea/{eid}", cookies=cookies)
+        assert r.status_code == 200
+        assert "<img" not in r.text.split('id="hero-icon"')[1].split("</div>")[0]

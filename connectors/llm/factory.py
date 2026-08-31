@@ -167,6 +167,35 @@ def create_extractor(ai_config: dict) -> StructuredExtractor:
         )
 
 
+def llm_configured(ai_config: dict | None = None) -> bool:
+    """Whether a provider is configured, without building a client.
+
+    Answers at RENDER time what :func:`create_extractor_from_env_or_config`
+    answers at call time. A page that can only learn "there is no model" by
+    dispatching a turn has to greet the user, take their message, and only
+    then withdraw the offer — which is what both builders did, discarding
+    what the person had typed.
+
+    Asks the resolution below rather than restating it. A first attempt
+    restated it — "is there an ai: block, or one of three env vars?" — and was
+    wrong in the ordinary case: a config carrying ``provider: anthropic`` with
+    no key present resolves as configured by that reading and raises
+    ``ValueError`` when the turn actually builds the client. The page then
+    promised an assistant that could not answer, which is the exact failure
+    this predicate exists to prevent.
+
+    Building the extractor is local work — imports and argument validation, no
+    network — and this runs once per builder page render.
+    """
+    if ai_config is None:
+        ai_config = _load_ai_config_or_none()
+    try:
+        create_extractor_from_env_or_config(ai_config)
+        return True
+    except ValueError:
+        return False
+
+
 def create_extractor_from_env_or_config(
     ai_config: dict | None,
 ) -> StructuredExtractor:

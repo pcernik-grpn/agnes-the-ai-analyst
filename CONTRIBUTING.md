@@ -11,7 +11,7 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 3. Keep changes vendor-agnostic — this is the public OSS distribution. No
    customer-specific deployments, project IDs, internal hostnames, or
    cross-references to private repos in code, config, comments, docs, or commits.
-4. Run the full suite before pushing: `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`.
+4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
 5. Add a `## [Unreleased]` CHANGELOG bullet for any user-visible behavior change.
 
 ## Testing conventions
@@ -49,9 +49,10 @@ Before claiming a change is done, run the checks cheapest-first and fix what
 fails until each passes:
 
 ```bash
-python3 scripts/verify_syncmap.py          # instant, no venv — the sync-map rows below
-.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
-/agnes-review                              # judgment only, once the above are green
+python3 scripts/verify_syncmap.py                                       # instant, no venv
+.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q   # seconds to ~2 min
+.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q       # ~3 min
+/agnes-review                            # judgment only, once the above are green
 ```
 
 `scripts/verify_syncmap.py` covers the sync-map rows that have no test guard.
@@ -59,6 +60,30 @@ The ordering is the point: anything a script can decide should never cost an LLM
 reviewer a finding. The step-by-step loop (which guards to run for which diff,
 how to treat WARN findings, when to add a new check) is
 `.claude/skills/verify-agnes-change/SKILL.md`.
+
+### Test lanes — what to run locally, and what CI runs
+
+**The full suite is CI's job, not yours.** It is ~24 000 tests: 12 parallel jobs
+of ~15 minutes each in CI, and 10:28 locally. Running it before every push — then
+again after each review round — is where a two-line fix turns into a two-hour
+merge, and it buys nothing CI is not about to compute anyway. The pre-push gate
+goes from 12:25 to 2:57 measured on the same machine.
+
+| Lane | Command | What it is |
+|---|---|---|
+| `impacted` | `pytest tests/ connectors/ --lane impacted -n auto -q` | Only the test files this branch's diff plausibly touches. Falls back to `fast` — never to the full suite — when the diff is too broad to target (a merge magnet like `src/db.py`, or a match set covering >25% of the suite's runtime). Inspect the selection with `python3 scripts/dev/impacted_tests.py --json`. |
+| `fast` | `pytest tests/ connectors/ --lane fast -n auto -q` | 12 989 tests, **2:57** (1:59 with `AGNES_TEST_MAX_WORKERS=10` on a 14-core machine — the default cap of 6 is tuned for the full suite's memory profile, and the fast lane is cheaper per worker). Every test whose recorded runtime sits under the ~150 ms floor a test pays the moment it builds a `system.duckdb` — i.e. the half of the suite that is pure unit work — **plus every test with no recorded duration**, so a test you just wrote is always in. |
+| full | `pytest tests/ connectors/ -n auto -q` | 24 231 tests, **10:28**. CI runs this on every push. Locally: when CI is red and the failure will not reproduce under a narrower lane, or when you touched a merge magnet and want the answer before the round trip. |
+
+Both lanes print which lane ran in the pytest header and a kept/deselected line
+in the summary, so a green run can never be mistaken for a full one. Machinery:
+the root `conftest.py` and `scripts/dev/impacted_tests.py`; ratchets in
+`tests/test_test_lanes.py` (which fail if the fast lane stops being fast, or
+starts covering so little that green means nothing).
+
+**Where a full local run still earns its keep:** a change to `src/db.py`, the
+repository factory, `tests/conftest.py` or `app/main.py` — the merge magnets the
+selector refuses to guess about. Everything else: push, and read CI.
 
 **A PR that gets no CI is not reviewable, whatever it targets.** `ci.yml`'s
 `pull_request` trigger therefore carries no `branches:` filter — a PR into a
@@ -97,6 +122,7 @@ mirror is missing.
 | `query_mode='remote'` table | `_remote_attach` row in `extract.duckdb` | BLOCKING | `scripts/verify_syncmap.py` (connector must mention `_remote_attach`) |
 | New function-scoped test fixture needing a FastAPI app | request the session-shared `shared_app` (or `seeded_app`) — never call `create_app()` per test (~430 ms each) | BLOCKING | `tests/test_shared_app_contract.py` |
 | New web page | extends `base_ds.html` / `base_page.html` (never `base.html`); CSS in `head_extra` | BLOCKING | `tests/test_design_system_contract.py` (partial) |
+| A template or JS string that renders a cover `<img>` for a grid card or page hero | carries the perf contract for its layout: a grid card (`width:100%` of its column) carries `loading="lazy" decoding="async" width height srcset sizes`; a page hero (fixed-size tile) is eager with `fetchpriority="high"`, never lazy, fetches the fixed 480-px variant directly, and never carries a srcset. Exempt: an external (non-mirrored) cover URL never gets a srcset — there's no `?w=` variant to request for it; a one-off admin upload preview/thumbnail (e.g. `admin_corporate_memory.html`'s `onCoverFilePickedCmd`) isn't a repeated card layout and carries none of this contract | BLOCKING | `tests/test_cover_image_perf_contract.py` (partial — the JS string sites aren't pinned by tests) |
 | New/renamed/removed user-facing web page or admin-nav entry | the chat agent's web-UI guide `app/initial_workspace_default/.claude/skills/agnes-web-guide/` — add/update/remove the page's entry so the agent describes the same product the user sees | BLOCKING | `tests/test_web_guide_skill_sync.py` (both directions: unmentioned live page, mentioned dead path) |
 | New/changed CLI or MCP read/find command | command-UX standard (`.claude/skills/agnes-conventions/references/command-ux.md`): default scope = auto/everywhere, origin labeled, `--scope` (never a new boolean scope flag), positional term + `--limit` + `--json`, "not found" hints the next step | BLOCKING | `scripts/verify_syncmap.py` (new boolean scope flag only — the rest is review) |
 | New MCP foundation tool | defined in `app/api/mcp/foundation_tools.py` + name appended to `FOUNDATION_TOOL_NAMES` — never hand-added to a single transport module | BLOCKING | `tests/test_mcp_tool_parity.py` |

@@ -237,15 +237,14 @@ export const TOURS = {
   'skill-builder': [
     {
       page: '/skills',
-      // Anchors on the TYPE cards, which are the first thing on the page and
-      // the first decision to make. It briefly anchored on the name field
-      // instead; that broke when type became step 1, because the name field
-      // does not exist in the DOM until a type is chosen — the coach-mark had
-      // nothing to point at. The cards are always present, including on the
-      // ?type= deep link where step 1 lands collapsed.
-      selector: '[data-sk-type], [data-sk-change]',
+      // Anchors on the TYPE cards — the first decision on the page. It
+      // briefly anchored on the name field instead; that broke because the
+      // name field does not exist in the DOM until a type is chosen. The
+      // cards are present whenever the type is not yet answered, which is
+      // every entry this tour is launched from.
+      selector: '[data-sk-type], [data-sec="identity"]',
       title: 'Start here',
-      desc: 'Pick what you are building — a skill, a plugin, or an agent template. The rest of the form follows from that choice.',
+      desc: 'Describe what you want in the conversation on the left and it fills this form in — or write the form yourself. Nothing is shared until you press Save to Library.',
       points: [
         'Choose who can use it: just you, or everyone in the organization.',
         'Save to Library and it appears in your Library, ready to share.',

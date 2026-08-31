@@ -1979,7 +1979,14 @@ async def test_connection(
             connection_id,
             _log_host(stack_url),
         )
-        return {"ok": False, "error": "no token available (vault empty, token_env unset)"}
+        # "vault empty, token_env unset" names the two places the server
+        # looked. An admin reads it on the source card's Test button and
+        # learns nothing they can act on — the fix is to paste a token, and
+        # the message never said so.
+        return {
+            "ok": False,
+            "error": "No credential stored for this connection — add a Storage API token on its card.",
+        }
 
     url = f"{stack_url}/v2/storage/tokens/verify"
     # Outcome log lines carry the status/reason but never the response body —
@@ -2171,7 +2178,10 @@ async def list_connection_tables(
     if not token:
         raise HTTPException(
             status_code=400,
-            detail="no token available (vault empty, token_env unset)",
+            detail=(
+                "no_credential: this connection has no Storage API token stored, "
+                "so its tables cannot be listed — add one on its card in Data → Sources."
+            ),
         )
 
     client = KeboolaStorageClient(url=stack_url, token=token)

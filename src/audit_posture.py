@@ -490,6 +490,7 @@ POSTURE: dict[str, str] = {
     "POST /api/store/entities/{entity_id}/versions/{version_no}/restore": "store.entity.restore",
     "POST /api/store/import-bundle": "store.bundle.import",
     "PUT /api/store/entities/{entity_id}": "store.entity.update",
+    "PUT /api/store/entities/{entity_id}/from-markdown": "store.entity.update",
     "PUT /api/store/entities/{entity_id}/publisher": "store.entity.publisher",
     "PUT /api/store/entities/{entity_id}/verification": "store.entity.verification",
     # -- app.api.store_lint_admin ----------------------------------------------
@@ -957,6 +958,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/store/entities/{entity_id}": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/docs/{filename}": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/files": "exempt:ui_support",
+    "GET /api/store/entities/{entity_id}/markdown": "exempt:ui_support",
     "GET /api/store/entities/{entity_id}/photo": "exempt:static",
     "GET /api/store/entities/{entity_id}/status": "exempt:ui_support",
     "GET /api/store/owners": "exempt:ui_support",
@@ -1047,6 +1049,8 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/marketplaces": "exempt:ui_support",
     "GET /admin/mcp-sources": "exempt:ui_support",
     "GET /admin/mcp-sources/new": "exempt:ui_support",
+    "GET /admin/mcp-sources/{source_id}/edit": "exempt:ui_support",
+    "GET /admin/data-packages/{pkg_id}/edit": "exempt:ui_support",
     "GET /admin/mcp-sources/{source_id}": "exempt:ui_support",
     "GET /admin/mcp-tools/{tool_id}/grants": "exempt:ui_support",
     "GET /admin/news": "exempt:ui_support",
@@ -1372,6 +1376,10 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "store_rate": "store.entity.rate",
     "store_status": "exempt:ui_support",
     "store_publish_markdown": "store.entity.create",
+    # Reading a document back is an owner-scoped read, like store_status.
+    "store_read_markdown": "exempt:ui_support",
+    # Writing one over an entity is the same act the REST sibling audits.
+    "store_edit_markdown": "store.entity.update",
     "store_compose_plugin": "store.entity.create",
     "marketplace_search": "exempt:ui_support",
     "marketplace_detail": "exempt:ui_support",
