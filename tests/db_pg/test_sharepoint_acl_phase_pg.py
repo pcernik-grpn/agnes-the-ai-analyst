@@ -199,3 +199,65 @@ def test_sharepoint_only_sharing_set_makes_a_seeded_claim_answerable(pg_env, fac
 
     claims = facts.claims(alice, fact_id)
     assert claims["claims"][0]["quote"] == "Sharing set exists in SharePoint only."
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-31 plan, Task 6 — retroactive cleanup's stable-id matching path.
+# PG-only: ``corpus_file_sources`` has no DuckDB sibling (A3 ratchet, see
+# ``src/repositories/corpus_file_sources_pg.py``'s own module docstring),
+# so this half of ``_cleanup_connection_content``'s matcher (as opposed to
+# the path-prefix half, covered on DuckDB by
+# ``tests/test_sharepoint_subtree_sweep.py::TestRetroactiveCleanup``) can
+# only be exercised here.
+# ---------------------------------------------------------------------------
+
+
+def test_stable_id_match_purges_file_outside_excluded_folder(pg_env, monkeypatch):
+    """A file's PATH sits outside any excluded folder (so the cleanup's
+    path-prefix matcher would NOT catch it), but its Graph item id is
+    itself the excluded (unique-permission) file — the crawler could have
+    placed it under a differently-named local path than the one Graph
+    reports. Fails if the file survives cleanup (stable-id matching
+    silently skipped, e.g. because ``corpus_file_sources_repo()`` raised
+    and was not caught) or if the path-based match would have caught it
+    anyway (which would make this assertion vacuous)."""
+    from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo, users_repo
+
+    users_repo().create(id="uploader1", email="uploader1@test.com", name="Uploader")
+    col_id = file_corpora_repo().create(
+        name="Stable Id Col", slug="stable-id-col", description=None, created_by="uploader1"
+    )
+    conn_id = _make_connection("conn-s6-pg")
+    _add_scope(conn_id, source_scope_id="root", collection_id=col_id)
+
+    file_id = corpus_files_repo().add(
+        corpus_id=col_id,
+        filename="F.docx",
+        sha256="sha-f",
+        file_type="text/plain",
+        size_bytes=1,
+        storage_path=None,
+        path="open/F.docx",  # NOT under the excluded item's own rel_path ("F.docx")
+    )
+    corpus_file_sources_repo().upsert(corpus_file_id=file_id, corpus_id=col_id, source_stable_id="graph:F")
+
+    monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+    async def fake_children(token, drive_id, item_id):
+        if item_id == "root":
+            return [{"id": "F", "name": "F.docx", "is_folder": False, "child_count": 0}]
+        raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+    async def fake_probe(token, drive_id, item_ids):
+        return {i: True for i in item_ids}
+
+    monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+    monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+    result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+    assert result["errors"] == []
+    assert corpus_files_repo().list_for_corpus(col_id) == [], (
+        "the file must be purged by its Graph stable id even though its local path "
+        "falls outside the excluded item's own rel_path"
+    )
