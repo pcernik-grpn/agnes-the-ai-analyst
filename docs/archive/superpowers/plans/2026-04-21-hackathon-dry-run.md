@@ -36,14 +36,14 @@ Before starting, the executing agent MUST verify all of the following. If any fa
 
   Expected: line containing `Logged in to github.com` and a line listing scopes that include `workflow`. If `workflow` scope is missing, abort with message: `Run: gh auth refresh -h github.com -s workflow`.
 
-- [ ] **`gcloud` authenticated** to project `internal-prod`. Run:
+- [ ] **`gcloud` authenticated** to project `<gcp-project>`. Run:
 
   ```bash
   gcloud config get-value project
   gcloud auth list --filter=status:ACTIVE --format="value(account)"
   ```
 
-  Expected: project is `internal-prod`, at least one active account. If not, abort with message: `Run: gcloud config set project internal-prod && gcloud auth login`.
+  Expected: project is `<gcp-project>`, at least one active account. If not, abort with message: `Run: gcloud config set project <gcp-project> && gcloud auth login`.
 
 - [ ] **SSH to `agnes-dev` works** (OS Login). Run:
 
@@ -412,7 +412,7 @@ Before starting, the executing agent MUST verify all of the following. If any fa
 
   ```bash
   cd /tmp/agnes-infra-keboola/terraform
-  export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.agnes-keys/agnes-deploy-internal-prod-key.json"
+  export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.agnes-keys/agnes-deploy-<gcp-project>-key.json"
   [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ] || { echo "SA key not found — skipping plan"; exit 2; }
   terraform init -input=false -upgrade=false
   terraform plan -input=false -no-color -out=/tmp/dryrun-tfplan.bin > /tmp/dryrun-tfplan.txt 2>&1
@@ -790,7 +790,7 @@ Before starting, the executing agent MUST verify all of the following. If any fa
 
   1. <If protection-note said NONE/PARTIAL:> Configure required status check 'test' on main branch of keboola/agnes-the-ai-analyst.
   2. Pin prod image_tag in agnes-infra-keboola/terraform/terraform.tfvars from "stable" to "stable-2026.04.XX" (current running version). Revert after hackathon.
-  3. Rotate admin password '1234' on prod (<prod-vm-ip>:8000/login) and dev (<dev-vm-ip>:8000/login).
+  3. Rotate admin password '<password>' on prod (<prod-vm-ip>:8000/login) and dev (<dev-vm-ip>:8000/login).
   4. Wire notification_channel_ids in tfvars so uptime alerts actually notify someone.
   5. Share the hackathon 1-pager + switch-dev-vm.sh via the team Slack channel.
   6. Review PR $(cat /tmp/dryrun-baseline/deliverable-pr.txt) and merge if switch-dev-vm.sh looks good.

@@ -429,7 +429,25 @@ function renderJourneyPanel() {
           title="Replay the ${brand} tour" aria-label="Replay the tour">↻</button>
         ${
           inRailPopover
-            ? ""
+            ? // The collapse chevron, LAST in the row so it sits furthest
+              // right — the panel's outermost control, past the one that acts
+              // on the panel's contents. It closes the popover, which the card
+              // already did four ways (second click on the launcher,
+              // click-away, Escape, mouse-leave) and advertised none of; the
+              // chevron is what makes "this can be put away" visible.
+              //
+              // No handler bound here on purpose: rail_popover.js listens for
+              // `[data-rail-popover-collapse]` on the document, because this
+              // innerHTML is rebuilt on every journey update and a per-button
+              // handler would be discarded with it the first time a step
+              // completed.
+              //
+              // Rail only. The inline /chat panel is part of the page rather
+              // than a popover hanging off a launcher, so there is nothing to
+              // collapse there — it keeps the "×" instead, which is a
+              // different action (dismiss for the page load).
+              `<button type="button" class="cloud-chat-journey-iconbtn" data-rail-popover-collapse
+          title="Collapse" aria-label="Collapse onboarding checklist">⌄</button>`
             : `<button type="button" class="cloud-chat-journey-iconbtn" data-journey-close
           title="Close" aria-label="Close onboarding">×</button>`
         }
@@ -702,6 +720,18 @@ function tourModule() {
 function maybeAutoLaunchTour() {
   if (!chatMode) return; // the first step anchors on /chat's composer
   if (!isNewcomer()) return;
+  // An admin whose instance is not set up yet is not the audience for this.
+  // The welcome tour teaches the ANALYST product — "ask a question", "your
+  // Library", "data packages your admin set up appear here on their own" —
+  // to the person who has to be that admin, before any of it is true. It ran
+  // over the top of a first-run instance and left them 2/6 through a
+  // "setup" that never mentions connecting a source or granting anything.
+  //
+  // Deliberately narrow: this suppresses the tour for an admin with an
+  // INCOMPLETE chain only. A non-admin still gets it on their first visit —
+  // that is who it was written for — and so does an admin once the instance
+  // is actually set up, because by then they are also just a user.
+  if (window._agAdminSetupPending === true) return;
   // A deep link into an existing conversation is not a first look at the
   // product — and the empty-state composer the first step points at isn't even
   // the thing on screen.

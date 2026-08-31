@@ -856,6 +856,23 @@ async def get_mcp_source(
     )
     out["tools"] = [_serialize_tool(t) for t in tools]
     out["per_user_secrets"] = _per_user_secret_coverage(source_id)
+    # Which groups this source is granted to, in the same units the grant and
+    # revoke endpoints work in ("every tool of this source"). Derived here
+    # because grants live per tool: an editing surface that wanted to show
+    # the current access had no choice but a call per tool, so it either
+    # skipped the section or made forty requests to draw it.
+    # `grants` is the intersection — granted on EVERY tool, which is what the
+    # bulk grant produces; `partial_grants` names the rest rather than
+    # rounding them to "granted" (which would overstate access) or to
+    # "not granted" (which would have a re-save silently revoke them).
+    granted_sets = [set(tools_repo.grants_for_tool(t["tool_id"])) for t in tools]
+    if granted_sets:
+        every = set.intersection(*granted_sets)
+        some = set.union(*granted_sets) - every
+    else:
+        every, some = set(), set()
+    out["grants"] = sorted(every)
+    out["partial_grants"] = sorted(some)
     return out
 
 

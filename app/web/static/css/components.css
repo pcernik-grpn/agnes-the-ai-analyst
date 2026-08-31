@@ -313,3 +313,89 @@
     opacity: .75;
 }
 .ds-groupglyph svg { width: 100%; height: 100%; }
+
+/* ── Tabs — ONE definition for every secondary tab row ────────────────────
+   Four copies of this look had drifted apart: `.tab-strip` in the legacy
+   sheet on legacy tokens (People, Access), `.tab-flow__item` here on --ds-
+   tokens (Data), and a page-local rewrite in library.html re-underlining a
+   pill segmented control (Library). The Data row was the one that looked
+   right, so it is the one that stayed — and it now lives here, in the global
+   component sheet, because Library is not an admin page and cannot reach
+   admin_page.css.
+
+   The FLOW variant differs only in its connectors: arrows between the tabs of
+   a pipeline, a rule where the pipeline ends. Those stay in admin_page.css
+   with the one section that asks for them (Data). The items themselves are
+   the same object everywhere — which is what the flow variant's own comment
+   already claimed, before the two definitions diverged.
+
+   `.fbar-seg__btn` appears in the selector list ONLY inside `.tab-strip`:
+   the Library's tabs are wired to filter_toolbar.js through that class, so
+   the hook stays and the look comes from the strip around it. */
+.tab-strip {
+    display: flex;
+    align-items: stretch;
+    flex-wrap: wrap;
+    gap: 2px;
+    margin: 0 0 18px;
+    padding: 0;
+    background: none;
+    border: 0;
+    border-bottom: 1px solid var(--ds-border);
+}
+.tab-strip__item,
+.tab-strip .fbar-seg__btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: auto;
+    padding: 9px 14px 10px;
+    margin-bottom: -1px;
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+    color: var(--ds-text-secondary);
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: var(--ds-radius-btn) var(--ds-radius-btn) 0 0;
+    cursor: pointer;
+}
+.tab-strip__item:hover,
+.tab-strip .fbar-seg__btn:hover {
+    background: var(--ds-surface-dim);
+    color: var(--ds-text-primary);
+}
+/* `[aria-selected]` and `[aria-checked]` as well as the class: the three
+   strips are variously tablists and a radiogroup, and a tab that looks
+   inactive while announcing itself selected is the worse half of that
+   mismatch. */
+.tab-strip__item.is-active,
+.tab-strip__item[aria-selected="true"],
+.tab-strip .fbar-seg__btn.is-active,
+.tab-strip .fbar-seg__btn[aria-checked="true"] {
+    color: var(--ds-primary-dark);
+    background: transparent;
+    box-shadow: none;
+    border-bottom-color: var(--ds-primary);
+}
+/* The count beside a tab's name. Quieter than the label at rest, and it
+   takes the tab's own colour when active rather than a second accent. */
+.tab-strip__n,
+.tab-strip .fbar-seg__n {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--ds-text-muted);
+}
+.tab-strip__item.is-active .tab-strip__n,
+.tab-strip__item[aria-selected="true"] .tab-strip__n,
+.tab-strip .fbar-seg__btn.is-active .fbar-seg__n,
+.tab-strip .fbar-seg__btn[aria-checked="true"] .fbar-seg__n {
+    color: var(--ds-primary-dark);
+}
+@media (max-width: 640px) {
+    .tab-strip { flex-wrap: nowrap; overflow-x: auto; }
+    .tab-strip__item, .tab-strip .fbar-seg__btn { flex: 0 0 auto; }
+}

@@ -1060,6 +1060,64 @@ CATALOG: dict[str, AuditEvent] = {
         "system",
         "The scheduler's SharePoint extraction sweep ran.",
     ),
+    # -- 2026-08-30 plan, Task 4: sharepoint-acl-sync worker job — per-scope
+    # SharePoint permission mirroring (connectors/sharepoint/acl_sync.py).
+    # `sync_triggered` is emitted by Task 5's admin route, registered here
+    # per the plan's instruction (declared alongside its sibling actions).
+    "sharepoint_acl.sync_completed": AuditEvent(
+        "sharepoint_acl.sync_completed",
+        "mutation",
+        "A SharePoint ACL-mirroring sync completed for one connection.",
+    ),
+    "sharepoint_acl.sync_failed": AuditEvent(
+        "sharepoint_acl.sync_failed",
+        "mutation",
+        "A SharePoint ACL-mirroring sync failed for one connection.",
+    ),
+    "sharepoint_acl.grant_added": AuditEvent(
+        "sharepoint_acl.grant_added",
+        "mutation",
+        "A SharePoint ACL sync granted a mirrored group access to a collection.",
+    ),
+    "sharepoint_acl.grant_removed": AuditEvent(
+        "sharepoint_acl.grant_removed",
+        "mutation",
+        "A SharePoint ACL sync revoked a mirrored group's access to a collection (source-side revocation).",
+    ),
+    "sharepoint_acl.membership_replaced": AuditEvent(
+        "sharepoint_acl.membership_replaced",
+        "mutation",
+        "A SharePoint ACL sync replaced a mirrored group's membership from the source directory.",
+    ),
+    "sharepoint_acl.principal_unmatched": AuditEvent(
+        "sharepoint_acl.principal_unmatched",
+        "mutation",
+        "A SharePoint ACL sync could not resolve one or more source principals to an Agnes account "
+        "(one row per run, with counts — never per-user).",
+    ),
+    "sharepoint_acl.grants_suspended": AuditEvent(
+        "sharepoint_acl.grants_suspended",
+        "mutation",
+        "A SharePoint connection's mirrored grants were suspended after exceeding "
+        "acl_sync.max_stale_hours (must_not guarantee mode).",
+    ),
+    "sharepoint_acl.sync_triggered": AuditEvent(
+        "sharepoint_acl.sync_triggered",
+        "mutation",
+        "An admin manually triggered a SharePoint ACL sync for one connection (POST .../acl-sync).",
+    ),
+    # -- 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The
+    # sweep job itself (connectors/sharepoint/acl_sync.py::run_subtree_sweep)
+    # writes no audit row of its own (state persisted into the connection's
+    # config, no log_safe call) -- only the admin-facing per-subtree
+    # "include anyway" override gets one, since it is a deliberate,
+    # security-relevant decision (spec §3(b)'s should_not-only escape hatch).
+    "sharepoint_acl.subtree_override": AuditEvent(
+        "sharepoint_acl.subtree_override",
+        "mutation",
+        "An admin overrode a detected broken-inheritance subtree exclusion "
+        "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
+    ),
 }
 
 

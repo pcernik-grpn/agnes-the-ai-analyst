@@ -28,6 +28,10 @@ def test_build_jobs_uses_documented_defaults(monkeypatch):
     lint_job = next(j for j in build_jobs() if j[0] == "store-lint-audit")
     assert lint_job[2] == "/api/admin/store/lint-audit"
     assert lint_job[3] == "POST"
+    # 2026-08-30 plan, Task 7 — broken-inheritance subtree sweep, weekly
+    # (native cron) — Monday 07:00 UTC, offset from store-lint-audit's own
+    # Monday 05:00 row and sharepoint-acl's daily 06:00 row.
+    assert jobs["sharepoint-subtree-sweep"] == "cron 0 7 * * 1"
     assert resolved_tick_seconds() == 30
 
 
@@ -498,6 +502,14 @@ class TestEnqueueMigratedJobs:
                 "ducklake-maintenance",
                 {"kind": "ducklake-maintenance", "idempotency_key": "ducklake-maintenance"},
             ),
+            (
+                "sharepoint-acl",
+                {"kind": "sharepoint-acl-sync", "idempotency_key": "sharepoint-acl-sync"},
+            ),
+            (
+                "sharepoint-subtree-sweep",
+                {"kind": "sharepoint-subtree-sweep", "idempotency_key": "sharepoint-subtree-sweep"},
+            ),
         ],
     )
     def test_migrated_row_posts_to_jobs_queue(self, name, expected_body):
@@ -518,6 +530,8 @@ class TestEnqueueMigratedJobs:
             "corporate-memory",
             "ducklake-maintenance",
             "jira-org-refresh",
+            "sharepoint-acl",
+            "sharepoint-subtree-sweep",
         ],
     )
     def test_migrated_row_uses_short_enqueue_timeout(self, name):
@@ -541,6 +555,8 @@ class TestEnqueueMigratedJobs:
             "corporate-memory",
             "ducklake-maintenance",
             "jira-org-refresh",
+            "sharepoint-acl",
+            "sharepoint-subtree-sweep",
         }
         for j in build_jobs():
             if j[0] in migrated:

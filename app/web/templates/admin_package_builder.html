@@ -12,7 +12,7 @@
    a detour. This is not a detour — you came here to build the thing — so it
    looks like the other two places you come to build a thing. #}
 
-{% block title %}New data package — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ 'Edit data package' if edit_pkg_id else 'New data package' }} — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
@@ -61,17 +61,25 @@
     'use strict';
     var mount = document.getElementById('pkg-builder-view');
     if (!mount || !window.AgnesPackageDrawer) return;
+    {# Set by /admin/data-packages/<id>/edit. Same page, same component, same
+       fields — the only difference is whether there is a package to load. #}
+    var editId = {{ (edit_pkg_id | tojson) if edit_pkg_id else 'null' }};
     window.AgnesPackageDrawer.open({
       builder: true,
       mount: mount,
-      // Leaving goes back to where packages live, not to whatever page the
-      // drawer was last opened over.
-      backHref: '/library',
-      backLabel: 'Library',
+      mode: editId ? 'edit' : 'create',
+      pkgId: editId,
+      // Leaving goes back where the thing lives: the package itself when
+      // there is one, otherwise where packages live.
+      backHref: editId ? '/admin/data-packages/' + encodeURIComponent(editId) : '/library',
+      backLabel: editId ? 'Package' : 'Library',
       onCreated: function (pkg) {
         window.location.href = pkg && pkg.id
           ? '/admin/data-packages/' + encodeURIComponent(pkg.id)
           : '/admin/data-packages';
+      },
+      onSaved: function () {
+        window.location.href = '/admin/data-packages/' + encodeURIComponent(editId);
       },
     });
   })();

@@ -12,7 +12,7 @@ context each arm reads is identical.
 
 ## Contents
 
-- `01_ontology/` -- the producer's ontology.yaml (Cuesta Star / TCRD-185,
+- `01_ontology/` -- the producer's ontology.yaml (Northwind Star / TCRD-185,
   v0.2.0) plus a plain-language rationale for why each node/edge type
   exists.
 - `02_taxonomies/` -- the closed vocabularies (enums) and canonicalization

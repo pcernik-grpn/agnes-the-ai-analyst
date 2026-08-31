@@ -91,6 +91,8 @@ class TestRegisterAllKinds:
         "collections-purge",
         "webhook-deliver",
         "corpus-extraction",
+        "sharepoint-acl-sync",
+        "sharepoint-subtree-sweep",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):
@@ -123,6 +125,8 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["analytics-rebuild"].lane == HEAVY_LANE
         assert JOB_KINDS["collections-purge"].lane == HEAVY_LANE
         assert JOB_KINDS["corpus-extraction"].lane == EXTRACTION_LANE
+        assert JOB_KINDS["sharepoint-acl-sync"].lane == LIGHT_LANE
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lane == LIGHT_LANE
 
     def test_idempotent_reregistration(self):
         """Calling register_all_kinds() twice (e.g. test re-imports, or a
@@ -134,6 +138,38 @@ class TestRegisterAllKinds:
         register_all_kinds()
 
         assert len(JOB_KINDS) == len(self._ALWAYS_REGISTERED)
+
+    def test_sharepoint_subtree_sweep_no_automatic_retry(self):
+        """Same rationale as corpus-extraction — a failed multi-hour sweep
+        needs an operator to look at it, not an unattended re-run."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        assert JOB_KINDS["sharepoint-subtree-sweep"].retry_in_seconds is None
+
+    def test_sharepoint_subtree_sweep_lease_env_override(self, monkeypatch):
+        """``_sp_sweep_lease_seconds()`` reads the env fresh on every
+        ``register_all_kinds()`` call — no reload needed, same as every
+        other lease knob in this module."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        monkeypatch.setenv("AGNES_SP_SWEEP_LEASE_S", "600")
+        register_all_kinds()
+
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 600
+
+    def test_sharepoint_subtree_sweep_lease_default(self):
+        """Default 4h (14400s) — a full probe pass over a large library is
+        multi-hour (spec §6.2)."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 14400
 
 
 class TestAgentResponseRoleSplitRegistration:
@@ -571,10 +607,28 @@ class TestCorpusExtractionHandler:
             handler({"connection_id": "conn1"})
 
     def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material", config=None):
+        # Default config carries ONE confirmed scope: since the corpus-map
+        # handoff, a scope-less connection with no payload corpus_id refuses
+        # to run (see test_no_scopes_and_no_corpus_id_refuses) — tests that
+        # exercise that exact refusal pass config={} explicitly.
+        default_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-default-1",
+                    "display_path": "Default site",
+                    "anonymize": False,
+                    "collection_id": "col_default",
+                }
+            ]
+        }
         monkeypatch.setattr(
             "src.repositories.source_connections_repo",
             lambda: _FakeSourceConnectionsRepo(
-                row={"id": "conn1", "source_type": "sharepoint", "config": config if config is not None else {}}
+                row={
+                    "id": "conn1",
+                    "source_type": "sharepoint",
+                    "config": config if config is not None else default_config,
+                }
             ),
         )
         from connectors.sharepoint.settings import SharePointSettings
@@ -854,7 +908,10 @@ class TestCorpusExtractionHandler:
         self._fake_run_capturing(monkeypatch, calls)
         handler = self._register()
 
-        handler({"connection_id": "conn1"})
+        # corpus_id because a scope-less connection now refuses without one
+        # (see test_no_scopes_and_no_corpus_id_refuses) — this test is about
+        # the anonymize vars staying absent, not about scope routing.
+        handler({"connection_id": "conn1", "corpus_id": "corpus-9"})
 
         env = calls[0]["env"]
         assert "AGNES_EXTRACTION_ANONYMIZE_SCOPES" not in env
@@ -932,6 +989,149 @@ class TestCorpusExtractionHandler:
         with pytest.raises(RuntimeError, match="not an allowed anonymization key variable"):
             handler({"connection_id": "conn1"})
         assert calls == []
+
+    # ---------------------------------------------------------------- corpus map
+    # The standard enqueue path (POST /connections/{id}/extract and the
+    # scheduled sweep) sends `{"connection_id": ...}` with no corpus_id, so
+    # the ONLY way the producer can learn where documents go is
+    # AGNES_EXTRACTION_CORPUS_MAP built from the connection's own confirmed
+    # scopes. Keys must be in the producer's corpusmap.corpus_for() shape —
+    # matched against crawler rows whose `site` is the site display name and
+    # whose `path` is DRIVE-RELATIVE — not the wizard's display_path verbatim
+    # (which includes the document-library segment for folder scopes).
+
+    _SCOPED_CONFIG = {
+        "scopes": [
+            {
+                # Folder scope: an item id (neither a composite site id nor a
+                # "b!" drive id). The wizard breadcrumb always includes the
+                # library ("Documents") — the map key must NOT.
+                "source_scope_id": "01SO3DIHVJLOMDRMYCA5B37XU577X4KL57",
+                "display_path": "Communication site/Documents/Project Kemp",
+                "anonymize": False,
+                "collection_id": "col_kemp",
+            },
+            {
+                # Site scope: Graph composite id "<host>,<siteGuid>,<webGuid>".
+                "source_scope_id": "host.sharepoint.com,f0259dd4-6abe-451b-9b7c-6760d1cdcb5f,aaac162f-d03a-4137-9b64-b56386e26ff0",
+                "display_path": "Northwind Star Test",
+                "anonymize": False,
+                "collection_id": "col_site",
+            },
+        ]
+    }
+
+    def test_corpus_map_built_from_confirmed_scopes(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._SCOPED_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert len(calls) == 1
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_EXTRACTION_CORPUS_MAP"]) == {
+            "Communication site/Project Kemp": "col_kemp",
+            "Northwind Star Test": "col_site",
+        }
+        # Collection routing is data, not command line — never on argv.
+        argv_joined = " ".join(calls[0]["argv"])
+        assert "col_kemp" not in argv_joined
+        assert "col_site" not in argv_joined
+
+    def test_drive_scope_key_degrades_to_site_segment(self, monkeypatch):
+        """A whole-library scope (Graph drive ids start "b!") keys on the
+        site segment alone — the producer's map format has no drive
+        dimension. Segments are stripped so a UI-authored
+        "Site / Documents" display path cannot poison component matching."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        config = {
+            "scopes": [
+                {
+                    "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
+                    "display_path": "Northwind Star Test / Documents",
+                    "anonymize": False,
+                    "collection_id": "col_drive",
+                }
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=config)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_EXTRACTION_CORPUS_MAP"]) == {"Northwind Star Test": "col_drive"}
+
+    def test_colliding_corpus_map_keys_refuse_loudly(self, monkeypatch):
+        """A site scope and a drive scope of the SAME site resolve to the
+        same key but different collections — silently routing every row to
+        whichever scope happened to win the dict insert is exactly the
+        silent-loss class this feature must never have. Refuse, naming both
+        scopes, before any subprocess runs."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        config = {
+            "scopes": [
+                {
+                    "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
+                    "display_path": "Northwind Star Test",
+                    "anonymize": False,
+                    "collection_id": "col_site",
+                },
+                {
+                    "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
+                    "display_path": "Northwind Star Test / Documents",
+                    "anonymize": False,
+                    "collection_id": "col_drive",
+                },
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=config)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="corpus map"):
+            handler({"connection_id": "conn1"})
+        assert calls == []
+
+    def test_no_scopes_and_no_corpus_id_refuses(self, monkeypatch):
+        """The producer would only preflight-fail later with its own error;
+        failing HERE names the connection and costs nothing."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="no confirmed scopes"):
+            handler({"connection_id": "conn1"})
+        assert calls == []
+
+    def test_explicit_corpus_id_without_scopes_still_runs(self, monkeypatch):
+        """A manual payload with corpus_id keeps working on a connection
+        with no confirmed scopes — corpus_id wins outright on the producer
+        side, so no map is required."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "corpus_id": "corpus-9"})
+
+        env = calls[0]["env"]
+        assert env["AGNES_EXTRACTION_CORPUS_ID"] == "corpus-9"
+        assert "AGNES_EXTRACTION_CORPUS_MAP" not in env
 
     def test_producer_output_is_not_buffered_in_this_process(self, monkeypatch):
         """The producer may run for `extraction.timeout_s` (an hour by
@@ -1156,6 +1356,85 @@ class TestCorpusExtractionHandler:
         handler({"connection_id": "conn1"})
 
         assert calls[0]["env"]["AGNES_API_URL"] == "http://127.0.0.1:8000"
+
+    # -- broken-inheritance subtree exclusion handoff (2026-08-30 plan,
+    # Task 7) --------------------------------------------------------------
+
+    _EXCLUDED_SUBTREE_CONFIG = {
+        "scopes": [
+            {
+                "source_scope_id": "scope-excl-1",
+                "display_path": "Contracts",
+                "collection_id": "col_excl_1",
+                "access_mode": "mirrored",
+                "excluded_subtrees": [
+                    {"item_id": "item-A", "path": "Contracts/A", "detected_at": "2026-08-30T00:00:00+00:00"},
+                    {"item_id": "item-B", "path": "Contracts/B/C", "detected_at": "2026-08-30T00:00:00+00:00"},
+                ],
+            },
+            {
+                "source_scope_id": "scope-plain-1",
+                "display_path": "Public docs",
+                "collection_id": "col_plain_1",
+                "access_mode": "mirrored",
+            },
+        ]
+    }
+
+    def test_excluded_subtrees_land_in_child_env_as_json(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._EXCLUDED_SUBTREE_CONFIG)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_SP_EXCLUDED_SUBTREE_IDS"]) == {"scope-excl-1": ["item-A", "item-B"]}
+        # The unaffected scope contributes nothing to the map.
+        assert "scope-plain-1" not in json.loads(env["AGNES_SP_EXCLUDED_SUBTREE_IDS"])
+
+    def test_no_excluded_subtrees_omits_the_var(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        plain_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-plain-1",
+                    "display_path": "Public docs",
+                    "collection_id": "col_plain_1",
+                    "access_mode": "mirrored",
+                }
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=plain_config)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert "AGNES_SP_EXCLUDED_SUBTREE_IDS" not in calls[0]["env"]
+
+    def test_include_excluded_subtrees_override_omits_that_scope_from_the_map(self, monkeypatch):
+        """`should_not`'s per-subtree "include anyway" override
+        (``app/api/admin_sharepoint.py``'s ``include_excluded_subtrees``) —
+        the crawler must NOT be told to skip a subtree the admin explicitly
+        chose to include."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        overridden_config = {
+            "scopes": [
+                {
+                    **self._EXCLUDED_SUBTREE_CONFIG["scopes"][0],
+                    "include_excluded_subtrees": True,
+                },
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=overridden_config)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert "AGNES_SP_EXCLUDED_SUBTREE_IDS" not in calls[0]["env"]
 
 
 class TestJiraWebhookEnqueues:

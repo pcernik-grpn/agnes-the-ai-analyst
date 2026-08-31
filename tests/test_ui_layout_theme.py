@@ -353,7 +353,12 @@ class TestRailOptIn:
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         text = resp.text
-        head = text.split('class="lib-head"', 1)[1].split('class="fbar-dock"', 1)[0]
+        # Bounded by the browsing block, which is the next landmark after the
+        # header. It used to slice to `class="fbar-dock"`, which /library has not
+        # rendered since #1751 — so the slice silently ran to the end of the
+        # document and the assertion below covered the whole page instead of the
+        # header.
+        head = text.split('class="lib-head"', 1)[1].split('class="lib-browse"', 1)[0]
         assert 'href="/stack"' not in head
 
         rows = re.findall(r"<tr[^>]*\bdata-item-id=[^>]*>", text)
@@ -569,7 +574,7 @@ class TestRailOptIn:
         assert "data, memory & files" in text
         # Available-but-not-yet-added marketplace items are surfaced and the
         # ones already in the stack are marked (not filtered out).
-        assert "In your stack" in text
+        assert "Agents can use this" in text
         assert "any plugin or skill available to you" in text.lower()
         # The "work in progress" notice is GONE (AGT-6). It said agents were
         # saved but that running them was still to come — and running them is
@@ -739,6 +744,14 @@ class TestRailChatHistory:
         don't carry one either, and it navigates rather than expands)."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
+        # This slot holds one of two rows, and it is the ANALYST one under
+        # test here. An admin mid-chain gets the setup chain instead, so the
+        # chain is stood down for this test — the state every member is always
+        # in, and the state an admin reaches once their instance is set up.
+        import app.web.router as _router
+
+        monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
+        _router.templates.env.globals["admin_setup_rail"] = lambda: None
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         # Asserted against the rail chrome slice, not the whole document — the
@@ -1057,7 +1070,11 @@ class TestRailTwoZones:
             'class="rail-admin"',  # ...Admin behind a divider
             'class="rail-foot"',  # zone 3 — always reachable, never collapsed
             'href="/how-it-works#connect"',  # …take Agnes elsewhere,
-            'class="rail-getstarted"',  # …then the onboarding row,
+            # Either row — the analyst journey or the admin setup chain, which
+            # share this slot and this class. Anchored without the closing
+            # quote so the chain's `class="rail-getstarted rail-setupchain"`
+            # matches too; the assertion is about WHERE the row sits.
+            'class="rail-getstarted',  # …then the onboarding row,
             'id="userMenu"',  # …then profile, at the very bottom
         ]
         positions = [rail.find(anchor) for anchor in sequence]
@@ -1369,14 +1386,24 @@ class TestRailChatsDestination:
         assert 'class="rail-history"' not in rail
         assert 'id="rail-pinned"' not in rail
 
-    def test_the_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
+    def test_the_analyst_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
         """It measures the ANALYST's journey — take Agnes to your tools, ask your
         first question — and it is the only element in the rail with a coloured
         progress arc, so it pulls hardest of anything on screen while you are
         registering a table. Nothing is lost: the checklist is still reachable from
-        the account menu and from the chat dashboard's "Set up Agnes" door."""
+        the account menu and from the chat dashboard's "Set up Agnes" door.
+
+        The exclusion is of that journey, not of the slot. The admin's OWN
+        chain now uses it (sibling test below), and the reason above is why
+        that is the right way round rather than an exception to this rule: on
+        an admin page the chain names the exact job you are there to do.
+        """
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
+        _router.templates.env.globals["admin_setup_rail"] = lambda: None
         admin_rail = self._rail(web_client, admin_cookie, "/admin/users")
         assert 'id="railGetStarted"' not in admin_rail
         assert "rail-getstarted" not in admin_rail
@@ -1384,6 +1411,380 @@ class TestRailChatsDestination:
         assert "js/chat_onboarding.js" not in web_client.get("/admin/users", cookies=admin_cookie).text
         # Still there on an app page — this is a scoping change, not a removal.
         assert 'id="railGetStarted"' in self._rail(web_client, admin_cookie)
+
+    def test_the_admin_chain_takes_the_slot_while_it_is_unfinished(self, web_client, admin_cookie, monkeypatch):
+        """An admin mid-chain had no view of their own progress anywhere but
+        /chat, and on app pages the rail showed them the ANALYST checklist —
+        six steps, none of them their job.
+
+        The row switches on whose steps can currently succeed: until a source
+        is connected and shared, "ask your first question" has nothing to
+        answer from. It is server-rendered with its own ids, so
+        chat_onboarding.js — whose every lookup is guarded — finds nothing and
+        cannot write analyst numbers over admin ones.
+        """
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        chain = {
+            "done": 1,
+            "total": 6,
+            "complete": False,
+            "steps": [
+                {"label": "Connect a source", "done": True, "failed": False, "href": "/admin/data-sources"},
+                {"label": "Choose tables", "done": False, "failed": False, "href": "/admin/tables"},
+                {"label": "Invite people", "done": False, "failed": True, "href": "/admin/users"},
+            ],
+        }
+        _router.templates.env.globals["admin_setup_rail"] = lambda: chain
+        try:
+            for path in ("/library", "/admin/users"):
+                rail = self._rail(web_client, admin_cookie, path)
+                assert 'id="railSetupChain"' in rail, f"the chain is missing on {path}"
+                assert "1 of 6 steps complete" in rail
+                assert "Connect a source" in rail and "Choose tables" in rail
+                # The analyst row stands down — one journey VISIBLE in the
+                # slot, which is the whole reason this row exists. It is
+                # present in the document and marked as the standby occupant
+                # (rail.css hides it until the admin asks for it), because a
+                # row that is absent is a row the profile menu's "Start over
+                # onboarding" cannot reveal — it reset journey state into an
+                # empty rail, which is how that control came to do nothing.
+                if path == "/library":
+                    assert 'id="railGetStarted"' in rail
+                    assert "data-chain-alternate" in rail, (
+                        "the analyst row is not marked standby — it would render "
+                        "alongside the chain as a second progress ring"
+                    )
+                else:
+                    # Admin pages never carry the analyst row at all, chain or
+                    # no chain — a half-finished analyst checklist is not
+                    # relevant while you are registering a table.
+                    assert 'id="railGetStarted"' not in rail
+                # A step whose own check raised says so instead of reading as
+                # an ordinary open step on a healthy chain.
+                assert "could not check" in rail
+        finally:
+            _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
+
+    def test_the_chain_is_wired_end_to_end_without_a_stub(self, web_client, admin_cookie, monkeypatch):
+        """The two tests around this one inject the chain through the Jinja
+        global, which proves the ROW renders and proves nothing about how the
+        row gets its data.
+
+        That gap is not hypothetical: it let a build pass every test while the
+        row appeared on no page at all, and the twenty minutes that followed
+        went on debugging a template that was fine. So this one calls the real
+        registered global — resolver, memo and registration included — and
+        only asserts the shape, because the numbers depend on the fixture's
+        instance and pinning them would make this a test of the seed data.
+        """
+        import app.web.router as _router
+
+        chain = _router.templates.env.globals["admin_setup_rail"]()
+        assert chain is not None, "the chain resolver returned nothing on a seeded instance"
+        assert chain["total"] > 0
+        assert isinstance(chain["steps"], list) and chain["steps"]
+        for st in chain["steps"]:
+            assert st["label"], "a step with no label renders as an empty row"
+            assert st["href"], "every step is a door — one with no href is a dead line of text"
+
+    def test_the_chain_can_be_hidden_and_brought_back(self, web_client, admin_cookie, monkeypatch):
+        """The chain gets the analyst card's PAIR of controls: a quiet way out
+        in its own panel, and a way back in the profile menu once it is gone.
+
+        Everything asserted here is markup + wiring, because that is where the
+        pair can silently come apart. The dismissal itself is a per-browser
+        localStorage flag — the chain's six steps are readings of instance
+        state, so "skip" cannot mean "write them done" the way the analyst
+        journey's can, and there is no per-user preference table to hold it.
+
+        The no-flash half is the point of the inline script: `defer` would hide
+        the card only after first paint, so a dismissed card would flash back
+        on every single page load.
+        """
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        _router.templates.env.globals["admin_setup_rail"] = lambda: {
+            "done": 1,
+            "total": 6,
+            "complete": False,
+            "steps": [{"label": "Connect a source", "done": False, "failed": False, "href": "/admin"}],
+        }
+        try:
+            for path in ("/library", "/admin/users"):
+                page = web_client.get(path, cookies=admin_cookie).text
+                rail = self._rail(web_client, admin_cookie, path)
+                # The panel's own control, and the JS seam it hangs on.
+                assert "data-setupchain-skip>" in rail, f"no way to skip the chain on {path}"
+                assert "Skip setup" in rail
+                # The way back. Rendered under the same gate as the card, so
+                # the two never ship apart; rail.css keeps it out of sight
+                # until the dismissal is actually stored.
+                assert 'id="rail-restart-setupchain"' in rail, f"no way back on {path}"
+                assert "Show setup checklist" in rail
+                # …and on an app page it sits with the analyst equivalent, not
+                # somewhere else in the menu: the two are one kind of action,
+                # and together they are the switch between the slot's two
+                # cards. On an admin page the analyst entry is gone (the row it
+                # re-arms is not rendered there), so there is no pair to order.
+                if path == "/library":
+                    assert rail.index("rail-restart-onboarding") < rail.index(
+                        "rail-restart-setupchain"
+                    )
+                else:
+                    assert "rail-restart-onboarding" not in rail
+                # The module that wires both. Asserted on the whole PAGE, not
+                # the rail slice: the rail's scripts sit after `</nav>`, which
+                # is exactly where `_rail()` cuts.
+                assert "rail_setupchain.js" in page, f"neither control is wired on {path}"
+
+                # The pre-paint guard, and the pair of ids it governs.
+                assert "agnes.setupchain.skipped" in rail
+                # Pre-paint suppression must be INLINE — a `src=` script is
+                # `defer`red and so runs only AFTER first paint, which is the
+                # flash this guard exists to prevent.
+                #
+                # Asserted on the LAST script element before the card, and on
+                # its BODY, because the two obvious weaker forms both pass the
+                # bug: the rail opens with an inline `<script>` of its own
+                # ~600 lines above, so `"<script>" in head` is true whatever
+                # this guard is, and the key string survives being moved onto
+                # an attribute of an external tag (`data-key="…"`), so the
+                # assertion above does not pin it either. Confirmed by
+                # mutation: rewriting the guard as
+                # `<script src=… data-key="agnes.setupchain.skipped" defer>`
+                # left both of those green.
+                head = rail.split('id="railSetupChain"', 1)[0]
+                guard = head[head.rindex("<script") :]
+                assert "src=" not in guard, (
+                    f"the pre-paint guard is an external script, so it cannot beat "
+                    f"first paint: {guard[:120]}"
+                )
+                assert 'localStorage.getItem("agnes.setupchain.skipped")' in guard, (
+                    "the script before the card does not read the dismissal — the "
+                    f"card will flash back on every load: {guard[:120]}"
+                )
+        finally:
+            _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
+
+    def test_the_two_cards_are_a_switch_not_a_stack(self, web_client, admin_cookie, monkeypatch):
+        """One card VISIBLE in the slot, and the stored flag picks which.
+
+        Two six-step journeys with different numerators side by side is the bug
+        the one-slot design exists to prevent, and it still cannot happen — but
+        the mechanism moved. It used to be "render only one", which made the
+        profile menu's "Start over onboarding" a dead control for an admin
+        mid-chain: it reset the journey server-side and there was no card in the
+        document for the result to appear in. Now both render and CSS picks,
+        which is what gives that entry something to reveal.
+
+        The complementary pair is the whole invariant, so both halves are
+        asserted here: miss the second rule and the two cards render stacked.
+        """
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        _router.templates.env.globals["admin_setup_rail"] = lambda: {
+            "done": 1,
+            "total": 6,
+            "complete": False,
+            "steps": [{"label": "Connect a source", "done": False, "failed": False, "href": "/admin"}],
+        }
+        try:
+            rail = self._rail(web_client, admin_cookie)
+            # Both in the document…
+            assert 'id="railSetupChain"' in rail
+            assert 'id="railGetStarted"' in rail
+            # …and the analyst one marked as the standby.
+            standby = rail.split('id="railGetStarted"', 1)[1].split(">", 1)[0]
+            assert "data-chain-alternate" in standby
+        finally:
+            _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
+
+        css = (Path(__file__).resolve().parents[1] / "app/web/static/css/rail.css").read_text()
+        rail_scope = 'html[data-ui-layout="rail"]'
+        # No flag → the standby is hidden, so the chain is alone on screen.
+        assert (
+            f'{rail_scope}:not([data-setupchain-skipped="1"]) '
+            ".rail-getstarted[data-chain-alternate] {" in css
+        ), "nothing hides the standby card — both journeys would render stacked"
+        # Flag → the chain is hidden, so the standby is alone on screen.
+        assert f'{rail_scope}[data-setupchain-skipped="1"] .rail-setupchain {{' in css
+
+    def test_the_restart_entry_is_absent_where_it_could_not_work(
+        self, web_client, admin_cookie, monkeypatch
+    ):
+        """"Start over onboarding" is gated on the card it re-arms.
+
+        On an admin page the analyst row is deliberately absent and
+        chat_onboarding.js — which owns the click — is not loaded, so the entry
+        was a menu item that reset journey state and showed nothing. The switch
+        fixes that everywhere the row can render; here the honest fix is not to
+        offer it.
+        """
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        admin_page = self._rail(web_client, admin_cookie, "/admin/users")
+        assert 'id="rail-restart-onboarding"' not in admin_page
+        # …and present on an app page, where the row it re-arms exists.
+        assert 'id="rail-restart-onboarding"' in self._rail(web_client, admin_cookie)
+
+    def test_both_launcher_cards_share_one_popover_implementation(self):
+        """The chain card must be openable and collapsible, like its twin.
+
+        It reuses `.rail-getstarted` for its LOOK but carries its own ids so
+        chat_onboarding.js cannot write analyst numbers into it — and those
+        distinct ids also took it out of the only wiring that made the panel
+        clickable, which lived inline in rail_history.js bound to
+        `rail-getstarted-*`. The chain could be previewed on hover and never
+        opened, pinned or collapsed: two cards that are the same object
+        visually, behaving differently, the second one worse.
+
+        Asserted structurally rather than by driving a browser: that the
+        behaviour has ONE definition and both cards call it. A copy in the
+        second file would pass any behavioural test and drift on the next fix.
+        """
+        js = Path(__file__).resolve().parents[1] / "app/web/static/js"
+        helper = (js / "rail_popover.js").read_text()
+        history = (js / "rail_history.js").read_text()
+        chain = (js / "rail_setupchain.js").read_text()
+
+        # The behaviour lives in the helper…
+        for behaviour in ("is-open", "is-closed", "Escape", "mouseleave", "aria-expanded"):
+            assert behaviour in helper, f"the shared popover lost its {behaviour} handling"
+
+        # …and BOTH cards reach it through the same call.
+        assert "railPopover.wire" in history, "the analyst card no longer uses the shared popover"
+        assert "railPopover.wire" in chain, "the chain card is not wired for click/collapse"
+
+        # No second copy: `.is-closed` is the tell — it is the one class only
+        # this behaviour touches, so a file setting it is a file that
+        # reimplemented the behaviour rather than calling it. Matched as a
+        # string LITERAL, not as prose: both files discuss the class in
+        # comments (rail_setupchain.js's explains why it stopped setting it by
+        # hand), and a guard that cannot tell code from a comment about code
+        # fires on the very note that documents the fix.
+        for name, src in (("rail_history.js", history), ("rail_setupchain.js", chain)):
+            assert '"is-closed"' not in src and "'is-closed'" not in src, (
+                f"{name} manipulates `.is-closed` directly — that is the shared "
+                "popover's business, and a second copy of it will drift"
+            )
+
+    def test_both_panels_advertise_the_collapse(self):
+        """A chevron, top right, on BOTH launcher panels.
+
+        The panel closed four ways before this — a second click on the
+        launcher, click-away, Escape, mouse-leave — and advertised none of
+        them, so the card read as something that opens and then stays. The
+        chevron is the only visible affordance for putting it away, which is
+        why both panels must carry it and not just the one that happened to
+        get looked at.
+
+        The analyst panel's goes LAST in the actions row, past the ↻ replay
+        button: the chevron acts on the panel, ↻ acts on the panel's contents,
+        so the outermost control sits furthest right. Asserted by index rather
+        than by eye, because the two are adjacent in one template string and a
+        later edit reorders them without looking wrong.
+        """
+        js = Path(__file__).resolve().parents[1] / "app/web/static/js"
+        rail_tpl = (
+            Path(__file__).resolve().parents[1] / "app/web/templates/_app_rail.html"
+        ).read_text()
+        onboarding = (js / "chat_onboarding.js").read_text()
+
+        # The admin chain's, in its own head row above the steps.
+        head = rail_tpl.split('id="rail-setupchain-panel"', 1)[1].split("<ul", 1)[0]
+        assert "data-rail-popover-collapse" in head, (
+            "the chain panel has no collapse chevron — it opens and cannot be told to close"
+        )
+
+        # The analyst panel's, after the replay button.
+        actions = onboarding.split("cloud-chat-journey-actions", 1)[1].split("</div>", 1)[0]
+        assert "data-rail-popover-collapse" in actions
+        assert actions.index("data-journey-replay") < actions.index(
+            "data-rail-popover-collapse"
+        ), "the chevron must sit to the RIGHT of the refresh button"
+
+        # Rail only: the inline /chat panel is part of the page, not a popover
+        # hanging off a launcher, so it keeps "×" (a different action) instead.
+        assert "data-journey-close" in actions
+
+    def test_the_collapse_chevron_is_delegated_not_bound(self):
+        """chat_onboarding.js rebuilds the analyst panel's innerHTML on every
+        journey update, so a handler attached to the chevron would be discarded
+        with the button the first time a step completed — the control would work
+        until the user did something, then quietly stop. The listener lives on
+        the document instead.
+
+        Asserted because the failure is invisible: a per-button handler passes
+        every "does the chevron close the panel" check on a freshly loaded page.
+        """
+        js = Path(__file__).resolve().parents[1] / "app/web/static/js"
+        popover = (js / "rail_popover.js").read_text()
+        onboarding = (js / "chat_onboarding.js").read_text()
+
+        assert 'document.addEventListener("click"' in popover
+        assert "data-rail-popover-collapse" in popover
+        # The renderer supplies the attribute and nothing else — no
+        # addEventListener on the chevron it just built.
+        rendered = onboarding.split("data-rail-popover-collapse", 1)[1].split("</div>", 1)[0]
+        assert "addEventListener" not in rendered
+
+    def test_skip_and_collapse_are_different_words_for_different_things(self):
+        """The chain's footer button says "Skip setup", matching the analyst
+        card's "Skip onboarding", because it is the same outcome and the same
+        gesture: the card goes for good, recoverable only from the profile menu.
+
+        It read "Hide this checklist" first, on the argument that nothing is
+        truly skipped — the work the chain names still has to happen. But that
+        reasoning describes the instance and the button acts on the card, and
+        to a reader "hide" promises exactly the collapse the chevron now
+        provides. Two controls that do different things cannot both be called
+        hiding.
+        """
+        rail_tpl = (
+            Path(__file__).resolve().parents[1] / "app/web/templates/_app_rail.html"
+        ).read_text()
+        # `data-setupchain-skip>` with the closing bracket: the bare attribute
+        # name is a PREFIX of the pre-paint flag `data-setupchain-skipped`, so
+        # splitting on it lands in the inline script instead of on the button.
+        skip = rail_tpl.split("data-setupchain-skip>", 1)[1].split("</button>", 1)[0]
+        assert "Skip setup" in skip
+        assert "Hide" not in skip, "the skip button reads as the collapse affordance"
+
+    def test_the_hidden_state_is_styled_not_guessed(self):
+        """Both halves of the flag live in rail.css: the card goes when it is
+        set, and the menu entry arrives. Miss the second rule and the way back
+        is permanently invisible — the card would be unrecoverable."""
+        css = (Path(__file__).resolve().parents[1] / "app/web/static/css/rail.css").read_text()
+        skipped = 'html[data-ui-layout="rail"][data-setupchain-skipped="1"]'
+        assert f"{skipped} .rail-setupchain {{" in css
+        assert f"{skipped} .rail-restart-setupchain {{" in css
+        # Hidden by DEFAULT, or it offers to restore a card already on screen.
+        assert 'html[data-ui-layout="rail"] .rail-restart-setupchain {\n    display: none;' in css
+
+    def test_a_finished_chain_hands_the_slot_back(self, web_client, admin_cookie, monkeypatch):
+        """Once the instance is set up the admin is also a user, and the
+        analyst steps become things that can actually succeed. The row is not
+        retired — it is handed back."""
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        self._enable_chat(web_client, monkeypatch)
+        import app.web.router as _router
+
+        _router.templates.env.globals["admin_setup_rail"] = lambda: {
+            "done": 6, "total": 6, "complete": True, "steps": [],
+        }
+        try:
+            rail = self._rail(web_client, admin_cookie)
+            assert 'id="railSetupChain"' not in rail
+            assert 'id="railGetStarted"' in rail
+        finally:
+            _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
 
 
 class TestRailAdminIsOnePlainLink:
@@ -1611,7 +2012,14 @@ class TestRailDashboard:
         # That button is the CONNECT action, never the journey's current step:
         # `admin_notice.cta` can read "Invite people" on a partly-set-up
         # instance, which is incoherent beside "nothing is registered yet".
-        assert "Invite people" not in text
+        # Scoped to the hero, not the document: the rail's setup-chain row
+        # lists every step by name — "Invite people" among them — which is
+        # correct there and says nothing about this button. Before that row
+        # existed the whole page was a safe proxy for the hero; it is not any
+        # more, and a document-wide assertion would have started failing for a
+        # reason unrelated to what it is checking.
+        _hero = text.split('cld-door--setup', 1)[1].split("</section>", 1)[0]
+        assert "Invite people" not in _hero
         assert "/admin/data-sources?add=" in text
         # The composer must not advertise the one thing that cannot work here.
         assert "summarize revenue trends" not in text, "the zero state still offers a data example"
@@ -2298,17 +2706,74 @@ class TestRedesignedPageContracts:
             conn.close()
         return web_client.get("/chat", cookies=admin_cookie)
 
-    def test_chat_keeps_upload_menu_journey_and_row_menu(self, web_client, admin_cookie, monkeypatch):
-        """The composer "+" menu and the row menu render on the page; the
-        journey checklist is the rail's own ``railGetStarted`` card
-        (chat.html's ``#chat-journey`` div is the retired topnav sidebar's
-        slot — the live page never renders it)."""
+    def test_chat_keeps_upload_menu_and_row_menu(self, web_client, admin_cookie, monkeypatch):
+        """The composer "+" menu and the row menu render on the page."""
         resp = self._chat(web_client, admin_cookie)
         assert resp.status_code == 200
         assert 'id="chat-plus-menu"' in resp.text
-        assert 'id="railGetStarted"' in resp.text
         assert "chat_row_menu.js" in resp.text
         assert 'id="chat-copy-transcript"' in resp.text
+
+    def test_the_analyst_journey_yields_to_an_unfinished_admin_chain(
+        self, web_client, admin_cookie, monkeypatch
+    ):
+        """Two six-step "setup" journeys must never render together.
+
+        The rail's ``railGetStarted`` card is the ANALYST journey (ask a
+        question, explore your Library, put knowledge in your stack…). The
+        hero card on the same page is the ADMIN chain (connect a source,
+        choose tables, bundle, invite, share, verify). They share no steps,
+        and rendering both put two "of 6" counters with different numerators
+        on one screen — the one the front door drove being the one that never
+        mentions the admin's actual job.
+
+        So for an admin whose chain is unfinished the analyst journey yields.
+        This asserts the narrowing in BOTH directions: it is not "the journey
+        is gone", it is "the journey is not shown to the wrong person at the
+        wrong time". A non-admin, and an admin who has finished, still get it.
+        """
+        resp = self._chat(web_client, admin_cookie)
+        assert resp.status_code == 200
+        # This fixture's instance has no source and no tables, so the admin
+        # chain is unfinished and the analyst journey must stand down — as the
+        # slot's STANDBY occupant, not by being absent. Absent is what made
+        # "Start over onboarding" a control that reset state and showed
+        # nothing; `data-chain-alternate` keeps it hidden until the admin asks
+        # for it, so only one of the two counters is ever on screen.
+        assert 'id="railGetStarted"' in resp.text
+        standby = resp.text.split('id="railGetStarted"', 1)[1].split(">", 1)[0]
+        assert "data-chain-alternate" in standby
+        assert "window._agAdminSetupPending = true" in resp.text
+
+    def test_the_analyst_journey_is_untouched_for_a_non_admin(self):
+        """The narrowing keys off `admin_setup`, which the chat route computes
+        only for an admin — so a member's render is bit-for-bit unchanged.
+
+        Asserted on the template condition itself rather than through a second
+        seeded user: the condition IS the contract, and a member fixture would
+        test the seeding as much as the rule.
+        """
+        from jinja2 import Environment
+
+        env = Environment()
+        pill = env.from_string(
+            "{% if not (admin_setup and not admin_setup.complete) %}PILL{% else %}NONE{% endif %}"
+        )
+        flag = env.from_string(
+            "{% if admin_setup and not admin_setup.complete %}FLAG{% else %}NONE{% endif %}"
+        )
+        # A non-admin never gets `admin_setup` at all.
+        assert pill.render() == "PILL"
+        assert flag.render() == "NONE"
+        assert pill.render(admin_setup=None) == "PILL"
+        # An admin who has finished is, for this purpose, just a user again.
+        done = {"done": 6, "total": 6, "complete": True}
+        assert pill.render(admin_setup=done) == "PILL"
+        assert flag.render(admin_setup=done) == "NONE"
+        # Only the unfinished admin yields.
+        mid = {"done": 2, "total": 6, "complete": False}
+        assert pill.render(admin_setup=mid) == "NONE"
+        assert flag.render(admin_setup=mid) == "FLAG"
 
     # ── Wave 2 (spec 2026-08-07-default-chrome-ux-parity): the page rewrites. ──
 

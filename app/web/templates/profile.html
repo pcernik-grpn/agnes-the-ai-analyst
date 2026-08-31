@@ -674,7 +674,15 @@ async function pfSaveName() {
         const kindCls = "pf-kind" + (accent ? ` pf-kind--${accent}` : "");
         html += `<li class="pf-row">
           <span class="${kindCls}">${escapeHtml(String(it.resource_type).replace(/_/g, " "))}</span>
-          <span class="pf-row-body"><span class="pf-row-name pf-mono">${escapeHtml(it.resource_id)}</span></span>
+          <span class="pf-row-body"><span class="pf-row-name${it.unresolved ? " pf-mono" : ""}">${
+            it.href
+              ? `<a href="${escapeHtml(it.href)}">${escapeHtml(it.name || it.resource_id)}</a>`
+              : escapeHtml(it.name || it.resource_id)
+          }</span>${
+            it.unresolved
+              ? ` <span class="pf-row-sub">no longer exists</span>`
+              : ""
+          }</span>
           <span class="pf-via">${via}</span>
         </li>`;
       }

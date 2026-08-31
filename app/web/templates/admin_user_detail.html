@@ -962,7 +962,11 @@ async function loadEffectiveAccess() {
     html += `
       <tr>
         <td><span class="${kindCls}">${esc(String(it.resource_type).replace(/_/g, " "))}</span></td>
-        <td class="ud-mono">${esc(it.resource_id)}</td>
+        <td${it.unresolved ? ' class="ud-mono"' : ""}>${
+          it.href
+            ? `<a href="${esc(it.href)}">${esc(it.name || it.resource_id)}</a>`
+            : esc(it.name || it.resource_id)
+        }${it.unresolved ? ' <span class="ud-warn">— no longer exists</span>' : ""}</td>
         <td><span class="ud-via">${viaHtml}</span></td>
       </tr>`;
   }

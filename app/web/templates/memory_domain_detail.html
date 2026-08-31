@@ -93,15 +93,14 @@
      other two states live in the rail and the overflow menu. #}
   {% if detail.redesign %}
     {% if not in_stack %}
-      {# "Add to stack" is the product's noun for what this button changes, and
-         it is the wording the data-package header uses for the identical
-         action — the two surfaces described the same click differently. The
-         rail's Availability block is where the download itself is spelled
-         out. Legacy keeps "Download locally". #}
-      {{ ds.button('Add to stack', variant='primary', type='button', id='dom-add-btn') }}
+      {# Same words as the data-package header, because it is the identical
+         action: the grant already put this domain in reach, and the click
+         only decides whether `agnes pull` keeps a local copy. The rail's
+         Availability block spells the download state out. #}
+      {{ ds.button(words.keep_local, variant='primary', type='button', id='dom-add-btn') }}
     {% endif %}
   {% elif effective_requirement == 'required' %}
-    <button class="btn btn-required" disabled>Always downloaded (required)</button>
+    <button class="btn btn-required" disabled title="{{ words.tier_automatic_help }}">{{ words.tier_automatic }} — always downloaded</button>
   {% elif in_stack %}
     {{ ds.button('Remove local copy', variant='danger', type='button', id='dom-remove-btn') }}
   {% else %}
@@ -206,7 +205,7 @@
 {{ detail.side_open('Availability', icon='stack') }}
   {% if effective_requirement == 'required' %}
     {{ detail.side_panel_open('ok') }}
-      {{ detail.status('Always downloaded', 'ok') }}
+      {{ detail.status(words.tier_automatic ~ ' — always downloaded', 'ok') }}
       <p class="detail-side__note">
         Set to Automatic for your groups, so it always travels with your workspace.
       </p>
@@ -222,7 +221,7 @@
     {{ detail.side_panel_open('warn') }}
       {{ detail.status('Not downloaded', 'warn') }}
       <p class="detail-side__note">
-        You have access to this domain. Add it to your stack to keep a local copy.
+        You already have access to this domain. Keep a local copy so `agnes pull` downloads it too.
       </p>
     {{ detail.side_panel_close() }}
   {% endif %}

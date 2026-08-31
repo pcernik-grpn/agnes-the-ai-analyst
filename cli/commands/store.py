@@ -25,6 +25,7 @@ from cli.v2_client import (
     api_get_stream,
     api_post_json,
     api_post_multipart,
+    api_put_json,
     api_put_multipart,
 )
 
@@ -101,6 +102,75 @@ def publish_markdown(
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
     typer.echo(f"Published: id={body['id']} name={body['name']} version={body['version']}")
+    if body.get("visibility_status") == "pending":
+        typer.echo(f"Held for automated review — check progress with: agnes store status {body['id']} --wait")
+
+
+@store_app.command("show-md")
+def show_markdown(
+    entity_id: str = typer.Argument(..., help="Entity id (from `agnes store mine`)"),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write to this file instead of stdout"),
+):
+    """Print the Markdown behind a skill or agent template you own.
+
+    The read half of `agnes store edit-md`: revising something starts with
+    what it currently says.
+    """
+    try:
+        body = api_get_json(f"/api/store/entities/{entity_id}/markdown")
+    except V2ClientError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    text = body.get("skill_md") or ""
+    if out:
+        out.write_text(text, encoding="utf-8")
+        typer.echo(f"Wrote {len(text)} bytes to {out}")
+    else:
+        typer.echo(text)
+    if body.get("blocked_reason"):
+        typer.echo(f"Note: {body['blocked_reason']}", err=True)
+
+
+@store_app.command("edit-md")
+def edit_markdown(
+    entity_id: str = typer.Argument(..., help="Entity id (from `agnes store mine`)"),
+    skill_md: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="Path to the Markdown file"),
+    name: Optional[str] = typer.Option(None, "--name", help="Rename it (default: keep the current name)"),
+    description: Optional[str] = typer.Option(None, "--description"),
+    category: Optional[str] = typer.Option(
+        None,
+        "--category",
+        help="Category (case-insensitive). One of: " + ", ".join(STORE_CATEGORIES),
+    ),
+):
+    """Replace what a published skill or agent SAYS, from a Markdown file.
+
+    `agnes store update` edits the metadata around an entity; this edits its
+    content. The server rebuilds the bundle and runs the same guardrail +
+    review pipeline as publishing, so the new version may be held for review.
+
+        agnes store show-md <id> --out skill.md   # read it
+        agnes store edit-md <id> skill.md         # write it back
+    """
+    try:
+        current = api_get_json(f"/api/store/entities/{entity_id}/markdown")
+    except V2ClientError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    payload: dict = {
+        "name": name or current.get("name") or "",
+        "skill_md": skill_md.read_text(encoding="utf-8"),
+    }
+    if description:
+        payload["description"] = description
+    if category:
+        payload["category"] = category
+    try:
+        body = api_put_json(f"/api/store/entities/{entity_id}/from-markdown", payload)
+    except V2ClientError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Updated: id={body['id']} name={body['name']} version={body['version']}")
     if body.get("visibility_status") == "pending":
         typer.echo(f"Held for automated review — check progress with: agnes store status {body['id']} --wait")
 

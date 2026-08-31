@@ -30,8 +30,11 @@ commit per task), passed by the parent.
    -> STOP, leave the tree clean (abort the cherry-pick/merge), and report which
    two tasks collided and on which file — the decomposer should have coupled them.
    Do NOT force a resolution you are unsure about.
-5. **Verify.** After integration, run `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`
-   once. Report the result.
+5. **Verify.** After integration, run `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`
+   once, plus `--lane impacted` for the integrated diff. Report both results and
+   the lane line each printed. The full suite runs in CI on the push — reach for
+   it locally only if integration touched a merge magnet (`src/db.py`,
+   `tests/conftest.py`, `app/main.py`).
 
 ## Output
 

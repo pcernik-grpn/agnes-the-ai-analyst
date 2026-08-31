@@ -33,7 +33,7 @@ Usage:
     python3 scripts/debug/probe_google_groups.py <access_token> <email>
 
 Example:
-    python3 scripts/debug/probe_google_groups.py ya29.a0AfH6S... petr@keboola.com
+    python3 scripts/debug/probe_google_groups.py ya29.a0AfH6S... owner@example.com
 """
 
 from __future__ import annotations

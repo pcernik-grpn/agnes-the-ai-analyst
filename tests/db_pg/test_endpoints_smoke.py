@@ -1233,6 +1233,8 @@ class TestStoreSmoke:
         "POST /api/store/entities/from-markdown",
         "POST /api/store/entities/from-components",
         "PUT /api/store/entities/{entity_id}",
+        "GET /api/store/entities/{entity_id}/markdown",
+        "PUT /api/store/entities/{entity_id}/from-markdown",
         "POST /api/store/entities/{entity_id}/install",
         "DELETE /api/store/entities/{entity_id}/install",
         "POST /api/store/entities/{entity_id}/rate",
@@ -1241,6 +1243,18 @@ class TestStoreSmoke:
         "GET /api/store/bundle.zip",
         "POST /api/store/import-bundle",
     }
+
+    def test_reading_and_writing_an_entity_document(self, seeded_app_both):
+        """The editing pair. Both refuse an unknown id the same way the rest of
+        the store does — 404, without admitting whether the row exists."""
+        c, h = seeded_app_both["client"], _admin_headers(seeded_app_both)
+        assert c.get("/api/store/entities/nope/markdown", headers=h).status_code == 404
+        r = c.put(
+            "/api/store/entities/nope/from-markdown",
+            json={"name": "whatever", "skill_md": "# hi"},
+            headers=h,
+        )
+        assert r.status_code == 404, r.text
 
     def test_categories(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/store/categories", headers=_admin_headers(seeded_app_both))
@@ -1367,19 +1381,44 @@ class TestMcpBuilderSmoke:
 
     COVERED_ROUTES = {
         "GET /admin/mcp-sources/new",
+        "GET /admin/mcp-sources/{source_id}/edit",
+        "GET /admin/data-packages/{pkg_id}/edit",
         "POST /api/admin/mcp-sources/builder/turn",
         "GET /admin/linked-apps/new",
     }
+
+    def test_editing_an_unknown_package_is_a_404(self, seeded_app_both):
+        """Same reason as the source below: an edit page pointed at nothing
+        would render an empty builder that CREATES on save."""
+        r = seeded_app_both["client"].get(
+            "/admin/data-packages/does-not-exist/edit", headers=_admin_headers(seeded_app_both)
+        )
+        assert r.status_code == 404, r.text
+
+    def test_editing_an_unknown_source_is_a_404(self, seeded_app_both):
+        """The edit page is the create page pointed at a row — so it has to
+        refuse an id that is not one, rather than rendering an empty builder
+        that would register a second source on save."""
+        r = seeded_app_both["client"].get(
+            "/admin/mcp-sources/does-not-exist/edit", headers=_admin_headers(seeded_app_both)
+        )
+        assert r.status_code == 404, r.text
 
     def test_builder_page_renders_for_an_admin(self, seeded_app_both):
         r = seeded_app_both["client"].get("/admin/mcp-sources/new", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200, r.text
         assert "mcp-builder-view" in r.text
 
-    def test_linked_apps_builder_page_renders_for_an_admin(self, seeded_app_both):
-        r = seeded_app_both["client"].get("/admin/linked-apps/new", headers=_admin_headers(seeded_app_both))
-        assert r.status_code == 200, r.text
-        assert "la-builder-view" in r.text
+    def test_the_old_new_linked_app_path_redirects(self, seeded_app_both):
+        """There is no separate create step for a linked app any more:
+        publishing them is picking a connected server and reading its list."""
+        r = seeded_app_both["client"].get(
+            "/admin/linked-apps/new",
+            headers=_admin_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == "/admin/linked-apps"
 
     def test_the_opening_turn_reports_slots_and_engine(self, seeded_app_both):
         """An empty first message is the builder speaking first; it must come
@@ -3147,6 +3186,14 @@ KNOWN_UNTESTED = {
     # realistic upload/update/rename/delete fixture, pagination, and the
     # DuckDB typed-501 are all in tests/db_pg/test_sharepoint_changes_pg.py.
     "GET /api/admin/sharepoint/connections/{connection_id}/changes",
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
+    # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
+    # EXISTING jobs table, no new schema surface" reasoning as the
+    # extraction routes above; auth matrix, flag-gate 409, dedup, and the
+    # exact payload shape are covered by
+    # tests/test_admin_sharepoint.py::TestAclSyncTrigger; not duplicated
+    # in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

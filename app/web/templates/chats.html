@@ -49,11 +49,11 @@
 
 {% block page_head %}
 {# The header is the page's NAME and nothing else — no controls level with the
-   title. Search and New chat ride the dock instead, which is where /library puts
-   them and for the same reason: the header scrolls away, so the two controls a
-   caller reaches for most would be in the one place that leaves the screen
-   exactly when a long list makes them worth having. `#ch-search` keeps its id
-   wherever it sits — filter_toolbar.js resolves it off `document`. #}
+   title. Search and New chat ride the browsing block above the list instead,
+   which is where /library puts them and for the same reason: they act on the
+   list, so they belong against it rather than in a band that introduces the
+   page. `#ch-search` keeps its id wherever it sits — filter_toolbar.js resolves
+   it off `document`. #}
 <div class="ch-head">
   <div class="ch-head__titles">
     <h1>Chats</h1>
@@ -64,36 +64,53 @@
 
 {% block page_surface %}
 <section class="ch-section">
-  {# ── Toolbar — the Library's FLOATING DOCK, same component, same behaviour
-       (`.fbar-dock`, shared with /library; both wrap the same `.fbar`).
+  {# ── The browsing block — the Library's, same component, same shape ────────
+       Search, the filters, sort, New chat, the count and the active filters are
+       ONE job, so they are one block, and it sits directly on the list it acts
+       on (`.lib-browse` in library.html is the sibling of this).
 
-       A dock rather than a strip under the header for the reason /library
-       adopted one: this is a scrolling inventory, so the controls that narrow it
-       have to stay reachable at row 200 as much as at row 1 — parked at the top
-       they scroll away exactly when a long list makes them worth having.
+       It used to be the shared FLOATING DOCK (`.fbar-dock`), bought for a real
+       property: the controls that narrow a scrolling inventory are wanted at
+       row 200 as much as at row 1, and a bar parked under a header that scrolls
+       away leaves exactly when a long list makes it worth having. The cost was
+       worse than the property — the card floats over the FOOT of the page, so
+       it covered the last rows on every screen and put the controls below the
+       list they narrow. /library left the dock for this layout in #1751 and
+       /chats was the only caller still on it (TCRD-280).
 
-       One card, two rows, in this order:
-         Row 1 (#ch-chips) — removable chips for the applied facets. ABOVE the
-           controls: they are the current STATE, the row below is the machinery
-           that changes it. Hidden until a facet is applied.
-         Row 2 (.fbar) — search · the four views · Filter · sort · New chat.
-           No list⇄grid control: this page has one view.
-       Everything the dock opens (the Filter menu and its category popovers)
-       opens UPWARD — see `.fbar-dock` in filter_toolbar.css.
+       The property IS given up, and deliberately: this block scrolls away, so
+       search is off screen at row 200. /library made the same trade and neither
+       page pins its header (`.lib-head` is not sticky — see the note there; on
+       /library it is the group BANDS that pin, and this page has none). The
+       reasoning is that narrowing a list is something you do on arrival, before
+       you scroll, so the controls belong where you first reach for them; a
+       caller deep in a long list scrolls up, which is cheaper than every screen
+       losing its last rows. If that turns out wrong, the fix is to pin this
+       block — not to put the controls back under the list.
+
+       Two rows, in this order:
+         Row 1 (.fbar) — search · Filter · sort · New chat. No list⇄grid
+           control: this page has one view.
+         Row 2 (.ch-listhead) — one line stating what the row above did:
+           select-all, the count, and the removable facet chips. BELOW the
+           controls now, not above them: it is the current STATE, and it belongs
+           against the list it describes rather than between the machinery and
+           the page. Same reasoning as `.lib-browse__state`.
+       Menus and category popovers open DOWNWARD, the shared component's
+       default; the upward overrides the dock needed are gone with it.
 
        Search and New chat are the two ENDS of the controls row, exactly as
        /library places them: search LEFT (the way into a list of any size), the
        call to action RIGHT, with the controls that narrow the list between them.
-       The bar carries no `--center` because of it — search is a flex control, so
-       there is no free space left for centring to distribute.
 
-       The bulk bar takes this same spot while something is selected (see
-       `.has-selection` in chats.css): "narrow the list" and "act on the
-       selection" are two different jobs and must not stack two floating cards on
-       top of each other. ── #}
-  <div class="fbar-dock" id="ch-dock"><span class="fbar-dock__veil" aria-hidden="true"></span><div class="fbar-dock__card">
-  <div class="fbar-chips fbar-chips--center" id="ch-chips" hidden></div>
-  <div class="fbar ch-fbar" role="group" aria-label="Search, filter and sort chats">
+       `.fbar--ranked` is the rank treatment both pages share (filter_toolbar.css)
+       — search as a field rather than a fifth equal box, quiet utilities, one
+       filled primary, 32px throughout.
+
+       The bulk bar no longer contends for this spot: it stays fixed at the foot
+       while a selection lasts, and the toolbar stays visible above it. ── #}
+  <div class="ch-browse">
+  <div class="fbar ch-fbar fbar--ranked" role="group" aria-label="Search, filter and sort chats">
     {# The bar's own `role="search"` landmark rides this box rather than fronting
        one: a search field with no landmark of its own is unreachable by landmark
        navigation. #}
@@ -240,7 +257,6 @@
       <span>New chat</span>
     </a>
   </div>
-  </div></div>
 
   <div class="ch-listhead">
     {# Selects every row the current filters leave VISIBLE, not every row on the
@@ -257,6 +273,13 @@
     </span>
     {% endif %}
     <span class="ch-count" id="ch-count">{{ chat_rows | length }} chat{{ '' if chat_rows | length == 1 else 's' }}</span>
+    {# The applied facets, as removable chips, on the same line as the count —
+       they are one sentence ("4 of 31, because Agent is Revenue Analyst"), and
+       splitting them put the number here and the chips in the toolbar above.
+       `filter_toolbar.js` resolves `#ch-chips` off `document`, so it keeps its
+       id wherever it sits. Hidden until a facet is applied. #}
+    <div class="fbar-chips" id="ch-chips" hidden></div>
+  </div>
   </div>
 
   {% if chat_rows %}
