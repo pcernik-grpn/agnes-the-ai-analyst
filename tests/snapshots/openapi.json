@@ -14306,9 +14306,25 @@
     },
     "/admin/linked-apps": {
       "get": {
-        "description": "Gone, for the same reason as ``/admin/linked-apps/new`` above: the\nwizard's three steps (pick a source \u2192 materialize its lister \u2192 select and\ngrant the apps) are now the last section of the builder that registers the\nsource, reached in the flow that created it.",
+        "description": "Publish apps from a tool server that is already connected.\n\nThe other half of the MCP builder's apps section, and a different errand:\nthere you are connecting a server and its apps are the obvious next move;\nhere the server was connected weeks ago and today's job starts from the\napp list. Routing that through the connection form would ask an admin to\nre-answer questions they answered once.\n\nIt is the same panel in both places (``linked_apps_panel.js``), so \"what\ndoes reading the list write\" cannot have two answers. What the retired\nwizard did wrong is not repeated: the source is CHOSEN from a list rather\nthan detected by elimination, and the empty state hands off to the builder\ninstead of saying \"register one first, then come back\".\n\n``?source=`` preselects a server \u2014 how the builder's \"publish these\nelsewhere\" link and a return trip from connecting one land on the right\nrow instead of an empty picker.",
         "operationId": "admin_linked_apps_page_admin_linked_apps_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -14329,8 +14345,10 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
-                "schema": {}
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
             "description": "Successful Response"
@@ -14354,7 +14372,7 @@
     },
     "/admin/linked-apps/new": {
       "get": {
-        "description": "Gone \u2014 publishing linked apps is a section of the MCP-source builder.\n\nIt was always downstream of that builder and could never stand alone: step\none asked which MCP source to read apps from and dead-ended with \"not\nregistered yet? register one first, then come back\", and when exactly one\nsource existed it picked that one by elimination and printed \"\u2713 Using\" for\na choice the admin never made. Folding it in removes the round trip, the\nguess, and an entry point that could not complete on an instance with data\napps switched off. The path stays so bookmarks and the old admin links\nstill land somewhere useful.",
+        "description": "The old \"new linked app\" path. There is no separate create step any\nmore \u2014 publishing apps is picking a connected server and reading its list\n\u2014 so this lands on the page that does it.",
         "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
         "parameters": [
           {

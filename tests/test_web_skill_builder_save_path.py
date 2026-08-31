@@ -66,14 +66,17 @@ def test_save_button_reports_in_flight_state(seeded_app):
     assert "!(canPublish() && !reviewInProgress && !inFlight)" in html
 
 
-def test_both_save_paths_route_failures_to_the_work_list(seeded_app):
-    """Bundle and markdown saves both land in `fail`, not in prose.
+def test_every_save_path_routes_failures_to_the_work_list(seeded_app):
+    """Bundle, markdown and edit saves all land in `fail`, not in prose.
 
-    Two `.catch(fail)` sites, one per path. `fail` is what turns a refusal into
-    the alert + per-field marks; a path that skips it silently loses the verdict.
+    Three `.catch(fail)` sites, one per path — the third arrived with editing a
+    saved item in the builder (`?edit=<id>`), which is a save like the other
+    two and must not invent its own way of reporting a refusal. `fail` is what
+    turns a refusal into the alert + per-field marks; a path that skips it
+    silently loses the verdict.
     """
     html = seeded_app["client"].get("/skills", headers=_auth(seeded_app["admin_token"])).text
-    assert html.count(".catch(fail)") == 2
+    assert html.count(".catch(fail)") == 3
 
 
 def test_progress_is_named_on_the_control_that_started_it(seeded_app):

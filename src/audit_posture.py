@@ -1376,6 +1376,10 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "store_rate": "store.entity.rate",
     "store_status": "exempt:ui_support",
     "store_publish_markdown": "store.entity.create",
+    # Reading a document back is an owner-scoped read, like store_status.
+    "store_read_markdown": "exempt:ui_support",
+    # Writing one over an entity is the same act the REST sibling audits.
+    "store_edit_markdown": "store.entity.update",
     "store_compose_plugin": "store.entity.create",
     "marketplace_search": "exempt:ui_support",
     "marketplace_detail": "exempt:ui_support",

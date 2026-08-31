@@ -500,12 +500,16 @@ window.AgnesMcpBuilder.open({ mount });
     )
 
 
+#: One read-only tool and one the server does not vouch for. That split is
+#: what the builder's defaults key on — read-only arrives ON, anything that
+#: could write arrives OFF — so the curation these tests exercise starts from
+#: the state a real admin sees.
 _TWO_TOOLS = """{
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   'POST /api/admin/mcp-sources/preview-introspect': {
     status: 200,
     body: { tools: [
-      { name: 'search_crm', description: 'Search', input_schema: { type: 'object' } },
+      { name: 'search_crm', description: 'Search', read_only: true, input_schema: { type: 'object' } },
       { name: 'delete_account', description: 'Danger' },
     ] },
   },
@@ -514,10 +518,14 @@ _TWO_TOOLS = """{
 
 
 def test_the_tools_left_on_are_registered_so_an_agent_can_call_them():
+    """Both end up registered here — but only because the admin turns the
+    write-capable one on. It does not arrive that way."""
     res = _node(
         _mcp_script(
             _TWO_TOOLS,
             r"""
+  fire('click', { 'data-mcp-tool': 'delete_account' });
+  for (let i = 0; i < 4; i++) await flush();
   fire('click', { id: 'mcp-save' });
   for (let i = 0; i < 16; i++) await flush();
   process.stdout.write(JSON.stringify({
@@ -547,11 +555,14 @@ def test_the_tools_left_on_are_registered_so_an_agent_can_call_them():
 
 
 def test_a_tool_toggled_off_is_never_registered():
+    """`search_crm` is read-only, so it arrives on; switching it off must
+    keep it out of the registry entirely — and `delete_account`, which arrives
+    off, must stay out without being touched."""
     res = _node(
         _mcp_script(
             _TWO_TOOLS,
             r"""
-  fire('click', { 'data-mcp-tool': 'delete_account' });
+  fire('click', { 'data-mcp-tool': 'search_crm' });
   for (let i = 0; i < 4; i++) await flush();
   fire('click', { id: 'mcp-save' });
   for (let i = 0; i < 16; i++) await flush();
@@ -563,8 +574,8 @@ def test_a_tool_toggled_off_is_never_registered():
         )
     )
     names = [b["original_name"] for b in res["bodies"]]
-    assert names == ["search_crm"], (
-        f"a tool the admin switched off was registered anyway (or the on one was not): {names}"
+    assert names == [], (
+        f"a tool the admin switched off was registered anyway: {names}"
     )
 
 
@@ -602,7 +613,7 @@ def test_a_second_save_does_not_duplicate_the_tool_rows():
             """{
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   'POST /api/admin/mcp-sources/preview-introspect': {
-    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search', read_only: true }] },
   },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-r' } }],
   // The tool registers fine; the GRANT fails once, so Save is retried with
@@ -664,7 +675,9 @@ def test_a_no_tools_registered_409_is_a_failure_not_a_shrug():
             """{
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   'POST /api/admin/mcp-sources/preview-introspect': {
-    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+    // Read-only, so it arrives switched ON — which is what makes the click
+    // below a deliberate "turn everything off", the state this test is about.
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search', read_only: true }] },
   },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-n' } }],
   'POST /api/admin/mcp-sources/src-n/grants': {
