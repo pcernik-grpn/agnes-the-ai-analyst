@@ -524,6 +524,60 @@ session can still reach the same information live via the
 `get_semantic_context`/`semantic_model_search` MCP tools or the `agnes
 semantic-model` CLI; it just never gets it injected ambiently.
 
+## Reading the layer cheaply
+
+How an agent reads the definitions decides whether the layer looks free or
+expensive. The local cache above is the cheap path; when a read does go to
+the server, batch it:
+
+```bash
+agnes semantic-model context dataset metric relationship     # whole layer, compact, ONE call
+agnes semantic-model context metric --id net_revenue --id aov  # full detail, batched
+agnes catalog --metrics --show revenue/net --show orders/aov   # repeatable too
+```
+
+`GET /api/semantic-models/context` has always accepted a LIST of selections;
+both callers (the MCP tool and the CLI) used to hardcode a one-element list,
+so a "what exists here?" bootstrap cost one round trip per type. This matters
+more than the latency: every lookup leaves its payload in the agent's
+conversation, and every later turn re-reads it. Forty lookups where five
+would do is not forty round trips of waste — it is forty payloads multiplied
+by the rest of the session. A definition already read this session is still
+valid; re-fetching it buys nothing.
+
+What that costs in tokens is measurable rather than arguable — see
+[`observability.md`](observability.md) → *Chat cost*, which reports cached
+and uncached tokens separately and prices each session by the model it
+actually ran on. Charging a re-read of a cached prefix at the full input rate
+(~10x its real price) is the single easiest way to make a governed layer look
+expensive on paper.
+
+## Encoding a rule so it cannot be missed
+
+If a definition carries a business rule — "net revenue excludes cancelled
+and returned orders" — put the rule in the document as a **constraint**, not
+only in the metric's prose. A rule in prose is advisory: an agent that never
+reads that field, or reads it and forgets, computes a confidently wrong
+number. A `required_filter` constraint is checked by
+`agnes semantic-model validate-query` *before* the query runs:
+
+```yaml
+custom_extensions:
+  - vendor_name: AGNES
+    data: >-
+      {"constraints": [{"name": "net_revenue_excludes_cancelled",
+       "constraint_type": "required_filter",
+       "rule": "order_status NOT IN ('cancelled', 'returned')",
+       "severity": "error", "metrics": ["net_revenue"]}]}
+```
+
+That is the difference between a layer that makes a mistake *cheap to catch*
+(one lookup instead of a re-investigation) and one that stops the mistake.
+Prefer the second wherever the rule can be written down. See *Query
+validation* below for what the validator can and cannot check statically —
+anything beyond a filter-presence check degrades to `post_execution_checks`,
+which is honest rather than a guessed all-clear.
+
 ## Query validation
 
 Before running a SQL statement, check it against the semantic layer: does it

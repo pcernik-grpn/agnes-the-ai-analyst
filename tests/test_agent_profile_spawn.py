@@ -219,6 +219,33 @@ def test_build_profile_omits_facts_rails_when_the_switch_is_off(monkeypatch):
     assert agent_profile.DATA_ACCESS_RAILS in md
 
 
+def test_semantic_section_teaches_batched_reading(monkeypatch):
+    """The persona's semantic pointer must carry the ECONOMY rules, not just
+    the existence of the layer.
+
+    An agent that discovers the layer without them issues one lookup per
+    object, and every one of those payloads then sits in the conversation for
+    the rest of the session — the cost of reading a governed layer is decided
+    almost entirely by whether the reads are batched and not repeated.
+    """
+    monkeypatch.setattr(
+        "src.claude_md._semantic_layer_models",
+        lambda conn, user: [{"slug": "retail", "description": "Orders", "instructions": ""}],
+    )
+    monkeypatch.setattr(
+        "src.repositories.users_repo",
+        lambda: type("R", (), {"get_by_email": staticmethod(lambda e: {"id": "u1", "email": e})})(),
+    )
+    section = agent_profile._semantic_layer_section("u@x.com")
+    assert "retail" in section
+    # One call for every type, one call for every id.
+    assert "context dataset metric relationship" in section
+    assert "--id <a> --id <b>" in section
+    # And don't re-read what you already have.
+    assert "already read is still valid" in section
+    assert "validate-query" in section
+
+
 def test_build_profile_skill_body_is_valid_skill_md():
     row = _agent_row(system_prompt="Be helpful.")
     profile = agent_profile.build_profile(row)

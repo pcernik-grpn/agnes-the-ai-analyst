@@ -156,6 +156,85 @@ def summary(
         typer.echo("  * not in the table registry (parsed from query SQL)")
 
 
+@app.command("chat-cost")
+def chat_cost(
+    window: str = typer.Option("7d", "--window", help="1d|7d|30d|all"),
+    user: str = typer.Option(None, "--user", help="Restrict to one session owner's email."),
+    limit: int = typer.Option(20, "--limit", help="Max (session, model) rows to show."),
+    json_out: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
+):
+    """Measured chat cost, split cached vs uncached — not a model, a measurement.
+
+    Whether an AI workflow is expensive turns almost entirely on how a
+    re-read of a large cached prefix is priced: at the full input rate it
+    dominates the bill, at the real cached rate (~0.1x input) it nearly
+    vanishes. This reads both halves straight out of the recorded per-message
+    usage and prices each session by the model it actually ran on
+    (src/llm_pricing.py), so a cost claim can be checked instead of modelled.
+
+    A row marked `cache:unavailable` predates the recording of prompt-cache
+    figures: its cached tokens are unknown, not zero, and its cost is a floor.
+    """
+    if window not in ("1d", "7d", "30d", "all"):
+        typer.echo(f"[err] window must be 1d|7d|30d|all, got {window!r}", err=True)
+        raise typer.Exit(1)
+
+    params: dict = {"window": window, "limit": limit}
+    if user:
+        params["user"] = user
+
+    client = get_client(timeout=60)
+    try:
+        resp = client.get("/api/admin/telemetry/chat-cost", params=params)
+    except Exception as e:
+        typer.echo(f"[err] cannot reach server: {e}", err=True)
+        raise typer.Exit(1)
+    _handle_error(resp, "chat-cost")
+    data = resp.json()
+
+    if json_out:
+        import json
+
+        typer.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    t = data.get("totals") or {}
+    share = t.get("cached_input_share")
+    share_str = f"{share:.1%}" if isinstance(share, (int, float)) else "n/a"
+    typer.echo(f"Chat cost — window {data.get('window', window)}")
+    typer.echo(
+        f"  total: ${t.get('cost_usd', 0):.4f}   "
+        f"in {t.get('input_tokens', 0):,}   out {t.get('output_tokens', 0):,}   "
+        f"cache read {t.get('cache_read_tokens', 0):,}   cache write {t.get('cache_creation_tokens', 0):,}"
+    )
+    typer.echo(f"  share of read input served from cache: {share_str}")
+
+    sessions = data.get("sessions") or []
+    if not sessions:
+        typer.echo("  (no assistant messages in this window)")
+    else:
+        typer.echo("")
+        typer.echo(f"  {'session':<26} {'model':<20} {'msgs':>5} {'cost':>10} {'cached%':>8}  cache")
+        for row in sessions:
+            read_input = (
+                (row.get("input_tokens") or 0)
+                + (row.get("cache_read_tokens") or 0)
+                + (row.get("cache_creation_tokens") or 0)
+            )
+            pct = f"{(row.get('cache_read_tokens') or 0) / read_input:.1%}" if read_input else "n/a"
+            typer.echo(
+                f"  {str(row.get('session_id', ''))[:25]:<26} "
+                f"{str(row.get('model') or '-')[:19]:<20} "
+                f"{row.get('messages', 0):>5} "
+                f"${row.get('cost_usd', 0):>9.4f} "
+                f"{pct:>8}  {row.get('cache_accounting', '?')}"
+            )
+
+    for note in data.get("notes") or []:
+        typer.echo("")
+        typer.echo(f"  note: {note}")
+
+
 @app.command()
 def reprocess():
     """Force re-extraction of all sessions for the usage processor."""

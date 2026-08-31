@@ -266,10 +266,24 @@ def _semantic_layer_section(user_email: str | None) -> str:
             lines.append(line + "\n")
             if m.get("instructions"):
                 lines.append(f"  - Model author's note about this data: {m['instructions']}\n")
+        # Discovery guidance is deliberately economy-first. An agent that
+        # finds the layer without it issues one lookup per object, and every
+        # one of those payloads then sits in the conversation for the rest of
+        # the session — reading the layer is cheap, reading it one object at a
+        # time and re-reading it later is not.
         lines.append(
-            "\nDiscover more: `agnes semantic-model context <type>` (or the "
-            "MCP `get_semantic_context` tool). Always check a query against "
-            'it first with `agnes semantic-model validate-query "<SQL>"`.\n'
+            "\nDiscover more in ONE call, then work from what you read:\n"
+            "- `agnes semantic-model context dataset metric relationship` — "
+            "the whole layer, compact (or the MCP `get_semantic_context` tool "
+            "with the same list).\n"
+            "- `agnes semantic-model context metric --id <a> --id <b>` — full "
+            "detail for several objects at once. A call per object multiplies "
+            "both round trips and the context every later turn carries, and a "
+            "definition you have already read is still valid.\n"
+            "- Always check a query against the layer first with `agnes "
+            'semantic-model validate-query "<SQL>"` — it catches a constraint '
+            "violation (an excluded order state, a wrong grain) and a dialect "
+            "mismatch before the query hands you a confidently wrong number.\n"
         )
         return "".join(lines)
     except Exception:

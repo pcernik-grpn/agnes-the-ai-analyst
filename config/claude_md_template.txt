@@ -130,17 +130,23 @@ against the server regardless of cache age, so always validate a query
 against it before running it, even between pulls.
 
 ```
-agnes semantic-model context dataset                       # every dataset, compact (name + summary)
-agnes semantic-model context metric --id <name>             # one metric, full detail
+agnes semantic-model context dataset metric relationship    # the WHOLE layer, compact, in ONE call
+agnes semantic-model context metric --id <a> --id <b>       # full detail for several metrics, one call
 agnes semantic-model schema dataset metric relationship     # the object schema, straight from the source
 agnes semantic-model validate-query "<SQL>"                 # check a query against it before running it
 agnes glossary search "<term>"                              # what a business term means here
 agnes semantic-model apply <file.yml>                       # write a definition back (admins apply it live; everyone else submits it for review)
 ```
 
-`agnes semantic-model context <type>` without `--id` returns every object of
-that type compactly; pass one or more `--id` to get full attributes
+`agnes semantic-model context <type…>` without `--id` returns every object of
+those types compactly; pass one or more `--id` to get full attributes
 (expression, fields, ai_context, constraints) for just the ones you need.
+
+Both forms take several arguments on purpose: **one call for every type, one
+call for every id you need in full.** When you do go to the server rather
+than the cached files above, a call per object multiplies both round trips
+and the context every later turn has to carry — and a definition you have
+already read this session is still valid, so re-fetching it buys nothing.
 Always validate a query you built against this layer before running it —
 `agnes semantic-model validate-query` checks constraint violations and
 whether the metrics you used are executable on the engine you're about to

@@ -1230,26 +1230,40 @@ async def sync_semantic_source(source_id: str, user: dict = Depends(require_admi
 
 @router.get("/api/semantic-models/search")
 async def search_semantic_models(
-    q: str = Query(..., min_length=1, description="Search query"),
+    q: str = Query("", description="Search query. Empty lists every model you can read."),
     limit: int = Query(10, ge=1, le=100),
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Case-insensitive substring search over slug/name/description, RBAC
     filtered to models linked to a Data Package the caller can access
-    (admins see everything)."""
+    (admins see everything).
+
+    An empty ``q`` lists everything readable rather than 422-ing: default
+    scope is everything and a term NARROWS it (command-UX standard), so a
+    caller who wants the whole list should not have to invent a substring
+    that matches it. (``/api/semantic-models/bundle`` also enumerates the
+    accessible set, but it renders the pull cache payload — this stays the
+    lightweight find surface.)
+
+    ``truncated`` says out loud when ``limit`` cut the list short: a partial
+    result that reads as complete is a silent cap, which the same standard
+    forbids.
+    """
     needle = q.lower()
     matches: list[dict[str, Any]] = []
+    truncated = False
     for row in semantic_model_repo().list_all():
         haystack = " ".join(filter(None, [row.get("slug"), row.get("name"), row.get("description")])).lower()
-        if needle not in haystack:
+        if needle and needle not in haystack:
             continue
         if not _can_read_model(user, row, conn):
             continue
-        matches.append(row)
         if len(matches) >= limit:
+            truncated = True
             break
-    return {"query": q, "models": matches, "count": len(matches)}
+        matches.append(row)
+    return {"query": q, "models": matches, "count": len(matches), "truncated": truncated}
 
 
 @router.get("/api/semantic-models/{slug}.yaml")

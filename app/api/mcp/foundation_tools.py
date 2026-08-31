@@ -707,7 +707,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def get_semantic_context(
-        semantic_type: Literal["dataset", "metric", "relationship"],
+        semantic_type: Literal["dataset", "metric", "relationship"] | list[str],
         ids: list[str] | None = None,
         model_ids: list[str] | None = None,
     ) -> dict:
@@ -725,23 +725,45 @@ def register_foundation_tools(
         contributes no objects, silently — not an error. Mirrors
         ``GET /api/semantic-models/context`` and `agnes semantic-model context`.
 
+        BATCH — do this in ONE call, not N:
+
+        - ``semantic_type=["dataset", "metric", "relationship"]`` is the whole
+          layer, compactly, in a single round trip. Make this your first call.
+        - ``semantic_type="metric", ids=["revenue", "aov", "margin", ...]``
+          returns full detail for every id at once. Twenty separate one-id
+          calls cost twenty round trips and leave twenty tool results in
+          context for the same answer.
+
+        And once read, work from what you already have — re-fetching a
+        definition you looked up earlier in the session buys nothing.
+
         Args:
-            semantic_type: ``dataset``, ``metric``, or ``relationship``.
-            ids: Specific object names to fetch in full. Omit (or pass an
-                empty list) for every object of this type, compactly.
+            semantic_type: ``dataset``, ``metric``, ``relationship`` — or a
+                LIST of them to fetch several types in one call.
+            ids: Specific object names to fetch in full — pass them all in
+                one call. Omit (or pass an empty list) for every object of
+                the requested type(s), compactly. With several types, the
+                same id filter applies to each; a type with no match simply
+                contributes nothing.
             model_ids: Restrict to these models by id, slug, or model name
                 (the ``model`` label each returned object carries; matched
                 case-insensitively). Omit for every model you can access.
 
         Returns ``{"results": [{"semantic_type", "mode", "objects": [...]}],
-        "unknown_types": [...], "model_hashes": {slug: content_hash}}``. Each
+        "unknown_types": [...], "model_hashes": {slug: content_hash}}`` — one
+        ``results`` entry per requested type. Each
         object carries ``"model"`` (which semantic model it came from)
         alongside its own attributes. ``model_hashes`` covers every model you
         can access (not narrowed by ``model_ids``) — use it to check whether
         a local `semantic/<slug>/…` cache file `agnes pull` wrote (header
         `content_hash`) is still current once its `ttl_seconds` has elapsed.
         """
-        params: dict[str, Any] = {"selections": json.dumps([{"semantic_type": semantic_type, "ids": ids or None}])}
+        # The wire endpoint has always accepted a LIST of selections; this
+        # tool used to hardcode a one-element list, which is what made a
+        # "what exists here?" bootstrap cost one round trip per type.
+        requested = [semantic_type] if isinstance(semantic_type, str) else list(semantic_type)
+        selections = [{"semantic_type": t, "ids": ids or None} for t in requested]
+        params: dict[str, Any] = {"selections": json.dumps(selections)}
         if model_ids:
             params["model_ids"] = model_ids
         async with httpx.AsyncClient() as c:

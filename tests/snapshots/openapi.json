@@ -13054,7 +13054,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.91.0"
+    "version": "0.92.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -33854,6 +33854,104 @@
         ]
       }
     },
+    "/api/admin/telemetry/chat-cost": {
+      "get": {
+        "description": "Measured cost of chat sessions, split by cached vs uncached tokens.\n\nThe point of this route is that it MEASURES rather than models. A cost\ncomparison between two agent workflows (say, one that loads business\ndefinitions from a governed semantic layer once per session against one\nthat carries them by hand) turns almost entirely on how a re-read of a\nlarge cached prefix is priced: at the full input rate it dominates the\nbill, at the real cached rate (~0.1x) it nearly vanishes. Both figures\ncome from ``chat_messages`` here, per model, so nobody has to guess.\n\n``cache_accounting`` per row, and ``notes`` overall, say out loud when a\nzero is not a measurement: rows written before migration 0092 carry no\ncache figures at all, and a \"0 cached tokens\" that means \"unrecorded\" is\nexactly the mistake this route exists to stop.",
+        "operationId": "chat_cost_api_admin_telemetry_chat_cost_get",
+        "parameters": [
+          {
+            "description": "1d|7d|30d|all",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "1d|7d|30d|all",
+              "title": "Window",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Restrict to one session owner's email.",
+            "in": "query",
+            "name": "user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Restrict to one session owner's email.",
+              "title": "User"
+            }
+          },
+          {
+            "description": "Max (session, model) rows.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "Max (session, model) rows.",
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat Cost",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
     "/api/admin/telemetry/export": {
       "get": {
         "description": "Stream usage_events filtered by since/until/user_id/source.\n\nReads through the backend-aware repository factory so the export\nreflects the active state backend (DuckDB or Postgres), not the\nalways-DuckDB request connection (#513/#518 bug class).\n\nCSV: standard library `csv.writer`, one row per event with all columns.\nJSON: streaming NDJSON (one JSON object per line) \u2014 easier to pipe + tail.\nParquet: pyarrow table written to an in-memory buffer (engine-agnostic).",
@@ -49512,17 +49610,17 @@
     },
     "/api/semantic-models/search": {
       "get": {
-        "description": "Case-insensitive substring search over slug/name/description, RBAC\nfiltered to models linked to a Data Package the caller can access\n(admins see everything).",
+        "description": "Case-insensitive substring search over slug/name/description, RBAC\nfiltered to models linked to a Data Package the caller can access\n(admins see everything).\n\nAn empty ``q`` lists everything readable rather than 422-ing: default\nscope is everything and a term NARROWS it (command-UX standard), so a\ncaller who wants the whole list should not have to invent a substring\nthat matches it. (``/api/semantic-models/bundle`` also enumerates the\naccessible set, but it renders the pull cache payload \u2014 this stays the\nlightweight find surface.)\n\n``truncated`` says out loud when ``limit`` cut the list short: a partial\nresult that reads as complete is a silent cap, which the same standard\nforbids.",
         "operationId": "search_semantic_models_api_semantic_models_search_get",
         "parameters": [
           {
-            "description": "Search query",
+            "description": "Search query. Empty lists every model you can read.",
             "in": "query",
             "name": "q",
-            "required": true,
+            "required": false,
             "schema": {
-              "description": "Search query",
-              "minLength": 1,
+              "default": "",
+              "description": "Search query. Empty lists every model you can read.",
               "title": "Q",
               "type": "string"
             }

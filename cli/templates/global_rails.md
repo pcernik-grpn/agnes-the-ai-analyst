@@ -12,7 +12,12 @@ platform. When asked about org data, follow this protocol:
 3. **Reuse snapshots** across questions; `agnes snapshot list` before
    fetching; drop with `agnes snapshot drop <name>` when done.
 4. **Business metrics**: look up canonical definitions first —
-   `agnes catalog --metrics` / `--show <id>`. Never invent metric SQL.
+   `agnes catalog --metrics` / `--show <id> --show <id2>` (repeatable, so
+   several definitions cost one call). Never invent metric SQL.
+5. **Semantic layer**, where the instance has one: read it in ONE pass —
+   `agnes semantic-model context dataset metric relationship` — then work
+   from what you read rather than re-fetching per object, and
+   `agnes semantic-model validate-query "<SQL>"` before running.
 
 Full protocol: `agnes skills show agnes-data-querying`. Data freshness is
 maintained automatically (SessionStart hook); manual refresh: `agnes update`.

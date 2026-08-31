@@ -460,6 +460,22 @@ HTML dashboard pages use the design-system **page shell** (#367/#482): `{% exten
 - **Jira**: `connectors/jira/webhook.py` → `incremental_transform.py` → `extract_init.py` updates `_meta`.
 - **Databricks**: `connectors/databricks/extractor.py` materializes registered SQL on a SQL warehouse (Statement Execution API → Arrow → parquet, no SDK); `remote.py` ships an analyst's statement to the warehouse per query for `query_mode='remote'` rows; `attach.py` + `extract_init.py` optionally ATTACH Unity Catalog into DuckDB (`uc_catalog`/`delta`, opt-in, experimental) so remote rows can be JOINed locally; `semantic_layer.py` mirrors Unity Catalog metric views into `metric_definitions` (`source='databricks_semantic_layer'`, scoped prune per workspace).
 
+### LLM cost accounting (`src/llm_pricing.py`)
+One model-aware, cache-aware price table is the only place token counts
+become USD — input, output, cache read (0.1x input) and cache write (1.25x
+input), resolved by exact id then longest known prefix, with an unknown
+model priced at the most expensive general-purpose tier (a guardrail that
+must guess should guess in the direction that stops sooner). Two budget
+surfaces share ONE definition of a chargeable token via `budget_tokens()`:
+`input + output + cache_creation`, cache reads excluded. The chat path
+records all four kinds per message (`chat_messages.cache_read_tokens` /
+`cache_creation_tokens`, PG-only, migration `0092`), which is what makes
+`GET /api/admin/telemetry/chat-cost` (`agnes admin usage chat-cost`) a
+measurement rather than a model — see
+[`docs/observability.md`](docs/observability.md) → *Chat cost*. The daily
+spend cap remains deliberately coarser (a two-bucket counter with no model
+attached) and says so.
+
 ### Config Loading
 1. `config/loader.py` loads `instance.yaml`.
 2. `app/instance_config.py` exposes `get_data_source_type()`, `get_value()`.

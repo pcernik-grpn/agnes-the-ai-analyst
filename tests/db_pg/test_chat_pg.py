@@ -169,6 +169,103 @@ def test_append_message_updates_session_rollup(sessions, messages):
     assert refreshed.last_message_at is not None
 
 
+def test_cache_tokens_round_trip(sessions, messages):
+    """Migration 0092's two columns: written, read back, and NULL when the
+    caller had nothing to record (NULL means "not recorded", never a
+    measured zero)."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    messages.append_message(
+        session_id=s.id,
+        role="assistant",
+        content="hello",
+        tokens_in=10,
+        tokens_out=20,
+        cache_read_tokens=5000,
+        cache_creation_tokens=300,
+        model="claude-sonnet-5",
+    )
+    messages.append_message(session_id=s.id, role="user", content="hi")
+
+    by_role = {m.role: m for m in messages.list_messages(s.id)}
+    assert by_role["assistant"].cache_read_tokens == 5000
+    assert by_role["assistant"].cache_creation_tokens == 300
+    assert by_role["user"].cache_read_tokens is None
+    assert by_role["user"].cache_creation_tokens is None
+
+
+def test_session_and_daily_totals_charge_cache_writes_only(sessions, messages):
+    """`input + output + cache_creation`, cache reads excluded — the shared
+    budget definition (`src.llm_pricing.budget_tokens`). The daily aggregate
+    is what the live counter re-seeds from after a restart, so if it counted
+    a different in-total the re-seed would move a user's remaining budget."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    messages.append_message(
+        session_id=s.id,
+        role="assistant",
+        content="a",
+        tokens_in=100,
+        tokens_out=200,
+        cache_read_tokens=1_000_000,  # must NOT be charged
+        cache_creation_tokens=50,  # must be charged
+    )
+    assert messages.session_total_tokens(s.id) == 350
+    assert messages.daily_anthropic_tokens("u@x.com") == (150, 200)
+
+
+def test_cost_breakdown_groups_by_session_and_model(sessions, messages):
+    """One row per (session, model) — a session that switched models must not
+    be averaged into one wrong rate — and `cache_recorded_messages` must
+    distinguish "used no cache" from "never recorded any"."""
+    s1 = sessions.create_session(user_email="a@x.com", surface=Surface.WEB)
+    s2 = sessions.create_session(user_email="b@x.com", surface=Surface.WEB)
+    messages.append_message(
+        session_id=s1.id,
+        role="assistant",
+        content="a",
+        tokens_in=10,
+        tokens_out=20,
+        cache_read_tokens=900,
+        cache_creation_tokens=5,
+        model="claude-sonnet-5",
+    )
+    messages.append_message(
+        session_id=s1.id,
+        role="assistant",
+        content="b",
+        tokens_in=1,
+        tokens_out=2,
+        model="claude-opus-5",  # same session, different model
+    )
+    messages.append_message(
+        session_id=s2.id,
+        role="assistant",
+        content="c",
+        tokens_in=7,
+        tokens_out=8,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+        model="claude-sonnet-5",
+    )
+    # A user turn must never appear in a cost breakdown.
+    messages.append_message(session_id=s1.id, role="user", content="q")
+
+    rows = messages.cost_breakdown()
+    keyed = {(r["session_id"], r["model"]): r for r in rows}
+    assert len(rows) == 3
+
+    sonnet = keyed[(s1.id, "claude-sonnet-5")]
+    assert sonnet["tokens_in"] == 10
+    assert sonnet["cache_read_tokens"] == 900
+    assert sonnet["cache_recorded_messages"] == 1
+
+    # Recorded-as-zero (a real measurement) vs never-recorded (unknown).
+    assert keyed[(s2.id, "claude-sonnet-5")]["cache_recorded_messages"] == 1
+    assert keyed[(s1.id, "claude-opus-5")]["cache_recorded_messages"] == 0
+
+    only_a = messages.cost_breakdown(user_email="a@x.com")
+    assert {r["session_id"] for r in only_a} == {s1.id}
+
+
 def test_list_messages_and_after_id(sessions, messages):
     s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
     m1 = messages.append_message(session_id=s.id, role="user", content="one")

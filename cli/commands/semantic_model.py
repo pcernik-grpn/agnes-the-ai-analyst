@@ -395,7 +395,9 @@ def validate_query(
 
 @semantic_model_app.command("context")
 def context(
-    semantic_type: str = typer.Argument(..., help=f"One of: {', '.join(_SEMANTIC_TYPES)}"),
+    semantic_type: list[str] = typer.Argument(
+        ..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)} — several types cost one round trip, not N."
+    ),
     id: list[str] | None = typer.Option(
         None, "--id", help="Specific object id/name — repeatable. Omit for every object of this type (compact)."
     ),
@@ -410,12 +412,18 @@ def context(
 ):
     """Look up datasets/metrics/relationships from your accessible semantic models.
 
-    Omitting `--id` returns every object of `semantic_type` COMPACTLY (name +
-    a short summary); passing one or more `--id` returns the FULL attributes
-    of just those objects. Mirrors `GET /api/semantic-models/context` and the
-    MCP `get_semantic_context` foundation tool.
+    Omitting `--id` returns every object of the requested type(s) COMPACTLY
+    (name + a short summary); passing one or more `--id` returns the FULL
+    attributes of just those objects. Mirrors
+    `GET /api/semantic-models/context` and the MCP `get_semantic_context`
+    foundation tool.
+
+    Batch: `context dataset metric relationship` reads the whole layer in one
+    round trip, and `context metric --id a --id b --id c` reads three metrics
+    in full in one — prefer both over a call per object, which multiplies both
+    round trips and the context every later turn carries.
     """
-    selections = [{"semantic_type": semantic_type, "ids": id or None}]
+    selections = [{"semantic_type": t, "ids": id or None} for t in semantic_type]
     params: dict = {"selections": json.dumps(selections)}
     if model:
         params["model_ids"] = model

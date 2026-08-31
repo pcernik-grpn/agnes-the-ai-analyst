@@ -713,6 +713,9 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin_upgrade_freeze --
     "GET /api/admin/upgrade-freeze": "exempt:ui_support",
     # -- app.api.admin_usage --
+    # Cross-user aggregate read (every session owner's spend), so a real
+    # action rather than exempt:ui_support per the read-posture policy.
+    "GET /api/admin/telemetry/chat-cost": "usage.chat_cost",
     "GET /api/admin/telemetry/export": "usage.export",
     # -- app.api.admin_usage_summary --
     "GET /api/admin/telemetry/facets": "exempt:ui_support",

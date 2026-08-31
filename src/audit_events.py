@@ -114,6 +114,9 @@ CATALOG: dict[str, AuditEvent] = {
         "store.submission.bundle_downloaded", "read", "A marketplace store submission's bundle was downloaded."
     ),
     "usage.ask": AuditEvent("usage.ask", "read", "A natural-language usage question was answered."),
+    "usage.chat_cost": AuditEvent(
+        "usage.chat_cost", "read", "Measured chat token/cost breakdown was read across users."
+    ),
     "usage.export": AuditEvent("usage.export", "read", "Usage data was exported."),
     "usage.summary": AuditEvent("usage.summary", "read", "A usage summary was read."),
     # -- system: scheduler ticks, startup, broker guardrails, review internals

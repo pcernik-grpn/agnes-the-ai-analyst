@@ -1080,6 +1080,14 @@ _EXEMPT: dict[str, str] = {
     "/api/store/entities/{entity_id}/publisher": _TRUST_LINE_REASON,
     "/api/store/entities/{entity_id}/verification": _TRUST_LINE_REASON,
     "/api/store/entities/{entity_id}/verification/request": _TRUST_LINE_REASON,
+    "/api/admin/telemetry/chat-cost": (
+        "admin-only cost telemetry read, and it DOES have a CLI surface "
+        "(`agnes admin usage chat-cost`) alongside the rest of `agnes admin "
+        "usage`. No MCP tool, matching its siblings `/api/admin/telemetry/"
+        "summary` and `/export`: the MCP foundation tools are the ANALYST "
+        "surface over their own data, and an agent has no business reading "
+        "every user's spend."
+    ),
     "/api/admin/prompts/{kind}": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/source": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/bind-git": _PROMPTS_REASON,

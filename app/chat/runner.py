@@ -1776,6 +1776,16 @@ async def _consume_turn(
     collected_text: list[str] = []
     tokens_in = 0
     tokens_out = 0
+    # Prompt-cache halves of the same usage object. Dropping these (which
+    # this runner did until the cost-accounting fix) makes a long agent
+    # session's real context volume unrecoverable after the fact:
+    # `input_tokens` counts only UNCACHED input, so a session with a big
+    # cached prefix reports a fraction of what the model actually read, and
+    # the re-read cost — the dominant term in a many-turn session — has no
+    # column at all. src/llm_pricing.py prices all four; this is where the
+    # two new ones enter the system.
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
     model = ""
     # Per-turn tool-call budget: count tool_call emissions; on
     # overflow emit a confirmation_required frame and break the loop
@@ -1865,6 +1875,14 @@ async def _consume_turn(
                         "content": partial,
                         "tokens_in": tokens_in,
                         "tokens_out": tokens_out,
+                        # Same four-field usage shape as the turn-end frame:
+                        # a turn killed by the watchdog still burned (and
+                        # wrote) cached context, and dropping it here would
+                        # under-count both the measured cost and the daily
+                        # budget for exactly the turns most likely to be
+                        # expensive.
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_creation_tokens": cache_creation_tokens,
                         "model": model,
                     }
                 )
@@ -1964,6 +1982,8 @@ async def _consume_turn(
             if msg.usage:
                 tokens_in += msg.usage.get("input_tokens", 0)
                 tokens_out += msg.usage.get("output_tokens", 0)
+                cache_read_tokens += msg.usage.get("cache_read_input_tokens", 0)
+                cache_creation_tokens += msg.usage.get("cache_creation_input_tokens", 0)
 
         elif isinstance(msg, UserMessage):
             # The SDK feeds tool results back as a UserMessage carrying
@@ -1980,6 +2000,8 @@ async def _consume_turn(
             if msg.usage:
                 tokens_in = msg.usage.get("input_tokens", tokens_in)
                 tokens_out = msg.usage.get("output_tokens", tokens_out)
+                cache_read_tokens = msg.usage.get("cache_read_input_tokens", cache_read_tokens)
+                cache_creation_tokens = msg.usage.get("cache_creation_input_tokens", cache_creation_tokens)
             # ResultMessage signals turn end; receive_response() stops after it.
             # Content prefers the consolidated TextBlocks (canonical);
             # falls back to the streamed deltas should an SDK build omit
@@ -1995,6 +2017,8 @@ async def _consume_turn(
                     "content": "\n\n".join(t for t in collected_text if t.strip()) or "".join(streamed_pieces),
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
                     "model": model,
                 }
             )
