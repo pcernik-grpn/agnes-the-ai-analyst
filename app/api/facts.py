@@ -297,6 +297,32 @@ class FactsIngestAnonymizationReport(BaseModel):
     scopes: Dict[str, FactsIngestAnonymizationScope] = Field(default_factory=dict)
 
 
+class FactsIngestLlmUsage(BaseModel):
+    """OPTIONAL producer-reported LLM cost/usage tally for THIS ingest run
+    — tokens, prompt-cache counts, model(s) used, documents processed, wall
+    time the extraction pipeline spent producing this batch. Additive to
+    the wire contract, same strict-typed treatment as
+    :class:`FactsIngestAnonymizationReport`: malformed input here is a real
+    protocol error (422), not tolerated crawler noise.
+
+    Every field is individually optional — a producer that cannot report a
+    given figure (e.g. a model with no prompt-cache, or a pipeline that
+    doesn't track wall time) omits it rather than send a fabricated zero to
+    a reader who cannot tell "zero" from "unknown". This is honest,
+    ongoing cost VISIBILITY, never joined against a fingerprint or the
+    ingest idempotency logic — purely descriptive metadata about the run
+    that produced a batch, not part of what makes two batches "the same".
+    """
+
+    input_tokens: Optional[int] = Field(default=None, ge=0)
+    output_tokens: Optional[int] = Field(default=None, ge=0)
+    cache_read_input_tokens: Optional[int] = Field(default=None, ge=0)
+    cache_creation_input_tokens: Optional[int] = Field(default=None, ge=0)
+    models: Optional[List[str]] = None
+    documents: Optional[int] = Field(default=None, ge=0)
+    wall_seconds: Optional[float] = Field(default=None, ge=0)
+
+
 def _anonymize_marked_corpus_ids() -> set:
     """Collection ids at least one SharePoint connection's confirmed scope
     marks ``anonymize=true`` (the connect wizard's step-2 checkbox,
@@ -433,15 +459,21 @@ class FactsIngestRequest(BaseModel):
     rejected), so a rigid Pydantic model would reject valid producer input
     on every crawler-side field addition.
 
-    ``anonymization`` is the one exception: a small, OPTIONAL, strictly
-    typed block (spec §9.2) — malformed input there is a real protocol
-    error (422), not tolerated crawler noise."""
+    ``anonymization`` and ``llm_usage`` are the two exceptions: small,
+    OPTIONAL, strictly typed blocks (spec §9.2, and cost-visibility) —
+    malformed input in either is a real protocol error (422), not
+    tolerated crawler noise."""
 
     documents: List[Dict[str, Any]] = Field(default_factory=list)
     full_documents: List[str] = Field(default_factory=list)
     nodes: List[Dict[str, Any]] = Field(default_factory=list)
     edges: List[Dict[str, Any]] = Field(default_factory=list)
     anonymization: Optional[FactsIngestAnonymizationReport] = None
+    #: OPTIONAL per-run LLM cost/usage tally (see FactsIngestLlmUsage) — rides
+    #: into the persisted run report only (GET /api/facts/ingest-runs), never
+    #: into the fingerprint/idempotency logic and never echoed on the direct
+    #: ingest response, same treatment `anonymization` gets above.
+    llm_usage: Optional[FactsIngestLlmUsage] = None
 
 
 @router.post("/ingest")
@@ -505,6 +537,16 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
     ``documents`` never mention is kept, not rejected: this is the
     producer's self-reported tally of what it anonymized, not something
     Agnes independently verifies — see ``docs/anonymization.md``).
+
+    ``llm_usage`` (optional, see :class:`FactsIngestLlmUsage`) rides along
+    the SAME way — into the persisted run report only, never the returned
+    report, and never part of the ingest fingerprint/idempotency logic. It
+    is honest, ongoing cost VISIBILITY for what this run of the extraction
+    pipeline itself cost (tokens, prompt-cache, wall time) — never
+    independently verified, exactly like ``anonymization``'s self-reported
+    tally. ``GET /api/facts/ingest-runs`` echoes it per-run and also
+    returns a ``llm_usage_totals`` cumulative rollup across every run this
+    instance has ever persisted.
 
     Anonymize-fail-closed hardening: BEFORE any of the above runs, a batch
     that documents a corpus whose SharePoint connect-wizard scope is
@@ -587,6 +629,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
             subjects_deleted=report.get("subjects_deleted", 0),
             review_items=report.get("review_items", []),
             anonymization=body.anonymization.model_dump() if body.anonymization else None,
+            llm_usage=body.llm_usage.model_dump(exclude_none=True) if body.llm_usage else None,
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)
@@ -701,5 +744,18 @@ def list_ingest_runs(
     ``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only
     (A3 ratchet); on a DuckDB-backed instance this raises
     ``RequiresPostgresBackend``, translated to a typed ``501`` by the
-    app-wide handler."""
-    return {"runs": facts_ingest_runs_repo().list_recent(limit=limit)}
+    app-wide handler.
+
+    ``llm_usage_totals`` is a CUMULATIVE rollup of every persisted run's
+    optional ``llm_usage`` block (see :class:`FactsIngestLlmUsage`) —
+    summed tokens/documents/wall time, the union of models seen, and a
+    rough ``estimated_cost_usd`` (``None`` until at least one run can be
+    priced; see :meth:`FactsIngestRunsPgRepository.llm_usage_rollup` for
+    why it is never a fabricated precise number). It covers EVERY run this
+    instance has ever persisted, not just the ``limit``-bounded ``runs``
+    list above, and is instance-wide rather than per-connection (same
+    interim limitation as ``distinct_corpus_ids``'s "scope collections"
+    heuristic) — a per-connection split is a documented follow-up once a
+    real connection-to-collection mapping exists."""
+    repo = facts_ingest_runs_repo()
+    return {"runs": repo.list_recent(limit=limit), "llm_usage_totals": repo.llm_usage_rollup()}

@@ -232,6 +232,68 @@ def test_ingest_omitted_anonymization_is_fine_pre_pg(facts_client):
 
 
 # ---------------------------------------------------------------------------
+# `llm_usage` block on POST /api/facts/ingest (cost-visibility) — additive,
+# optional, strictly typed (same posture as `anonymization` above), validated
+# BEFORE the PG-only repo call, so a malformed block 422s cleanly even on the
+# DuckDB backend.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_malformed_llm_usage_negative_token_count_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"llm_usage": {"input_tokens": -5}},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_malformed_llm_usage_wall_seconds_wrong_type_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"llm_usage": {"wall_seconds": "not-a-number"}},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_malformed_llm_usage_models_wrong_type_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"llm_usage": {"models": "claude-sonnet-4"}},  # must be a list, not a bare string
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_omitted_llm_usage_is_fine_pre_pg(facts_client):
+    """No `llm_usage` key at all — the field is optional; the request still
+    validates and only fails past the gate at the PG-only repo call, same as
+    every other bare ingest request against the DuckDB backend."""
+    r = facts_client["client"].post("/api/facts/ingest", json={}, headers=_auth(facts_client["admin_token"]))
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_well_formed_llm_usage_is_fine_pre_pg(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "llm_usage": {
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_read_input_tokens": 50,
+                "cache_creation_input_tokens": 5,
+                "models": ["claude-sonnet-4"],
+                "documents": 3,
+                "wall_seconds": 4.2,
+            }
+        },
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 501, r.text  # cleared validation; fails clean past it, same as every other body
+
+
+# ---------------------------------------------------------------------------
 # anonymize-fail-closed gate: refuse a batch that carries claims for a
 # corpus whose SharePoint scope is anonymize-marked unless the batch's own
 # `anonymization` block declares it. Runs BEFORE the PG-only `facts_repo()`

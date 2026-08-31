@@ -4260,8 +4260,101 @@
         "title": "FactsIngestAnonymizationScope",
         "type": "object"
       },
+      "FactsIngestLlmUsage": {
+        "description": "OPTIONAL producer-reported LLM cost/usage tally for THIS ingest run\n\u2014 tokens, prompt-cache counts, model(s) used, documents processed, wall\ntime the extraction pipeline spent producing this batch. Additive to\nthe wire contract, same strict-typed treatment as\n:class:`FactsIngestAnonymizationReport`: malformed input here is a real\nprotocol error (422), not tolerated crawler noise.\n\nEvery field is individually optional \u2014 a producer that cannot report a\ngiven figure (e.g. a model with no prompt-cache, or a pipeline that\ndoesn't track wall time) omits it rather than send a fabricated zero to\na reader who cannot tell \"zero\" from \"unknown\". This is honest,\nongoing cost VISIBILITY, never joined against a fingerprint or the\ningest idempotency logic \u2014 purely descriptive metadata about the run\nthat produced a batch, not part of what makes two batches \"the same\".",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Creation Input Tokens"
+          },
+          "cache_read_input_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read Input Tokens"
+          },
+          "documents": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Documents"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Tokens"
+          },
+          "models": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "wall_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wall Seconds"
+          }
+        },
+        "title": "FactsIngestLlmUsage",
+        "type": "object"
+      },
       "FactsIngestRequest": {
-        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.\n\n``anonymization`` is the one exception: a small, OPTIONAL, strictly\ntyped block (spec \u00a79.2) \u2014 malformed input there is a real protocol\nerror (422), not tolerated crawler noise.",
+        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.\n\n``anonymization`` and ``llm_usage`` are the two exceptions: small,\nOPTIONAL, strictly typed blocks (spec \u00a79.2, and cost-visibility) \u2014\nmalformed input in either is a real protocol error (422), not\ntolerated crawler noise.",
         "properties": {
           "anonymization": {
             "anyOf": [
@@ -4295,6 +4388,16 @@
             },
             "title": "Full Documents",
             "type": "array"
+          },
+          "llm_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactsIngestLlmUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "nodes": {
             "items": {
@@ -39175,7 +39278,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token, admin PAT,\nor a corpus-extraction producer credential (``ProducerPrincipal``, see\n``app.auth.producer_token``) scoped to a set of collections.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.\n\nProducer scope gate: a ``ProducerPrincipal`` caller additionally has\nevery ``documents[]`` row's ``corpus_id`` checked against its own\n``collection_ids`` claim \u2014 any row naming a corpus outside that set is\nREJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,\nitemizing the offending corpus ids), an authorization boundary\nindependent of the ``ambiguous_cross_collection_doc_id`` data-integrity\nrule above. See :func:`_refuse_producer_out_of_scope_documents`. A\nhuman admin (or the scheduler token) has no such claim and is\nunaffected.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token, admin PAT,\nor a corpus-extraction producer credential (``ProducerPrincipal``, see\n``app.auth.producer_token``) scoped to a set of collections.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\n``llm_usage`` (optional, see :class:`FactsIngestLlmUsage`) rides along\nthe SAME way \u2014 into the persisted run report only, never the returned\nreport, and never part of the ingest fingerprint/idempotency logic. It\nis honest, ongoing cost VISIBILITY for what this run of the extraction\npipeline itself cost (tokens, prompt-cache, wall time) \u2014 never\nindependently verified, exactly like ``anonymization``'s self-reported\ntally. ``GET /api/facts/ingest-runs`` echoes it per-run and also\nreturns a ``llm_usage_totals`` cumulative rollup across every run this\ninstance has ever persisted.\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.\n\nProducer scope gate: a ``ProducerPrincipal`` caller additionally has\nevery ``documents[]`` row's ``corpus_id`` checked against its own\n``collection_ids`` claim \u2014 any row naming a corpus outside that set is\nREJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,\nitemizing the offending corpus ids), an authorization boundary\nindependent of the ``ambiguous_cross_collection_doc_id`` data-integrity\nrule above. See :func:`_refuse_producer_out_of_scope_documents`. A\nhuman admin (or the scheduler token) has no such claim and is\nunaffected.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -39243,7 +39346,7 @@
     },
     "/api/facts/ingest-runs": {
       "get": {
-        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.",
+        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.\n\n``llm_usage_totals`` is a CUMULATIVE rollup of every persisted run's\noptional ``llm_usage`` block (see :class:`FactsIngestLlmUsage`) \u2014\nsummed tokens/documents/wall time, the union of models seen, and a\nrough ``estimated_cost_usd`` (``None`` until at least one run can be\npriced; see :meth:`FactsIngestRunsPgRepository.llm_usage_rollup` for\nwhy it is never a fabricated precise number). It covers EVERY run this\ninstance has ever persisted, not just the ``limit``-bounded ``runs``\nlist above, and is instance-wide rather than per-connection (same\ninterim limitation as ``distinct_corpus_ids``'s \"scope collections\"\nheuristic) \u2014 a per-connection split is a documented follow-up once a\nreal connection-to-collection mapping exists.",
         "operationId": "list_ingest_runs_api_facts_ingest_runs_get",
         "parameters": [
           {

@@ -199,3 +199,12 @@ class IngestRun(Base):
     #: docs_skipped}}}``. Empty ``{}`` (never null) when the producer never
     #: anonymizes — see ``migrations/versions/0081_ingest_runs_anonymize.py``.
     anonymization: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"), nullable=False)
+    #: The producer's OPTIONAL per-run cost-visibility tally — tokens,
+    #: prompt-cache counts, the model(s) used, documents processed, wall
+    #: time (``app/api/facts.py::FactsIngestLlmUsage``). Unlike
+    #: `anonymization` above, this is genuinely NULLABLE: a run that never
+    #: reported usage (every run before this feature, or a producer build
+    #: that doesn't send it yet) reads back as "no figure available", never
+    #: a fabricated `{}`/zero — see
+    #: ``migrations/versions/0086_ingest_runs_llm_usage.py``.
+    llm_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
