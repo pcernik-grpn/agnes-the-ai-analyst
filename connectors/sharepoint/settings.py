@@ -30,6 +30,7 @@ the certificate key must never be a legal ``token_env`` on a connector-written
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from dataclasses import dataclass
@@ -146,7 +147,29 @@ def _env_secret(env_name: str) -> str:
             "startup script — a running instance only picks up a new one after a "
             "recreate. Upload the certificate to the connection to avoid the dependency."
         )
-    return value
+    return _maybe_decode_base64_pem(value)
+
+
+def _maybe_decode_base64_pem(value: str) -> str:
+    """Decode the infra module's single-line base64 transport, verbatim
+    otherwise.
+
+    A multiline PEM cannot ride /opt/agnes/.env as-is (the .env format, the
+    auto-upgrade script's bash ``source``, and compose's env_file parsing all
+    break on it), so ``runtime_secret_env_multiline`` in the customer-instance
+    Terraform module writes the Secret Manager value base64-encoded on one
+    line. PEM material always contains ``-----BEGIN``; base64 text never does
+    (no hyphen in its alphabet) — so decoding only when the marker is absent
+    AND the decode reveals one cannot misfire on a raw PEM, and an opaque
+    non-PEM value passes through untouched either way.
+    """
+    if "-----BEGIN" in value:
+        return value
+    try:
+        decoded = base64.b64decode(value, validate=True).decode("utf-8")
+    except Exception:  # noqa: BLE001 — not base64 (or not text): treat as the literal credential
+        return value
+    return decoded if "-----BEGIN" in decoded else value
 
 
 def resolve_sharepoint_settings(connection: Dict[str, Any]) -> SharePointSettings:
