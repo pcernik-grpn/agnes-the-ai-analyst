@@ -56,6 +56,17 @@ def register_adapter(name: str, adapter: SemanticAdapter) -> None:
     _REGISTRY[name] = adapter
 
 
+def adapter_names() -> List[str]:
+    """Every registered adapter name, sorted — the single source of truth for
+    anything that has to *tell a human* which adapters exist (CLI ``--help``,
+    error messages, generated docs). A hand-maintained copy of this list drifts
+    silently: the ``agnes admin semantic source add --adapter`` help long
+    recommended a ``databricks_semantic`` that was never registered, and every
+    reader who copied it got a 400.
+    """
+    return sorted(_REGISTRY)
+
+
 def get_adapter(name: str) -> SemanticAdapter:
     try:
         return _REGISTRY[name]

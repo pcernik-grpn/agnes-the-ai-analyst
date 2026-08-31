@@ -41,6 +41,7 @@ from typing import Optional
 import typer
 
 from cli.client import api_delete, api_get, api_post
+from src.semantic.adapters import adapter_names
 
 admin_semantic_app = typer.Typer(help="Admin: the semantic layer — documents, their sources, and its health")
 
@@ -388,7 +389,10 @@ def add_source(
     adapter: str = typer.Option(
         "native",
         "--adapter",
-        help="Adapter: native | keboola_metastore | snowflake_semantic | databricks_semantic (default: native)",
+        # Generated from the registry, never hand-listed: the literal this
+        # replaced advertised a `databricks_semantic` that was never
+        # registered, so anyone who followed `--help` got a 400.
+        help=f"Adapter: {' | '.join(adapter_names())} (default: native)",
     ),
     repo_url: Optional[str] = typer.Option(None, "--repo-url", help="git: repository URL"),
     ref: Optional[str] = typer.Option(None, "--ref", help="git: branch/tag (default: repo default)"),
