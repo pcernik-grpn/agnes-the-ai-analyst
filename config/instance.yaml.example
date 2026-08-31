@@ -79,6 +79,15 @@ instance:
   #                                  # `name` above still drives browser <title> text and page
   #                                  # headings — keep it populated. Env override:
   #                                  # AGNES_INSTANCE_LOGO_SVG.
+  # logo_mark_svg: |                  # Inline <svg> brand MARK — a square monogram, not a
+  #   <svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
+  #     <rect width="28" height="28" rx="7" fill="#333"/>
+  #   </svg>
+  #                                  # lockup. Rendered where a wordmark does not fit: the
+  #                                  # left rail collapsed to its 56px icon strip. Only read
+  #                                  # when `logo_svg` above is set; unset, that slot shows an
+  #                                  # initial derived from `brand`. Env override:
+  #                                  # AGNES_INSTANCE_LOGO_MARK_SVG.
   # favicon: "img/my-icon.png"       # Favicon href. A path (no leading slash) is resolved
                                      # as a static asset under app/web/static/ (same
                                      # cache-busting `static_url()` every other asset gets);

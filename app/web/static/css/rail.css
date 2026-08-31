@@ -205,12 +205,88 @@ html[data-ui-layout="rail"] .rail-logo {
     overflow: hidden;
     color: var(--ds-text-primary);
     text-decoration: none;
+    /* Containing block for `.rail-logo-mark` — the collapsed-strip stand-in for
+       a custom lockup, which is positioned rather than laid out so the swap
+       between the two costs no layout. See that block below. */
+    position: relative;
 }
 
 html[data-ui-layout="rail"] .rail-logo svg {
     height: 28px;
     width: auto;
     flex-shrink: 0;
+}
+
+/* ── A custom lockup and its collapsed MARK ──────────────────────────────
+   Only rendered for an instance with `instance.logo_svg` set; the built-in
+   brand is an orb plus a text span and needs none of this.
+
+   The problem this solves (#1898 item 5): a lockup is one <svg>, the collapsed
+   strip gives it a ~40px box, and `.rail-logo`'s `overflow: hidden` therefore
+   cropped a wordmark mid-glyph — half a word, which reads as a broken image
+   rather than as a narrow sidebar. Every other label in the rail survives the
+   collapse because it is a SEPARATE element the strip can hide outright; the
+   lockup had no such second half, so it got one (`_app_rail.html`).
+
+   The two cross-fade on the same timings as every other peek reveal, and the
+   mark is absolutely positioned so neither of them can move the brand row while
+   the column animates — the invariant the whole peek choreography rests on
+   (see the `visibility` note in the icon-mode block below).
+
+   `left: 4.5px` is the same formula the collapsed `.rail-logo` padding uses:
+   the strip's centre is 27.5px, the rail's own padding puts the row's content
+   edge at 8px, so a 30px mark starts 4.5px in. It is a constant rather than
+   inherited padding because an absolutely positioned box is laid out against
+   the PADDING box — it would ignore that padding, and animating it would move
+   the mark for no reason while it is fading out anyway. */
+html[data-ui-layout="rail"] .rail-logo-full {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    overflow: hidden;
+}
+
+html[data-ui-layout="rail"] .rail-logo-mark {
+    position: absolute;
+    left: 4.5px;
+    top: 50%;
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    transform: translateY(-50%);
+    /* Hidden by default: expanded is the lockup's state, and the mark only
+       exists for the strip. `visibility` as well as `opacity`, so it never takes
+       the click that belongs to the lockup underneath it. */
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+html[data-ui-layout="rail"] .rail-logo-mark svg {
+    height: 26px;
+    width: 26px;
+    flex-shrink: 0;
+}
+
+/* The DERIVED mark — the brand's initial, for an operator who set a lockup but
+   no monogram. Deliberately quiet: a neutral tile in the page's own dim
+   surface, not an invented brand colour we have no way to know. An operator who
+   wants their own mark sets `instance.logo_mark_svg` and this never renders. */
+html[data-ui-layout="rail"] .rail-logo-mono {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface-dim);
+    color: var(--ds-text-primary);
+    /* 15px/700 in a 28px tile — the wordmark it stands in for is 16px/650, and
+       a single glyph needs the extra weight to carry the same presence. */
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0;
+    line-height: 1;
 }
 
 /* The ONE rail-width control (collapse when expanded, expand when
@@ -1655,6 +1731,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        `margin-top: auto` up and down — the same path a caller without a
        chat grant already takes. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-full,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i-label,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-user-txt,
@@ -1716,6 +1793,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        content is present for every frame of its own reveal and for none before
        it. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-full,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i-label,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-user-txt,
@@ -1739,6 +1817,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        keep it after. Nothing can paint outside the panel meanwhile: the labels
        are clipped by their own boxes, not by this timing. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-logo-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-logo-full,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-i-label,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-user-txt,
@@ -1746,6 +1825,37 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-history {
         transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) 0s,
                     visibility 0s linear 0s;
+    }
+
+    /* ── The brand mark: the lockup's COLLAPSED form ──────────────────
+       Exact mirror of the hide/reveal pair above, and the same mechanism, so a
+       custom lockup behaves in the strip the way the built-in orb + wordmark
+       always did: the strip shows a mark, the open rail shows the lockup, and
+       the two are never both on screen.
+
+       Only the two of them cross-fade; nothing moves. The mark is out of flow
+       and the lockup keeps its box (`visibility`, per the note above), so the
+       brand row's geometry is identical at both widths and the swap rides the
+       width animation instead of competing with it.
+
+       Timing matches the labels exactly — in on `--rail-peek-text-delay` so the
+       lockup arrives with them, out on `--rail-peek-text-out` with no delay so
+       it releases before the column narrows over it. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-mark {
+        opacity: 1;
+        visibility: visible;
+        transition: opacity var(--rail-peek-text-out) var(--ds-ease-standard, ease) 0s,
+                    visibility 0s linear 0s;
+    }
+
+    /* Peeked or focused open: the lockup is back, so the mark goes. Same
+       specificity dance as every other peek rule — `:is()` counts its most
+       specific argument, so this must stay AFTER the icon-mode rule. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-mark {
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay),
+                    visibility 0s linear calc(var(--rail-peek-text-delay) + var(--ds-motion-fast, .16s));
     }
 
     /* ── The Chats row: this zone's COLLAPSED form ────────────────────
@@ -2154,6 +2264,12 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-user-txt,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-history,
+    /* Both halves of the lockup ⇄ mark swap, for the same reason: with motion
+       reduced the two exchange places on one frame rather than cross-fading. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-full,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-mark,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-full,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-mark,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-history,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-txt,
     html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i-label,

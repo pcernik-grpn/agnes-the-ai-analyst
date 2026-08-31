@@ -35,6 +35,7 @@ from app.instance_config import (
     get_privacy_policy_url,
     get_workspace_dir_name,
     get_workspace_launcher_word,
+    get_instance_logo_mark_svg,
     get_instance_logo_svg,
     get_instance_favicon,
     get_instance_overview,
@@ -810,6 +811,9 @@ def _config_proxy() -> type:
         # because the partial renders on chromes whose builders don't set it.
         INSTANCE_BRAND = get_instance_brand()
         LOGO_SVG = get_instance_logo_svg()
+        # The mark for slots a lockup does not fit (the rail's collapsed
+        # strip). Only read where LOGO_SVG is set — see the resolver.
+        LOGO_MARK_SVG = get_instance_logo_mark_svg()
         INSTANCE_OVERVIEW = get_instance_overview()
         INSTANCE_SUPPORT = get_instance_support()
         HIDE_LOGIN_FEATURES = get_hidden_login_features()
