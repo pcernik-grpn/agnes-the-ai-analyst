@@ -749,6 +749,39 @@ class TestRailCollapsePreference:
         assert 'class="rail-icon-mode"' not in lib_text
         assert 'class="rail"' in lib_text
 
+    def test_every_builder_keeps_the_app_rail_not_the_admin_default(self, seeded_app, monkeypatch) -> None:
+        """The JS builders live under /admin/* for routing reasons but are
+        authoring surfaces reached from the Library, so they are exempt from
+        the collapsed admin default AND from the admin-scoped remembered width
+        — an author who expanded the rail on /library must not watch it
+        collapse mid-task.
+
+        Parametrized over ALL of them because the exemption was keyed on
+        `_path.endswith('/new')`, which silently excluded the apps builder:
+        /admin/linked-apps IS its own route, so it got the admin rail while
+        the other two did not. Add a builder → add it here."""
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        # The apps builder's route is gated on the same predicate that hides
+        # the apps hub, and 404s without it — a 404 body has no rail, so the
+        # assertions below would fail for the wrong reason.
+        monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "1")
+        c = seeded_app["client"]
+        for path in ("/admin/mcp-sources/new", "/admin/data-packages/new", "/admin/linked-apps"):
+            resp = c.get(path, headers=self._auth(seeded_app["admin_token"]))
+            assert resp.status_code == 200, f"{path} → {resp.status_code}"
+            text = resp.text
+            nav = text[text.index("<nav class=") :]
+            head = nav[:400]
+            assert "rail-icon-mode" not in head, f"{path} renders the collapsed admin default"
+            # The remembered width is per context, so the wrong context is a
+            # second, quieter version of the same bug: the builder would read
+            # and write the `.admin` preference instead of the `.app` one the
+            # Library uses.
+            assert 'data-rail-context="app"' in head, f"{path} is on the admin-scoped remembered width"
+            # The admin sidebar is the other half of "treated as an admin
+            # page" — a builder must not render it either.
+            assert 'class="admin-nav"' not in text, f"{path} renders the admin sidebar"
+
     def test_preference_bootstrap_script_renders_on_every_rail_page(self, seeded_app, monkeypatch) -> None:
         """The before-first-paint bootstrap (reads localStorage, applies a
         stored preference to the `<nav>` class before the browser paints —
