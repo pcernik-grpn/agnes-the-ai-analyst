@@ -67,10 +67,37 @@ class AgentPrincipal:
     caller_email: str | None = None
 
 
+@dataclass(frozen=True)
+class ProducerPrincipal:
+    """Auth subject of a corpus-extraction producer's scoped callback
+    credential — see ``app.auth.producer_token`` for how it is minted
+    (``app/worker/kinds.py::_agnes_producer_callback_env``) and resolved.
+
+    Replaces the historical over-grant of the scheduler shared-secret
+    token (which resolved to a synthetic Admin-group user) with a narrow,
+    short-lived JWT naming exactly one connection and its own confirmed
+    scope collections.
+
+    Deliberately carries NO ``intersection`` field the way
+    ``SessionPrincipal``/``AgentPrincipal`` do: its authority is not
+    modeled by the generic per-resource-type grant-intersection primitive
+    those two share (``app.auth.access.can_access_session``) — that helper
+    rejects this principal type outright (see its own docstring).
+    ``app.auth.producer_token`` fail-closes it to a small, FIXED set of
+    endpoints before this object is ever constructed, and each of those
+    endpoints applies its own explicit scope check against
+    ``connection_id``/``collection_ids`` — never a generic grant table.
+    """
+
+    connection_id: str
+    collection_ids: frozenset[str]
+    jti: str
+
+
 #: Either restricted principal. Consumers that mean "not a full user dict —
 #: use the intersection, deny admin" should branch on this union, not on one
 #: member, so a new principal kind cannot silently bypass a seam.
-Principal = Union[SessionPrincipal, AgentPrincipal]
+Principal = Union[SessionPrincipal, AgentPrincipal, ProducerPrincipal]
 
 #: Runtime companion to :data:`Principal` for ``isinstance`` checks —
 #: ``isinstance(x, Principal)`` is a TypeError on a ``typing.Union``. Every
@@ -81,4 +108,4 @@ Principal = Union[SessionPrincipal, AgentPrincipal]
 #: construction site in ``app/auth/pat_resolver.py``) keep naming
 #: ``SessionPrincipal`` directly — that is the signal they are NOT a
 #: restricted-principal seam.
-PRINCIPAL_TYPES: tuple[type, ...] = (SessionPrincipal, AgentPrincipal)
+PRINCIPAL_TYPES: tuple[type, ...] = (SessionPrincipal, AgentPrincipal, ProducerPrincipal)

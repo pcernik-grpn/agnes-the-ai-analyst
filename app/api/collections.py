@@ -6,7 +6,11 @@ Endpoints:
   GET    /api/collections                         auth (RBAC-filtered list)
   GET    /api/collections/{collection_id}         require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}         owner or admin
-  POST   /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
+  POST   /api/collections/{collection_id}/files   require_collection_write_or_producer_access(
+                                                  "{collection_id}") — also accepts a
+                                                  ProducerPrincipal scoped to this collection
+                                                  (the corpus-extraction producer's own upload
+                                                  callback, app.auth.producer_token)
   GET    /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}/files/{file_id}
                                                   require_collection_access("{collection_id}")
@@ -50,9 +54,12 @@ from app.auth.access import (
     can_access_collection,
     is_user_admin,
     require_collection_access,
+    require_collection_write_or_producer_access,
 )
 from app.auth.dependencies import get_current_user
+from app.auth.session_principal import ProducerPrincipal
 from app.services.journey import mark_journey
+from src.audit_helpers import log_safe
 from src.corpus_allowlist import classify
 from src.file_storage import delete_corpus_file, store_corpus_file
 from src.ingest.member_identity import is_reserved_member_stable_id
@@ -1040,9 +1047,16 @@ async def upload_files(
     source_doc_ids: Optional[List[str]] = Form(None),
     source_sha256s: Optional[List[str]] = Form(None),
     document_dates: Optional[List[str]] = Form(None),
-    user=Depends(require_collection_access("{collection_id}")),
+    user=Depends(require_collection_write_or_producer_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
+
+    Also the corpus-extraction producer's own upload callback (TCRD-...):
+    a ``ProducerPrincipal`` scoped to THIS collection may call this too
+    (see ``require_collection_write_or_producer_access``) — every OTHER
+    collection route (read/delete/reingest/preview/raw) keeps
+    ``require_collection_access`` unchanged and still 403s that same
+    principal.
 
     Each file passes through the extension allowlist:
 
@@ -1120,6 +1134,19 @@ async def upload_files(
     corpus = file_corpora_repo().get(collection_id)
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
+
+    if isinstance(user, ProducerPrincipal):
+        # A restricted principal's identity is never stashed onto
+        # `request.state.user`, so the generic audit-fallback middleware
+        # sees no attributable caller for this mutating POST and writes
+        # nothing at all — self-audit explicitly instead, distinguishably
+        # (`client_kind="producer"`).
+        log_safe(
+            action="collection.file_add",
+            resource=collection_id,
+            client_kind="producer",
+            params={"file_count": len(files)},
+        )
 
     # Positional pairing is only safe when the lists line up 1:1.
     if paths is not None and len(paths) != len(files):
