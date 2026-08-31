@@ -2122,8 +2122,41 @@
          popover on hover/focus (see .fbar-cat in filter_toolbar.css). Type is
          absent by design: items are GROUPED by type into collapsible sections
          below, so the grouping is the type navigation. Only controls that can
-         change the page render — no dead filters. #}
+         change the page render — no dead filters.
+
+         The categories are resolved HERE, above the control, because whether
+         there are any decides what the control is. Every one of them is
+         conditional — a facet with fewer than two values does not render — so on
+         a new or nearly empty instance the whole menu came out empty and the
+         button opened a popover holding nothing but Clear and Done (#1898 item
+         4). "No dead filters" has to include the Filter button itself: with
+         nothing to slice it renders DISABLED, saying so in its tooltip, and the
+         menu is not built at all rather than built empty. It comes back on its
+         own — these are page-load facts, and the next render with two of
+         anything in it has a live control again. #}
+      {% set _cats = [
+         ('tag', 'Tags', library_tags),
+         ('age', 'Added', library_ages),
+         ('ownership', 'Yours or shared', library_ownerships),
+         ('owner', 'Owner', library_owners),
+         ('origin', 'Source', library_origins),
+         ('format', 'File format', library_formats),
+         ('requirement', 'Access', library_requirements),
+       ] %}
+      {% set _has_facets = library_available_count or (_cats | map(attribute=2) | select | list | length) > 0 %}
       <div class="fbar-filter">
+        {% if not _has_facets %}
+        {# Disabled, not hidden: the toolbar keeps its shape, and a control that
+           is visibly unavailable answers "where is the filter" better than an
+           absent one. `aria-disabled` as well as `disabled` — the attribute is
+           what a screen reader announces on a <button> that is also
+           `title`-explained. #}
+        <button type="button" class="fbar-filter__btn" id="lib-filter-btn" disabled aria-disabled="true"
+                title="Nothing to filter yet — filters appear once your library holds a few items">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
+          Filter
+        </button>
+        {% else %}
         <button type="button" class="fbar-filter__btn" id="lib-filter-btn" aria-haspopup="true" aria-expanded="false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
           Filter
@@ -2144,18 +2177,10 @@
           {% if library_available_count %}
           <label class="fbar-menu__opt"><input type="checkbox" data-facet="availability" value="available"><span class="fbar-menu__opt-text">Not added yet</span><span class="fbar-menu__opt-n">{{ library_available_count }}</span></label>
           {% endif %}
-          {# Ordered by the question each answers, commonest first. A category with
-               fewer than two values does not render at all, so this list is the
+          {# Ordered by the question each answers, commonest first (the list is
+               resolved above the control — see the note there). A category with
+               fewer than two values does not render at all, so that list is the
                menu's ceiling rather than its content. #}
-            {% set _cats = [
-               ('tag', 'Tags', library_tags),
-               ('age', 'Added', library_ages),
-               ('ownership', 'Yours or shared', library_ownerships),
-               ('owner', 'Owner', library_owners),
-               ('origin', 'Source', library_origins),
-               ('format', 'File format', library_formats),
-               ('requirement', 'Access', library_requirements),
-             ] %}
           {% for facet_key, cat_label, options in _cats %}
           {% if options %}
           <div class="fbar-cat" data-cat="{{ facet_key }}">
@@ -2185,6 +2210,7 @@
             <button type="button" data-fbar-done>Done</button>
           </div>
         </div>
+        {% endif %}
       </div>
   
       {# "In stack only" — a binary condition, and the single most consequential

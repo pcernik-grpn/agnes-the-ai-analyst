@@ -45,7 +45,7 @@
 
    `--ds-text-secondary`, not `--ds-text-muted` — muted is 3.67:1 on this
    page's background, under the 4.5:1 AA floor for 13px text. */
-.sl-back {
+.slb-back {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -54,8 +54,8 @@
     color: var(--ds-text-secondary);
     text-decoration: none;
 }
-.sl-back:hover { color: var(--ds-text-primary); }
-.sl-back svg { width: 15px; height: 15px; }
+.slb-back:hover { color: var(--ds-text-primary); }
+.slb-back svg { width: 15px; height: 15px; }
 
 /* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
 .sl-head { margin: 2px 0 0; }
@@ -415,7 +415,7 @@
 
 {% block page_head %}
 {% set _back = detail_back('semantics', '/library', 'Library') %}
-<a class="sl-back" href="{{ _back.href }}">
+<a class="slb-back" href="{{ _back.href }}">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
   {{ _back.label }}
 </a>
