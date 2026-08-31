@@ -132,3 +132,16 @@ class FileCorporaRepository:
             "UPDATE file_corpora SET deleted_at = current_timestamp, updated_at = current_timestamp WHERE id = ?",
             [corpus_id],
         )
+
+    def restore(self, corpus_id: str) -> None:
+        """Clear ``deleted_at`` (soft_delete's inverse). Idempotent.
+
+        Only for undoing an AUTOMATIC soft-delete (e.g. the SharePoint
+        wizard re-adopting the empty scope collection it tidied away on
+        untick) — a user's deliberate delete must never be restored by a
+        background flow.
+        """
+        self.conn.execute(
+            "UPDATE file_corpora SET deleted_at = NULL, updated_at = current_timestamp WHERE id = ?",
+            [corpus_id],
+        )

@@ -176,6 +176,30 @@ def test_soft_delete_sets_deleted_at(repo):
     assert row["updated_at"] >= row["created_at"]
 
 
+def test_restore_clears_deleted_at(repo):
+    """``restore`` is soft_delete's inverse — the SharePoint wizard re-adopts
+    a scope collection it auto-deleted on untick by restoring it on re-tick
+    (the slug is UNIQUE across soft-deleted rows, so minting a replacement
+    instead would collide)."""
+    corpus_id = repo.create(name="Husk", slug="husk", description=None, created_by="u")
+    repo.soft_delete(corpus_id)
+    assert repo.get(corpus_id) is None  # precondition: hidden while deleted
+    repo.restore(corpus_id)
+    row = repo.get(corpus_id)
+    assert row is not None
+    assert row["deleted_at"] is None
+    # restore is a mutation — updated_at moves with it
+    assert row["updated_at"] >= row["created_at"]
+
+
+def test_restore_of_a_live_row_is_a_noop(repo):
+    corpus_id = repo.create(name="Live2", slug="live-restore", description=None, created_by="u")
+    repo.restore(corpus_id)
+    row = repo.get(corpus_id)
+    assert row is not None
+    assert row["deleted_at"] is None
+
+
 def test_list_search_filters_by_name(repo):
     repo.create(name="Finance Data", slug="finance", description=None, created_by="u")
     repo.create(name="Marketing Stuff", slug="marketing", description=None, created_by="u")
