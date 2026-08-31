@@ -1,5 +1,6 @@
 """Query commands — agnes query."""
 
+import csv
 import hashlib
 import json
 import re
@@ -482,9 +483,21 @@ def _output(columns: list, rows: list, fmt: str):
         output = [dict(zip(columns, row)) for row in rows]
         typer.echo(json.dumps(output, indent=2, default=str))
     elif fmt == "csv":
-        typer.echo(",".join(columns))
+        # RFC 4180 escaping (#1801): the previous plain ",".join(...)
+        # corrupted any value containing a comma, a double quote, or an
+        # embedded newline. `lineterminator="\n"` deliberately deviates
+        # from RFC 4180's "\r\n" so output stays byte-identical to today's
+        # for every consumer parsing clean data — this fix targets broken
+        # escaping, not line endings. QUOTE_MINIMAL (the csv module
+        # default) only quotes a field that actually needs it. Values are
+        # passed through un-stringified: csv.writer already renders None
+        # as an empty, unquoted field (preserving today's None -> ""
+        # behavior) and str()s everything else (datetimes, Decimals, ...)
+        # the same way the old ",".join(...) did.
+        writer = csv.writer(sys.stdout, lineterminator="\n")
+        writer.writerow(columns)
         for row in rows:
-            typer.echo(",".join(str(v) if v is not None else "" for v in row))
+            writer.writerow(row)
     else:
         # Table format using rich, with a vertical-record fallback when the
         # column count would collapse every cell to zero width.
