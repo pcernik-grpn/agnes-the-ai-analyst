@@ -528,6 +528,15 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     BEFORE a job is queued rather than 30 minutes later when a worker claims
     it and the handler raises.
 
+    Both gates already honor a deploy-time env override ahead of
+    ``instance.yaml`` — ``AGNES_EXTRACTION_ENABLED`` (via
+    ``feature_enabled`` below) and ``AGNES_EXTRACTION_PRODUCER_COMMAND`` /
+    ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
+    :func:`app.worker.kinds._extraction_producer_argv`, called below) — so
+    this function and the handler it mirrors see the identical truth
+    regardless of which source (env or yaml) an instance configures
+    through.
+
     Returns ``(True, None)`` when usable, or ``(False, {"error": ...,
     "message": ...})`` naming the exact fix.
     """
@@ -546,7 +555,8 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
             "error": "extraction_producer_not_configured",
             "message": (
                 "No producer configured — set extraction.producer.command or "
-                "extraction.producer.module in instance.yaml."
+                "extraction.producer.module in instance.yaml (or "
+                "AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)."
             ),
         }
 

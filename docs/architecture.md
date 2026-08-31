@@ -709,7 +709,13 @@ Postgres — same dedup behavior, different mechanism per backend.
 **Worker loop** (`app/worker/runtime.py`, started from `app/main.py`'s
 lifespan when the process's `AGNES_ROLE` includes the worker plane): up to
 three lanes share one asyncio loop — heavy (concurrency 1), light
-(concurrency 2), and extraction (concurrency 1, spec §7.5 — see below).
+(concurrency 2), and extraction (concurrency **configurable**, default 1 —
+`extraction.concurrency` / `AGNES_EXTRACTION_CONCURRENCY`, clamped to
+`[1, 8]`, resolved once at worker start; spec §7.5 — see below and
+`docs/DEPLOYMENT.md#multi-process`). Extraction's slot count is the only
+one of the three that isn't hardcoded — parallelism ACROSS connections
+(the per-connection idempotency key still caps one in-flight job per
+connection), not sharding within one.
 Each lane slot repeats `claim_next()` → runs the kind's
 handler in a thread while a heartbeat extends the lease →
 `complete()`/`fail()`. A fresh-per-claim `lease_token` (not just

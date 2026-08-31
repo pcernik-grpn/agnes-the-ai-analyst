@@ -641,6 +641,7 @@ resource "google_compute_instance" "vm" {
     extraction_worker_image      = var.extraction_worker_image
     extraction_worker_mem_limit  = each.value.extraction_worker_mem_limit
     extraction_worker_cpus       = each.value.extraction_worker_cpus
+    extraction_producer_command  = var.extraction_producer_command
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [
