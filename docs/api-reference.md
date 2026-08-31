@@ -992,6 +992,7 @@ authoring-suggestions queue (never an admin-direct write).
 ### `/api/admin/telemetry` — Query telemetry
 
 - /api/admin/telemetry/ask
+- /api/admin/telemetry/chat-cost
 - /api/admin/telemetry/export
 - /api/admin/telemetry/facets
 - /api/admin/telemetry/kpis

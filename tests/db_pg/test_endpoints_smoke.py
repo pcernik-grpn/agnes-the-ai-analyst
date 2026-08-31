@@ -2859,6 +2859,14 @@ KNOWN_UNTESTED = {
     "POST /api/admin/store/submissions/{submission_id}/rescan",
     "POST /api/admin/store/submissions/{submission_id}/retry",
     # Admin telemetry
+    # chat-cost takes a `window` (and optional `user`) query parameter and is
+    # admin-gated, so it is not parameter-free-GET shaped for this sweep.
+    # Behaviourally covered in tests/test_chat_cost_readout.py: the RBAC gate
+    # (analyst 403, anonymous 401/403), a bad window as a clean 400, each
+    # window value, and the pricing itself — per-session by the model that
+    # actually ran, cached reads priced as cached, unrecorded cache reported
+    # as unavailable rather than as zero.
+    "GET /api/admin/telemetry/chat-cost",
     "GET /api/admin/telemetry/export",
     "GET /api/admin/telemetry/facets",
     "GET /api/admin/telemetry/kpis",
