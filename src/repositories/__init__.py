@@ -149,6 +149,7 @@ __all__ = [
     "corpus_files_repo",
     "corpus_chunks_repo",
     "corpus_file_sources_repo",
+    "corpus_file_events_repo",
     # Fact graph over Collections
     "facts_repo",
     "ontology_drafts_repo",
@@ -552,6 +553,11 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "corpus_file_sources": {
         PG: ("src.repositories.corpus_file_sources_pg", "CorpusFileSourcesPgRepository"),
     },
+    # Observed-change log behind the SharePoint changes feed (2026-08-30) —
+    # PG-only, A3 ratchet: no DuckDB backend.
+    "corpus_file_events": {
+        PG: ("src.repositories.corpus_file_events_pg", "CorpusFileEventsPgRepository"),
+    },
     # Fact graph over Collections (design doc §2 consequences) — PG-only,
     # A3 ratchet: no DuckDB backend.
     "facts": {
@@ -937,6 +943,15 @@ def corpus_file_sources_repo() -> Any:
     """Crawler-anchor mapping (fact-graph-over-Collections §6). PG-only —
     raises ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
     return _build("corpus_file_sources")
+
+
+def corpus_file_events_repo() -> Any:
+    """Append-only observed-change log behind the SharePoint changes feed
+    (``GET /api/admin/sharepoint/connections/{id}/changes``, 2026-08-30).
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance; callers that write to it (``app/api/collections.py``) do so
+    best-effort so that raise never breaks the upload/delete it describes."""
+    return _build("corpus_file_events")
 
 
 def facts_repo() -> Any:
