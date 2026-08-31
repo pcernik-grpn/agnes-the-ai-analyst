@@ -17030,7 +17030,7 @@
     },
     "/api/admin/adoption/kpis": {
       "get": {
-        "description": "Headline adoption numbers for the selected window.",
+        "description": "Headline adoption numbers for the selected window.\n\n``cost_usd`` prices the window's tokens through the shared read model\n(``app.services.usage_stats``), so the figure here is the same one\n/me/activity shows its owner. It is ``null`` \u2014 not zero \u2014 when it cannot be\ncomputed: an instance-wide per-model split needs the Postgres-only\n``usage_turns`` table, and a DuckDB-backed instance has no equivalent.",
         "operationId": "adoption_kpis_api_admin_adoption_kpis_get",
         "parameters": [
           {
@@ -17315,6 +17315,7 @@
     },
     "/api/admin/adoption/users/{user_id}/kpis": {
       "get": {
+        "description": "One user's adoption numbers for the selected window.\n\n``cost_usd`` comes from the shared read model, keyed on ``users.id`` \u2014 the\nsame computation behind that user's own /me/activity, so the admin view and\nthe analyst view of one person's spend cannot drift apart.",
         "operationId": "adoption_user_kpis_api_admin_adoption_users__user_id__kpis_get",
         "parameters": [
           {
@@ -34461,7 +34462,7 @@
     },
     "/api/admin/telemetry/kpis": {
       "get": {
-        "description": "Four headline numbers, scoped to the same filters as /query.\n\nThe cards on /admin/usage echo these as clickable quick-filters, so the\nserver applies the same WHERE the table will see \u2014 otherwise the cards\nand the table tell different stories at the same time.",
+        "description": "Four headline numbers, scoped to the same filters as /query \u2014 plus what\nthe window cost.\n\nThe cards on /admin/usage echo these as clickable quick-filters, so the\nserver applies the same WHERE the table will see \u2014 otherwise the cards\nand the table tell different stories at the same time.\n\n``cost_usd`` is the one figure here NOT read from ``usage_events``: token\ncounts live on session summaries, so it comes from the shared read model\n(``app.services.usage_stats``) over the same user and window, rounded up to\nwhole days. The narrower event filters (tool/source/event_type/only_errors)\ndo not apply to it \u2014 it prices everything the selected user spent in the\nwindow, which is the same number /me/activity and the adoption drill-down\nreport for them. It is ``null`` when it cannot be computed rather than a\nzero that would read as \"free\": an unresolvable ``username``, or an\ninstance-wide read on a backend without the Postgres-only ``usage_turns``\ntable.",
         "operationId": "usage_kpis_api_admin_telemetry_kpis_get",
         "parameters": [
           {
@@ -61637,7 +61638,7 @@
     },
     "/me/activity": {
       "get": {
-        "description": "Unified personal-activity page \u2014 consolidated replacement for\nthe old ``/me/stats`` + ``/profile/sessions`` split.  Four tabs\n(Sessions / Token usage / Data access / Sync activity) backed by\n``/api/me/stats/*`` endpoints.  The Sessions tab merges usage\nmetrics with verification-pipeline status and download links.",
+        "description": "Unified personal-activity page \u2014 consolidated replacement for\nthe old ``/me/stats`` + ``/profile/sessions`` split.  Four tabs\n(Sessions / Token usage / Data access / Sync activity) backed by\n``/api/me/stats/*`` endpoints.  The Sessions tab merges usage\nmetrics with verification-pipeline status and download links.\n\n``last_session_upload_at`` is the only server-rendered datum: the Token\nusage tab's empty state needs to distinguish \"this account has never\npushed a session HERE\" (usually a workspace pointed at another instance)\nfrom \"pushed, not processed yet\", and the tokens API cannot see the audit\ntrail. Best-effort \u2014 a failing audit read must not take the page down.",
         "operationId": "me_activity_page_me_activity_get",
         "parameters": [
           {

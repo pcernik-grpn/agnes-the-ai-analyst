@@ -27,6 +27,7 @@ the v45 ``user_id`` column carry no id and stay out of self-views; they
 remain visible in the admin session browser, which also matches on
 ``username``.
 """
+
 from __future__ import annotations
 
 import logging
@@ -39,13 +40,14 @@ import duckdb
 from fastapi import APIRouter, Depends, Query
 
 from app.auth.dependencies import _get_db, get_current_user
+from app.services import usage_stats
 
 from src.repositories import (
     audit_repo,
     session_processor_state_repo,
-    usage_repo,
     users_repo,
 )
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/me/stats", tags=["me"])
@@ -57,11 +59,7 @@ def _session_data_dir() -> Path:
     default matches the admin resolver (and the upload API's actual write
     location, ``${DATA_DIR}/user_sessions``) — the old ``/data/sessions``
     default pointed at a directory nothing writes to (#640 review)."""
-    return Path(
-        os.environ.get("SESSION_DATA_DIR")
-        or os.environ.get("AGNES_SESSION_DATA_DIR")
-        or "/data/user_sessions"
-    )
+    return Path(os.environ.get("SESSION_DATA_DIR") or os.environ.get("AGNES_SESSION_DATA_DIR") or "/data/user_sessions")
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +100,10 @@ def list_self_sessions(
     # ``AGNES_SESSION_DATA_DIR`` + this endpoint's historical default).
     email_local = (user.get("email") or "").split("@")[0]
     base = _session_data_dir()
-    user_dirs = [
-        base / name for name in dict.fromkeys([email_local, user_id]) if name
-    ]
+    user_dirs = [base / name for name in dict.fromkeys([email_local, user_id]) if name]
 
     try:
-        rows_db = usage_repo().list_sessions_for_user_self(user_id)
+        rows_db = usage_stats.sessions_for_user(user_id)
     except Exception:
         rows_db = []
 
@@ -146,24 +142,26 @@ def list_self_sessions(
                 continue
             seen_fs.add(p.name)
             mtime = datetime.fromtimestamp(p.stat().st_mtime).isoformat()
-            all_rows.append({
-                "session_file": p.name,
-                "session_id": p.stem,
-                "started_at": mtime,
-                "ended_at": None,
-                "active_seconds": 0,
-                "wall_seconds": 0,
-                "user_messages": 0,
-                "tool_calls": 0,
-                "tool_errors": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_read_tokens": 0,
-                "cache_creation_tokens": 0,
-                "tokens_total": 0,
-                "primary_model": None,
-                "processed": False,
-            })
+            all_rows.append(
+                {
+                    "session_file": p.name,
+                    "session_id": p.stem,
+                    "started_at": mtime,
+                    "ended_at": None,
+                    "active_seconds": 0,
+                    "wall_seconds": 0,
+                    "user_messages": 0,
+                    "tool_calls": 0,
+                    "tool_errors": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "tokens_total": 0,
+                    "primary_model": None,
+                    "processed": False,
+                }
+            )
 
     # --- Enrich with verification-pipeline status ---
     # State table keys rows by ``<dir>/<filename>`` (the pipeline runner's
@@ -176,9 +174,7 @@ def list_self_sessions(
     state_map: dict[str, dict] = {}
     if state_keys:
         try:
-            state_map = session_processor_state_repo().get_states_for_session_files(
-                "verification", state_keys
-            )
+            state_map = session_processor_state_repo().get_states_for_session_files("verification", state_keys)
         except Exception:
             state_map = {}
     _enrich_pipeline_status(all_rows, user_id, state_map)
@@ -239,9 +235,7 @@ def _enrich_pipeline_status(
         else:
             items = state.get("items_extracted")
             row["items_extracted"] = items
-            row["pipeline_status"] = (
-                "extracted" if items and items > 0 else "processed"
-            )
+            row["pipeline_status"] = "extracted" if items and items > 0 else "processed"
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +260,17 @@ def get_tokens(
     """
     user_id: str = user["id"]
 
-    repo = usage_repo()
-    daily_series = repo.tokens_daily_series(user_id, days)
-    model_breakdown = repo.tokens_by_model(user_id)
-    top = repo.tokens_top_sessions(user_id)
-    totals = repo.tokens_totals(user_id)
+    canonical = usage_stats.token_totals(user_id, None)
+    totals = {
+        key: canonical[key]
+        for key in ("input", "output", "cache_read", "cache_creation", "total", "sessions", "cost_usd")
+    }
 
     return {
         "days": days,
-        "daily": daily_series,
-        "by_model": model_breakdown,
-        "top_sessions": top,
+        "daily": usage_stats.daily_token_series(user_id, days),
+        "by_model": canonical["by_model"],
+        "top_sessions": usage_stats.top_token_sessions(user_id),
         "totals": totals,
     }
 

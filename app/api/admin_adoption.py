@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.access import require_admin
 from app.api.activity import _should_audit
+from app.services import usage_stats
 
 from src.repositories import (
     audit_repo,
@@ -51,6 +52,14 @@ def _cutoff(window: str) -> datetime:
 
 def _norm_window(window: str) -> str:
     return window if window in _WINDOW_DELTAS else "7d"
+
+
+def _since_days(window: str) -> int:
+    """The KPI window expressed in whole days, which is the unit the shared
+    usage read model windows on. Every pill value is a whole number of days
+    (24h == 1), so this is exact rather than a rounding."""
+    delta = _WINDOW_DELTAS.get(window) or _WINDOW_DELTAS["7d"]
+    return max(1, int(delta.total_seconds() // 86400))
 
 
 def _hours(seconds: int) -> float:
@@ -163,12 +172,20 @@ def adoption_kpis(
     window: str = Query("7d"),
     user: dict = Depends(require_admin),
 ):
-    """Headline adoption numbers for the selected window."""
+    """Headline adoption numbers for the selected window.
+
+    ``cost_usd`` prices the window's tokens through the shared read model
+    (``app.services.usage_stats``), so the figure here is the same one
+    /me/activity shows its owner. It is ``null`` — not zero — when it cannot be
+    computed: an instance-wide per-model split needs the Postgres-only
+    ``usage_turns`` table, and a DuckDB-backed instance has no equivalent.
+    """
     window = _norm_window(window)
     k = usage_repo().adoption_kpis(_cutoff(window))
     _audit(user, "adoption.kpis", {"window": window})
     return {
         "window": window,
+        "cost_usd": usage_stats.cost_usd_for_user(None, _since_days(window)),
         "active_users": k["active_users"],
         "active_seconds": k["active_seconds"],
         "wall_seconds": k["wall_seconds"],
@@ -242,6 +259,12 @@ def adoption_user_kpis(
     window: str = Query("7d"),
     user: dict = Depends(require_admin),
 ):
+    """One user's adoption numbers for the selected window.
+
+    ``cost_usd`` comes from the shared read model, keyed on ``users.id`` — the
+    same computation behind that user's own /me/activity, so the admin view and
+    the analyst view of one person's spend cannot drift apart.
+    """
     window = _norm_window(window)
     target = _resolve(user_id)
     username = _username_for_user(target)
@@ -254,6 +277,7 @@ def adoption_user_kpis(
         "email": target.get("email"),
         "active_hours": _hours(k["active_seconds"]),
         "wall_hours": _hours(k["wall_seconds"]),
+        "cost_usd": usage_stats.cost_usd_for_user(user_id, _since_days(window)),
         **k,
     }
 
