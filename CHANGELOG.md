@@ -17,7 +17,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
-- **The nightly `/catalog` smoke asserted a label the Library stopped using.** #1751 renamed the acquisition filter from *"Not in stack yet"* to *"Not added yet"* and `scripts/e2e/smoke_catalog.sh` kept the old needle, so the browser smoke has failed on every run since — the fifth time this script has been red against a stale assertion rather than a regression (#1497, #1506, #1510, #1522 were the same shape). Needle updated. The vocabulary guard added in 0.93 only reads templates, which is why this class of drift still escapes it.
 
 - **The nightly `/catalog` smoke asserted a label the Library stopped using.** #1751 renamed the acquisition filter from *"Not in stack yet"* to *"Not added yet"* and `scripts/e2e/smoke_catalog.sh` kept the old needle, so the browser smoke has failed on every run since — the fifth time this script has been red against a stale assertion rather than a regression (#1497, #1506, #1510, #1522 were the same shape). Needle updated. The vocabulary guard added in 0.93 only reads templates, which is why this class of drift still escapes it.
 
