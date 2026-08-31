@@ -12,6 +12,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **SharePoint connections can authenticate with an Entra client secret.** `config.auth_method = "client_secret"` (wizard: Credential → Client secret) switches the connection from the certificate-credential flow to Entra's plain client-secret flow — same vault slot, or the `SHAREPOINT_CLIENT_SECRET` env var (`config.client_secret_env` override, allowlist-gated). Covers the Microsoft Graph calls Agnes makes; the certificate stays the default and the only method legacy SharePoint REST app-only accepts, and unlike a certificate a client secret expires. The source card shows "Client secret" instead of thumbprint/expiry rows, storing PEM material into a client-secret connection is a named 400, and the extraction producer receives `AGNES_SHAREPOINT_AUTH_METHOD` + `AGNES_SHAREPOINT_CLIENT_SECRET` in place of the private-key variable.
+
 - **Eight MCP tools for the semantic-layer admin actions that had REST and CLI
   and nothing else (#1707).** Three families were reachable from a terminal and
   a browser but not from an agent: where documents are synced FROM

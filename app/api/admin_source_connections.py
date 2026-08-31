@@ -400,10 +400,11 @@ _CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
     "snowflake": ("token_env", "private_key_env", "private_key_passphrase_env"),
     "databricks": ("token_env",),
     # `connectors.sharepoint.settings.resolve_sharepoint_settings` falls back
-    # to this env var name when the connection has no vault secret of its
-    # own — same admin-writable secret-ref-NAME shape as Snowflake/Databricks
-    # above, and the same exfiltration risk without this guard.
-    "sharepoint": ("cert_private_key_env",),
+    # to these env var names when the connection has no vault secret of its
+    # own (which one depends on `auth_method`) — same admin-writable
+    # secret-ref-NAME shape as Snowflake/Databricks above, and the same
+    # exfiltration risk without this guard.
+    "sharepoint": ("cert_private_key_env", "client_secret_env"),
 }
 
 
@@ -1532,16 +1533,29 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                     raise _preflight_error(exc, redacted, stack_url, what="storage token") from exc
                 _reject_project_mismatch(row, info, what="storage token")
         elif row.get("source_type") == "sharepoint":
-            # Fail fast on unusable certificate material. Without this, any
-            # string stored fine and surfaced hours later as an opaque
-            # provider auth error on the first Graph call — the least
-            # discoverable part of the whole flow is that the credential is
-            # the certificate AND its private key concatenated in one PEM.
-            from connectors.sharepoint.graph_client import validate_certificate_material
+            if ((row.get("config") or {}).get("auth_method") or "certificate") == "client_secret":
+                # A client secret is opaque — no shape to validate — but PEM
+                # material landing here is a real, nameable mix-up.
+                if "-----BEGIN" in value:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "this connection uses client_secret auth, but the value looks like "
+                            "certificate material — paste the Entra client secret, or switch the "
+                            "connection's auth_method to 'certificate' and store the PEM"
+                        ),
+                    )
+            else:
+                # Fail fast on unusable certificate material. Without this, any
+                # string stored fine and surfaced hours later as an opaque
+                # provider auth error on the first Graph call — the least
+                # discoverable part of the whole flow is that the credential is
+                # the certificate AND its private key concatenated in one PEM.
+                from connectors.sharepoint.graph_client import validate_certificate_material
 
-            reason = validate_certificate_material(value)
-            if reason:
-                raise HTTPException(status_code=400, detail=f"sharepoint_pem_invalid: {reason}")
+                reason = validate_certificate_material(value)
+                if reason:
+                    raise HTTPException(status_code=400, detail=f"sharepoint_pem_invalid: {reason}")
         key = connection_id
 
     try:

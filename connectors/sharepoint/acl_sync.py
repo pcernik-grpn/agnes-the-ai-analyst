@@ -378,7 +378,7 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     token: Optional[str] = None
     try:
         settings = resolve_sharepoint_settings(connection)
-        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key)
+        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret)
     except (SharePointSettingsError, SharePointGraphError) as exc:
         error = str(exc)
 
@@ -881,7 +881,7 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     token: Optional[str] = None
     try:
         settings = resolve_sharepoint_settings(connection)
-        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key)
+        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret)
     except (SharePointSettingsError, SharePointGraphError) as exc:
         error = str(exc)
 

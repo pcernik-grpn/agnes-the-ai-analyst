@@ -1573,17 +1573,19 @@
         </div>
 
         <div class="ds-field">
-          <label for="spw-cert-choice">Certificate</label>
+          <label for="spw-cert-choice">Credential</label>
           <select id="spw-cert-choice" class="ds-dropdown-native">
-            <option value="upload" selected>Upload your own</option>
+            <option value="upload" selected>Upload certificate</option>
             <option value="env">Server certificate</option>
+            <option value="secret">Client secret</option>
           </select>
           {{ ds.dropdown(
             id='spw-cert-choice-dd', target='spw-cert-choice',
-            aria_label='Certificate source', selected='upload',
+            aria_label='Credential source', selected='upload',
             options=[
-              {'value': 'upload', 'label': 'Upload your own'},
+              {'value': 'upload', 'label': 'Upload certificate'},
               {'value': 'env', 'label': 'Server certificate'},
+              {'value': 'secret', 'label': 'Client secret'},
             ],
           ) }}
           <div id="spw-cert-upload" style="margin-top:10px;">
@@ -1595,6 +1597,10 @@
           <div id="spw-cert-env" style="margin-top:10px; display:none;">
             <input type="text" id="spw-cert-env-name" placeholder="SHAREPOINT_CERT_PRIVATE_KEY (default)" autocomplete="off" spellcheck="false">
             <div class="field-hint">Name of the env var the deployment injects the certificate under. A new value only takes effect after the server process is recreated.</div>
+          </div>
+          <div id="spw-cert-secret" style="margin-top:10px; display:none;">
+            <input type="password" id="spw-client-secret" placeholder="Entra client secret value" autocomplete="off" spellcheck="false">
+            <div class="field-hint">The app registration's client secret (Certificates &amp; secrets &rarr; Client secrets). Covers the Graph calls Agnes makes; note client secrets expire — the certificate option never surprises you that way. Stored write-only in the server vault.</div>
           </div>
           <div id="spw-cert-status" class="field-hint" style="display:none;"></div>
         </div>
@@ -2176,6 +2182,7 @@ function _sharepointFactsHtml(row) {
   }
 
   const cert = fs.certificate || {};
+  const isSecretAuth = cert.auth_method === "client_secret";
   const certBadge = cert.error
     ? `<span class="ds-badge badge-unset">not configured</span>`
     : `<span class="ds-badge ${cert.origin === "vault" ? "badge-vault" : "badge-env"}">${_esc(cert.origin || "unset")}</span>`;
@@ -2345,16 +2352,17 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" ${extractionReady ? "" : "disabled"} onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
   </div>
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k">Certificate</span>
+    <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
     <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Update</button></span>
   </div>${certMetaHtml}
   <div class="ds-rotate-row" id="ds-sp-cert-row-${row.id}">
-    <textarea id="ds-sp-cert-input-${row.id}" rows="5" placeholder="-----BEGIN CERTIFICATE-----...-----END PRIVATE KEY-----" autocomplete="off" spellcheck="false"></textarea>
+    <textarea id="ds-sp-cert-input-${row.id}" rows="${isSecretAuth ? 2 : 5}" placeholder="${isSecretAuth ? "new Entra client secret" : "-----BEGIN CERTIFICATE-----...-----END PRIVATE KEY-----"}" autocomplete="off" spellcheck="false"></textarea>
+    ${isSecretAuth ? "" : `
     <input type="file" id="ds-sp-cert-file-${row.id}" accept=".pem,.crt,.cer,.key,.txt" multiple style="display:none;" onchange="spCertFilePicked(this, 'ds-sp-cert-input-${row.id}', 'ds-sp-cert-file-status-${row.id}')">
     <div class="field-hint" id="ds-sp-cert-file-status-${row.id}" style="display:none;"></div>
-    <button type="button" class="btn btn-secondary" onclick="document.getElementById('ds-sp-cert-file-${row.id}').click()">Upload PEM file&hellip;</button>
-    <button type="button" class="btn btn-primary" onclick="saveSpCertificate('${row.id}')">Save certificate</button>
+    <button type="button" class="btn btn-secondary" onclick="document.getElementById('ds-sp-cert-file-${row.id}').click()">Upload PEM file&hellip;</button>`}
+    <button type="button" class="btn btn-primary" onclick="saveSpCertificate('${row.id}')">${isSecretAuth ? "Save secret" : "Save certificate"}</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Cancel</button>
   </div>
   <div class="ds-src__fact">
@@ -6053,6 +6061,7 @@ function openSpWizard() {
   document.getElementById("spw-client").value = "";
   document.getElementById("spw-cert-pem").value = "";
   document.getElementById("spw-cert-env-name").value = "";
+  document.getElementById("spw-client-secret").value = "";
   document.getElementById("spw-cert-status").style.display = "none";
   document.getElementById("spw-connect-error").style.display = "none";
   spSetCertChoice("upload");
@@ -6157,6 +6166,7 @@ function spSetCertChoice(choice) {
   document.getElementById("spw-cert-choice").value = choice;
   document.getElementById("spw-cert-upload").style.display = choice === "upload" ? "" : "none";
   document.getElementById("spw-cert-env").style.display = choice === "env" ? "" : "none";
+  document.getElementById("spw-cert-secret").style.display = choice === "secret" ? "" : "none";
 }
 document.getElementById("spw-cert-choice").addEventListener("change", (e) => spSetCertChoice(e.target.value));
 
@@ -6192,6 +6202,7 @@ document.getElementById("spw-connect-btn").addEventListener("click", () => {
     const envName = document.getElementById("spw-cert-env-name").value.trim();
     if (envName) config.cert_private_key_env = envName;
   }
+  if (spCertChoice === "secret") config.auth_method = "client_secret";
 
   const btn = document.getElementById("spw-connect-btn");
   btn.disabled = true;
@@ -6200,11 +6211,13 @@ document.getElementById("spw-connect-btn").addEventListener("click", () => {
   spApi(SP_CONN_API, { method: "POST", body: { name: name, source_type: "sharepoint", config: config } })
     .then((row) => {
       spConnId = row.id;
-      if (spCertChoice === "upload") {
-        const pem = document.getElementById("spw-cert-pem").value.trim();
-        if (!pem) return Promise.resolve(row);
+      if (spCertChoice === "upload" || spCertChoice === "secret") {
+        const value = spCertChoice === "secret"
+          ? document.getElementById("spw-client-secret").value.trim()
+          : document.getElementById("spw-cert-pem").value.trim();
+        if (!value) return Promise.resolve(row);
         return spApi(`${SP_CONN_API}/${encodeURIComponent(row.id)}/secret`, {
-          method: "PUT", body: { value: pem, kind: "storage" },
+          method: "PUT", body: { value: value, kind: "storage" },
         }).then(() => row);
       }
       return row;

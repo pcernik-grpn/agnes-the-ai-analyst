@@ -228,3 +228,80 @@ class TestGuardMessagesNameTheMistake:
         assert resp.status_code == 400, resp.text
         assert "AGNES_CONFIG_SECRET_ENVS" in resp.text
         assert "token_env" in resp.text
+
+
+class TestClientSecretConnections:
+    """`config.auth_method = "client_secret"` connections store an opaque
+    secret in the same vault slot — the PEM validation must not fire on
+    them, and certificate material pasted into one is a named mistake."""
+
+    @pytest.fixture()
+    def secret_conn(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": f"sp-clientsecret-{id(monkeypatch)}",
+                "source_type": "sharepoint",
+                "config": {
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
+                    "client_id": "app-client-id",
+                    "auth_method": "client_secret",
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        yield c, token, resp.json()["id"]
+        _reset_ephemeral_key_for_tests()
+
+    def test_opaque_secret_is_accepted(self, secret_conn):
+        c, token, conn_id = secret_conn
+        resp = c.put(f"{BASE}/{conn_id}/secret", json={"value": "plain-app-secret"}, headers=_auth(token))
+        assert resp.status_code == 204, resp.text
+
+    def test_pem_material_in_a_client_secret_connection_is_named(self, secret_conn):
+        c, token, conn_id = secret_conn
+        resp = c.put(f"{BASE}/{conn_id}/secret", json={"value": COMBINED_PEM}, headers=_auth(token))
+        assert resp.status_code == 400, resp.text
+        assert "client_secret" in resp.text
+
+    def test_unknown_auth_method_is_rejected_at_create(self, seeded_app):
+        c = seeded_app["client"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "sp-bad-auth-method",
+                "source_type": "sharepoint",
+                "config": {
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
+                    "client_id": "app-client-id",
+                    "auth_method": "managed_identity",
+                },
+            },
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "auth_method" in resp.text
+
+    def test_client_secret_env_name_is_allowlist_gated(self, seeded_app):
+        c = seeded_app["client"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "sp-secret-env-evil",
+                "source_type": "sharepoint",
+                "config": {
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
+                    "client_id": "app-client-id",
+                    "auth_method": "client_secret",
+                    "client_secret_env": "JWT_SECRET_KEY",
+                },
+            },
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "client_secret_env" in resp.text

@@ -341,7 +341,9 @@ async def _resolved_token(row: Dict[str, Any]) -> str:
             detail={"error": "sharepoint_cert_unresolved", "message": str(exc)},
         ) from exc
     try:
-        return await get_app_token(settings.tenant_id, settings.client_id, settings.private_key)
+        return await get_app_token(
+            settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret
+        )
     except SharePointGraphError as exc:
         raise HTTPException(
             status_code=502,
@@ -1154,6 +1156,10 @@ async def certificate(
         settings = resolve_sharepoint_settings(row)
     except SharePointSettingsError as exc:
         return {"certificate": None, "reason": f"sharepoint_cert_unresolved: {exc}"}
+    if settings.auth_method == "client_secret":
+        # No certificate exists to describe — a typed absence, same shape as
+        # the unresolved/unparseable cases, never an error.
+        return {"certificate": None, "reason": "client_secret_auth"}
     return certificate_metadata(settings.private_key)
 
 

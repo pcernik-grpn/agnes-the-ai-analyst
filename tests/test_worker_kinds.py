@@ -663,7 +663,9 @@ class TestCorpusExtractionHandler:
         with pytest.raises(RuntimeError, match="certificate not configured"):
             handler({"connection_id": "conn1"})
 
-    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material", config=None):
+    def _stub_connection_and_settings(
+        self, monkeypatch, *, private_key="super-secret-pem-material", config=None, **settings_overrides
+    ):
         # Default config carries ONE confirmed scope: since the corpus-map
         # handoff, a scope-less connection with no payload corpus_id refuses
         # to run (see test_no_scopes_and_no_corpus_id_refuses) — tests that
@@ -695,6 +697,7 @@ class TestCorpusExtractionHandler:
             client_id="client-1",
             private_key=private_key,
             credential_source="vault",
+            **settings_overrides,
         )
         monkeypatch.setattr("connectors.sharepoint.settings.resolve_sharepoint_settings", lambda conn: fake_settings)
         return fake_settings
@@ -734,6 +737,36 @@ class TestCorpusExtractionHandler:
         assert call["env"]["AGNES_SHAREPOINT_CLIENT_ID"] == "client-1"
         assert call["env"]["AGNES_SHAREPOINT_PRIVATE_KEY"] == "super-secret-pem-material"
         assert call["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "corpus-9"
+
+    def test_client_secret_connection_forwards_the_secret_not_a_key(self, monkeypatch):
+        """`auth_method="client_secret"` connections hand the producer
+        AGNES_SHAREPOINT_CLIENT_SECRET (+ the method marker) and no empty
+        AGNES_SHAREPOINT_PRIVATE_KEY placeholder."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(
+            monkeypatch, private_key="", auth_method="client_secret", client_secret="app-secret-value"
+        )
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, timeout=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+        handler({"connection_id": "conn1", "corpus_id": "corpus-9"})
+
+        env = calls[0]["env"]
+        assert "app-secret-value" not in " ".join(calls[0]["argv"])
+        assert env["AGNES_SHAREPOINT_CLIENT_SECRET"] == "app-secret-value"
+        assert env["AGNES_SHAREPOINT_AUTH_METHOD"] == "client_secret"
+        assert "AGNES_SHAREPOINT_PRIVATE_KEY" not in env
 
     def test_child_env_does_not_forward_instance_secrets(self, monkeypatch):
         """The producer is an EXTERNAL, admin-configurable binary — it must

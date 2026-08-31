@@ -85,3 +85,19 @@ def test_snowflake_passes_through_secret_ref_fields():
     assert cfg["role"] == "ANALYST"
     assert cfg["private_key_env"] == "MY_SF_KEY"
     assert cfg["private_key_passphrase_env"] == "MY_SF_PASSPHRASE"
+
+
+def test_sharepoint_auth_method_defaults_to_certificate():
+    from src.connection_specs import validate_connection_config
+
+    cfg = validate_connection_config("sharepoint", {"tenant_id": "t", "client_id": "c"})
+    assert cfg["auth_method"] == "certificate"
+
+
+def test_sharepoint_rejects_unknown_auth_method():
+    from src.connection_specs import validate_connection_config
+
+    with pytest.raises(ValueError, match="auth_method"):
+        validate_connection_config(
+            "sharepoint", {"tenant_id": "t", "client_id": "c", "auth_method": "managed_identity"}
+        )
