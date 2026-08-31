@@ -139,10 +139,26 @@ fi
 chown -R 999:999 "$ROOT"
 
 if [ ! -f "$DEST/system.duckdb" ]; then
-    # No source file was copied above — record the skip honestly instead of
-    # verifying a file that does not exist (which would read FAILED and page
-    # on every run of an instance that legitimately has no DuckDB state).
-    STATUS=SKIPPED
+    # No source file was copied above. Whether that is legitimate depends on
+    # the BACKEND, not on the file's absence alone:
+    #
+    #  - Postgres side-car active -> nothing to back up on the DuckDB side
+    #    (born on Postgres, or the frozen post-migration snapshot retired).
+    #    A genuine skip; recorded honestly instead of verifying a file that
+    #    does not exist, which would read FAILED and page every run.
+    #
+    #  - No side-car (DuckDB or cloud backend) -> system.duckdb IS the app
+    #    state, so its absence is the catastrophe this unit exists to catch
+    #    (a deleted file, a broken mount, an unmounted disk). Calling that
+    #    SKIPPED would exit 0 and never fire the webhook, turning the daily
+    #    backup alarm off exactly when it matters.
+    if pg_backend_active; then
+        STATUS=SKIPPED
+    else
+        STATUS=FAILED
+        echo "system.duckdb missing at /data/state/system.duckdb and no Postgres side-car is active" \
+            > "$DEST/verify.log"
+    fi
 elif docker exec agnes-app-1 python /data/backups/agnes-db-verify.py \
         "$DEST/system.duckdb" > "$DEST/verify.log" 2>&1; then
     STATUS=OK
@@ -175,5 +191,7 @@ fi
 if [ -n "$PG_STATUS" ]; then
     { [ "$STATUS" = "OK" ] || [ "$STATUS" = "SKIPPED" ]; } && [ "$PG_STATUS" = "OK" ]
 else
-    [ "$STATUS" = "OK" ] || [ "$STATUS" = "SKIPPED" ]
+    # No side-car: STATUS can only be OK or FAILED here — the branch above
+    # never records SKIPPED without an active Postgres backend.
+    [ "$STATUS" = "OK" ]
 fi
