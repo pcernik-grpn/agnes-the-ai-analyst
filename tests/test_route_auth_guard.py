@@ -93,6 +93,13 @@ _EXEMPT: dict[str, str] = {
         "handler body (not a Depends-chain auth dependency) so an anonymous browser "
         "hit can redirect to /login instead of only ever raising a raw 401"
     ),
+    "/api/webhooks/sharepoint/{connection_id}": (
+        "Microsoft Graph change-notification receiver — Graph is the caller, so "
+        "there is no session/PAT to require. Admission control is the router-level "
+        "extraction_webhook.enabled gate (404 when off) plus a per-notification "
+        "clientState check verified with hmac.compare_digest inside the handler "
+        "body, never a Depends chain — same class as the Slack webhooks above."
+    ),
 }
 
 

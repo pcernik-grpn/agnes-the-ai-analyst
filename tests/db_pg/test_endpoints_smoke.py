@@ -3179,6 +3179,26 @@ KNOWN_UNTESTED = {
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
     "POST /api/admin/sharepoint/extraction/run-due",
+    # Graph change-notification receiver (webhook-triggered extraction) — the
+    # admin secret-rotation endpoint writes only into the EXISTING
+    # `source_connections.config` JSON column (no new schema surface), and
+    # the public receiver route carries no user auth to smoke at all (Graph
+    # is the caller; admission is a per-notification clientState check, not
+    # a Depends chain — see tests/test_route_auth_guard.py's _EXEMPT entry).
+    # Both routes' actual behavior (secret mint/rotate/persist, handshake
+    # echo, clientState verification, dedup + debounce, the feature gate,
+    # the request-size cap) is covered by
+    # tests/test_admin_sharepoint.py::TestWebhookSecretRotation and
+    # tests/test_sharepoint_webhooks.py; not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/webhook",
+    "POST /api/webhooks/sharepoint/{connection_id}",
+    # Observed-changes feed (2026-08-30) — NEW schema surface
+    # (corpus_file_events, PG-only, A3 ratchet), so unlike its siblings
+    # above it IS covered per-backend, just not in this file: auth matrix,
+    # 404-before-work, since/until filtering, all four change kinds off a
+    # realistic upload/update/rename/delete fixture, pagination, and the
+    # DuckDB typed-501 are all in tests/db_pg/test_sharepoint_changes_pg.py.
+    "GET /api/admin/sharepoint/connections/{connection_id}/changes",
     # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
     # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
     # EXISTING jobs table, no new schema surface" reasoning as the

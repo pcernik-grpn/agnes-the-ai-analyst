@@ -1197,14 +1197,14 @@ class TestCorpusExtractionHandler:
         assert "THE-ONLY-PART-THAT-MATTERS" in tails[0]
         assert "A" * 100 not in tails[0], "the whole 5 KB was logged, not a 32-byte tail"
 
-    # -- producer callback credential (TCRD-226) -----------------------------
+    # -- producer callback credential ----------------------------------------
     # The producer calls back into Agnes's own REST API (corpus-map, scopes,
-    # POST /api/facts/ingest) to do its actual work — until this wiring it had
-    # no credential to do so at all. The scheduler shared-secret token is the
-    # natural fit (the only existing credential class a headless subprocess
-    # can already present); see the module docstring for the honest over-grant
-    # note (it resolves to a synthetic Admin-group user, far more than the
-    # producer actually needs).
+    # the collections upload, POST /api/facts/ingest, GET
+    # /api/facts/corrections) to do its actual work. AGNES_API_TOKEN is a
+    # short-lived, PRODUCER-SCOPED JWT minted fresh for this run (see
+    # app.auth.producer_token) — this REPLACES the earlier design that
+    # forwarded the scheduler shared secret here (a genuine over-grant: that
+    # secret resolves to a synthetic Admin-group user).
 
     def _run_capturing_env(self, monkeypatch):
         calls = []
@@ -1233,24 +1233,39 @@ class TestCorpusExtractionHandler:
 
         assert calls[0]["env"]["AGNES_API_URL"] == "https://agnes.example.com"
 
-    def test_agnes_api_token_forwarded_when_scheduler_secret_configured(self, monkeypatch):
+    def test_agnes_api_token_is_always_a_producer_jwt_never_the_scheduler_secret(self, monkeypatch):
+        """AGNES_API_TOKEN must be present and be a producer-typed JWT
+        regardless of whether SCHEDULER_API_TOKEN happens to be configured
+        — the two credentials are unrelated now. Regression guard for the
+        exact bug this change fixes: the child env used to carry the raw
+        scheduler secret verbatim."""
+        from app.auth.jwt import verify_token
+
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
-        monkeypatch.setenv("SCHEDULER_API_TOKEN", "s" * 40)
+        secret = "s" * 40
+        monkeypatch.setenv("SCHEDULER_API_TOKEN", secret)
         self._stub_connection_and_settings(monkeypatch)
         calls = self._run_capturing_env(monkeypatch)
         handler = self._register()
 
         handler({"connection_id": "conn1"})
 
-        env = calls[0]["env"]
-        assert env["AGNES_API_TOKEN"] == "s" * 40
+        token = calls[0]["env"]["AGNES_API_TOKEN"]
+        assert token != secret
+        payload = verify_token(token)
+        assert payload is not None
+        assert payload["typ"] == "producer"
+        assert payload["connection_id"] == "conn1"
         # Never on argv — same F7 rule as every other secret this handler
         # resolves.
-        assert "s" * 40 not in " ".join(calls[0]["argv"])
+        assert token not in " ".join(calls[0]["argv"])
 
-    def test_agnes_api_token_absent_when_no_scheduler_secret_configured(self, monkeypatch):
-        """No scheduler shared secret configured (e.g. LOCAL_DEV_MODE) →
-        no token to forward — never a placeholder/empty credential."""
+    def test_agnes_api_token_present_even_with_no_scheduler_secret_configured(self, monkeypatch):
+        """No scheduler shared secret configured (e.g. LOCAL_DEV_MODE) used
+        to mean no callback token at all — now it makes no difference,
+        since the producer JWT is minted independently."""
+        from app.auth.jwt import verify_token
+
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
         monkeypatch.delenv("SCHEDULER_API_TOKEN", raising=False)
         self._stub_connection_and_settings(monkeypatch)
@@ -1259,7 +1274,102 @@ class TestCorpusExtractionHandler:
 
         handler({"connection_id": "conn1"})
 
-        assert "AGNES_API_TOKEN" not in calls[0]["env"]
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload is not None
+        assert payload["typ"] == "producer"
+
+    def test_agnes_api_token_collection_ids_match_the_confirmed_scopes(self, monkeypatch):
+        """`collection_ids` claim is the SAME source `GET .../corpus-map`
+        reads — every confirmed scope's `collection_id`, sorted."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "instance-hmac-secret")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_anon_1", "col_plain_1"]
+
+    def test_no_scopes_and_no_corpus_id_is_refused_before_any_token_is_minted(self, monkeypatch):
+        """The scenario this test used to describe — no confirmed scopes, no
+        payload `corpus_id`, token minted with `collection_ids: []` — is not a
+        run the handler performs at all: nothing says which collection the
+        documents go to, so it refuses up front rather than spending a producer
+        run on it. Asserted here so the refusal, not an empty credential, is
+        what this case is pinned to."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="no confirmed scopes"):
+            handler({"connection_id": "conn1"})
+        assert calls == [], "the producer must not be run at all"
+
+    def test_agnes_api_token_covers_the_payloads_explicit_corpus_id(self, monkeypatch):
+        """A run with no confirmed scopes is supported as long as the payload
+        names a `corpus_id` — the handler forwards it as
+        `AGNES_EXTRACTION_CORPUS_ID`. The credential has to cover it, or the
+        producer would be 403'd by `POST /api/collections/{id}/files` and by
+        `/api/facts/ingest`'s corpus check on the one collection it was told to
+        fill. Scoping the token to the confirmed scopes alone (what it did
+        before) set that run up to fail."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "corpus_id": "col_explicit"})
+
+        assert calls[0]["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "col_explicit"
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_explicit"]
+
+    def test_agnes_api_token_unions_the_corpus_id_with_the_confirmed_scopes(self, monkeypatch):
+        """Same hole with scopes present: a payload naming a collection outside
+        them must widen the claim, not be silently left out of it. The union is
+        deduplicated and sorted, so naming a collection already in scope adds
+        nothing."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "corpus_id": "col_outside"})
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default", "col_outside"]
+
+        # naming a collection already in scope adds nothing
+        handler({"connection_id": "conn1", "corpus_id": "col_default"})
+        payload = verify_token(calls[1]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default"]
+
+    def test_agnes_api_token_expiry_tracks_timeout_plus_grace(self, monkeypatch):
+        from app.auth.jwt import verify_token
+        from app.worker.kinds import _PRODUCER_TOKEN_GRACE_SECONDS
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        # self._ENABLED_CONFIG sets timeout_s=60. `iat`/`exp` are minted from
+        # two separate `datetime.now()` calls a few microseconds apart, so
+        # assert within a tight tolerance rather than exact equality — a
+        # sub-second-boundary flake is possible but not the thing this test
+        # means to pin.
+        assert abs((payload["exp"] - payload["iat"]) - (60 + _PRODUCER_TOKEN_GRACE_SECONDS)) <= 1
 
     def test_agnes_api_token_never_logged(self, monkeypatch, caplog):
         import logging
@@ -1267,12 +1377,14 @@ class TestCorpusExtractionHandler:
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
         monkeypatch.setenv("SCHEDULER_API_TOKEN", "t" * 40)
         self._stub_connection_and_settings(monkeypatch)
-        self._run_capturing_env(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
         handler = self._register()
 
         with caplog.at_level(logging.DEBUG):
             handler({"connection_id": "conn1"})
 
+        token = calls[0]["env"]["AGNES_API_TOKEN"]
+        assert token not in caplog.text
         assert "t" * 40 not in caplog.text
 
     # -- loopback callback URL guard (role-split worker, no SERVER_URL) -----

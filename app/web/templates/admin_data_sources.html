@@ -1560,7 +1560,9 @@
           ) }}
           <div id="spw-cert-upload" style="margin-top:10px;">
             <textarea id="spw-cert-pem" rows="5" placeholder="-----BEGIN CERTIFICATE-----...-----END PRIVATE KEY-----" autocomplete="off" spellcheck="false"></textarea>
-            <div class="field-hint">The certificate followed by its private key, in one PEM. Stored write-only in the server vault — never echoed back, only its origin and set-date are shown.</div>
+            <input type="file" id="spw-cert-file" accept=".pem,.crt,.cer,.key,.txt" multiple style="display:none;">
+            <button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="document.getElementById('spw-cert-file').click()">Upload PEM file&hellip;</button>
+            <div class="field-hint">The certificate followed by its private key, in one PEM — paste it, or pick the file(s); selecting the certificate and key files together concatenates them. Stored write-only in the server vault — never echoed back, only its origin and set-date are shown.</div>
           </div>
           <div id="spw-cert-env" style="margin-top:10px; display:none;">
             <input type="text" id="spw-cert-env-name" placeholder="SHAREPOINT_CERT_PRIVATE_KEY (default)" autocomplete="off" spellcheck="false">
@@ -2305,6 +2307,9 @@ function _sharepointFactsHtml(row) {
   </div>${certMetaHtml}
   <div class="ds-rotate-row" id="ds-sp-cert-row-${row.id}">
     <textarea id="ds-sp-cert-input-${row.id}" rows="5" placeholder="-----BEGIN CERTIFICATE-----...-----END PRIVATE KEY-----" autocomplete="off" spellcheck="false"></textarea>
+    <input type="file" id="ds-sp-cert-file-${row.id}" accept=".pem,.crt,.cer,.key,.txt" multiple style="display:none;" onchange="spCertFilePicked(this, 'ds-sp-cert-input-${row.id}', 'ds-sp-cert-file-status-${row.id}')">
+    <div class="field-hint" id="ds-sp-cert-file-status-${row.id}" style="display:none;"></div>
+    <button type="button" class="btn btn-secondary" onclick="document.getElementById('ds-sp-cert-file-${row.id}').click()">Upload PEM file&hellip;</button>
     <button type="button" class="btn btn-primary" onclick="saveSpCertificate('${row.id}')">Save certificate</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Cancel</button>
   </div>
@@ -5667,6 +5672,46 @@ const SP_DEFAULT_CERT_ENV = "SHAREPOINT_CERT_PRIVATE_KEY";
 // One wording for the unique-permissions badge label, defined once so the
 // tree row and (were it ever needed elsewhere) any other renderer agree.
 const SP_UNIQUE_PERMS_LABEL = "&#9888; unique permissions";
+
+/* Advisory client-side check of certificate material — answers before any
+   network call; the PUT endpoint's server-side validation stays the
+   authority. Mirrors its vocabulary: a CERTIFICATE block plus an
+   UNENCRYPTED private-key block, concatenated in one PEM. */
+function spPemFormatCheck(text) {
+  if (/-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text)) {
+    return { ok: false, message: "The private key is encrypted — export it unencrypted (PKCS#8) and try again." };
+  }
+  const hasCert = text.indexOf("-----BEGIN CERTIFICATE-----") !== -1;
+  const hasKey = /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/.test(text);
+  if (hasCert && hasKey) return { ok: true, message: "Certificate and private key found." };
+  if (!hasCert && !hasKey) return { ok: false, message: "No PEM blocks found — expected the certificate followed by its private key." };
+  if (!hasCert) return { ok: false, message: "Missing the CERTIFICATE block — pick the certificate file too (you can select both files at once)." };
+  return { ok: false, message: "Missing the PRIVATE KEY block — pick the key file too (you can select both files at once)." };
+}
+
+/* Shared by the wizard's picker and each source card's rotate row (inline
+   `onchange`). Reads every selected file, concatenates (block order is
+   irrelevant to the server's parser), fills the target textarea so the
+   admin sees exactly what will be submitted, and reports the format
+   verdict in the status element. Values flow through `.value` and
+   `.textContent` only — never innerHTML. */
+async function spCertFilePicked(inputEl, targetId, statusId) {
+  const files = Array.from((inputEl && inputEl.files) || []);
+  if (!files.length) return;
+  const parts = [];
+  for (const f of files) parts.push((await f.text()).trim());
+  const combined = parts.join("\n") + "\n";
+  document.getElementById(targetId).value = combined;
+  const verdict = spPemFormatCheck(combined);
+  const status = document.getElementById(statusId);
+  status.textContent = verdict.message;
+  status.style.display = "";
+  status.style.color = verdict.ok ? "" : "var(--ds-accent-danger-ink)";
+  try { inputEl.value = ""; } catch (e) { /* re-picking the same file must still fire change */ }
+}
+document.getElementById("spw-cert-file").addEventListener("change", (e) => {
+  spCertFilePicked(e.target, "spw-cert-pem", "spw-cert-status");
+});
 
 let spConnId = null;
 let spCertChoice = "upload";

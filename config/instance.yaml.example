@@ -1341,14 +1341,16 @@ extraction:
   # different keys, or the same person pseudonymizes identically across
   # tenants). Neither var is set when no scope is anonymize-marked.
   #
-  # Producer callback credential (TCRD-226): the producer calls BACK into
-  # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
-  # its actual work, so the child env ALSO carries AGNES_API_URL (this
-  # instance's own base URL — resolved from SERVER_URL, falling back to
-  # AGNES_INTERNAL_URL, then to this process's own loopback) and, when
-  # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
-  # shared-secret bearer token). On a role-split `extraction-worker`
-  # container (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
+  # Producer callback credential: the producer calls BACK into Agnes's own
+  # REST API (corpus-map, scopes, the collections upload, POST
+  # /api/facts/ingest, GET /api/facts/corrections) to do its actual work,
+  # so the child env ALSO carries AGNES_API_URL (this instance's own base
+  # URL — resolved from SERVER_URL, falling back to AGNES_INTERNAL_URL,
+  # then to this process's own loopback) and AGNES_API_TOKEN — a
+  # short-lived, PRODUCER-SCOPED JWT (`app/auth/producer_token.py`) minted
+  # fresh for this run, naming only THIS connection and its own confirmed
+  # scope collections. On a role-split `extraction-worker` container
+  # (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
   # `extraction-worker` service in docker-compose.yml) that loopback
   # fallback would be the WORKER's own address, not the instance's real
   # callback surface — so on that topology the job refuses cleanly instead
@@ -1356,18 +1358,13 @@ extraction:
   # the two is set explicitly. A single-container ("all-in-one") deployment
   # is unaffected: there, the producer's parent process IS the app, so the
   # loopback fallback is correct and no explicit configuration is required.
-  # The token itself is a DELIBERATE OVER-GRANT, not an
-  # oversight: presenting that token resolves to a synthetic user in the
-  # Admin system group (see app/auth/scheduler_token.py) — god-mode on
-  # every RBAC check — while the producer only ever needs to read its own
-  # connection's scope map, upload into its own scope collections, and
-  # POST to the facts-ingest endpoint. It is reused because it is the only
-  # existing credential class a headless subprocess can already present; a
-  # narrower, producer-scoped credential is the right long-term fix and is
-  # out of scope here. A compromised or merely misbehaving producer under
-  # this token can do anything an admin can, not merely ingest facts —
-  # weigh that before pointing `producer` at anything you have not
-  # reviewed.
+  # The token resolves to a RESTRICTED principal — never a real user, never
+  # Admin — accepted on only the small, fixed set of endpoints named above;
+  # every other endpoint 403s it. This replaces an earlier design that
+  # forwarded the scheduler shared secret here (a genuine over-grant: that
+  # secret resolves to a synthetic Admin-group user, god-mode on every RBAC
+  # check) — SCHEDULER_API_TOKEN is unrelated to this token and does not
+  # need to be configured for extraction to work.
   anonymization:
     # Name of the env var holding the per-instance HMAC key — checked
     # against ITS OWN allowlist before the value is read (the name here is
@@ -1382,6 +1379,26 @@ extraction:
     # resolvable key fails the extraction job clean rather than running the
     # producer without a key.
     hmac_key_env: ""
+
+
+# Microsoft Graph change-notification receiver for SharePoint connections —
+# POST /api/webhooks/sharepoint/{connection_id}. Lets a subscribed Graph
+# drive push near-real-time notifications instead of Agnes waiting for
+# extraction.schedule above. A SEPARATE top-level section from `extraction:`
+# on purpose (see app/switches.py's `extraction_webhook_enabled` entry): that
+# section's own `enabled` flag is deployment-locked (needs a worker lane +
+# producer), while this one is a plain, always-editable route gate.
+#
+# Off by default: the whole route answers 404 when off. Gates the RECEIVER
+# route only — a notification it accepts still needs `extraction.enabled` +
+# a configured producer + a worker polling the `extraction` lane to actually
+# run the resulting `corpus-extraction` job. Agnes never creates, renews, or
+# deletes the Graph subscription itself; an operator runs the producer's own
+# `subscriptions.py create --url <webhook_url>` against the URL + secret
+# `POST /api/admin/sharepoint/connections/{connection_id}/webhook` mints.
+# AGNES_EXTRACTION_WEBHOOK_ENABLED overrides this at the environment level.
+extraction_webhook:
+  enabled: false
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,

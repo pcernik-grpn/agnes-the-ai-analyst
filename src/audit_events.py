@@ -957,6 +957,11 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a SharePoint connection's certificate metadata (never the private key).",
     ),
+    "sharepoint_connection.changes_read": AuditEvent(
+        "sharepoint_connection.changes_read",
+        "read",
+        "An admin read a SharePoint connection's observed content-changes feed.",
+    ),
     "sharepoint_connection.corpus_map_read": AuditEvent(
         "sharepoint_connection.corpus_map_read",
         "read",
@@ -1054,6 +1059,22 @@ CATALOG: dict[str, AuditEvent] = {
         "run_sharepoint_extraction",
         "system",
         "The scheduler's SharePoint extraction sweep ran.",
+    ),
+    # -- SharePoint Graph change-notification receiver -------------------------
+    "sharepoint_connection.webhook_secret_rotate": AuditEvent(
+        "sharepoint_connection.webhook_secret_rotate",
+        "mutation",
+        "An admin (re)generated a SharePoint connection's Graph change-notification webhook secret.",
+    ),
+    "webhook.sharepoint_received": AuditEvent(
+        "webhook.sharepoint_received",
+        "system",
+        "A SharePoint Graph change notification passed clientState verification and enqueued a corpus-extraction run.",
+    ),
+    "webhook.sharepoint_rejected": AuditEvent(
+        "webhook.sharepoint_rejected",
+        "system",
+        "A SharePoint Graph change notification was rejected (clientState did not match the connection's secret).",
     ),
     # -- 2026-08-30 plan, Task 4: sharepoint-acl-sync worker job — per-scope
     # SharePoint permission mirroring (connectors/sharepoint/acl_sync.py).

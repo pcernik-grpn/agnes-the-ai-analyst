@@ -148,6 +148,17 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # (Re)generates the Graph change-notification receiver's shared secret.
+    # Handler writes its own row (log_safe), same as scope_confirm above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/webhook": "sharepoint_connection.webhook_secret_rotate",
+    # -- app.api.sharepoint_webhooks --------------------------------------------
+    # Public, unauthenticated (Graph is the caller) — carries no user
+    # identity, so AuditFallbackMiddleware never fires for it regardless of
+    # this declared action; the entire audit signal is the handler's own
+    # explicit log_safe(user_id=None, ...) calls, exactly like
+    # "POST /webhooks/jira" below. Declared here only to satisfy the
+    # mutating-route posture ratchet.
+    "POST /api/webhooks/sharepoint/{connection_id}": "webhook.sharepoint_received",
     # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
     # trigger. Handler writes nothing itself; the fallback middleware emits
     # this cataloged action on its behalf (src/audit_events.py CATALOG).
@@ -671,6 +682,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sessions/{username}/{session_file}/transcript": "session.transcript_view",
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
+    "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map": "sharepoint_connection.corpus_map_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",

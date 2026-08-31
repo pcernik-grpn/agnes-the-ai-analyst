@@ -1166,7 +1166,11 @@ Admin-only surface behind the "connect → scope → share" file-source wizard o
 `/admin/data-sources`. The SharePoint connection itself is an ordinary
 `source_type=sharepoint` row through `/api/admin/source-connections` (tenant/
 client id, certificate via vault secret or `config.cert_private_key_env`);
-these three routes are the wizard's own steps 2/3.
+these three routes are the wizard's own steps 2/3. `GET …/scopes` and
+`GET …/corpus-map` additionally accept a corpus-extraction producer's own
+scoped callback credential (`ProducerPrincipal`, `app/auth/producer_token.py`)
+when its `connection_id` claim matches the path — a producer token minted
+for a DIFFERENT connection 403s.
 
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
@@ -1175,6 +1179,8 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
+- /api/admin/sharepoint/connections/{connection_id}/webhook
+- /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
@@ -1296,8 +1302,76 @@ is configured (absent/empty = off). A clean, typed no-op (`{"dispatched":
 [], "count": 0, "skipped": true, "reason": ...}`), never an error, when the
 feature isn't usable or no schedule is configured.
 
+`GET …/changes` (2026-08-30) is the observed-changes feed — "what changed
+between two timestamps" for this connection — derived from the append-only
+`corpus_file_events` log that `POST /api/collections/{id}/files`'s
+upsert-on-upload and `DELETE /api/collections/{id}/files/{file_id}` already
+write (never a live Graph query). Params: `since`/`until` (ISO 8601,
+inclusive, both optional), `limit` (default 50, max 500), `cursor` (opaque,
+from a prior page's `next_cursor`; a malformed one is a typed `400
+invalid_cursor`). Each item is `{change, name, path, collection_id,
+file_id, source_stable_id, source_modified, observed_at, ingest_run_id}` —
+`change` is `added`/`updated`/`renamed`/`deleted`; `renamed` is only ever
+produced for uploads anchored by a `source_stable_id` (a bare path match has
+no identity that survives a path change, so a path-only upload can never be
+told apart from a plain re-upload after the fact). `observed_at` is when
+Agnes learned of the change (its own upload/delete handler's write time),
+never SharePoint's own modified-timestamp — a document edited at the source
+but not yet re-crawled does not appear until the next sync uploads it.
+Ordering is `(observed_at, id)` ascending, deterministic even when several
+events share a timestamp. Scoped to every collection any of the
+connection's confirmed scopes maps to; no scopes yet is an empty page, not
+an error. PG-only (`corpus_file_events` has no DuckDB counterpart, A3
+ratchet) — a DuckDB-backed instance answers a typed `501`.
+
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
+
+**Graph change-notification receiver.** `POST …/webhook` (re)generates this
+connection's Microsoft Graph change-notification shared secret and returns
+`{webhook_url, secret}` — the URL and secret an operator feeds to the
+external producer's own `subscriptions.py create --url <webhook_url>` to
+actually create the Graph drive subscription (Agnes never creates, renews,
+or deletes that subscription itself). Always mints a FRESH secret; there is
+no "read the current one" verb, so a caller who needs it again calls this
+again, which also invalidates whatever subscription was signed with the old
+value. Persisted in `config.webhook_secret` — the same trust boundary
+`config.tenant_id`/`client_id` already sit behind, unlike the outbound
+agent-webhook secret this mirrors, which is shown once and never re-served.
+See `/api/webhooks/sharepoint/{connection_id}` below for the receiver
+itself.
+
+### `/api/webhooks/sharepoint/{connection_id}` — Graph change-notification receiver
+
+Public, unauthenticated (Microsoft Graph is the caller) `POST` route that
+lets a SharePoint drive push near-real-time change notifications instead of
+Agnes waiting for `extraction.schedule`'s clock. Feature-gated by
+`extraction_webhook.enabled` (default off) — the whole route 404s when off,
+same posture as `/api/facts*`.
+
+Two request shapes on the same route, matching Graph's own contract:
+
+- **Validation handshake** — a `?validationToken=` query param is present
+  (sent when a subscription is created/renewed). Echoed back verbatim as
+  `200 text/plain` within Graph's 10-second window; no body read, no
+  connection lookup, no side effects.
+- **Notification delivery** — a JSON body `{"value": [{..., "clientState":
+  "..."}]}`. Every notification's `clientState` is checked in constant time
+  (`hmac.compare_digest`) against the connection's own `config.
+  webhook_secret` (minted by `POST /api/admin/sharepoint/connections/
+  {connection_id}/webhook` above). The response is `202` regardless of
+  whether the connection exists, a secret is configured, or any
+  notification verified — never an oracle. On at least one verified
+  notification, enqueues the SAME `corpus-extraction` job kind the manual
+  admin trigger uses, with the same idempotency key (so a burst of
+  notifications for one connection collapses onto a single run) and a
+  ~60s `run_after` debounce; skipped (still `202`) when `extraction.enabled`
+  or its producer isn't configured, so a webhook burst never queues a job
+  doomed to fail. Hard 1 MiB request-body cap, enforced by streaming rather
+  than buffering first (`413` on overflow).
+
+Admin-only wizard/system-to-system bookkeeping with no analyst CLI/MCP
+analogue — Graph is the only caller.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 
@@ -1727,7 +1801,11 @@ repository directly — facts have no local scope, so every result is labeled
 `[server]` on the CLI's stderr, a deliberate deviation from the `--scope
 auto|local|server` convention (spec §12).
 
-**Write surface** (build order step 4) — scheduler token or admin PAT, no
+**Write surface** (build order step 4) — scheduler token, admin PAT, or a
+corpus-extraction producer's own scoped callback credential
+(`ProducerPrincipal`, `app/auth/producer_token.py`; `ingest` additionally
+rejects, itemized (`403` `producer_corpus_out_of_scope`), any document
+whose `corpus_id` is outside that credential's own `collection_ids`), no
 CLI/MCP by design (a producer contract, not an analyst command). `ingest`
 is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `413`; a single document's evidence alone over the claim cap is a `422`

@@ -512,6 +512,7 @@ from app.api.admin_mcp import router as admin_mcp_router
 from app.api.admin_contributed_skills import router as admin_contributed_skills_router
 from app.api.admin_datasource_secrets import router as admin_datasource_secrets_router
 from app.api.admin_sharepoint import router as admin_sharepoint_router
+from app.api.sharepoint_webhooks import router as sharepoint_webhooks_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
 from app.api.admin_sso import router as admin_sso_router
 from app.api.admin_source_connections import router as source_connections_admin_router
@@ -2949,6 +2950,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_sso_router)
     app.include_router(source_connections_admin_router)
     app.include_router(admin_sharepoint_router)
+    app.include_router(sharepoint_webhooks_router)
     app.include_router(source_discovery_admin_router)
     app.include_router(mcp_passthrough_router)
     app.include_router(mcp_user_secrets_router)
@@ -3474,6 +3476,11 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health",
         "/api/health/detailed",
         "/api/version",
+        # Microsoft Graph change-notification receiver — Graph is the only
+        # caller, gated by extraction_webhook.enabled (404 when off), never
+        # a session/PAT (see app/api/sharepoint_webhooks.py). It can never
+        # answer 401/403.
+        "/api/webhooks/sharepoint/{connection_id}",
     }
 )
 

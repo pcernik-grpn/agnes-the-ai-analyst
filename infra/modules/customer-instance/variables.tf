@@ -659,7 +659,13 @@ variable "runtime_secrets" {
 }
 
 variable "runtime_secret_env" {
-  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: anthropic-api-key -> ANTHROPIC_API_KEY, slack-bot-token -> SLACK_BOT_TOKEN."
+  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: anthropic-api-key -> ANTHROPIC_API_KEY, slack-bot-token -> SLACK_BOT_TOKEN. Single-line values ONLY — a multiline value (a PEM certificate, an SA key JSON) breaks the .env format, the auto-upgrade script's bash source of it, and compose env_file parsing; map those through `runtime_secret_env_multiline` instead."
+  type        = map(string)
+  default     = {}
+}
+
+variable "runtime_secret_env_multiline" {
+  description = "Like `runtime_secret_env`, for MULTILINE secret values — e.g. the SharePoint combined cert+key PEM under SHAREPOINT_CERT_PRIVATE_KEY. The startup script base64-encodes the fetched value so it rides /opt/agnes/.env as a single line; the app decodes it on read (connectors/sharepoint/settings resolves either form). Store the secret in Secret Manager as the RAW value (the module does the encoding). Do not map the same secret name here and in `runtime_secret_env` — the module suppresses the duplicate IAM binding, but the two .env lines would fight."
   type        = map(string)
   default     = {}
 }

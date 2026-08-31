@@ -577,6 +577,14 @@ GOOGLE_CLIENT_SECRET=$(gcloud secrets versions access latest --secret="$${OAUTH_
 ${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null || echo "")
 %{ endfor ~}
 
+# Multiline secrets (`runtime_secret_env_multiline`, e.g. a SharePoint
+# cert+key PEM): base64-encoded to a single line so the value survives the
+# .env format, the auto-upgrade script's bash source, and compose env_file
+# parsing. The app decodes on read (connectors/sharepoint/settings).
+%{ for secret_name, env_name in runtime_secret_env_multiline ~}
+${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null | base64 -w0 || echo "")
+%{ endfor ~}
+
 # AGNES_VERSION, RELEASE_CHANNEL, AGNES_COMMIT_SHA are baked into the image
 # itself as ENV (see Dockerfile ARG/ENV + release.yml build-args). We do NOT
 # set them here — doing so would override the image-level values with the
@@ -1300,6 +1308,9 @@ ACME_EMAIL=$ACME_EMAIL
 GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
 %{ for secret_name, env_name in runtime_secret_env ~}
+${env_name}=$${${env_name}}
+%{ endfor ~}
+%{ for secret_name, env_name in runtime_secret_env_multiline ~}
 ${env_name}=$${${env_name}}
 %{ endfor ~}
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD

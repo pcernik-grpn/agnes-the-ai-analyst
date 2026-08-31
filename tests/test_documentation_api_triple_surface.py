@@ -1062,6 +1062,12 @@ _EXEMPT: dict[str, str] = {
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
         "admin-only, no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/changes": (
+        "observed-changes feed (what changed between two timestamps) derived from the "
+        "connection's own corpus_file_events log — admin-only wizard/ops display "
+        "primitive, no analyst CLI/MCP analogue; the eventual document surface is "
+        "`agnes facts …`, already triple-surface in _COHORT above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/certificate": (
         "read-only certificate metadata (thumbprint/subject/issuer/expiry) for the "
         "wizard's source card, derived at request time from the connection's own "
@@ -1080,6 +1086,21 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven sweep firing corpus-extraction for every due SharePoint "
         "connection — admin/scheduler maintenance op, mirrors the "
         "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/webhook": (
+        "admin-only (re)generation of the Graph change-notification receiver's "
+        "shared secret + receiver URL, feeding the operator's own Graph "
+        "subscription create call — admin-only wizard bookkeeping, no analyst "
+        "CLI/MCP analogue"
+    ),
+    "/api/webhooks/sharepoint/{connection_id}": (
+        "Microsoft Graph change-notification receiver (validation handshake + "
+        "notification delivery) for a SharePoint connection — system-to-system, "
+        "verified via a per-connection clientState secret in the handler body, "
+        "never a session/PAT; same webhook carve-out class as /webhooks/jira and "
+        "/api/slack/events (CONTRIBUTING.md's standing 'health checks, webhooks, "
+        "OAuth callbacks, and internal/SSE routes' exemption). No analyst CLI/MCP "
+        "analogue — Graph is the only caller."
     ),
     "/api/admin/sharepoint/connections/{connection_id}/acl-sync": (
         "admin 'sync now' trigger for the sharepoint-acl-sync job (spec §5.1, "

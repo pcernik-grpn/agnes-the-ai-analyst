@@ -6,7 +6,11 @@ Endpoints:
   GET    /api/collections                         auth (RBAC-filtered list)
   GET    /api/collections/{collection_id}         require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}         owner or admin
-  POST   /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
+  POST   /api/collections/{collection_id}/files   require_collection_write_or_producer_access("{collection_id}")
+                                                  — also accepts a ProducerPrincipal scoped to
+                                                  this collection (the corpus-extraction
+                                                  producer's own upload callback,
+                                                  app.auth.producer_token)
   GET    /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}/files/{file_id}
                                                   require_collection_access("{collection_id}")
@@ -58,15 +62,19 @@ from app.auth.access import (
     can_access_collection,
     is_user_admin,
     require_collection_access,
+    require_collection_write_or_producer_access,
 )
 from app.auth.dependencies import get_current_user
+from app.auth.session_principal import ProducerPrincipal
 from app.services.journey import mark_journey
+from src.audit_helpers import log_safe
 from src.corpus_allowlist import classify
 from src.file_storage import delete_corpus_file, store_corpus_file
 from src.ingest.member_identity import is_reserved_member_stable_id
 from src.sql_ident import quote_ident
 from src.repositories import (
     corpus_chunks_repo,
+    corpus_file_events_repo,
     corpus_file_sources_repo,
     corpus_files_repo,
     file_corpora_repo,
@@ -857,6 +865,56 @@ def _ingest_incomplete(row: dict) -> bool:
     return True
 
 
+def _record_corpus_file_event(
+    *,
+    corpus_id: str,
+    file_id: str,
+    change: str,
+    name: str,
+    path: str | None,
+    source_stable_id: str | None = None,
+) -> None:
+    """Best-effort write to the observed-change log behind the SharePoint
+    changes feed (``GET /api/admin/sharepoint/connections/{id}/changes``).
+
+    PG-only (``src/repositories/corpus_file_events_pg.py``) — a DuckDB-backed
+    instance raises ``RequiresPostgresBackend`` on EVERY call here, which
+    this catches and swallows exactly like ``facts_ingest_runs``'s own
+    best-effort report write (``app/api/facts.py::facts_ingest``): this row
+    must never look like the upload/delete it describes failing.
+    """
+    try:
+        corpus_file_events_repo().record(
+            corpus_id=corpus_id,
+            file_id=file_id,
+            change=change,
+            name=name,
+            path=path,
+            source_stable_id=source_stable_id,
+        )
+    except Exception:  # noqa: BLE001 — never let this look like the real failure
+        logger.debug(
+            "corpus_file_events: failed to record %s for file_id=%s (upload/delete itself succeeded)",
+            change,
+            file_id,
+            exc_info=True,
+        )
+
+
+def _resolve_source_stable_id(file_id: str) -> str | None:
+    """Best-effort lookup of a file's crawler-anchor stable id, for the
+    ``deleted`` event — read BEFORE the row (and its cascade-deleted
+    ``corpus_file_sources`` mapping) is purged. Same DuckDB-safety concern as
+    ``_record_corpus_file_event`` above: swallows ``RequiresPostgresBackend``
+    rather than let a lookup that exists purely to enrich an event log block
+    the delete it is describing."""
+    try:
+        row = corpus_file_sources_repo().get(file_id)
+    except Exception:  # noqa: BLE001 — advisory lookup only
+        return None
+    return row.get("source_stable_id") if row else None
+
+
 def _upsert_corpus_file(
     collection_id: str,
     *,
@@ -972,6 +1030,28 @@ def _upsert_corpus_file(
             source_sha256=source_sha256_meta,
         )
 
+    # Observed-change log (SharePoint changes feed) — the classification
+    # below is exactly the decision this function already made above; only
+    # the WRITE is new. No event for a byte-identical retry/resync (existing
+    # row, unchanged content, unchanged filename/path) — nothing changed.
+    if existing is None:
+        change: str | None = "added"
+    elif content_changed:
+        change = "updated"
+    elif existing.get("filename") != filename or existing.get("path") != path:
+        change = "renamed"
+    else:
+        change = None
+    if change is not None:
+        _record_corpus_file_event(
+            corpus_id=collection_id,
+            file_id=file_id,
+            change=change,
+            name=filename,
+            path=path,
+            source_stable_id=stable_id,
+        )
+
     return file_id, needs_processing, claims_purged
 
 
@@ -1069,9 +1149,16 @@ async def upload_files(
     source_doc_ids: Optional[List[str]] = Form(None),
     source_sha256s: Optional[List[str]] = Form(None),
     document_dates: Optional[List[str]] = Form(None),
-    user=Depends(require_collection_access("{collection_id}")),
+    user=Depends(require_collection_write_or_producer_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
+
+    Also the corpus-extraction producer's own upload callback (TCRD-...):
+    a ``ProducerPrincipal`` scoped to THIS collection may call this too
+    (see ``require_collection_write_or_producer_access``) — every OTHER
+    collection route (read/delete/reingest/preview/raw) keeps
+    ``require_collection_access`` unchanged and still 403s that same
+    principal.
 
     Each file passes through the extension allowlist:
 
@@ -1149,6 +1236,19 @@ async def upload_files(
     corpus = file_corpora_repo().get(collection_id)
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
+
+    if isinstance(user, ProducerPrincipal):
+        # A restricted principal's identity is never stashed onto
+        # `request.state.user`, so the generic audit-fallback middleware
+        # sees no attributable caller for this mutating POST and writes
+        # nothing at all — self-audit explicitly instead, distinguishably
+        # (`client_kind="producer"`).
+        log_safe(
+            action="collection.file_add",
+            resource=collection_id,
+            client_kind="producer",
+            params={"file_count": len(files)},
+        )
 
     # Positional pairing is only safe when the lists line up 1:1.
     if paths is not None and len(paths) != len(files):
@@ -1490,7 +1590,17 @@ async def delete_file(
     row = cf_repo.get(file_id)
     if not row or row.get("corpus_id") != collection_id:
         raise HTTPException(status_code=404, detail="file_not_found")
+    # Read BEFORE the purge cascades corpus_file_sources' own mapping row away.
+    source_stable_id = _resolve_source_stable_id(file_id)
     _purge_file_row(collection_id, row)
+    _record_corpus_file_event(
+        corpus_id=collection_id,
+        file_id=file_id,
+        change="deleted",
+        name=row.get("filename"),
+        path=row.get("path"),
+        source_stable_id=source_stable_id,
+    )
     logger.info(
         "corpus_file deleted file_id=%s collection=%s by=%s",
         file_id,

@@ -17,6 +17,15 @@ PG notes:
   §6): maps a producer's stable id to a ``corpus_files`` row so a re-sync or
   a manual path re-upload of the same document preserves that row's id
   instead of cascading its (future) claims away.
+- CorpusFileEvent (PG-only — A3 ratchet, no DuckDB side) is the append-only
+  observed-change log behind the SharePoint "what changed between A and B"
+  feed (``GET /api/admin/sharepoint/connections/{id}/changes``). Written
+  best-effort from ``app/api/collections.py`` at the two points that already
+  know the classification (upsert-on-upload, delete) — never on the read
+  path, and never allowed to fail the upload/delete it describes. A snapshot
+  table like ``corpus_files`` cannot answer "was this an update or a
+  rename" after the fact (both just bump ``updated_at``), which is why this
+  needs its own event row instead of being derived at query time.
 """
 
 from __future__ import annotations
@@ -145,3 +154,30 @@ class CorpusFileSource(Base):
     source_doc_id: Mapped[str | None] = mapped_column(String, nullable=True)
     source_sha256: Mapped[str | None] = mapped_column(String, nullable=True)
     source_url: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class CorpusFileEvent(Base):
+    """Append-only observed-change log (PG-only, A3 ratchet — see module
+    docstring). One row per add/update/rename/delete transition a
+    ``corpus_files`` upsert or delete ALREADY classifies as a side effect of
+    its own existing logic — this table only persists that classification,
+    it never invents new business logic. No foreign key to ``corpus_files``:
+    a ``deleted`` row must outlive the row it describes.
+    """
+
+    __tablename__ = "corpus_file_events"
+    __table_args__ = (sa.Index("idx_corpus_file_events_corpus_observed", "corpus_id", "observed_at", "id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    corpus_id: Mapped[str] = mapped_column(String, nullable=False)
+    file_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_stable_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # added | updated | renamed | deleted
+    change: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    path: Mapped[str | None] = mapped_column(String, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=_text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )

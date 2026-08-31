@@ -650,6 +650,10 @@ const SECTION_META = {
     title: "Fact graph",
     help: "Typed facts and edges extracted from Collections documents, each claim carrying its evidencing document and a verbatim quote. Postgres-only; visibility derives from collection grants. visibility_mode: any_evidence (default) shows a subject when any readable claim evidences it, all_evidence requires every claim to be readable.",
   },
+  extraction_webhook: {
+    title: "Extraction webhook",
+    help: "Microsoft Graph change-notification receiver for SharePoint connections (POST /api/webhooks/sharepoint/{connection_id}) — lets a subscribed Graph drive push near-real-time notifications instead of waiting for extraction.schedule's clock. OFF by default: the whole route 404s when off. Gates the RECEIVER only — a notification it accepts still needs extraction.enabled, a configured producer, and a worker on the extraction lane for the run to succeed. Agnes never creates, renews or deletes the Graph subscription itself.",
+  },
   acl_mirroring: {
     title: "ACL mirroring",
     help: "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope access_mode='mirrored', and the admin sync-now endpoint. OFF by default — turning it on changes nothing until a scope opts into mirroring.",
@@ -1248,7 +1252,7 @@ function renderSection(section, payload, knownForSection) {
 
 const SECTION_GROUPS = [
   { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
-  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "facts", "acl_mirroring", "acl_sync", "extraction", "mcp", "studio"] },
+  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "facts", "acl_mirroring", "acl_sync", "extraction", "extraction_webhook", "mcp", "studio"] },
   // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
   // exclusive (buildSidenav()/renderAll() read them independently). "Chat
   // access" is a real registry section (SECTION_META above) that belongs in
