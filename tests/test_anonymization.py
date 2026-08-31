@@ -301,6 +301,25 @@ def test_the_key_never_appears_in_the_error_message():
 
 
 # ---------------------------------------------------------------------------
+# the detector boundary
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_detector_propagates_rather_than_degrading():
+    # A detector that cannot run must NOT be swallowed into a regex-only or
+    # entity-free pass: that would hand back a document reporting a redaction
+    # nobody performed. The pipeline has no exception handling, by design.
+    class DetectionUnavailable(RuntimeError):
+        pass
+
+    def broken(_text: str) -> list[Entity]:
+        raise DetectionUnavailable("model unreachable")
+
+    with pytest.raises(DetectionUnavailable):
+        anonymize_markdown("Jan Novák podepsal.", key=KEY, detector=broken)
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
