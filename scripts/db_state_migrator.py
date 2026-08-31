@@ -1316,6 +1316,21 @@ def main(
             with MigrationLock():
                 _flip_and_verify()
 
+        # A completed DuckDB-source migration turns the source file into a
+        # frozen snapshot — record that next to it so the docker-compose
+        # data-migrate one-shot (which re-runs the ON CONFLICT DO NOTHING
+        # copy on every `compose up`) skips it instead of resurrecting rows
+        # deleted from Postgres after the cutover. Best-effort by contract:
+        # the helper never raises, and a missing marker only costs the skip.
+        if source_backend == "duckdb":
+            from scripts.migrate_duckdb_to_pg.marker import write_completion_marker
+
+            write_completion_marker(
+                duckdb_path,
+                tables_migrated=int(copy_summary.get("tables_migrated", 0)),
+                source="db_state_migrator",
+            )
+
         # The read-back that guards this lives in `_flip_and_verify` above,
         # inside the migration lock. The applier leans on the ordering: when
         # it sees status=success it treats instance.yaml as already naming

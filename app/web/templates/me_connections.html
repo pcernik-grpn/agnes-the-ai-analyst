@@ -21,8 +21,6 @@
 /* ── Head band — the same anatomy as /me/activity's ── */
 .connx-head { margin: 2px 0 0; }
 .connx-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
-.connx-head h1 { font-size: 24px; margin: 2px 0 0; }
-.connx-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 6px 0 0; max-width: 64ch; }
 
 .connx-list { max-width: 760px; }
 .connx-card {
@@ -78,8 +76,8 @@
 {% block page_head %}
 <div class="connx-head">
   <div class="connx-kicker">Your account</div>
-  <h1>My connections</h1>
-  <p class="lede">Connect your own accounts so {{ instance_brand_short }} queries data as you. You see only what you are allowed to see.</p>
+  <h1 class="page-title">My connections</h1>
+  <p class="page-lede">Connect your own accounts so {{ instance_brand_short }} queries data as you. You see only what you are allowed to see.</p>
 </div>
 {% endblock %}
 

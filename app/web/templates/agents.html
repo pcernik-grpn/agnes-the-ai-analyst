@@ -48,8 +48,7 @@
      accent; actions stay on --ds-primary; entity-kind tags keep the
      categorical --ds-kind-* palette. */
   .ag-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin: 8px 0 0; padding-bottom: 24px; }
-  .ag-head h1 { font-size: 24px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
-  .ag-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 0; max-width: 64ch; }
+  .ag-head h1 { display: flex; align-items: center; gap: 10px; }
 
   /* ── List view ── */
   /* The list is two bands — ready first, drafts under — because a card's
@@ -123,8 +122,8 @@
 {% block page_head %}
 <div class="ag-head" id="ag-page-head">
   <div>
-    <h1>Agents</h1>
-    <p class="lede">An agent is a narrower version of the chat in your sidebar: one role, only the data you give it, only the tools you enable — and never more than you can reach yourself. Describe what you need and the builder configures it, grounded in anything you can access. Try it in Preview before you mark it ready.</p>
+    <h1 class="page-title">Agents</h1>
+    <p class="page-lede">An agent is a narrower version of the chat in your sidebar: one role, only the data you give it, only the tools you enable — and never more than you can reach yourself. Describe what you need and the builder configures it, grounded in anything you can access. Try it in Preview before you mark it ready.</p>
   </div>
 </div>
 {# The "not wired to the surfaces yet" caveat is gone: agents run from here now

@@ -22,8 +22,6 @@
    for most belong with the rest of them, not in a second place). */
 .ch-head { margin: 8px 0 0; }
 .ch-head__titles { min-width: 0; }
-.ch-head h1 { font-size: 24px; margin: 0 0 8px; }
-.ch-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 0; max-width: 68ch; }
 
 /* The call to action at the end of the controls row — the house primary button
    (`.cc-btn--primary`, catalog_card.css) with nothing added but the icon gap.

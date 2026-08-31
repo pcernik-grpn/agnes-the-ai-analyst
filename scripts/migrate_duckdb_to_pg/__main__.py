@@ -54,6 +54,17 @@ def main() -> int:
             "source. Incompatible with --reset-target."
         ),
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Run the copy even though a completion marker records a "
+            "finished migration. After completion the DuckDB snapshot is "
+            "no longer a source of truth — re-copying it re-inserts rows "
+            "deleted from Postgres since. Only force when you know the "
+            "marker is wrong (e.g. the target database was replaced)."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="DEBUG-level logging")
     args = parser.parse_args()
 
@@ -92,12 +103,49 @@ def main() -> int:
         print(f"DuckDB file not found: {duckdb_path}", file=sys.stderr)
         return 2
 
+    from scripts.migrate_duckdb_to_pg.marker import (
+        marker_path,
+        read_completion_marker,
+        target_has_app_state,
+        write_completion_marker,
+    )
+
     import src.db_pg as db_pg
     from src.duckdb_conn import _open_duckdb
     from scripts.migrate_duckdb_to_pg import run_all
 
-    duck_conn = _open_duckdb(str(duckdb_path), read_only=True)
     pg_engine = db_pg.get_engine()
+
+    # Completion gate: once a run has migrated EVERYTHING successfully, the
+    # source file is a frozen snapshot and Postgres is the source of truth.
+    # Re-running the ON CONFLICT DO NOTHING copy from that snapshot would
+    # re-insert any row deleted from Postgres since the migration (original
+    # values, no audit trail) — the compose data-migrate one-shot re-runs on
+    # every `compose up`, so without this gate every post-cutover delete of
+    # a pre-cutover row silently reverts on the next container recreate.
+    # The target-side probe keeps the marker honest against a replaced or
+    # restored database (see target_has_app_state). --force overrides;
+    # --reset-target already asserts a deliberate re-cutover; --dry-run
+    # writes nothing and stays available as a diagnostic.
+    if not (args.force or args.reset_target or args.dry_run):
+        marker = read_completion_marker(duckdb_path)
+        if marker is not None:
+            if target_has_app_state(pg_engine):
+                print(
+                    f"migration already completed at {marker.get('completed_at')} "
+                    f"({marker_path(duckdb_path)}) — skipping copy. The DuckDB "
+                    "snapshot is no longer a source of truth; re-copying it would "
+                    "resurrect rows deleted from Postgres since the migration. "
+                    "Pass --force to copy anyway."
+                )
+                return 0
+            print(
+                "completion marker present but the target holds no app state — "
+                "assuming the target database was replaced or restored; "
+                "running the copy despite the marker."
+            )
+
+    duck_conn = _open_duckdb(str(duckdb_path), read_only=True)
 
     reports = run_all(
         duck_conn,
@@ -113,7 +161,18 @@ def main() -> int:
     # checksum_match key; the default-True on .get() previously masked
     # them. Treat the explicit error key as the authoritative failure
     # signal. Both predicates must hold for exit 0.
-    return 0 if all("error" not in r and r.get("checksum_match", True) for r in reports) else 1
+    ok = all("error" not in r and r.get("checksum_match", True) for r in reports)
+    # Record completion only for a run that could have completed the whole
+    # migration: every task selected (no --only), rows actually written
+    # (no --dry-run), and nothing failed or was halt-skipped. A partial or
+    # diagnostic run must not claim the snapshot is fully mirrored.
+    if ok and not args.dry_run and not args.only and not any(r.get("skipped") for r in reports):
+        write_completion_marker(
+            duckdb_path,
+            tables_migrated=len(reports),
+            source="migrate_duckdb_to_pg",
+        )
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
