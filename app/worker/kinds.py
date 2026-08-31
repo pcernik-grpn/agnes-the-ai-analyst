@@ -1468,25 +1468,31 @@ def _resolve_anonymization_key() -> str:
 
 def _confirmed_scope_collection_ids(connection: dict) -> list[str]:
     """Sorted, de-duplicated collection ids from THIS connection's own
-    confirmed scope rows (``config.scopes[].collection_id``) — the exact
-    same source ``GET .../corpus-map``
-    (``app/api/admin_sharepoint.py::corpus_map``) reads, so the
-    producer-scoped callback token built by
-    :func:`_agnes_producer_callback_env` is scoped to precisely the
-    collections that endpoint's own mapping names — never a wider set.
+    confirmed scope rows (``config.scopes[].collection_id``) PLUS its active
+    permission zones (``config.acl_zones[].collection_id``) — the exact
+    same set ``producer_corpus_map(scope_rows, active_zone_rows(...))``
+    advertises as routing targets, so the producer-scoped callback token
+    built by :func:`_agnes_producer_callback_env` authorizes precisely the
+    collections the corpus map names — never a wider set, and never
+    narrower: a zone key in the map with no matching token scope would 403
+    every zone delivery (`producer_corpus_out_of_scope`) and the zone
+    collection would stay silently empty.
 
-    Reads the connection row's own ``config.scopes`` directly rather than
+    Reads the connection row's own ``config`` directly rather than
     importing the admin router, same reasoning as
     :func:`_anonymize_marked_scope_map` above.
     """
+    from connectors.sharepoint.acl_sync import active_zone_rows
+
     scopes = (connection.get("config") or {}).get("scopes")
     if not isinstance(scopes, list):
-        return []
+        scopes = []
     ids = {
         str(scope["collection_id"])
         for scope in scopes
         if isinstance(scope, dict) and scope.get("source_scope_id") and scope.get("collection_id")
     }
+    ids |= {str(zone["collection_id"]) for zone in active_zone_rows(connection) if zone.get("collection_id")}
     return sorted(ids)
 
 

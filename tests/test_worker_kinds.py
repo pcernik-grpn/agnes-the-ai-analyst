@@ -1380,6 +1380,52 @@ class TestCorpusExtractionHandler:
         payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
         assert payload["collection_ids"] == ["col_anon_1", "col_plain_1"]
 
+    def test_agnes_api_token_collection_ids_include_active_zone_collections(self, monkeypatch):
+        """An ACTIVE permission zone's collection joins the `collection_ids`
+        claim (a dissolved one does not) — the corpus map advertises the zone
+        collection as a routing target, so a token without it would 403 every
+        zone delivery (`producer_corpus_out_of_scope`) and the zone would stay
+        silently empty."""
+        from app.auth.jwt import verify_token
+
+        zoned_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-default-1",
+                    "display_path": "Default site",
+                    "anonymize": False,
+                    "collection_id": "col_default",
+                }
+            ],
+            "acl_zones": [
+                {
+                    "zone_item_id": "zone-item-1",
+                    "parent_scope_id": "scope-default-1",
+                    "display_path": "Default site/Documents/Legal",
+                    "rel_path": "Legal",
+                    "collection_id": "col_zone_active",
+                    "status": "active",
+                },
+                {
+                    "zone_item_id": "zone-item-2",
+                    "parent_scope_id": "scope-default-1",
+                    "display_path": "Default site/Documents/Old",
+                    "rel_path": "Old",
+                    "collection_id": "col_zone_gone",
+                    "status": "dissolved",
+                },
+            ],
+        }
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=zoned_config)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default", "col_zone_active"]
+
     def test_no_scopes_and_no_corpus_id_is_refused_before_any_token_is_minted(self, monkeypatch):
         """The scenario this test used to describe — no confirmed scopes, no
         payload `corpus_id`, token minted with `collection_ids: []` — is not a
