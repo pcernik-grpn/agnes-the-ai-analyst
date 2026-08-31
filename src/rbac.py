@@ -40,7 +40,27 @@ def table_not_in_stack_message(table_id: str) -> str:
     funnel through ``can_access_table`` and return this same string so
     the analyst's mental model stays consistent: "the table I asked
     about isn't in my stack — admin needs to add it to a Data Package".
+
+    Internal tables (``agnes_sessions`` & co.) get their own wording: they
+    are stack-gated like any other table since the ``agnes-usage`` package
+    (see ``connectors/internal/registry.py``), but they are never
+    distributed to the laptop — `agnes pull` skips them — so the generic
+    "then run `agnes pull` to refresh" tail would name a next step that
+    cannot work. Same convention as ``cli/query_hints.py``: a denial says
+    what to do next, and only things that actually help.
     """
+    from connectors.internal.access import is_internal_table
+
+    if is_internal_table(table_id):
+        from connectors.internal.registry import USAGE_PACKAGE_SLUG
+
+        return (
+            f"Table '{table_id}' is not in your stack. It carries your own "
+            f"Agnes usage data — ask an admin to grant you the "
+            f"'{USAGE_PACKAGE_SLUG}' Data Package that carries this table. "
+            f"It is queryable server-side only (`agnes query`), never synced "
+            f"to your laptop."
+        )
     return (
         f"Table '{table_id}' is not in your stack. Ask an admin to add it "
         f"to a Data Package you have access to (Required or in your stack), "
@@ -72,11 +92,8 @@ def can_access_table(
     """True iff the user can read ``table_id``.
 
     Three sources of access (in precedence order):
-      1. Internal data-source tables (``agnes_sessions`` / ``agnes_telemetry``
-         / ``agnes_audit``) — implicitly accessible to every authenticated
-         user. RBAC there is row-level (the per-request view filters to the
-         caller's rows). Admin gets the unscoped view; non-admin gets their
-         own rows.
+      1. Principal callers (co-session / agent-session) — see the branch
+         below, including the deliberate internal-table carve-out.
       2. Admin god-mode — members of the Admin system group see every
          registered table (dict users only; a Principal is never admin).
          v106: gated on the credential's data-read surface — a PAT minted
@@ -93,15 +110,33 @@ def can_access_table(
          granting the package; ad-hoc per-table grants in
          ``resource_grants`` are a no-op for analysts (still consulted
          for backwards-compat fallback inside admin-only flows).
+
+    Internal data-source tables (``agnes_sessions`` / ``agnes_telemetry`` /
+    ``agnes_audit``) used to short-circuit to ``True`` here for EVERY
+    caller. They no longer do for dict users: they are members of the
+    seeded ``agnes-usage`` data package and resolve through the stack check
+    like any other table, so an admin can decide who may query usage data
+    at all (design ``docs/superpowers/specs/2026-08-31-usage-package-and-
+    per-turn-tokens-design.md`` §2, **BREAKING**). The row-level filter is
+    unchanged and independent: package membership decides visibility of the
+    TABLE, never row scope.
     """
-    from connectors.internal.access import is_internal_table
-
-    if is_internal_table(table_id):
-        return True
-
     from app.auth.session_principal import PRINCIPAL_TYPES
 
     if isinstance(user, PRINCIPAL_TYPES):
+        from connectors.internal.access import is_internal_table
+
+        # Deliberate carve-out (spec §2): a restricted principal has no
+        # personal stack, so "is the package in the caller's stack" has no
+        # answer for it. Internal tables stay reachable — the principal's
+        # authority is already bounded by owner grants ∩ scope, the row
+        # filter yields only rows it is entitled to, and removing them
+        # would break delegation for no governance gain. Pinned by
+        # tests/test_agent_scope_seams.py, tests/test_copresence_datapath.py
+        # and tests/test_query_internal_session_principal.py.
+        if is_internal_table(table_id):
+            return True
+
         from app.auth.access import can_access_session
         from app.resource_types import ResourceType
 
@@ -221,8 +256,7 @@ def get_accessible_tables(
 ) -> Optional[list[str]]:
     """List of table IDs the user can read. ``None`` means "all" (admin).
 
-    Stack-gated for analysts: the set is the union of
-      * internal tables (row-level RBAC at query time), and
+    Stack-gated for analysts: the set is
       * tables belonging to data packages in the user's stack
         (``StackResolver.stack``, whose formula forks on
         ``features.stack_auto_membership`` — classic default: required ∪
@@ -234,10 +268,18 @@ def get_accessible_tables(
     Per-table ``resource_grants(group, 'table', …)`` rows are NO LONGER
     consulted for analyst visibility — see :func:`can_access_table`.
 
+    Internal tables (``agnes_sessions`` & co.) are no longer appended
+    unconditionally for dict users: they are members of the seeded
+    ``agnes-usage`` package and therefore arrive through the same package
+    membership as any other table (spec §2, **BREAKING**).
+
     For a ``Principal`` (co-session or agent-session), returns the
-    intersection table-ids plus internal tables. NEVER ``None`` — ``None`` is
-    the admin "all" sentinel, and a restricted principal must always get a
-    concrete list, even when its intersection is empty.
+    intersection table-ids plus internal tables — the carve-out documented
+    in :func:`can_access_table`, which this branch must keep mirroring or a
+    principal would be told a table is unreadable that ``can_access_table``
+    still waves through. NEVER ``None`` — ``None`` is the admin "all"
+    sentinel, and a restricted principal must always get a concrete list,
+    even when its intersection is empty.
     """
     from app.auth.session_principal import PRINCIPAL_TYPES
 
@@ -303,12 +345,10 @@ def get_accessible_tables(
                     rid = r.get("id")
                     if rid and rid not in result:
                         result.append(rid)
-        # Internal tables — always accessible (row-level RBAC at query time).
-        from connectors.internal.access import INTERNAL_TABLES
-
-        for t in INTERNAL_TABLES:
-            if t.registry_id not in result:
-                result.append(t.registry_id)
+        # NO internal-table append here on purpose: since the seeded
+        # `agnes-usage` package they are ordinary package members, so
+        # `list_member_table_ids` above already returns them to a caller who
+        # holds the grant — and must NOT return them to one who does not.
         return result
     finally:
         if should_close:

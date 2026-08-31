@@ -141,9 +141,10 @@ def query_table(
     limit = min(body.limit, MAX_LIMIT)
     truncated = body.limit > MAX_LIMIT
 
-    # Registry lookup + RBAC. Internal tables (agnes_sessions / _usage / _audit)
-    # are implicitly granted to every authenticated user via can_access's
-    # internal-table short-circuit.
+    # Registry lookup + RBAC. Internal tables (agnes_sessions /
+    # agnes_telemetry / agnes_audit) hold no special status here any more:
+    # they are members of the seeded `agnes-usage` data package and gate
+    # through `can_access_table` like every other table.
     tables_repo = table_registry_repo()
     table = tables_repo.get(table_id)
     if table is None:

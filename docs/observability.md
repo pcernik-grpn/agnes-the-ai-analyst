@@ -63,6 +63,35 @@ nothing until an admin opts in. See `src/audit_retention.py` for the
 dispatcher and `config/instance.yaml.example` for the full `retention:`
 block.
 
+### Self-service usage data — the `agnes-usage` package
+
+Three of those trails are also queryable as ordinary tables, so a user can
+analyze their own usage with `agnes query` instead of an admin page:
+
+| Table | Source | Row scope |
+|---|---|---|
+| `agnes_sessions` | `usage_session_summary` | own rows (non-admin) / all (admin) |
+| `agnes_telemetry` | `usage_events` | own rows (non-admin) / all (admin) |
+| `agnes_audit` | `audit_log` | own rows (non-admin) / all (admin) |
+
+They are server-side only — `agnes pull` never downloads them — and they are
+**members of a seeded data package with the slug `agnes-usage`**, so who may
+query usage data at all is an admin decision like any other table grant.
+Grant the package to a group (`/admin/access`, or `agnes admin grant create
+<group> data_package <pkg-id>`) and its members can read the tables, still
+filtered to their own rows; without the grant the tables are absent from
+`agnes catalog` and a `SELECT` against them returns 403 naming the package.
+Admins are unaffected (god-mode) and keep the unscoped view. Agents and
+co-sessions also keep access without the grant — their authority is already
+owner grants ∩ scope. Full model:
+[`RBAC.md`](RBAC.md#internal-usage-tables-the-agnes-usage-package).
+
+**Operator step after upgrading** to the release that introduced this
+(previously every authenticated user had implicit access): grant
+`agnes-usage` to the groups that should keep it — granting it to `Everyone`
+restores the previous behaviour exactly, since the per-row filter was and
+remains what separates one user's rows from another's.
+
 ## Chat cost — measured, not modelled
 
 ```bash

@@ -161,11 +161,15 @@ class TestGetAccessibleTables:
         try:
             tables = get_accessible_tables({"id": "user1"}, conn)
             internal_ids = {t.registry_id for t in INTERNAL_TABLES}
-            # Granted tables + auto-appended internal tables (every
-            # authenticated user gets the agnes_* row-scoped views).
+            # Package-derived tables ONLY. The agnes_* internal tables used
+            # to be appended unconditionally here; since the seeded
+            # `agnes-usage` package they arrive through package membership
+            # like any other table, so a caller without that grant does not
+            # see them (docs/superpowers/plans/2026-08-31-usage-package-
+            # per-turn-tokens.md Task 8, **BREAKING**).
             assert "orders" in tables
-            assert internal_ids <= set(tables)
-            assert set(tables) - internal_ids == {"orders"}
+            assert not (internal_ids & set(tables))
+            assert set(tables) == {"orders"}
         finally:
             conn.close()
 
@@ -179,9 +183,11 @@ class TestGetAccessibleTables:
         conn = get_system_db()
         try:
             UserRepository(conn).create(id="loner", email="loner@test.com", name="L")
-            # Membership in Everyone alone (no grants on it). The user still
-            # gets the agnes_* internal tables (row-level RBAC handles the
-            # actual security), but no granted tables.
+            # Membership in Everyone alone (no grants on it) → nothing at
+            # all, not even the agnes_* internal tables: those are members
+            # of the seeded `agnes-usage` package now and need its grant
+            # like any other table (Task 8 of the usage-package plan,
+            # **BREAKING**).
             everyone = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_EVERYONE_GROUP]).fetchone()
             if everyone:
                 UserGroupMembersRepository(conn).add_member(
@@ -190,7 +196,9 @@ class TestGetAccessibleTables:
                     source="system_seed",
                 )
             internal_ids = {t.registry_id for t in INTERNAL_TABLES}
-            assert set(get_accessible_tables({"id": "loner"}, conn)) == internal_ids
+            accessible = set(get_accessible_tables({"id": "loner"}, conn))
+            assert accessible == set()
+            assert not (accessible & internal_ids)
         finally:
             conn.close()
 
