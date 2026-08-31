@@ -15,6 +15,7 @@ no Stop control while the crawl has no cancel flag.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -498,6 +499,49 @@ class TestRunsDrawer:
     def test_no_runs_is_an_empty_state_not_a_blank_drawer(self):
         out = _run_js("console.log(JSON.stringify({html: _extRunsHtml({runs: [], total: 0})}));")
         assert "No extraction runs recorded yet" in out["html"]
+
+
+class TestStopReasonVocabularyAgrees:
+    """The stop-reason contract has ONE producer (the crawl's `_stop_reason`)
+    and, on this side, TWO consumers: `RESUMABLE_STOP_REASONS` in Python
+    decides whether Agnes promises "your work is safe", and
+    `EXT_STOP_REASON_TEXT` in the template decides how the reason reads.
+    Two tables written against one upstream vocabulary is exactly the shape
+    that drifts silently — a reason added to one and forgotten in the other
+    fails nothing at runtime. This pins them to each other.
+    """
+
+    @staticmethod
+    def _js_reason_keys() -> set:
+        block = _extract_block(TEMPLATE.read_text(encoding="utf-8"), "const EXT_STOP_REASON_TEXT = {")
+        return set(re.findall(r"^\s*([a-z_]+):", block, re.M))
+
+    def test_every_resumable_reason_has_a_human_phrase(self):
+        """A resumable stop is the one an operator most needs to understand
+        — it is the row that says "do not re-run this". Rendering it as a
+        bare slug would undercut the reassurance sitting right beneath it."""
+        from app.api.admin_extraction import RESUMABLE_STOP_REASONS
+
+        missing = set(RESUMABLE_STOP_REASONS) - self._js_reason_keys()
+        assert not missing, f"resumable stop reasons with no rendered phrase: {sorted(missing)}"
+
+    def test_the_unresumable_reason_is_phrased_but_never_vouched_for(self):
+        """`error` must read legibly AND must not be claimed resumable —
+        the two tables disagreeing on this one is the costly direction."""
+        from app.api.admin_extraction import RESUMABLE_STOP_REASONS
+
+        assert "error" in self._js_reason_keys()
+        assert "error" not in RESUMABLE_STOP_REASONS
+
+    def test_no_phrase_exists_for_a_reason_python_has_never_heard_of(self):
+        """A phrase without a matching upstream value is dead copy that will
+        one day be attached to the wrong thing."""
+        from app.api.admin_extraction import RESUMABLE_STOP_REASONS
+
+        known = set(RESUMABLE_STOP_REASONS) | {"error"}
+        assert self._js_reason_keys() <= known, (
+            f"rendered phrases for reasons nothing produces: {sorted(self._js_reason_keys() - known)}"
+        )
 
 
 class TestConfigDrawer:
