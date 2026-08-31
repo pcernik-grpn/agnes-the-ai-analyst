@@ -159,6 +159,45 @@ _COHORT: dict[str, tuple[str, str]] = {
     # surface with outcome branching (admin → applied, non-admin → queued
     # for moderation).
     "/api/semantic-models/apply": ("semantic-model apply", "apply_semantic_model"),
+    # Where documents are synced FROM (#1707). These three families were
+    # _EXEMPT with the reason "no MCP analogue by design"; the owner reversed
+    # that — neither standing exemption covers them, and an admin PAT is what
+    # gates the tools exactly as it gates the endpoints.
+    #
+    # The old exemption's SECOND argument was not hand-waving and is not
+    # dropped here: "a tool that can point this server at an arbitrary git
+    # remote and trigger a fetch is a credential/config surface, not a read
+    # tool". That was true, and it was true of REST and the CLI too — the
+    # same two calls exfiltrated a server env var through git's credential
+    # helper long before an MCP tool existed. It is answered at the
+    # transport, where every caller passes: `src.semantic.transports.
+    # validate_git_config` gates the URL scheme, the credential env var
+    # (`is_semantic_git_token_env_allowed`) and the repository host
+    # (`is_semantic_git_host_allowed`) before any egress, and the write
+    # endpoints repeat it so an admin is refused at POST. See
+    # tests/test_semantic_git_source_egress.py.
+    #
+    # One cohort row per PATH, so the MCP column names one tool per path and
+    # the siblings (`semantic_source_add` on the POST,
+    # `semantic_model_reattach`) are asserted in FOUNDATION_TOOL_NAMES by
+    # tests/test_mcp_tool_parity.py — the same shape as the
+    # /api/admin/semantic-layer/mutes rows above.
+    "/api/admin/semantic-sources": ("admin semantic source list", "semantic_source_list"),
+    "/api/admin/semantic-sources/{source_id}": ("admin semantic source rm", "semantic_source_remove"),
+    "/api/admin/semantic-sources/{source_id}/sync": ("admin semantic source sync", "semantic_source_sync"),
+    # Taking a source-owned model off the sync path so it can be edited, and
+    # handing it back.
+    "/api/admin/semantic-models/{model_id}/detach": ("admin semantic detach", "semantic_model_detach"),
+    "/api/admin/semantic-models/{model_id}/reattach": ("admin semantic reattach", "semantic_model_reattach"),
+    # Which Data Package carries a model to non-admin readers.
+    "/api/admin/semantic-models/{slug}/packages": (
+        "admin semantic link-package",
+        "semantic_model_link_package",
+    ),
+    "/api/admin/semantic-models/{slug}/packages/{package_id}": (
+        "admin semantic unlink-package",
+        "semantic_model_unlink_package",
+    ),
     # Contributed-skill triple-surface (GET list + DELETE; POST contribute is _EXEMPT below).
     "/api/admin/contributed-skills": ("admin skill list", "list_contributed_skills"),
     "/api/admin/contributed-skills/{name}": ("admin skill delete", "delete_contributed_skill"),
@@ -447,28 +486,11 @@ _SEMANTIC_MODELS_ADMIN_REASON = (
     "semantic list/show/import/delete`; no MCP analogue by design — an "
     "agent's read path is `semantic_model_search`/`semantic_model_get` "
     "(paired with the public, resource-gated export endpoint in _COHORT "
-    "above), not the admin corpus-management surface, mirroring the "
-    "/api/admin/data-packages and /api/admin/metrics admin-CRUD precedent."
-)
-_SEMANTIC_MODEL_PACKAGE_LINK_REASON = (
-    "admin junction management between a semantic model and a Data Package "
-    "(open semantic-layer contract) — linking/unlinking is the "
-    "administrative visibility control the module docstring describes ('a "
-    "model with no linked package is reachable by admins only'), same tier "
-    "as the rest of the admin CRUD above. Reachable via `agnes admin "
-    "semantic link-package/unlink-package`; no MCP analogue by "
-    "design, mirroring _SEMANTIC_MODELS_ADMIN_REASON above."
-)
-_SEMANTIC_SOURCES_ADMIN_REASON = (
-    "admin CRUD + manual sync-trigger over registered semantic-layer sync "
-    "sources (git/upload/connection), open semantic-layer contract Task 10 "
-    "— configuring where documents come from, and triggering a fetch, are "
-    "admin actions. Reachable via `agnes admin semantic source add/list/"
-    "sync/rm`; no MCP analogue by design, mirroring the "
-    "_SOURCE_CONNECTIONS_CRUD_REASON precedent above (an agent-invokable "
-    "tool that can point this server at an arbitrary git remote or upload "
-    "payload and trigger a fetch is a credential/config surface, not a "
-    "read tool)."
+    "above) and its write path is `apply_semantic_model`, not the admin "
+    "corpus-management surface, mirroring the /api/admin/data-packages and "
+    "/api/admin/metrics admin-CRUD precedent. Scoped to THESE two paths "
+    "since #1707: detach/reattach, the package links and semantic-sources "
+    "are now triple-surface in _COHORT."
 )
 _BROKER_REASON = (
     "chat sandbox secret broker (2026-07-14 incident hardening) — internal "
@@ -1169,22 +1191,16 @@ _EXEMPT: dict[str, str] = {
         "builder preview, no analyst CLI/MCP analogue"
     ),
     # Open semantic-layer contract (Task 10) — admin CRUD over the
-    # semantic-model registry and its sync sources. The public,
-    # resource-gated export endpoint carries the triple-surface contract in
-    # _COHORT above.
+    # semantic-model registry itself. The public, resource-gated export
+    # endpoint carries the triple-surface contract in _COHORT above, as do
+    # this registry's sync sources since #1707.
     "/api/admin/semantic-models": _SEMANTIC_MODELS_ADMIN_REASON,
     "/api/admin/semantic-models/{model_id}": _SEMANTIC_MODELS_ADMIN_REASON,
-    # F3 detach/re-attach — the same admin registry-management surface, one
-    # step further: taking a source-owned model out of (and back into) the
-    # sync path. Reachable via `agnes admin semantic detach/reattach`;
-    # no MCP analogue for the same reason the rest of this row has none.
-    "/api/admin/semantic-models/{model_id}/detach": _SEMANTIC_MODELS_ADMIN_REASON,
-    "/api/admin/semantic-models/{model_id}/reattach": _SEMANTIC_MODELS_ADMIN_REASON,
-    "/api/admin/semantic-models/{slug}/packages": _SEMANTIC_MODEL_PACKAGE_LINK_REASON,
-    "/api/admin/semantic-models/{slug}/packages/{package_id}": _SEMANTIC_MODEL_PACKAGE_LINK_REASON,
-    "/api/admin/semantic-sources": _SEMANTIC_SOURCES_ADMIN_REASON,
-    "/api/admin/semantic-sources/{source_id}": _SEMANTIC_SOURCES_ADMIN_REASON,
-    "/api/admin/semantic-sources/{source_id}/sync": _SEMANTIC_SOURCES_ADMIN_REASON,
+    # F3 detach/re-attach, the package link pair and semantic-sources CRUD
+    # were exempt here with the reason "no MCP analogue by design". That was
+    # reversed in #1707: none of the three fits either standing exemption
+    # (credential-provisioning writes, security-posture diagnostics), so they
+    # are in _COHORT above with the tools that now mirror them.
     "/api/semantic-models/bundle": (
         "Fáze 1 physical-distribution cache — RBAC-scoped semantic-model "
         "bundle consumed by `agnes pull` (renders the read-only local cache "

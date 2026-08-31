@@ -19,6 +19,7 @@ instead of failing it on every run forever.
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
@@ -49,18 +50,81 @@ class PreflightableAdapter(Protocol):
         row."""
 
 
+class AdapterUnavailable(UnknownAdapter):
+    """The adapter is registered, but its module could not be imported.
+
+    A subclass of :class:`UnknownAdapter` on purpose — every caller already
+    handles "this name will not run" — but with a message that says which of
+    the two happened, because "you typed a name nobody registered" and "the
+    connector this adapter reads is not installed on this instance" need
+    different fixes.
+    """
+
+
+#: Adapters registered at runtime — the built-ins, once imported, plus
+#: anything a test or a plugin injects through :func:`register_adapter`. An
+#: entry here always wins over the built-in table below.
 _REGISTRY: Dict[str, SemanticAdapter] = {}
+
+#: The built-in adapters as DATA — ``name -> (module, class)`` — imported the
+#: first time one is actually asked for.
+#:
+#: Deliberately not four module-level imports. This module is the answer to
+#: "which adapters exist", a question the CLI asks to build one line of
+#: ``--help``; importing it used to drag in the whole connector chain, and
+#: with it ``requests``, which is NOT a core dependency. The result was that
+#: `agnes` — every command, including ones that never touch the semantic
+#: layer — failed at import on an analyst install without the ``[server]``
+#: extra. Names are cheap and implementations are not, so only the names load
+#: eagerly.
+_BUILTIN_ADAPTERS: Dict[str, tuple[str, str]] = {
+    "native": ("src.semantic.adapters.native", "NativeAdapter"),
+    "keboola_metastore": ("connectors.keboola.semantic_ossie", "KeboolaMetastoreAdapter"),
+    "snowflake_semantic": ("connectors.snowflake.semantic_ossie", "SnowflakeSemanticAdapter"),
+    "databricks_metric_views": ("connectors.databricks.semantic_ossie", "DatabricksMetricViewAdapter"),
+}
 
 
 def register_adapter(name: str, adapter: SemanticAdapter) -> None:
     _REGISTRY[name] = adapter
 
 
+def adapter_names() -> List[str]:
+    """Every adapter name, sorted — the single source of truth for anything
+    that has to *tell a human* which adapters exist (CLI ``--help``, error
+    messages, generated docs). A hand-maintained copy of this list drifts
+    silently: the ``agnes admin semantic source add --adapter`` help long
+    recommended a ``databricks_semantic`` that was never registered, and every
+    reader who copied it got a 400.
+
+    Imports nothing. That is the point — see :data:`_BUILTIN_ADAPTERS`.
+    """
+    return sorted(set(_REGISTRY) | set(_BUILTIN_ADAPTERS))
+
+
 def get_adapter(name: str) -> SemanticAdapter:
+    """The adapter registered under ``name``, importing it on first use."""
+    adapter = _REGISTRY.get(name)
+    if adapter is not None:
+        return adapter
+
+    target = _BUILTIN_ADAPTERS.get(name)
+    if target is None:
+        raise UnknownAdapter(f"unknown semantic adapter {name!r}; available: {', '.join(adapter_names())}") from None
+
+    module_path, class_name = target
     try:
-        return _REGISTRY[name]
-    except KeyError:
-        raise UnknownAdapter(f"unknown semantic adapter {name!r}; available: {', '.join(sorted(_REGISTRY))}") from None
+        module = importlib.import_module(module_path)
+    except ImportError as exc:
+        # "Registered but not installed here" — a real state on an analyst
+        # install (no `[server]` extra) and worth its own message, rather
+        # than a bare ImportError escaping into an endpoint or the sweep.
+        raise AdapterUnavailable(
+            f"semantic adapter {name!r} is registered but its module ({module_path}) could not be imported: {exc}"
+        ) from None
+
+    _REGISTRY[name] = getattr(module, class_name)()
+    return _REGISTRY[name]
 
 
 def unconfigured_reason(source: Dict[str, Any]) -> Optional[str]:
@@ -95,20 +159,3 @@ def unconfigured_reason(source: Dict[str, Any]) -> Optional[str]:
             exc,
         )
         return None
-
-
-from src.semantic.adapters.native import NativeAdapter  # noqa: E402
-
-register_adapter("native", NativeAdapter())
-
-from connectors.keboola.semantic_ossie import KeboolaMetastoreAdapter  # noqa: E402
-
-register_adapter("keboola_metastore", KeboolaMetastoreAdapter())
-
-from connectors.snowflake.semantic_ossie import SnowflakeSemanticAdapter  # noqa: E402
-
-register_adapter("snowflake_semantic", SnowflakeSemanticAdapter())
-
-from connectors.databricks.semantic_ossie import DatabricksMetricViewAdapter  # noqa: E402
-
-register_adapter("databricks_metric_views", DatabricksMetricViewAdapter())

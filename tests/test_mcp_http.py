@@ -16,7 +16,6 @@ import pytest
 
 from src.mcp_tooling import MCPOutputTooLarge
 
-
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 
@@ -60,6 +59,7 @@ class TestAuthMiddleware:
     def test_valid_token_passes_through_to_mcp(self, seeded_app):
         """_AuthMiddleware calls the underlying ASGI app when the token is valid."""
         import asyncio
+
         from app.api.mcp_http import _AuthMiddleware
 
         tok = seeded_app["analyst_token"]
@@ -85,6 +85,7 @@ class TestAuthMiddleware:
         per_user source forwards the caller's own credential), and resets it
         after."""
         import asyncio
+
         from app.api.mcp_http import _AuthMiddleware, _current_user_id
 
         tok = seeded_app["analyst_token"]
@@ -109,6 +110,7 @@ class TestAuthMiddleware:
     def test_query_param_token_passes_through(self, seeded_app):
         """?token= fallback also reaches the inner app when valid."""
         import asyncio
+
         from app.api.mcp_http import _AuthMiddleware
 
         tok = seeded_app["analyst_token"]
@@ -369,6 +371,22 @@ class TestToolRegistration:
             "semantic_mutes_list",
             "mute_semantic_check",
             "unmute_semantic_check",
+            # Where documents are synced FROM, taking a model off that sync
+            # path, and which Data Package carries it to non-admin readers
+            # (#1707) — three admin families that had REST + CLI and no MCP.
+            # Triple-surface with /api/admin/semantic-sources* +
+            # /api/admin/semantic-models/{id}/{detach,reattach} +
+            # /api/admin/semantic-models/{slug}/packages* and `agnes admin
+            # semantic source add|list|sync|rm` / `detach` / `reattach` /
+            # `link-package` / `unlink-package`.
+            "semantic_source_add",
+            "semantic_source_list",
+            "semantic_source_sync",
+            "semantic_source_remove",
+            "semantic_model_detach",
+            "semantic_model_reattach",
+            "semantic_model_link_package",
+            "semantic_model_unlink_package",
             # Is the layer trustworthy right now (F4.2) — sync failures,
             # disconnected models, invalid documents, static document-quality
             # checks, F4.1's coverage roll-up, and F4.3's active mutes.

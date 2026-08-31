@@ -7748,6 +7748,63 @@ def _connected_sources() -> list[str]:
     return sorted(types)
 
 
+#: How many pending auto-drafts the /admin/tables strip will count before it
+#: stops counting and says "more". A badge does not need an exact number past
+#: this point, and the page should not pay for one.
+_DRAFT_BADGE_CAP = 99
+
+
+def _pending_semantic_draft_count() -> tuple[int, bool]:
+    """How many semantic models the auto-draft sweep has proposed and nobody
+    has decided yet.
+
+    ``POST /api/admin/semantic-auto-draft-sweep`` (scheduler-driven, every 55
+    minutes) drafts a model for tables with no semantic-layer coverage and
+    files each one in the shared ``authoring_suggestions`` moderation queue as
+    the non-admin ``semantic-drafter`` identity. /admin/tables — the page whose
+    tables those are — said nothing about it, so the sweep worked and was
+    invisible unless the admin already knew the queue existed.
+
+    Scoped to the DRAFTER's own pending ``semantic-layer`` rows: a person's
+    proposal sitting in the same queue is not a table awaiting an
+    automatically suggested model, and counting it would make the strip's
+    sentence untrue.
+
+    Counted by listing rather than by a new repo method — the sweep itself
+    already reads this exact set the same way (``_pending_count`` in
+    ``app/api/semantic_models.py``), and a filtered ``count_pending`` would be
+    a new method on a frozen DuckDB↔PG pair for the sake of a strip.
+
+    CAPPED at :data:`_DRAFT_BADGE_CAP`, because a list is not a count: the
+    sweep's own call asks for 100k rows, which is fine for a job that is
+    about to spawn a chat session per row and wrong for a page render that
+    only needs a number. One row past the cap is enough to know there are
+    "more than the cap", and the strip says so.
+
+    Returns ``(count, overflowed)``. Never raises: an unreadable queue means
+    the page says nothing, not a 500.
+    """
+    try:
+        from app.auth.system_users import SEMANTIC_DRAFTER_USER_EMAIL
+        from src.repositories import authoring_suggestions_repo
+
+        rows = authoring_suggestions_repo().list(
+            status="pending",
+            domain="semantic-layer",
+            created_by=SEMANTIC_DRAFTER_USER_EMAIL,
+            # One past the cap: enough to distinguish "exactly the cap" from
+            # "more than we are willing to load for a badge".
+            limit=_DRAFT_BADGE_CAP + 1,
+        )
+    except Exception as e:  # noqa: BLE001 — an unreadable queue is not a page failure
+        logger.warning("admin tables: could not count pending semantic auto-drafts: %s", e)
+        return 0, False
+
+    if len(rows) > _DRAFT_BADGE_CAP:
+        return _DRAFT_BADGE_CAP, True
+    return len(rows), False
+
+
 @router.get("/admin/tables", response_class=HTMLResponse)
 async def admin_tables(
     request: Request,
@@ -7759,6 +7816,7 @@ async def admin_tables(
     # Branch the register-modal layout server-side so the JS doesn't have
     # to round-trip /api/admin/server-config to learn the source type.
     data_source_type = get_data_source_type() or "keboola"
+    _draft_badge = _pending_semantic_draft_count()
     ctx = _build_context(
         request,
         user=user,
@@ -7784,6 +7842,14 @@ async def admin_tables(
         # sentinel) + instance-level credential probes. See
         # `_connected_sources()`.
         connected_sources=_connected_sources(),
+        # The auto-draft sweep's queued proposals, announced on the page whose
+        # tables they describe. `studio_enabled` decides whether the strip may
+        # LINK to the moderation queue: that page redirects home when the
+        # Studio surface is off, and a call to action that bounces is worse
+        # than the sentence alone. See `_pending_semantic_draft_count`.
+        semantic_draft_pending_count=_draft_badge[0],
+        semantic_draft_pending_overflow=_draft_badge[1],
+        studio_enabled=get_studio_enabled(),
     )
     return templates.TemplateResponse(request, "admin_tables.html", ctx)
 

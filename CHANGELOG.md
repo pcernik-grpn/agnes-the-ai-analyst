@@ -10,6 +10,46 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **Eight MCP tools for the semantic-layer admin actions that had REST and CLI
+  and nothing else (#1707).** Three families were reachable from a terminal and
+  a browser but not from an agent: where documents are synced FROM
+  (`semantic_source_add` / `_list` / `_sync` / `_remove`), taking a
+  source-owned model off that sync path (`semantic_model_detach` /
+  `semantic_model_reattach`), and which Data Package carries a model to
+  non-admin readers (`semantic_model_link_package` / `_unlink_package`). The
+  gap was never justified as an exception — CONTRIBUTING.md's only standing MCP
+  exemptions are credential-provisioning writes and security-posture
+  diagnostics — so the endpoints move from "REST-only by design" to
+  triple-surface. Each tool is a thin wrapper over the endpoint the CLI already
+  calls, so the admin gate, the validation and the Postgres-only refusals stay
+  in the one place that owns them; detach/reattach pass the frozen DuckDB
+  backend's typed `501 requires_postgres_backend` straight through. Their
+  confirmation flags (`confirm_detach` / `confirm_reattach`) are REQUIRED
+  arguments rather than defaulted to true, so an agent cannot confirm a danger
+  flow on the user's behalf, and an unconfirmed re-attach returns the endpoint's
+  staleness preview instead of acting. Writes are annotated non-read-only (so
+  cloud chat's approval gate raises a card), with source removal, detach,
+  reattach AND sync flagged destructive — a sync prunes, so an upstream that
+  dropped a document takes the model and its package links with it. The source
+  listing is size-capped (`ensure_output_size`) because an `upload` source
+  carries whole documents in its config. Registering a git source goes through
+  the new credential-egress guardrail (see Fixed). HTTP transports only — the
+  stdio server still carries no semantic tools by design.
+- **`/admin/tables` now says when the auto-draft sweep is waiting on you
+  (#1707).** `POST /api/admin/semantic-auto-draft-sweep` runs every 55 minutes,
+  drafts a semantic model for tables with no semantic-layer coverage and files
+  each one in the `authoring_suggestions` moderation queue as the non-admin
+  `semantic-drafter` identity — and nothing on the page about those very tables
+  mentioned it, so the feature worked and was invisible to anyone who did not
+  already know the queue existed. A strip above the table list now states it —
+  "**N** tables await approval of a suggested model" — and links to the queue.
+  Scoped to the drafter's own pending `semantic-layer` rows, so a person's
+  proposal in the same shared queue is never counted as an auto-draft. The
+  link is conditional, not the strip: the queue page redirects home while the
+  Studio surface is off (`studio.enabled`, off by default) and rows filed
+  before it was switched off survive it, so that state announces the count and
+  names the switch rather than offering a door that bounces. An unreadable
+  suggestions store renders no strip instead of failing the page.
 - **The two views of one metric now link to each other (#1707).** The metric
   registry on `/catalog/semantics` (the flat projection) and the semantic
   document browser on `/semantic-layer` render the same metric twice with no
@@ -1192,6 +1232,49 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
 ### Fixed
+- **A git semantic source can no longer be pointed at an arbitrary host with an
+  arbitrary server secret (#1707).** `config.repo_url` and `config.token_env`
+  are admin-writable, the clone reads that env var, and git's credential helper
+  is scoped to whatever host the URL names — so two calls (register a source at
+  an attacker host with `token_env` naming any secret in the process
+  environment, then sync it) handed that secret over. Reachable over REST and
+  the CLI since the feature shipped; the new MCP tools put it within an agent's
+  reach, which is what surfaced it. `src/semantic/transports.py` now validates
+  before any egress — and so do `POST`/`PUT /api/admin/semantic-sources`, so an
+  admin is refused at write time instead of in a sync error later: the URL
+  scheme must be `https`/`ssh`/`git+ssh` (or `git@host:org/repo`), which also
+  closes `ext::` (git's ext transport executes its argument) and `file://`
+  (reads the server's own disk); `token_env` must be on a git-credential
+  allowlist (`AGNES_SEMANTIC_GIT_TOKEN_ENVS`, default `AGNES_SEMANTIC_GIT_TOKEN`
+  / `GIT_TOKEN` / `GITHUB_TOKEN` / `GITLAB_TOKEN` / `BITBUCKET_TOKEN`); and the
+  host must be pinned when `AGNES_SEMANTIC_GIT_HOST_ALLOWLIST` is set. Both
+  allowlists are siblings of the connector-ATTACH ones and never share
+  membership with them — a Keboola storage token or a Databricks PAT is not a
+  git credential, and names from another trust boundary are subtracted out even
+  if an override lists them. A public repo with no `token_env` is unaffected.
+  **Upgrade note:** an existing git source whose `token_env` is a
+  deployment-specific name must list it in `AGNES_SEMANTIC_GIT_TOKEN_ENVS`
+  (the variable REPLACES the default set) or its next sync refuses.
+- **`agnes` imports again on an install without the `[server]` extra (#1707).**
+  Building the `--adapter` help from the adapter registry (below) imported that
+  registry at CLI module scope, and it eagerly imported all four connector
+  adapters — pulling in `requests`, which is not a core dependency. Every
+  `agnes` command failed at import on an analyst wheel, not just the semantic
+  ones. The built-in adapters are now a NAME table (`_BUILTIN_ADAPTERS`) whose
+  implementations import on first use, so listing adapters imports nothing;
+  `tests/test_packaging.py::test_cli_imports_without_the_server_extra` blocks
+  the server-only modules in a subprocess and imports the CLI plus its whole
+  Typer command tree, so this class of break cannot return.
+- **`agnes admin semantic source add --help` no longer recommends an adapter
+  that does not exist (#1707).** The `--adapter` enumeration was a
+  hand-maintained literal and had drifted: it offered `databricks_semantic`,
+  while the registered adapter is `databricks_metric_views`, so anyone who
+  copied the name straight out of `--help` got a 400. The enumeration is now
+  generated from the adapter registry itself
+  (`src.semantic.adapters.adapter_names()`), and a test asserts both
+  directions — every name the help advertises is registered, and every
+  registered adapter is advertised — so registering a new adapter cannot leave
+  the help behind again.
 - **The semantic model detail page no longer offers a "Detach to edit"
   button that dead-ends in a 501 on a DuckDB-backed instance.** Detaching an
   imported model is Postgres-only (A3 ratchet); the toolbar on

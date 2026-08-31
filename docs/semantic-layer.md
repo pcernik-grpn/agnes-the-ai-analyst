@@ -89,6 +89,31 @@ than it sounds: an empty document list legitimately means "upstream deleted
 everything", which prunes. A failed clone must never be able to present itself
 as an empty source, so the error is recorded on the source row and re-raised.
 
+### What a git source is allowed to reach
+
+`repo_url` and `token_env` are admin-writable, the clone reads that env var,
+and git's credential helper is scoped to whatever host the URL names — so
+unguarded, the pair is a way to post a server secret to an arbitrary host.
+Three checks run before any egress, in `src/semantic/transports.py`
+(`validate_git_config`) and again at `POST`/`PUT /api/admin/semantic-sources`
+so an admin is refused at write time rather than in a sync error a week later:
+
+| Check | Default | Operator control |
+|---|---|---|
+| URL scheme is `https`, `ssh`, `git+ssh` or `git@host:org/repo` | enforced | not configurable — `ext::` runs a command, `file://` reads the server's disk |
+| `token_env` is a known git-credential name | `AGNES_SEMANTIC_GIT_TOKEN`, `GIT_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN` | `AGNES_SEMANTIC_GIT_TOKEN_ENVS` (CSV; **replaces** the default set) |
+| Repository host is pinned | unpinned, with a warning logged whenever a credential is used | `AGNES_SEMANTIC_GIT_HOST_ALLOWLIST` (CSV of `host[:port]`) |
+
+Both allowlists are siblings of the connector-ATTACH ones in
+`src/orchestrator_security.py` and deliberately do **not** share membership
+with them: a Keboola storage token or a Databricks PAT is never a git
+credential, and an operator's ATTACH host pin is about DuckDB endpoints, not
+git remotes. Names belonging to another boundary are subtracted out even if an
+override lists them.
+
+A public repository with no `token_env` needs no configuration — the common
+case still works out of the box.
+
 ### Scheduled refresh
 
 Every registered source — regardless of kind — is also synced automatically by
@@ -848,6 +873,46 @@ The three reports are three different questions, which is why
 
 Business terms projected out of a document are read through the glossary
 surface: `agnes glossary search <term>` / `agnes glossary show <id>`.
+
+### The same actions from an agent (MCP)
+
+Every command above that an agent could plausibly need is also an MCP
+foundation tool (`app/api/mcp/foundation_tools.py`), on the HTTP transports
+only — the stdio server carries no semantic tools by design. The tools are
+thin wrappers over the same endpoints, so the admin gate, the validation and
+the Postgres-only refusals stay in one place.
+
+| MCP tool | CLI equivalent |
+|---|---|
+| `semantic_model_search` / `semantic_model_get` | `agnes semantic-model search` / `export` |
+| `get_semantic_context` / `get_semantic_schema` | `agnes semantic-model context` / `schema` |
+| `validate_semantic_query` | `agnes semantic-model validate-query` |
+| `apply_semantic_model` | `agnes semantic-model apply` |
+| `flag_semantic_issue` | `agnes semantic-model feedback submit` |
+| `semantic_source_add` / `_list` / `_sync` / `_remove` | `agnes admin semantic source add\|list\|sync\|rm` |
+| `semantic_model_detach` / `semantic_model_reattach` | `agnes admin semantic detach` / `reattach` |
+| `semantic_model_link_package` / `_unlink_package` | `agnes admin semantic link-package` / `unlink-package` |
+| `semantic_model_coverage[_tag/_untag]`, `admin_semantic_coverage`, `admin_semantic_layer_coverage` | `agnes admin semantic coverage*` / `keboola-import` |
+| `semantic_layer_health`, `semantic_mutes_list`, `mute_semantic_check`, `unmute_semantic_check` | `agnes admin semantic health` / `mutes` / `mute` / `unmute` |
+| `semantic_feedback_list` / `semantic_feedback_resolve` | `agnes admin semantic feedback list` / `resolve` |
+
+Two details worth knowing before an agent calls them:
+
+- `semantic_model_detach` and `semantic_model_reattach` take their
+  confirmation flag as a **required** argument, deliberately not defaulted to
+  true. The caller has to decide, and an unconfirmed re-attach returns the
+  staleness preview (when it was detached, whether the source has changed
+  since) instead of acting. Both are Postgres-only and answer
+  `501 requires_postgres_backend` on the frozen DuckDB app-state backend.
+- Everything that writes is annotated non-read-only, so cloud chat's approval
+  gate raises a card before it runs. Removing a source, detaching, re-attaching
+  AND `semantic_source_sync` are additionally flagged destructive — a sync
+  prunes, so an upstream that dropped a document takes the model and its
+  package links with it, and no annotation should imply otherwise just because
+  the action is routine.
+- `semantic_source_add` cannot point the server at an arbitrary host with an
+  arbitrary credential: see "What a git source is allowed to reach" above. The
+  guardrail is in the transport, so it holds for the REST and CLI paths too.
 
 ### Renamed in this release
 

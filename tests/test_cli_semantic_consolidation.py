@@ -15,6 +15,7 @@ old ones alive.
 
 from __future__ import annotations
 
+import inspect
 import json
 from unittest.mock import MagicMock, patch
 
@@ -324,6 +325,35 @@ class TestAdminSemanticGroup:
         assert result.exit_code == 1
         assert "agnes admin semantic source list" in result.output
 
+    def test_source_add_help_enumerates_exactly_the_registered_adapters(self):
+        """The `--adapter` help used to be a hand-maintained literal and had
+        already drifted: it recommended `databricks_semantic`, which is not a
+        registered adapter, so anyone who copied it got a 400. The enumeration
+        is now generated from the registry; this guards both directions so it
+        cannot drift again."""
+        from cli.commands.admin_semantic import add_source
+        from src.semantic.adapters import adapter_names
+
+        help_text = inspect.signature(add_source).parameters["adapter"].default.help
+        enumeration = help_text.split("Adapter:", 1)[1].split("(default:", 1)[0]
+        advertised = {name.strip() for name in enumeration.split("|") if name.strip()}
+
+        registered = set(adapter_names())
+        assert advertised == registered, (
+            f"help advertises {sorted(advertised - registered)} that are not registered; "
+            f"registry has {sorted(registered - advertised)} the help omits"
+        )
+
+    def test_source_add_help_shows_the_generated_enumeration_to_the_user(self):
+        """The generated string must actually reach `--help` output, not just
+        live in the signature."""
+        from src.semantic.adapters import adapter_names
+
+        result = runner.invoke(app, ["admin", "semantic", "source", "add", "--help"], env={"COLUMNS": "200"})
+        rendered = " ".join(result.output.split())
+        for name in adapter_names():
+            assert name in rendered, f"--help does not mention the registered adapter {name}"
+
     def test_keboola_import_reads_the_keboola_only_endpoint(self):
         with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, {"sources": []})) as m:
             result = runner.invoke(app, ["admin", "semantic", "keboola-import"])
@@ -555,7 +585,7 @@ class TestDeprecatedAliases:
         assert "admin semantic export" not in result.output
 
     def test_each_alias_names_the_command_that_was_actually_run(self):
-        """"The group moved" is not an instruction — the line has to name the
+        """ "The group moved" is not an instruction — the line has to name the
         command the user just typed and its replacement."""
         with patch("cli.commands.admin_semantic.api_post", return_value=_resp(200, {"package_ids": []})):
             result = runner.invoke(app, ["admin", "semantic-model", "link-package", "retail", "pkg_1"])
@@ -621,9 +651,7 @@ class TestDeprecatedAliases:
     def test_the_notice_goes_to_stderr_so_json_stays_pipeable(self):
         """A rename must not break `… --json | jq`."""
         with patch("cli.commands.admin_semantic.api_get", return_value=_resp(200, [_MODEL_ROW])):
-            result = runner.invoke(
-                app, ["admin", "semantic-model", "list", "--json"], catch_exceptions=False
-            )
+            result = runner.invoke(app, ["admin", "semantic-model", "list", "--json"], catch_exceptions=False)
         # CliRunner merges the streams into `.output`; `.stdout` is stdout only.
         assert _DEPRECATED not in result.stdout
         json.loads(result.stdout)

@@ -62,6 +62,7 @@ git source emptying a model IS a real delete signal.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -72,6 +73,8 @@ from src.marketplace import _redact, _run_git
 from src.repositories import semantic_source_repo
 from src.semantic.adapters import get_adapter
 from src.semantic.importer import ImportReport, import_documents
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_GLOB = "**/*.yaml"
 
@@ -179,6 +182,69 @@ def _assert_ref_is_the_sources_own(*, source_id: str, label: str, config: Dict[s
     )
 
 
+def validate_git_config(config: Dict[str, Any]) -> None:
+    """Refuse a git source config that would leak a secret — or run a command.
+
+    Three checks, all on admin-writable input, all BEFORE any network call:
+
+    1. ``repo_url`` names an allowed scheme. ``ext::`` runs its argument as a
+       shell command and ``file://`` reads the server's own disk, so the
+       scheme list is an allowlist and is not operator-configurable.
+    2. ``token_env`` is on the semantic-git credential allowlist. The clone
+       reads that env var and hands its value to git, so an unrestricted name
+       makes any server secret readable — ``ANTHROPIC_API_KEY`` as much as a
+       PAT.
+    3. The repository host is allowlisted, when an operator has pinned one.
+       ``src.marketplace._credential_args`` scopes the credential helper to
+       whatever host the URL names, so host and token together are the
+       exfiltration primitive: either gate alone leaves half of it open.
+
+    Raises ``ValueError`` with a message an admin can act on. Called from the
+    transport (so it holds for a row written by any path, including one that
+    predates this check) and from ``POST``/``PUT /api/admin/semantic-sources``
+    (so the admin learns at write time rather than at first sync).
+    """
+    from src.orchestrator_security import (
+        get_allowed_semantic_git_token_envs,
+        is_semantic_git_host_allowed,
+        is_semantic_git_token_env_allowed,
+        semantic_git_host_allowlist_configured,
+        semantic_git_scheme_refusal,
+    )
+
+    repo_url = str(config.get("repo_url") or "").strip()
+    refusal = semantic_git_scheme_refusal(repo_url)
+    if refusal:
+        raise ValueError(refusal)
+
+    token_env = str(config.get("token_env") or "").strip()
+    if token_env and not is_semantic_git_token_env_allowed(token_env):
+        raise ValueError(
+            f"config.token_env {token_env!r} is not an allowed semantic-source git credential. "
+            f"Allowed: {', '.join(sorted(get_allowed_semantic_git_token_envs())) or '(none)'}. "
+            "Add a deployment-specific name to AGNES_SEMANTIC_GIT_TOKEN_ENVS (it REPLACES the "
+            "default set). Names that belong to another trust boundary — a connector ATTACH "
+            "token, a config-resolution secret, the anonymization key — are never accepted here."
+        )
+
+    if not is_semantic_git_host_allowed(repo_url):
+        from src.marketplace import _strip_userinfo
+
+        raise ValueError(
+            f"config.repo_url host is not in AGNES_SEMANTIC_GIT_HOST_ALLOWLIST "
+            f"({_strip_userinfo(repo_url)}) — a semantic source may only clone from a pinned host."
+        )
+
+    if token_env and not semantic_git_host_allowlist_configured():
+        # Default-open, exactly like the ATTACH host gate — but never silent.
+        logger.warning(
+            "semantic git source carries a credential (token_env=%s) with no "
+            "AGNES_SEMANTIC_GIT_HOST_ALLOWLIST configured: the token will be offered to whatever "
+            "host config.repo_url names. Pin the hosts you clone from.",
+            token_env,
+        )
+
+
 def _clone(*, repo_url: str, ref: Optional[str], token_env: Optional[str], dest: Path) -> Path:
     """Shallow-clone ``repo_url`` into ``dest`` and return the clone root."""
     token = os.environ.get(token_env, "") if token_env else ""
@@ -223,9 +289,11 @@ def load_documents(source: Dict[str, Any]) -> List[str]:
     if kind == "upload":
         payload: Dict[str, Any] = {"documents": list(config.get("documents") or [])}
     elif kind == "git":
+        # Before the temp dir, before the clone, before any egress: the
+        # config is admin-writable and reaches here from REST, the CLI, the
+        # MCP tools and any row already in the database.
+        validate_git_config(config)
         repo_url = (config.get("repo_url") or "").strip()
-        if not repo_url:
-            raise ValueError("git semantic source requires config.repo_url")
         with tempfile.TemporaryDirectory(prefix="agnes-semantic-") as tmp:
             root = _clone(
                 repo_url=repo_url,

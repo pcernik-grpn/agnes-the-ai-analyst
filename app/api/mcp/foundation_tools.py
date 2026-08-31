@@ -203,6 +203,22 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "semantic_mutes_list",
     "mute_semantic_check",
     "unmute_semantic_check",
+    # The three admin families that had REST + CLI and no MCP (#1707): where
+    # documents are synced FROM, taking a model off that sync path, and which
+    # Data Package carries it to non-admin readers. Triple-surface with
+    # /api/admin/semantic-sources* + /api/admin/semantic-models/{id}/
+    # {detach,reattach} + /api/admin/semantic-models/{slug}/packages* and
+    # `agnes admin semantic source add|list|sync|rm` / `detach` / `reattach` /
+    # `link-package` / `unlink-package`. Admin-gated, not MCP-exempt — same
+    # reasoning as the tag/untag and mute pairs above.
+    "semantic_source_add",
+    "semantic_source_list",
+    "semantic_source_sync",
+    "semantic_source_remove",
+    "semantic_model_detach",
+    "semantic_model_reattach",
+    "semantic_model_link_package",
+    "semantic_model_unlink_package",
     # Is the layer trustworthy right now (F4.2) — sync failures, models whose
     # source is gone, invalid documents, three static document-quality checks,
     # F4.1's coverage roll-up, and every active mute, in one call. Triple-
@@ -2139,6 +2155,310 @@ def register_foundation_tools(
             )
             _raise_for_status_with_detail(r)
             return {"unmuted": mute_id}
+
+    # ── Where documents come from, and who they reach ────────────────────
+    #
+    # Sources, detach/reattach and the Data Package link pair had REST and
+    # CLI and no MCP tool (#1707). Nothing justified the gap: CONTRIBUTING's
+    # only standing MCP exemptions are credential-provisioning writes and
+    # security-posture diagnostics, and none of these is either. Every one is
+    # a thin wrapper over the endpoint the CLI already calls, so the admin
+    # gate, the validation and the Postgres-only refusals stay in the one
+    # place that owns them.
+
+    @tool(read_only=False)
+    async def semantic_source_add(
+        name: str,
+        kind: str,
+        adapter: str = "native",
+        config: dict | None = None,
+        enabled: bool = True,
+    ) -> dict:
+        """Register a place semantic-model documents are synced FROM (admin only).
+
+        A source is a standing instruction, not a one-off import: once
+        registered it is swept on a schedule, and the models it brings in are
+        owned by it — editing one through the API answers ``409
+        source_owned`` until it is detached. Register one when documents
+        should keep arriving; to load a document once, use
+        ``apply_semantic_model``.
+
+        Args:
+            name: Display name, shown wherever the source appears.
+            kind: ``git`` (clone a repository), ``upload`` (documents carried
+                in ``config.documents``), or ``connection`` (read an existing
+                connected system through its adapter).
+            adapter: Which reader turns the upstream into Ossie documents.
+                ``native`` is for documents that already ARE Ossie
+                (git/upload); a connection source uses its connector's own.
+                An unknown name is refused with the full list of registered
+                adapters, generated from the registry itself — which is why
+                this docstring does not restate it: the hand-written copy in
+                the CLI's `--adapter` help had already drifted to a name that
+                did not exist, and a second copy here would be the same bug
+                waiting to happen.
+            config: Kind-specific settings — git: ``repo_url`` (+ optional
+                ``ref``, ``glob``, ``token_env``); upload: ``documents``;
+                connection: ``connection_id``. Provenance keys are refused:
+                a source may not claim to be another source.
+            enabled: False registers it excluded from sync — both the
+                scheduled sweep and ``semantic_source_sync`` skip it until
+                it is enabled.
+
+        Mirrors ``POST /api/admin/semantic-sources`` and ``agnes admin
+        semantic source add``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-sources",
+                json={
+                    "name": name,
+                    "kind": kind,
+                    "adapter": adapter,
+                    "config": config or {},
+                    "enabled": enabled,
+                },
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_source_list(enabled_only: bool = False) -> dict:
+        """List the registered semantic-model sources and how their last sync went (admin only).
+
+        Read this before concluding a model is missing or stale: each row
+        carries ``last_sync_status``/``last_sync_at``, ``owned_model_count``
+        (did the last sync bring anything back) and ``scan_scope`` (what it
+        actually looked at). ``ok`` with zero owned models and a named scope
+        is the signature of a source whose credentials cannot see the
+        upstream it is pointed at — not of an empty upstream.
+
+        Args:
+            enabled_only: Only sources that participate in sync. Disabled
+                ones are skipped by the sweep, which is usually the answer to
+                "why has nothing arrived".
+
+        Returns ``{"sources": [...]}``.
+
+        Mirrors ``GET /api/admin/semantic-sources`` and ``agnes admin
+        semantic source list``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-sources",
+                params={"enabled_only": "true"} if enabled_only else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return ensure_output_size(
+                {"sources": r.json()},
+                "semantic_source_list",
+                hint="an `upload` source carries its whole documents in `config`; "
+                "read one source at a time through the REST API, or narrow with `enabled_only`",
+            )
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_source_sync(source_id: str) -> dict:
+        """Fetch one semantic source now, instead of waiting for the sweep (admin only).
+
+        Imports what the source currently holds and PRUNES, within that
+        source's own provenance, the models it no longer sends — deleting
+        them and their Data Package links. That is why this is flagged
+        destructive despite being routine: an upstream that has dropped a
+        document (or a misconfigured scope that can no longer see it) takes
+        the model with it, and nothing here can put it back. It never touches
+        another source's models or a hand-authored one, and a detached model
+        keeps its local edits — sync records drift instead of overwriting it.
+
+        Additive to the schedule, not a substitute: the report it returns
+        (imported / updated / pruned / failed, with per-document errors) is
+        the fastest way to see why a source is not producing what was
+        expected. 409 if the source is disabled — that is deliberate
+        exclusion, so enable it first rather than working around it.
+
+        Args:
+            source_id: The source's id, from ``semantic_source_list``.
+
+        Mirrors ``POST /api/admin/semantic-sources/{source_id}/sync`` and
+        ``agnes admin semantic source sync``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-sources/{source_id}/sync",
+                headers=headers_fn(),
+                # A sync clones a repository or queries an upstream system;
+                # the CLI gives it room and so does this.
+                timeout=300,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_source_remove(source_id: str) -> dict:
+        """Stop syncing from a semantic source (admin only).
+
+        Deletes the source ROW. The models it already imported stay — they
+        keep its provenance and simply stop being refreshed, which is what
+        makes them show up as orphaned in ``semantic_layer_health``. Nothing
+        recreates the row: registering it again is a new source, and the
+        first sync re-adopts the models by provenance.
+
+        Prefer disabling it (``enabled: false``) when the intent is "pause
+        this", not "forget where these came from".
+
+        Args:
+            source_id: The source's id, from ``semantic_source_list``.
+
+        Mirrors ``DELETE /api/admin/semantic-sources/{source_id}`` and
+        ``agnes admin semantic source rm``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-sources/{source_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return {"deleted": source_id}
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_model_detach(model_ref: str, confirm_detach: bool) -> dict:
+        """Take a source-owned semantic model off the sync path so it can be edited (admin only).
+
+        The escape hatch out of ``409 source_owned``: the model stays where it
+        is and keeps its provenance, but sync stops overwriting it and starts
+        recording drift instead. From here ``apply_semantic_model`` and the
+        admin edit surfaces work on it — and it stops receiving upstream
+        corrections, which is the cost. ``semantic_model_reattach`` undoes it.
+
+        Args:
+            model_ref: The model's id or slug.
+            confirm_detach: Must be passed explicitly. Ask the user before
+                setting it to True — this is a danger flow, and the endpoint
+                refuses ``confirm_required`` without it rather than the tool
+                deciding on the caller's behalf.
+
+        Mirrors ``POST /api/admin/semantic-models/{model_ref}/detach`` and
+        ``agnes admin semantic detach``.
+
+        Requires an admin PAT, and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-models/{model_ref}/detach",
+                json={"confirm_detach": confirm_detach},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_model_reattach(model_ref: str, confirm_reattach: bool) -> dict:
+        """Return a detached semantic model to the sync path (admin only).
+
+        The next sync run rewrites the document from the source, DISCARDING
+        every local edit made since it was detached — that is the whole point
+        of re-attaching, and why it is not reversible by re-detaching.
+        Unconfirmed, the endpoint answers a staleness preview instead of
+        acting (when it was detached, whether the source changed since); read
+        that back to the user before confirming.
+
+        Args:
+            model_ref: The model's id or slug.
+            confirm_reattach: Must be passed explicitly. Pass False first to
+                get the preview, then True once the user has agreed to lose
+                the local edits.
+
+        Mirrors ``POST /api/admin/semantic-models/{model_ref}/reattach`` and
+        ``agnes admin semantic reattach``.
+
+        Requires an admin PAT, and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-models/{model_ref}/reattach",
+                json={"confirm_reattach": confirm_reattach},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_link_package(slug: str, package_id: str) -> dict:
+        """Give a semantic model a Data Package's audience (admin only).
+
+        A model linked to no package is readable by admins only, so this is
+        how a document reaches the analysts who are supposed to use it: it
+        inherits that package's grants for non-admin search and export.
+        Idempotent, and unaffected by ownership — the link lives in a
+        junction table, so a source re-sync cannot revert it.
+
+        Args:
+            slug: The model's slug.
+            package_id: The Data Package to link it to.
+
+        Returns ``{"package_ids": [...]}`` — every package now carrying the
+        model.
+
+        Mirrors ``POST /api/admin/semantic-models/{slug}/packages`` and
+        ``agnes admin semantic link-package``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-models/{slug}/packages",
+                json={"package_id": package_id},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_unlink_package(slug: str, package_id: str) -> dict:
+        """Take a semantic model out of a Data Package's audience (admin only).
+
+        Removes the junction row only — the model itself is untouched and
+        keeps every other package it is linked to. Once it is in none, it is
+        readable by admins only again. Idempotent on a pair that was never
+        linked.
+
+        Args:
+            slug: The model's slug.
+            package_id: The Data Package to unlink it from.
+
+        Returns ``{"package_ids": [...]}`` — the packages still carrying the
+        model.
+
+        Mirrors ``DELETE /api/admin/semantic-models/{slug}/packages/{package_id}``
+        and ``agnes admin semantic unlink-package``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-models/{slug}/packages/{package_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
 
     @tool(read_only=True)
     async def semantic_layer_health() -> dict:

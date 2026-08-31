@@ -1384,6 +1384,38 @@
            toolbar and the rows it acts on. #}
         <div class="apg-strip apg-strip--warn" id="adminTablesConnectorNotice" hidden></div>
 
+        {# ─── The auto-draft sweep, said out loud ───────────────────────────
+           Agnes drafts a semantic model for tables with no coverage every 55
+           minutes and files each one in the moderation queue. That queue is
+           somewhere else entirely, so the work landed where nobody who had
+           not already found it would look — the page about these very tables
+           never mentioned it. One strip, only when something is actually
+           waiting, tinted because it is a thing to act on.
+
+           The link is conditional, not the strip: the queue page redirects
+           home while the Studio surface is off, and rows filed before it was
+           turned off survive it. Announcing them with a door that bounces
+           would be the same invisibility in mirror image, so that branch
+           names the switch instead. #}
+        {% if semantic_draft_pending_count %}
+        <div class="apg-strip apg-strip--warn" id="adminTablesSemanticDrafts">
+          <span class="apg-strip__mark" aria-hidden="true">{{ ico.icon('sparkle', 15) }}</span>
+          <span>
+            <strong>{{ semantic_draft_pending_count }}{{ '+' if semantic_draft_pending_overflow }}</strong>
+            {{ 'table awaits' if semantic_draft_pending_count == 1 and not semantic_draft_pending_overflow else 'tables await' }}
+            approval of a suggested model — Agnes drafted one for each table with no
+            semantic-layer coverage, and nothing it drafts is applied until you approve it.
+          </span>
+          <span class="apg-strip__end">
+            {% if studio_enabled %}
+            <a href="/admin/studio/suggestions">Review the queue →</a>
+            {% else %}
+            Reviewing them needs the Studio surface — set <code>studio.enabled</code>.
+            {% endif %}
+          </span>
+        </div>
+        {% endif %}
+
         {# ─── One toolbar: search, narrowing, order, then the page's actions ──
            `.fbar` — the Library's control chrome, the same component People,
            Groups and /chats run, and now on the same ENGINE as well

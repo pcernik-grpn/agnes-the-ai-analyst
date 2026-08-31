@@ -107,6 +107,49 @@ def test_flag_semantic_issue_is_declared_a_write():
     assert ann.readOnlyHint is False
 
 
+def test_semantic_admin_families_are_foundation_tools():
+    """Sources, detach/reattach and package links (#1707).
+
+    REST and CLI carried all three; MCP carried none, and no standing
+    exemption covered them — CONTRIBUTING.md's are credential-provisioning
+    writes and security-posture diagnostics. Configuring where documents come
+    from is admin-gated, not MCP-exempt: the tools mirror the same endpoints,
+    so the same admin PAT is what decides.
+    """
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in (
+        "semantic_source_add",
+        "semantic_source_list",
+        "semantic_source_sync",
+        "semantic_source_remove",
+        "semantic_model_detach",
+        "semantic_model_reattach",
+        "semantic_model_link_package",
+        "semantic_model_unlink_package",
+    ):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
+def test_the_irreversible_semantic_admin_tools_are_declared_destructive():
+    """Removing a source and detaching a model are not "edits".
+
+    A client that auto-approves anything not flagged destructive would let an
+    agent drop a sync source, or take a model off the sync path, without the
+    user being asked. Re-attaching is the same class of act from the other
+    side: it hands the model back to the importer, which overwrites whatever
+    was edited locally at the next run.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from app.api import mcp_http
+
+    tools = _tools_by_name(mcp_http.mcp)
+    for name in ("semantic_source_remove", "semantic_model_detach", "semantic_model_reattach"):
+        ann = tools[name].annotations
+        assert ann.readOnlyHint is False, f"{name} writes state"
+        assert ann.destructiveHint is True, f"{name} must be flagged destructive"
+
+
 def test_activity_tool_is_a_foundation_tool():
     """Unified Activity Center timeline (E3 slice 2) — CLI/REST/web had no
     MCP counterpart before this."""
@@ -262,6 +305,18 @@ SEMANTIC_TOOL_NAMES = frozenset(
         "flag_semantic_issue",
         "semantic_feedback_list",
         "semantic_feedback_resolve",
+        # The three admin families that had REST + CLI and no MCP (#1707):
+        # where documents come from, detaching a model from its source, and
+        # which Data Package carries it. Nothing anywhere justified the gap as
+        # an exception, so it was one.
+        "semantic_source_add",
+        "semantic_source_list",
+        "semantic_source_sync",
+        "semantic_source_remove",
+        "semantic_model_detach",
+        "semantic_model_reattach",
+        "semantic_model_link_package",
+        "semantic_model_unlink_package",
     }
 )
 
@@ -378,6 +433,15 @@ _TITLE_VERBS = {
     "open",
     "show",
     "register",
+    # Semantic-layer admin verbs (#1707) — a model leaves and rejoins its
+    # source's sync path, and is linked to the Data Package that carries it.
+    # Named actions, so the derived titles ("Semantic Model Detach") already
+    # say what the call does and need no TITLE_OVERRIDES entry; this list is
+    # the vocabulary, and it was simply missing the words.
+    "detach",
+    "reattach",
+    "link",
+    "unlink",
 }
 
 
