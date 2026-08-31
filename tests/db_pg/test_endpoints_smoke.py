@@ -3140,6 +3140,13 @@ KNOWN_UNTESTED = {
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
     "POST /api/admin/sharepoint/extraction/run-due",
+    # Observed-changes feed (2026-08-30) — NEW schema surface
+    # (corpus_file_events, PG-only, A3 ratchet), so unlike its siblings
+    # above it IS covered per-backend, just not in this file: auth matrix,
+    # 404-before-work, since/until filtering, all four change kinds off a
+    # realistic upload/update/rename/delete fixture, pagination, and the
+    # DuckDB typed-501 are all in tests/db_pg/test_sharepoint_changes_pg.py.
+    "GET /api/admin/sharepoint/connections/{connection_id}/changes",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

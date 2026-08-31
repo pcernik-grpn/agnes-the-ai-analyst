@@ -89,11 +89,24 @@ class TestAuthGating:
         r = seeded_app["client"].get(f"{BASE}/nope/corpus-map", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 403
 
+    def test_changes_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/changes")
+        assert r.status_code == 401
+
+    def test_changes_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/changes", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
 
 class TestConnectionNotFound:
     def test_tree_404_for_unknown_connection(self, seeded_app):
         r = seeded_app["client"].get(f"{BASE}/does-not-exist/tree", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 404
+
+    def test_changes_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/changes", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+        assert r.json()["detail"] == "connection_not_found"
         assert r.json()["detail"] == "connection_not_found"
 
     def test_tree_404_for_non_sharepoint_connection(self, seeded_app, monkeypatch):
@@ -1111,6 +1124,37 @@ class TestCorpusMap:
         mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
         assert mapping.status_code == 200
         assert mapping.json() == {}
+
+
+class TestChangesFeedFailsCleanOnDuckDB:
+    """The observed-changes feed (`GET .../changes`) is PG-only —
+    `corpus_file_events` has no DuckDB counterpart (A3 ratchet). The happy
+    path (real events, since/until filtering, pagination, all four change
+    kinds off a realistic upload/update/rename/delete fixture) lives in
+    tests/db_pg/test_sharepoint_changes_pg.py; this suite (the DuckDB-backed
+    default here) only proves the typed 501 — never a raw 500 — regardless
+    of whether the connection has any confirmed scopes yet."""
+
+    def test_changes_501_on_duckdb_backend_no_scopes(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="changes-noscope-conn")
+        r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_changes_501_on_duckdb_backend_with_a_confirmed_scope(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="changes-scoped-conn")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(token),
+        )
+        r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
 
 
 # ---------------------------------------------------------------------------

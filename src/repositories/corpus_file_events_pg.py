@@ -119,6 +119,13 @@ class CorpusFileEventsPgRepository:
         Returns ``(items, next_cursor)`` — ``next_cursor`` is ``None`` when
         this page reached the end of the window.
         """
+        # Decode BEFORE the empty-corpus_ids short-circuit below: a caller
+        # that passed a malformed cursor gets a typed 400 regardless of
+        # whether the connection has any scopes configured yet — the two
+        # concerns (bad input vs. nothing to return) must not depend on each
+        # other's order.
+        cursor_position = decode_cursor(cursor) if cursor is not None else None
+
         if not corpus_ids:
             return [], None
         limit = max(1, min(limit, 500))
@@ -131,8 +138,8 @@ class CorpusFileEventsPgRepository:
         if until is not None:
             clauses.append("observed_at <= :until")
             params["until"] = until
-        if cursor is not None:
-            cursor_ts, cursor_id = decode_cursor(cursor)
+        if cursor_position is not None:
+            cursor_ts, cursor_id = cursor_position
             clauses.append("(observed_at, id) > (:cursor_ts, :cursor_id)")
             params["cursor_ts"] = cursor_ts
             params["cursor_id"] = cursor_id

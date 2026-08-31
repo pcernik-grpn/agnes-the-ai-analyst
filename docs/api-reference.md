@@ -1175,6 +1175,7 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
+- /api/admin/sharepoint/connections/{connection_id}/changes
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1275,6 +1276,28 @@ scheduling mechanism). Scheduler row `extraction-run-due` in
 is configured (absent/empty = off). A clean, typed no-op (`{"dispatched":
 [], "count": 0, "skipped": true, "reason": ...}`), never an error, when the
 feature isn't usable or no schedule is configured.
+
+`GET …/changes` (2026-08-30) is the observed-changes feed — "what changed
+between two timestamps" for this connection — derived from the append-only
+`corpus_file_events` log that `POST /api/collections/{id}/files`'s
+upsert-on-upload and `DELETE /api/collections/{id}/files/{file_id}` already
+write (never a live Graph query). Params: `since`/`until` (ISO 8601,
+inclusive, both optional), `limit` (default 50, max 500), `cursor` (opaque,
+from a prior page's `next_cursor`; a malformed one is a typed `400
+invalid_cursor`). Each item is `{change, name, path, collection_id,
+file_id, source_stable_id, source_modified, observed_at, ingest_run_id}` —
+`change` is `added`/`updated`/`renamed`/`deleted`; `renamed` is only ever
+produced for uploads anchored by a `source_stable_id` (a bare path match has
+no identity that survives a path change, so a path-only upload can never be
+told apart from a plain re-upload after the fact). `observed_at` is when
+Agnes learned of the change (its own upload/delete handler's write time),
+never SharePoint's own modified-timestamp — a document edited at the source
+but not yet re-crawled does not appear until the next sync uploads it.
+Ordering is `(observed_at, id)` ascending, deterministic even when several
+events share a timestamp. Scoped to every collection any of the
+connection's confirmed scopes maps to; no scopes yet is an empty page, not
+an error. PG-only (`corpus_file_events` has no DuckDB counterpart, A3
+ratchet) — a DuckDB-backed instance answers a typed `501`.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.

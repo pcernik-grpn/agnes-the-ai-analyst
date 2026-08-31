@@ -12,6 +12,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **SharePoint connections have an observed-changes feed.** `GET /api/admin/sharepoint/connections/{id}/changes` answers "what changed between two timestamps" — `added`/`updated`/`renamed`/`deleted`, derived from an append-only log (`corpus_file_events`, PG-only) that the collection upload/delete endpoints already write. `since`/`until` (both optional, inclusive) and `(observed_at, id)`-cursor pagination; scoped to the connection's own confirmed-scope collections. `observed_at` is when Agnes learned of the change, never a live Microsoft Graph query — a document edited at the source but not yet re-crawled does not appear until the next sync. DuckDB-backed instances answer a typed `501`.
+
 ### Changed
 
 ### Fixed
