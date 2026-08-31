@@ -273,17 +273,35 @@ def _convert_markitdown(path: Path, filename: str) -> str:
 
 
 def _convert_pdf(path: Path, filename: str, max_chars: int) -> str:
-    """PDF → text in reading order, page by page (pypdfium2, permissive).
+    """PDF → markdown: structure pass first, plain reading-order as fallback.
 
-    Structure reconstruction (headings, tables, lists) is explicitly out of
-    scope for v1 — see the module docstring. Pages are separated by
-    :data:`PAGE_BREAK`; a page with no text contributes nothing but still
-    consumes a separator, so page numbering stays meaningful.
+    The default path is :func:`connectors.sharepoint.pdf_structure.reconstruct_pdf`
+    (headings + tables from glyph positions; it degrades per page to the same
+    reading-order text this module's plain loop produces, so it is never
+    worse). The plain loop below remains the fallback when the structure pass
+    itself fails. Pages are separated by :data:`PAGE_BREAK`; a page with no
+    text contributes nothing but still consumes a separator, so page
+    numbering stays meaningful.
     """
     try:
         import pypdfium2 as pdfium  # type: ignore[import-untyped]
     except ImportError as exc:
         raise MissingConversionDependency(filename, "pypdfium2", engine=ENGINE_PYPDFIUM2) from exc
+
+    try:
+        from connectors.sharepoint.pdf_structure import reconstruct_pdf
+
+        structured = str(reconstruct_pdf(path)).strip()
+    except Exception as exc:  # noqa: BLE001 — degrade to plain extraction below
+        logger.warning(
+            "sharepoint.convert: structure pass failed for %s (%s); using plain extraction",
+            filename,
+            type(exc).__name__,
+        )
+    else:
+        # Same no-text-layer contract as the plain path: near-empty means a
+        # scan (engine="empty" upstream), never a different engine.
+        return structured if len(structured) >= MIN_PDF_TEXT_CHARS else ""
 
     try:
         document = pdfium.PdfDocument(str(path))

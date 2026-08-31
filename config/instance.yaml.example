@@ -1245,6 +1245,11 @@ facts:
 extraction:
   enabled: false
   producer:
+    # "builtin" runs the IN-PROCESS crawl→convert→anonymize→ingest pipeline
+    # (connectors/sharepoint/crawler.py — no external producer needed; the
+    # `extraction` optional dependency extra must be installed). Anything
+    # else, including unset, keeps the external-subprocess behavior below.
+    mode: ""
     # Full command line for the producer entrypoint, e.g.:
     #   command: "python -m your_producer.run"
     # OR, when the worker image installed it as a package (see the
@@ -1260,6 +1265,12 @@ extraction:
     # by default. Only the NAMES listed here are copied — this is not a way
     # back to forwarding the whole environment.
     env_passthrough: []
+  # Built-in crawler tuning (mode: builtin only).
+  crawler:
+    # Per-file size cap in MB; larger files are skipped AND counted in the
+    # run report's `skipped_oversize` block so a corpus of large files is
+    # visible, never silently dropped. 0 = unlimited (streamed download).
+    max_file_mb: 50
   # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
   # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
   # driving a scheduler row (`extraction-run-due`, see

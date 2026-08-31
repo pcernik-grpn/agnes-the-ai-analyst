@@ -234,7 +234,7 @@ def test_pdf_extracts_text_in_reading_order(tmp_path):
     result = convert_to_markdown(path, "application/pdf")
 
     assert result.engine == "pypdfium2"
-    assert result.markdown == "Hello Agnes\nSecond line"
+    assert result.markdown == "Hello Agnes\n\nSecond line"
 
 
 def test_pdf_pages_are_separated_by_a_horizontal_rule(tmp_path):
@@ -273,7 +273,7 @@ def test_scrambled_content_stream_is_sorted_top_to_bottom_left_to_right(tmp_path
     result = convert_to_markdown(path, "application/pdf")
 
     assert result.engine == "pypdfium2"
-    lines = result.markdown.splitlines()
+    lines = [line for line in result.markdown.splitlines() if line]
     assert lines[0] == "leftmost column rightmost column"
     assert lines[1] == "bottom of the page"
 
@@ -294,7 +294,7 @@ def test_native_reading_order_is_preserved_not_re_sorted(tmp_path):
 
     result = convert_to_markdown(path, "application/pdf")
 
-    assert result.markdown == "alpha heading\nbeta paragraph\ngamma footer"
+    assert result.markdown == "alpha heading\n\nbeta paragraph\n\ngamma footer"
 
 
 def test_pdf_without_a_text_layer_is_empty_not_an_error(tmp_path):
@@ -488,3 +488,23 @@ def test_no_agpl_dependency_is_imported_by_the_converter():
 
     assert not imported & _AGPL_MODULES, f"AGPL dependency imported: {sorted(imported & _AGPL_MODULES)}"
     assert {"markitdown", "pypdfium2"} <= imported
+
+
+def test_structure_pass_failure_degrades_to_plain_extraction(tmp_path, monkeypatch):
+    """The structure-first PDF route must never be load-bearing: when
+    ``pdf_structure.reconstruct_pdf`` raises, ``_convert_pdf`` falls back to
+    the plain reading-order loop (single-newline joins, no block spacing)."""
+    from connectors.sharepoint import pdf_structure
+
+    def _boom(path, max_pages=None):
+        raise RuntimeError("structure pass broken on purpose")
+
+    monkeypatch.setattr(pdf_structure, "reconstruct_pdf", _boom)
+
+    path = tmp_path / "fallback.pdf"
+    path.write_bytes(_build_pdf([[("Hello Agnes", 72, 700), ("Second line", 72, 660)]]))
+
+    result = convert_to_markdown(path, "application/pdf")
+
+    assert result.engine == "pypdfium2"
+    assert result.markdown == "Hello Agnes\nSecond line"

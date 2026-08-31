@@ -754,26 +754,9 @@ class LLMDetector:
 
 
 def _resolve_regex_detector() -> Callable[[str], Sequence[Any]] | None:
-    """Find the anonymizer's deterministic detector, or ``None``.
+    """The anonymizer's deterministic detector (same branch since the merge)."""
+    from src.anonymization import RegexDetector
 
-    ==== INTEGRATION GLUE — the one line for the integrator ================
-    The name is pinned: ``src.anonymization.RegexDetector``, a plain class,
-    instantiated with no arguments, whose instances are callable
-    (``RegexDetector()(text) -> list[Entity]``). Once ``src/anonymization.py``
-    is on the same branch, this whole function collapses to::
-
-        from src.anonymization import RegexDetector       # module top level
-
-    …with ``RegexDetector()`` used directly in :func:`hybrid_detector`. The
-    try/except stays only until then: on a branch where the anonymizer has
-    not landed yet, an absent module must leave this module importable and
-    its tests runnable rather than exploding at import time.
-    =======================================================================
-    """
-    try:
-        from src.anonymization import RegexDetector  # type: ignore
-    except Exception:  # noqa: BLE001 — module not on this branch yet
-        return None
     return RegexDetector()
 
 

@@ -530,14 +530,20 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
             "message": "extraction.enabled is false — enable it in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
         }
 
-    from app.worker.kinds import _extraction_producer_argv
+    from app.worker.kinds import _PRODUCER_MODE_BUILTIN, _extraction_producer_argv, _extraction_producer_mode
+
+    if _extraction_producer_mode() == _PRODUCER_MODE_BUILTIN:
+        # Builtin mode runs the in-process crawler — no external command to
+        # check; the handler resolves its own imports/config and fails clean.
+        return True, None
 
     if _extraction_producer_argv() is None:
         return False, {
             "error": "extraction_producer_not_configured",
             "message": (
                 "No producer configured — set extraction.producer.command or "
-                "extraction.producer.module in instance.yaml."
+                "extraction.producer.module in instance.yaml (or "
+                "extraction.producer.mode: builtin for the in-process crawler)."
             ),
         }
 
