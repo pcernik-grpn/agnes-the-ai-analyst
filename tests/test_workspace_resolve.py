@@ -103,7 +103,7 @@ def test_precedence_differs_from_update_resolver(tmp_path, monkeypatch):
     assert update_resolve() == anchor.resolve()  # anchor first
 
 
-def test_query_run_local_falls_back_to_anchor(tmp_path, monkeypatch):
+def test_query_run_local_falls_back_to_anchor(tmp_path, monkeypatch, capsys):
     """From an unshaped cwd, _run_local opens the ANCHOR's DuckDB (spec §5.2)."""
     import duckdb
 
@@ -121,10 +121,12 @@ def test_query_run_local_falls_back_to_anchor(tmp_path, monkeypatch):
     plain.mkdir()
     monkeypatch.chdir(plain)
 
-    printed: list[str] = []
-    monkeypatch.setattr(query_module.typer, "echo", lambda *a, **k: printed.append(str(a[0]) if a else ""))
+    # Captured via capsys, not a patched typer.echo: since #1801 the csv
+    # branch of _output() writes through csv.writer(sys.stdout) directly,
+    # so typer.echo never sees the rows. This test's subject is the
+    # workspace fallback, not the output transport.
     query_module._run_local("SELECT answer FROM t", fmt="csv", limit=10)
-    assert any("42" in line for line in printed)
+    assert "42" in capsys.readouterr().out
 
 
 def test_query_run_local_none_raises_missing(tmp_path, monkeypatch):
