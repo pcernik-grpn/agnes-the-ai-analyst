@@ -1544,10 +1544,30 @@ class TestRailChatsDestination:
 
                 # The pre-paint guard, and the pair of ids it governs.
                 assert "agnes.setupchain.skipped" in rail
-                # Pre-paint suppression must be INLINE — a `src=` script
-                # cannot beat first paint.
+                # Pre-paint suppression must be INLINE — a `src=` script is
+                # `defer`red and so runs only AFTER first paint, which is the
+                # flash this guard exists to prevent.
+                #
+                # Asserted on the LAST script element before the card, and on
+                # its BODY, because the two obvious weaker forms both pass the
+                # bug: the rail opens with an inline `<script>` of its own
+                # ~600 lines above, so `"<script>" in head` is true whatever
+                # this guard is, and the key string survives being moved onto
+                # an attribute of an external tag (`data-key="…"`), so the
+                # assertion above does not pin it either. Confirmed by
+                # mutation: rewriting the guard as
+                # `<script src=… data-key="agnes.setupchain.skipped" defer>`
+                # left both of those green.
                 head = rail.split('id="railSetupChain"', 1)[0]
-                assert "<script>" in head, "the pre-paint guard is not inline before the card"
+                guard = head[head.rindex("<script") :]
+                assert "src=" not in guard, (
+                    f"the pre-paint guard is an external script, so it cannot beat "
+                    f"first paint: {guard[:120]}"
+                )
+                assert 'localStorage.getItem("agnes.setupchain.skipped")' in guard, (
+                    "the script before the card does not read the dismissal — the "
+                    f"card will flash back on every load: {guard[:120]}"
+                )
         finally:
             _router.templates.env.globals["admin_setup_rail"] = _router._admin_setup_rail
 
