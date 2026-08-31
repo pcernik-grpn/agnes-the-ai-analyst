@@ -727,10 +727,16 @@ class UsageRepository:
         ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
 
-    def list_sessions_for_user_self(self, username: str) -> list[dict]:
-        """Self per-user session list (14 cols). Filters on username only.
-        KEPT SEPARATE from the admin variant. Source: app/api/me_stats.py
-        list_self_sessions."""
+    def list_sessions_for_user_self(self, user_id: str) -> list[dict]:
+        """Self per-user session list (14 cols). Filters on ``user_id`` — the
+        account id the pipeline writes alongside the row (runner.py), NOT the
+        ``username`` column, which since v60 holds the display email. KEPT
+        SEPARATE from the admin variant. Source: app/api/me_stats.py
+        list_self_sessions.
+
+        Legacy rows written before v45 have no ``user_id`` and therefore do
+        not surface in self-views; they remain reachable through the admin
+        variant, which also matches on ``username``. No backfill."""
         cols = [
             "session_file",
             "session_id",
@@ -757,18 +763,19 @@ class UsageRepository:
                 cache_read_tokens, cache_creation_tokens,
                 primary_model
             FROM usage_session_summary
-            WHERE username = ?
+            WHERE user_id = ?
             ORDER BY started_at DESC NULLS LAST
             """,
-            [username],
+            [user_id],
         ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
 
     # ------------------------------------------------------------------
     # per-user token breakdown reads (DuckDB).  Source: me_stats.get_tokens.
+    # Keyed on ``user_id`` (see list_sessions_for_user_self).
     # ------------------------------------------------------------------
 
-    def tokens_daily_series(self, username: str, days: int) -> list[dict]:
+    def tokens_daily_series(self, user_id: str, days: int) -> list[dict]:
         rows = self.conn.execute(
             """
             SELECT
@@ -779,12 +786,12 @@ class UsageRepository:
                 COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                 COUNT(*) AS sessions
             FROM usage_session_summary
-            WHERE username = ?
+            WHERE user_id = ?
               AND started_at >= current_timestamp - INTERVAL (?) DAY
             GROUP BY 1
             ORDER BY 1
             """,
-            [username, days],
+            [user_id, days],
         ).fetchall()
         return [
             {
@@ -799,7 +806,7 @@ class UsageRepository:
             for (d, i, o, cr, cc, s) in rows
         ]
 
-    def tokens_by_model(self, username: str) -> list[dict]:
+    def tokens_by_model(self, user_id: str) -> list[dict]:
         rows = self.conn.execute(
             """
             SELECT
@@ -810,7 +817,7 @@ class UsageRepository:
                 COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                 COUNT(*) AS sessions
             FROM usage_session_summary
-            WHERE username = ?
+            WHERE user_id = ?
             GROUP BY 1
             ORDER BY (
                 COALESCE(SUM(input_tokens), 0)
@@ -819,7 +826,7 @@ class UsageRepository:
                 + COALESCE(SUM(cache_creation_tokens), 0)
             ) DESC
             """,
-            [username],
+            [user_id],
         ).fetchall()
         return [
             {
@@ -834,7 +841,7 @@ class UsageRepository:
             for (m, i, o, cr, cc, s) in rows
         ]
 
-    def tokens_top_sessions(self, username: str, limit: int = 10) -> list[dict]:
+    def tokens_top_sessions(self, user_id: str, limit: int = 10) -> list[dict]:
         rows = self.conn.execute(
             """
             SELECT
@@ -845,11 +852,11 @@ class UsageRepository:
                  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0))
                 AS tokens_total
             FROM usage_session_summary
-            WHERE username = ?
+            WHERE user_id = ?
             ORDER BY tokens_total DESC
             LIMIT ?
             """,
-            [username, limit],
+            [user_id, limit],
         ).fetchall()
         return [
             {
@@ -866,7 +873,7 @@ class UsageRepository:
             for (sf, sid, st, pm, i, o, cr, cc, tt) in rows
         ]
 
-    def tokens_totals(self, username: str) -> dict:
+    def tokens_totals(self, user_id: str) -> dict:
         row = self.conn.execute(
             """
             SELECT
@@ -876,9 +883,9 @@ class UsageRepository:
                 COALESCE(SUM(cache_creation_tokens), 0),
                 COUNT(*)
             FROM usage_session_summary
-            WHERE username = ?
+            WHERE user_id = ?
             """,
-            [username],
+            [user_id],
         ).fetchone()
         ti, to, tcr, tcc, tses = row or (0, 0, 0, 0, 0)
         return {

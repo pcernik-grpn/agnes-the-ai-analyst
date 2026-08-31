@@ -46022,7 +46022,7 @@
     },
     "/api/me/stats/tokens": {
       "get": {
-        "description": "Token breakdown for the Tokens tab.\n\nReturns a daily series (last *days* days), by-model breakdown\n(lifetime), top-10 biggest sessions (by total tokens, lifetime),\nand the lifetime grand total. Single round-trip via three\nsub-queries \u2014 each scans the same per-user partition of\n``usage_session_summary`` (filtered on ``username``; no secondary\nindex \u2014 see ``src/db.py::_v94_to_v95`` for why).",
+        "description": "Token breakdown for the Tokens tab.\n\nReturns a daily series (last *days* days), by-model breakdown\n(lifetime), top-10 biggest sessions (by total tokens, lifetime),\nand the lifetime grand total. Single round-trip via three\nsub-queries \u2014 each scans the same per-user partition of\n``usage_session_summary`` (filtered on ``user_id``; no secondary\nindex \u2014 see ``src/db.py::_v94_to_v95`` for why).",
         "operationId": "get_tokens_api_me_stats_tokens_get",
         "parameters": [
           {

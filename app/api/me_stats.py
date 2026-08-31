@@ -18,10 +18,14 @@ caller can only see their own data:
   ``audit_log`` rows where action is ``sync.*`` or ``manifest.*``,
   plus the user's ``last_pull_at`` for prominent header rendering.
 
-Username derivation: ``_username_for_stats(user)`` reuses the
-email-local-part rule from ``app.api.me`` so the joins on
-``usage_*`` rows (filesystem-derived OS username) align with what
-the session collector writes.
+Identity key: every self-scoped read filters on ``users.id``. The
+session pipeline writes that id into ``usage_session_summary.user_id``
+while ``username`` holds the display email (since v60,
+``services/session_pipeline/runner.py``) — filtering ``username`` with
+an id matched nothing and rendered zero in every panel. Rows predating
+the v45 ``user_id`` column carry no id and stay out of self-views; they
+remain visible in the admin session browser, which also matches on
+``username``.
 """
 from __future__ import annotations
 
@@ -29,7 +33,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, Query
@@ -45,25 +49,6 @@ from src.repositories import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/me/stats", tags=["me"])
-
-
-def _username_for_stats(user: dict) -> str:
-    """Return the key that ``usage_session_summary.username`` holds for
-    sessions uploaded by *user*.
-
-    Production convention: ``app/api/upload.py`` writes JSONLs under
-    ``${DATA_DIR}/user_sessions/<user_id>/``; the session-pipeline
-    runner uses the directory name as the ``username`` column when
-    extracting summaries. ``/profile/sessions`` (now redirected to
-    /me/activity) reads the same dir keyed by ``user_id``. The column
-    is historically named ``username`` but its current contents are
-    user_ids — return the matching lookup key.
-
-    v45 schema added a separate ``user_id`` column for RBAC purposes
-    (#293); reading from the legacy ``username`` column still works
-    because it carries the user_id value as the runner-written key.
-    """
-    return user["id"]
 
 
 def _session_data_dir() -> Path:
@@ -108,14 +93,11 @@ def list_self_sessions(
     and a ``download_url`` when the uploaded JSONL exists in
     ``${DATA_DIR}/user_sessions/<user_id>/``.
     """
-    username = _username_for_stats(user)
     user_id: str = user["id"]
     # Both ingestion layouts, same as the admin endpoints (#640): the legacy
     # collector writes under the email LOCAL-PART, the upload API under
     # users.id — scanning one of them hid the other's sessions from the
-    # self-service list until the usage processor indexed them. NOTE:
-    # ``_username_for_stats`` returns the user_id (the summary-table key),
-    # so the legacy dir name must be derived from the email — and the base
+    # self-service list until the usage processor indexed them. The base
     # comes from THIS module's ``_session_data_dir`` (it honors
     # ``AGNES_SESSION_DATA_DIR`` + this endpoint's historical default).
     email_local = (user.get("email") or "").split("@")[0]
@@ -125,7 +107,7 @@ def list_self_sessions(
     ]
 
     try:
-        rows_db = usage_repo().list_sessions_for_user_self(username)
+        rows_db = usage_repo().list_sessions_for_user_self(user_id)
     except Exception:
         rows_db = []
 
@@ -143,8 +125,9 @@ def list_self_sessions(
         )
         d["processed"] = True
         # Dedup key: BASENAME of ``session_file``. The session-pipeline
-        # runner writes ``session_file = f"{username}/{filename}"`` while
-        # the filesystem scan below walks bare filenames. Keying by
+        # runner writes ``session_file = f"{dir_name}/{filename}"`` — the
+        # upload directory, i.e. the user_id, NOT the ``username`` column —
+        # while the filesystem scan below walks bare filenames. Keying by
         # basename makes both views agree without normalizing the stored
         # column.
         processed[Path(d["session_file"]).name] = d
@@ -278,16 +261,16 @@ def get_tokens(
     (lifetime), top-10 biggest sessions (by total tokens, lifetime),
     and the lifetime grand total. Single round-trip via three
     sub-queries — each scans the same per-user partition of
-    ``usage_session_summary`` (filtered on ``username``; no secondary
+    ``usage_session_summary`` (filtered on ``user_id``; no secondary
     index — see ``src/db.py::_v94_to_v95`` for why).
     """
-    username = _username_for_stats(user)
+    user_id: str = user["id"]
 
     repo = usage_repo()
-    daily_series = repo.tokens_daily_series(username, days)
-    model_breakdown = repo.tokens_by_model(username)
-    top = repo.tokens_top_sessions(username)
-    totals = repo.tokens_totals(username)
+    daily_series = repo.tokens_daily_series(user_id, days)
+    model_breakdown = repo.tokens_by_model(user_id)
+    top = repo.tokens_top_sessions(user_id)
+    totals = repo.tokens_totals(user_id)
 
     return {
         "days": days,

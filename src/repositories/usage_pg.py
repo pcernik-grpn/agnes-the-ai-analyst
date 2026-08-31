@@ -760,8 +760,10 @@ class UsagePgRepository:
             ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
 
-    def list_sessions_for_user_self(self, username: str) -> list[dict]:
-        """PG mirror of UsageRepository.list_sessions_for_user_self (14 cols)."""
+    def list_sessions_for_user_self(self, user_id: str) -> list[dict]:
+        """PG mirror of UsageRepository.list_sessions_for_user_self (14 cols).
+        Filters on ``user_id``; rows without one (pre-v45) stay out of
+        self-views, same as DuckDB."""
         cols = [
             "session_file",
             "session_id",
@@ -790,19 +792,20 @@ class UsagePgRepository:
                         cache_read_tokens, cache_creation_tokens,
                         primary_model
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     ORDER BY started_at DESC NULLS LAST
                     """
                 ),
-                {"uname": username},
+                {"uid": user_id},
             ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
 
     # ------------------------------------------------------------------
     # per-user token breakdown reads (Postgres).  Mirrors UsageRepository.
+    # Keyed on ``user_id`` (see list_sessions_for_user_self).
     # ------------------------------------------------------------------
 
-    def tokens_daily_series(self, username: str, days: int) -> list[dict]:
+    def tokens_daily_series(self, user_id: str, days: int) -> list[dict]:
         # PARITY: PG interval window mirrors delete_older_than's dialect.
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -816,13 +819,13 @@ class UsagePgRepository:
                         COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                         COUNT(*) AS sessions
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                       AND started_at >= (CURRENT_TIMESTAMP - (:days * INTERVAL '1 day'))
                     GROUP BY 1
                     ORDER BY 1
                     """
                 ),
-                {"uname": username, "days": days},
+                {"uid": user_id, "days": days},
             ).fetchall()
         return [
             {
@@ -837,7 +840,7 @@ class UsagePgRepository:
             for (d, i, o, cr, cc, s) in rows
         ]
 
-    def tokens_by_model(self, username: str) -> list[dict]:
+    def tokens_by_model(self, user_id: str) -> list[dict]:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
@@ -850,7 +853,7 @@ class UsagePgRepository:
                         COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                         COUNT(*) AS sessions
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     GROUP BY 1
                     ORDER BY (
                         COALESCE(SUM(input_tokens), 0)
@@ -860,7 +863,7 @@ class UsagePgRepository:
                     ) DESC
                     """
                 ),
-                {"uname": username},
+                {"uid": user_id},
             ).fetchall()
         return [
             {
@@ -875,7 +878,7 @@ class UsagePgRepository:
             for (m, i, o, cr, cc, s) in rows
         ]
 
-    def tokens_top_sessions(self, username: str, limit: int = 10) -> list[dict]:
+    def tokens_top_sessions(self, user_id: str, limit: int = 10) -> list[dict]:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
@@ -888,12 +891,12 @@ class UsagePgRepository:
                          + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0))
                         AS tokens_total
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     ORDER BY tokens_total DESC
                     LIMIT :lim
                     """
                 ),
-                {"uname": username, "lim": limit},
+                {"uid": user_id, "lim": limit},
             ).fetchall()
         return [
             {
@@ -910,7 +913,7 @@ class UsagePgRepository:
             for (sf, sid, st, pm, i, o, cr, cc, tt) in rows
         ]
 
-    def tokens_totals(self, username: str) -> dict:
+    def tokens_totals(self, user_id: str) -> dict:
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
@@ -922,10 +925,10 @@ class UsagePgRepository:
                         COALESCE(SUM(cache_creation_tokens), 0),
                         COUNT(*)
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     """
                 ),
-                {"uname": username},
+                {"uid": user_id},
             ).fetchone()
         ti, to, tcr, tcc, tses = row or (0, 0, 0, 0, 0)
         return {
