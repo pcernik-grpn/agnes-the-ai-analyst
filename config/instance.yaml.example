@@ -1227,11 +1227,19 @@ facts:
 # with a config error rather than a crash until a producer is configured.
 #
 # `extraction.enabled` is a registered switch (app/switches.py) — set it
-# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
-# NOT editable from /admin/server-config (locked: requires the
-# extraction-worker deployment) — this is operator/deploy-time config, not
-# a runtime toggle. The rest of this block (`producer`, `schedule`,
-# `timeout_s`) is plain instance data, read directly via get_value.
+# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It IS
+# editable from /admin/server-config, alongside the rest of this block
+# (`producer.command`/`.module`/`.env_passthrough`, `schedule`, `timeout_s`)
+# — reversing this switch's original deploy-time-only stance. `enabled`,
+# `producer.command` and `producer.module` each still honor their own
+# deploy-time env var (AGNES_EXTRACTION_ENABLED /
+# AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)
+# AHEAD of a value set here or via the panel — a Terraform-provisioned
+# instance shows those three leaves read-only in the panel ("set by
+# deployment (Terraform)") and a save touching one 409s
+# (`field_locked_by_deployment`) instead of persisting a value the running
+# process would never read. `schedule`/`timeout_s`/`env_passthrough` carry
+# no such override and are always plain writable instance data.
 #
 # Flipping `enabled` here is NOT, by itself, enough to run the
 # extraction-worker compose service. That service sets AGNES_ROLE=worker
