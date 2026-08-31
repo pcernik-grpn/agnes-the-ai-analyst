@@ -647,11 +647,20 @@ module-level `extraction_worker_image` (a worker image that carries your
 extraction producer — the plain app image has no producer on PATH, and the
 module refuses the flag without an image at plan time). The module then
 renders the Redis coordination backend, the `.env` coordination
-declaration, and an always-on `extraction-worker` service into the boot
-path. The startup script is under `lifecycle.ignore_changes`, so flipping
-the flag on an existing VM takes effect only through a VM recreate
-(`terraform apply -replace=<vm address>`); the Postgres app-state and
-explicit-secrets prerequisites above remain yours to satisfy — on a
+declaration, an `AGNES_EXTRACTION_ENABLED=1` line, an
+`AGNES_EXTRACTION_PRODUCER_COMMAND` line (module-level
+`extraction_producer_command`, defaulting to the conventional in-image
+path `python /opt/producer/agnes_lane.py` — override only if your
+producer build installs somewhere else), and an always-on
+`extraction-worker` service into the boot path. Because these ride `.env`
+(env overrides `instance.yaml` — the same posture
+`app/coordination/factory.py` already uses for the coordination backend
+itself), the TF flag alone activates `corpus-extraction` end to end — no
+applier-owned edit of `instance.yaml` on the VM's data disk is needed for
+the ordinary case. The startup script is under `lifecycle.ignore_changes`,
+so flipping the flag on an existing VM takes effect only through a VM
+recreate (`terraform apply -replace=<vm address>`); the Postgres app-state
+and explicit-secrets prerequisites above remain yours to satisfy — on a
 DuckDB app-state instance the app still refuses to boot, naming the
 missing piece.
 

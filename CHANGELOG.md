@@ -14,6 +14,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **The extraction lane's Terraform flag alone now activates it end to end.** `extraction_worker_enabled = true` used to still need a manual, per-VM edit of `/data/state/instance.yaml` (an `extraction:` block with `enabled: true` + `producer.command`/`.module`) because that file is applier-owned and the module cannot render it. `app/worker/kinds.py::_extraction_producer_argv()` now honors `AGNES_EXTRACTION_PRODUCER_COMMAND` / `AGNES_EXTRACTION_PRODUCER_MODULE` env overrides (env wins over `instance.yaml`, same posture as `app/coordination/factory.py`), and the `customer-instance` module writes `AGNES_EXTRACTION_ENABLED=1` + `AGNES_EXTRACTION_PRODUCER_COMMAND` into `/opt/agnes/.env` whenever `extraction_worker_enabled` is set — a new module-level `extraction_producer_command` variable (default `python /opt/producer/agnes_lane.py`) supplies the value. `AGNES_EXTRACTION_ENABLED` was already honored everywhere `extraction.enabled` is read.
+
 ### Fixed
 
 ### Removed
