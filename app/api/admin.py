@@ -588,6 +588,7 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "mcp": "live",  # matches all five switches under it
     "access_policies": "live",  # matches its switch
     "facts": "live",  # both switches (enabled/visibility_mode) are read per-call — feature_enabled()/switch_value(), no cached object
+    "extraction_webhook": "live",  # matches its switch — no other known key under this section
     "acl_mirroring": "live",  # matches its switch — no other known key under this section
     "acl_sync": "live",  # matches both switches under it (guarantee_mode/max_stale_hours)
     # --- restart: something under the section is built once at boot and
@@ -766,6 +767,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "moderation queue, plus the public suggestion API). Read per "
                 "request, so turning it off hides the nav entries, redirects the "
                 "routes home and 403s the suggestion API immediately."
+            ),
+        },
+    },
+    "extraction_webhook": {
+        "enabled": {
+            "kind": "bool",
+            "default": _flag_default("extraction_webhook", "enabled", False),
+            "hint": (
+                "Microsoft Graph change-notification receiver for SharePoint "
+                "connections (POST /api/webhooks/sharepoint/{connection_id}) — 404s "
+                "the whole route when off. Gates the receiver route only; the "
+                "corpus-extraction job it enqueues still needs extraction.enabled + a "
+                "configured producer + a worker polling the extraction lane to "
+                "actually run. New feature — off by default."
             ),
         },
     },

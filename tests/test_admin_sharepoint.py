@@ -1342,6 +1342,51 @@ class TestCertificateMetadata:
         assert body["reason"].startswith("certificate_unparseable")
 
 
+class TestWebhookSecretRotation:
+    """`POST /connections/{id}/webhook` — (re)generates the Graph
+    change-notification receiver's shared secret, returning it alongside
+    the receiver URL an operator feeds to the producer's own
+    `subscriptions.py create --url ...`."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/nope/webhook", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/nope/webhook")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/does-not-exist/webhook", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_generates_a_secret_and_the_receiver_url(self, seeded_app):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="webhook-conn")
+        r = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["webhook_url"].endswith(f"/api/webhooks/sharepoint/{conn_id}")
+        assert isinstance(body["secret"], str) and len(body["secret"]) >= 32
+
+    def test_persists_the_secret_on_the_connection(self, seeded_app):
+        from src.repositories import source_connections_repo
+
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="webhook-persist-conn")
+        r = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token))
+        secret = r.json()["secret"]
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["webhook_secret"] == secret
+
+    def test_rotating_again_mints_a_different_secret(self, seeded_app):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="webhook-rotate-conn")
+        first = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token)).json()["secret"]
+        second = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token)).json()["secret"]
+        assert first != second
+
+
 class TestCorpusMap:
     def test_corpus_map_keys_are_producer_resolver_shaped(self, seeded_app):
         """Keys must be what the producer's corpus_for() resolver matches

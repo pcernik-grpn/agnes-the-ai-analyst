@@ -588,6 +588,31 @@ def require_facts_enabled() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="facts_disabled")
 
 
+def require_extraction_webhook_enabled() -> None:
+    """Dependency: 404 the whole request when ``extraction_webhook.enabled``
+    is off.
+
+    Mounted as a router-level ``dependencies=[...]`` entry on
+    ``app/api/sharepoint_webhooks.py``'s router — same "close the whole
+    surface" posture as :func:`require_facts_enabled`, `404` rather than
+    `403`: a caller (Microsoft Graph) that never had a route to discover
+    should see "not found", not "forbidden". This is the ONLY gate on that
+    router — it carries no session/PAT auth (Graph is the caller; its own
+    ``clientState`` is verified inside the handler body, never a
+    ``Depends`` chain).
+
+    ``extraction_webhook`` is its OWN top-level config section, deliberately
+    NOT nested under ``extraction`` — see the ``Switch`` entry's own comment
+    in ``app/switches.py`` for why (mixing this always-editable switch into
+    the locked ``extraction`` section would trip
+    ``test_no_section_mixes_editable_and_locked_switches``).
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("extraction_webhook", "enabled", env_var="AGNES_EXTRACTION_WEBHOOK_ENABLED", default=False):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction_webhook_disabled")
+
+
 def access_denied_detail(resource_type: ResourceType, resource_id: str) -> str:
     """Human-readable 403 detail for a resource-scoped denial.
 
