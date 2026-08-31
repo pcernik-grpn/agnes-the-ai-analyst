@@ -141,13 +141,17 @@ inconsistently surfaced, and in one case simply broken:
 - **Writers:**
   1. The usage session processor emits one row per assistant turn while it
      already walks `message.usage` (Claude Code jsonl uploads).
-  2. **Chat: fix the capture at the source first.** Add
-     `cache_read_tokens` / `cache_creation_tokens` to `chat_messages`
-     (both backends — `usage`/`chat` are frozen pre-A3 pairs) and read them in
-     `app/chat/runner.py:1736-1737, 1752-1753`; then write the `usage_turns`
-     row synchronously at message persist for the built-in chat and the
-     Slack/Telegram/Teams surfaces. Only after that does widening
-     `session_export.py:173-177` mean anything.
+  2. **Chat: fix the capture at the source first.** Read
+     `cache_read_input_tokens` / `cache_creation_input_tokens` off the SDK
+     usage object in `app/chat/runner.py:1736-1737, 1752-1753` and carry them
+     on the turn frame; the manager writes the `usage_turns` row synchronously
+     at message persist for the built-in chat and the Slack/Telegram/Teams
+     surfaces. **`chat_messages` gains no columns** — the DuckDB schema
+     ladder is frozen (A3 forbids new `_vN` steps even on frozen pairs), so
+     the per-turn table is the sole home for chat cache tokens. The usage
+     processor skips turn emission for `chat-*.jsonl` files (their turns are
+     written live) and instead overlays the chat session's summary cache
+     totals from `usage_turns`, so `agnes_sessions` and `agnes_turns` agree.
   3. The agent-API broker keeps writing `llm_usage` (already per-call, all four
      token kinds, sole writer `app/api/broker_agent_policy.py:387`); no
      duplication into `usage_turns`.
@@ -214,9 +218,9 @@ inconsistently surfaced, and in one case simply broken:
 - No persisted cost values, no billing-grade metering (the existing
   "best-effort guardrail, not a billing ledger" stance stands).
 - No retention-policy changes.
-- No new DuckDB app-state repos or schema ladder steps (A3 respected); the
-  `chat_messages` column addition is a frozen-pair maintenance change, which
-  A3 explicitly still allows.
+- No new DuckDB app-state repos or schema ladder steps (A3 respected) — which
+  is also why `chat_messages` gains no cache columns; `usage_turns` (PG-only)
+  is the sole home for per-turn cache tokens.
 
 ## Testing
 
