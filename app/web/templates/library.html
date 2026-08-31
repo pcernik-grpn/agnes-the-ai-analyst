@@ -700,84 +700,11 @@
 
      Everything it opens now opens DOWNWARD, the shared component's default;
      the upward overrides the dock needed are gone with it. */
-  /* ══ Toolbar refinement ═══════════════════════════════════════════════
-     Page-scoped only: `/chats` renders the same `.fbar-*` component and is
-     untouched by every rule below.
-
-     The problem was never the structure, it was that FIVE controls shared one
-     treatment — 38px tall, 1px border, 9px radius, on `--ds-surface`. Search,
-     Filter, the stack toggle, the view switcher and "+ Add" were five equal
-     boxes, so nothing in the row had rank and the row read as leftovers rather
-     than as a system. Search made it worse by being the only flex-grow child
-     (`flex: 1 1 220px`), so on a desktop width it swallowed the free space and
-     became the loudest thing on a page whose subject is a list.
-
-     The fix is rank, not new components:
-       search   — a FIELD, not a button: quiet fill, no resting border, fixed
-                  width, so it reads as somewhere to type;
-       Filter · stack · view — utilities: borderless, muted, tinting only on
-                  hover and when on;
-       + Add    — the only filled control, therefore the only primary.
-     Everything drops 38px → 32px so the controls sit lighter than the rows
-     they act on. */
-  .library-page .fbar { gap: 6px; margin: 0; }
-
-  /* Search stops growing: a fixed, modest field beside the title. */
-  .library-page .fbar__search { flex: 0 1 300px; }
-  .library-page .fbar__search input {
-    height: 32px; font-size: 13px; padding: 0 10px 0 30px;
-    background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
-    border-color: transparent;
-  }
-  .library-page .fbar__search input:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
-  .library-page .fbar__search input:focus { background: var(--ds-surface); border-color: var(--ds-primary); }
-  .library-page .fbar__search svg { left: 9px; width: 15px; height: 15px; }
-
-  /* The utility cluster — quiet until used. */
-  .library-page .fbar-filter__btn,
-  .library-page .fbar-toggle {
-    height: 32px; padding: 0 9px; font-size: 12.5px; font-weight: 500;
-    color: var(--ds-text-secondary); background: transparent; border-color: transparent;
-  }
-  .library-page .fbar-filter__btn:hover,
-  .library-page .fbar-toggle:hover {
-    color: var(--ds-text-primary);
-    background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent);
-    border-color: transparent;
-  }
-  /* On = a tint, not an outline. An outline here competed with "+ Add". */
-  .library-page .fbar-filter__btn.is-active,
-  .library-page .fbar-toggle.is-active {
-    color: var(--ds-primary); background: var(--ds-primary-light); border-color: transparent;
-  }
-  .library-page .fbar-filter__btn svg,
-  .library-page .fbar-toggle svg { width: 14px; height: 14px; }
-  /* The stack toggle's number is a hint at what pressing it leaves, not a
-     filter badge — so it stays muted text rather than gaining a pill. */
-  .library-page .fbar-toggle__n { font-weight: 600; }
-  .library-page .fbar-filter__n { min-width: 16px; height: 16px; font-size: 10.5px; }
-
-  /* Sort. It renders only in GRID view (the table sorts from its column
-     headers), and it kept the shared 38px while everything around it had come
-     down to 32 — so switching view made the whole toolbar jump 4px.
-  Sort is the design system's `ds-dropdown` (the native <select> beside it is
-     the accessible source of truth and is visually hidden), so the height that
-     mattered is the BUTTON's, not the select's. `min-width: 180px` went too:
-     "Recently added" does not need a 180px slot in a row of content-sized
-     controls. */
-  .library-page .fbar-select .ds-dropdown-btn {
-    height: 32px; min-width: 0; font-size: 12.5px; padding: 0 8px 0 10px;
-    background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
-    border-color: transparent;
-  }
-  .library-page .fbar-select .ds-dropdown-btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
-
-  /* View switcher: same weight as its neighbours, no box of its own. */
-  .library-page .fbar-view { border: 0; border-radius: 8px; overflow: hidden; }
-  .library-page .fbar-view__btn { width: 30px; height: 32px; background: transparent; }
-  .library-page .fbar-view__btn + .fbar-view__btn { border-left: 0; }
-  .library-page .fbar-view__btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent); }
-  .library-page .fbar-view__btn svg { width: 16px; height: 16px; }
+  /* The row's rank treatment — search as a field, quiet utilities, one filled
+     primary, everything 32px — is `.fbar--ranked` in filter_toolbar.css. It
+     lived here, page-scoped, until /chats moved onto the same layout and would
+     have had to copy it (TCRD-280). Only what is genuinely this page's stays
+     below: where ITS primary sits, and that primary's own height. */
 
   /* A hairline before the primary, so "utilities … then the action" is legible
      without another border per control. */
@@ -880,12 +807,6 @@
      be. */
   @media (max-width: 900px) {
     .library-page .lib-table thead th { position: static; }
-  }
-
-  /* Narrow viewports: the controls drop under the title rather than squeezing
-     search to a slot too small to type in. */
-  @media (max-width: 900px) {
-    .library-page .fbar__search { flex: 1 1 180px; }
   }
 
   /* "+ Add" is content-sized like every other control in the row. */
@@ -2174,7 +2095,7 @@
      list, and everything here narrows the one they chose. #}
   <div class="lib-browse">
       <div class="lib-head__controls">
-    <div class="fbar" role="group" aria-label="Search, filter and sort library">
+    <div class="fbar fbar--ranked" role="group" aria-label="Search, filter and sort library">
       {# The bar's own `role="search"` landmark. It sits inside a `group` rather
          than fronting one, which is why the landmark rides this box: a search
          field with no landmark of its own is unreachable by landmark navigation. #}

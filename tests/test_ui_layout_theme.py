@@ -353,7 +353,12 @@ class TestRailOptIn:
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         text = resp.text
-        head = text.split('class="lib-head"', 1)[1].split('class="fbar-dock"', 1)[0]
+        # Bounded by the browsing block, which is the next landmark after the
+        # header. It used to slice to `class="fbar-dock"`, which /library has not
+        # rendered since #1751 — so the slice silently ran to the end of the
+        # document and the assertion below covered the whole page instead of the
+        # header.
+        head = text.split('class="lib-head"', 1)[1].split('class="lib-browse"', 1)[0]
         assert 'href="/stack"' not in head
 
         rows = re.findall(r"<tr[^>]*\bdata-item-id=[^>]*>", text)

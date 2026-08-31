@@ -690,11 +690,10 @@ def test_search_and_new_ride_the_toolbar(seeded_app):
         assert kept in browse, kept
 
     # The controls row carries both, at its two ends, with the list controls
-    # between them. Bounded by the dock's own closing markup rather than by the
-    # chips row — the chips sit ABOVE the bar, so slicing to `id="lib-chips"`
-    # would run to the end of the document and assert nothing.
-    # Bounded by the tab strip, which is the next landmark after the controls.
-    bar = text.split('class="fbar" role="group"', 1)[1].split('id="lib-tabs"', 1)[0]
+    # between them. Anchored on the bar's aria-label rather than its class list:
+    # the class carries opt-in modifiers (`fbar--ranked`, the rank treatment
+    # shared with /chats) that this test has no view on.
+    bar = text.split('aria-label="Search, filter and sort library"', 1)[1].split('id="lib-tabs"', 1)[0]
     for kept in (
         'id="lib-search"',
         'id="lib-filter-btn"',
@@ -734,7 +733,7 @@ def test_search_and_new_ride_the_toolbar(seeded_app):
     # to the list they describe: inside the old dock they had to sit above the
     # bar (a card whose two rows read top-down); beside the list they read as
     # the list's current narrowing, which is what they are.
-    assert text.index('id="lib-tabs"') < text.index('class="fbar" role="group"')
+    assert text.index('id="lib-tabs"') < text.index('aria-label="Search, filter and sort library"')
     assert text.index('class="lib-browse"') < text.index("data-lib-sec=")
 
 
@@ -803,6 +802,7 @@ def test_page_header_carries_the_controls_and_the_bands_own_the_top(seeded_app):
     assert 'class="fbar-dock"' not in text
     assert "fbar-dock__veil" not in text
     assert "fbar-dock__card" not in text
+
 
 def test_library_title_carries_no_setup_caveat(seeded_app):
     """The caveat never rides the TITLE: no `.pnote` panel under the lede, and no
