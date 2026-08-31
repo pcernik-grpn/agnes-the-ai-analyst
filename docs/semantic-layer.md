@@ -845,6 +845,40 @@ The three reports are three different questions, which is why
 Business terms projected out of a document are read through the glossary
 surface: `agnes glossary search <term>` / `agnes glossary show <id>`.
 
+### The same actions from an agent (MCP)
+
+Every command above that an agent could plausibly need is also an MCP
+foundation tool (`app/api/mcp/foundation_tools.py`), on the HTTP transports
+only — the stdio server carries no semantic tools by design. The tools are
+thin wrappers over the same endpoints, so the admin gate, the validation and
+the Postgres-only refusals stay in one place.
+
+| MCP tool | CLI equivalent |
+|---|---|
+| `semantic_model_search` / `semantic_model_get` | `agnes semantic-model search` / `export` |
+| `get_semantic_context` / `get_semantic_schema` | `agnes semantic-model context` / `schema` |
+| `validate_semantic_query` | `agnes semantic-model validate-query` |
+| `apply_semantic_model` | `agnes semantic-model apply` |
+| `flag_semantic_issue` | `agnes semantic-model feedback submit` |
+| `semantic_source_add` / `_list` / `_sync` / `_remove` | `agnes admin semantic source add\|list\|sync\|rm` |
+| `semantic_model_detach` / `semantic_model_reattach` | `agnes admin semantic detach` / `reattach` |
+| `semantic_model_link_package` / `_unlink_package` | `agnes admin semantic link-package` / `unlink-package` |
+| `semantic_model_coverage[_tag/_untag]`, `admin_semantic_coverage`, `admin_semantic_layer_coverage` | `agnes admin semantic coverage*` / `keboola-import` |
+| `semantic_layer_health`, `semantic_mutes_list`, `mute_semantic_check`, `unmute_semantic_check` | `agnes admin semantic health` / `mutes` / `mute` / `unmute` |
+| `semantic_feedback_list` / `semantic_feedback_resolve` | `agnes admin semantic feedback list` / `resolve` |
+
+Two details worth knowing before an agent calls them:
+
+- `semantic_model_detach` and `semantic_model_reattach` take their
+  confirmation flag as a **required** argument, deliberately not defaulted to
+  true. The caller has to decide, and an unconfirmed re-attach returns the
+  staleness preview (when it was detached, whether the source has changed
+  since) instead of acting. Both are Postgres-only and answer
+  `501 requires_postgres_backend` on the frozen DuckDB app-state backend.
+- Everything that writes is annotated non-read-only, so cloud chat's approval
+  gate raises a card before it runs; removing a source, detaching and
+  re-attaching are additionally flagged destructive.
+
 ### Renamed in this release
 
 Five groups that all read as "the semantic layer" became the two above. Every

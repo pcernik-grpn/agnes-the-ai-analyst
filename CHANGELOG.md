@@ -10,6 +10,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **Eight MCP tools for the semantic-layer admin actions that had REST and CLI
+  and nothing else (#1707).** Three families were reachable from a terminal and
+  a browser but not from an agent: where documents are synced FROM
+  (`semantic_source_add` / `_list` / `_sync` / `_remove`), taking a
+  source-owned model off that sync path (`semantic_model_detach` /
+  `semantic_model_reattach`), and which Data Package carries a model to
+  non-admin readers (`semantic_model_link_package` / `_unlink_package`). The
+  gap was never justified as an exception — CONTRIBUTING.md's only standing MCP
+  exemptions are credential-provisioning writes and security-posture
+  diagnostics — so the endpoints move from "REST-only by design" to
+  triple-surface. Each tool is a thin wrapper over the endpoint the CLI already
+  calls, so the admin gate, the validation and the Postgres-only refusals stay
+  in the one place that owns them; detach/reattach pass the frozen DuckDB
+  backend's typed `501 requires_postgres_backend` straight through. Their
+  confirmation flags (`confirm_detach` / `confirm_reattach`) are REQUIRED
+  arguments rather than defaulted to true, so an agent cannot confirm a danger
+  flow on the user's behalf, and an unconfirmed re-attach returns the endpoint's
+  staleness preview instead of acting. Writes are annotated non-read-only (so
+  cloud chat's approval gate raises a card), with source removal, detach and
+  reattach additionally flagged destructive. HTTP transports only — the stdio
+  server still carries no semantic tools by design.
 - **`/admin/tables` now says when the auto-draft sweep is waiting on you
   (#1707).** `POST /api/admin/semantic-auto-draft-sweep` runs every 55 minutes,
   drafts a semantic model for tables with no semantic-layer coverage and files
