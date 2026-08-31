@@ -2600,7 +2600,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
 {fns}
 
 const SP_CONN_API = "/api/admin/source-connections";
-let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms;
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites;
 function spSetCertChoice(c) {{}}
 function spGoStep(n) {{}}
 function _syncDropdownRebuild(sel) {{}}

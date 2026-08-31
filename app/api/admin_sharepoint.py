@@ -120,6 +120,7 @@ import re
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -135,6 +136,7 @@ from connectors.sharepoint.graph_client import (
     build_folder_matcher,
     certificate_metadata,
     get_app_token,
+    get_site_by_path,
     list_drives,
     list_item_children,
     list_root_children,
@@ -144,7 +146,6 @@ from connectors.sharepoint.graph_client import (
 )
 from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
-from src.audit_helpers import log_safe
 from src.repositories import (
     corpus_file_events_repo,
     file_corpora_repo,
@@ -284,6 +285,62 @@ def _validate_graph_id(value: str, field: str) -> None:
     500 from a Graph call that silently misrouted."""
     if not value or not _GRAPH_ID_RE.match(value):
         raise HTTPException(status_code=422, detail={"error": f"invalid_{field}", "message": f"malformed {field}"})
+
+
+_SITE_URL_MAX_LEN = 2048
+#: RFC-1123-ish: lowercase letters/digits/dots/hyphens, must start with an
+#: alphanumeric and contain a dot. Deliberately NOT pinned to
+#: ``*.sharepoint.com`` — sovereign clouds (`.sharepoint.us`, `.sharepoint.cn`,
+#: …) and vanity domains are legitimate hosts; the Graph base URL is a
+#: constant, so a wrong host can only make Graph itself answer 400/404.
+_SITE_HOSTNAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
+
+
+def _invalid_site_url(reason: str) -> None:
+    raise HTTPException(status_code=422, detail={"error": "invalid_site_url", "message": f"invalid site_url: {reason}"})
+
+
+def _parse_site_url(raw: str) -> Tuple[str, str]:
+    """An admin-pasted SharePoint URL -> ``(hostname, server_relative_path)``
+    for Graph's by-path site addressing.
+
+    Admins paste whatever their browser shows, so a URL deep inside the site
+    (a library page, a document) is trimmed to the site itself when the path
+    starts with a site-collection managed path (``/sites/…``, ``/teams/…``
+    -> first two segments). Any other path shape is kept as given — the
+    tenant root site (empty path) included.
+
+    This is request validation, not transport safety: every segment is
+    ALSO percent-encoded at the Graph client (`get_site_by_path`), so the
+    typed 422s here exist to tell the admin what to fix, not to be the only
+    thing standing between a pasted string and the Graph URL. Rejections are
+    structural (scheme, userinfo/port smuggling, dot-dot or control-character
+    segments), never a guess at which tenants are plausible.
+    """
+    value = (raw or "").strip()
+    if not value:
+        _invalid_site_url("empty")
+    if len(value) > _SITE_URL_MAX_LEN:
+        _invalid_site_url("too long")
+    if "://" not in value:
+        value = "https://" + value
+    parts = urlsplit(value)
+    if parts.scheme != "https":
+        _invalid_site_url("only https:// URLs are accepted")
+    host = parts.netloc.lower()
+    if "@" in host or ":" in host:
+        _invalid_site_url("hostname must not carry credentials or a port")
+    if "." not in host or not _SITE_HOSTNAME_RE.match(host):
+        _invalid_site_url("malformed hostname")
+    segments = [unquote(seg) for seg in parts.path.split("/") if seg]
+    for seg in segments:
+        if seg in (".", "..") or "\\" in seg or any(ord(ch) < 32 for ch in seg):
+            _invalid_site_url("malformed path segment")
+    if segments and segments[0].lower() in ("sites", "teams"):
+        if len(segments) < 2:
+            _invalid_site_url("the URL names a managed path but no site")
+        segments = segments[:2]
+    return host, "/".join(segments)
 
 
 #: A single browse click never fans out into more Graph calls than this many
@@ -663,6 +720,7 @@ async def browse_tree(
     site_id: Optional[str] = None,
     drive_id: Optional[str] = None,
     item_id: Optional[str] = None,
+    site_url: Optional[str] = None,
     with_permissions: bool = False,
     _user: dict = Depends(require_admin),
 ):
@@ -675,6 +733,15 @@ async def browse_tree(
     item id, never a path, and is structurally validated before it reaches
     a Graph URL).
 
+    ``site_url`` (exclusive with all three coordinates above) resolves ONE
+    site addressed directly by a pasted URL and returns it as a one-item
+    ``sites`` level. This is the ``Sites.Selected`` escape hatch: that
+    permission 403-forbids every enumeration Graph offers, so the sites
+    level above is unreachable for such an app registration, while a granted
+    site it can NAME stays readable (Graph by-path addressing). A deep URL
+    (a library page, a document) is trimmed to its site when it starts with
+    a site-collection managed path — see :func:`_parse_site_url`.
+
     ``with_permissions=1`` (default off) additionally probes each listed
     FOLDER for ``hasUniqueRoleAssignments`` — an ADVISORY-ONLY signal
     (Decision #2: Agnes never derives or enforces anything from a
@@ -686,6 +753,17 @@ async def browse_tree(
     fails the browse itself — affected folders just come back ``null``
     ("unknown").
     """
+    if site_url is not None and (site_id or drive_id or item_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "site_url_exclusive",
+                "message": "site_url resolves a site on its own — it cannot be combined with site_id/drive_id/item_id",
+            },
+        )
+    site_by_url: Optional[Tuple[str, str]] = None
+    if site_url is not None:
+        site_by_url = _parse_site_url(site_url)  # typed 422 before any token resolution
     if item_id is not None:
         if not drive_id:
             raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
@@ -693,6 +771,10 @@ async def browse_tree(
     row = _sharepoint_connection_or_404(connection_id)
     token = await _resolved_token(row)
     try:
+        if site_by_url is not None:
+            hostname, site_path = site_by_url
+            site = await get_site_by_path(token, hostname, site_path)
+            return {"level": "sites", "items": [site]}
         if drive_id:
             items = await (
                 list_item_children(token, drive_id, item_id) if item_id else list_root_children(token, drive_id)
@@ -706,6 +788,33 @@ async def browse_tree(
         items = await list_sites(token)
         return {"level": "sites", "items": items}
     except SharePointGraphError as exc:
+        # A Graph 403 is a PERMISSION verdict on an issued token, never an
+        # outage — classify the two cases this endpoint can make actionable
+        # instead of letting them read as "SharePoint did not answer" (the
+        # generic wrap below, which one real Sites.Selected tenant surfaced
+        # for a working certificate).
+        if exc.status_code == 403 and site_by_url is not None:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "sharepoint_site_not_granted",
+                    "message": (
+                        "Graph refused this site (HTTP 403): the app registration has no grant on it. "
+                        "Grant the app access to this site (Sites.Selected), or check the URL."
+                    ),
+                },
+            ) from exc
+        if exc.status_code == 403 and not site_id and not drive_id:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "sharepoint_discovery_forbidden",
+                    "message": (
+                        "Graph refused to list sites (HTTP 403). An app registration holding only "
+                        "Sites.Selected cannot enumerate sites — add a granted site directly by its URL instead."
+                    ),
+                },
+            ) from exc
         raise HTTPException(
             status_code=502,
             detail={"error": "sharepoint_graph_error", "message": str(exc)},

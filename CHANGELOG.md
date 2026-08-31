@@ -538,6 +538,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **The SharePoint connect wizard now works for app registrations holding only `Sites.Selected`.** That permission 403-forbids all site discovery by design, so the wizard's site picker dead-ended with a generic "SharePoint did not answer" even when the certificate was fine. The sites level gains an "Add a site by URL" fallback (`GET /api/admin/sharepoint/connections/{id}/tree?site_url=…`, Graph by-path addressing — a pasted deep link is trimmed to its site), sites added this way accumulate and render as ordinary rows, and a Graph 403 on discovery or on a named site is now a typed, actionable error (`sharepoint_discovery_forbidden` / `sharepoint_site_not_granted`) instead of reading as an outage.
 - **The catalog's `fetch_via` hint for internal tables promised a local path that does not exist.** `query_mode='internal'` rows (`agnes_sessions`/`agnes_telemetry`/`agnes_audit`) claimed they become queryable locally "after the usage export + `agnes pull`" — no such export exists, and both `agnes pull` and the signed-URL sync API refuse internal tables. The hint now says server-side only.
 - A chat turn ended by the idle watchdog now persists its prompt-cache tokens like any other turn. The partial-save path carried only `tokens_in`/`tokens_out`, so it under-counted both the measured cost and the daily budget for precisely the turns most likely to be expensive.
 

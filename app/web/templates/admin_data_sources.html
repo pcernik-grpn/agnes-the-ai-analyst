@@ -1652,6 +1652,22 @@
           <div id="spw-search-results" class="sp-tree" style="display:none; margin-bottom:12px;"></div>
         </div>
 
+        {# Sites.Selected escape hatch: that permission forbids ALL site
+           discovery (Graph 403s the listing by design), so a granted site
+           must be addable by the URL an admin pastes. Shown only at the
+           sites level; resolved sites accumulate client-side and render as
+           ordinary site rows. #}
+        <div class="sp-search" id="spw-site-by-url-wrap" style="display:none;">
+          <div class="sp-search__row">
+            <div class="ds-field sp-search__q">
+              <label for="spw-site-by-url">Add a site by URL</label>
+              <input type="text" id="spw-site-by-url"
+                     placeholder="https://yourtenant.sharepoint.com/sites/YourSite" autocomplete="off">
+            </div>
+            <button type="button" class="btn btn-secondary" id="spw-site-by-url-btn">Add site</button>
+          </div>
+        </div>
+
         <div class="ds-field">
           <label for="spw-tree-filter">Filter loaded folders</label>
           <input type="text" id="spw-tree-filter" placeholder="Narrow what's shown below…" autocomplete="off">
@@ -2452,7 +2468,7 @@ function _spGroupRejectionRows(rows) {
   const groups = [];
   const indexByKey = {};
   rows.forEach((r) => {
-    const key = `${r.doc_id || ""} ${r.reason || ""}`;
+    const key = `${r.doc_id || ""}\u0000${r.reason || ""}`;
     if (indexByKey[key] === undefined) {
       indexByKey[key] = groups.length;
       groups.push(Object.assign({}, r, { count: 1 }));
@@ -6005,6 +6021,11 @@ let spLastSearchMatches = null; // last server-search (#3) result list, or null 
 // permissions" anywhere that reads this map. ADVISORY ONLY (Decision #2:
 // Agnes does not derive or enforce anything from a SharePoint ACL).
 let spUniquePerms = {};
+// site_id -> site row resolved via `?site_url=` — the Sites.Selected escape
+// hatch (discovery is 403-forbidden under that permission, so these rows are
+// the ONLY way the sites level can populate there). Merged into every
+// sites-level render so an added site survives navigating away and back.
+let spManualSites = {};
 
 function spEsc(s) {
   return String(s == null ? "" : s)
@@ -6048,7 +6069,9 @@ function openSpWizard() {
   spTreeFilterQuery = "";
   spLastSearchMatches = null;
   spUniquePerms = {};
+  spManualSites = {};
 
+  document.getElementById("spw-site-by-url").value = "";
   document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-search-q").value = "";
   document.getElementById("spw-search-truncated").style.display = "none";
@@ -6263,12 +6286,27 @@ function spCurrentLevel() {
   return "sites";
 }
 
+/* Splice the `?site_url=`-resolved sites into a sites-level listing —
+   under Sites.Selected they are the only rows the level can ever show,
+   and under normal discovery they must survive alongside listed sites
+   without duplicating one that discovery already returned. */
+function spMergeManualSites() {
+  const have = new Set(spItems.map((i) => i.id));
+  Object.values(spManualSites).forEach((s) => { if (!have.has(s.id)) spItems.push(s); });
+}
+
+function spSyncSiteByUrlVisibility() {
+  document.getElementById("spw-site-by-url-wrap").style.display =
+    spCurrentLevel() === "sites" ? "" : "none";
+}
+
 function spLoadTree() {
   spTreeErr("");
   spTreeFilterQuery = "";
   document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-tree").innerHTML = '<div class="ds-loading">Loading…</div>';
   spRenderCrumbs();
+  spSyncSiteByUrlVisibility();
   const params = new URLSearchParams();
   if (spLevel.site_id) params.set("site_id", spLevel.site_id);
   if (spLevel.drive_id) params.set("drive_id", spLevel.drive_id);
@@ -6289,6 +6327,7 @@ function spLoadTree() {
         if (item.unique_permissions === true) spUniquePerms[item.id] = true;
         else if (!(item.id in spUniquePerms)) spUniquePerms[item.id] = item.unique_permissions ?? null;
       });
+      if (body.level === "sites") spMergeManualSites();
       spRenderTree(body.level);
     })
     .catch((e) => {
@@ -6296,6 +6335,13 @@ function spLoadTree() {
       document.getElementById("spw-tree").innerHTML = "";
       if (e.detail && e.detail.error === "sharepoint_cert_unresolved") {
         spTreeErr("No certificate configured yet — " + e.detail.message);
+      } else if (e.detail && e.detail.error === "sharepoint_discovery_forbidden") {
+        // Sites.Selected: the listing is forbidden BY DESIGN, but sites
+        // already added by URL are real and stay browsable — render them
+        // and keep the by-URL field as the way forward.
+        spMergeManualSites();
+        if (spItems.length) spRenderTree("sites");
+        spTreeErr(e.detail.message);
       } else if (e.detail && e.detail.error === "sharepoint_graph_error") {
         spTreeErr("SharePoint did not answer: " + e.detail.message);
       } else {
@@ -6303,6 +6349,35 @@ function spLoadTree() {
       }
     });
 }
+
+function spAddSiteByUrl() {
+  const input = document.getElementById("spw-site-by-url");
+  const btn = document.getElementById("spw-site-by-url-btn");
+  const url = input.value.trim();
+  if (!url || !spConnId) return;
+  btn.disabled = true;
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree?site_url=${encodeURIComponent(url)}`)
+    .then((body) => {
+      btn.disabled = false;
+      (body.items || []).forEach((s) => { spManualSites[s.id] = s; });
+      input.value = "";
+      if (spCurrentLevel() === "sites") {
+        spTreeErr("");
+        spMergeManualSites();
+        spRenderTree("sites");
+      }
+    })
+    .catch((e) => {
+      btn.disabled = false;
+      const msg = e.detail && e.detail.message ? e.detail.message : e.message;
+      spTreeErr("Could not add the site: " + msg);
+    });
+}
+
+document.getElementById("spw-site-by-url-btn").addEventListener("click", spAddSiteByUrl);
+document.getElementById("spw-site-by-url").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); spAddSiteByUrl(); }
+});
 
 function spRenderCrumbs() {
   const nav = document.getElementById("spw-crumbs");

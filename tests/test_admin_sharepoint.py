@@ -206,6 +206,148 @@ class TestTreeCertResolution:
         assert r.json()["detail"]["error"] == "sharepoint_graph_error"
 
 
+class TestSiteByUrl:
+    """``?site_url=`` — the `Sites.Selected` escape hatch: that permission
+    forbids ALL site discovery (Graph 403s ``/sites?search=*`` by design), so
+    the wizard must be able to reach a granted site addressed directly by the
+    URL an admin pastes, and the discovery 403 itself must say so instead of
+    reading as an outage."""
+
+    def _mock_graph(self, monkeypatch, handler):
+        from connectors.sharepoint import graph_client as gc
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+
+        def full_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            return handler(request)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(full_handler), timeout=10)
+        )
+
+    def test_resolves_a_granted_site_directly_by_url(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(
+                200, json={"id": "s-by-url", "displayName": "Project Hub", "webUrl": "https://contoso/x"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="by-url-conn")
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["level"] == "sites"
+        assert body["items"] == [{"id": "s-by-url", "name": "Project Hub", "web_url": "https://contoso/x"}]
+
+    def test_a_deep_page_url_is_trimmed_to_its_site(self, seeded_app, monkeypatch):
+        """Admins paste whatever their browser shows — a document-library page
+        deep inside the site must still resolve the SITE, not 404 on the page
+        path."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(200, json={"id": "s-by-url", "displayName": "Project Hub", "webUrl": "https://c/x"})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="by-url-deep")
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub/Shared%20Documents/Forms/AllItems.aspx"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["items"][0]["id"] == "s-by-url"
+
+    def test_site_url_is_exclusive_with_tree_coordinates(self, seeded_app, monkeypatch):
+        self._mock_graph(monkeypatch, lambda request: httpx.Response(500))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="by-url-excl")
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"site_url": "https://contoso.sharepoint.com/sites/X", "site_id": "s1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "site_url_exclusive"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "http://contoso.sharepoint.com/sites/X",  # non-https scheme
+            "https://user@contoso.sharepoint.com/sites/X",  # userinfo smuggling
+            "https://contoso.sharepoint.com:8443/sites/X",  # explicit port
+            "https://contoso.sharepoint.com/sites/%2e%2e/other",  # dot-dot segment
+            "https://bad host/sites/X",  # malformed hostname
+            "https:///sites/X",  # no hostname at all
+            "https://contoso.sharepoint.com/sites",  # managed path with no site name
+        ],
+    )
+    def test_malformed_site_url_is_a_typed_422(self, seeded_app, monkeypatch, bad):
+        self._mock_graph(monkeypatch, lambda request: httpx.Response(500))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="by-url-bad")
+        r = c.get(f"{BASE}/{conn_id}/tree", params={"site_url": bad}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_site_url"
+
+    def test_discovery_403_names_sites_selected_and_the_url_fallback(self, seeded_app, monkeypatch):
+        """Found live on a Sites.Selected tenant (2026-08-31): the listing
+        call 403s BY DESIGN, and the old generic wrap ("SharePoint did not
+        answer") read as an outage while the certificate was fine."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="disc-403")
+        r = c.get(f"{BASE}/{conn_id}/tree", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 502, r.text
+        detail = r.json()["detail"]
+        assert detail["error"] == "sharepoint_discovery_forbidden"
+        assert "Sites.Selected" in detail["message"]
+        assert "URL" in detail["message"]
+
+    def test_by_url_403_is_a_typed_not_granted_error(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="by-url-403")
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"site_url": "https://contoso.sharepoint.com/sites/NotGranted"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_site_not_granted"
+
+    def test_drive_level_403_keeps_the_generic_graph_error(self, seeded_app, monkeypatch):
+        """The Sites.Selected classification applies only where it is TRUE —
+        a 403 while browsing inside a known site is not a discovery refusal
+        and must not be dressed up as one."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="drives-403")
+        r = c.get(f"{BASE}/{conn_id}/tree", params={"site_id": "s1"}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_graph_error"
+
+
 class TestSubfolderBrowsing:
     """TCRD-240: `?item_id=` lets the wizard browse below the drive root at
     any depth — the pre-existing contract stopped at "sites -> drives ->

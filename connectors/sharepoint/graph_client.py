@@ -30,6 +30,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 import jwt as pyjwt
@@ -327,6 +328,35 @@ async def list_sites(access_token: str) -> List[Dict[str, Any]]:
         }
         for site in body.get("value", [])
     ]
+
+
+async def get_site_by_path(access_token: str, hostname: str, server_relative_path: str) -> Dict[str, Any]:
+    """One site, addressed by hostname + server-relative path — Graph's
+    by-path form ``/sites/{hostname}:/{path}`` (bare ``/sites/{hostname}``
+    for the tenant root site when ``server_relative_path`` is empty).
+
+    This is the discovery-free complement to :func:`list_sites`: an app
+    registration holding only ``Sites.Selected`` is 403-forbidden from ANY
+    site enumeration by design, but may read a granted site it can name.
+    Same normalized shape as one :func:`list_sites` item, so callers can
+    splice the result straight into a sites-level browse listing.
+
+    Each path segment is percent-encoded before it reaches the Graph URL —
+    the path originates from an admin-pasted URL, and quoting is what makes
+    it structurally inert here regardless of what the caller validated
+    (security playbook: never build a request path from an unchecked value).
+    """
+    segments = [seg for seg in server_relative_path.split("/") if seg]
+    if segments:
+        path = f"/sites/{hostname}:/" + "/".join(quote(seg, safe="") for seg in segments)
+    else:
+        path = f"/sites/{hostname}"
+    body = await _graph_get(access_token, path, params={"$select": "id,name,displayName,webUrl"})
+    return {
+        "id": body["id"],
+        "name": body.get("displayName") or body.get("name") or body["id"],
+        "web_url": body.get("webUrl"),
+    }
 
 
 async def list_drives(access_token: str, site_id: str) -> List[Dict[str, Any]]:
