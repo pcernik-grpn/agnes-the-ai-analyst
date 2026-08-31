@@ -650,6 +650,34 @@ class TestTransport:
         assert report["retries"] == 2
         assert report["new"] == 1
 
+    def test_a_throttled_download_aborts_the_run_instead_of_being_swallowed(self, crawl_env, monkeypatch):
+        """A 429 budget exhausted while DOWNLOADING is a tenant-wide signal,
+        not one file's problem — absorbing it per file would keep hammering."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(429, headers={"Retry-After": "300"}, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item("a"), _file_item("b", ctag="c2"), _file_item("c", ctag="c3")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        with pytest.raises(crawler.GraphThrottled):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        # Only the FIRST item's download burned a budget; the run stopped
+        # rather than spending one per remaining file.
+        assert len({url for url in seen if url.endswith("/content")}) == 1
+
     def test_a_401_forces_exactly_one_token_refresh(self, crawl_env, monkeypatch):
         calls = {"n": 0}
 

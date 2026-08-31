@@ -907,6 +907,13 @@ async def _process_item(
         tmp_path = await transport.download_to_temp(
             target.drive_id, str(item["id"]), name, max_bytes=_max_file_bytes(max_file_mb)
         )
+    except GraphThrottled:
+        # NOT a per-file fault, despite being a CrawlError: the tenant is
+        # throttling this app registration as a whole, so absorbing it here
+        # would turn "back off" into "keep hammering, one 429 budget per
+        # file". Aborts the run; the next one resumes from the persisted
+        # deltaLink + cTags.
+        raise
     except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
         stats.errors += 1
         logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
